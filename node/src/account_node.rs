@@ -960,10 +960,13 @@ impl AccountNode {
         amount: u64,
         next_public_key: &zkcoins_program::types::PublicKey,
     ) -> Result<MintingPrepared, &'static str> {
-        use zkcoins_program::hash::hash_bytes;
+        use zkcoins_program::hash::sha256_to_digest;
         use zkcoins_program::types::{calculate_asset_id, calculate_name_hash};
 
-        let owner = hash_bytes(creator_pubkey);
+        // owner = protocol address H(Pk₀) = SHA-256(creator_pubkey) (#226),
+        // consistent with the wallet/SDK address, the username-claim gate and
+        // the SMT — NOT the in-circuit Poseidon hash.
+        let owner = sha256_to_digest(creator_pubkey);
         let name_hash = calculate_name_hash(name);
         let asset_id = calculate_asset_id(creator_pubkey, &name_hash, decimals);
 

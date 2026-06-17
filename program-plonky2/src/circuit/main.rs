@@ -476,8 +476,8 @@ pub struct StateTransitionCircuit {
     // ===== Issuer-gated mint witnesses (neutral multi-asset) =====
     /// 5×56-bit limbs of the asset creator's public key. Private
     /// witness (NOT a public input). Used by the issuer gate to derive
-    /// `owner_from_creator = H(creator_pubkey)` and the asset id. For a
-    /// legitimate issuer-mint these limbs are the minting account's
+    /// the asset id and to bind `account.public_key == creator_pubkey`.
+    /// For a legitimate issuer-mint these limbs are the minting account's
     /// initial pubkey; for non-mint transitions they are unconstrained
     /// (the gate they feed is masked off when `is_minting = false`).
     pub creator_pubkey_limbs: [Target; 5],
@@ -629,13 +629,19 @@ pub fn build_circuit() -> StateTransitionCircuit {
     // (relaxing the "Initial balance must be 0" rule) is granted ONLY to
     // an account that proves it is the legitimate issuer of its own
     // asset, i.e.:
-    //   owner          == H(creator_pubkey)
-    //   transition_aid == calculate_asset_id(creator_pubkey, name_hash, decimals)
-    // Both derivations are recomputed cheaply in-circuit from private
-    // witnesses (`creator_pubkey_limbs`, `name_hash`, `decimals`). Anyone
-    // can mint THEIR OWN asset; nobody can forge or inflate someone
-    // else's, because forging would require a `creator_pubkey` that both
-    // hashes to the victim's `owner` AND derives the victim's `asset_id`.
+    //   transition_aid     == calculate_asset_id(creator_pubkey, name_hash, decimals)
+    //   account.public_key == creator_pubkey
+    // Both are checked cheaply in-circuit from private witnesses
+    // (`creator_pubkey_limbs`, `name_hash`, `decimals`). Anyone can mint
+    // THEIR OWN asset; nobody can forge or inflate someone else's, because
+    // forging would require a `creator_pubkey` that both derives the
+    // victim's `asset_id` AND equals the account's own commitment key.
+    //
+    // The account `owner` is the protocol address `H(Pk₀) = SHA-256(pubkey)`
+    // (off-circuit, #226); it is NOT bound to the creator key here. (The
+    // legacy in-circuit `owner == Poseidon(creator_pubkey)` binding was
+    // removed — Variant B — to make the owner consistent with the SHA-256
+    // address used by the wallet/SDK, username-claim and SMT.)
     let creator_pubkey_limbs: [Target; 5] = std::array::from_fn(|_| {
         let t = builder.add_virtual_target();
         builder.range_check(t, 56);
@@ -658,16 +664,14 @@ pub fn build_circuit() -> StateTransitionCircuit {
     derived_aid_input.push(decimals);
     let derived_asset_id = builder.hash_n_to_hash_no_pad::<PoseidonHash>(derived_aid_input);
 
-    // owner_from_creator = H(creator_pubkey) == hash_bytes(pubkey)
-    // (the 33-byte pubkey packs into the same 5 limbs `pubkey_to_limbs`
-    // produces, so the in-circuit hash of the limbs equals the
-    // off-circuit `hash_bytes(&pubkey)`).
-    let owner_from_creator =
-        builder.hash_n_to_hash_no_pad::<PoseidonHash>(creator_pubkey_limbs.to_vec());
-
-    // asset_ok = AND over 4 elems (derived_asset_id == transition_asset_id)
-    // owner_ok  = AND over 4 elems (owner_from_creator == owner)
-    // is_minting = asset_ok AND owner_ok
+    // asset_ok   = AND over 4 elems (derived_asset_id == transition_asset_id)
+    // is_minting = asset_ok AND (account.public_key == creator_pubkey, below)
+    //
+    // The `owner == Poseidon(creator_pubkey)` binding was removed (#226,
+    // Variant B): `owner` is the off-circuit SHA-256 address, so it cannot
+    // be cheaply re-derived in-circuit, and forge protection is fully held
+    // by the asset_id derivation here plus the `public_key == creator`
+    // binding below (and the off-circuit creator signature at commit time).
     let mut is_minting = builder._true();
     for i in 0..4 {
         let aid_eq = builder.is_equal(
@@ -675,8 +679,6 @@ pub fn build_circuit() -> StateTransitionCircuit {
             transition_asset_id.elements[i],
         );
         is_minting = builder.and(is_minting, aid_eq);
-        let owner_eq = builder.is_equal(owner_from_creator.elements[i], owner.elements[i]);
-        is_minting = builder.and(is_minting, owner_eq);
     }
     // Bind the creator key to the account's own commitment key. The
     // account's `public_key` (`pubkey_limbs`) is the key that signs the
@@ -2299,7 +2301,7 @@ mod tests {
     }
 
     /// Build a non-mint account that does NOT satisfy the issuer gate:
-    /// its `owner` is `hash_bytes(own pubkey)` but its `asset_id` is one
+    /// its `owner` is `SHA-256(own pubkey)` but its `asset_id` is one
     /// it did NOT create (derived from a *different* creator key). Such
     /// an account is a legitimate holder of someone else's asset and may
     /// receive coins, but it cannot grant itself the mint exception.
@@ -2757,15 +2759,18 @@ mod tests {
         assert!(prove_initial(&circuit, &account_state, history_root, asset_id, None).is_err());
     }
 
-    /// Issuer gate positive: owner == hash_bytes(creator_pk) AND
+    /// Issuer gate positive: account.public_key == creator_pk AND
     /// transition asset_id == calculate_asset_id(creator_pk, name_hash,
     /// decimals), Initial with non-zero balance → proof builds/verifies.
+    /// (Owner is the off-circuit SHA-256 address and is not gated — #226.)
     #[test]
     fn issuer_gated_mint_accepted() {
         let circuit = build_circuit();
         let (account_state, asset_id, mint) = mint_account(45, 1_000_000);
-        // Precondition: the gate's two derivations hold for this fixture.
-        assert_eq!(account_state.owner, hash_bytes(&mint.creator_pubkey));
+        // Precondition: the gate's bindings hold for this fixture, and the
+        // owner is the SHA-256 address (not the Poseidon image).
+        assert_eq!(account_state.public_key, mint.creator_pubkey);
+        assert_eq!(account_state.owner, crate::hash::sha256_to_digest(&mint.creator_pubkey));
         assert_eq!(
             asset_id,
             crate::types::calculate_asset_id(&mint.creator_pubkey, &mint.name_hash, mint.decimals)
@@ -2786,23 +2791,26 @@ mod tests {
         );
     }
 
-    /// Issuer gate negative: owner != hash_bytes(creator_pk). The mint
-    /// witness supplies a creator key that does NOT hash to the
-    /// account's owner, so `owner_ok` is false → no mint exception →
-    /// the non-zero Initial balance is rejected.
+    /// Issuer gate negative: the account's `public_key` is NOT the asset's
+    /// creator key. `asset_ok` holds (the asset_id derives from the creator
+    /// key) but the in-circuit `public_key == creator_pubkey` binding fails
+    /// → no mint exception → the non-zero Initial balance is rejected.
+    /// Post-#226 this `public_key == creator` binding is the forge guard the
+    /// removed `owner == Poseidon(creator)` binding used to provide.
     #[test]
-    fn mint_rejected_when_owner_not_creator() {
+    fn mint_rejected_when_pubkey_not_creator() {
         let circuit = build_circuit();
         // Build a self-consistent asset_id for `creator_pubkey`, but make
-        // the ACCOUNT owned by a DIFFERENT key. asset_ok holds, owner_ok
-        // does not.
+        // the ACCOUNT keyed by a DIFFERENT pubkey. asset_ok holds, the
+        // pubkey binding does not.
         let creator_pubkey = dummy_pubkey(70);
         let name_hash = crate::types::calculate_name_hash("TEST");
         let asset_id = crate::types::calculate_asset_id(&creator_pubkey, &name_hash, 8);
-        // Account owned by a different pubkey (71) but claims the same asset.
+        // Account whose own pubkey is a different key (71) but claims the
+        // creator's asset.
         let mut account_state = AccountState::new(dummy_pubkey(71), asset_id);
         account_state.balance = 1;
-        assert_ne!(account_state.owner, hash_bytes(&creator_pubkey));
+        assert_ne!(account_state.public_key, creator_pubkey);
 
         let mint = MintWitness {
             creator_pubkey,
@@ -2812,7 +2820,7 @@ mod tests {
         assert!(prove_initial(
             &circuit,
             &account_state,
-            hash_bytes(b"owner-not-creator"),
+            hash_bytes(b"pubkey-not-creator"),
             asset_id,
             Some(mint),
         )
@@ -2832,7 +2840,7 @@ mod tests {
         let asset_id = foreign_asset_id();
         let mut account_state = AccountState::new(creator_pubkey, asset_id);
         account_state.balance = 1;
-        assert_eq!(account_state.owner, hash_bytes(&creator_pubkey));
+        assert_eq!(account_state.public_key, creator_pubkey);
         assert_ne!(
             asset_id,
             crate::types::calculate_asset_id(
@@ -2876,7 +2884,7 @@ mod tests {
         let mut account_state = AccountState::new(creator_pubkey, asset_id);
         account_state.public_key = dummy_pubkey(74);
         account_state.balance = 1;
-        assert_eq!(account_state.owner, hash_bytes(&creator_pubkey));
+        assert_eq!(account_state.owner, crate::hash::sha256_to_digest(&creator_pubkey));
         assert_ne!(account_state.public_key, creator_pubkey);
 
         let mint = MintWitness {

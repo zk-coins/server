@@ -109,7 +109,9 @@ pub(crate) fn validate_mint_request(req: &MintRequest) -> Result<MintIdentity, F
         ));
     }
     let creator_pubkey = req.creator_pubkey.serialize();
-    let owner = zkcoins_program::hash::hash_bytes(&creator_pubkey);
+    // owner = protocol address H(Pk₀) = SHA-256(creator_pubkey) (#226),
+    // consistent with the wallet/SDK address / username-claim / SMT.
+    let owner = zkcoins_program::hash::sha256_to_digest(&creator_pubkey);
     let name_hash = zkcoins_program::types::calculate_name_hash(&req.name);
     let asset_id =
         zkcoins_program::types::calculate_asset_id(&creator_pubkey, &name_hash, req.decimals);
