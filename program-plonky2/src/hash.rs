@@ -11,6 +11,7 @@ use plonky2::field::types::Field;
 use plonky2::hash::hash_types::HashOut;
 use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::plonk::config::Hasher;
+use sha2::{Digest, Sha256};
 
 use crate::F;
 
@@ -62,9 +63,25 @@ pub fn digest_from_bytes(bytes: &[u8; 32]) -> HashDigest {
     for i in 0..4 {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&bytes[i * 8..(i + 1) * 8]);
-        elements[i] = F::from_canonical_u64(u64::from_be_bytes(buf));
+        // `from_noncanonical_u64` (not `from_canonical_u64`): an 8-byte
+        // chunk of an externally-supplied 32-byte value (e.g. a SHA-256
+        // address) can exceed the Goldilocks modulus; canonical conversion
+        // would debug-panic / yield a non-canonical element. Noncanonical
+        // reduction is deterministic and consistent across all consumers.
+        elements[i] = F::from_noncanonical_u64(u64::from_be_bytes(buf));
     }
     HashOut { elements }
+}
+
+/// Account address / owner: `H(pubkey) = SHA-256(pubkey)`, per the protocol
+/// spec (`address = H(Pk₀)`, where `H` is SHA-256 for addresses / off-circuit
+/// ids). The 32-byte SHA-256 image is carried as a [`HashDigest`] via
+/// [`digest_from_bytes`] (big-endian, 4 field elements). This is the
+/// off-circuit identity hash and is distinct from the in-circuit Poseidon `H`
+/// used for Merkle/state hashing.
+pub fn sha256_to_digest(bytes: &[u8]) -> HashDigest {
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    digest_from_bytes(&digest)
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]

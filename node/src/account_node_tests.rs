@@ -11,7 +11,7 @@ use bitcoin::{
 use lazy_static::lazy_static;
 use shared::{commitment::Commitment, ProofData};
 use zkcoins_program::hash::{
-    digest_from_bytes, digest_to_bytes, hash_bytes, hash_concat, ZERO_HASH,
+    digest_from_bytes, digest_to_bytes, hash_bytes, hash_concat, sha256_to_digest, ZERO_HASH,
 };
 
 lazy_static! {
@@ -82,7 +82,9 @@ impl TestAccountData {
         let xpriv = Xpriv::new_master(Network::Bitcoin, secret)
             .expect("Failed to create private key for source account.");
         let initial_pk_bytes = generate_test_public_key(&xpriv, 0).serialize().to_vec();
-        let address = hash_bytes(&initial_pk_bytes);
+        // Address = H(Pk₀) = SHA-256(pubkey) per spec (#226), matching the
+        // owner the node mint/account model now derives.
+        let address = sha256_to_digest(&initial_pk_bytes);
 
         TestAccountData {
             xpriv,
@@ -96,7 +98,8 @@ impl TestAccountData {
             .expect("Failed to create private key for generic account.");
 
         let initial_pk_bytes = generate_test_public_key(&xpriv, 0).serialize().to_vec();
-        let address = hash_bytes(&initial_pk_bytes);
+        // Address = H(Pk₀) = SHA-256(pubkey) per spec (#226).
+        let address = sha256_to_digest(&initial_pk_bytes);
 
         TestAccountData {
             xpriv,
