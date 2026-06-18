@@ -540,6 +540,19 @@ async fn balance_missing_param_returns_422() {
 }
 
 #[tokio::test]
+async fn balance_address_without_asset_id_returns_422() {
+    // Multi-asset contract: balance is per-(owner, asset_id), so a query
+    // with a valid `address` but NO `asset_id` is 422 — not a 200-with-zero.
+    let address = format!("0x{}", "00".repeat(32));
+    let resp = http_client()
+        .get(url(&format!("/api/balance?address={}", address)))
+        .send()
+        .await
+        .expect("GET /api/balance (address, no asset_id)");
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
 async fn balance_invalid_hex_returns_422() {
     let resp = http_client()
         .get(url("/api/balance?address=not_hex"))
@@ -2530,12 +2543,12 @@ const APP_KNOWN_ERROR_STRINGS: &[&str] = &[
 /// the app lists generic `"Invalid hex"`, `"Invalid address length"`,
 /// `"Broadcast failed"` placeholders that the server never emits as-is.
 ///
-/// This test does ONE full mint up front so the heavier provocations
-/// (Insufficient funds, prev_commitment_pubkey, replay) can re-use
-/// the same balance without re-paying prove cost — keep new
-/// provocations grouped here for the same reason.
+/// Covers the mint-INDEPENDENT lockstep strings (and the length guard) so
+/// they keep running against DEV. The one mint-dependent provocation
+/// ("Insufficient funds") lives in the separate
+/// `error_strings_insufficient_funds` test, which is `#[ignore]`d pending
+/// zk-coins/node#226.
 #[tokio::test]
-#[ignore = "blocked on zk-coins/node#226 — the Insufficient-funds provocation needs a minted balance, which is credited under a Poseidon owner instead of the spec SHA-256 address"]
 async fn error_strings_match_known_app_mapping() {
     let client = http_client();
 
@@ -2719,71 +2732,11 @@ async fn error_strings_match_known_app_mapping() {
         let body: Value = resp.json().await.expect("body JSON");
         let actual = body["error"].as_str().expect("error string");
         assert_eq!(
-            actual, "account_address must be 32 bytes (64 hex chars)",
-            "server emits a per-field length error today; app \
+            actual, "address must be 32 bytes (64 hex chars)",
+            "server emits a single combined length error for from/to today; app \
              `KNOWN_SERVER_ERRORS` carries the generic \
              `\"Invalid address length\"` — lockstep gap"
         );
-    }
-
-    // ---- Strings reachable ONLY after a successful mint --------
-    //
-    // The block below is gated on the minting balance — if the
-    // deploy-dev DEV server is too drained to mint, skip with a clear
-    // log line instead of failing the whole suite. The provocations
-    // re-use one mint to keep prove cost amortised.
-    let alice = TestWallet::new();
-    let bob = TestWallet::new();
-
-    let mint_result = mint_via_job(&client, &alice, ASSET_NAME, ASSET_DECIMALS, MINT_AMOUNT).await;
-    assert_eq!(mint_result["success"], Value::Bool(true), "mint failed");
-    let aid = asset_id_hex(&alice.pubkey(0), ASSET_NAME, ASSET_DECIMALS);
-    let _ = poll_balance_at_least(&client, &alice.address_hex(), &aid, MINT_AMOUNT).await;
-
-    // "prev_commitment_pubkey required for account update" — covered by
-    // `router_tests::map_send_coins_error_prev_commitment_pubkey_required_is_400`
-    // and `account_node_tests::*prev_commitment_pubkey*`. Live-provoking
-    // it from the HTTP surface needs a second send on a wallet whose
-    // `account.proof` is already populated — alice has only received a
-    // mint here, so the inner path takes the AccountCreation branch
-    // and never reaches the AccountUpdate gate. We could chain a full
-    // mint→send→commit and then a second send, but the additional
-    // on-chain cost (publisher UTXO per inscription) outweighs the
-    // value of duplicating coverage that the unit tests already give.
-
-    // "Insufficient funds" — send MINT_AMOUNT + 1 (one sat over balance).
-    // This is a `send_coins` business error, so the job is admitted
-    // (inline gates pass) and the rejection surfaces async as a
-    // terminal `failed` status carrying the lockstep string. (The
-    // legacy 422 status now lives in the job's stored response_status,
-    // not on the poll response.)
-    {
-        let amount: u64 = MINT_AMOUNT + 1;
-        let ts = unix_now();
-        let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
-        let (job_id, status, _admit) = submit_send_job(
-            &client,
-            &json!({
-                "account_address": alice.address_hex(),
-                "recipient": bob.address_hex(),
-                "amount": amount,
-                "public_key": hex::encode(alice.pubkey(0).serialize()),
-                "next_public_key": hex::encode(alice.pubkey(1).serialize()),
-                "signature": Some(signature),
-                "timestamp": Some(ts),
-                "asset_id": aid,
-            }),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::ACCEPTED,
-            "insufficient-funds send is admitted (inline gates pass)"
-        );
-        let job_id = job_id.expect("send job_id");
-        let terminal = poll_job_until_terminal(&client, &job_id).await;
-        assert_eq!(terminal["status"], "failed");
-        assert_eq!(terminal["error"], "Insufficient funds");
     }
 
     // ---- Strings NOT deterministically reachable from a black-box
@@ -2865,6 +2818,53 @@ async fn error_strings_match_known_app_mapping() {
          KNOWN_SERVER_ERRORS — update both in lockstep (got {})",
         APP_KNOWN_ERROR_STRINGS.len()
     );
+}
+
+/// Mint-dependent half of the error-string lockstep: the "Insufficient
+/// funds" provocation needs a real minted balance. Split out of
+/// `error_strings_match_known_app_mapping` and `#[ignore]`d pending the node
+/// owner-hash fix (#226) — un-ignore once #228 lands and DEV redeploys.
+#[tokio::test]
+#[ignore = "blocked on zk-coins/node#226 — needs a minted balance, currently credited under a Poseidon owner instead of the spec SHA-256 address"]
+async fn error_strings_insufficient_funds() {
+    let client = http_client();
+    let alice = TestWallet::new();
+    let bob = TestWallet::new();
+
+    let mint_result = mint_via_job(&client, &alice, ASSET_NAME, ASSET_DECIMALS, MINT_AMOUNT).await;
+    assert_eq!(mint_result["success"], Value::Bool(true), "mint failed");
+    let aid = asset_id_hex(&alice.pubkey(0), ASSET_NAME, ASSET_DECIMALS);
+    let _ = poll_balance_at_least(&client, &alice.address_hex(), &aid, MINT_AMOUNT).await;
+
+    // "Insufficient funds" — send MINT_AMOUNT + 1 (one sat over balance). A
+    // `send_coins` business error: the job is admitted (inline gates pass) and
+    // the rejection surfaces async as a terminal `failed` carrying the string.
+    let amount: u64 = MINT_AMOUNT + 1;
+    let ts = unix_now();
+    let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
+    let (job_id, status, _admit) = submit_send_job(
+        &client,
+        &json!({
+            "account_address": alice.address_hex(),
+            "recipient": bob.address_hex(),
+            "amount": amount,
+            "public_key": hex::encode(alice.pubkey(0).serialize()),
+            "next_public_key": hex::encode(alice.pubkey(1).serialize()),
+            "signature": Some(signature),
+            "timestamp": Some(ts),
+            "asset_id": aid,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "insufficient-funds send is admitted (inline gates pass)"
+    );
+    let job_id = job_id.expect("send job_id");
+    let terminal = poll_job_until_terminal(&client, &job_id).await;
+    assert_eq!(terminal["status"], "failed");
+    assert_eq!(terminal["error"], "Insufficient funds");
 }
 
 // ---------------------------------------------------------------------------
