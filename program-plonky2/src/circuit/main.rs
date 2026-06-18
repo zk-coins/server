@@ -1473,9 +1473,11 @@ fn set_account_state_witness(
 /// asset creator's pubkey, the asset name hash, and the decimals. Supply
 /// `Some(_)` when proving a legitimate issuer-mint (an Initial proof
 /// whose account starts with a non-zero, freshly-minted supply); the
-/// gate then re-derives `H(creator_pubkey) == owner` and
+/// gate then checks `account.public_key == creator_pubkey` and
 /// `calculate_asset_id(creator_pubkey, name_hash, decimals) ==
 /// transition_asset_id` to grant the balance-may-be-nonzero exception.
+/// (The `owner` is the off-circuit SHA-256 address and is NOT bound in
+/// the gate — #226, Variant B.)
 ///
 /// For every non-mint path (send/receive/account-update, or an Initial
 /// proof with zero balance) pass `None` — the gate is masked off and the
@@ -2278,13 +2280,15 @@ mod tests {
     }
 
     /// Build a self-consistent issuer-mint fixture: an account that is
-    /// the legitimate issuer of its own asset. The account's `owner`
-    /// equals `hash_bytes(creator_pubkey)` (which is exactly what
-    /// `AccountState::new` sets) and its `asset_id` equals
+    /// the legitimate issuer of its own asset. Its `public_key` is the
+    /// creator key and its `asset_id` equals
     /// `calculate_asset_id(creator_pubkey, name_hash, decimals)`, so the
-    /// in-circuit issuer gate grants the mint (balance-may-be-nonzero)
-    /// exception. Returns the account, its asset_id, and the matching
-    /// `MintWitness`. The creator pubkey is the account's own pubkey.
+    /// in-circuit issuer gate (`public_key == creator` ∧ asset_id match)
+    /// grants the mint (balance-may-be-nonzero) exception. The `owner` is
+    /// the off-circuit SHA-256 address `AccountState::new` sets and is NOT
+    /// gate-relevant (#226, Variant B). Returns the account, its asset_id,
+    /// and the matching `MintWitness`. The creator pubkey is the account's
+    /// own pubkey.
     fn mint_account(seed: u8, balance: u64) -> (AccountState, HashDigest, MintWitness) {
         let creator_pubkey = dummy_pubkey(seed);
         let name_hash = crate::types::calculate_name_hash("TEST");
@@ -2791,6 +2795,36 @@ mod tests {
         );
     }
 
+    /// Variant B (#226): `owner` is the off-circuit SHA-256 address and is
+    /// NOT bound in the mint gate. A legitimate mint (asset_id derives from
+    /// the creator key AND account.public_key == creator) must still verify
+    /// when `owner` is an arbitrary value != SHA-256(creator). Pins the
+    /// removed `owner == Poseidon(creator)` binding so it cannot silently
+    /// return (forge protection rides on asset_id ∧ public_key, not owner).
+    #[test]
+    fn mint_accepted_with_arbitrary_owner() {
+        let circuit = build_circuit();
+        let (mut account_state, asset_id, mint) = mint_account(46, 1_000_000);
+        // Deliberately use a non-canonical owner (not SHA-256(creator)).
+        account_state.owner = hash_bytes(b"arbitrary-non-canonical-owner");
+        assert_ne!(
+            account_state.owner,
+            crate::hash::sha256_to_digest(&mint.creator_pubkey)
+        );
+        // The gate's actual bindings still hold for this fixture.
+        assert_eq!(account_state.public_key, mint.creator_pubkey);
+
+        let proof = prove_initial(
+            &circuit,
+            &account_state,
+            hash_bytes(b"arbitrary-owner-mint"),
+            asset_id,
+            Some(mint),
+        )
+        .expect("mint must verify with an arbitrary owner — owner is not gated (Variant B)");
+        verify(&circuit, &proof).expect("verify");
+    }
+
     /// Issuer gate negative: the account's `public_key` is NOT the asset's
     /// creator key. `asset_ok` holds (the asset_id derives from the creator
     /// key) but the in-circuit `public_key == creator_pubkey` binding fails
@@ -2828,9 +2862,9 @@ mod tests {
     }
 
     /// Issuer gate negative: transition asset_id is NOT
-    /// calculate_asset_id(creator_pk, ...). owner_ok holds (the account
-    /// is owned by creator_pk) but asset_ok does not → no exception →
-    /// the non-zero Initial balance is rejected.
+    /// calculate_asset_id(creator_pk, ...). The pubkey binding holds
+    /// (account.public_key == creator_pk) but asset_ok does not → no
+    /// exception → the non-zero Initial balance is rejected.
     #[test]
     fn mint_rejected_when_asset_id_not_derived_from_creator() {
         let circuit = build_circuit();

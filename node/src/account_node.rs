@@ -931,11 +931,13 @@ impl AccountNode {
     /// Neutral, permissionless model: anyone can create their own asset
     /// and mint their own supply. The `asset_id` is derived server-side
     /// from `calculate_asset_id(creator_pubkey, calculate_name_hash(name),
-    /// decimals)` and the owner from `H(creator_pubkey)`; the circuit's
-    /// issuer-mint gate binds `account.owner == H(creator_pubkey)`,
-    /// `account.asset_id == calculate_asset_id(...)`, and
-    /// `account.public_key == creator_pubkey`, so only the asset's
-    /// creator can ever bring it into existence with a non-zero balance
+    /// decimals)` and the owner is the off-circuit address
+    /// `H(creator_pubkey) = SHA-256(creator_pubkey)` (#226, Variant B —
+    /// NOT bound in-circuit). The circuit's issuer-mint gate binds only
+    /// `account.asset_id == calculate_asset_id(...)` and
+    /// `account.public_key == creator_pubkey`; together with the
+    /// off-circuit creator-signature check at commit time, only the
+    /// asset's creator can bring it into existence with a non-zero balance
     /// and nobody can forge or inflate a foreign asset.
     ///
     /// The mint is an Initial transition (or an AccountUpdate if the
