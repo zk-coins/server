@@ -45,7 +45,11 @@ pub fn hash_bytes(bytes: &[u8]) -> HashDigest {
 
 /// Serialize a digest to exactly 32 bytes, big-endian per field element. This
 /// is the on-the-wire representation used at the Poseidon ↔ Bitcoin boundary
-/// (Schnorr message bytes, on-disk SMT storage).
+/// (Schnorr message bytes, on-disk SMT storage). Writes the RAW limb `e.0`
+/// (not a canonicalised value), so it is the exact inverse of
+/// `digest_from_bytes` for any 32-byte input — do NOT switch to
+/// `to_canonical_u64()`, that would break the round-trip for non-canonical
+/// limbs (e.g. a SHA-256 address chunk ≥ the field modulus).
 pub fn digest_to_bytes(d: &HashDigest) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (i, e) in d.elements.iter().enumerate() {
@@ -55,19 +59,21 @@ pub fn digest_to_bytes(d: &HashDigest) -> [u8; 32] {
 }
 
 /// Parse 32 bytes back into a digest. Each 8-byte chunk is interpreted as a
-/// big-endian Goldilocks element. Bytes that exceed the field modulus are
-/// reduced (`from_noncanonical_u64`) — the reduction is deterministic and
-/// inverse of `digest_to_bytes` for any digest this crate emits.
+/// big-endian Goldilocks element via `from_noncanonical_u64`, which stores the
+/// raw u64 WITHOUT reducing it. This makes `digest_to_bytes ∘ digest_from_bytes`
+/// an EXACT byte round-trip for ANY 32-byte input — including externally-
+/// supplied values (e.g. a SHA-256 address) whose 8-byte chunks exceed the
+/// field modulus. (`from_canonical_u64` would debug-panic on such chunks.)
 pub fn digest_from_bytes(bytes: &[u8; 32]) -> HashDigest {
     let mut elements = [F::ZERO; 4];
     for i in 0..4 {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&bytes[i * 8..(i + 1) * 8]);
-        // `from_noncanonical_u64` (not `from_canonical_u64`): an 8-byte
+        // `from_noncanonical_u64` stores the raw u64 (no reduction): an 8-byte
         // chunk of an externally-supplied 32-byte value (e.g. a SHA-256
-        // address) can exceed the Goldilocks modulus; canonical conversion
-        // would debug-panic / yield a non-canonical element. Noncanonical
-        // reduction is deterministic and consistent across all consumers.
+        // address) can exceed the Goldilocks modulus, on which
+        // `from_canonical_u64` would debug-panic. Storing raw keeps the byte
+        // round-trip with `digest_to_bytes` exact (see its doc).
         elements[i] = F::from_noncanonical_u64(u64::from_be_bytes(buf));
     }
     HashOut { elements }
