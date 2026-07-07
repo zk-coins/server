@@ -2774,7 +2774,10 @@ mod tests {
         // Precondition: the gate's bindings hold for this fixture, and the
         // owner is the SHA-256 address (not the Poseidon image).
         assert_eq!(account_state.public_key, mint.creator_pubkey);
-        assert_eq!(account_state.owner, crate::hash::sha256_to_digest(&mint.creator_pubkey));
+        assert_eq!(
+            account_state.owner,
+            crate::hash::sha256_to_digest(&mint.creator_pubkey)
+        );
         assert_eq!(
             asset_id,
             crate::types::calculate_asset_id(&mint.creator_pubkey, &mint.name_hash, mint.decimals)
@@ -2920,7 +2923,10 @@ mod tests {
         let mut account_state = AccountState::new(creator_pubkey, asset_id);
         account_state.public_key = dummy_pubkey(74);
         account_state.balance = 1;
-        assert_eq!(account_state.owner, crate::hash::sha256_to_digest(&creator_pubkey));
+        assert_eq!(
+            account_state.owner,
+            crate::hash::sha256_to_digest(&creator_pubkey)
+        );
         assert_ne!(account_state.public_key, creator_pubkey);
 
         let mint = MintWitness {
