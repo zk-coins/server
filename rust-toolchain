@@ -1,4 +1,3 @@
 [toolchain]
-# Pin nightly so `-D warnings` does not flake when a newer nightly adds lints.
-channel = "nightly-2026-07-07"
+channel = "nightly-2026-06-18"
 components = ["llvm-tools", "rustc-dev", "rustfmt", "clippy"]
