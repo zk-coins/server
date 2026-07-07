@@ -1,6 +1,6 @@
 # Multi-stage Docker build for the zkCoins node post Plonky2 migration.
 #
-# The Plonky2 toolchain pin is `nightly` (see `rust-toolchain` at the
+# The Plonky2 toolchain pin is the dated nightly (see `rust-toolchain` at the
 # repo root). rustup respects that file and installs the right channel
 # automatically when cargo is first invoked — no manual `rustup install`
 # step needed.
