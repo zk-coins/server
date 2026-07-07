@@ -2474,6 +2474,10 @@ async fn send_returns_structured_error_envelope() {
             "prev_commitment_pubkey": Option::<String>::None,
             "signature": Some(signature),
             "timestamp": Some(ts),
+            // Required under the multi-asset model; without it the job would
+            // fail with "asset_id is required" before reaching the
+            // unknown-account check this test targets.
+            "asset_id": asset_id_hex(&alice.pubkey(0), ASSET_NAME, ASSET_DECIMALS),
         }),
     )
     .await;
