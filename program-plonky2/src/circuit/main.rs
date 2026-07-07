@@ -2805,8 +2805,10 @@ mod tests {
     fn mint_accepted_with_arbitrary_owner() {
         let circuit = build_circuit();
         let (mut account_state, asset_id, mint) = mint_account(46, 1_000_000);
-        // Deliberately use a non-canonical owner (not SHA-256(creator)).
-        account_state.owner = hash_bytes(b"arbitrary-non-canonical-owner");
+        // Deliberately give the account an owner that is NOT the spec
+        // SHA-256(creator) address (an unrelated Poseidon digest). Variant B:
+        // the mint gate no longer binds owner.
+        account_state.owner = hash_bytes(b"arbitrary-non-spec-owner");
         assert_ne!(
             account_state.owner,
             crate::hash::sha256_to_digest(&mint.creator_pubkey)
