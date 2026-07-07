@@ -2307,7 +2307,13 @@ async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
     // Alice's balance dropping to `MINT_AMOUNT - SEND_AMOUNT` is the
     // observable signal that the spend (hence the commitment) has been
     // scanned.
-    let _ = poll_balance_at_most(&client, &alice.address_hex(), &aid, MINT_AMOUNT - SEND_AMOUNT).await;
+    let _ = poll_balance_at_most(
+        &client,
+        &alice.address_hex(),
+        &aid,
+        MINT_AMOUNT - SEND_AMOUNT,
+    )
+    .await;
 
     // Send #2 spends Alice's send-#1 *change* directly. After send #1
     // committed, `coin_queue.clear()` ran and the unspent remainder
@@ -2359,9 +2365,15 @@ async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
     // leaves the in-process SMT advance to the event-driven scanner, so
     // the prev-commitment lookup can briefly miss until the on-chain
     // inscription is ingested.
-    let (send2_job_id, awaiting2) =
-        submit_send_no_prev_until_awaiting(&client, &alice, &bob.address_hex(), &aid, SEND_AMOUNT, 1)
-            .await;
+    let (send2_job_id, awaiting2) = submit_send_no_prev_until_awaiting(
+        &client,
+        &alice,
+        &bob.address_hex(),
+        &aid,
+        SEND_AMOUNT,
+        1,
+    )
+    .await;
 
     // Server-side counter advanced. `num_sends` is the server's
     // authoritative count of *committed* sends; send #2 reaching
