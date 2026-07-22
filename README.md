@@ -7,7 +7,7 @@
 
 The **trustless kernel** of zkCoins: Bitcoin chain scanner, nullifier accumulator, recursive-proof verifier and prover, data store, and the publisher/broadcaster — built in Rust (Axum, Plonky2 + Poseidon-Goldilocks).
 
-> Full system docs: **[docs.zkcoins.app](https://docs.zkcoins.app)** · Specification: **[docs.zkcoins.app/specification](https://docs.zkcoins.app/specification)**
+> Full system docs: **[docs.zkcoins.com](https://docs.zkcoins.com)** · Specification: **[docs.zkcoins.com/specification](https://docs.zkcoins.com/specification)**
 
 ## What zkCoins is
 
@@ -60,7 +60,7 @@ Container images: **[hub.docker.com/r/zkcoins/node](https://hub.docker.com/r/zkc
 | Bitcoin | Taproot inscriptions | 64-byte nullifiers, Esplora API scanning |
 | Bitcoin index | electrs (Esplora) | Esplora REST + WebSocket over the shared Docker network `bitcoin` |
 
-Full rationale: [docs.zkcoins.app/tech-decisions](https://docs.zkcoins.app/tech-decisions).
+Full rationale: [docs.zkcoins.com/tech-decisions](https://docs.zkcoins.com/tech-decisions).
 
 ### Build & run
 
@@ -150,7 +150,7 @@ node/
 
 ### Proving strategy
 
-zkCoins is **node-heavy**: this node generates all proofs; the wallet holds only the private key and signs BIP-340 Schnorr over the proof outputs. There is no in-browser Poseidon, no wasm verifier, no in-app ZK gadget. The hardware target is a single **Mac Studio M3 Ultra** (96 GB unified RAM): all on-box compute, no external GPU/CUDA, no cloud proving services. Performance budget: warm proof ≤ 5 s (target ≤ 1 s), cold-start ≤ 30 s, memory peak < 64 GB — if a design overshoots, the design changes. See [docs.zkcoins.app/specification](https://docs.zkcoins.app/specification).
+zkCoins is **node-heavy**: this node generates all proofs; the wallet holds only the private key and signs BIP-340 Schnorr over the proof outputs. There is no in-browser Poseidon, no wasm verifier, no in-app ZK gadget. The hardware target is a single **Mac Studio M3 Ultra** (96 GB unified RAM): all on-box compute, no external GPU/CUDA, no cloud proving services. Performance budget: warm proof ≤ 5 s (target ≤ 1 s), cold-start ≤ 30 s, memory peak < 64 GB — if a design overshoots, the design changes. See [docs.zkcoins.com/specification](https://docs.zkcoins.com/specification).
 
 ### Branch flow
 
@@ -164,7 +164,7 @@ Feature PRs land on **`staging`** first (the integration buffer), are batched in
 
 ## Protocol
 
-Based on [Shielded CSV](https://eprint.iacr.org/2025/068) by Jonas Nick (Blockstream), Liam Eagen (Alpen Labs), and Robin Linus (ZeroSync). Node code derived from [ZeroSync/ZKCoins](https://github.com/ZeroSync/ZKCoins). Protocol design drafts and the spec live in [`zk-coins/research`](https://github.com/zk-coins/research/tree/develop/zkcoins-design) and on the docs site: [docs.zkcoins.app/specification](https://docs.zkcoins.app/specification) · [docs.zkcoins.app/roadmap](https://docs.zkcoins.app/roadmap).
+Based on [Shielded CSV](https://eprint.iacr.org/2025/068) by Jonas Nick (Blockstream), Liam Eagen (Alpen Labs), and Robin Linus (ZeroSync). Node code derived from [ZeroSync/ZKCoins](https://github.com/ZeroSync/ZKCoins). Protocol design drafts and the spec live in [`zk-coins/research`](https://github.com/zk-coins/research/tree/develop/zkcoins-design) and on the docs site: [docs.zkcoins.com/specification](https://docs.zkcoins.com/specification) · [docs.zkcoins.com/roadmap](https://docs.zkcoins.com/roadmap).
 
 ## Contributing
 

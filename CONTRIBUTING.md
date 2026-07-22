@@ -3,7 +3,7 @@
 This guide covers how to set up, build, test, and ship changes to the zkCoins
 backend. It is intentionally limited to **developer setup, coding standards, and
 the PR flow** — protocol design, roadmap, and migration research live in the
-[docs site](https://docs.zkcoins.app) and the
+[docs site](https://docs.zkcoins.com) and the
 [research repo](https://github.com/zk-coins/research).
 
 ## Trust model — run your own node
@@ -161,7 +161,7 @@ node/
 When working inside `program-plonky2/`, read
 [`program-plonky2/CONTRIBUTING.md`](./program-plonky2/CONTRIBUTING.md) for the
 crate's toolchain, coverage gate, and gadget-authoring pattern. Protocol-level
-context lives in the spec at [docs.zkcoins.app/specification](https://docs.zkcoins.app/specification).
+context lives in the spec at [docs.zkcoins.com/specification](https://docs.zkcoins.com/specification).
 
 ## REST API & OpenAPI
 
@@ -275,5 +275,5 @@ the authoritative gate. After push, watch CI until green; never abandon a red ru
 ## Related Repos
 
 - [zk-coins/app](https://github.com/zk-coins/app) — Web application (frontend).
-- [zk-coins/docs](https://github.com/zk-coins/docs) — Documentation ([docs.zkcoins.app](https://docs.zkcoins.app)).
+- [zk-coins/docs](https://github.com/zk-coins/docs) — Documentation ([docs.zkcoins.com](https://docs.zkcoins.com)).
 - [zk-coins/research](https://github.com/zk-coins/research) — Protocol research, design drafts, upstream repos, paper PDFs.
