@@ -3067,7 +3067,7 @@ pub(crate) async fn root_handler() -> impl IntoResponse {
             openapi: "GET  /openapi.json",
             docs: "GET  /docs",
         },
-        docs: "https://docs.zkcoins.app",
+        docs: "https://docs.zkcoins.com",
     })
 }
 

@@ -2,7 +2,7 @@
 //!
 //! Mirrors `program/src/main.rs` (the SP1 entrypoint), but built as a
 //! Plonky2 cyclic-recursive circuit per the protocol specification
-//! §8 / §10 (<https://docs.zkcoins.app/specification>).
+//! §8 / §10 (<https://docs.zkcoins.com/specification>).
 //!
 //! ## Stage status
 //!

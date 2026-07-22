@@ -5,7 +5,7 @@
 //! constraints required to prove the same invariant in-circuit. The
 //! [`main`] module composes those gadgets into the monolithic
 //! state-transition circuit per the protocol specification §8
-//! (<https://docs.zkcoins.app/specification>).
+//! (<https://docs.zkcoins.com/specification>).
 
 pub mod main;
 pub mod mmr;

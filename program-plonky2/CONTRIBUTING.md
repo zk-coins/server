@@ -14,8 +14,8 @@ carries its own toolchain pin.
 > documents were archived out of the node repo into
 > [`zk-coins/research` → `zkcoins-design/`](https://github.com/zk-coins/research/tree/develop/zkcoins-design)
 > (verbatim, same section numbers); the published protocol spec and roadmap live
-> at [docs.zkcoins.app/specification](https://docs.zkcoins.app/specification) and
-> [docs.zkcoins.app/roadmap](https://docs.zkcoins.app/roadmap).
+> at [docs.zkcoins.com/specification](https://docs.zkcoins.com/specification) and
+> [docs.zkcoins.com/roadmap](https://docs.zkcoins.com/roadmap).
 
 ## Toolchain
 
