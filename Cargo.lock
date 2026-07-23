@@ -5224,6 +5224,8 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bincode",
+ "num-bigint",
+ "num-traits",
  "plonky2",
  "serde",
  "sha2",
