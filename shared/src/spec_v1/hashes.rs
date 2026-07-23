@@ -5,14 +5,15 @@
 
 use sha2::{Digest, Sha256};
 
-use super::encoding::{hc, HcInput};
+use super::datastructures::AccountState;
+use super::encoding::{digest_to_bytes, hc, HcInput};
 use super::error::SpecError;
 use super::tags::{
     NETWORK_TAG_MAINNET, NETWORK_TAG_REGTEST, NETWORK_TAG_TESTNET, TAG_ACCOUNT_STATE, TAG_ASSET_ID,
     TAG_ASSET_ID_V2, TAG_COIN, TAG_ISSUANCE_TERMS, TAG_ISSUANCE_TERMS_V2, TAG_NAV_COMMIT,
     TAG_NETWORK, TAG_NK_COMMIT, TAG_NPK_COMMIT, TAG_NULLIFIER,
 };
-use zkcoins_program::hash::{digest_to_bytes, HashDigest};
+use zkcoins_program::hash::HashDigest;
 
 // ---------------------------------------------------------------------------
 // Poseidon / Hc derivations
@@ -35,13 +36,17 @@ pub fn nullifier(nk: &[u8; 32], coin_identifier: HashDigest) -> HashDigest {
     .expect("fixed-size inputs")
 }
 
-/// `ash = Hc("AccountState", ByteString(serialize(AccountState)))`.
-pub fn account_state_hash(serialized_account_state: &[u8]) -> HashDigest {
-    hc(
-        TAG_ACCOUNT_STATE,
-        &[HcInput::ByteString(serialized_account_state)],
+/// `ash = Hc("AccountState", serialize(AccountState))`. Takes the typed
+/// `AccountState` (not raw bytes) so the canonical wire layout — including
+/// FIX 4's strictly-ascending-balances guarantee — is enforced by
+/// construction via `serialize_account_state`, never bypassable by hashing
+/// arbitrary bytes.
+pub fn account_state_hash(state: &AccountState) -> Result<HashDigest, SpecError> {
+    let bytes = super::serialize::serialize_account_state(state)?;
+    Ok(
+        hc(TAG_ACCOUNT_STATE, &[HcInput::ByteString(&bytes)])
+            .expect("account state serialization is well below 2^56 bytes"),
     )
-    .expect("account state serialization is well below 2^56 bytes")
 }
 
 /// `coin.identifier = Hc("Coin", Digest(prev_ash), ByteString(recipient), Digest(asset_id),
@@ -306,5 +311,53 @@ mod tests {
         hasher.update(preimage);
         let expected: [u8; 32] = hasher.finalize().into();
         assert_eq!(addr, expected);
+    }
+
+    #[test]
+    fn account_state_hash_matches_hc_over_canonical_bytes() {
+        use crate::spec_v1::datastructures::Address;
+        use crate::spec_v1::serialize::serialize_account_state;
+        use std::collections::BTreeMap;
+        use zkcoins_program::hash::ZERO_HASH;
+
+        let state = AccountState::new(
+            Address([0u8; 32]),
+            ZERO_HASH,
+            BTreeMap::new(),
+            [0u8; 32],
+            0,
+            ZERO_HASH,
+        )
+        .unwrap();
+        let via_fn = account_state_hash(&state).unwrap();
+        let ser = serialize_account_state(&state).unwrap();
+        let via_hc = hc(TAG_ACCOUNT_STATE, &[HcInput::ByteString(&ser)]).unwrap();
+        assert_eq!(via_fn, via_hc);
+    }
+
+    #[test]
+    fn account_state_hash_propagates_serialize_error() {
+        use crate::spec_v1::datastructures::{Address, MAX_ACCOUNT_ASSETS};
+        use std::collections::BTreeMap;
+        use zkcoins_program::hash::ZERO_HASH;
+
+        let mut balances = BTreeMap::new();
+        for i in 0..=MAX_ACCOUNT_ASSETS {
+            let mut k = [0u8; 32];
+            k[31] = i as u8;
+            balances.insert(k, 1);
+        }
+        let bad = AccountState {
+            owner: Address([0u8; 32]),
+            nk_commit: ZERO_HASH,
+            balances,
+            current_pubkey: [0u8; 32],
+            send_counter: 0,
+            coin_history_root: ZERO_HASH,
+        };
+        assert!(matches!(
+            account_state_hash(&bad),
+            Err(SpecError::TooManyBalances { .. })
+        ));
     }
 }

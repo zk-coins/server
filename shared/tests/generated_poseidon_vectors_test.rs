@@ -14,8 +14,8 @@ use shared::spec_v1::{
     coinhist_root_after_first_insert, coin_identifier, digest_to_bytes, hash_proof_data,
     merkle_root, name_hash, nav_commitment, network_id_mainnet, network_id_regtest,
     network_id_testnet, nflog_empty, nflog_root, nk_commit, npk_commit, nullifier,
-    serialize_account_state, serialize_proof_data, terms_hash_v1, terms_hash_v2, AccountState,
-    Address, CoinHistState, ProofData, TreeKind, GENESIS_TAG,
+    serialize_proof_data, terms_hash_v1, terms_hash_v2, AccountState, Address, CoinHistState,
+    ProofData, TreeKind, GENESIS_TAG,
 };
 
 fn sha256_label(label: &str) -> [u8; 32] {
@@ -53,10 +53,25 @@ fn generate_poseidon_vectors_file() {
 
     // 1
     let nflog_empty_v = nflog_empty();
+    assert_eq!(
+        hex_digest(&nflog_empty_v),
+        "0xf7599780b12dc6120b6e305e77feb04d1db533fbeb19f3fd25ca22b5b222c2bc",
+        "V.4 anchor pin: nflog_empty regressed"
+    );
     // 2
     let coinhist_empty = coinhist_empty_root();
+    assert_eq!(
+        hex_digest(&coinhist_empty),
+        "0x7d558733b6f685d85aff62341e3d017234056105bced89ce0319166dc90a6dcf",
+        "V.4 anchor pin: coinhist_empty_root regressed"
+    );
     // 3
     let nk_commit_sample = nk_commit(&nk);
+    assert_eq!(
+        hex_digest(&nk_commit_sample),
+        "0x444981ebd6edc1116dc1a13d51e7ed2c47988cc66ad5fb95c12de4f2efa4456e",
+        "V.4 anchor pin: nk_commit_sample regressed"
+    );
     // 4
     let asset_id = asset_id_v1(GENESIS_TAG, &pk0, &name_hash_usd, 2, 1);
     // 5
@@ -66,18 +81,21 @@ fn generate_poseidon_vectors_file() {
     let zk_bech32m = addr.to_bech32m();
     // 7 — canonical empty account (§2.2)
     let ash_empty = account_state_hash(
-        &serialize_account_state(
-            &AccountState::new(
-                addr,
-                nk_commit_sample,
-                BTreeMap::new(),
-                pk0,
-                0,
-                coinhist_empty,
-            )
-            .expect("empty account"),
+        &AccountState::new(
+            addr,
+            nk_commit_sample,
+            BTreeMap::new(),
+            pk0,
+            0,
+            coinhist_empty,
         )
-        .expect("serialize empty"),
+        .expect("empty account"),
+    )
+    .expect("hash empty account");
+    assert_eq!(
+        hex_digest(&ash_empty),
+        "0xef56b9ac8dc7a119c9d2679164b91f341d785e9649470158c2661cfd4f71b61b",
+        "V.4 anchor pin: ash_empty regressed"
     );
     // 8
     let coin_identifier_0 =
@@ -91,19 +109,17 @@ fn generate_poseidon_vectors_file() {
     let mut balances = BTreeMap::new();
     balances.insert(digest_to_bytes(&asset_id), 1_000_000_000u128);
     let ash_0 = account_state_hash(
-        &serialize_account_state(
-            &AccountState::new(
-                addr,
-                nk_commit_sample,
-                balances,
-                pk1,
-                1,
-                coin_history_root_0,
-            )
-            .expect("ash_0 account"),
+        &AccountState::new(
+            addr,
+            nk_commit_sample,
+            balances,
+            pk1,
+            1,
+            coin_history_root_0,
         )
-        .expect("serialize ash_0"),
-    );
+        .expect("ash_0 account"),
+    )
+    .expect("hash ash_0 account");
     // 11
     let nf_sample = nullifier(&nk, coin_identifier_0);
     // 12
@@ -114,6 +130,11 @@ fn generate_poseidon_vectors_file() {
     let nav_root_empty = nflog_root(0, nflog_empty_v);
     // 15
     let nav_commitment_0 = nav_commitment(nav_root_empty, &nav_rand);
+    assert_eq!(
+        hex_digest(&nav_commitment_0),
+        "0xeec40cabb6cece9f2c76cd3fde2f55c2bf193def66c4482bd94f1cb44acbe34d",
+        "V.4 anchor pin: nav_commitment_0 regressed"
+    );
     // 16
     let h_proof_data_0 = hash_proof_data(&serialize_proof_data(&ProofData {
         new_account_state_hash: ash_0,
@@ -125,6 +146,11 @@ fn generate_poseidon_vectors_file() {
     }));
     // 17
     let network_id_mainnet_v = network_id_mainnet();
+    assert_eq!(
+        hex_digest(&network_id_mainnet_v),
+        "0xfb5080433fbd3d5c9ed7aad0e1feced2954859c4492ecb0880b0713f6b09ec8c",
+        "V.4 anchor pin: network_id_mainnet regressed"
+    );
     let network_id_testnet_v = network_id_testnet();
     let network_id_regtest_v = network_id_regtest();
     // 18
