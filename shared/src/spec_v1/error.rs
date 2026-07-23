@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use super::accumulator::ChainPosition;
+
 /// Protocol-foundation validation / encoding error.
 ///
 /// Every recoverable failure in `spec_v1` returns this type rather than
@@ -46,6 +48,14 @@ pub enum SpecError {
     CoinAlreadySpent { coin_id: [u8; 32] },
     /// Non-inclusion proof requested for a coin that is present.
     CoinNotAbsent { coin_id: [u8; 32] },
+    /// Nullifier fold invoked with a `ChainPosition` that is not strictly
+    /// greater than the last successfully-ordered fold (§3.6 step 4).
+    OutOfOrderFold {
+        previous: ChainPosition,
+        attempted: ChainPosition,
+    },
+    /// `coinhist_node_hash` level is outside the domain `0..=256`.
+    CoinHistLevelOutOfRange { level: u32 },
 }
 
 impl fmt::Display for SpecError {
@@ -123,6 +133,18 @@ impl fmt::Display for SpecError {
                 f,
                 "coin not absent: {}",
                 hex::encode(coin_id)
+            ),
+            SpecError::OutOfOrderFold {
+                previous,
+                attempted,
+            } => write!(
+                f,
+                "out-of-order nullifier fold: attempted chain_pos {:?} is not strictly after previous {:?}",
+                attempted, previous
+            ),
+            SpecError::CoinHistLevelOutOfRange { level } => write!(
+                f,
+                "coin-history node level out of range: {level} (must be <= 256)"
             ),
         }
     }

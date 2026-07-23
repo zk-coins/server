@@ -272,6 +272,12 @@ fn verify_subproof(
 ) -> Option<(Vec<HashDigest>, HashDigest)> {
     if m == n {
         if b {
+            // Residual proof must be empty — otherwise an attacker can prepend
+            // garbage digests to a genuine consistency proof for power-of-two
+            // prefixes and still pass verification.
+            if !proof.is_empty() {
+                return None;
+            }
             return Some((vec![mth_a_hint], mth_a_hint));
         }
         if proof.len() != 1 {
@@ -579,6 +585,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A genuine consistency proof for power-of-two `m` must reject a proof
+    /// that has garbage digests prepended (proof canonicity: residual at the
+    /// `m == n && b == true` base case must be empty).
+    #[test]
+    fn consistency_rejects_prepended_garbage_for_power_of_two_m() {
+        // m=4 (power of two), n=8: subproof recursion eventually hits
+        // m==n && b==true with an empty residual for a genuine proof.
+        // Prepending garbage leaves a non-empty residual at that base case.
+        let entries = synthetic_entries(8);
+        let m = 4u64;
+        let n = 8u64;
+        let mth_a = nflog_mth(&entries[..m as usize]);
+        let mth_b = nflog_mth(&entries[..n as usize]);
+        let proof = consistency_proof(m, &entries[..n as usize]).expect("m <= n");
+        assert!(
+            verify_consistency(m, mth_a, n, mth_b, &proof),
+            "genuine proof must verify"
+        );
+
+        let garbage = nflog_leaf_hash(99, &entries[0]);
+        let mut padded = vec![garbage];
+        padded.extend_from_slice(&proof);
+        assert!(
+            !verify_consistency(m, mth_a, n, mth_b, &padded),
+            "prepended garbage must be rejected for power-of-two m={m}"
+        );
+
+        // Also cover m=2, n=4 for the same class of bug.
+        let m2 = 2u64;
+        let n2 = 4u64;
+        let mth_a2 = nflog_mth(&entries[..m2 as usize]);
+        let mth_b2 = nflog_mth(&entries[..n2 as usize]);
+        let proof2 = consistency_proof(m2, &entries[..n2 as usize]).expect("m <= n");
+        assert!(verify_consistency(m2, mth_a2, n2, mth_b2, &proof2));
+        let mut padded2 = vec![garbage];
+        padded2.extend_from_slice(&proof2);
+        assert!(
+            !verify_consistency(m2, mth_a2, n2, mth_b2, &padded2),
+            "prepended garbage must be rejected for power-of-two m={m2}"
+        );
     }
 
     /// Round-trip consistency proofs for prefixes whose binary representation
