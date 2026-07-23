@@ -30,6 +30,22 @@ pub enum SpecError {
     /// `serialize(AccountState)` balance entries were not strictly ascending by
     /// `asset_id` (byte order) on the wire (§1.7.4).
     BalancesNotAscending { index: usize },
+    /// Inclusion path requested for a position outside the log.
+    PositionOutOfRange { position: u64, size: u64 },
+    /// Consistency proof requested with `m > n`.
+    ConsistencyRangeInvalid { m: u64, n: u64 },
+    /// `NetworkParams.network_tag` longer than 255 UTF-8 bytes.
+    NetworkTagTooLong { len: usize },
+    /// `finality_confirmations` is not the protocol-pinned constant 6.
+    InvalidFinalityConfirmations { value: u8 },
+    /// Coin-history admit attempted on a non-`Absent` coin.
+    CoinAlreadyAdmitted { coin_id: [u8; 32] },
+    /// Coin-history spend attempted on a coin that was never admitted.
+    CoinNotAdmitted { coin_id: [u8; 32] },
+    /// Coin-history spend attempted on an already-spent coin.
+    CoinAlreadySpent { coin_id: [u8; 32] },
+    /// Non-inclusion proof requested for a coin that is present.
+    CoinNotAbsent { coin_id: [u8; 32] },
 }
 
 impl fmt::Display for SpecError {
@@ -72,6 +88,41 @@ impl fmt::Display for SpecError {
             SpecError::BalancesNotAscending { index } => write!(
                 f,
                 "balances entry {index} is not strictly ascending by asset_id (byte order)"
+            ),
+            SpecError::PositionOutOfRange { position, size } => write!(
+                f,
+                "position {position} out of range for log of size {size}"
+            ),
+            SpecError::ConsistencyRangeInvalid { m, n } => write!(
+                f,
+                "consistency range invalid: m={m} > n={n}"
+            ),
+            SpecError::NetworkTagTooLong { len } => {
+                write!(f, "network tag too long: {len} bytes (max 255)")
+            }
+            SpecError::InvalidFinalityConfirmations { value } => write!(
+                f,
+                "invalid finality_confirmations: {value} (must be 6)"
+            ),
+            SpecError::CoinAlreadyAdmitted { coin_id } => write!(
+                f,
+                "coin already admitted: {}",
+                hex::encode(coin_id)
+            ),
+            SpecError::CoinNotAdmitted { coin_id } => write!(
+                f,
+                "coin not admitted: {}",
+                hex::encode(coin_id)
+            ),
+            SpecError::CoinAlreadySpent { coin_id } => write!(
+                f,
+                "coin already spent: {}",
+                hex::encode(coin_id)
+            ),
+            SpecError::CoinNotAbsent { coin_id } => write!(
+                f,
+                "coin not absent: {}",
+                hex::encode(coin_id)
             ),
         }
     }
