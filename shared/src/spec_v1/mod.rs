@@ -25,8 +25,8 @@ pub use datastructures::{
     MAX_ACCOUNT_ASSETS,
 };
 pub use encoding::{
-    encode_byte_string, encode_digest, encode_small_numeric, hc, HcInput, MAX_BYTE_STRING_LEN,
-    MAX_SMALL_NUMERIC,
+    digest_from_bytes, digest_to_bytes, encode_byte_string, encode_digest, encode_small_numeric, hc,
+    HcInput, MAX_BYTE_STRING_LEN, MAX_SMALL_NUMERIC,
 };
 pub use error::SpecError;
 pub use hashes::{
@@ -46,5 +46,7 @@ pub use trees::{empty_leaf_hash, leaf_hash, merkle_root, node_hash, TreeKind};
 
 // Re-export the hash/digest primitives used throughout this module so
 // callers don't need a second import path for the same types.
-pub use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, HashDigest, ZERO_HASH};
+// Digest encoding lives in `encoding` (canonical §1.7.1); HashDigest /
+// ZERO_HASH remain type aliases / constants from the program crate.
+pub use zkcoins_program::hash::{HashDigest, ZERO_HASH};
 pub use zkcoins_program::F;

@@ -24,6 +24,12 @@ pub enum SpecError {
     SmallNumericOutOfRange { value: u64 },
     /// Byte-string length ≥ 2^56 (cannot be represented as a length element).
     ByteStringTooLong { len: usize },
+    /// A Poseidon-digest byte limb is `>= GoldilocksField::ORDER` (§1.7.1: every
+    /// digest limb MUST be canonical, i.e. reduced mod p).
+    NonCanonicalDigestLimb { limb_index: usize, value: u64 },
+    /// `serialize(AccountState)` balance entries were not strictly ascending by
+    /// `asset_id` (byte order) on the wire (§1.7.4).
+    BalancesNotAscending { index: usize },
 }
 
 impl fmt::Display for SpecError {
@@ -59,6 +65,14 @@ impl fmt::Display for SpecError {
                     "byte-string length out of range: {len} (must be < 2^56)"
                 )
             }
+            SpecError::NonCanonicalDigestLimb { limb_index, value } => write!(
+                f,
+                "non-canonical digest limb {limb_index}: {value:#x} >= p (GoldilocksField::ORDER)"
+            ),
+            SpecError::BalancesNotAscending { index } => write!(
+                f,
+                "balances entry {index} is not strictly ascending by asset_id (byte order)"
+            ),
         }
     }
 }

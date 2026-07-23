@@ -7,7 +7,7 @@
 //! chunks with no length prefix. Spec §1.7.2 requires a length element and
 //! **big-endian** 7-byte chunks.
 
-use plonky2::field::types::Field;
+use plonky2::field::types::{Field, Field64, PrimeField64};
 use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::plonk::config::Hasher;
 
@@ -58,6 +58,49 @@ pub fn encode_byte_string(bytes: &[u8]) -> Result<Vec<F>, SpecError> {
 /// Encode a digest input: the four limbs, no length prefix.
 pub fn encode_digest(d: HashDigest) -> [F; 4] {
     d.elements
+}
+
+/// Canonical Poseidon-digest → 32-byte encoding per §1.7.1: each of the 4
+/// limbs is reduced mod `p` via `to_canonical_u64()` before being emitted as
+/// 8 bytes big-endian, in order.
+///
+/// **Critical:** this is intentionally different from the old-model
+/// `zkcoins_program::hash::digest_to_bytes`, which emits `elements[i].0`
+/// directly. `GoldilocksField(pub u64).0` is NOT guaranteed `< p` — only
+/// `to_canonical_u64()` performs the reduction — so the old function can
+/// serialize two mathematically-equal field elements to different bytes.
+pub fn digest_to_bytes(d: &HashDigest) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, e) in d.elements.iter().enumerate() {
+        out[i * 8..(i + 1) * 8].copy_from_slice(&e.to_canonical_u64().to_be_bytes());
+    }
+    out
+}
+
+/// Canonical byte → Poseidon-digest parse per §1.7.1 (fail-loud). Each 8-byte
+/// big-endian limb MUST be strictly `< GoldilocksField::ORDER`; a limb
+/// `>= ORDER` is REJECTED, never silently reduced.
+///
+/// **Critical:** this is intentionally different from the old-model
+/// `zkcoins_program::hash::digest_from_bytes`, which routes through the
+/// infallible `F::from_canonical_u64`, whose `n < ORDER` check is a
+/// `debug_assert!` — a no-op in release builds, i.e. no validation at all
+/// outside debug builds.
+pub fn digest_from_bytes(bytes: &[u8; 32]) -> Result<HashDigest, SpecError> {
+    let mut elements = [F::ZERO; 4];
+    for (i, elem) in elements.iter_mut().enumerate() {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[i * 8..(i + 1) * 8]);
+        let limb = u64::from_be_bytes(buf);
+        if limb >= F::ORDER {
+            return Err(SpecError::NonCanonicalDigestLimb {
+                limb_index: i,
+                value: limb,
+            });
+        }
+        *elem = F::from_canonical_u64(limb);
+    }
+    Ok(HashDigest { elements })
 }
 
 /// Encode a small-numeric input as one field element. Fails if `v ≥ 2^56`.
@@ -283,5 +326,59 @@ mod tests {
         assert_ne!(nflog_elems, coins_elems);
         assert_eq!(nflog_elems, tag_elems + 1);
         assert_eq!(coins_elems, coins_tag_elems + 4);
+    }
+
+    #[test]
+    fn digest_to_bytes_is_canonical_for_noncanonical_representation() {
+        use plonky2::field::goldilocks_field::GoldilocksField;
+        use plonky2::field::types::Field64;
+        use plonky2::hash::hash_types::HashOut;
+
+        // Mathematically identical (all-zero) digests with different internal
+        // Goldilocks representations: canonical F::ZERO vs non-canonical
+        // F(ORDER) ≡ 0 mod p but ORDER != 0 as a raw u64.
+        let canonical: HashDigest = HashOut {
+            elements: [F::ZERO; 4],
+        };
+        let noncanonical: HashDigest = HashOut {
+            elements: [GoldilocksField(F::ORDER), F::ZERO, F::ZERO, F::ZERO],
+        };
+
+        let canon_bytes = digest_to_bytes(&canonical);
+        let noncanon_bytes = digest_to_bytes(&noncanonical);
+        assert_eq!(canon_bytes, noncanon_bytes);
+        assert_eq!(canon_bytes, [0u8; 32]);
+        // Old-model `.0.to_be_bytes()` would emit ORDER in the first limb and
+        // fail this equality — that is the whole point of this regression.
+        assert_ne!(noncanonical.elements[0].0, 0u64);
+        assert_eq!(noncanonical.elements[0].to_canonical_u64(), 0u64);
+    }
+
+    #[test]
+    fn digest_from_bytes_rejects_noncanonical_limb() {
+        use plonky2::field::types::Field64;
+
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&F::ORDER.to_be_bytes());
+        assert_eq!(
+            digest_from_bytes(&bytes),
+            Err(SpecError::NonCanonicalDigestLimb {
+                limb_index: 0,
+                value: F::ORDER,
+            })
+        );
+
+        // Genuinely canonical inputs must parse Ok.
+        assert_eq!(
+            digest_from_bytes(&[0u8; 32]).unwrap().elements,
+            [F::ZERO; 4]
+        );
+        let some = hc(
+            "zkCoins/v1/NkCommit",
+            &[HcInput::ByteString(&[1u8; 32])],
+        )
+        .unwrap();
+        let roundtrip = digest_from_bytes(&digest_to_bytes(&some)).unwrap();
+        assert_eq!(roundtrip, some);
     }
 }

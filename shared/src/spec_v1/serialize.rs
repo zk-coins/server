@@ -1,13 +1,14 @@
 //! Canonical serialization / deserialization (§1.7.4, §1.4, §1.7.7).
 
+use bech32::primitives::decode::CheckedHrpstring;
 use bech32::{Bech32m, Hrp};
 
 use super::datastructures::{
     AccountState, Address, Coin, ProofData, SpendRecord, MAX_ACCOUNT_ASSETS,
 };
+use super::encoding::{digest_from_bytes, digest_to_bytes};
 use super::error::SpecError;
 use super::tags::ADDRESS_HRP;
-use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
 
 // ---------------------------------------------------------------------------
 // Coin — fixed 112 bytes
@@ -39,10 +40,10 @@ pub fn deserialize_coin(bytes: &[u8]) -> Result<Coin, SpecError> {
     let mut aid_b = [0u8; 32];
     aid_b.copy_from_slice(&bytes[80..112]);
     Ok(Coin {
-        identifier: digest_from_bytes(&id_b),
+        identifier: digest_from_bytes(&id_b)?,
         recipient: Address(recip),
         amount: u128::from_be_bytes(amt_b),
-        asset_id: digest_from_bytes(&aid_b),
+        asset_id: digest_from_bytes(&aid_b)?,
     })
 }
 
@@ -120,7 +121,8 @@ pub fn parse_account_state(bytes: &[u8]) -> Result<AccountState, SpecError> {
     }
     let mut balances = std::collections::BTreeMap::new();
     let mut off = 140;
-    for _ in 0..count {
+    let mut prev_aid: Option<[u8; 32]> = None;
+    for index in 0..count {
         let mut aid = [0u8; 32];
         aid.copy_from_slice(&bytes[off..off + 32]);
         off += 32;
@@ -131,21 +133,23 @@ pub fn parse_account_state(bytes: &[u8]) -> Result<AccountState, SpecError> {
         if amount == 0 {
             return Err(SpecError::ZeroAmountBalance);
         }
-        if balances.insert(aid, amount).is_some() {
-            // Duplicate asset_id — fail loud (spec: MUST NOT appear).
-            return Err(SpecError::WrongLength {
-                expected,
-                actual: bytes.len(),
-            });
+        // Wire order must be strictly ascending by asset_id (byte order) so
+        // ash's preimage is canonical (§1.7.4). Also rejects duplicates.
+        if let Some(prev) = prev_aid {
+            if aid <= prev {
+                return Err(SpecError::BalancesNotAscending { index });
+            }
         }
+        prev_aid = Some(aid);
+        balances.insert(aid, amount);
     }
     AccountState::new(
         Address(owner),
-        digest_from_bytes(&nkc),
+        digest_from_bytes(&nkc)?,
         balances,
         pk,
         u64::from_be_bytes(sc),
-        digest_from_bytes(&chr),
+        digest_from_bytes(&chr)?,
     )
 }
 
@@ -185,11 +189,11 @@ pub fn deserialize_proof_data(bytes: &[u8]) -> Result<ProofData, SpecError> {
     let mut f = [0u8; 32];
     f.copy_from_slice(&bytes[160..192]);
     Ok(ProofData {
-        new_account_state_hash: digest_from_bytes(&a),
-        output_coins_root: digest_from_bytes(&b),
-        input_nullifiers_root: digest_from_bytes(&c),
-        coin_history_root: digest_from_bytes(&d),
-        nav_commitment: digest_from_bytes(&e),
+        new_account_state_hash: digest_from_bytes(&a)?,
+        output_coins_root: digest_from_bytes(&b)?,
+        input_nullifiers_root: digest_from_bytes(&c)?,
+        coin_history_root: digest_from_bytes(&d)?,
+        nav_commitment: digest_from_bytes(&e)?,
         npk_commit: f,
     })
 }
@@ -234,17 +238,20 @@ impl Address {
         bech32::encode::<Bech32m>(hrp, &self.0).expect("32-byte payload always encodes")
     }
 
-    /// Decode a Bech32m address. Rejects wrong HRP and non-32-byte payloads.
-    /// Does **not** reject solely for exceeding 90 characters.
+    /// Decode a Bech32m address. Rejects wrong HRP, non-32-byte payloads, and
+    /// legacy Bech32 (non-m) checksums. Does **not** reject solely for
+    /// exceeding 90 characters.
     pub fn from_bech32m(s: &str) -> Result<Self, SpecError> {
-        let (hrp, data) =
-            bech32::decode(s).map_err(|e| SpecError::Bech32DecodeError(e.to_string()))?;
+        let checked = CheckedHrpstring::new::<Bech32m>(s)
+            .map_err(|e| SpecError::Bech32DecodeError(e.to_string()))?;
+        let hrp = checked.hrp();
         if hrp.as_str() != ADDRESS_HRP {
             return Err(SpecError::Bech32WrongHrp {
                 expected: ADDRESS_HRP,
                 actual: hrp.to_string(),
             });
         }
+        let data: Vec<u8> = checked.byte_iter().collect();
         if data.len() != 32 {
             return Err(SpecError::WrongLength {
                 expected: 32,
@@ -434,5 +441,45 @@ mod tests {
         assert_eq!(total_with_header, 202);
         // Raw single-nullifier body (Pk ‖ signature) = 96 bytes.
         assert_eq!(32 + 64, 96);
+    }
+
+    #[test]
+    fn from_bech32m_rejects_legacy_bech32_checksum() {
+        let hrp_zk = Hrp::parse("zk").unwrap();
+        let legacy_encoded =
+            bech32::encode::<bech32::Bech32>(hrp_zk, &[0u8; 32]).unwrap();
+        // Checksum is valid Bech32 (non-m) with correct HRP and payload length,
+        // but §1.7.7 requires Bech32m only.
+        assert!(Address::from_bech32m(&legacy_encoded).is_err());
+    }
+
+    #[test]
+    fn parse_account_state_rejects_descending_asset_ids() {
+        let nkc = nk_commit(&sample_nk());
+        let owner_bytes = address(&sample_pk0(), nkc);
+        let mut balances = BTreeMap::new();
+        balances.insert([0x01u8; 32], 100u128);
+        balances.insert([0x02u8; 32], 200u128);
+        let state = AccountState::new(
+            Address(owner_bytes),
+            nkc,
+            balances,
+            sample_pk1(),
+            0,
+            ZERO_HASH,
+        )
+        .unwrap();
+        let mut ser = serialize_account_state(&state).unwrap();
+        assert_eq!(ser.len(), 140 + 48 * 2);
+        // Swap the two 48-byte balance entries in-place (start at offset 140)
+        // to produce a descending-order wire message.
+        let entry0 = ser[140..188].to_vec();
+        let entry1 = ser[188..236].to_vec();
+        ser[140..188].copy_from_slice(&entry1);
+        ser[188..236].copy_from_slice(&entry0);
+        assert!(matches!(
+            parse_account_state(&ser),
+            Err(SpecError::BalancesNotAscending { index: 1 })
+        ));
     }
 }
