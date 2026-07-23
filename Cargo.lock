@@ -3294,10 +3294,12 @@ dependencies = [
 name = "shared"
 version = "1.1.0"
 dependencies = [
+ "bech32",
  "bincode",
  "bitcoin",
  "hex",
  "lazy_static",
+ "plonky2",
  "serde",
  "sha2",
  "zkcoins-program-plonky2",

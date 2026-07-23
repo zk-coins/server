@@ -11,3 +11,11 @@ sha2 = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 hex = "0.4.3"
+bech32 = { workspace = true }
+plonky2 = "1.1.0"
+
+[dev-dependencies]
+# Integration tests (`tests/*`) are separate crates and cannot see package
+# dependencies unless listed here.
+hex = "0.4.3"
+sha2 = { workspace = true }

@@ -14,6 +14,7 @@ use zkcoins_program::hash::{digest_to_bytes, hash_concat, HashDigest, ZERO_HASH}
 use zkcoins_program::types::{AccountState, Amount};
 
 pub mod commitment;
+pub mod spec_v1;
 pub use zkcoins_program::types::ProofData;
 
 lazy_static! {
