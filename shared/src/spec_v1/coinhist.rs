@@ -28,9 +28,16 @@ pub fn coinhist_leaf_hash(state: CoinHistState) -> HashDigest {
 
 /// `H'_node(i, l, r) = Hc("CoinHist/Node", SmallNumeric(i), Digest(l), Digest(r))`.
 ///
-/// Level 0 = leaf, level 256 = root.
-pub fn coinhist_node_hash(level: u32, left: HashDigest, right: HashDigest) -> HashDigest {
-    hc(
+/// Level 0 = leaf, level 256 = root. Levels `> 256` are rejected.
+pub fn coinhist_node_hash(
+    level: u32,
+    left: HashDigest,
+    right: HashDigest,
+) -> Result<HashDigest, SpecError> {
+    if level > 256 {
+        return Err(SpecError::CoinHistLevelOutOfRange { level });
+    }
+    Ok(hc(
         TAG_COINHIST_NODE,
         &[
             HcInput::SmallNumeric(level as u64),
@@ -38,7 +45,7 @@ pub fn coinhist_node_hash(level: u32, left: HashDigest, right: HashDigest) -> Ha
             HcInput::Digest(right),
         ],
     )
-    .expect("level ≤ 256")
+    .expect("level ≤ 256 and digests are well-formed"))
 }
 
 /// The 257 empty-subtree constants:
@@ -50,7 +57,8 @@ pub fn coinhist_empty_subtree_roots() -> &'static [HashDigest; 257] {
         let mut roots = [zkcoins_program::hash::ZERO_HASH; 257];
         roots[0] = coinhist_leaf_hash(CoinHistState::Absent);
         for i in 1..=256 {
-            roots[i] = coinhist_node_hash(i as u32, roots[i - 1], roots[i - 1]);
+            roots[i] = coinhist_node_hash(i as u32, roots[i - 1], roots[i - 1])
+                .expect("level in 1..=256 by construction");
         }
         roots
     })
@@ -88,7 +96,7 @@ pub fn coinhist_root_after_first_insert(key_be: &[u8; 32], state: CoinHistState)
             // bit 0 ⇒ child is LEFT, sibling is RIGHT
             (cur, sibling)
         };
-        cur = coinhist_node_hash(lvl, left, right);
+        cur = coinhist_node_hash(lvl, left, right).expect("level in 1..=256 by construction");
     }
     cur
 }
@@ -117,7 +125,7 @@ impl CoinHistProof {
             let bit = key_bit(coin_id, lvl - 1);
             let sibling = self.siblings[(lvl - 1) as usize];
             let (l, r) = if bit { (sibling, cur) } else { (cur, sibling) };
-            cur = coinhist_node_hash(lvl, l, r);
+            cur = coinhist_node_hash(lvl, l, r).expect("level in 1..=256 by construction");
         }
         cur == root
     }
@@ -143,7 +151,14 @@ impl CoinHistTree {
                 self.leaves.insert(coin_id, CoinHistState::Admitted);
                 Ok(())
             }
-            Some(_) => Err(SpecError::CoinAlreadyAdmitted { coin_id }),
+            Some(CoinHistState::Admitted) => Err(SpecError::CoinAlreadyAdmitted { coin_id }),
+            Some(CoinHistState::Spent) => Err(SpecError::CoinAlreadySpent { coin_id }),
+            Some(CoinHistState::Absent) => {
+                unreachable!(
+                    "CoinHistState::Absent is never stored as a map value \
+                     (it is the implicit not-present state)"
+                )
+            }
         }
     }
 
@@ -218,7 +233,7 @@ fn build_subtree(occupied: &[(&[u8; 32], CoinHistState)], depth_from_root: u32) 
     }
     let l = build_subtree(&left, depth_from_root + 1);
     let r = build_subtree(&right, depth_from_root + 1);
-    coinhist_node_hash(256 - depth_from_root, l, r)
+    coinhist_node_hash(256 - depth_from_root, l, r).expect("level in 1..=256 by construction")
 }
 
 /// Same recursion as `build_subtree`, but also appends the sibling along
@@ -261,11 +276,13 @@ fn build_subtree_with_path(
         let right_root = build_subtree_with_path(&right, depth_from_root + 1, target_key, path_out);
         path_out.push(sibling);
         coinhist_node_hash(256 - depth_from_root, sibling, right_root)
+            .expect("level in 1..=256 by construction")
     } else {
         let left_root = build_subtree_with_path(&left, depth_from_root + 1, target_key, path_out);
         let sibling = build_subtree(&right, depth_from_root + 1);
         path_out.push(sibling);
         coinhist_node_hash(256 - depth_from_root, left_root, sibling)
+            .expect("level in 1..=256 by construction")
     }
 }
 
@@ -421,6 +438,29 @@ mod tests {
         tree.spend(id).expect("spend");
         assert_eq!(
             tree.spend(id).expect_err("second spend"),
+            SpecError::CoinAlreadySpent { coin_id: id }
+        );
+    }
+
+    #[test]
+    fn coinhist_node_hash_rejects_level_above_256() {
+        let left = coinhist_leaf_hash(CoinHistState::Absent);
+        let right = coinhist_leaf_hash(CoinHistState::Admitted);
+        let err = coinhist_node_hash(257, left, right).expect_err("level 257");
+        assert_eq!(err, SpecError::CoinHistLevelOutOfRange { level: 257 });
+        // Boundary still accepted.
+        assert!(coinhist_node_hash(256, left, right).is_ok());
+        assert!(coinhist_node_hash(0, left, right).is_ok());
+    }
+
+    #[test]
+    fn admit_on_spent_coin_returns_already_spent() {
+        let mut tree = CoinHistTree::new();
+        let id = coin_id(9);
+        tree.admit(id).expect("admit");
+        tree.spend(id).expect("spend");
+        assert_eq!(
+            tree.admit(id).expect_err("re-admit after spend"),
             SpecError::CoinAlreadySpent { coin_id: id }
         );
     }
