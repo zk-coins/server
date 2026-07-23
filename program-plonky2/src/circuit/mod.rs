@@ -7,6 +7,7 @@
 //! state-transition circuit per the protocol specification §8
 //! (<https://docs.zkcoins.com/specification>).
 
+pub mod gadgets;
 pub mod main;
 pub mod mmr;
 #[cfg(test)]
