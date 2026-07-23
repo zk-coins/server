@@ -64,7 +64,7 @@ pub fn merkle_root(kind: TreeKind, leaves: &[HashDigest]) -> HashDigest {
     level.resize(target, pad);
     while level.len() > 1 {
         let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks_exact(2) {
+        for pair in level.as_chunks::<2>().0 {
             next.push(node_hash(kind, pair[0], pair[1]));
         }
         level = next;

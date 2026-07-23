@@ -6,19 +6,25 @@
 //! 2.5, 6.5. Does **not** replace the old-model types in `shared::` root or
 //! `zkcoins_program::types`.
 
+pub mod accumulator;
 pub mod coinhist;
 pub mod datastructures;
 pub mod encoding;
 pub mod error;
 pub mod hashes;
+pub mod network_params;
 pub mod nflog;
 pub mod serialize;
 pub mod tags;
 pub mod trees;
 
+pub use accumulator::{
+    ChainPosition, FoldOutcome, LookupResult, NfLogAccumulator, PublishedNullifier,
+    SpendClassification,
+};
 pub use coinhist::{
     coinhist_empty_root, coinhist_empty_subtree_roots, coinhist_leaf_hash, coinhist_node_hash,
-    coinhist_root_after_first_insert, CoinHistState,
+    coinhist_root_after_first_insert, CoinHistProof, CoinHistState, CoinHistTree,
 };
 pub use datastructures::{
     AccountState, Address, Coin, CoinTemplate, ProofData, SpendRecord, XOnlyPubKey,
@@ -34,8 +40,10 @@ pub use hashes::{
     name_hash, nav_commitment, network_id, network_id_mainnet, network_id_regtest,
     network_id_testnet, nk_commit, npk_commit, nullifier, terms_hash_v1, terms_hash_v2,
 };
+pub use network_params::NetworkParams;
 pub use nflog::{
-    nflog_empty, nflog_leaf_hash, nflog_mth, nflog_node_hash, nflog_root, Nav, NfLogEntry,
+    consistency_proof, inclusion_path, nflog_empty, nflog_leaf_hash, nflog_mth, nflog_node_hash,
+    nflog_root, verify_consistency, verify_inclusion, Nav, NfLogEntry,
 };
 pub use serialize::{
     deserialize_coin, deserialize_proof_data, deserialize_spend_record, parse_account_state,
