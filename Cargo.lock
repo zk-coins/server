@@ -5226,6 +5226,7 @@ dependencies = [
  "bincode",
  "plonky2",
  "serde",
+ "sha2",
 ]
 
 [[package]]
