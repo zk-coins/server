@@ -495,4 +495,40 @@ mod curve_tests {
             "a mutated scalar-multiplication result unexpectedly satisfied the circuit"
         );
     }
+
+    #[test]
+    fn curve_glv_scalar_mul_fits_standard_recursion_zk_config() {
+        let mut builder =
+            CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_zk_config());
+        let scalar_target = builder.add_virtual_nonnative_target::<Secp256K1Scalar>();
+        let expected_target = builder.add_virtual_affine_point_target::<Secp256K1>();
+        let generator_target = builder.constant_affine_point(Secp256K1::GENERATOR_AFFINE);
+        let actual = builder.glv_mul(&generator_target, &scalar_target);
+        builder.connect_affine_point(&actual, &expected_target);
+        builder.curve_assert_valid(&actual);
+
+        println!(
+            "pinned recursion-zk scalar_mul num_gates(): {}",
+            builder.num_gates()
+        );
+        let data = builder.build::<C>();
+        println!(
+            "pinned recursion-zk scalar_mul degree_bits(): {}",
+            data.common.degree_bits()
+        );
+
+        let scalar_bytes = [0x42; 32];
+        let mut witness = PartialWitness::new();
+        set_nonnative(
+            &mut witness,
+            &scalar_target,
+            scalar_from_bytes(scalar_bytes),
+        );
+        set_point(&mut witness, &expected_target, oracle_mul(scalar_bytes));
+        let proof = data
+            .prove(witness)
+            .expect("pinned recursion-zk scalar_mul proof failed");
+        data.verify(proof)
+            .expect("pinned recursion-zk scalar_mul proof verification failed");
+    }
 }
