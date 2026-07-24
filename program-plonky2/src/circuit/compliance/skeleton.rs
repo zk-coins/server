@@ -44,7 +44,8 @@ use super::targets::{
     virtual_bytes, AccountStateTarget, AssetIssuanceTarget, BalanceSlotTarget, CoinTarget,
     HistoryUpdatePathTarget, InputAuthTarget, InputCoinTarget, NavOpeningTarget, NavTarget,
     OutputTemplateTarget, PrevProofTargets, PrevStateNullifierTarget, ProofDataTarget,
-    MAX_ACCOUNT_ASSETS, MAX_HISTORY_UPDATES_D3,
+    ReceivedAuthTarget, ReceivedCoinTarget, MAX_ACCOUNT_ASSETS, MAX_HISTORY_UPDATES,
+    MAX_OUTPUT_MERKLE_DEPTH, MAX_RX_COINS,
 };
 use super::{
     GENESIS_TAG, M_STATE_MAINNET, M_STATE_REGTEST, M_STATE_TESTNET, NETWORK_TAG_MAINNET,
@@ -97,8 +98,10 @@ pub struct ComplianceTargets {
     pub input_auth: [InputAuthTarget; MAX_TX_INPUTS],
     pub output_templates: [OutputTemplateTarget; MAX_TX_OUTPUTS],
     pub output_coins: [CoinTarget; MAX_TX_OUTPUTS],
+    pub received_coins: [ReceivedCoinTarget; MAX_RX_COINS],
+    pub received_auth: [ReceivedAuthTarget; MAX_RX_COINS],
     pub asset_issuance: AssetIssuanceTarget,
-    pub history_update_paths: [HistoryUpdatePathTarget; MAX_HISTORY_UPDATES_D3],
+    pub history_update_paths: [HistoryUpdatePathTarget; MAX_HISTORY_UPDATES],
     pub next_pubkey: [Target; 32],
     pub npk_rand: [Target; 32],
     pub nav: NavTarget,
@@ -379,6 +382,52 @@ fn coins_node_hash(
     builder.hash_n_to_hash_no_pad::<PoseidonHash>(elements)
 }
 
+fn verify_received_output_inclusion(
+    builder: &mut CircuitBuilder<F, D>,
+    active: BoolTarget,
+    identifier: HashOutTarget,
+    leaf_index: Target,
+    depth: Target,
+    siblings: &[HashOutTarget; MAX_OUTPUT_MERKLE_DEPTH],
+    output_coins_root: HashOutTarget,
+) {
+    let depth_selectors: [BoolTarget; MAX_OUTPUT_MERKLE_DEPTH + 1] =
+        std::array::from_fn(|candidate| {
+            let candidate = builder.constant(F::from_canonical_usize(candidate));
+            builder.is_equal(depth, candidate)
+        });
+    let valid_depth = builder.add_many(depth_selectors.map(|selector| selector.target));
+    builder.assert_one(valid_depth);
+
+    let index_bits = builder.split_le(leaf_index, 32);
+    for (bit_index, bit) in index_bits.iter().copied().enumerate() {
+        let mut allowed = builder.constant_bool(false);
+        for (candidate_depth, selector) in depth_selectors.iter().copied().enumerate() {
+            if candidate_depth > bit_index {
+                allowed = builder.or(allowed, selector);
+            }
+        }
+        let forbidden = builder.not(allowed);
+        let set_forbidden = builder.and(bit, forbidden);
+        let violation = builder.and(active, set_forbidden);
+        builder.assert_zero(violation.target);
+    }
+
+    let mut accumulator = coins_leaf_hash(builder, identifier);
+    for level in 0..MAX_OUTPUT_MERKLE_DEPTH {
+        let mut level_active = builder.constant_bool(false);
+        for selector in depth_selectors.iter().copied().skip(level + 1) {
+            level_active = builder.or(level_active, selector);
+        }
+        let current_on_right = index_bits[level];
+        let left = select_hash(builder, current_on_right, siblings[level], accumulator);
+        let right = select_hash(builder, current_on_right, accumulator, siblings[level]);
+        let combined = coins_node_hash(builder, left, right);
+        accumulator = select_hash(builder, level_active, combined, accumulator);
+    }
+    enforce_hash_when(builder, active, accumulator, output_coins_root);
+}
+
 fn output_coins_root_target(
     builder: &mut CircuitBuilder<F, D>,
     templates: &[OutputTemplateTarget; MAX_TX_OUTPUTS],
@@ -485,6 +534,19 @@ fn masked_output_sum(
             include = builder.and(include, is_self);
         }
         U128Target::mask(builder, include, &output.amount)
+    });
+    accumulate(builder, &masked)
+}
+
+fn masked_received_sum(
+    builder: &mut CircuitBuilder<F, D>,
+    received: &[ReceivedCoinTarget; MAX_RX_COINS],
+    asset_id: HashOutTarget,
+) -> WideSum {
+    let masked = received.map(|coin| {
+        let same_asset = hashes_equal(builder, coin.asset_id, asset_id);
+        let include = builder.and(coin.active, same_asset);
+        U128Target::mask(builder, include, &coin.amount)
     });
     accumulate(builder, &masked)
 }
@@ -668,8 +730,10 @@ fn enforce_balance_fold(
     new: &AccountStateTarget,
     inputs: &[InputCoinTarget; MAX_TX_INPUTS],
     outputs: &[OutputTemplateTarget; MAX_TX_OUTPUTS],
+    received: &[ReceivedCoinTarget; MAX_RX_COINS],
 ) {
-    let candidates: [HashOutTarget; 2 * MAX_ACCOUNT_ASSETS + 2 * MAX_TX_INPUTS] =
+    let candidates: [HashOutTarget;
+        2 * MAX_ACCOUNT_ASSETS + MAX_TX_INPUTS + MAX_TX_OUTPUTS + MAX_RX_COINS] =
         std::array::from_fn(|i| {
             if i < MAX_ACCOUNT_ASSETS {
                 previous.balances[i].asset_id
@@ -677,8 +741,10 @@ fn enforce_balance_fold(
                 new.balances[i - MAX_ACCOUNT_ASSETS].asset_id
             } else if i < 2 * MAX_ACCOUNT_ASSETS + MAX_TX_INPUTS {
                 inputs[i - 2 * MAX_ACCOUNT_ASSETS].asset_id
-            } else {
+            } else if i < 2 * MAX_ACCOUNT_ASSETS + MAX_TX_INPUTS + MAX_TX_OUTPUTS {
                 outputs[i - 2 * MAX_ACCOUNT_ASSETS - MAX_TX_INPUTS].asset_id
+            } else {
+                received[i - 2 * MAX_ACCOUNT_ASSETS - MAX_TX_INPUTS - MAX_TX_OUTPUTS].asset_id
             }
         });
     for asset_id in candidates {
@@ -686,7 +752,9 @@ fn enforce_balance_fold(
         let new = masked_balance_sum(builder, &new.balances, asset_id);
         let input = masked_input_sum(builder, inputs, asset_id);
         let self_output = masked_output_sum(builder, outputs, Some(&previous.owner), asset_id);
-        let lhs = add_wide(builder, &prev, &self_output);
+        let received_sum = masked_received_sum(builder, received, asset_id);
+        let credited = add_wide(builder, &self_output, &received_sum);
+        let lhs = add_wide(builder, &prev, &credited);
         let rhs = add_wide(builder, &new, &input);
         connect_wide(builder, &lhs, &rhs);
     }
@@ -699,13 +767,14 @@ fn coin_history_update_target(
     inputs: &[InputCoinTarget; MAX_TX_INPUTS],
     outputs: &[OutputTemplateTarget; MAX_TX_OUTPUTS],
     output_coins: &[CoinTarget; MAX_TX_OUTPUTS],
-    paths: &[HistoryUpdatePathTarget; MAX_HISTORY_UPDATES_D3],
+    received: &[ReceivedCoinTarget; MAX_RX_COINS],
+    paths: &[HistoryUpdatePathTarget; MAX_HISTORY_UPDATES],
 ) -> HashOutTarget {
     let mut current_root = previous.coin_history_root;
-    for index in 0..MAX_HISTORY_UPDATES_D3 {
+    for index in 0..MAX_HISTORY_UPDATES {
         let (key, old_state, new_state, apply) = if index < MAX_TX_INPUTS {
             (inputs[index].identifier, 1, 2, inputs[index].active)
-        } else {
+        } else if index < MAX_TX_INPUTS + MAX_TX_OUTPUTS {
             let output_index = index - MAX_TX_INPUTS;
             let is_self = bytes_equal(builder, &outputs[output_index].recipient, &previous.owner);
             (
@@ -713,6 +782,14 @@ fn coin_history_update_target(
                 0,
                 1,
                 builder.and(outputs[output_index].active, is_self),
+            )
+        } else {
+            let received_index = index - MAX_TX_INPUTS - MAX_TX_OUTPUTS;
+            (
+                received[received_index].identifier,
+                0,
+                1,
+                received[received_index].active,
             )
         };
         let key_bytes = digest_to_be_bytes_target(builder, key);
@@ -729,6 +806,100 @@ fn coin_history_update_target(
     }
     builder.connect_hashes(current_root, new.coin_history_root);
     current_root
+}
+
+fn enforce_received_admission(
+    builder: &mut CircuitBuilder<F, D>,
+    owner: &[Target; 32],
+    nav: NavTarget,
+    received_coins: &[ReceivedCoinTarget; MAX_RX_COINS],
+    received_auth: &[ReceivedAuthTarget; MAX_RX_COINS],
+) {
+    for index in 0..MAX_RX_COINS - 1 {
+        let inactive = builder.not(received_coins[index].active);
+        let gap = builder.and(inactive, received_coins[index + 1].active);
+        builder.assert_zero(gap.target);
+    }
+
+    for index in 0..MAX_RX_COINS {
+        let coin = received_coins[index];
+        let auth = &received_auth[index];
+        let active = coin.active;
+        let creating_pis = unpack_prev_proof_pis(builder, &auth.creating_proof);
+
+        let recomputed_identifier = coin_identifier_with_index_target(
+            builder,
+            auth.creating_prev_ash,
+            &coin.recipient,
+            coin.asset_id,
+            coin.amount,
+            auth.inclusion_leaf_index,
+        );
+        enforce_hash_when(builder, active, recomputed_identifier, coin.identifier);
+        enforce_bytes_when(builder, active, &coin.recipient, owner);
+        verify_received_output_inclusion(
+            builder,
+            active,
+            coin.identifier,
+            auth.inclusion_leaf_index,
+            auth.inclusion_depth,
+            &auth.inclusion_siblings,
+            creating_pis.proof_data.output_coins_root,
+        );
+
+        let opened_creating_nav = nav_commitment_target(
+            builder,
+            auth.creating_nav_opening.nav,
+            &auth.creating_nav_opening.nav_rand,
+        );
+        enforce_hash_when(
+            builder,
+            active,
+            creating_pis.proof_data.nav_commitment,
+            opened_creating_nav,
+        );
+        let empty = nflog_empty_target(builder);
+        let zero = builder.zero();
+        let effective_r_size = builder.select(active, auth.creating_nav_opening.nav.size, zero);
+        let effective_r_mth =
+            select_hash(builder, active, auth.creating_nav_opening.nav.mth, empty);
+        let effective_size = builder.select(active, nav.size, zero);
+        let effective_mth = select_hash(builder, active, nav.mth, empty);
+        verify_nflog_consistency(
+            builder,
+            effective_r_size,
+            effective_r_mth,
+            effective_size,
+            effective_mth,
+            &auth.creating_nav_consistency,
+        );
+
+        let creating_leaf =
+            nflog_leaf_hash_target(builder, auth.pos_create, &auth.pk_create, &auth.r_create);
+        let effective_position = builder.select(active, auth.pos_create, zero);
+        let one = builder.one();
+        let effective_inclusion_size = builder.select(active, nav.size, one);
+        let effective_inclusion_mth = select_hash(builder, active, nav.mth, creating_leaf);
+        verify_nflog_inclusion(
+            builder,
+            creating_leaf,
+            effective_position,
+            &auth.creating_nav_inclusion,
+            effective_inclusion_size,
+            effective_inclusion_mth,
+        );
+
+        let h_creating_proof_data = hash_proof_data_target(builder, &creating_pis.proof_data);
+        let creating_opening =
+            s2c_open_with_point(builder, &auth.r_prime_create, &h_creating_proof_data);
+        enforce_bytes_when(builder, active, &auth.r_create, &creating_opening.rx_bytes);
+        enforce_bytes_when(
+            builder,
+            active,
+            &auth.pk_create,
+            &creating_pis.consumed_pubkey,
+        );
+    }
 }
 
 fn network_id_target(builder: &mut CircuitBuilder<F, D>, network: Network) -> HashOutTarget {
@@ -863,6 +1034,9 @@ fn build_with_common(
     let input_coins = std::array::from_fn(|_| InputCoinTarget::new_virtual(&mut builder));
     let input_auth = std::array::from_fn(|_| InputAuthTarget::new_virtual(&mut builder));
     let output_templates = std::array::from_fn(|_| OutputTemplateTarget::new_virtual(&mut builder));
+    let received_coins = std::array::from_fn(|_| ReceivedCoinTarget::new_virtual(&mut builder));
+    let received_auth =
+        std::array::from_fn(|_| ReceivedAuthTarget::new_virtual(&mut builder, common));
     let asset_issuance = AssetIssuanceTarget::new_virtual(&mut builder);
     let history_update_paths =
         std::array::from_fn(|_| HistoryUpdatePathTarget::new_virtual(&mut builder));
@@ -941,6 +1115,7 @@ fn build_with_common(
         &new_account_state,
         &input_coins,
         &output_templates,
+        &received_coins,
     );
     let coin_history_root = coin_history_update_target(
         &mut builder,
@@ -949,6 +1124,7 @@ fn build_with_common(
         &input_coins,
         &output_templates,
         &output_coins,
+        &received_coins,
         &history_update_paths,
     );
     let (new_account_state_hash, balance_count) =
@@ -1022,6 +1198,14 @@ fn build_with_common(
     let base_proof = builder.add_virtual_proof_with_pis(common);
     let base_verifier_data = builder.add_virtual_verifier_data(common.config.fri_config.cap_height);
     let prev_pis = unpack_prev_proof_pis(&mut builder, &prev_proof);
+
+    enforce_received_admission(
+        &mut builder,
+        &prev_account_state.owner,
+        nav,
+        &received_coins,
+        &received_auth,
+    );
 
     enforce_hash_when(
         &mut builder,
@@ -1144,6 +1328,17 @@ fn build_with_common(
             common,
         )
         .expect("cyclic recursion wiring must be structurally valid");
+    for (index, auth) in received_auth.iter().enumerate() {
+        builder
+            .conditionally_verify_cyclic_proof::<C>(
+                received_coins[index].active,
+                &auth.creating_proof,
+                &base_proof,
+                &base_verifier_data,
+                common,
+            )
+            .expect("received-proof cyclic recursion wiring must be structurally valid");
+    }
 
     let recursion = PrevProofTargets {
         is_account_update,
@@ -1162,6 +1357,8 @@ fn build_with_common(
         input_auth,
         output_templates,
         output_coins,
+        received_coins,
+        received_auth,
         asset_issuance,
         history_update_paths,
         next_pubkey,
