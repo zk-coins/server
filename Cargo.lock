@@ -5225,6 +5225,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "itertools 0.11.0",
+ "num",
  "num-bigint",
  "num-traits",
  "plonky2",
