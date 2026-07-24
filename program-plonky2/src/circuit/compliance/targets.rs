@@ -1,7 +1,7 @@
 use plonky2::hash::hash_types::HashOutTarget;
 use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
-use plonky2::plonk::circuit_data::VerifierCircuitTarget;
+use plonky2::plonk::circuit_data::{CommonCircuitData, VerifierCircuitTarget};
 use plonky2::plonk::proof::ProofWithPublicInputsTarget;
 
 use crate::circuit::gadgets::curve::{AffinePointTarget, CircuitBuilderCurve};
@@ -13,11 +13,14 @@ use crate::{D, F};
 /// Maximum number of distinct non-zero balances in a spec-v1.1 account.
 pub const MAX_ACCOUNT_ASSETS: usize = 32;
 
-/// Coin-history updates in this increment: eight spends plus eight self admissions.
-///
-/// P1-D.5 extends this fixed array to the normative 20 slots when the four
-/// clause-10 received-coin admissions are introduced.
-pub const MAX_HISTORY_UPDATES_D3: usize = 16;
+/// Maximum number of clause-10 received coins admitted in one transition.
+pub const MAX_RX_COINS: usize = 4;
+
+/// Maximum depth of the power-of-two padded output-coins tree.
+pub const MAX_OUTPUT_MERKLE_DEPTH: usize = 3;
+
+/// Eight spends, eight self admissions, and four received-coin admissions.
+pub const MAX_HISTORY_UPDATES: usize = 20;
 
 /// One witnessed 256-level CoinHist sibling path.
 #[derive(Clone, Copy, Debug)]
@@ -178,6 +181,28 @@ impl InputAuthTarget {
     }
 }
 
+/// One fixed-array clause-10 received-coin slot.
+#[derive(Clone, Copy, Debug)]
+pub struct ReceivedCoinTarget {
+    pub active: BoolTarget,
+    pub identifier: HashOutTarget,
+    pub recipient: [Target; 32],
+    pub amount: U128Target,
+    pub asset_id: HashOutTarget,
+}
+
+impl ReceivedCoinTarget {
+    pub(crate) fn new_virtual(builder: &mut CircuitBuilder<F, D>) -> Self {
+        Self {
+            active: builder.add_virtual_bool_target_safe(),
+            identifier: builder.add_virtual_hash(),
+            recipient: virtual_bytes(builder),
+            amount: U128Target::new_virtual(builder),
+            asset_id: builder.add_virtual_hash(),
+        }
+    }
+}
+
 /// In-circuit form of spec-v1.1 `Coin`.
 #[derive(Clone, Copy, Debug)]
 pub struct CoinTarget {
@@ -228,6 +253,51 @@ impl NavOpeningTarget {
         Self {
             nav: NavTarget::new_virtual(builder),
             nav_rand: virtual_bytes(builder),
+        }
+    }
+}
+
+/// Clause-10 provenance, coin-membership, NAV-prefix, and anchoring witness.
+#[derive(Clone, Debug)]
+pub struct ReceivedAuthTarget {
+    pub creating_proof: ProofWithPublicInputsTarget<D>,
+    pub inclusion_leaf_index: Target,
+    pub inclusion_depth: Target,
+    pub inclusion_siblings: [HashOutTarget; MAX_OUTPUT_MERKLE_DEPTH],
+    pub creating_prev_ash: HashOutTarget,
+    pub pk_create: [Target; 32],
+    pub r_create: [Target; 32],
+    pub r_prime_create: AffinePointTarget<Secp256K1>,
+    pub creating_nav_inclusion: [HashOutTarget; H_MAX],
+    pub pos_create: Target,
+    pub creating_nav_opening: NavOpeningTarget,
+    pub creating_nav_consistency: [HashOutTarget; 2 * H_MAX],
+}
+
+impl ReceivedAuthTarget {
+    pub(crate) fn new_virtual(
+        builder: &mut CircuitBuilder<F, D>,
+        common: &CommonCircuitData<F, D>,
+    ) -> Self {
+        let inclusion_leaf_index = builder.add_virtual_target();
+        builder.range_check(inclusion_leaf_index, 32);
+        let inclusion_depth = builder.add_virtual_target();
+        builder.range_check(inclusion_depth, 8);
+        let pos_create = builder.add_virtual_target();
+        builder.split_le(pos_create, 64);
+        Self {
+            creating_proof: builder.add_virtual_proof_with_pis(common),
+            inclusion_leaf_index,
+            inclusion_depth,
+            inclusion_siblings: std::array::from_fn(|_| builder.add_virtual_hash()),
+            creating_prev_ash: builder.add_virtual_hash(),
+            pk_create: virtual_bytes(builder),
+            r_create: virtual_bytes(builder),
+            r_prime_create: builder.add_virtual_affine_point_target(),
+            creating_nav_inclusion: std::array::from_fn(|_| builder.add_virtual_hash()),
+            pos_create,
+            creating_nav_opening: NavOpeningTarget::new_virtual(builder),
+            creating_nav_consistency: std::array::from_fn(|_| builder.add_virtual_hash()),
         }
     }
 }

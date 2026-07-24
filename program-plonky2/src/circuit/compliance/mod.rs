@@ -19,7 +19,8 @@ pub use targets::{
     AccountStateTarget, AssetIssuanceTarget, BalanceSlotTarget, CoinTarget,
     HistoryUpdatePathTarget, InputAuthTarget, InputCoinTarget, NavOpeningTarget, NavTarget,
     OutputTemplateTarget, PrevProofTargets, PrevStateNullifierTarget, ProofDataTarget,
-    MAX_ACCOUNT_ASSETS, MAX_HISTORY_UPDATES_D3,
+    ReceivedAuthTarget, ReceivedCoinTarget, MAX_ACCOUNT_ASSETS, MAX_HISTORY_UPDATES,
+    MAX_OUTPUT_MERKLE_DEPTH, MAX_RX_COINS,
 };
 
 const TAG_ACCOUNT_STATE: &str = "zkCoins/v1/AccountState";
