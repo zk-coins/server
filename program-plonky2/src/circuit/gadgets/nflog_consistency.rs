@@ -10,9 +10,84 @@ use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 
 use crate::circuit::util::swap_if;
+use crate::hash::{HashDigest, ZERO_HASH};
 
 /// Maximum RFC-6962 recursion depth for a `u64` log size.
 pub const H_MAX: usize = 64;
+
+#[allow(dead_code)]
+fn split_point_u64(n: u64) -> u64 {
+    debug_assert!(n >= 2);
+    let bit_length = 64 - (n - 1).leading_zeros();
+    1u64 << (bit_length - 1)
+}
+
+#[allow(dead_code)]
+fn terminal_b_and_depth(mut m: u64, mut n: u64) -> (bool, u32) {
+    let mut b = true;
+    let mut depth = 0;
+    while m != n {
+        let k = split_point_u64(n);
+        if m <= k {
+            n = k;
+        } else {
+            m -= k;
+            n -= k;
+            b = false;
+        }
+        depth += 1;
+    }
+    (b, depth)
+}
+
+/// Converts the host's deepest-first RFC-6962 path into fixed circuit slots.
+#[allow(dead_code)]
+pub(crate) fn fill_inclusion_slots(path_host: &[HashDigest]) -> [HashDigest; H_MAX] {
+    assert!(
+        path_host.len() <= H_MAX,
+        "NfLog inclusion path exceeds H_MAX"
+    );
+    let mut slots = [ZERO_HASH; H_MAX];
+    let depth = path_host.len();
+    for level in 0..depth {
+        slots[level] = path_host[depth - 1 - level];
+    }
+    slots
+}
+
+/// Converts the host RFC-6962 consistency proof into fixed circuit slots.
+#[allow(dead_code)]
+pub(crate) fn fill_consistency_slots(
+    proof_host: &[HashDigest],
+    m: u64,
+    n: u64,
+) -> [HashDigest; 2 * H_MAX] {
+    if m == 0 || m == n {
+        assert!(
+            proof_host.is_empty(),
+            "special consistency proof must be empty"
+        );
+        return [ZERO_HASH; 2 * H_MAX];
+    }
+    assert!(m < n, "consistency slot adapter requires m <= n");
+    let (b_at_term, depth) = terminal_b_and_depth(m, n);
+    let mut slots = [ZERO_HASH; 2 * H_MAX];
+    let (base_digest, regular): (HashDigest, &[HashDigest]) = if b_at_term {
+        (ZERO_HASH, proof_host)
+    } else {
+        assert!(
+            !proof_host.is_empty(),
+            "right-turn proof needs a base digest"
+        );
+        (proof_host[0], &proof_host[1..])
+    };
+    assert_eq!(regular.len(), depth as usize);
+    for level in 0..regular.len() {
+        slots[level] = regular[regular.len() - 1 - level];
+    }
+    slots[H_MAX] = base_digest;
+    slots
+}
 
 // Local copies are cross-checked against `shared` by the tests below.
 const TAG_NFLOG_LEAF: &str = "zkCoins/v1/NfLog/Leaf";
@@ -330,58 +405,6 @@ mod tests {
         consistency_proof, inclusion_path, nflog_empty, nflog_leaf_hash, nflog_mth,
         nflog_node_hash, verify_consistency, verify_inclusion, NfLogEntry,
     };
-
-    fn split_point_u64(n: u64) -> u64 {
-        debug_assert!(n >= 2);
-        let bit_length = 64 - (n - 1).leading_zeros();
-        1u64 << (bit_length - 1)
-    }
-
-    fn terminal_b_and_depth(mut m: u64, mut n: u64) -> (bool, u32) {
-        let mut b = true;
-        let mut depth = 0;
-        while m != n {
-            let k = split_point_u64(n);
-            if m <= k {
-                n = k;
-            } else {
-                m -= k;
-                n -= k;
-                b = false;
-            }
-            depth += 1;
-        }
-        (b, depth)
-    }
-
-    fn fill_inclusion_slots(path_host: &[HashDigest]) -> [HashDigest; H_MAX] {
-        let mut slots = [ZERO_HASH; H_MAX];
-        let d = path_host.len();
-        for l in 0..d {
-            slots[l] = path_host[d - 1 - l];
-        }
-        slots
-    }
-
-    fn fill_consistency_slots(
-        proof_host: &[HashDigest],
-        m: u64,
-        n: u64,
-    ) -> [HashDigest; 2 * H_MAX] {
-        let (b_at_term, depth) = terminal_b_and_depth(m, n);
-        let mut slots = [ZERO_HASH; 2 * H_MAX];
-        let (base_digest, regular): (HashDigest, &[HashDigest]) = if b_at_term {
-            (ZERO_HASH, proof_host)
-        } else {
-            (proof_host[0], &proof_host[1..])
-        };
-        assert_eq!(regular.len(), depth as usize);
-        for l in 0..regular.len() {
-            slots[l] = regular[regular.len() - 1 - l];
-        }
-        slots[H_MAX] = base_digest;
-        slots
-    }
 
     fn symbolic_path(
         rel_pos: u64,

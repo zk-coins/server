@@ -17,8 +17,9 @@ pub use skeleton::{
 };
 pub use targets::{
     AccountStateTarget, AssetIssuanceTarget, BalanceSlotTarget, CoinTarget,
-    HistoryUpdatePathTarget, InputAuthTarget, InputCoinTarget, OutputTemplateTarget,
-    ProofDataTarget, MAX_ACCOUNT_ASSETS, MAX_HISTORY_UPDATES_D3,
+    HistoryUpdatePathTarget, InputAuthTarget, InputCoinTarget, NavOpeningTarget, NavTarget,
+    OutputTemplateTarget, PrevProofTargets, PrevStateNullifierTarget, ProofDataTarget,
+    MAX_ACCOUNT_ASSETS, MAX_HISTORY_UPDATES_D3,
 };
 
 const TAG_ACCOUNT_STATE: &str = "zkCoins/v1/AccountState";
@@ -35,6 +36,8 @@ const TAG_ASSET_ID_V2: &str = "zkCoins/v1/AssetIdV2";
 const TAG_ISSUANCE_TERMS: &str = "zkCoins/v1/IssuanceTerms";
 const TAG_ISSUANCE_TERMS_V2: &str = "zkCoins/v1/IssuanceTermsV2";
 const TAG_NPK_COMMIT: &[u8] = b"zkCoins/v1/NpkCommit";
+const TAG_NAV_COMMIT: &str = "zkCoins/v1/NavCommit";
+const TAG_NFLOG_ROOT: &str = "zkCoins/v1/NfLog/Root";
 const GENESIS_TAG: &[u8] = b"zkCoins/v1/genesis";
 
 const NETWORK_TAG_MAINNET: &[u8] = b"zkCoins/v1/mainnet";

@@ -147,6 +147,26 @@ pub(crate) fn be_bytes32_to_u32_limbs(
     })
 }
 
+/// Converts eight little-endian u32 limbs into one big-endian 32-byte integer.
+pub(crate) fn u32_limbs_to_be_bytes32(
+    builder: &mut CircuitBuilder<F, D>,
+    limbs: &[Target; 8],
+) -> [Target; 32] {
+    let mut bytes = Vec::with_capacity(32);
+    for &limb in limbs.iter().rev() {
+        let bits = builder.split_le(limb, 32);
+        for byte_index in (0..4).rev() {
+            let offset = byte_index * 8;
+            let byte = builder.le_sum(bits[offset..offset + 8].iter());
+            builder.range_check(byte, 8);
+            bytes.push(byte);
+        }
+    }
+    bytes
+        .try_into()
+        .expect("eight u32 limbs always encode as 32 bytes")
+}
+
 pub(crate) fn strict_be_bytes_less_than(
     builder: &mut CircuitBuilder<F, D>,
     lhs: &[Target; 32],

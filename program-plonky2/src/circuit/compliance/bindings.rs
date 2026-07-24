@@ -12,10 +12,12 @@ use crate::{D, F};
 
 use super::serialize::{
     digest_to_be_bytes_target, encode_byte_string_target, tag_targets, u128_to_be_bytes_target,
+    u64_to_be_bytes_target,
 };
-use super::targets::{InputAuthTarget, InputCoinTarget, ProofDataTarget};
+use super::targets::{InputAuthTarget, InputCoinTarget, NavTarget, ProofDataTarget};
 use super::{
-    TAG_COIN, TAG_NK_COMMIT, TAG_NULLIFIER, TAG_NULLIFIERS_ROOT_LEAF, TAG_NULLIFIERS_ROOT_NODE,
+    TAG_COIN, TAG_NAV_COMMIT, TAG_NFLOG_ROOT, TAG_NK_COMMIT, TAG_NULLIFIER,
+    TAG_NULLIFIERS_ROOT_LEAF, TAG_NULLIFIERS_ROOT_NODE,
 };
 
 fn select_hash(
@@ -99,6 +101,26 @@ pub(crate) fn nk_commit_target(
 ) -> HashOutTarget {
     let mut elements = tag_targets(builder, TAG_NK_COMMIT);
     elements.extend(encode_byte_string_target(builder, nk));
+    builder.hash_n_to_hash_no_pad::<PoseidonHash>(elements)
+}
+
+pub(crate) fn nav_root_target(builder: &mut CircuitBuilder<F, D>, nav: NavTarget) -> HashOutTarget {
+    let size_bytes = u64_to_be_bytes_target(builder, nav.size);
+    let mut elements = tag_targets(builder, TAG_NFLOG_ROOT);
+    elements.extend(encode_byte_string_target(builder, &size_bytes));
+    elements.extend(nav.mth.elements);
+    builder.hash_n_to_hash_no_pad::<PoseidonHash>(elements)
+}
+
+pub(crate) fn nav_commitment_target(
+    builder: &mut CircuitBuilder<F, D>,
+    nav: NavTarget,
+    nav_rand: &[Target; 32],
+) -> HashOutTarget {
+    let nav_root = nav_root_target(builder, nav);
+    let mut elements = tag_targets(builder, TAG_NAV_COMMIT);
+    elements.extend(nav_root.elements);
+    elements.extend(encode_byte_string_target(builder, nav_rand));
     builder.hash_n_to_hash_no_pad::<PoseidonHash>(elements)
 }
 
