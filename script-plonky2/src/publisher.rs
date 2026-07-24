@@ -8,28 +8,44 @@
 //!
 //! ## §3.5 block_anchor selection
 //!
-//! The publisher chooses one `block_anchor` that **MUST be an ancestor of, or
-//! equal to, the oldest member's own build tip** (spec §3.5). Members carry
-//! their proof-time tip in [`BatchMember::build_tip`]; the publisher never
+//! The publisher chooses one `block_anchor` as the oldest **caller-asserted**
+//! member tip among [`BatchMember::build_tip`] values. The publisher never
 //! silently substitutes a fresher tip.
 //!
-//! **Every** member's `build_tip` is validated against this node's chain view
-//! (`height ≤ tip` and `hash == getblockhash(height)`), including members that
-//! are not selected as the batch anchor. `build_tip` is a **caller assertion**,
-//! not a crypto-bound field of the half-aggregate (see [`BatchMember`]).
+//! **What this layer checks.** Every member's claimed tip exists on this node's
+//! canonical chain (`height ≤ tip` and `hash == getblockhash(height)`),
+//! including members that are not selected as the batch anchor. Immediately
+//! before broadcast the selected anchor is re-verified by **identity**
+//! (`getblockhash(height)` still equals the selected hash — not merely the
+//! height gap), so a same-height reorg cannot sneak a stale hash past the
+//! height-only check.
 //!
-//! The consensus inclusion-height gap bound is
-//! `inclusion_height − anchor.height ≤ `[`BLOCK_ANCHOR_MAX_GAP`] (`100`). At
-//! publish time the tip can still advance before the reveal is mined, so
-//! selection and the pre-broadcast re-check use the stricter effective bound
-//! [`BLOCK_ANCHOR_PUBLISH_MAX_GAP`] (`MAX_GAP − `[`BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN`]).
+//! **What this layer cannot check.** Nothing in the half-aggregate or the §3.5
+//! payload binds a per-member build tip. NISSHAC aggregation coefficients are
+//! computed over `(R, Pk)` only; `aggregate_verify` ignores `block_anchor`.
+//! `ProofData` carries no height and no block-anchor field. The publisher
+//! therefore **cannot** know that a claimed tip is the tip the proof was
+//! actually built against — see [`BatchMember::build_tip`].
+//!
+//! **Inclusion-delay budget.** The consensus scanner bound is
+//! `inclusion_height − anchor.height ≤ `[`BLOCK_ANCHOR_MAX_GAP`] (`100`).
+//! Selection and the pre-broadcast re-check use the stricter effective bound
+//! `MAX_GAP − `[`PublisherConfig::inclusion_delay_margin`]. With margin `m`,
+//! inclusion up to `m + 1` blocks after the pre-broadcast check still
+//! satisfies §3.5; beyond that the batch carries **zero** valid nullifiers
+//! while its fees remain spent. The margin is a **budget**, not a guarantee —
+//! RBF fee-bumping is **not** available for the commit transaction (bumping
+//! would change `commit_txid` and invalidate the pre-built reveal). The only
+//! lever is an adequate `fee_rate_sat_per_vb` up front (and a larger margin).
 //!
 //! ## Batch size is the caller's policy
 //!
 //! This module **never auto-splits** a batch. Which nullifiers share one
 //! inscription is a policy decision (first-occurrence / fee / privacy). If the
 //! resulting reveal exceeds Bitcoin Core's standardness weight limit, publish
-//! fails loudly and the caller must split and re-submit. Use
+//! fails loudly and the caller must split and re-submit. Member-count and
+//! reveal-weight checks run **before** any per-member chain RPC so an
+//! unpublishable batch costs O(1) RPCs. Use
 //! [`max_half_agg_members_for_standard_reveal`] to learn the bound for a given
 //! payload shape.
 //!
@@ -42,6 +58,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -89,31 +107,61 @@ pub const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 /// Scanner consensus bound: `inclusion_height − block_anchor.height ≤ 100`.
 pub const BLOCK_ANCHOR_MAX_GAP: u32 = 100;
 
-/// Blocks reserved so inclusion can lag the tip after publish selection.
+/// Recommended inclusion-delay margin (blocks of tip advance reserved so the
+/// reveal can still land inside [`BLOCK_ANCHOR_MAX_GAP`]).
 ///
-/// Publish-time selection cannot know the eventual inclusion height. This
-/// margin is subtracted from [`BLOCK_ANCHOR_MAX_GAP`] to form
-/// [`BLOCK_ANCHOR_PUBLISH_MAX_GAP`].
+/// Callers pass this value explicitly as
+/// [`PublisherConfig::inclusion_delay_margin`]. It is **not** applied as a
+/// silent default — the field is mandatory on the config struct. Must be
+/// strictly less than [`BLOCK_ANCHOR_MAX_GAP`].
+///
+/// With margin `m` and pre-broadcast tip `T`, an anchor that passes the
+/// effective bound (`MAX_GAP − m`) still satisfies the §3.5 consensus gap of
+/// 100 when the reveal is included at any height `≤ T + 1 + m` (i.e. up to
+/// `m + 1` blocks after the pre-broadcast tip). Later inclusion yields a gap
+/// `> 100` and the batch carries zero valid nullifiers while fees remain spent.
 pub const BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN: u32 = 6;
 
-/// Effective max gap at selection and pre-broadcast re-check:
+/// Effective publish max gap when using the **recommended** margin:
 /// [`BLOCK_ANCHOR_MAX_GAP`] − [`BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN`] = 94.
 ///
-/// If `(tip + 1) − anchor.height` exceeds this bound, members must re-prove
-/// against a fresher tip. The consensus scanner bound remains
-/// [`BLOCK_ANCHOR_MAX_GAP`].
+/// Prefer computing `BLOCK_ANCHOR_MAX_GAP − config.inclusion_delay_margin` at
+/// runtime (see [`publish_max_gap`]). This constant documents the recommended
+/// effective bound only.
 pub const BLOCK_ANCHOR_PUBLISH_MAX_GAP: u32 =
     BLOCK_ANCHOR_MAX_GAP - BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN;
 
 /// Cap on fee/topology fixed-point rounds before failing loudly.
 const MAX_FEE_CONVERGENCE_ROUNDS: usize = 5;
 
+/// Maximum number of funding UTXOs for which a signed commit is **constructed**
+/// (built + `signrawtransactionwithwallet`) per `publish` call.
+///
+/// Candidates that fail the arithmetic pre-filter (cannot cover
+/// `reveal_output_value` plus theoretical minimum fees) are skipped without
+/// construction and do not count toward this limit. Exhausting the limit fails
+/// loudly with counts of constructed attempts and pre-filter skips.
+const MAX_FUNDING_CONSTRUCT_ATTEMPTS: usize = 32;
+
+/// Absolute lower bound on commit vsize (vB) for a single deterministic segwit
+/// input and one P2TR output with no change. Intentionally low so the funding
+/// pre-filter never skips a UTXO that could still succeed after measurement.
+const MIN_COMMIT_VSIZE_LOWER_BOUND: usize = 100;
+
 /// Configuration for a [`Publisher`] talking to one bitcoind wallet.
 ///
 /// Every field is mandatory. There is no default fee rate, no default reveal
-/// output value, no default network, and no password-based RPC auth — missing
-/// values fail at the call site that builds this struct, not inside the
-/// publisher.
+/// output value, no default network, no default inclusion-delay margin, and no
+/// password-based RPC auth — missing values fail at the call site that builds
+/// this struct, not inside the publisher.
+///
+/// ## Commit fee policy (no RBF path)
+///
+/// **RBF fee-bumping is not available for the commit transaction.** Bumping
+/// the commit would change `commit_txid` and invalidate the pre-built reveal
+/// (which spends that exact outpoint). The only levers for timely inclusion
+/// are choosing an adequate [`Self::fee_rate_sat_per_vb`] up front and a
+/// sufficient [`Self::inclusion_delay_margin`].
 #[derive(Clone, Debug)]
 pub struct PublisherConfig {
     /// Base RPC URL, e.g. `http://127.0.0.1:18443`. The wallet path is appended.
@@ -123,19 +171,47 @@ pub struct PublisherConfig {
     /// Name of the loaded descriptor wallet that funds the commit.
     pub wallet_name: String,
     /// Fee rate in satoshis per virtual byte. Applied to measured vsizes.
+    /// Must be set high enough for timely inclusion — see struct-level note
+    /// on the absence of a commit RBF path.
     pub fee_rate_sat_per_vb: u64,
     /// Explicit value of the reveal transaction's single output. Must sit
     /// at or above the dust limit of its scriptPubKey.
     pub reveal_output_value: Amount,
     /// zkCoins network constant used for aggregate signature verification
     /// (`m_state`). Must match the network the members signed against.
+    ///
+    /// Chain binding (exact): `Mainnet↔Bitcoin`, `Testnet↔Signet`,
+    /// `Regtest↔Regtest`. Testnet3 / Testnet4 are **not** accepted for
+    /// [`Network::Testnet`] — the normative testnet is Signet (§3.6).
     pub network: Network,
+    /// Blocks of tip advance reserved between the pre-broadcast freshness
+    /// check and eventual reveal inclusion.
+    ///
+    /// Must be strictly less than [`BLOCK_ANCHOR_MAX_GAP`]. The recommended
+    /// value is [`BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN`] (`6`); callers must
+    /// set it explicitly (no silent default).
+    ///
+    /// **What the margin buys.** Effective publish bound is
+    /// `BLOCK_ANCHOR_MAX_GAP − inclusion_delay_margin`. With margin `m`, if
+    /// the pre-broadcast tip is `T` and the anchor passes the effective
+    /// bound, inclusion at height `≤ T + 1 + m` still satisfies the §3.5
+    /// consensus gap of 100. Inclusion later than that makes the batch carry
+    /// **zero** valid nullifiers under a conformant scanner while the commit
+    /// and reveal fees remain spent. The margin is a budget for mempool lag,
+    /// not a guarantee of inclusion within that window — see the struct-level
+    /// note that commit RBF is unavailable.
+    pub inclusion_delay_margin: u32,
 }
 
 /// Connected publisher bound to one wallet RPC endpoint.
 pub struct Publisher {
     rpc: Client,
     config: PublisherConfig,
+    /// Test-only: invoked once immediately before the pre-broadcast anchor
+    /// identity re-check, so a deterministic reorg can be injected without
+    /// racing the publish path.
+    #[cfg(test)]
+    pre_broadcast_hook: Mutex<Option<Box<dyn FnMut(&Client) + Send>>>,
 }
 
 /// One batch member together with the chain tip its proof was built against (§3.5).
@@ -143,22 +219,41 @@ pub struct Publisher {
 pub struct BatchMember {
     /// Half-aggregate contribution (BIP-340 `Pk`, `R`, `s`).
     pub sig: NullifierSig,
-    /// Proof-time Bitcoin tip this member was built against.
+    /// Caller-asserted Bitcoin tip this member claims it was built against.
     ///
-    /// **Caller assertion, not crypto-bound.** NISSHAC half-aggregation does
-    /// not commit to `build_tip`; the aggregate signature only covers the
-    /// publisher-chosen batch `block_anchor` in the payload header. The
-    /// publisher validates **every** member's tip against this node's chain
-    /// (`height ≤ tip`, `hash == getblockhash(height)`) as an operational
-    /// precondition before selecting the oldest tip as the batch anchor.
+    /// ## What the publisher *does* check
     ///
-    /// A dishonest submitter can **overstate freshness** by claiming a tip that
-    /// exists on-chain but is newer than the real proof-time height. The
-    /// scanner cannot observe that lie from the half-aggregate alone, so there
-    /// is no consensus divergence at the inscription layer; closing the gap
-    /// requires proof-layer tip supply (out of scope for the v1 publisher).
-    /// Cryptographic binding of proof-time height lives in the per-account
-    /// proof, not here.
+    /// Every member's claimed tip exists on **this** node's canonical chain
+    /// and is not in the future: `height ≤ node tip` and
+    /// `hash == getblockhash(height)`. The oldest validated tip becomes the
+    /// batch `block_anchor`. Immediately before broadcast that selected
+    /// identity is re-verified (not merely the height gap).
+    ///
+    /// ## What the publisher *cannot* check
+    ///
+    /// That the claimed tip is the tip the proof was **actually** built
+    /// against. Nothing in the half-aggregate or the §3.5 payload binds a
+    /// per-member build tip:
+    /// - NISSHAC aggregation coefficients are computed over `(R, Pk)` members
+    ///   only; `aggregate_verify` ignores `block_anchor` entirely.
+    /// - The publisher-chosen batch `block_anchor` is written into the payload
+    ///   header after aggregation; it is not a commitment to each member's
+    ///   proof-time height.
+    /// - `ProofData` has no height field and no block-anchor field.
+    ///
+    /// ## Real consequence of a dishonest claim
+    ///
+    /// A submitter whose proof was really built at `H−150` can claim the
+    /// current tip `H`. The batch is then admitted, whereas the truthful
+    /// anchor would have given gap 151 and the batch would have carried
+    /// **zero** valid nullifiers under §3.5. The lie converts a rejection into
+    /// an acceptance. All conformant scanners accept the batch identically, so
+    /// there is no divergence *between* nodes — but §3.5's
+    /// actual-oldest-tip requirement is **not enforced** by this layer.
+    ///
+    /// This is therefore a **trust assumption on the submitting caller**, to
+    /// be closed by a future version that carries a proof-bound tip. Do not
+    /// treat chain-existence validation as cryptographic binding.
     pub build_tip: BlockAnchor,
 }
 
@@ -177,8 +272,8 @@ pub struct PublishedBatch {
     pub commit_output: TxOut,
     /// Publisher-chosen §3.5 anchor: the chain-consistency-checked oldest
     /// member tip (`height ≤ node tip`, `hash == getblockhash(height)`).
-    /// Not a crypto-bound field of the half-aggregate — only the selected
-    /// anchor is covered by the aggregate signature in the payload header.
+    /// Written into the payload header; not a crypto-bound commitment to each
+    /// member's actual proof-time height (see [`BatchMember::build_tip`]).
     pub block_anchor: BlockAnchor,
 }
 
@@ -225,6 +320,14 @@ impl Publisher {
             !config.cookie_path.as_os_str().is_empty(),
             "PublisherConfig.cookie_path must not be empty"
         );
+        // Fail loudly on an unusable margin before any RPC. No silent clamp.
+        publish_max_gap(config.inclusion_delay_margin).with_context(|| {
+            format!(
+                "PublisherConfig.inclusion_delay_margin {} is invalid \
+                 (must be < BLOCK_ANCHOR_MAX_GAP={BLOCK_ANCHOR_MAX_GAP})",
+                config.inclusion_delay_margin
+            )
+        })?;
 
         let base = config.rpc_url.trim_end_matches('/');
         let wallet_url = format!("{base}/wallet/{}", config.wallet_name);
@@ -247,7 +350,12 @@ impl Publisher {
             )
         })?;
 
-        Ok(Self { rpc, config })
+        Ok(Self {
+            rpc,
+            config,
+            #[cfg(test)]
+            pre_broadcast_hook: Mutex::new(None),
+        })
     }
 
     /// Tip block as a [`BlockAnchor`].
@@ -282,12 +390,15 @@ impl Publisher {
     ///
     /// ## Failure modes (nothing is broadcast unless all checks pass)
     ///
-    /// - empty batch
+    /// - empty batch / member count exceeds `u16::MAX`
+    /// - reveal exceeds [`MAX_STANDARD_TX_WEIGHT`] (checked **before** any
+    ///   per-member chain RPC)
     /// - invalid / inconsistent member build tips (§3.5 oldest-tip rule)
     /// - aggregate verification failure (wrong network, corrupted `s`, …)
-    /// - reveal or commit exceeds [`MAX_STANDARD_TX_WEIGHT`]
-    /// - no eligible funding UTXO covers the final measured fees
+    /// - no eligible funding UTXO covers the inscription (arithmetic pre-filter
+    ///   and/or measured fees; attempt limit exhausted)
     /// - fee/topology fixed-point does not converge
+    /// - selected `block_anchor` reorged out or became too stale before broadcast
     ///
     /// **Batch composition is never auto-split.** An oversized batch fails
     /// with an actionable error; the caller decides how to split.
@@ -296,7 +407,39 @@ impl Publisher {
             !members.is_empty(),
             "publish requires at least one BatchMember"
         );
+        let member_count = members.len();
+        ensure!(
+            member_count <= usize::from(u16::MAX),
+            "batch member count {member_count} exceeds u16::MAX ({}); split the batch — \
+             the publisher does not auto-split",
+            u16::MAX
+        );
 
+        // ── O(1) structural gates before any per-member getblockhash ────
+        // Half-agg payload size depends only on member count (fixed header +
+        // 64 B per member + 32 B s_agg). A synthetic payload of that shape is
+        // enough to reject an unpublishable batch without chain RPCs.
+        let sizing_scalar = {
+            let mut s = [0u8; 32];
+            s[31] = 1;
+            s
+        };
+        let sizing_payload = synthetic_half_agg_payload(
+            member_count,
+            &NUMS_INTERNAL_KEY_BYTES,
+            &NUMS_INTERNAL_KEY_BYTES,
+            &sizing_scalar,
+        )
+        .context("synthetic sizing payload for pre-RPC weight check failed")?;
+        ensure_tx_within_standard_weight(
+            "reveal",
+            measure_reveal_weight(&sizing_payload)
+                .context("measure_reveal_weight for pre-RPC weight check failed")?,
+            member_count,
+            sizing_payload.len(),
+        )?;
+
+        // ── Per-member chain validation + anchor selection (RPC) ────────
         let block_anchor = self.select_block_anchor(members)?;
         let sigs: Vec<NullifierSig> = members.iter().map(|m| m.sig).collect();
         let aggregate = aggregate_sig_with_anchor(&sigs, block_anchor)
@@ -309,10 +452,9 @@ impl Publisher {
             )
         })?;
         let payload = aggregate.serialize();
-        let member_count = members.len();
 
-        // Fail before any funding selection / broadcast if the reveal alone is
-        // not standard. The NUMS key path cannot recover a stuck commit.
+        // Real payload must also be standard (same weight class as sizing; the
+        // NUMS key path cannot recover a stuck commit).
         ensure_tx_within_standard_weight(
             "reveal",
             measure_reveal_weight(&payload)?,
@@ -356,11 +498,60 @@ impl Publisher {
             self.config.wallet_name
         );
 
-        let mut best_shortfall: Option<(Amount, Amount, usize)> = None;
+        // Arithmetic pre-filter: skip candidates that cannot cover even the
+        // theoretical minimum without building or signing anything.
+        let reveal_vsize_for_min = sizing_inscription(&payload)
+            .context("sizing inscription for theoretical min funding failed")?
+            .reveal_tx
+            .vsize();
+        let theoretical_min = theoretical_min_funding_required(
+            self.config.reveal_output_value,
+            reveal_vsize_for_min,
+            self.config.fee_rate_sat_per_vb,
+        )?;
+
+        let mut best_before: Option<(Amount, Amount)> = None;
+        let mut best_after: Option<(Amount, Amount)> = None;
+        let mut skipped_before_construct: usize = 0;
+        let mut constructed_attempts: usize = 0;
+        let mut before_count: usize = 0;
+        let mut after_count: usize = 0;
         let mut last_non_funding_err: Option<anyhow::Error> = None;
         let mut built: Option<ConvergedInscription> = None;
 
-        for (index, funding) in candidates.iter().enumerate() {
+        for funding in candidates.iter() {
+            if funding.amount < theoretical_min {
+                skipped_before_construct = skipped_before_construct
+                    .checked_add(1)
+                    .context("skipped_before_construct overflow")?;
+                before_count = before_count
+                    .checked_add(1)
+                    .context("before_count overflow")?;
+                record_best_shortfall(
+                    &mut best_before,
+                    theoretical_min,
+                    funding.amount,
+                );
+                continue;
+            }
+
+            if constructed_attempts >= MAX_FUNDING_CONSTRUCT_ATTEMPTS {
+                bail!(
+                    "funding construct attempt limit exhausted: constructed {} attempt(s) \
+                     (limit {MAX_FUNDING_CONSTRUCT_ATTEMPTS}), \
+                     prefilter_skipped_before_construct={skipped_before_construct}, \
+                     rejected_before_measurement={before_count}, \
+                     rejected_after_measurement={after_count}, \
+                     candidates_listed={}; refusing further signrawtransactionwithwallet calls",
+                    constructed_attempts,
+                    candidates.len()
+                );
+            }
+
+            constructed_attempts = constructed_attempts
+                .checked_add(1)
+                .context("constructed_attempts overflow")?;
+
             match self.converge_fees_and_build(
                 &payload,
                 funding,
@@ -372,56 +563,41 @@ impl Publisher {
                     built = Some(converged);
                     break;
                 }
-                Err(err) => {
-                    if let Some((required, have)) = shortfall_amounts(&err) {
-                        let shortfall = required
-                            .checked_sub(have)
-                            .unwrap_or(required);
-                        match &mut best_shortfall {
-                            None => best_shortfall = Some((required, have, index + 1)),
-                            Some((best_req, best_have, tried)) => {
-                                let best_gap = best_req
-                                    .checked_sub(*best_have)
-                                    .unwrap_or(*best_req);
-                                if shortfall < best_gap
-                                    || (shortfall == best_gap && have > *best_have)
-                                {
-                                    *best_req = required;
-                                    *best_have = have;
-                                }
-                                *tried = index + 1;
-                            }
-                        }
-                        continue;
+                Err(err) => match classify_funding_reject(&err) {
+                    Some(FundingRejectKind::BeforeMeasurement { have, required }) => {
+                        before_count = before_count
+                            .checked_add(1)
+                            .context("before_count overflow")?;
+                        record_best_shortfall(&mut best_before, required, have);
                     }
-                    // Non-funding errors (signing, drift, …) are fatal.
-                    last_non_funding_err = Some(err);
-                    break;
-                }
+                    Some(FundingRejectKind::AfterMeasurement { have, required }) => {
+                        after_count = after_count
+                            .checked_add(1)
+                            .context("after_count overflow")?;
+                        record_best_shortfall(&mut best_after, required, have);
+                    }
+                    None => {
+                        // Non-funding errors (signing, drift, …) are fatal.
+                        last_non_funding_err = Some(err);
+                        break;
+                    }
+                },
             }
         }
 
-        let converged = match (built, last_non_funding_err, best_shortfall) {
-            (Some(c), _, _) => c,
-            (None, Some(err), _) => return Err(err),
-            (None, None, Some((required, best, tried))) => {
+        let converged = match (built, last_non_funding_err) {
+            (Some(c), _) => c,
+            (None, Some(err)) => return Err(err),
+            (None, None) => {
                 bail!(
-                    "no eligible funding UTXO covers final measured fees of {} sat; \
-                     best candidate has {} sat (shortfall {} sat); tried {} of {} candidate(s)",
-                    required.to_sat(),
-                    best.to_sat(),
-                    required
-                        .checked_sub(best)
-                        .map(|a| a.to_sat())
-                        .unwrap_or(required.to_sat()),
-                    tried,
-                    candidates.len()
-                );
-            }
-            (None, None, None) => {
-                bail!(
-                    "no eligible funding UTXO could fund the inscription \
-                     ({} candidate(s) tried)",
+                    "no eligible funding UTXO covers the inscription; \
+                     rejected_before_measurement={before_count}{}, \
+                     rejected_after_measurement={after_count}{}, \
+                     constructed_attempts={constructed_attempts}/{MAX_FUNDING_CONSTRUCT_ATTEMPTS}, \
+                     prefilter_skipped_before_construct={skipped_before_construct}, \
+                     candidates_listed={}",
+                    format_best_shortfall_clause("arithmetic minimum", best_before),
+                    format_best_shortfall_clause("measured requirement", best_after),
                     candidates.len()
                 );
             }
@@ -457,18 +633,26 @@ impl Publisher {
             converged.reveal_vsize
         );
 
-        // Re-check tip immediately before broadcast — the chain may have
-        // advanced during fee convergence / signing.
-        let tip_now = self.current_anchor().context(
-            "get tip before sendrawtransaction failed; refusing to broadcast without freshness re-check",
-        )?;
-        ensure_publish_gap_ok(block_anchor, tip_now).with_context(|| {
-            format!(
-                "block_anchor became too stale before sendrawtransaction \
-                 (anchor height {}, tip now {}); refusing broadcast",
-                block_anchor.height, tip_now.height
-            )
-        })?;
+        // Test-only injection point: deterministic reorg before the identity
+        // re-check (no wall-clock race).
+        #[cfg(test)]
+        {
+            if let Some(mut hook) = self
+                .pre_broadcast_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                hook(&self.rpc);
+            }
+        }
+
+        // Re-verify anchor **identity** (not just height gap) immediately
+        // before broadcast. A reorg during fee convergence can replace the
+        // block at the same height; a cached hash from selection would hide
+        // that. Always call getblockhash fresh — bypass any selection cache.
+        self.ensure_anchor_ready_for_broadcast(block_anchor)
+            .context("pre-broadcast anchor re-check failed; refusing sendrawtransaction")?;
 
         let commit_txid = converged.signed_commit.compute_txid();
         let reveal_txid = converged.reveal_tx.compute_txid();
@@ -511,6 +695,52 @@ impl Publisher {
             commit_output,
             block_anchor,
         })
+    }
+
+    /// Re-verify that `anchor` is still the canonical block at its height on
+    /// this node and that the publish gap still holds under the configured
+    /// inclusion-delay margin.
+    ///
+    /// Always issues a fresh `getblockhash(anchor.height)` — never uses a
+    /// selection-time cache. Called immediately before the first
+    /// `sendrawtransaction`.
+    pub fn ensure_anchor_ready_for_broadcast(&self, anchor: BlockAnchor) -> Result<()> {
+        let tip_now = self.current_anchor().context(
+            "get tip before sendrawtransaction failed; refusing to broadcast without freshness re-check",
+        )?;
+        let live_hash = self
+            .rpc
+            .get_block_hash(u64::from(anchor.height))
+            .with_context(|| {
+                format!(
+                    "getblockhash({}) for pre-broadcast anchor identity re-check failed",
+                    anchor.height
+                )
+            })?;
+        let live_bytes = live_hash.to_byte_array();
+        ensure!(
+            live_bytes == anchor.block_hash,
+            "block_anchor was reorged out before sendrawtransaction: \
+             selected hash {:x?} at height {} is no longer canonical; \
+             live getblockhash returns {:x?}; refusing broadcast \
+             (height-only gap check would have passed — identity re-check is mandatory)",
+            anchor.block_hash,
+            anchor.height,
+            live_bytes
+        );
+        ensure_publish_gap_ok(
+            anchor,
+            tip_now,
+            self.config.inclusion_delay_margin,
+        )
+        .with_context(|| {
+            format!(
+                "block_anchor became too stale before sendrawtransaction \
+                 (anchor height {}, tip now {}); refusing broadcast",
+                anchor.height, tip_now.height
+            )
+        })?;
+        Ok(())
     }
 
     /// Poll until `txid` has at least `min_conf` confirmations or `timeout`
@@ -609,12 +839,11 @@ impl Publisher {
     /// Choose the §3.5 `block_anchor` from member build tips.
     ///
     /// - **every** member's `build_tip` is validated: `height ≤ node tip` and
-    ///   `hash == getblockhash(height)` (RPC results cached per height)
+    ///   `hash == getblockhash(height)` (RPC results cached per height **within
+    ///   this call only** — the pre-broadcast re-check never uses this cache)
     /// - lowest `build_tip.height` wins among validated tips
     /// - ties require identical hashes (else members are on different chains)
-    /// - `(tip + 1) − anchor.height ≤ `[`BLOCK_ANCHOR_PUBLISH_MAX_GAP`] so the
-    ///   §3.5 inclusion gap can still hold after
-    ///   [`BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN`] blocks of tip advance
+    /// - `(tip + 1) − anchor.height ≤ MAX_GAP − config.inclusion_delay_margin`
     ///
     /// Offending member indices are named in error messages. `build_tip` is a
     /// caller assertion — see [`BatchMember::build_tip`].
@@ -626,7 +855,8 @@ impl Publisher {
 
         let node_tip = self.current_anchor()?;
         // Cache getblockhash results so multi-member batches at the same height
-        // issue one RPC call per distinct height.
+        // issue one RPC call per distinct height. This cache is call-local and
+        // is NOT reused by the pre-broadcast identity re-check.
         let mut hash_cache: HashMap<u32, [u8; 32]> = HashMap::new();
 
         for (index, member) in members.iter().enumerate() {
@@ -669,7 +899,11 @@ impl Publisher {
             }
         }
 
-        ensure_publish_gap_ok(oldest, node_tip)?;
+        ensure_publish_gap_ok(
+            oldest,
+            node_tip,
+            self.config.inclusion_delay_margin,
+        )?;
         Ok(oldest)
     }
 
@@ -893,9 +1127,11 @@ impl Publisher {
 
             if funding.amount < reveal_out {
                 bail!(
-                    "funding shortfall: UTXO {} sat < required {} sat \
-                     (reveal_output + commit_fee + reveal_fee) on no-change round {round}",
+                    "funding rejected before measurement: UTXO {} sat < arithmetic minimum {} sat \
+                     (reveal_output_value {}; no transaction was built or measured) \
+                     on no-change round {round}",
                     funding.amount.to_sat(),
+                    reveal_out.to_sat(),
                     reveal_out.to_sat()
                 );
             }
@@ -935,8 +1171,9 @@ impl Publisher {
                 sum_amounts(&[reveal_out, next_commit_fee, next_reveal_fee])?;
             if funding.amount < measured_required {
                 bail!(
-                    "funding shortfall: UTXO {} sat < required {} sat \
-                     (reveal_output + commit_fee + reveal_fee) on no-change round {round}",
+                    "funding rejected after measurement: UTXO {} sat < measured requirement {} sat \
+                     (reveal_output + measured commit_fee + measured reveal_fee) \
+                     on no-change round {round}",
                     funding.amount.to_sat(),
                     measured_required.to_sat()
                 );
@@ -1351,18 +1588,15 @@ pub fn nums_internal_key() -> Result<XOnlyPublicKey> {
 
 /// Whether bitcoind's chain matches the zkCoins [`Network`] config constant.
 ///
-/// Mapping (both sides named in connect errors):
+/// Exact mapping (anything else is a mismatch):
 /// - [`Network::Mainnet`] ↔ [`BitcoinNetwork::Bitcoin`]
-/// - [`Network::Testnet`] ↔ [`BitcoinNetwork::Testnet`],
-///   [`BitcoinNetwork::Testnet4`], or [`BitcoinNetwork::Signet`]
+/// - [`Network::Testnet`] ↔ [`BitcoinNetwork::Signet`] only
+///   (normative testnet is Signet per §3.6; Testnet3/Testnet4 are rejected)
 /// - [`Network::Regtest`] ↔ [`BitcoinNetwork::Regtest`]
 pub fn chain_matches_config(chain: BitcoinNetwork, config_network: Network) -> bool {
     match (config_network, chain) {
         (Network::Mainnet, BitcoinNetwork::Bitcoin) => true,
-        (
-            Network::Testnet,
-            BitcoinNetwork::Testnet | BitcoinNetwork::Testnet4 | BitcoinNetwork::Signet,
-        ) => true,
+        (Network::Testnet, BitcoinNetwork::Signet) => true,
         (Network::Regtest, BitcoinNetwork::Regtest) => true,
         _ => false,
     }
@@ -1370,7 +1604,7 @@ pub fn chain_matches_config(chain: BitcoinNetwork, config_network: Network) -> b
 
 /// Fail if bitcoind's chain and [`PublisherConfig::network`] disagree.
 ///
-/// Error names both sides and documents the expected mapping.
+/// Error names both the configured network and the chain bitcoind reported.
 pub fn ensure_chain_matches_config(
     chain: BitcoinNetwork,
     config_network: Network,
@@ -1378,9 +1612,24 @@ pub fn ensure_chain_matches_config(
     ensure!(
         chain_matches_config(chain, config_network),
         "bitcoind chain {chain:?} does not match PublisherConfig.network {config_network:?} \
-         (expected mapping: Bitcoin↔Mainnet, Testnet|Testnet4|Signet↔Testnet, Regtest↔Regtest)"
+         (expected mapping: Bitcoin↔Mainnet, Signet↔Testnet, Regtest↔Regtest; \
+         Testnet3/Testnet4 are not accepted for Network::Testnet)"
     );
     Ok(())
+}
+
+/// Effective publish max gap for a configured inclusion-delay margin:
+/// [`BLOCK_ANCHOR_MAX_GAP`] − `inclusion_delay_margin`.
+///
+/// Fails loudly when `inclusion_delay_margin >= BLOCK_ANCHOR_MAX_GAP` (no
+/// silent clamp, no default).
+pub fn publish_max_gap(inclusion_delay_margin: u32) -> Result<u32> {
+    ensure!(
+        inclusion_delay_margin < BLOCK_ANCHOR_MAX_GAP,
+        "inclusion_delay_margin {inclusion_delay_margin} must be < \
+         BLOCK_ANCHOR_MAX_GAP ({BLOCK_ANCHOR_MAX_GAP}); refusing silent clamp"
+    );
+    Ok(BLOCK_ANCHOR_MAX_GAP - inclusion_delay_margin)
 }
 
 /// Minimum inclusion gap if the reveal is mined in the next block:
@@ -1401,24 +1650,45 @@ pub fn publish_inclusion_gap(anchor: BlockAnchor, node_tip: BlockAnchor) -> Resu
         .context("anchor height exceeds inclusion lower bound after tip check")
 }
 
-/// Enforce [`BLOCK_ANCHOR_PUBLISH_MAX_GAP`] at selection and pre-broadcast.
+/// Enforce the effective publish gap bound at selection and pre-broadcast.
 ///
-/// On failure the message is `"members too stale, re-prove"` and includes the
-/// actual gap and the effective publish bound (not the consensus
-/// [`BLOCK_ANCHOR_MAX_GAP`] alone).
-pub fn ensure_publish_gap_ok(anchor: BlockAnchor, node_tip: BlockAnchor) -> Result<()> {
+/// Effective bound = [`BLOCK_ANCHOR_MAX_GAP`] − `inclusion_delay_margin`
+/// (see [`publish_max_gap`]). On failure the message is
+/// `"members too stale, re-prove"` and includes the actual gap and the
+/// effective publish bound (not the consensus [`BLOCK_ANCHOR_MAX_GAP`] alone).
+pub fn ensure_publish_gap_ok(
+    anchor: BlockAnchor,
+    node_tip: BlockAnchor,
+    inclusion_delay_margin: u32,
+) -> Result<()> {
+    let bound = publish_max_gap(inclusion_delay_margin)?;
     let gap = publish_inclusion_gap(anchor, node_tip)?;
     ensure!(
-        gap <= BLOCK_ANCHOR_PUBLISH_MAX_GAP,
+        gap <= bound,
         "members too stale, re-prove: oldest build tip height {} with node tip {} \
-         implies inclusion gap ≥ {} > effective publish bound {BLOCK_ANCHOR_PUBLISH_MAX_GAP} \
-         (§3.5 MAX_GAP={BLOCK_ANCHOR_MAX_GAP} − inclusion-delay margin \
-         {BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN}); refusing to substitute a fresher anchor",
+         implies inclusion gap ≥ {} > effective publish bound {bound} \
+         (§3.5 MAX_GAP={BLOCK_ANCHOR_MAX_GAP} − inclusion_delay_margin \
+         {inclusion_delay_margin}); refusing to substitute a fresher anchor",
         anchor.height,
         node_tip.height,
         gap
     );
     Ok(())
+}
+
+/// Theoretical minimum funding: `reveal_output_value` plus fees for the
+/// measured reveal vsize and a lower-bound commit vsize at the configured rate.
+///
+/// Used only as a pre-filter to skip hopeless UTXOs without signing. Admission
+/// still requires measured fees after construction.
+pub fn theoretical_min_funding_required(
+    reveal_output: Amount,
+    reveal_vsize: usize,
+    fee_rate_sat_per_vb: u64,
+) -> Result<Amount> {
+    let commit_fee = fee_for_vsize(MIN_COMMIT_VSIZE_LOWER_BOUND, fee_rate_sat_per_vb)?;
+    let reveal_fee = fee_for_vsize(reveal_vsize, fee_rate_sat_per_vb)?;
+    sum_amounts(&[reveal_output, commit_fee, reveal_fee])
 }
 
 /// Clamp provisional/pure fee seeds so a signed measure can be built.
@@ -1485,20 +1755,74 @@ fn sum_amounts(parts: &[Amount]) -> Result<Amount> {
     Ok(total)
 }
 
-/// Parse "funding shortfall: UTXO X sat < required Y sat" from an error chain.
-fn shortfall_amounts(err: &anyhow::Error) -> Option<(Amount, Amount)> {
+/// Funding-UTXO rejection kind. Distinguishes arithmetic pre-measurement
+/// shortfalls from shortfalls computed after a signed measure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FundingRejectKind {
+    /// No transaction was built or measured; `required` is an arithmetic minimum.
+    BeforeMeasurement { have: Amount, required: Amount },
+    /// A transaction was built and measured; `required` is the measured total.
+    AfterMeasurement { have: Amount, required: Amount },
+}
+
+/// Classify a funding rejection from an error chain. Returns `None` for
+/// non-funding errors (signing incomplete, fee cycle, …).
+fn classify_funding_reject(err: &anyhow::Error) -> Option<FundingRejectKind> {
     for cause in err.chain() {
         let msg = cause.to_string();
-        if let Some(rest) = msg.strip_prefix("funding shortfall: UTXO ") {
-            // "N sat < required M sat ..."
-            let mut parts = rest.split(" sat");
-            let have = parts.next()?.parse::<u64>().ok()?;
-            let rest2 = parts.next()?.strip_prefix(" < required ")?;
-            let required = rest2.parse::<u64>().ok()?;
-            return Some((Amount::from_sat(required), Amount::from_sat(have)));
+        if let Some(rest) = msg.strip_prefix("funding rejected before measurement: UTXO ") {
+            let (have, required) = parse_utxo_vs_required(rest, " < arithmetic minimum ")?;
+            return Some(FundingRejectKind::BeforeMeasurement { have, required });
+        }
+        if let Some(rest) = msg.strip_prefix("funding rejected after measurement: UTXO ") {
+            let (have, required) = parse_utxo_vs_required(rest, " < measured requirement ")?;
+            return Some(FundingRejectKind::AfterMeasurement { have, required });
         }
     }
     None
+}
+
+/// Parse `"N sat < … M sat …"` into `(have, required)`.
+fn parse_utxo_vs_required(rest: &str, middle: &str) -> Option<(Amount, Amount)> {
+    let (have_s, after_have) = rest.split_once(" sat")?;
+    let have = have_s.parse::<u64>().ok()?;
+    let after_mid = after_have.strip_prefix(middle)?;
+    let required_s = after_mid.split_whitespace().next()?;
+    let required = required_s.parse::<u64>().ok()?;
+    Some((Amount::from_sat(have), Amount::from_sat(required)))
+}
+
+fn record_best_shortfall(
+    best: &mut Option<(Amount, Amount)>,
+    required: Amount,
+    have: Amount,
+) {
+    let shortfall = required.checked_sub(have).unwrap_or(required);
+    match best {
+        None => *best = Some((required, have)),
+        Some((best_req, best_have)) => {
+            let best_gap = best_req.checked_sub(*best_have).unwrap_or(*best_req);
+            if shortfall < best_gap || (shortfall == best_gap && have > *best_have) {
+                *best_req = required;
+                *best_have = have;
+            }
+        }
+    }
+}
+
+fn format_best_shortfall_clause(label: &str, best: Option<(Amount, Amount)>) -> String {
+    match best {
+        Some((required, have)) => format!(
+            " (best {label}: required {} sat, have {} sat, shortfall {} sat)",
+            required.to_sat(),
+            have.to_sat(),
+            required
+                .checked_sub(have)
+                .map(|a| a.to_sat())
+                .unwrap_or(required.to_sat())
+        ),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1579,9 +1903,142 @@ mod tests {
         assert_eq!(key.serialize(), NUMS_INTERNAL_KEY_BYTES);
     }
 
-    /// Finding 1: oversized half-agg batch is rejected by the weight guard
-    /// before any bitcoind interaction. Payload built by repeating one valid
-    /// member (accepted by `aggregate_sig_with_anchor`).
+    /// Finding 1: exact chain mapping — Testnet binds only to Signet.
+    #[test]
+    fn chain_matches_config_exact_mapping() {
+        assert!(
+            chain_matches_config(BitcoinNetwork::Bitcoin, Network::Mainnet),
+            "Bitcoin ↔ Mainnet"
+        );
+        assert!(
+            chain_matches_config(BitcoinNetwork::Signet, Network::Testnet),
+            "Signet ↔ Testnet"
+        );
+        assert!(
+            chain_matches_config(BitcoinNetwork::Regtest, Network::Regtest),
+            "Regtest ↔ Regtest"
+        );
+
+        // Testnet3 / Testnet4 must NOT match Network::Testnet (spec pins Signet).
+        assert!(
+            !chain_matches_config(BitcoinNetwork::Testnet, Network::Testnet),
+            "Testnet3 must not match Network::Testnet"
+        );
+        assert!(
+            !chain_matches_config(BitcoinNetwork::Testnet4, Network::Testnet),
+            "Testnet4 must not match Network::Testnet"
+        );
+        assert!(
+            !chain_matches_config(BitcoinNetwork::Signet, Network::Mainnet),
+            "Signet must not match Mainnet"
+        );
+        assert!(
+            !chain_matches_config(BitcoinNetwork::Regtest, Network::Testnet),
+            "Regtest must not match Testnet"
+        );
+        assert!(
+            !chain_matches_config(BitcoinNetwork::Bitcoin, Network::Testnet),
+            "Bitcoin must not match Testnet"
+        );
+
+        let err = ensure_chain_matches_config(BitcoinNetwork::Testnet, Network::Testnet)
+            .expect_err("Testnet3 vs Network::Testnet must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Testnet") && (msg.contains("Signet") || msg.contains("mapping")),
+            "error must name both sides / mapping: {msg}"
+        );
+    }
+
+    /// Finding 4: margin ≥ MAX_GAP is rejected loudly (no silent clamp).
+    #[test]
+    fn inclusion_delay_margin_must_be_below_max_gap() {
+        let err = publish_max_gap(BLOCK_ANCHOR_MAX_GAP)
+            .expect_err("margin == MAX_GAP must fail");
+        assert!(
+            err.to_string().contains("inclusion_delay_margin"),
+            "unexpected: {err}"
+        );
+        let err = publish_max_gap(BLOCK_ANCHOR_MAX_GAP + 1)
+            .expect_err("margin > MAX_GAP must fail");
+        assert!(
+            err.to_string().contains("BLOCK_ANCHOR_MAX_GAP"),
+            "unexpected: {err}"
+        );
+        assert_eq!(
+            publish_max_gap(BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN).expect("recommended"),
+            BLOCK_ANCHOR_PUBLISH_MAX_GAP
+        );
+        assert_eq!(publish_max_gap(0).expect("zero margin"), BLOCK_ANCHOR_MAX_GAP);
+        assert_eq!(publish_max_gap(10).expect("custom 10"), 90);
+    }
+
+    /// Finding 5: oversized batch is rejected by the weight guard **before**
+    /// any per-member chain RPC. A batch that is both oversize and would need
+    /// many getblockhash lookups (distinct future heights) must surface the
+    /// weight error, not a chain/tip error.
+    #[test]
+    fn oversized_batch_rejected_before_chain_rpc() {
+        let (template, _) = signed_members(1, Network::Regtest);
+        let one = template[0];
+        let max = max_half_agg_members_for_standard_reveal()
+            .expect("max_half_agg_members_for_standard_reveal");
+        let over_n = max + 1;
+        // Distinct future heights — would force O(members) getblockhash if
+        // select_block_anchor ran first.
+        let members: Vec<BatchMember> = (0..over_n)
+            .map(|i| BatchMember {
+                sig: one,
+                build_tip: BlockAnchor {
+                    block_hash: {
+                        let mut h = [0u8; 32];
+                        h[0] = (i % 256) as u8;
+                        h[1] = ((i / 256) % 256) as u8;
+                        h
+                    },
+                    height: 1_000_000 + (i as u32),
+                },
+            })
+            .collect();
+
+        // Structural path used by publish() before select_block_anchor.
+        let sizing_scalar = {
+            let mut s = [0u8; 32];
+            s[31] = 1;
+            s
+        };
+        let sizing_payload = synthetic_half_agg_payload(
+            members.len(),
+            &NUMS_INTERNAL_KEY_BYTES,
+            &NUMS_INTERNAL_KEY_BYTES,
+            &sizing_scalar,
+        )
+        .expect("synthetic");
+        let w = measure_reveal_weight(&sizing_payload).expect("measure");
+        assert!(w > MAX_STANDARD_TX_WEIGHT, "fixture must be oversize");
+        let err = ensure_tx_within_standard_weight(
+            "reveal",
+            w,
+            members.len(),
+            sizing_payload.len(),
+        )
+        .expect_err("oversize must fail weight guard");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MAX_STANDARD_TX_WEIGHT") || msg.contains(&MAX_STANDARD_TX_WEIGHT.to_string()),
+            "must be weight error, not chain error: {msg}"
+        );
+        assert!(
+            !msg.contains("getblockhash")
+                && !msg.contains("canonical")
+                && !msg.contains("build_tip"),
+            "weight path must not mention chain validation: {msg}"
+        );
+        let _ = members; // keep the oversize+future-heights fixture live
+    }
+
+    /// Finding 1 (legacy name): oversized half-agg batch is rejected by the
+    /// weight guard before any bitcoind interaction.
     #[test]
     fn oversized_batch_rejected_by_standard_weight_guard() {
         let (template, _) = signed_members(1, Network::Regtest);
@@ -1687,6 +2144,18 @@ mod tests {
     }
 
     fn live_publisher_with(fee_rate_sat_per_vb: u64, reveal_output_value: Amount) -> Publisher {
+        live_publisher_with_margin(
+            fee_rate_sat_per_vb,
+            reveal_output_value,
+            BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN,
+        )
+    }
+
+    fn live_publisher_with_margin(
+        fee_rate_sat_per_vb: u64,
+        reveal_output_value: Amount,
+        inclusion_delay_margin: u32,
+    ) -> Publisher {
         let url = require_env("ZKCOINS_REGTEST_URL");
         let cookie = require_env("ZKCOINS_REGTEST_COOKIE");
         let wallet = require_env("ZKCOINS_REGTEST_WALLET");
@@ -1697,12 +2166,24 @@ mod tests {
             fee_rate_sat_per_vb,
             reveal_output_value,
             network: Network::Regtest,
+            inclusion_delay_margin,
         })
         .expect("Publisher::connect to live regtest must succeed")
     }
 
     fn live_publisher() -> Publisher {
         live_publisher_with(2, Amount::from_sat(1_000))
+    }
+
+    /// Install a one-shot pre-broadcast hook (test-only reorg injection).
+    fn set_pre_broadcast_hook<F>(publisher: &Publisher, hook: F)
+    where
+        F: FnMut(&Client) + Send + 'static,
+    {
+        *publisher
+            .pre_broadcast_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
     }
 
     fn signed_members(count: usize, m_state_network: Network) -> (Vec<NullifierSig>, &'static [u8]) {
@@ -2062,31 +2543,181 @@ mod tests {
         );
     }
 
-    /// Finding F2: connect fails when PublisherConfig.network disagrees with
-    /// the live bitcoind chain (Mainnet config against regtest).
+    /// Finding F2 / F1 live: connect fails when PublisherConfig.network
+    /// disagrees with the live bitcoind chain (Mainnet or Testnet against regtest).
     #[test]
     #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
     fn regtest_connect_rejects_network_mismatch() {
         let url = require_env("ZKCOINS_REGTEST_URL");
         let cookie = require_env("ZKCOINS_REGTEST_COOKIE");
         let wallet = require_env("ZKCOINS_REGTEST_WALLET");
-        let result = Publisher::connect(PublisherConfig {
+
+        let mainnet_err = match Publisher::connect(PublisherConfig {
+            rpc_url: url.clone(),
+            cookie_path: PathBuf::from(&cookie),
+            wallet_name: wallet.clone(),
+            fee_rate_sat_per_vb: 2,
+            reveal_output_value: Amount::from_sat(1_000),
+            network: Network::Mainnet,
+            inclusion_delay_margin: BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN,
+        }) {
+            Ok(_) => panic!("Mainnet config against regtest must fail connect"),
+            Err(e) => e,
+        };
+        let msg = mainnet_err.to_string();
+        assert!(
+            (msg.contains("Mainnet") || msg.contains("Bitcoin"))
+                && (msg.contains("Regtest") || msg.contains("regtest")),
+            "connect error must name both config and chain sides: {msg}"
+        );
+
+        // Finding 1: Network::Testnet must not accept regtest (only Signet).
+        let testnet_err = match Publisher::connect(PublisherConfig {
             rpc_url: url,
             cookie_path: PathBuf::from(cookie),
             wallet_name: wallet,
             fee_rate_sat_per_vb: 2,
             reveal_output_value: Amount::from_sat(1_000),
-            network: Network::Mainnet,
-        });
-        let err = match result {
-            Ok(_) => panic!("Mainnet config against regtest must fail connect"),
+            network: Network::Testnet,
+            inclusion_delay_margin: BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN,
+        }) {
+            Ok(_) => panic!("Testnet config against regtest must fail connect"),
+            Err(e) => e,
+        };
+        let msg = testnet_err.to_string();
+        assert!(
+            msg.contains("Testnet")
+                && (msg.contains("Regtest") || msg.contains("regtest") || msg.contains("Signet")),
+            "Testnet-vs-regtest connect error must name both sides: {msg}"
+        );
+    }
+
+    /// Finding 4 live: margin ≥ MAX_GAP rejected at connect; custom margin
+    /// bound still publishes at exactly the effective gap.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_custom_inclusion_delay_margin() {
+        let url = require_env("ZKCOINS_REGTEST_URL");
+        let cookie = require_env("ZKCOINS_REGTEST_COOKIE");
+        let wallet = require_env("ZKCOINS_REGTEST_WALLET");
+
+        let err = match Publisher::connect(PublisherConfig {
+            rpc_url: url,
+            cookie_path: PathBuf::from(cookie),
+            wallet_name: wallet,
+            fee_rate_sat_per_vb: 2,
+            reveal_output_value: Amount::from_sat(1_000),
+            network: Network::Regtest,
+            inclusion_delay_margin: BLOCK_ANCHOR_MAX_GAP,
+        }) {
+            Ok(_) => panic!("margin == MAX_GAP must fail connect"),
             Err(e) => e,
         };
         let msg = err.to_string();
         assert!(
-            (msg.contains("Mainnet") || msg.contains("Bitcoin"))
-                && (msg.contains("Regtest") || msg.contains("regtest")),
-            "connect error must name both config and chain sides: {msg}"
+            msg.contains("inclusion_delay_margin") || msg.contains("BLOCK_ANCHOR_MAX_GAP"),
+            "unexpected margin error: {msg}"
+        );
+
+        // Custom margin 10 → effective bound 90. Mine 89 after H → gap 90.
+        let custom_margin = 10u32;
+        let publisher =
+            live_publisher_with_margin(2, Amount::from_sat(1_000), custom_margin);
+        let bound = publish_max_gap(custom_margin).expect("bound");
+        assert_eq!(bound, 90);
+        let build_tip = publisher.current_anchor().expect("record tip H");
+        let mine_n_blocks = bound
+            .checked_sub(1)
+            .expect("bound >= 1");
+        mine_n(&publisher, u64::from(mine_n_blocks));
+        let tip_after = publisher.current_anchor().expect("tip after mine");
+        assert_eq!(
+            tip_after.height,
+            build_tip.height.checked_add(mine_n_blocks).expect("h"),
+            "must advance tip by exactly {mine_n_blocks}"
+        );
+        let gap = publish_inclusion_gap(build_tip, tip_after).expect("gap");
+        assert_eq!(gap, bound, "gap must equal effective bound");
+
+        let (sigs, m_state) = signed_members(1, Network::Regtest);
+        let batch = publisher
+            .publish(&[BatchMember {
+                sig: sigs[0],
+                build_tip,
+            }])
+            .expect("gap == custom effective bound must succeed");
+        assert_eq!(batch.block_anchor, build_tip);
+        aggregate_verify(&batch.aggregate, m_state).expect("verify");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm custom-margin publish");
+    }
+
+    /// Finding 3: pre-broadcast anchor identity re-check aborts on reorg
+    /// before any sendrawtransaction (mempool unchanged).
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_pre_broadcast_aborts_on_anchor_reorg() {
+        let publisher = live_publisher();
+        let before = mempool_txids(&publisher);
+        let tip = publisher.current_anchor().expect("tip");
+        let orphaned_hash = BlockHash::from_byte_array(tip.block_hash);
+        let orphaned_height = tip.height;
+
+        // After fee convergence / signing, reorg out the tip block and mine a
+        // replacement at the same height so getblockhash(height) returns a
+        // different identity. Funding UTXOs are mature coinbases deeper in
+        // the chain and remain spendable.
+        set_pre_broadcast_hook(&publisher, move |rpc| {
+            rpc.invalidate_block(&orphaned_hash)
+                .expect("invalidateblock of selected anchor");
+            let network = rpc
+                .get_blockchain_info()
+                .expect("getblockchaininfo")
+                .chain;
+            let addr = rpc
+                .get_new_address(None, Some(AddressType::Bech32m))
+                .expect("getnewaddress")
+                .require_network(network)
+                .expect("address network");
+            // Rebuild at least one block so height orphaned_height exists again
+            // with a different hash.
+            rpc.generate_to_address(1, &addr)
+                .expect("generatetoaddress after invalidate");
+            let live = rpc
+                .get_block_hash(u64::from(orphaned_height))
+                .expect("getblockhash after reorg");
+            assert_ne!(
+                live, orphaned_hash,
+                "reorg fixture must replace the block at the anchor height"
+            );
+        });
+
+        let (sigs, _) = signed_members(1, Network::Regtest);
+        let members = batch_at_tip(&publisher, &sigs);
+        assert_eq!(members[0].build_tip, tip);
+
+        let err = publisher
+            .publish(&members)
+            .expect_err("reorged anchor must fail pre-broadcast identity check");
+        // Full chain: outer context + root ensure! message.
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reorged")
+                || msg.contains("no longer canonical")
+                || msg.contains("identity"),
+            "error must name the identity failure: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{orphaned_height}"))
+                || msg.contains("height"),
+            "error must mention the anchor height: {msg}"
+        );
+        let after = mempool_txids(&publisher);
+        assert_eq!(
+            before, after,
+            "mempool must be unchanged — no sendrawtransaction after reorg"
         );
     }
 
@@ -2463,5 +3094,213 @@ mod tests {
             m_state,
         )
         .expect("verify");
+    }
+
+    /// Finding 5 live: arithmetic pre-filter skips unusable UTXOs without
+    /// signing them; construct-attempt limit fails loudly when exhausted.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_funding_prefilter_and_attempt_limit() {
+        let publisher = live_publisher_with(2, Amount::from_sat(1_000));
+        let btc_net = publisher.chain_network().expect("net");
+        let reveal_out = Amount::from_sat(1_000);
+
+        // Create several confirmed UTXOs strictly below reveal_output_value so
+        // the arithmetic pre-filter skips them without signrawtransaction.
+        let below = Amount::from_sat(500);
+        for _ in 0..3 {
+            let addr = publisher
+                .rpc
+                .get_new_address(None, Some(AddressType::Bech32m))
+                .expect("addr")
+                .require_network(btc_net)
+                .expect("net");
+            publisher
+                .rpc
+                .send_to_address(&addr, below, None, None, None, None, None, None)
+                .expect("create below-reveal utxo");
+        }
+        mine_one(&publisher);
+
+        // Lock every UTXO that could actually fund the inscription so publish
+        // can only see the below-reveal candidates.
+        let unspent = publisher
+            .rpc
+            .list_unspent(Some(1), None, None, Some(true), None)
+            .expect("listunspent");
+        let to_lock: Vec<OutPoint> = unspent
+            .iter()
+            .filter(|u| u.amount >= reveal_out)
+            .map(|u| OutPoint {
+                txid: u.txid,
+                vout: u.vout,
+            })
+            .collect();
+        assert!(
+            !to_lock.is_empty(),
+            "need large UTXOs to lock so only tiny candidates remain"
+        );
+        publisher
+            .rpc
+            .lock_unspent(&to_lock)
+            .expect("lock_unspent large UTXOs");
+
+        let result = (|| {
+            let candidates = publisher.list_funding_candidates().expect("cands");
+            assert!(
+                candidates.iter().all(|c| c.amount < reveal_out)
+                    && !candidates.is_empty(),
+                "after lock, only below-reveal candidates should remain: {:?}",
+                candidates.iter().map(|c| c.amount.to_sat()).collect::<Vec<_>>()
+            );
+
+            let (sigs, _) = signed_members(1, Network::Regtest);
+            let members = batch_at_tip(&publisher, &sigs);
+            let err = publisher
+                .publish(&members)
+                .expect_err("only below-reveal UTXOs must fail funding");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("rejected_before_measurement")
+                    || msg.contains("before measurement")
+                    || msg.contains("prefilter_skipped"),
+                "error must report unmeasured/prefilter rejection: {msg}"
+            );
+            assert!(
+                !msg.contains("final measured fees"),
+                "must not claim measured fees when nothing was measured: {msg}"
+            );
+            // All candidates should be pre-filter skips → zero constructions.
+            assert!(
+                msg.contains("constructed_attempts=0")
+                    || msg.contains("prefilter_skipped_before_construct"),
+                "must report zero constructions / prefilter skips: {msg}"
+            );
+            Ok::<(), String>(())
+        })();
+
+        let _ = publisher.rpc.unlock_unspent_all();
+        result.expect("F5 prefilter path");
+    }
+
+    /// Finding 6 live: funding below reveal_output_value is reported as an
+    /// unmeasured arithmetic shortfall — never as "measured".
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_funding_below_reveal_output_is_unmeasured() {
+        let reveal_out = Amount::from_sat(50_000);
+        let publisher = live_publisher_with(2, reveal_out);
+        let btc_net = publisher.chain_network().expect("net");
+
+        // Confirmed UTXO below reveal_output_value.
+        let tiny = Amount::from_sat(1_000);
+        let addr = publisher
+            .rpc
+            .get_new_address(None, Some(AddressType::Bech32m))
+            .expect("addr")
+            .require_network(btc_net)
+            .expect("net");
+        publisher
+            .rpc
+            .send_to_address(&addr, tiny, None, None, None, None, None, None)
+            .expect("create tiny");
+        mine_one(&publisher);
+
+        let unspent = publisher
+            .rpc
+            .list_unspent(Some(1), None, None, Some(true), None)
+            .expect("listunspent");
+        let to_lock: Vec<OutPoint> = unspent
+            .iter()
+            .filter(|u| u.amount != tiny)
+            .map(|u| OutPoint {
+                txid: u.txid,
+                vout: u.vout,
+            })
+            .collect();
+        if !to_lock.is_empty() {
+            publisher
+                .rpc
+                .lock_unspent(&to_lock)
+                .expect("lock all but tiny");
+        }
+
+        let result = (|| {
+            let (sigs, _) = signed_members(1, Network::Regtest);
+            let members = batch_at_tip(&publisher, &sigs);
+            let err = publisher
+                .publish(&members)
+                .expect_err("tiny < reveal_output must fail");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("rejected_before_measurement")
+                    || msg.contains("before measurement")
+                    || msg.contains("arithmetic"),
+                "error must name unmeasured arithmetic shortfall: {msg}"
+            );
+            assert!(
+                !msg.to_lowercase().contains("measured fees")
+                    && !msg.contains("final measured"),
+                "must not describe unmeasured rejection as measured: {msg}"
+            );
+            assert!(
+                msg.contains("rejected_after_measurement=0")
+                    || !msg.contains("rejected_after_measurement="),
+                "after-measurement count should be zero or absent: {msg}"
+            );
+            Ok::<(), String>(())
+        })();
+
+        let _ = publisher.rpc.unlock_unspent_all();
+        result.expect("F6 unmeasured shortfall path");
+    }
+
+    /// Finding 5 live (ordering): oversize batch fails with weight error via
+    /// the full publish path (not a chain/tip error), even when tips would
+    /// require many getblockhash calls.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_oversize_batch_fails_before_chain_lookups() {
+        let publisher = live_publisher();
+        let before = mempool_txids(&publisher);
+        let (template, _) = signed_members(1, Network::Regtest);
+        let one = template[0];
+        let max = max_half_agg_members_for_standard_reveal().expect("max");
+        let over_n = max + 1;
+        // Cap the constructed member list for time: still oversize weight, and
+        // future heights that would force many RPCs if selection ran first.
+        // max for standard reveal is typically thousands; building that many
+        // BatchMember structs is fine (Copy), and publish must weight-reject
+        // before select_block_anchor walks them with getblockhash.
+        let members: Vec<BatchMember> = (0..over_n)
+            .map(|i| BatchMember {
+                sig: one,
+                build_tip: BlockAnchor {
+                    block_hash: [0u8; 32],
+                    height: 9_000_000 + (i as u32),
+                },
+            })
+            .collect();
+        let err = publisher
+            .publish(&members)
+            .expect_err("oversize batch must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MAX_STANDARD_TX_WEIGHT")
+                || msg.contains(&MAX_STANDARD_TX_WEIGHT.to_string())
+                || msg.contains("weight"),
+            "must be weight error: {msg}"
+        );
+        assert!(
+            !msg.contains("getblockhash")
+                && !msg.contains("canonical block")
+                && !msg.contains("in the future"),
+            "must not reach per-member chain validation: {msg}"
+        );
+        assert_eq!(
+            before,
+            mempool_txids(&publisher),
+            "mempool unchanged after oversize reject"
+        );
     }
 }
