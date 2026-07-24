@@ -1,22 +1,39 @@
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use plonky2::field::types::{Field, PrimeField64};
-use plonky2::iop::target::Target;
+use num::BigUint;
+use plonky2::field::secp256k1_base::Secp256K1Base;
+use plonky2::field::secp256k1_scalar::Secp256K1Scalar;
+use plonky2::field::types::{Field, PrimeField, PrimeField64};
+use plonky2::hash::hash_types::HashOutTarget;
+use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::{PartialWitness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::CircuitConfig;
+use sha2::{Digest, Sha256};
 
 use shared::spec_v1::{
-    self as host, AccountState, Address, CoinTemplate, HashDigest, HcInput, TreeKind, ZERO_HASH,
+    self as host, AccountState, Address, Coin, CoinTemplate, HashDigest, HcInput, ProofData,
+    TreeKind, ZERO_HASH,
 };
 
+use crate::circuit::gadgets::biguint::WitnessBigUint;
+use crate::circuit::gadgets::curve::AffinePointTarget;
+use crate::circuit::gadgets::curve_types::{AffinePoint, Curve, CurveScalar, Secp256K1};
+use crate::circuit::gadgets::nonnative::NonNativeTarget;
 use crate::circuit::gadgets::u128_arith::U128Target;
 use crate::{C, D, F};
 
+use super::bindings::{
+    hash_proof_data_target, input_nullifiers_root_target, nk_commit_target, nullifier_target,
+};
 use super::serialize::encode_ascii_tag_elements;
 use super::skeleton::coin_identifier_target;
-use super::targets::{AccountStateTarget, OutputTemplateTarget};
+use super::targets::{
+    AccountStateTarget, InputAuthTarget, InputCoinTarget, OutputTemplateTarget, ProofDataTarget,
+};
 use super::*;
 
 fn digest(label: &[u8]) -> HashDigest {
@@ -140,6 +157,54 @@ fn set_output_templates(
     }
 }
 
+fn set_input_slot(
+    witness: &mut PartialWitness<F>,
+    coin_target: InputCoinTarget,
+    auth_target: InputAuthTarget,
+    input: Option<&InputFixture>,
+) {
+    if let Some(input) = input {
+        witness
+            .set_bool_target(coin_target.active, true)
+            .expect("active input assignment must succeed");
+        witness
+            .set_hash_target(coin_target.identifier, input.coin.identifier)
+            .expect("input identifier assignment must succeed");
+        set_bytes(witness, &coin_target.recipient, &input.coin.recipient.0);
+        set_u128(witness, coin_target.amount, input.coin.amount);
+        witness
+            .set_hash_target(coin_target.asset_id, input.coin.asset_id)
+            .expect("input asset-id assignment must succeed");
+        witness
+            .set_hash_target(auth_target.creating_prev_ash, input.creating_prev_ash)
+            .expect("creating prev ash assignment must succeed");
+        witness
+            .set_target(
+                auth_target.coin_index,
+                F::from_canonical_u32(input.coin_index),
+            )
+            .expect("coin index assignment must succeed");
+    } else {
+        witness
+            .set_bool_target(coin_target.active, false)
+            .expect("inactive input assignment must succeed");
+        witness
+            .set_hash_target(coin_target.identifier, ZERO_HASH)
+            .expect("inactive input identifier assignment must succeed");
+        set_bytes(witness, &coin_target.recipient, &[0u8; 32]);
+        set_u128(witness, coin_target.amount, 0);
+        witness
+            .set_hash_target(coin_target.asset_id, ZERO_HASH)
+            .expect("inactive input asset-id assignment must succeed");
+        witness
+            .set_hash_target(auth_target.creating_prev_ash, ZERO_HASH)
+            .expect("inactive creating prev ash assignment must succeed");
+        witness
+            .set_target(auth_target.coin_index, F::ZERO)
+            .expect("inactive coin index assignment must succeed");
+    }
+}
+
 fn bytes_as_u32_le_limbs(bytes: &[u8; 32]) -> [F; 8] {
     std::array::from_fn(|index| {
         let start = 28 - 4 * index;
@@ -168,6 +233,453 @@ fn sample_balances() -> (BTreeMap<[u8; 32], u128>, Vec<HashDigest>) {
     (balances, assets)
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn field_bytes<FF: PrimeField>(value: FF) -> [u8; 32] {
+    let encoded = value.to_canonical_biguint().to_bytes_be();
+    assert!(encoded.len() <= 32, "secp256k1 field value fits 32 bytes");
+    let mut bytes = [0u8; 32];
+    bytes[32 - encoded.len()..].copy_from_slice(&encoded);
+    bytes
+}
+
+fn is_odd<FF: PrimeField>(value: FF) -> bool {
+    (&value.to_canonical_biguint() & BigUint::from(1u8)) == BigUint::from(1u8)
+}
+
+fn tagged_hash(tag: &[u8], message: &[u8]) -> [u8; 32] {
+    let tag_hash = Sha256::digest(tag);
+    let mut preimage = Vec::with_capacity(64 + message.len());
+    preimage.extend_from_slice(&tag_hash);
+    preimage.extend_from_slice(&tag_hash);
+    preimage.extend_from_slice(message);
+    Sha256::digest(preimage).into()
+}
+
+fn deterministic_secret(label: &[u8]) -> Secp256K1Scalar {
+    let bytes = Sha256::digest(label);
+    let scalar = Secp256K1Scalar::from_noncanonical_biguint(BigUint::from_bytes_be(&bytes));
+    assert!(scalar.is_nonzero(), "deterministic secret must be non-zero");
+    scalar
+}
+
+fn normalized_key(secret: Secp256K1Scalar) -> (Secp256K1Scalar, AffinePoint<Secp256K1>, [u8; 32]) {
+    let mut normalized_secret = secret;
+    let mut public = (CurveScalar(normalized_secret) * Secp256K1::GENERATOR_PROJECTIVE).to_affine();
+    assert!(!public.zero, "non-zero secret produces a public key");
+    if is_odd(public.y) {
+        normalized_secret = -normalized_secret;
+        public = -public;
+    }
+    assert!(!is_odd(public.y), "BIP-340 public key must have even y");
+    (normalized_secret, public, field_bytes(public.x))
+}
+
+#[derive(Clone)]
+struct TransitionSignature {
+    rx: Secp256K1Base,
+    s: Secp256K1Scalar,
+    r_prime: AffinePoint<Secp256K1>,
+}
+
+fn sign_transition(
+    secret: Secp256K1Scalar,
+    public: AffinePoint<Secp256K1>,
+    h_proof_data: &[u8; 32],
+) -> TransitionSignature {
+    let pk_bytes = field_bytes(public.x);
+    for nonce_counter in 1u64.. {
+        let mut k_prime = Secp256K1Scalar::from_canonical_u64(nonce_counter);
+        let mut r_prime = (CurveScalar(k_prime) * Secp256K1::GENERATOR_PROJECTIVE).to_affine();
+        if is_odd(r_prime.y) {
+            k_prime = -k_prime;
+            r_prime = -r_prime;
+        }
+
+        let r_prime_bytes = field_bytes(r_prime.x);
+        let mut tweak_preimage = Vec::with_capacity(64);
+        tweak_preimage.extend_from_slice(&r_prime_bytes);
+        tweak_preimage.extend_from_slice(h_proof_data);
+        let tweak_bytes: [u8; 32] = Sha256::digest(tweak_preimage).into();
+        let tweak_integer = BigUint::from_bytes_be(&tweak_bytes);
+        if tweak_integer >= Secp256K1Scalar::order() {
+            continue;
+        }
+        let tweak = Secp256K1Scalar::from_noncanonical_biguint(tweak_integer);
+        let r = (r_prime + (CurveScalar(tweak) * Secp256K1::GENERATOR_PROJECTIVE).to_affine())
+            .to_affine();
+        if r.zero || is_odd(r.y) {
+            continue;
+        }
+
+        let rx_bytes = field_bytes(r.x);
+        let mut challenge_preimage = Vec::with_capacity(64 + M_STATE_TESTNET.len());
+        challenge_preimage.extend_from_slice(&rx_bytes);
+        challenge_preimage.extend_from_slice(&pk_bytes);
+        challenge_preimage.extend_from_slice(M_STATE_TESTNET);
+        let challenge_bytes = tagged_hash(b"BIP0340/challenge", &challenge_preimage);
+        let challenge =
+            Secp256K1Scalar::from_noncanonical_biguint(BigUint::from_bytes_be(&challenge_bytes));
+        let s = k_prime + tweak + challenge * secret;
+        if s.is_zero() {
+            continue;
+        }
+
+        let candidate = ((CurveScalar(s) * Secp256K1::GENERATOR_PROJECTIVE)
+            + (CurveScalar(challenge) * (-public).to_projective()))
+        .to_affine();
+        assert_eq!(candidate, r, "fresh host signature must satisfy BIP-340");
+        return TransitionSignature {
+            rx: r.x,
+            s,
+            r_prime,
+        };
+    }
+    unreachable!("deterministic nonce redraw must eventually succeed")
+}
+
+fn set_nonnative<FF: PrimeField>(
+    witness: &mut PartialWitness<F>,
+    target: &NonNativeTarget<FF>,
+    value: FF,
+) {
+    witness
+        .set_biguint_target(&target.value, &value.to_canonical_biguint())
+        .expect("set nonnative witness");
+}
+
+fn set_point(
+    witness: &mut PartialWitness<F>,
+    target: &AffinePointTarget<Secp256K1>,
+    point: AffinePoint<Secp256K1>,
+) {
+    set_nonnative(witness, &target.x, point.x);
+    set_nonnative(witness, &target.y, point.y);
+}
+
+#[derive(Clone)]
+struct InputFixture {
+    coin: Coin,
+    creating_prev_ash: HashDigest,
+    coin_index: u32,
+}
+
+#[derive(Clone)]
+struct ComplianceFixture {
+    prev_state: AccountState,
+    new_state: AccountState,
+    prev_ash: HashDigest,
+    templates: Vec<CoinTemplate>,
+    expected_coin_ids: Vec<HashDigest>,
+    inputs: Vec<InputFixture>,
+    nk: [u8; 32],
+    next_pubkey: [u8; 32],
+    npk_rand: [u8; 32],
+    proof_data: ProofData,
+    signature: TransitionSignature,
+    wrong_pubkey: [u8; 32],
+}
+
+impl ComplianceFixture {
+    fn new() -> Self {
+        let (balances, _assets) = sample_balances();
+        assert_eq!(
+            balances.len(),
+            3,
+            "fixture must exercise a partial slot count"
+        );
+        let owner = Address([0x19u8; 32]);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/compliance-d2/nk").into();
+        let nk_commit = host::nk_commit(&nk);
+
+        let (secret, public, current_pubkey) =
+            normalized_key(deterministic_secret(b"zkCoins/v1/compliance-d2/spend-key"));
+        let (_, _, wrong_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-d2/wrong-spend-key",
+        ));
+        assert_ne!(current_pubkey, wrong_pubkey);
+        let next_pubkey: [u8; 32] = Sha256::digest(b"zkCoins/v1/compliance-d2/next-pubkey").into();
+
+        let prev_state = AccountState::new(
+            owner,
+            nk_commit,
+            balances.clone(),
+            current_pubkey,
+            41,
+            digest(b"previous-coin-history-root"),
+        )
+        .expect("valid previous account state");
+        let new_state = AccountState::new(
+            owner,
+            nk_commit,
+            balances,
+            next_pubkey,
+            42,
+            digest(b"new-coin-history-root"),
+        )
+        .expect("valid new account state");
+        let prev_ash = host::account_state_hash(&prev_state).expect("previous ash must compute");
+        let expected_new_ash = host::account_state_hash(&new_state).expect("new ash must compute");
+
+        let templates = vec![
+            CoinTemplate {
+                recipient: Address([0x81u8; 32]),
+                amount: 5,
+                asset_id: digest(b"output-asset-0"),
+            },
+            CoinTemplate {
+                recipient: Address([0x82u8; 32]),
+                amount: (1u128 << 88) + 7,
+                asset_id: digest(b"output-asset-1"),
+            },
+            CoinTemplate {
+                recipient: Address([0x83u8; 32]),
+                amount: u128::MAX - 9,
+                asset_id: digest(b"output-asset-2"),
+            },
+        ];
+        let expected_coin_ids: Vec<HashDigest> = templates
+            .iter()
+            .enumerate()
+            .map(|(index, template)| {
+                host::coin_identifier(
+                    prev_ash,
+                    &template.recipient.0,
+                    template.asset_id,
+                    template.amount,
+                    index as u32,
+                )
+            })
+            .collect();
+        let output_coins_root = host::merkle_root(TreeKind::CoinsRoot, &expected_coin_ids);
+
+        let inputs: Vec<InputFixture> = [
+            (b"input-creating-prev-ash-0".as_slice(), 2u32, 91u128),
+            (
+                b"input-creating-prev-ash-1".as_slice(),
+                7u32,
+                (1u128 << 100) + 33,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (creating_label, coin_index, amount))| {
+            let creating_prev_ash = digest(creating_label);
+            let asset_id = digest(format!("input-asset-{index}").as_bytes());
+            let identifier =
+                host::coin_identifier(creating_prev_ash, &owner.0, asset_id, amount, coin_index);
+            InputFixture {
+                coin: Coin {
+                    identifier,
+                    recipient: owner,
+                    amount,
+                    asset_id,
+                },
+                creating_prev_ash,
+                coin_index,
+            }
+        })
+        .collect();
+        let nullifiers: Vec<_> = inputs
+            .iter()
+            .map(|input| host::nullifier(&nk, input.coin.identifier))
+            .collect();
+        let input_nullifiers_root = host::merkle_root(TreeKind::NullifiersRoot, &nullifiers);
+        let npk_rand = [0xa5u8; 32];
+        let expected_npk_commit = host::npk_commit(&next_pubkey, &npk_rand);
+        let proof_data = ProofData {
+            new_account_state_hash: expected_new_ash,
+            output_coins_root,
+            input_nullifiers_root,
+            coin_history_root: digest(b"pass-through-proof-coin-history-root"),
+            nav_commitment: digest(b"pass-through-nav-commitment"),
+            npk_commit: expected_npk_commit,
+        };
+        let serialized = host::serialize_proof_data(&proof_data);
+        let h_proof_data = host::hash_proof_data(&serialized);
+        let signature = sign_transition(secret, public, &h_proof_data);
+
+        Self {
+            prev_state,
+            new_state,
+            prev_ash,
+            templates,
+            expected_coin_ids,
+            inputs,
+            nk,
+            next_pubkey,
+            npk_rand,
+            proof_data,
+            signature,
+            wrong_pubkey,
+        }
+    }
+
+    fn witness(
+        &self,
+        targets: &ComplianceTargets,
+        layout: BalanceLayout,
+        mutation: WitnessMutation,
+    ) -> PartialWitness<F> {
+        let mut witness = PartialWitness::new();
+        let mut prev_state = self.prev_state.clone();
+        if matches!(mutation, WitnessMutation::WrongPublicKey) {
+            prev_state.current_pubkey = self.wrong_pubkey;
+        }
+        set_account_state_fixed(&mut witness, targets.prev_account_state, &prev_state);
+        set_account_state_fixed(&mut witness, targets.new_account_state, &self.new_state);
+        set_account_balances(
+            &mut witness,
+            targets.prev_account_state,
+            &prev_state,
+            layout,
+        );
+        set_account_balances(
+            &mut witness,
+            targets.new_account_state,
+            &self.new_state,
+            layout,
+        );
+        witness
+            .set_hash_target(targets.prev_account_state_hash, self.prev_ash)
+            .expect("prev ash witness assignment must succeed");
+
+        let mut witnessed_nk = self.nk;
+        if matches!(mutation, WitnessMutation::WrongNk) {
+            witnessed_nk[0] ^= 1;
+        }
+        set_bytes(&mut witness, &targets.nk, &witnessed_nk);
+
+        let wrong_input = if matches!(mutation, WitnessMutation::WrongInputIdentifier) {
+            let mut input = self.inputs[0].clone();
+            input.coin.identifier.elements[0] += F::ONE;
+            Some(input)
+        } else {
+            None
+        };
+        for index in 0..MAX_TX_INPUTS {
+            let source = if index == 0 {
+                wrong_input.as_ref().or_else(|| self.inputs.first())
+            } else if matches!(mutation, WitnessMutation::DuplicateNullifier) && index == 1 {
+                self.inputs.first()
+            } else {
+                self.inputs.get(index)
+            };
+            set_input_slot(
+                &mut witness,
+                targets.input_coins[index],
+                targets.input_auth[index],
+                source,
+            );
+        }
+
+        set_output_templates(&mut witness, &targets.output_templates, &self.templates);
+        set_bytes(&mut witness, &targets.next_pubkey, &self.next_pubkey);
+        set_bytes(&mut witness, &targets.npk_rand, &self.npk_rand);
+        set_bytes(
+            &mut witness,
+            &targets.consumed_pubkey,
+            &prev_state.current_pubkey,
+        );
+        witness
+            .set_hash_target(
+                targets.proof_data.coin_history_root,
+                self.proof_data.coin_history_root,
+            )
+            .expect("proof coin-history-root assignment must succeed");
+        witness
+            .set_hash_target(
+                targets.proof_data.nav_commitment,
+                self.proof_data.nav_commitment,
+            )
+            .expect("nav-commitment assignment must succeed");
+
+        set_nonnative(&mut witness, &targets.txn_sig_rx, self.signature.rx);
+        let signature_s = if matches!(mutation, WitnessMutation::WrongSignature) {
+            self.signature.s + Secp256K1Scalar::ONE
+        } else {
+            self.signature.s
+        };
+        set_nonnative(&mut witness, &targets.txn_sig_s, signature_s);
+        set_point(&mut witness, &targets.s2c_r_prime, self.signature.r_prime);
+        witness
+    }
+
+    fn expected_public_inputs(&self) -> Vec<F> {
+        let mut expected = Vec::with_capacity(40);
+        for digest in [
+            self.proof_data.new_account_state_hash,
+            self.proof_data.output_coins_root,
+            self.proof_data.input_nullifiers_root,
+            self.proof_data.coin_history_root,
+            self.proof_data.nav_commitment,
+        ] {
+            expected.extend(digest.elements);
+        }
+        expected.extend(bytes_as_u32_le_limbs(&self.proof_data.npk_commit));
+        expected.extend(bytes_as_u32_le_limbs(&self.prev_state.current_pubkey));
+        expected.extend(host::network_id_testnet().elements);
+        expected
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WitnessMutation {
+    None,
+    WrongSignature,
+    WrongPublicKey,
+    WrongNk,
+    DuplicateNullifier,
+    WrongInputIdentifier,
+}
+
+struct SharedCircuit {
+    circuit: SkeletonCircuit,
+    build_time: Duration,
+}
+
+static SHARED_CIRCUIT: OnceLock<SharedCircuit> = OnceLock::new();
+static FULL_CIRCUIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn shared_circuit() -> &'static SharedCircuit {
+    SHARED_CIRCUIT.get_or_init(|| {
+        let started = Instant::now();
+        let circuit = build_skeleton_circuit(
+            CircuitConfig::standard_recursion_zk_config(),
+            Network::Testnet,
+        );
+        SharedCircuit {
+            circuit,
+            build_time: started.elapsed(),
+        }
+    })
+}
+
+fn assert_rejected(label: &str, mutation: WitnessMutation) {
+    let shared = shared_circuit();
+    let fixture = ComplianceFixture::new();
+    let witness = fixture.witness(&shared.circuit.targets, BalanceLayout::Valid, mutation);
+    let result = catch_unwind(AssertUnwindSafe(|| shared.circuit.data.prove(witness)));
+    match result {
+        Err(_) | Ok(Err(_)) => {}
+        Ok(Ok(proof)) => {
+            assert!(
+                shared.circuit.data.verify(proof).is_err(),
+                "{label}: tampered witness unexpectedly proved and verified"
+            );
+        }
+    }
+    println!("{label}: PASS (rejected)");
+}
+
 #[test]
 fn local_tags_and_tag_encoding_match_shared() {
     let string_tags = [
@@ -175,6 +687,10 @@ fn local_tags_and_tag_encoding_match_shared() {
         (TAG_COIN, host::TAG_COIN),
         (TAG_COINS_ROOT_LEAF, host::TAG_COINS_ROOT_LEAF),
         (TAG_COINS_ROOT_NODE, host::TAG_COINS_ROOT_NODE),
+        (TAG_NK_COMMIT, host::TAG_NK_COMMIT),
+        (TAG_NULLIFIER, host::TAG_NULLIFIER),
+        (TAG_NULLIFIERS_ROOT_LEAF, host::TAG_NULLIFIERS_ROOT_LEAF),
+        (TAG_NULLIFIERS_ROOT_NODE, host::TAG_NULLIFIERS_ROOT_NODE),
         (TAG_NETWORK, host::TAG_NETWORK),
     ];
     for (local, shared) in string_tags {
@@ -192,6 +708,7 @@ fn local_tags_and_tag_encoding_match_shared() {
     assert_eq!(NETWORK_TAG_TESTNET, host::NETWORK_TAG_TESTNET);
     assert_eq!(NETWORK_TAG_REGTEST, host::NETWORK_TAG_REGTEST);
     assert_eq!(MAX_ACCOUNT_ASSETS, host::MAX_ACCOUNT_ASSETS);
+    assert_eq!(MAX_TX_INPUTS, 8);
 }
 
 #[test]
@@ -200,7 +717,7 @@ fn compliance_address_gadget_matches_host() {
     let nk_commit = digest(b"address-nk-commit");
     let expected = host::address(&pk0, nk_commit);
 
-    let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+    let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_zk_config());
     let pk0_target = super::targets::virtual_bytes(&mut builder);
     let nk_commit_target = builder.add_virtual_hash();
     let address_target =
@@ -242,7 +759,7 @@ fn compliance_coin_identifier_matches_host() {
         coin_index as u32,
     );
 
-    let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+    let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_zk_config());
     let prev_ash_target = builder.add_virtual_hash();
     let template_target = OutputTemplateTarget::new_virtual(&mut builder);
     let identifier =
@@ -279,174 +796,196 @@ fn compliance_coin_identifier_matches_host() {
     );
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
+#[test]
+fn compliance_nullifier_gadget_matches_host() {
+    let nk: [u8; 32] = Sha256::digest(b"compliance-nf-parity-nk").into();
+    let identifier = digest(b"compliance-nf-parity-coin");
+    let expected = host::nullifier(&nk, identifier);
+
+    let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_zk_config());
+    let nk_target = super::targets::virtual_bytes(&mut builder);
+    let identifier_target = builder.add_virtual_hash();
+    let nf = nullifier_target(&mut builder, &nk_target, identifier_target);
+    builder.register_public_inputs(&nf.elements);
+    let data = builder.build::<C>();
+
+    let mut witness = PartialWitness::new();
+    set_bytes(&mut witness, &nk_target, &nk);
+    witness
+        .set_hash_target(identifier_target, identifier)
+        .expect("identifier witness assignment must succeed");
+    let proof = data.prove(witness).expect("nf parity circuit must prove");
+    assert_eq!(proof.public_inputs, expected.elements.to_vec());
+    data.verify(proof).expect("nf parity proof must verify");
+    println!(
+        "compliance nf host parity: PASS {:?}",
+        digest_limbs(expected)
+    );
+}
+
+#[test]
+fn compliance_nk_commit_gadget_matches_host() {
+    let nk: [u8; 32] = Sha256::digest(b"compliance-nk-commit-parity").into();
+    let expected = host::nk_commit(&nk);
+
+    let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_zk_config());
+    let nk_target = super::targets::virtual_bytes(&mut builder);
+    let commitment = nk_commit_target(&mut builder, &nk_target);
+    builder.register_public_inputs(&commitment.elements);
+    let data = builder.build::<C>();
+
+    let mut witness = PartialWitness::new();
+    set_bytes(&mut witness, &nk_target, &nk);
+    let proof = data
+        .prove(witness)
+        .expect("nk_commit parity circuit must prove");
+    assert_eq!(proof.public_inputs, expected.elements.to_vec());
+    data.verify(proof)
+        .expect("nk_commit parity proof must verify");
+    println!(
+        "compliance nk_commit host parity: PASS {:?}",
+        digest_limbs(expected)
+    );
+}
+
+#[test]
+fn compliance_hash_proof_data_gadget_matches_host() {
+    let pd = ProofData {
+        new_account_state_hash: digest(b"hpd-new-ash"),
+        output_coins_root: digest(b"hpd-ocr"),
+        input_nullifiers_root: digest(b"hpd-inr"),
+        coin_history_root: digest(b"hpd-history"),
+        nav_commitment: digest(b"hpd-nav"),
+        npk_commit: Sha256::digest(b"hpd-npk").into(),
+    };
+    let expected = host::hash_proof_data(&host::serialize_proof_data(&pd));
+
+    let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_zk_config());
+    let target = ProofDataTarget {
+        new_account_state_hash: builder.add_virtual_hash(),
+        output_coins_root: builder.add_virtual_hash(),
+        input_nullifiers_root: builder.add_virtual_hash(),
+        coin_history_root: builder.add_virtual_hash(),
+        nav_commitment: builder.add_virtual_hash(),
+        npk_commit: super::targets::virtual_bytes(&mut builder),
+    };
+    let hash = hash_proof_data_target(&mut builder, &target);
+    builder.register_public_inputs(&hash);
+    let data = builder.build::<C>();
+
+    let mut witness = PartialWitness::new();
+    witness
+        .set_hash_target(target.new_account_state_hash, pd.new_account_state_hash)
+        .expect("new ash assignment");
+    witness
+        .set_hash_target(target.output_coins_root, pd.output_coins_root)
+        .expect("ocr assignment");
+    witness
+        .set_hash_target(target.input_nullifiers_root, pd.input_nullifiers_root)
+        .expect("inr assignment");
+    witness
+        .set_hash_target(target.coin_history_root, pd.coin_history_root)
+        .expect("history assignment");
+    witness
+        .set_hash_target(target.nav_commitment, pd.nav_commitment)
+        .expect("nav assignment");
+    set_bytes(&mut witness, &target.npk_commit, &pd.npk_commit);
+    let proof = data
+        .prove(witness)
+        .expect("H(ProofData) parity circuit must prove");
+    assert_eq!(
+        proof.public_inputs,
+        expected.map(F::from_canonical_u8).to_vec()
+    );
+    data.verify(proof)
+        .expect("H(ProofData) parity proof must verify");
+    println!(
+        "compliance H(ProofData) host parity: PASS {}",
+        hex_bytes(&expected)
+    );
+}
+
+#[test]
+fn compliance_input_nullifiers_root_gadget_matches_host_for_empty_one_and_partial() {
+    let nk: [u8; 32] = Sha256::digest(b"compliance-inr-parity-nk").into();
+    let identifiers: [HashDigest; MAX_TX_INPUTS] =
+        std::array::from_fn(|index| digest(format!("inr-identifier-{index}").as_bytes()));
+
+    let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_zk_config());
+    let nk_target = super::targets::virtual_bytes(&mut builder);
+    let active: [BoolTarget; MAX_TX_INPUTS] =
+        std::array::from_fn(|_| builder.add_virtual_bool_target_safe());
+    let identifier_targets: [HashOutTarget; MAX_TX_INPUTS] =
+        std::array::from_fn(|_| builder.add_virtual_hash());
+    let (root, _, _) =
+        input_nullifiers_root_target(&mut builder, &nk_target, &active, &identifier_targets);
+    builder.register_public_inputs(&root.elements);
+    let data = builder.build::<C>();
+
+    for active_count in [0usize, 1, 3] {
+        let mut witness = PartialWitness::new();
+        set_bytes(&mut witness, &nk_target, &nk);
+        for index in 0..MAX_TX_INPUTS {
+            witness
+                .set_bool_target(active[index], index < active_count)
+                .expect("active assignment");
+            witness
+                .set_hash_target(identifier_targets[index], identifiers[index])
+                .expect("identifier assignment");
+        }
+        let nullifiers: Vec<_> = identifiers[..active_count]
+            .iter()
+            .map(|&identifier| host::nullifier(&nk, identifier))
+            .collect();
+        let expected = host::merkle_root(TreeKind::NullifiersRoot, &nullifiers);
+        let proof = data
+            .prove(witness)
+            .expect("input-nullifiers-root parity circuit must prove");
+        assert_eq!(proof.public_inputs, expected.elements.to_vec());
+        data.verify(proof)
+            .expect("input-nullifiers-root parity proof must verify");
+        println!(
+            "compliance input_nullifiers_root host parity count={active_count}: PASS {:?}",
+            digest_limbs(expected)
+        );
     }
-    out
 }
 
 #[test]
 fn compliance_skeleton_proves_host_parity_pi_layout_and_network_binding() {
-    let build_timer = Instant::now();
-    let circuit =
-        build_skeleton_circuit(CircuitConfig::standard_recursion_config(), Network::Testnet);
-    let build_time = build_timer.elapsed();
+    let _guard = FULL_CIRCUIT_TEST_LOCK
+        .lock()
+        .expect("full-circuit test lock");
+    let shared = shared_circuit();
+    let circuit = &shared.circuit;
+    let fixture = ComplianceFixture::new();
 
-    let (balances, _assets) = sample_balances();
-    assert_eq!(
-        balances.len(),
-        3,
-        "fixture must exercise a partial slot count"
-    );
-    let owner = Address([0x19u8; 32]);
-    let nk_commit = digest(b"account-nk-commit");
-    let current_pubkey = [0x2au8; 32];
-    let next_pubkey = [0x3bu8; 32];
-    let prev_state = AccountState::new(
-        owner,
-        nk_commit,
-        balances.clone(),
-        current_pubkey,
-        41,
-        digest(b"previous-coin-history-root"),
-    )
-    .expect("valid previous account state");
-    let new_state = AccountState::new(
-        owner,
-        nk_commit,
-        balances,
-        next_pubkey,
-        42,
-        digest(b"new-coin-history-root"),
-    )
-    .expect("valid new account state");
-    let prev_ash = host::account_state_hash(&prev_state).expect("previous ash must compute");
-    let expected_new_ash = host::account_state_hash(&new_state).expect("new ash must compute");
-
-    let templates = vec![
-        CoinTemplate {
-            recipient: Address([0x81u8; 32]),
-            amount: 5,
-            asset_id: digest(b"output-asset-0"),
-        },
-        CoinTemplate {
-            recipient: Address([0x82u8; 32]),
-            amount: (1u128 << 88) + 7,
-            asset_id: digest(b"output-asset-1"),
-        },
-        CoinTemplate {
-            recipient: Address([0x83u8; 32]),
-            amount: u128::MAX - 9,
-            asset_id: digest(b"output-asset-2"),
-        },
-    ];
-    let expected_coin_ids: Vec<HashDigest> = templates
-        .iter()
-        .enumerate()
-        .map(|(index, template)| {
-            host::coin_identifier(
-                prev_ash,
-                &template.recipient.0,
-                template.asset_id,
-                template.amount,
-                index as u32,
-            )
-        })
-        .collect();
-    let expected_ocr = host::merkle_root(TreeKind::CoinsRoot, &expected_coin_ids);
-    let input_nullifiers_root = digest(b"pass-through-inr");
-    let proof_coin_history_root = digest(b"pass-through-proof-coin-history-root");
-    let nav_commitment = digest(b"pass-through-nav-commitment");
-    let npk_rand = [0xa5u8; 32];
-    let expected_npk_commit = host::npk_commit(&next_pubkey, &npk_rand);
-    let expected_network_id = host::network_id_testnet();
-
-    let targets = circuit.targets;
-    let mut common_witness = PartialWitness::new();
-    set_account_state_fixed(&mut common_witness, targets.prev_account_state, &prev_state);
-    set_account_state_fixed(&mut common_witness, targets.new_account_state, &new_state);
-    common_witness
-        .set_hash_target(targets.prev_account_state_hash, prev_ash)
-        .expect("prev ash witness assignment must succeed");
-    set_output_templates(&mut common_witness, &targets.output_templates, &templates);
-    set_bytes(&mut common_witness, &targets.next_pubkey, &next_pubkey);
-    set_bytes(&mut common_witness, &targets.npk_rand, &npk_rand);
-    set_bytes(
-        &mut common_witness,
-        &targets.consumed_pubkey,
-        &current_pubkey,
-    );
-    common_witness
-        .set_hash_target(
-            targets.proof_data.input_nullifiers_root,
-            input_nullifiers_root,
-        )
-        .expect("input-nullifiers-root assignment must succeed");
-    common_witness
-        .set_hash_target(
-            targets.proof_data.coin_history_root,
-            proof_coin_history_root,
-        )
-        .expect("proof coin-history-root assignment must succeed");
-    common_witness
-        .set_hash_target(targets.proof_data.nav_commitment, nav_commitment)
-        .expect("nav-commitment assignment must succeed");
-
-    let mut gapped_balance_witness = common_witness.clone();
-    set_account_balances(
-        &mut gapped_balance_witness,
-        targets.prev_account_state,
-        &prev_state,
-        BalanceLayout::Gap,
-    );
-    set_account_balances(
-        &mut gapped_balance_witness,
-        targets.new_account_state,
-        &new_state,
-        BalanceLayout::Gap,
-    );
+    let gapped_balance_witness =
+        fixture.witness(&circuit.targets, BalanceLayout::Gap, WitnessMutation::None);
     assert!(
         circuit.data.prove(gapped_balance_witness).is_err(),
         "a non-left-aligned active-balance layout must not prove"
     );
+    println!("balance-gap negative: PASS (rejected)");
 
-    let mut descending_balance_witness = common_witness.clone();
-    set_account_balances(
-        &mut descending_balance_witness,
-        targets.prev_account_state,
-        &prev_state,
+    let descending_balance_witness = fixture.witness(
+        &circuit.targets,
         BalanceLayout::Descending,
-    );
-    set_account_balances(
-        &mut descending_balance_witness,
-        targets.new_account_state,
-        &new_state,
-        BalanceLayout::Descending,
+        WitnessMutation::None,
     );
     assert!(
         circuit.data.prove(descending_balance_witness).is_err(),
         "a non-ascending active-balance layout must not prove"
     );
+    println!("balance-descending negative: PASS (rejected)");
 
-    let mut witness = common_witness;
-    set_account_balances(
-        &mut witness,
-        targets.prev_account_state,
-        &prev_state,
+    let witness = fixture.witness(
+        &circuit.targets,
         BalanceLayout::Valid,
-    );
-    set_account_balances(
-        &mut witness,
-        targets.new_account_state,
-        &new_state,
-        BalanceLayout::Valid,
+        WitnessMutation::None,
     );
     assert_eq!(
-        new_state.balances.len(),
+        fixture.new_state.balances.len(),
         3,
         "valid witness must retain the partial balance fixture"
     );
@@ -457,24 +996,8 @@ fn compliance_skeleton_proves_host_parity_pi_layout_and_network_binding() {
         .prove(witness)
         .expect("valid compliance skeleton witness must prove");
     let prove_time = prove_timer.elapsed();
-    let build_and_prove = build_time + prove_time;
     assert_eq!(proof.public_inputs.len(), 40);
-
-    let expected_digests = [
-        expected_new_ash,
-        expected_ocr,
-        input_nullifiers_root,
-        proof_coin_history_root,
-        nav_commitment,
-    ];
-    let mut expected_public_inputs = Vec::with_capacity(40);
-    for digest in expected_digests {
-        expected_public_inputs.extend(digest.elements);
-    }
-    expected_public_inputs.extend(bytes_as_u32_le_limbs(&expected_npk_commit));
-    expected_public_inputs.extend(bytes_as_u32_le_limbs(&current_pubkey));
-    expected_public_inputs.extend(expected_network_id.elements);
-    assert_eq!(proof.public_inputs, expected_public_inputs);
+    assert_eq!(proof.public_inputs, fixture.expected_public_inputs());
 
     let mut wrong_network_proof = proof.clone();
     wrong_network_proof.public_inputs[36..40].copy_from_slice(&host::network_id_regtest().elements);
@@ -482,22 +1005,83 @@ fn compliance_skeleton_proves_host_parity_pi_layout_and_network_binding() {
         circuit.data.verify(wrong_network_proof).is_err(),
         "tampering testnet proof public inputs to regtest network_id must fail"
     );
+    println!("wrong network_id PI-tamper: PASS (rejected)");
+
+    let mut wrong_npk_commit_proof = proof.clone();
+    wrong_npk_commit_proof.public_inputs[20] += F::ONE;
+    assert!(
+        circuit.data.verify(wrong_npk_commit_proof).is_err(),
+        "tampering the npk_commit public-input limb must fail"
+    );
+    println!("wrong npk_commit PI-tamper: PASS (rejected)");
+
     circuit
         .data
         .verify(proof)
         .expect("valid compliance skeleton proof must verify");
-
+    println!("valid compliance witness prove+verify: PASS");
     println!(
-        "compliance host parity: balances=3/32 ash={:?} coin.identifier[0]={:?} ocr={:?}",
-        digest_limbs(expected_new_ash),
-        digest_limbs(expected_coin_ids[0]),
-        digest_limbs(expected_ocr)
+        "compliance host parity: balances=3/32 ash={:?} coin.identifier[0]={:?} ocr={:?} inr={:?}",
+        digest_limbs(fixture.proof_data.new_account_state_hash),
+        digest_limbs(fixture.expected_coin_ids[0]),
+        digest_limbs(fixture.proof_data.output_coins_root),
+        digest_limbs(fixture.proof_data.input_nullifiers_root),
     );
     println!(
-        "compliance PI layout: 40 elements (ProofData=28, consumed_pubkey=8, network_id=4); wrong-network verification rejected"
+        "compliance PI layout: 40 elements (ProofData=28, consumed_pubkey=8, network_id=4); network_id and npk_commit PI tampering rejected"
     );
     println!(
         "compliance skeleton metrics: gates={} build={:?} prove={:?} build+prove={:?}",
-        circuit.gate_count, build_time, prove_time, build_and_prove
+        circuit.gate_count,
+        shared.build_time,
+        prove_time,
+        shared.build_time + prove_time
+    );
+    println!(
+        "compliance skeleton degree_bits: {}",
+        circuit.data.common.degree_bits()
+    );
+}
+
+#[test]
+fn compliance_rejects_wrong_signature() {
+    let _guard = FULL_CIRCUIT_TEST_LOCK
+        .lock()
+        .expect("full-circuit test lock");
+    assert_rejected("wrong signature", WitnessMutation::WrongSignature);
+}
+
+#[test]
+fn compliance_rejects_wrong_consumed_public_key() {
+    let _guard = FULL_CIRCUIT_TEST_LOCK
+        .lock()
+        .expect("full-circuit test lock");
+    assert_rejected("wrong Pk_i", WitnessMutation::WrongPublicKey);
+}
+
+#[test]
+fn compliance_rejects_wrong_nk() {
+    let _guard = FULL_CIRCUIT_TEST_LOCK
+        .lock()
+        .expect("full-circuit test lock");
+    assert_rejected("wrong nk", WitnessMutation::WrongNk);
+}
+
+#[test]
+fn compliance_rejects_duplicate_nullifier() {
+    let _guard = FULL_CIRCUIT_TEST_LOCK
+        .lock()
+        .expect("full-circuit test lock");
+    assert_rejected("duplicate nf", WitnessMutation::DuplicateNullifier);
+}
+
+#[test]
+fn compliance_rejects_wrong_input_coin_identifier() {
+    let _guard = FULL_CIRCUIT_TEST_LOCK
+        .lock()
+        .expect("full-circuit test lock");
+    assert_rejected(
+        "wrong input coin.identifier",
+        WitnessMutation::WrongInputIdentifier,
     );
 }
