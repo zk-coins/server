@@ -12,6 +12,8 @@ use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::{PartialWitness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::CircuitConfig;
+use plonky2::plonk::proof::ProofWithPublicInputs;
+use plonky2::recursion::cyclic_recursion::check_cyclic_proof_verifier_data;
 use sha2::{Digest, Sha256};
 
 use shared::spec_v1::{
@@ -22,12 +24,16 @@ use shared::spec_v1::{
 use crate::circuit::gadgets::biguint::WitnessBigUint;
 use crate::circuit::gadgets::curve::AffinePointTarget;
 use crate::circuit::gadgets::curve_types::{AffinePoint, Curve, CurveScalar, Secp256K1};
+use crate::circuit::gadgets::nflog_consistency::{
+    fill_consistency_slots, fill_inclusion_slots, H_MAX,
+};
 use crate::circuit::gadgets::nonnative::NonNativeTarget;
 use crate::circuit::gadgets::u128_arith::U128Target;
 use crate::{C, D, F};
 
 use super::bindings::{
-    hash_proof_data_target, input_nullifiers_root_target, nk_commit_target, nullifier_target,
+    hash_proof_data_target, input_nullifiers_root_target, nav_commitment_target, nav_root_target,
+    nk_commit_target, nullifier_target,
 };
 use super::serialize::encode_ascii_tag_elements;
 use super::skeleton::coin_identifier_target;
@@ -105,12 +111,14 @@ fn set_account_balances(
         let source_index = match (layout, index) {
             (BalanceLayout::Descending, 0) => 1,
             (BalanceLayout::Descending, 1) => 0,
+            (BalanceLayout::Gap, 0) => usize::MAX,
+            (BalanceLayout::Gap, 1) => 0,
             _ => index,
         };
         if let Some((asset_bytes, amount)) = entries.get(source_index).copied() {
             let asset_id =
                 host::digest_from_bytes(asset_bytes).expect("test asset digest must be canonical");
-            let active = !matches!(layout, BalanceLayout::Gap) || index != 1;
+            let active = !matches!(layout, BalanceLayout::Gap) || index == 1;
             witness
                 .set_bool_target(slot.active, active)
                 .expect("active balance assignment must succeed");
@@ -417,6 +425,17 @@ struct ComplianceFixture {
     proof_data: ProofData,
     signature: TransitionSignature,
     wrong_pubkey: [u8; 32],
+    is_account_update: bool,
+    nav: host::Nav,
+    nav_rand: [u8; 32],
+    prev_nav: host::Nav,
+    prev_nav_rand: [u8; 32],
+    nav_consistency: [HashDigest; 2 * H_MAX],
+    prev_nullifier_pk: [u8; 32],
+    prev_nullifier_r: [u8; 32],
+    prev_nullifier_r_prime: AffinePoint<Secp256K1>,
+    prev_nullifier_inclusion: [HashDigest; H_MAX],
+    prev_nullifier_pos: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -444,154 +463,39 @@ impl ComplianceFixture {
     }
 
     fn without_mint() -> Self {
-        let mut fixture = Self::new();
-        fixture
-            .templates
-            .pop()
-            .expect("fixture has one mint output");
-        fixture
-            .expected_coin_ids
-            .pop()
-            .expect("fixture has one mint coin");
-        fixture.issuance = IssuanceFixture {
-            present: false,
-            asset_id: ZERO_HASH,
-            creator_pubkey: [0u8; 32],
-            issuance_version: 0,
-            name_hash: [0u8; 32],
-            decimals: 0,
-            amount: 0,
-            terms_hash: ZERO_HASH,
-            cap_total: 0,
-            terms_salt: [0u8; 32],
-        };
-        fixture.proof_data.output_coins_root =
-            host::merkle_root(TreeKind::CoinsRoot, &fixture.expected_coin_ids);
-        let (secret, public, _) =
-            normalized_key(deterministic_secret(b"zkCoins/v1/compliance-d2/spend-key"));
-        fixture.signature = sign_transition(
-            secret,
-            public,
-            &host::hash_proof_data(&host::serialize_proof_data(&fixture.proof_data)),
-        );
-        fixture
+        Self::new()
     }
 
     fn new_with_history_fault(replay_self_output: bool, absent_first_input: bool) -> Self {
-        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/compliance-d2/nk").into();
-        let nk_commit = host::nk_commit(&nk);
-
-        let (secret, public, current_pubkey) =
-            normalized_key(deterministic_secret(b"zkCoins/v1/compliance-d2/spend-key"));
-        let (_, _, wrong_pubkey) = normalized_key(deterministic_secret(
-            b"zkCoins/v1/compliance-d2/wrong-spend-key",
-        ));
-        assert_ne!(current_pubkey, wrong_pubkey);
-        let owner = Address(host::address(&current_pubkey, nk_commit));
-        let next_pubkey: [u8; 32] = Sha256::digest(b"zkCoins/v1/compliance-d2/next-pubkey").into();
-
-        let asset_a = digest(b"fold-asset-a");
-        let asset_b = digest(b"fold-asset-b");
-        let name_hash: [u8; 32] = Sha256::digest(b"Fixture Mint V1").into();
-        let mint_asset = host::asset_id_v1(host::GENESIS_TAG, &current_pubkey, &name_hash, 2, 1);
-        let issuance = IssuanceFixture {
-            present: true,
-            asset_id: mint_asset,
-            creator_pubkey: current_pubkey,
-            issuance_version: 1,
-            name_hash,
-            decimals: 2,
-            amount: 7,
-            terms_hash: host::terms_hash_v1(mint_asset, 1),
-            cap_total: 0,
-            terms_salt: [0u8; 32],
+        let genesis = Self::genesis_fixture();
+        let prev_state = genesis.new_state.clone();
+        let prev_ash = genesis.proof_data.new_account_state_hash;
+        let owner = prev_state.owner;
+        let asset_id = genesis.issuance.asset_id;
+        let input = InputFixture {
+            coin: Coin {
+                identifier: genesis.expected_coin_ids[0],
+                recipient: owner,
+                amount: 100,
+                asset_id,
+            },
+            creating_prev_ash: genesis.prev_ash,
+            coin_index: 0,
         };
-
-        let mut prev_balances = BTreeMap::new();
-        prev_balances.insert(host::digest_to_bytes(&asset_a), 100);
-        prev_balances.insert(host::digest_to_bytes(&asset_b), 50);
-        let provisional_prev = AccountState::new(
-            owner,
-            nk_commit,
-            prev_balances.clone(),
-            current_pubkey,
-            41,
-            ZERO_HASH,
-        )
-        .expect("provisional previous state");
-        let provisional_prev_ash =
-            host::account_state_hash(&provisional_prev).expect("provisional ash");
-
-        let inputs: Vec<InputFixture> = [(asset_a, 30u128, 2u32), (asset_b, 20u128, 7u32)]
-            .into_iter()
-            .enumerate()
-            .map(|(index, (asset_id, amount, coin_index))| {
-                let creating_prev_ash =
-                    digest(format!("input-creating-prev-ash-{index}").as_bytes());
-                let identifier = host::coin_identifier(
-                    creating_prev_ash,
-                    &owner.0,
-                    asset_id,
-                    amount,
-                    coin_index,
-                );
-                InputFixture {
-                    coin: Coin {
-                        identifier,
-                        recipient: owner,
-                        amount,
-                        asset_id,
-                    },
-                    creating_prev_ash,
-                    coin_index,
-                }
-            })
-            .collect();
-        let reserve_coin_ids = [
-            host::coin_identifier(
-                digest(b"reserve-creating-prev-ash-a"),
-                &owner.0,
-                asset_a,
-                70,
-                11,
-            ),
-            host::coin_identifier(
-                digest(b"reserve-creating-prev-ash-b"),
-                &owner.0,
-                asset_b,
-                30,
-                12,
-            ),
-        ];
-
+        let inputs = vec![input.clone()];
         let templates = vec![
             CoinTemplate {
                 recipient: owner,
-                amount: 10,
-                asset_id: asset_a,
+                amount: 70,
+                asset_id,
             },
             CoinTemplate {
                 recipient: Address([0x82u8; 32]),
-                amount: 20,
-                asset_id: asset_a,
-            },
-            CoinTemplate {
-                recipient: Address([0x83u8; 32]),
-                amount: 20,
-                asset_id: asset_b,
-            },
-            CoinTemplate {
-                recipient: Address([0x84u8; 32]),
-                amount: issuance.amount,
-                asset_id: mint_asset,
+                amount: 30,
+                asset_id,
             },
         ];
-
-        // Coin identifiers depend on the explicitly witnessed previous ash.
-        // Clause 1 will bind that ash to the prior proof in P1-D.4; for D.3
-        // the fixture uses a deterministic host hash independent of history.
-        let prev_ash = provisional_prev_ash;
-        let expected_coin_ids: Vec<HashDigest> = templates
+        let expected_coin_ids: Vec<_> = templates
             .iter()
             .enumerate()
             .map(|(index, template)| {
@@ -606,113 +510,93 @@ impl ComplianceFixture {
             .collect();
 
         let mut history = host::CoinHistTree::new();
-        for (index, input) in inputs.iter().enumerate() {
-            if absent_first_input && index == 0 {
-                continue;
-            }
-            history
-                .admit(host::digest_to_bytes(&input.coin.identifier))
-                .expect("initial input admission");
+        history
+            .admit(host::digest_to_bytes(&input.coin.identifier))
+            .expect("genesis self output admission");
+        assert_eq!(history.root(), prev_state.coin_history_root);
+        let input_key = host::digest_to_bytes(&input.coin.identifier);
+        let mut input_path = history.prove(input_key).siblings;
+        if absent_first_input {
+            input_path[0].elements[0] += F::ONE;
         }
-        for identifier in reserve_coin_ids {
-            history
-                .admit(host::digest_to_bytes(&identifier))
-                .expect("reserve coin admission backing the starting balances");
-        }
+        history.spend(input_key).expect("spend genesis coin");
+        let output_key = host::digest_to_bytes(&expected_coin_ids[0]);
+        let mut output_path = history.prove(output_key).siblings;
         if replay_self_output {
-            history
-                .admit(host::digest_to_bytes(&expected_coin_ids[0]))
-                .expect("pre-admit replayed self output");
+            output_path[0].elements[0] += F::ONE;
         }
-        let previous_history_root = history.root();
-        let prev_state = AccountState::new(
-            owner,
-            nk_commit,
-            prev_balances.clone(),
-            current_pubkey,
-            41,
-            previous_history_root,
-        )
-        .expect("valid previous account state");
+        history.admit(output_key).expect("admit update change");
+        let mut history_paths = vec![input_path];
+        history_paths.resize(MAX_TX_INPUTS, vec![ZERO_HASH; 256]);
+        history_paths.push(output_path);
+        history_paths.push(vec![ZERO_HASH; 256]);
+        history_paths.resize(MAX_HISTORY_UPDATES_D3, vec![ZERO_HASH; 256]);
 
-        let mut history_paths = Vec::with_capacity(MAX_HISTORY_UPDATES_D3);
-        for (index, input) in inputs.iter().enumerate() {
-            let key = host::digest_to_bytes(&input.coin.identifier);
-            let proof = history.prove(key);
-            history_paths.push(proof.siblings);
-            if absent_first_input && index == 0 {
-                assert_eq!(proof.state, host::CoinHistState::Absent);
-            } else {
-                assert_eq!(proof.state, host::CoinHistState::Admitted);
-                history.spend(key).expect("spend admitted input");
-            }
-        }
-        while history_paths.len() < MAX_TX_INPUTS {
-            history_paths.push(vec![ZERO_HASH; 256]);
-        }
-        for (index, template) in templates.iter().enumerate() {
-            if template.recipient == owner {
-                let key = host::digest_to_bytes(&expected_coin_ids[index]);
-                let proof = history.prove(key);
-                history_paths.push(proof.siblings);
-                if !replay_self_output {
-                    assert_eq!(proof.state, host::CoinHistState::Absent);
-                    history.admit(key).expect("admit fresh self output");
-                } else {
-                    assert_eq!(proof.state, host::CoinHistState::Admitted);
-                }
-            } else {
-                history_paths.push(vec![ZERO_HASH; 256]);
-            }
-        }
-        while history_paths.len() < MAX_HISTORY_UPDATES_D3 {
-            history_paths.push(vec![ZERO_HASH; 256]);
-        }
-
-        let mut new_balances = prev_balances;
-        for input in &inputs {
-            let key = host::digest_to_bytes(&input.coin.asset_id);
-            *new_balances.get_mut(&key).expect("input asset balance") -= input.coin.amount;
-        }
-        for template in &templates {
-            if template.recipient == owner {
-                let key = host::digest_to_bytes(&template.asset_id);
-                *new_balances.entry(key).or_insert(0) += template.amount;
-            }
-        }
-        new_balances.retain(|_, amount| *amount != 0);
-        assert_eq!(new_balances[&host::digest_to_bytes(&asset_a)], 80);
-        assert_eq!(new_balances[&host::digest_to_bytes(&asset_b)], 30);
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 70);
+        let (secret, public, current_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-chain/spend-key-1",
+        ));
+        assert_eq!(current_pubkey, prev_state.current_pubkey);
+        let (_, _, next_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-chain/spend-key-2",
+        ));
+        let (_, _, wrong_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-chain/wrong-spend-key",
+        ));
         let new_state = AccountState::new(
             owner,
-            nk_commit,
-            new_balances,
+            prev_state.nk_commit,
+            balances,
             next_pubkey,
-            42,
+            2,
             history.root(),
         )
-        .expect("valid new account state");
-        let expected_new_ash = host::account_state_hash(&new_state).expect("new ash must compute");
-        let output_coins_root = host::merkle_root(TreeKind::CoinsRoot, &expected_coin_ids);
-        let nullifiers: Vec<_> = inputs
-            .iter()
-            .map(|input| host::nullifier(&nk, input.coin.identifier))
-            .collect();
-        let input_nullifiers_root = host::merkle_root(TreeKind::NullifiersRoot, &nullifiers);
-        let npk_rand = [0xa5u8; 32];
-        let expected_npk_commit = host::npk_commit(&next_pubkey, &npk_rand);
-        let proof_data = ProofData {
-            new_account_state_hash: expected_new_ash,
-            output_coins_root,
-            input_nullifiers_root,
-            coin_history_root: new_state.coin_history_root,
-            nav_commitment: digest(b"pass-through-nav-commitment"),
-            npk_commit: expected_npk_commit,
-        };
-        let serialized = host::serialize_proof_data(&proof_data);
-        let h_proof_data = host::hash_proof_data(&serialized);
-        let signature = sign_transition(secret, public, &h_proof_data);
+        .expect("update state");
 
+        let prefix_entry = host::NfLogEntry {
+            pk: Sha256::digest(b"zkCoins/v1/compliance-chain/prefix-pk").into(),
+            r: Sha256::digest(b"zkCoins/v1/compliance-chain/prefix-r").into(),
+        };
+        let entry = host::NfLogEntry {
+            pk: genesis.prev_state.current_pubkey,
+            r: field_bytes(genesis.signature.rx),
+        };
+        let entries = [prefix_entry, entry];
+        let nav = host::Nav {
+            size: 2,
+            mth: host::nflog_mth(&entries),
+        };
+        let nav_rand = [0x3cu8; 32];
+        let npk_rand = [0xa5u8; 32];
+        let issuance = IssuanceFixture {
+            present: false,
+            asset_id: ZERO_HASH,
+            creator_pubkey: [0u8; 32],
+            issuance_version: 0,
+            name_hash: [0u8; 32],
+            decimals: 0,
+            amount: 0,
+            terms_hash: ZERO_HASH,
+            cap_total: 0,
+            terms_salt: [0u8; 32],
+        };
+        let proof_data = ProofData {
+            new_account_state_hash: host::account_state_hash(&new_state).unwrap(),
+            output_coins_root: host::merkle_root(TreeKind::CoinsRoot, &expected_coin_ids),
+            input_nullifiers_root: host::merkle_root(
+                TreeKind::NullifiersRoot,
+                &[host::nullifier(&genesis.nk, input.coin.identifier)],
+            ),
+            coin_history_root: new_state.coin_history_root,
+            nav_commitment: host::nav_commitment(nav.root(), &nav_rand),
+            npk_commit: host::npk_commit(&next_pubkey, &npk_rand),
+        };
+        let signature = sign_transition(
+            secret,
+            public,
+            &host::hash_proof_data(&host::serialize_proof_data(&proof_data)),
+        );
         Self {
             prev_state,
             new_state,
@@ -722,13 +606,196 @@ impl ComplianceFixture {
             inputs,
             issuance,
             history_paths,
+            nk: genesis.nk,
+            next_pubkey,
+            npk_rand,
+            proof_data,
+            signature,
+            wrong_pubkey,
+            is_account_update: true,
+            nav,
+            nav_rand,
+            prev_nav: genesis.nav,
+            prev_nav_rand: genesis.nav_rand,
+            nav_consistency: fill_consistency_slots(
+                &host::consistency_proof(1, &entries).unwrap(),
+                1,
+                2,
+            ),
+            prev_nullifier_pk: entry.pk,
+            prev_nullifier_r: entry.r,
+            prev_nullifier_r_prime: genesis.signature.r_prime,
+            prev_nullifier_inclusion: fill_inclusion_slots(
+                &host::inclusion_path(1, &entries).unwrap(),
+            ),
+            prev_nullifier_pos: 1,
+        }
+    }
+
+    fn genesis_fixture() -> Self {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/compliance-chain/nk").into();
+        let nk_commit = host::nk_commit(&nk);
+        let (secret, public, current_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-chain/spend-key-0",
+        ));
+        let (_, _, next_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-chain/spend-key-1",
+        ));
+        let (_, _, wrong_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-chain/wrong-spend-key",
+        ));
+        let owner = Address(host::address(&current_pubkey, nk_commit));
+        let name_hash: [u8; 32] = Sha256::digest(b"Recursive Fixture Asset").into();
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &current_pubkey, &name_hash, 2, 1);
+        let issuance = IssuanceFixture {
+            present: true,
+            asset_id,
+            creator_pubkey: current_pubkey,
+            issuance_version: 1,
+            name_hash,
+            decimals: 2,
+            amount: 100,
+            terms_hash: host::terms_hash_v1(asset_id, 1),
+            cap_total: 0,
+            terms_salt: [0u8; 32],
+        };
+        let prev_state = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            current_pubkey,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let prev_ash = host::account_state_hash(&prev_state).unwrap();
+        let templates = vec![CoinTemplate {
+            recipient: owner,
+            amount: 100,
+            asset_id,
+        }];
+        let expected_coin_ids = vec![host::coin_identifier(prev_ash, &owner.0, asset_id, 100, 0)];
+        let mut history = host::CoinHistTree::new();
+        let output_path = history
+            .prove(host::digest_to_bytes(&expected_coin_ids[0]))
+            .siblings;
+        history
+            .admit(host::digest_to_bytes(&expected_coin_ids[0]))
+            .unwrap();
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 100);
+        let new_state =
+            AccountState::new(owner, nk_commit, balances, next_pubkey, 1, history.root()).unwrap();
+        let mut history_paths = vec![vec![ZERO_HASH; 256]; MAX_TX_INPUTS];
+        history_paths.push(output_path);
+        history_paths.resize(MAX_HISTORY_UPDATES_D3, vec![ZERO_HASH; 256]);
+        let prefix_entry = host::NfLogEntry {
+            pk: Sha256::digest(b"zkCoins/v1/compliance-chain/prefix-pk").into(),
+            r: Sha256::digest(b"zkCoins/v1/compliance-chain/prefix-r").into(),
+        };
+        let nav = host::Nav {
+            size: 1,
+            mth: host::nflog_mth(&[prefix_entry]),
+        };
+        let nav_rand = [0x2bu8; 32];
+        let npk_rand = [0x4du8; 32];
+        let proof_data = ProofData {
+            new_account_state_hash: host::account_state_hash(&new_state).unwrap(),
+            output_coins_root: host::merkle_root(TreeKind::CoinsRoot, &expected_coin_ids),
+            input_nullifiers_root: host::merkle_root(TreeKind::NullifiersRoot, &[]),
+            coin_history_root: new_state.coin_history_root,
+            nav_commitment: host::nav_commitment(nav.root(), &nav_rand),
+            npk_commit: host::npk_commit(&next_pubkey, &npk_rand),
+        };
+        let signature = sign_transition(
+            secret,
+            public,
+            &host::hash_proof_data(&host::serialize_proof_data(&proof_data)),
+        );
+        Self {
+            prev_state,
+            new_state,
+            prev_ash,
+            templates,
+            expected_coin_ids,
+            inputs: vec![],
+            issuance,
+            history_paths,
             nk,
             next_pubkey,
             npk_rand,
             proof_data,
             signature,
             wrong_pubkey,
+            is_account_update: false,
+            nav,
+            nav_rand,
+            prev_nav: host::Nav {
+                size: 0,
+                mth: host::nflog_empty(),
+            },
+            prev_nav_rand: [0u8; 32],
+            nav_consistency: [ZERO_HASH; 2 * H_MAX],
+            prev_nullifier_pk: [0u8; 32],
+            prev_nullifier_r: [0u8; 32],
+            prev_nullifier_r_prime: Secp256K1::GENERATOR_AFFINE,
+            prev_nullifier_inclusion: [ZERO_HASH; H_MAX],
+            prev_nullifier_pos: 0,
         }
+    }
+
+    fn resign_update(&mut self) {
+        self.proof_data.nav_commitment = host::nav_commitment(self.nav.root(), &self.nav_rand);
+        let (secret, public, _) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-chain/spend-key-1",
+        ));
+        self.signature = sign_transition(
+            secret,
+            public,
+            &host::hash_proof_data(&host::serialize_proof_data(&self.proof_data)),
+        );
+    }
+
+    fn non_prefix_case() -> Self {
+        let mut fixture = Self::new();
+        let different_prefix = host::NfLogEntry {
+            pk: Sha256::digest(b"zkCoins/v1/compliance-chain/non-prefix-pk").into(),
+            r: Sha256::digest(b"zkCoins/v1/compliance-chain/non-prefix-r").into(),
+        };
+        let predecessor = host::NfLogEntry {
+            pk: fixture.prev_nullifier_pk,
+            r: fixture.prev_nullifier_r,
+        };
+        let entries = [different_prefix, predecessor];
+        fixture.nav.mth = host::nflog_mth(&entries);
+        fixture.nav_consistency =
+            fill_consistency_slots(&host::consistency_proof(1, &entries).unwrap(), 1, 2);
+        fixture.prev_nullifier_inclusion =
+            fill_inclusion_slots(&host::inclusion_path(1, &entries).unwrap());
+        fixture.resign_update();
+        fixture
+    }
+
+    fn wrong_prev_pk_case() -> Self {
+        let mut fixture = Self::new();
+        fixture.prev_nullifier_pk =
+            Sha256::digest(b"zkCoins/v1/compliance-chain/substituted-prev-pk").into();
+        let prefix = host::NfLogEntry {
+            pk: Sha256::digest(b"zkCoins/v1/compliance-chain/prefix-pk").into(),
+            r: Sha256::digest(b"zkCoins/v1/compliance-chain/prefix-r").into(),
+        };
+        let substituted = host::NfLogEntry {
+            pk: fixture.prev_nullifier_pk,
+            r: fixture.prev_nullifier_r,
+        };
+        let entries = [prefix, substituted];
+        fixture.nav.mth = host::nflog_mth(&entries);
+        fixture.nav_consistency =
+            fill_consistency_slots(&host::consistency_proof(1, &entries).unwrap(), 1, 2);
+        fixture.prev_nullifier_inclusion =
+            fill_inclusion_slots(&host::inclusion_path(1, &entries).unwrap());
+        fixture.resign_update();
+        fixture
     }
 
     fn mint_case(case: MintCase) -> Self {
@@ -831,12 +898,17 @@ impl ComplianceFixture {
         )];
         let output_coins_root = host::merkle_root(TreeKind::CoinsRoot, &expected_coin_ids);
         let input_nullifiers_root = host::merkle_root(TreeKind::NullifiersRoot, &[]);
+        let nav = host::Nav {
+            size: 0,
+            mth: host::nflog_empty(),
+        };
+        let nav_rand = [0x69u8; 32];
         let proof_data = ProofData {
             new_account_state_hash: host::account_state_hash(&new_state).expect("mint new ash"),
             output_coins_root,
             input_nullifiers_root,
             coin_history_root: empty_history,
-            nav_commitment: digest(b"mint-case-nav"),
+            nav_commitment: host::nav_commitment(nav.root(), &nav_rand),
             npk_commit: host::npk_commit(&next_pubkey, &npk_rand),
         };
         let signature = sign_transition(
@@ -859,15 +931,27 @@ impl ComplianceFixture {
             proof_data,
             signature,
             wrong_pubkey: other_pubkey,
+            is_account_update: false,
+            nav,
+            nav_rand,
+            prev_nav: nav,
+            prev_nav_rand: [0u8; 32],
+            nav_consistency: [ZERO_HASH; 2 * H_MAX],
+            prev_nullifier_pk: [0u8; 32],
+            prev_nullifier_r: [0u8; 32],
+            prev_nullifier_r_prime: Secp256K1::GENERATOR_AFFINE,
+            prev_nullifier_inclusion: [ZERO_HASH; H_MAX],
+            prev_nullifier_pos: 0,
         }
     }
 
     fn witness(
         &self,
-        targets: &ComplianceTargets,
+        circuit: &SkeletonCircuit,
         layout: BalanceLayout,
         mutation: WitnessMutation,
     ) -> PartialWitness<F> {
+        let targets = &circuit.targets;
         let mut witness = PartialWitness::new();
         let mut prev_state = self.prev_state.clone();
         let mut new_state = self.new_state.clone();
@@ -985,10 +1069,114 @@ impl ComplianceFixture {
         set_nonnative(&mut witness, &targets.txn_sig_s, signature_s);
         set_point(&mut witness, &targets.s2c_r_prime, self.signature.r_prime);
         witness
+            .set_bool_target(targets.recursion.is_account_update, self.is_account_update)
+            .expect("proof branch assignment");
+        let mut predecessor = if self.is_account_update {
+            shared_genesis_proof(circuit).clone()
+        } else {
+            circuit.base_proof.clone()
+        };
+        if matches!(mutation, WitnessMutation::ForgedPrevProof) {
+            predecessor.public_inputs[0] += F::ONE;
+        }
+        witness
+            .set_proof_with_pis_target(&targets.recursion.prev_proof, &predecessor)
+            .expect("base predecessor assignment");
+        witness
+            .set_proof_with_pis_target(&targets.recursion.base_proof, &circuit.base_proof)
+            .expect("conditional base proof assignment");
+        witness
+            .set_verifier_data_target(
+                &targets.recursion.base_verifier_data,
+                &circuit.base_verifier_data,
+            )
+            .expect("base verifier-data assignment");
+        witness
+            .set_verifier_data_target(
+                &targets.recursion.own_verifier_data,
+                &circuit.data.verifier_only,
+            )
+            .expect("own verifier-data assignment");
+        witness
+            .set_target(targets.nav.size, F::from_canonical_u64(self.nav.size))
+            .expect("nav size assignment");
+        witness
+            .set_hash_target(targets.nav.mth, self.nav.mth)
+            .expect("nav mth assignment");
+        let mut nav_rand = self.nav_rand;
+        if matches!(mutation, WitnessMutation::WrongNavRand) {
+            nav_rand[0] ^= 1;
+        }
+        set_bytes(&mut witness, &targets.nav_rand, &nav_rand);
+        witness
+            .set_target(
+                targets.prev_nav_opening.nav.size,
+                F::from_canonical_u64(self.prev_nav.size),
+            )
+            .expect("previous nav size assignment");
+        witness
+            .set_hash_target(targets.prev_nav_opening.nav.mth, self.prev_nav.mth)
+            .expect("previous nav mth assignment");
+        set_bytes(
+            &mut witness,
+            &targets.prev_nav_opening.nav_rand,
+            &self.prev_nav_rand,
+        );
+        for (&target, &value) in targets.nav_consistency.iter().zip(&self.nav_consistency) {
+            witness
+                .set_hash_target(target, value)
+                .expect("nav consistency assignment");
+        }
+        set_bytes(
+            &mut witness,
+            &targets.prev_state_nullifier.pk_prev,
+            &self.prev_nullifier_pk,
+        );
+        set_bytes(
+            &mut witness,
+            &targets.prev_state_nullifier.r_prev,
+            &self.prev_nullifier_r,
+        );
+        let r_prime_prev = if matches!(mutation, WitnessMutation::WrongPrevRPrime) {
+            normalized_key(deterministic_secret(
+                b"zkCoins/v1/compliance-chain/wrong-prev-r-prime",
+            ))
+            .1
+        } else {
+            self.prev_nullifier_r_prime
+        };
+        set_point(
+            &mut witness,
+            &targets.prev_state_nullifier.r_prime_prev,
+            r_prime_prev,
+        );
+        for (&target, &value) in targets
+            .prev_state_nullifier
+            .nav_inclusion
+            .iter()
+            .zip(&self.prev_nullifier_inclusion)
+        {
+            witness
+                .set_hash_target(target, value)
+                .expect("predecessor inclusion assignment");
+        }
+        witness
+            .set_target(
+                targets.prev_state_nullifier.pos_prev,
+                F::from_canonical_u64(
+                    if matches!(mutation, WitnessMutation::PrevPositionOutOfRange) {
+                        self.nav.size
+                    } else {
+                        self.prev_nullifier_pos
+                    },
+                ),
+            )
+            .expect("predecessor position assignment");
+        witness
     }
 
-    fn expected_public_inputs(&self) -> Vec<F> {
-        let mut expected = Vec::with_capacity(40);
+    fn expected_public_inputs(&self, circuit: &SkeletonCircuit) -> Vec<F> {
+        let mut expected = Vec::with_capacity(108);
         for digest in [
             self.proof_data.new_account_state_hash,
             self.proof_data.output_coins_root,
@@ -1001,6 +1189,10 @@ impl ComplianceFixture {
         expected.extend(bytes_as_u32_le_limbs(&self.proof_data.npk_commit));
         expected.extend(bytes_as_u32_le_limbs(&self.prev_state.current_pubkey));
         expected.extend(host::network_id_testnet().elements);
+        expected.extend(circuit.data.verifier_only.circuit_digest.elements);
+        for digest in &circuit.data.verifier_only.constants_sigmas_cap.0 {
+            expected.extend(digest.elements);
+        }
         expected
     }
 }
@@ -1017,6 +1209,10 @@ enum WitnessMutation {
     ConservationWraparound,
     WrongNewBalance,
     BalanceUnderflow,
+    ForgedPrevProof,
+    WrongNavRand,
+    WrongPrevRPrime,
+    PrevPositionOutOfRange,
 }
 
 struct SharedCircuit {
@@ -1025,6 +1221,7 @@ struct SharedCircuit {
 }
 
 static SHARED_CIRCUIT: OnceLock<SharedCircuit> = OnceLock::new();
+static GENESIS_PROOF: OnceLock<ProofWithPublicInputs<F, C, D>> = OnceLock::new();
 static FULL_CIRCUIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn shared_circuit() -> &'static SharedCircuit {
@@ -1041,13 +1238,32 @@ fn shared_circuit() -> &'static SharedCircuit {
     })
 }
 
+fn shared_genesis_proof(circuit: &SkeletonCircuit) -> &'static ProofWithPublicInputs<F, C, D> {
+    GENESIS_PROOF.get_or_init(|| {
+        let fixture = ComplianceFixture::genesis_fixture();
+        let witness = fixture.witness(circuit, BalanceLayout::Valid, WitnessMutation::None);
+        let proof = circuit
+            .data
+            .prove(witness)
+            .expect("canonical genesis fixture must prove");
+        check_cyclic_proof_verifier_data(&proof, &circuit.data.verifier_only, &circuit.data.common)
+            .expect("genesis proof must pin cyclic verifier data");
+        circuit
+            .data
+            .verify(proof.clone())
+            .expect("canonical genesis fixture must verify");
+        println!("recursive genesis InitialProof: PASS");
+        proof
+    })
+}
+
 fn assert_rejected(label: &str, mutation: WitnessMutation) {
     assert_fixture_rejected(label, ComplianceFixture::without_mint(), mutation);
 }
 
 fn assert_fixture_rejected(label: &str, fixture: ComplianceFixture, mutation: WitnessMutation) {
     let shared = shared_circuit();
-    let witness = fixture.witness(&shared.circuit.targets, BalanceLayout::Valid, mutation);
+    let witness = fixture.witness(&shared.circuit, BalanceLayout::Valid, mutation);
     let result = catch_unwind(AssertUnwindSafe(|| shared.circuit.data.prove(witness)));
     match result {
         Err(_) | Ok(Err(_)) => {}
@@ -1077,6 +1293,8 @@ fn local_tags_and_tag_encoding_match_shared() {
         (TAG_ASSET_ID_V2, host::TAG_ASSET_ID_V2),
         (TAG_ISSUANCE_TERMS, host::TAG_ISSUANCE_TERMS),
         (TAG_ISSUANCE_TERMS_V2, host::TAG_ISSUANCE_TERMS_V2),
+        (TAG_NAV_COMMIT, host::TAG_NAV_COMMIT),
+        (TAG_NFLOG_ROOT, host::TAG_NFLOG_ROOT),
     ];
     for (local, shared) in string_tags {
         assert_eq!(local.as_bytes(), shared.as_bytes());
@@ -1237,6 +1455,50 @@ fn compliance_nk_commit_gadget_matches_host() {
 }
 
 #[test]
+fn compliance_nav_binding_gadgets_match_host() {
+    let entries = [
+        host::NfLogEntry {
+            pk: [0x31; 32],
+            r: [0x41; 32],
+        },
+        host::NfLogEntry {
+            pk: [0x51; 32],
+            r: [0x61; 32],
+        },
+    ];
+    let nav = host::Nav {
+        size: entries.len() as u64,
+        mth: host::nflog_mth(&entries),
+    };
+    let nav_rand = [0x72; 32];
+    let expected_root = nav.root();
+    let expected_commitment = host::nav_commitment(expected_root, &nav_rand);
+
+    let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_zk_config());
+    let nav_target = NavTarget::new_virtual(&mut builder);
+    let rand_target = super::targets::virtual_bytes(&mut builder);
+    let root = nav_root_target(&mut builder, nav_target);
+    let commitment = nav_commitment_target(&mut builder, nav_target, &rand_target);
+    builder.register_public_inputs(&root.elements);
+    builder.register_public_inputs(&commitment.elements);
+    let data = builder.build::<C>();
+
+    let mut witness = PartialWitness::new();
+    witness
+        .set_target(nav_target.size, F::from_canonical_u64(nav.size))
+        .unwrap();
+    witness.set_hash_target(nav_target.mth, nav.mth).unwrap();
+    set_bytes(&mut witness, &rand_target, &nav_rand);
+    let proof = data.prove(witness).expect("NAV parity witness must prove");
+    assert_eq!(
+        proof.public_inputs,
+        [expected_root.elements, expected_commitment.elements].concat()
+    );
+    data.verify(proof).expect("NAV parity proof must verify");
+    println!("compliance NAV root/commitment host parity: PASS");
+}
+
+#[test]
 fn compliance_hash_proof_data_gadget_matches_host() {
     let pd = ProofData {
         new_account_state_hash: digest(b"hpd-new-ash"),
@@ -1349,33 +1611,26 @@ fn compliance_skeleton_proves_host_parity_pi_layout_and_network_binding() {
     let fixture = ComplianceFixture::without_mint();
 
     let gapped_balance_witness =
-        fixture.witness(&circuit.targets, BalanceLayout::Gap, WitnessMutation::None);
+        fixture.witness(circuit, BalanceLayout::Gap, WitnessMutation::None);
     assert!(
         circuit.data.prove(gapped_balance_witness).is_err(),
         "a non-left-aligned active-balance layout must not prove"
     );
     println!("balance-gap negative: PASS (rejected)");
 
-    let descending_balance_witness = fixture.witness(
-        &circuit.targets,
-        BalanceLayout::Descending,
-        WitnessMutation::None,
-    );
+    let descending_balance_witness =
+        fixture.witness(circuit, BalanceLayout::Descending, WitnessMutation::None);
     assert!(
         circuit.data.prove(descending_balance_witness).is_err(),
         "a non-ascending active-balance layout must not prove"
     );
     println!("balance-descending negative: PASS (rejected)");
 
-    let witness = fixture.witness(
-        &circuit.targets,
-        BalanceLayout::Valid,
-        WitnessMutation::None,
-    );
+    let witness = fixture.witness(circuit, BalanceLayout::Valid, WitnessMutation::None);
     assert_eq!(
         fixture.new_state.balances.len(),
-        2,
-        "valid witness must retain the partial balance fixture"
+        1,
+        "valid witness must retain the recursive balance fixture"
     );
 
     let prove_timer = Instant::now();
@@ -1384,8 +1639,8 @@ fn compliance_skeleton_proves_host_parity_pi_layout_and_network_binding() {
         .prove(witness)
         .expect("valid compliance skeleton witness must prove");
     let prove_time = prove_timer.elapsed();
-    assert_eq!(proof.public_inputs.len(), 40);
-    assert_eq!(proof.public_inputs, fixture.expected_public_inputs());
+    assert_eq!(proof.public_inputs.len(), 108);
+    assert_eq!(proof.public_inputs, fixture.expected_public_inputs(circuit));
 
     let mut wrong_network_proof = proof.clone();
     wrong_network_proof.public_inputs[36..40].copy_from_slice(&host::network_id_regtest().elements);
@@ -1411,11 +1666,16 @@ fn compliance_skeleton_proves_host_parity_pi_layout_and_network_binding() {
     );
     println!("wrong coin_history_root PI-tamper: PASS (rejected)");
 
+    check_cyclic_proof_verifier_data(&proof, &circuit.data.verifier_only, &circuit.data.common)
+        .expect("valid compliance proof must pin cyclic verifier data");
     circuit
         .data
         .verify(proof)
         .expect("valid compliance skeleton proof must verify");
     println!("valid compliance witness prove+verify: PASS");
+    println!(
+        "genuine 2-hop cyclic chain InitialProof -> AccountUpdateProof with predecessor NfLog/S2C anchoring: PASS"
+    );
     println!(
         "compliance host parity: balances=2/32 ash={:?} coin.identifier[0]={:?} ocr={:?} inr={:?}",
         digest_limbs(fixture.proof_data.new_account_state_hash),
@@ -1424,7 +1684,7 @@ fn compliance_skeleton_proves_host_parity_pi_layout_and_network_binding() {
         digest_limbs(fixture.proof_data.input_nullifiers_root),
     );
     println!(
-        "compliance PI layout: 40 elements (ProofData=28, consumed_pubkey=8, network_id=4); network_id and npk_commit PI tampering rejected"
+        "compliance PI layout: 108 elements (application=40, verifier_data=68); network_id and npk_commit PI tampering rejected"
     );
     println!(
         "compliance skeleton metrics: gates={} build={:?} prove={:?} build+prove={:?}",
@@ -1445,18 +1705,23 @@ fn compliance_v1_mint_proves() {
         .lock()
         .expect("full-circuit test lock");
     let shared = shared_circuit();
-    let fixture = ComplianceFixture::new();
-    let witness = fixture.witness(
-        &shared.circuit.targets,
-        BalanceLayout::Valid,
-        WitnessMutation::None,
-    );
+    let fixture = ComplianceFixture::genesis_fixture();
+    let witness = fixture.witness(&shared.circuit, BalanceLayout::Valid, WitnessMutation::None);
     let proof = shared
         .circuit
         .data
         .prove(witness)
         .expect("valid v1 mint must prove");
-    assert_eq!(proof.public_inputs, fixture.expected_public_inputs());
+    assert_eq!(
+        proof.public_inputs,
+        fixture.expected_public_inputs(&shared.circuit)
+    );
+    check_cyclic_proof_verifier_data(
+        &proof,
+        &shared.circuit.data.verifier_only,
+        &shared.circuit.data.common,
+    )
+    .expect("v1 genesis must pin cyclic verifier data");
     shared
         .circuit
         .data
@@ -1466,23 +1731,55 @@ fn compliance_v1_mint_proves() {
 }
 
 #[test]
+fn compliance_two_hop_recursive_chain_proves() {
+    let _guard = FULL_CIRCUIT_TEST_LOCK.lock().unwrap();
+    let shared = shared_circuit();
+    let fixture = ComplianceFixture::new();
+    let witness = fixture.witness(&shared.circuit, BalanceLayout::Valid, WitnessMutation::None);
+    let proof = shared
+        .circuit
+        .data
+        .prove(witness)
+        .expect("anchored AccountUpdateProof must prove");
+    check_cyclic_proof_verifier_data(
+        &proof,
+        &shared.circuit.data.verifier_only,
+        &shared.circuit.data.common,
+    )
+    .expect("two-hop proof must pin cyclic verifier data");
+    shared
+        .circuit
+        .data
+        .verify(proof)
+        .expect("anchored AccountUpdateProof must verify");
+    println!(
+        "genuine 2-hop cyclic chain InitialProof -> AccountUpdateProof with predecessor NfLog/S2C anchoring: PASS"
+    );
+}
+
+#[test]
 fn compliance_v2_mint_proves() {
     let _guard = FULL_CIRCUIT_TEST_LOCK
         .lock()
         .expect("full-circuit test lock");
     let shared = shared_circuit();
     let fixture = ComplianceFixture::mint_case(MintCase::ValidV2);
-    let witness = fixture.witness(
-        &shared.circuit.targets,
-        BalanceLayout::Valid,
-        WitnessMutation::None,
-    );
+    let witness = fixture.witness(&shared.circuit, BalanceLayout::Valid, WitnessMutation::None);
     let proof = shared
         .circuit
         .data
         .prove(witness)
         .expect("valid v2 mint must prove");
-    assert_eq!(proof.public_inputs, fixture.expected_public_inputs());
+    assert_eq!(
+        proof.public_inputs,
+        fixture.expected_public_inputs(&shared.circuit)
+    );
+    check_cyclic_proof_verifier_data(
+        &proof,
+        &shared.circuit.data.verifier_only,
+        &shared.circuit.data.common,
+    )
+    .expect("v2 genesis must pin cyclic verifier data");
     shared
         .circuit
         .data
@@ -1641,5 +1938,58 @@ fn compliance_rejects_wrong_input_coin_identifier() {
     assert_rejected(
         "wrong input coin.identifier",
         WitnessMutation::WrongInputIdentifier,
+    );
+}
+
+#[test]
+fn compliance_rejects_forged_recursive_predecessor_proof() {
+    let _guard = FULL_CIRCUIT_TEST_LOCK.lock().unwrap();
+    assert_rejected(
+        "forged prev_proof public input",
+        WitnessMutation::ForgedPrevProof,
+    );
+}
+
+#[test]
+fn compliance_rejects_wrong_nav_commitment_opening() {
+    let _guard = FULL_CIRCUIT_TEST_LOCK.lock().unwrap();
+    assert_rejected("wrong nav_rand opening", WitnessMutation::WrongNavRand);
+}
+
+#[test]
+fn compliance_rejects_non_prefix_nav() {
+    let _guard = FULL_CIRCUIT_TEST_LOCK.lock().unwrap();
+    assert_fixture_rejected(
+        "non-prefix predecessor nav",
+        ComplianceFixture::non_prefix_case(),
+        WitnessMutation::None,
+    );
+}
+
+#[test]
+fn compliance_rejects_predecessor_key_substitution() {
+    let _guard = FULL_CIRCUIT_TEST_LOCK.lock().unwrap();
+    assert_fixture_rejected(
+        "Pk_prev != prev_proof.consumed_pubkey",
+        ComplianceFixture::wrong_prev_pk_case(),
+        WitnessMutation::None,
+    );
+}
+
+#[test]
+fn compliance_rejects_wrong_predecessor_s2c_opening() {
+    let _guard = FULL_CIRCUIT_TEST_LOCK.lock().unwrap();
+    assert_rejected(
+        "wrong R_prime_prev S2C opening",
+        WitnessMutation::WrongPrevRPrime,
+    );
+}
+
+#[test]
+fn compliance_rejects_predecessor_position_out_of_range() {
+    let _guard = FULL_CIRCUIT_TEST_LOCK.lock().unwrap();
+    assert_rejected(
+        "pos_prev >= nav.size",
+        WitnessMutation::PrevPositionOutOfRange,
     );
 }

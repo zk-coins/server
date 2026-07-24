@@ -1,16 +1,29 @@
 use plonky2::field::secp256k1_base::Secp256K1Base;
 use plonky2::field::secp256k1_scalar::Secp256K1Scalar;
 use plonky2::field::types::{Field, Field64};
+use plonky2::gates::noop::NoopGate;
 use plonky2::hash::hash_types::HashOutTarget;
 use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::iop::target::{BoolTarget, Target};
+use plonky2::iop::witness::{PartialWitness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
-use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData};
+use plonky2::plonk::circuit_data::{
+    CircuitConfig, CircuitData, CommonCircuitData, VerifierOnlyCircuitData,
+};
+use plonky2::plonk::proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget};
 
-use crate::circuit::gadgets::bip340::{be_bytes32_to_nonnative, bip340_verify_with_s2c};
-use crate::circuit::gadgets::coinhist::coinhist_update_roots;
+use crate::circuit::gadgets::bip340::{
+    be_bytes32_to_nonnative, bip340_verify_with_s2c, s2c_open_with_point,
+};
+use crate::circuit::gadgets::coinhist::{
+    coinhist_leaf_hash_target, coinhist_node_hash_target, coinhist_update_roots, COINHIST_DEPTH,
+};
 use crate::circuit::gadgets::curve::{AffinePointTarget, CircuitBuilderCurve};
 use crate::circuit::gadgets::curve_types::Secp256K1;
+use crate::circuit::gadgets::nflog_consistency::{
+    nflog_empty_target, nflog_leaf_hash_target, verify_nflog_consistency, verify_nflog_inclusion,
+    H_MAX,
+};
 use crate::circuit::gadgets::nonnative::{CircuitBuilderNonNative, NonNativeTarget};
 use crate::circuit::gadgets::sha256::sha256;
 use crate::circuit::gadgets::u128_arith::{
@@ -20,17 +33,18 @@ use crate::{C, D, F};
 
 use super::bindings::{
     coin_identifier_with_index_target, enforce_input_coin_bindings, hash_proof_data_target,
-    input_nullifiers_root_target, nk_commit_target,
+    input_nullifiers_root_target, nav_commitment_target, nk_commit_target,
 };
 use super::serialize::{
     address_from_pk0_and_nk_commit, be_bytes32_to_u32_limbs, digest_to_be_bytes_target,
     encode_byte_string_target, strict_be_bytes_less_than, tag_targets, u128_to_be_bytes_target,
-    u64_to_be_bytes_target,
+    u32_limbs_to_be_bytes32, u64_to_be_bytes_target,
 };
 use super::targets::{
     virtual_bytes, AccountStateTarget, AssetIssuanceTarget, BalanceSlotTarget, CoinTarget,
-    HistoryUpdatePathTarget, InputAuthTarget, InputCoinTarget, OutputTemplateTarget,
-    ProofDataTarget, MAX_ACCOUNT_ASSETS, MAX_HISTORY_UPDATES_D3,
+    HistoryUpdatePathTarget, InputAuthTarget, InputCoinTarget, NavOpeningTarget, NavTarget,
+    OutputTemplateTarget, PrevProofTargets, PrevStateNullifierTarget, ProofDataTarget,
+    MAX_ACCOUNT_ASSETS, MAX_HISTORY_UPDATES_D3,
 };
 use super::{
     GENESIS_TAG, M_STATE_MAINNET, M_STATE_REGTEST, M_STATE_TESTNET, NETWORK_TAG_MAINNET,
@@ -74,6 +88,7 @@ impl Network {
 /// All witness and derived targets exposed to a host-side witness setter.
 #[derive(Clone, Debug)]
 pub struct ComplianceTargets {
+    pub recursion: PrevProofTargets,
     pub prev_account_state: AccountStateTarget,
     pub new_account_state: AccountStateTarget,
     pub prev_account_state_hash: HashOutTarget,
@@ -86,6 +101,11 @@ pub struct ComplianceTargets {
     pub history_update_paths: [HistoryUpdatePathTarget; MAX_HISTORY_UPDATES_D3],
     pub next_pubkey: [Target; 32],
     pub npk_rand: [Target; 32],
+    pub nav: NavTarget,
+    pub nav_rand: [Target; 32],
+    pub prev_nav_opening: NavOpeningTarget,
+    pub nav_consistency: [HashOutTarget; 2 * H_MAX],
+    pub prev_state_nullifier: PrevStateNullifierTarget,
     pub txn_sig_rx: NonNativeTarget<Secp256K1Base>,
     pub txn_sig_s: NonNativeTarget<Secp256K1Scalar>,
     pub s2c_r_prime: AffinePointTarget<Secp256K1>,
@@ -101,6 +121,8 @@ pub struct SkeletonCircuit {
     pub data: CircuitData<F, C, D>,
     pub targets: ComplianceTargets,
     pub gate_count: usize,
+    pub base_proof: ProofWithPublicInputs<F, C, D>,
+    pub base_verifier_data: VerifierOnlyCircuitData<C, D>,
 }
 
 fn select_hash(
@@ -140,6 +162,81 @@ fn bytes_equal(
         equal = builder.and(equal, byte_equal);
     }
     equal
+}
+
+fn enforce_hash_when(
+    builder: &mut CircuitBuilder<F, D>,
+    condition: BoolTarget,
+    lhs: HashOutTarget,
+    rhs: HashOutTarget,
+) {
+    let equal = hashes_equal(builder, lhs, rhs);
+    let unequal = builder.not(equal);
+    let violation = builder.and(condition, unequal);
+    builder.assert_zero(violation.target);
+}
+
+fn enforce_bytes_when(
+    builder: &mut CircuitBuilder<F, D>,
+    condition: BoolTarget,
+    lhs: &[Target; 32],
+    rhs: &[Target; 32],
+) {
+    let equal = bytes_equal(builder, lhs, rhs);
+    let unequal = builder.not(equal);
+    let violation = builder.and(condition, unequal);
+    builder.assert_zero(violation.target);
+}
+
+fn hash_from_pis(pis: &[Target], offset: usize) -> HashOutTarget {
+    HashOutTarget {
+        elements: pis[offset..offset + 4]
+            .try_into()
+            .expect("four public inputs form one Poseidon digest"),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PrevProofPublicInputsTarget {
+    proof_data: ProofDataTarget,
+    consumed_pubkey: [Target; 32],
+}
+
+fn unpack_prev_proof_pis(
+    builder: &mut CircuitBuilder<F, D>,
+    proof: &ProofWithPublicInputsTarget<D>,
+) -> PrevProofPublicInputsTarget {
+    assert_eq!(
+        proof.public_inputs.len(),
+        108,
+        "cyclic compliance proof must use the 108-element PI layout"
+    );
+    let npk_limbs: [Target; 8] = proof.public_inputs[20..28]
+        .try_into()
+        .expect("npk_commit has eight limbs");
+    let consumed_limbs: [Target; 8] = proof.public_inputs[28..36]
+        .try_into()
+        .expect("consumed_pubkey has eight limbs");
+    PrevProofPublicInputsTarget {
+        proof_data: ProofDataTarget {
+            new_account_state_hash: hash_from_pis(&proof.public_inputs, 0),
+            output_coins_root: hash_from_pis(&proof.public_inputs, 4),
+            input_nullifiers_root: hash_from_pis(&proof.public_inputs, 8),
+            coin_history_root: hash_from_pis(&proof.public_inputs, 12),
+            nav_commitment: hash_from_pis(&proof.public_inputs, 16),
+            npk_commit: u32_limbs_to_be_bytes32(builder, &npk_limbs),
+        },
+        consumed_pubkey: u32_limbs_to_be_bytes32(builder, &consumed_limbs),
+    }
+}
+
+fn coinhist_empty_root_target(builder: &mut CircuitBuilder<F, D>) -> HashOutTarget {
+    let zero = builder.zero();
+    let mut root = coinhist_leaf_hash_target(builder, zero);
+    for level in 1..=COINHIST_DEPTH {
+        root = coinhist_node_hash_target(builder, level as u32, root, root);
+    }
+    root
 }
 
 fn select_exact_hash(
@@ -645,10 +742,120 @@ fn network_id_target(builder: &mut CircuitBuilder<F, D>, network: Network) -> Ha
     builder.hash_n_to_hash_no_pad::<PoseidonHash>(elements)
 }
 
-/// Builds the real, non-recursive compliance skeleton for one network.
-pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> SkeletonCircuit {
+fn bootstrap_common_data(config: CircuitConfig) -> CommonCircuitData<F, D> {
+    let data0 = CircuitBuilder::<F, D>::new(config.clone()).build::<C>();
+
+    let mut pass1 = CircuitBuilder::<F, D>::new(config.clone());
+    let proof0 = pass1.add_virtual_proof_with_pis(&data0.common);
+    let verifier0 = pass1.add_virtual_verifier_data(data0.common.config.fri_config.cap_height);
+    pass1.verify_proof::<C>(&proof0, &verifier0, &data0.common);
+    let data1 = pass1.build::<C>();
+
+    let mut pass2 = CircuitBuilder::<F, D>::new(config);
+    for _ in 0..108 {
+        pass2.add_virtual_public_input();
+    }
+    let proof1 = pass2.add_virtual_proof_with_pis(&data1.common);
+    let verifier1 = pass2.add_virtual_verifier_data(data1.common.config.fri_config.cap_height);
+    pass2.verify_proof::<C>(&proof1, &verifier1, &data1.common);
+    // Starting at exactly 2^20 pre-blinding rows deterministically gives a
+    // degree-21 zk circuit. The real circuit is expected to fit below this
+    // threshold; if it does not, the fixed-point loop adopts its larger shape.
+    while pass2.num_gates() < 1 << 20 {
+        pass2.add_gate(NoopGate, vec![]);
+    }
+    let common = pass2.build::<C>().common;
+    assert_eq!(common.num_public_inputs, 108);
+    common
+}
+
+fn zk_blinding_gate_count(common: &CommonCircuitData<F, D>) -> usize {
+    let degree = common.degree();
+    let arities: Vec<usize> = common
+        .fri_params
+        .reduction_arity_bits
+        .iter()
+        .map(|&bits| 1usize << bits)
+        .collect();
+    let folding_points = arities.iter().map(|arity| arity - 1).sum::<usize>();
+    let final_poly_coeffs = degree / arities.iter().product::<usize>();
+    let fri_openings = common.config.fri_config.num_query_rounds
+        * (1 + D * folding_points + D * final_poly_coeffs);
+    let regular_openings = D + fri_openings;
+    let z_openings = 2 * D + fri_openings;
+    regular_openings + 2 * z_openings
+}
+
+fn zk_safe_dummy_circuit(common: &CommonCircuitData<F, D>) -> CircuitData<F, C, D> {
+    assert!(
+        common.config.zero_knowledge,
+        "zk-safe dummy helper is only used for the mandatory zk config"
+    );
+    let degree = common.degree();
+    let fixed_overhead = common.num_public_inputs.div_ceil(8) + 2;
+    let seed = degree
+        .checked_sub(fixed_overhead + zk_blinding_gate_count(common))
+        .expect("dummy circuit overhead must fit its target degree");
+
+    // The seed mirrors Plonky2's row accounting, including zk blinding. Try
+    // a narrow empirical window and accept only byte-for-byte CommonData
+    // equality; this is fail-loud and never falls back to a mismatched shape.
+    for delta in [0isize, -1, 1, -2, 2, -3, 3, -4, 4] {
+        let Some(noop_count) = seed.checked_add_signed(delta) else {
+            continue;
+        };
+        let mut builder = CircuitBuilder::<F, D>::new(common.config.clone());
+        for _ in 0..noop_count {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        for gate in &common.gates {
+            builder.add_gate_to_gate_set(gate.clone());
+        }
+        for _ in 0..common.num_public_inputs {
+            builder.add_virtual_public_input();
+        }
+        let data = builder.build::<C>();
+        if data.common == *common {
+            return data;
+        }
+    }
+    panic!(
+        "zk-safe dummy CommonCircuitData search did not converge around seed {seed} (degree {})",
+        common.degree()
+    );
+}
+
+fn build_base_proof(
+    dummy: &CircuitData<F, C, D>,
+    real_verifier_data: &VerifierOnlyCircuitData<C, D>,
+) -> ProofWithPublicInputs<F, C, D> {
+    let mut witness = PartialWitness::new();
+    let cap_elements = dummy.common.config.fri_config.num_cap_elements();
+    let vk_offset = dummy.common.num_public_inputs - 4 - 4 * cap_elements;
+    for (pi_index, &target) in dummy.prover_only.public_inputs.iter().enumerate() {
+        let value = if pi_index < vk_offset {
+            F::ZERO
+        } else if pi_index < vk_offset + 4 {
+            real_verifier_data.circuit_digest.elements[pi_index - vk_offset]
+        } else {
+            let relative = pi_index - vk_offset - 4;
+            real_verifier_data.constants_sigmas_cap.0[relative / 4].elements[relative % 4]
+        };
+        witness.set_target(target, value).unwrap();
+    }
+    dummy
+        .prove(witness)
+        .expect("empirically matched zk dummy circuit must prove")
+}
+
+fn build_with_common(
+    config: CircuitConfig,
+    network: Network,
+    common: &CommonCircuitData<F, D>,
+) -> (CircuitData<F, C, D>, ComplianceTargets, usize, bool) {
     let mut builder = CircuitBuilder::<F, D>::new(config);
 
+    let is_account_update = builder.add_virtual_bool_target_safe();
     let prev_account_state = AccountStateTarget::new_virtual(&mut builder);
     let new_account_state = AccountStateTarget::new_virtual(&mut builder);
     let prev_account_state_hash = builder.add_virtual_hash();
@@ -661,6 +868,11 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
         std::array::from_fn(|_| HistoryUpdatePathTarget::new_virtual(&mut builder));
     let next_pubkey = virtual_bytes(&mut builder);
     let npk_rand = virtual_bytes(&mut builder);
+    let nav = NavTarget::new_virtual(&mut builder);
+    let nav_rand = virtual_bytes(&mut builder);
+    let prev_nav_opening = NavOpeningTarget::new_virtual(&mut builder);
+    let nav_consistency = std::array::from_fn(|_| builder.add_virtual_hash());
+    let prev_state_nullifier = PrevStateNullifierTarget::new_virtual(&mut builder);
     let consumed_pubkey = virtual_bytes(&mut builder);
     let txn_sig_rx = builder.add_virtual_nonnative_target();
     let txn_sig_s = builder.add_virtual_nonnative_target();
@@ -685,14 +897,9 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
         &input_coins,
         &input_auth,
     );
-    let prev_asset_id_bytes = std::array::from_fn(|i| {
-        digest_to_be_bytes_target(&mut builder, prev_account_state.balances[i].asset_id)
-    });
-    let _prev_balance_count = enforce_balance_discipline(
-        &mut builder,
-        &prev_account_state.balances,
-        &prev_asset_id_bytes,
-    );
+    let (computed_prev_account_state_hash, prev_balance_count) =
+        account_state_hash_target(&mut builder, &prev_account_state);
+    builder.connect_hashes(prev_account_state_hash, computed_prev_account_state_hash);
 
     let input_active = input_coins.map(|coin| coin.active);
     let input_identifiers = input_coins.map(|coin| coin.identifier);
@@ -762,7 +969,7 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
         output_coins_root,
         input_nullifiers_root,
         coin_history_root,
-        nav_commitment: builder.add_virtual_hash(),
+        nav_commitment: nav_commitment_target(&mut builder, nav, &nav_rand),
         npk_commit,
     };
     let h_proof_data = hash_proof_data_target(&mut builder, &proof_data);
@@ -801,7 +1008,152 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
         "compliance skeleton must expose exactly 40 application public inputs"
     );
 
+    let own_verifier_data = builder.add_verifier_data_public_inputs();
+    assert_eq!(
+        builder.num_public_inputs(),
+        108,
+        "compliance circuit must append exactly 68 verifier-data public inputs"
+    );
+    assert_eq!(
+        common.num_public_inputs, 108,
+        "cyclic CommonCircuitData must describe the complete PI layout"
+    );
+    let prev_proof = builder.add_virtual_proof_with_pis(common);
+    let base_proof = builder.add_virtual_proof_with_pis(common);
+    let base_verifier_data = builder.add_virtual_verifier_data(common.config.fri_config.cap_height);
+    let prev_pis = unpack_prev_proof_pis(&mut builder, &prev_proof);
+
+    enforce_hash_when(
+        &mut builder,
+        is_account_update,
+        prev_pis.proof_data.new_account_state_hash,
+        computed_prev_account_state_hash,
+    );
+    enforce_hash_when(
+        &mut builder,
+        is_account_update,
+        prev_pis.proof_data.coin_history_root,
+        prev_account_state.coin_history_root,
+    );
+    let opened_prev_nav_commitment = nav_commitment_target(
+        &mut builder,
+        prev_nav_opening.nav,
+        &prev_nav_opening.nav_rand,
+    );
+    enforce_hash_when(
+        &mut builder,
+        is_account_update,
+        prev_pis.proof_data.nav_commitment,
+        opened_prev_nav_commitment,
+    );
+
+    let is_initial = builder.not(is_account_update);
+    let initial_owner = address_from_pk0_and_nk_commit(
+        &mut builder,
+        &consumed_pubkey,
+        prev_account_state.nk_commit,
+    );
+    enforce_bytes_when(
+        &mut builder,
+        is_initial,
+        &prev_account_state.owner,
+        &initial_owner,
+    );
+    let zero = builder.zero();
+    let balance_count_zero = builder.is_equal(prev_balance_count, zero);
+    let balance_count_nonzero = builder.not(balance_count_zero);
+    let bad_balance_count = builder.and(is_initial, balance_count_nonzero);
+    builder.assert_zero(bad_balance_count.target);
+    let counter_zero = builder.is_equal(prev_account_state.send_counter, zero);
+    let counter_nonzero = builder.not(counter_zero);
+    let bad_counter = builder.and(is_initial, counter_nonzero);
+    builder.assert_zero(bad_counter.target);
+    let empty_history = coinhist_empty_root_target(&mut builder);
+    enforce_hash_when(
+        &mut builder,
+        is_initial,
+        prev_account_state.coin_history_root,
+        empty_history,
+    );
+    let size_prev_zero = builder.is_equal(prev_nav_opening.nav.size, zero);
+    let size_prev_nonzero = builder.not(size_prev_zero);
+    let bad_size_prev = builder.and(is_initial, size_prev_nonzero);
+    builder.assert_zero(bad_size_prev.target);
+
+    let empty_nflog = nflog_empty_target(&mut builder);
+    let consistency_m = builder.select(is_account_update, prev_nav_opening.nav.size, zero);
+    let consistency_mth = select_hash(
+        &mut builder,
+        is_account_update,
+        prev_nav_opening.nav.mth,
+        empty_nflog,
+    );
+    verify_nflog_consistency(
+        &mut builder,
+        consistency_m,
+        consistency_mth,
+        nav.size,
+        nav.mth,
+        &nav_consistency,
+    );
+
+    let prev_leaf = nflog_leaf_hash_target(
+        &mut builder,
+        prev_state_nullifier.pos_prev,
+        &prev_state_nullifier.pk_prev,
+        &prev_state_nullifier.r_prev,
+    );
+    let effective_position = builder.select(is_account_update, prev_state_nullifier.pos_prev, zero);
+    let one = builder.one();
+    let effective_size = builder.select(is_account_update, nav.size, one);
+    let effective_mth = select_hash(&mut builder, is_account_update, nav.mth, prev_leaf);
+    verify_nflog_inclusion(
+        &mut builder,
+        prev_leaf,
+        effective_position,
+        &prev_state_nullifier.nav_inclusion,
+        effective_size,
+        effective_mth,
+    );
+
+    let h_prev_proof_data = hash_proof_data_target(&mut builder, &prev_pis.proof_data);
+    let prev_opening = s2c_open_with_point(
+        &mut builder,
+        &prev_state_nullifier.r_prime_prev,
+        &h_prev_proof_data,
+    );
+    enforce_bytes_when(
+        &mut builder,
+        is_account_update,
+        &prev_state_nullifier.r_prev,
+        &prev_opening.rx_bytes,
+    );
+    enforce_bytes_when(
+        &mut builder,
+        is_account_update,
+        &prev_state_nullifier.pk_prev,
+        &prev_pis.consumed_pubkey,
+    );
+
+    builder
+        .conditionally_verify_cyclic_proof::<C>(
+            is_account_update,
+            &prev_proof,
+            &base_proof,
+            &base_verifier_data,
+            common,
+        )
+        .expect("cyclic recursion wiring must be structurally valid");
+
+    let recursion = PrevProofTargets {
+        is_account_update,
+        prev_proof,
+        base_proof,
+        base_verifier_data,
+        own_verifier_data,
+    };
     let targets = ComplianceTargets {
+        recursion,
         prev_account_state,
         new_account_state,
         prev_account_state_hash,
@@ -814,6 +1166,11 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
         history_update_paths,
         next_pubkey,
         npk_rand,
+        nav,
+        nav_rand,
+        prev_nav_opening,
+        nav_consistency,
+        prev_state_nullifier,
         txn_sig_rx,
         txn_sig_s,
         s2c_r_prime,
@@ -823,11 +1180,57 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
         balance_count,
         output_count,
     };
+    while builder.num_gates() < 1 << 20 {
+        builder.add_gate(NoopGate, vec![]);
+    }
     let gate_count = builder.num_gates();
-    let data = builder.build::<C>();
+    let (data, success) = builder.try_build_with_options::<C>(true);
+    (data, targets, gate_count, success)
+}
+
+fn build_skeleton_circuit_inner(config: CircuitConfig, network: Network) -> SkeletonCircuit {
+    assert!(
+        config.zero_knowledge,
+        "the compliance circuit requires standard_recursion_zk_config"
+    );
+    let mut candidate = bootstrap_common_data(config.clone());
+    let mut converged = None;
+    for iteration in 0..16 {
+        let (data, targets, gate_count, success) =
+            build_with_common(config.clone(), network, &candidate);
+        if success && data.common == candidate {
+            converged = Some((data, targets, gate_count, iteration + 1));
+            break;
+        }
+        candidate = data.common.clone();
+    }
+    let (data, targets, gate_count, iterations) = converged.unwrap_or_else(|| {
+        panic!("compliance CommonCircuitData fixed point did not converge in 16 iterations")
+    });
+    eprintln!("compliance cyclic CommonCircuitData fixed point converged in {iterations} build(s)");
+
+    let dummy = zk_safe_dummy_circuit(&data.common);
+    let base_proof = build_base_proof(&dummy, &data.verifier_only);
     SkeletonCircuit {
+        base_verifier_data: dummy.verifier_only,
+        base_proof,
         data,
         targets,
         gate_count,
     }
+}
+
+/// Builds the cyclic spec-v1.1 compliance circuit for one network.
+///
+/// Plonky2's recursive target/common-data construction has deeply nested
+/// stack frames at this circuit size, so build it on an explicitly sized
+/// worker stack instead of relying on the test-runner or caller default.
+pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> SkeletonCircuit {
+    std::thread::Builder::new()
+        .name("zkcoins-compliance-build".to_owned())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || build_skeleton_circuit_inner(config, network))
+        .expect("compliance build worker must spawn")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
