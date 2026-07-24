@@ -330,6 +330,38 @@ impl ProverBridge {
         Ok(())
     }
 
+    /// Re-extract every application public input from the proof and bind it
+    /// to the convenience fields carried by `ProvedTransition`.
+    ///
+    /// Callers must run this before trusting `proof_data`, `consumed_pubkey`,
+    /// or `network_id`: those wrapper fields are independently mutable and
+    /// are not authenticated unless compared with `proof.public_inputs`.
+    pub(crate) fn verify_proved_transition_wrapper(
+        &self,
+        proved: &ProvedTransition,
+    ) -> Result<ProofData> {
+        let (proof_data, consumed_pubkey, proof_network_id) =
+            extract_transition_public_inputs(&proved.proof)
+                .context("re-extract proved transition public inputs")?;
+        ensure!(
+            proof_data == proved.proof_data,
+            "ProvedTransition.proof_data differs from proof public inputs"
+        );
+        ensure!(
+            consumed_pubkey == proved.consumed_pubkey,
+            "ProvedTransition.consumed_pubkey differs from proof public inputs"
+        );
+        ensure!(
+            proof_network_id == proved.network_id,
+            "ProvedTransition.network_id differs from proof public inputs"
+        );
+        ensure!(
+            proof_network_id == network_id(self.network),
+            "proved transition network_id differs from the bridge network"
+        );
+        Ok(proof_data)
+    }
+
     /// Assemble every `C_balance` target and produce a genuine non-cyclic
     /// balance-attestation proof.
     pub fn prove_attestation(&self, witness: &AttestationWitness) -> Result<ProvedAttestation> {
@@ -1489,39 +1521,41 @@ fn bytes_from_u32_le_limbs(limbs: &[F]) -> Result<[u8; 32]> {
     Ok(bytes)
 }
 
+/// Crate-internal test helpers for BIP-340 + sign-to-contract transition signing.
+///
+/// Used by `state_engine` tests and the bridge's own fixtures so both share one
+/// S2C+BIP-340 implementation rather than reimplementing the wallet signer.
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
+pub(crate) mod test_signing {
     use num::BigUint;
     use plonky2::field::types::Field;
     use sha2::{Digest, Sha256};
 
-    use super::*;
+    use plonky2::field::secp256k1_scalar::Secp256K1Scalar;
+    use zkcoins_program_plonky2::circuit::gadgets::curve_types::{
+        AffinePoint, Curve, CurveScalar, Secp256K1,
+    };
+
+    use super::{
+        extract_transition_public_inputs, field_bytes, is_odd, tagged_hash, Network, ProofData,
+        ProvedTransition, TransitionSignature,
+    };
+    use shared::spec_v1 as host;
 
     #[derive(Clone)]
-    struct TestSignature {
-        transition: TransitionSignature,
-        r_prime_point: AffinePoint<Secp256K1>,
+    pub(crate) struct TestSignature {
+        pub(crate) transition: TransitionSignature,
+        pub(crate) r_prime_point: AffinePoint<Secp256K1>,
     }
 
-    #[derive(Clone)]
-    struct GenesisFixture {
-        witness: TransitionWitness,
-        output_coin: Coin,
-        asset_id: HashDigest,
-        nav_opening: NavOpening,
-        signature: TestSignature,
-    }
-
-    fn deterministic_secret(label: &[u8]) -> Secp256K1Scalar {
+    pub(crate) fn deterministic_secret(label: &[u8]) -> Secp256K1Scalar {
         let digest = Sha256::digest(label);
         let scalar = Secp256K1Scalar::from_noncanonical_biguint(BigUint::from_bytes_be(&digest));
         assert!(scalar.is_nonzero());
         scalar
     }
 
-    fn normalized_key(
+    pub(crate) fn normalized_key(
         secret: Secp256K1Scalar,
     ) -> (Secp256K1Scalar, AffinePoint<Secp256K1>, [u8; 32]) {
         let mut normalized_secret = secret;
@@ -1534,10 +1568,12 @@ mod tests {
         (normalized_secret, public, field_bytes(public.x))
     }
 
-    fn sign_transition(
+    /// Sign `H(ProofData)` with BIP-340 + S2C for the given network's `m_state`.
+    pub(crate) fn sign_transition(
         secret: Secp256K1Scalar,
         public: AffinePoint<Secp256K1>,
         proof_data: &ProofData,
+        network: Network,
     ) -> TestSignature {
         let pk_bytes = field_bytes(public.x);
         let h_proof_data = host::hash_proof_data(&host::serialize_proof_data(proof_data));
@@ -1567,7 +1603,7 @@ mod tests {
             let mut challenge_preimage = Vec::with_capacity(64 + 32);
             challenge_preimage.extend_from_slice(&rx_bytes);
             challenge_preimage.extend_from_slice(&pk_bytes);
-            challenge_preimage.extend_from_slice(Network::Testnet.m_state_bytes());
+            challenge_preimage.extend_from_slice(network.m_state_bytes());
             let challenge = Secp256K1Scalar::from_noncanonical_biguint(BigUint::from_bytes_be(
                 &tagged_hash(b"BIP0340/challenge", &challenge_preimage),
             ));
@@ -1588,6 +1624,43 @@ mod tests {
             };
         }
         unreachable!("deterministic nonce sequence must eventually sign")
+    }
+
+    /// A correctly shaped dummy recursion-base proof and wrapper. It is not a
+    /// real transition proof, but is sufficient for host-only tests that must
+    /// reject wrapper/public-input mismatches before cryptographic verify.
+    pub(crate) fn base_proved_transition(network: Network) -> ProvedTransition {
+        let proof = super::compliance_circuit(network).base_proof.clone();
+        let (proof_data, consumed_pubkey, network_id) =
+            extract_transition_public_inputs(&proof).expect("base proof public-input shape");
+        ProvedTransition {
+            proof,
+            proof_data,
+            consumed_pubkey,
+            network_id,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use plonky2::field::types::Field;
+    use sha2::{Digest, Sha256};
+
+    use super::test_signing::{
+        deterministic_secret, normalized_key, sign_transition, TestSignature,
+    };
+    use super::*;
+
+    #[derive(Clone)]
+    struct GenesisFixture {
+        witness: TransitionWitness,
+        output_coin: Coin,
+        asset_id: HashDigest,
+        nav_opening: NavOpening,
+        signature: TestSignature,
     }
 
     fn genesis_fixture() -> GenesisFixture {
@@ -1663,7 +1736,7 @@ mod tests {
             nav_commitment: host::nav_commitment(nav_opening.nav.root(), &nav_opening.nav_rand),
             npk_commit: host::npk_commit(&next_pubkey, &npk_rand),
         };
-        let signature = sign_transition(secret, public, &proof_data);
+        let signature = sign_transition(secret, public, &proof_data, Network::Testnet);
         GenesisFixture {
             witness: TransitionWitness {
                 mode: TransitionMode::InitialProof,
@@ -1790,7 +1863,7 @@ mod tests {
             nav_commitment: host::nav_commitment(nav.root(), &nav_rand),
             npk_commit: host::npk_commit(&next_pubkey, &npk_rand),
         };
-        let signature = sign_transition(secret, public, &proof_data);
+        let signature = sign_transition(secret, public, &proof_data, Network::Testnet);
         TransitionWitness {
             mode: TransitionMode::AccountUpdateProof,
             prev_account_state,
