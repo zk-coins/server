@@ -11,6 +11,8 @@
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+extern crate alloc;
+
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
 
@@ -24,11 +26,14 @@ pub type C = PoseidonGoldilocksConfig;
 /// `standard_recursion_config`.
 pub const D: usize = 2;
 
+#[allow(clippy::chunks_exact_to_as_chunks, clippy::needless_range_loop)]
 pub mod circuit;
 pub mod hash;
 pub mod inputs;
 pub mod merkle;
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub mod types;
+pub mod u32_lib;
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
