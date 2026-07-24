@@ -560,10 +560,14 @@ mod tests {
         witness
             .set_biguint_target(&b, &BigUint::one())
             .expect("b fits in two canonical limbs");
-        let failed = catch_unwind(AssertUnwindSafe(|| data.prove(witness)));
-        assert!(
-            failed.is_err() || failed.expect("checked panic").is_err(),
-            "a noncanonical quotient limb unexpectedly satisfied the circuit"
-        );
+        match catch_unwind(AssertUnwindSafe(|| data.prove(witness))) {
+            Err(_) | Ok(Err(_)) => {}
+            Ok(Ok(proof)) => {
+                assert!(
+                    data.verify(proof).is_err(),
+                    "a noncanonical quotient limb unexpectedly satisfied the circuit"
+                );
+            }
+        }
     }
 }
