@@ -26,6 +26,8 @@
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod prover_bridge;
+
 use anyhow::Result;
 use plonky2::plonk::proof::ProofWithPublicInputs;
 

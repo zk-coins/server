@@ -5241,7 +5241,10 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bincode",
+ "num",
  "plonky2",
+ "sha2",
+ "shared",
  "zkcoins-program-plonky2",
 ]
 
