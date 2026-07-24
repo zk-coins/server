@@ -14,6 +14,7 @@ itertools = { version = "0.11", default-features = false, features = ["use_alloc
 [dev-dependencies]
 num-bigint = "0.4"
 num-traits = "0.2"
+secp256k1 = { version = "0.29", features = ["rand-std"] }
 sha2 = { workspace = true }
 shared = { path = "../shared" }
 
