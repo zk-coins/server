@@ -19,6 +19,7 @@ use plonky2::iop::witness::{PartialWitness, WitnessWrite};
 use plonky2::plonk::circuit_data::{CircuitConfig, VerifierOnlyCircuitData};
 use plonky2::plonk::proof::ProofWithPublicInputs;
 use plonky2::recursion::cyclic_recursion::check_cyclic_proof_verifier_data;
+use sha2::{Digest, Sha256};
 
 use shared::spec_v1::{
     self as host, AccountState, Address, Coin, CoinHistProof, CoinHistState, CoinTemplate,
@@ -34,7 +35,7 @@ use zkcoins_program_plonky2::circuit::compliance::{
 use zkcoins_program_plonky2::circuit::gadgets::biguint::WitnessBigUint;
 use zkcoins_program_plonky2::circuit::gadgets::curve::AffinePointTarget;
 use zkcoins_program_plonky2::circuit::gadgets::curve_types::{
-    lift_x_even_y, AffinePoint, Curve, Secp256K1,
+    lift_x_even_y, AffinePoint, Curve, CurveScalar, Secp256K1,
 };
 use zkcoins_program_plonky2::circuit::gadgets::nflog_consistency::H_MAX;
 use zkcoins_program_plonky2::circuit::gadgets::nonnative::NonNativeTarget;
@@ -623,9 +624,15 @@ fn validate_transition(w: &TransitionWitness, network: Network) -> Result<ProofD
         npk_commit: host::npk_commit(&w.next_pubkey, &w.npk_rand),
     };
 
-    // Fail before the expensive prover if the wallet signed for another
-    // network. Full BIP-340+S2C validity remains enforced by `C`.
-    let _ = network.m_state_bytes();
+    // Host preflight: fail fast on an invalid or wrong-network BIP-340+S2C
+    // signature before the expensive prover. `C` remains the authoritative
+    // in-circuit verifier.
+    let h_proof_data = host::hash_proof_data(&host::serialize_proof_data(&proof_data));
+    verify_transition_signature(
+        &w.transition_signature,
+        &h_proof_data,
+        network.m_state_bytes(),
+    )?;
     Ok(proof_data)
 }
 
@@ -1290,6 +1297,79 @@ fn set_point(
     set_nonnative(witness, &target.y, point.y)
 }
 
+fn field_bytes<FF: PrimeField>(value: FF) -> [u8; 32] {
+    let encoded = value.to_canonical_biguint().to_bytes_be();
+    assert!(encoded.len() <= 32);
+    let mut bytes = [0u8; 32];
+    bytes[32 - encoded.len()..].copy_from_slice(&encoded);
+    bytes
+}
+
+fn is_odd<FF: PrimeField>(value: FF) -> bool {
+    (&value.to_canonical_biguint() & BigUint::from(1u8)) == BigUint::from(1u8)
+}
+
+fn tagged_hash(tag: &[u8], message: &[u8]) -> [u8; 32] {
+    let tag_hash = Sha256::digest(tag);
+    let mut preimage = Vec::with_capacity(64 + message.len());
+    preimage.extend_from_slice(&tag_hash);
+    preimage.extend_from_slice(&tag_hash);
+    preimage.extend_from_slice(message);
+    Sha256::digest(preimage).into()
+}
+
+/// Host-side BIP-340 + sign-to-contract preflight for a transition signature.
+///
+/// Accepts exactly the signatures produced by the test / wallet signer
+/// (`R' + t·G` S2C tweak, even-y `R`, BIP-340 challenge over `m_state`).
+fn verify_transition_signature(
+    sig: &TransitionSignature,
+    h_proof_data: &[u8; 32],
+    m_state: &[u8],
+) -> Result<()> {
+    let mut tweak_preimage = Vec::with_capacity(64);
+    tweak_preimage.extend_from_slice(&sig.r_prime);
+    tweak_preimage.extend_from_slice(h_proof_data);
+    let tweak_bytes: [u8; 32] = Sha256::digest(tweak_preimage).into();
+    let tweak_integer = BigUint::from_bytes_be(&tweak_bytes);
+    ensure!(
+        tweak_integer < Secp256K1Scalar::order(),
+        "transition signature S2C tweak is not a canonical secp256k1 scalar"
+    );
+    let tweak = Secp256K1Scalar::from_noncanonical_biguint(tweak_integer);
+
+    let r_prime = canonical_x_point(&sig.r_prime, "transition signature R'")?;
+    let r = (r_prime + (CurveScalar(tweak) * Secp256K1::GENERATOR_PROJECTIVE).to_affine())
+        .to_affine();
+    ensure!(
+        !r.zero,
+        "transition signature S2C nonce is the point at infinity"
+    );
+    ensure!(!is_odd(r.y), "transition signature S2C nonce has odd y");
+
+    let rx_bytes = field_bytes(r.x);
+    ensure!(
+        rx_bytes.as_slice() == &sig.signature[..32],
+        "transition signature R does not match S2C-tweaked nonce"
+    );
+
+    let mut challenge_preimage = Vec::with_capacity(64 + m_state.len());
+    challenge_preimage.extend_from_slice(&rx_bytes);
+    challenge_preimage.extend_from_slice(&sig.pk_i);
+    challenge_preimage.extend_from_slice(m_state);
+    let e = Secp256K1Scalar::from_noncanonical_biguint(BigUint::from_bytes_be(
+        &tagged_hash(b"BIP0340/challenge", &challenge_preimage),
+    ));
+
+    let p = canonical_x_point(&sig.pk_i, "transition signature Pk_i")?;
+    let s = canonical_scalar(&sig.signature_s(), "transition signature s")?;
+
+    let s_g = (CurveScalar(s) * Secp256K1::GENERATOR_PROJECTIVE).to_affine();
+    let rhs = (r + (CurveScalar(e) * p.to_projective()).to_affine()).to_affine();
+    ensure!(s_g == rhs, "invalid transition signature");
+    Ok(())
+}
+
 fn canonical_base(bytes: &[u8; 32], label: &str) -> Result<Secp256K1Base> {
     let integer = BigUint::from_bytes_be(bytes);
     ensure!(
@@ -1414,9 +1494,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use num::BigUint;
-    use plonky2::field::types::{Field, PrimeField};
+    use plonky2::field::types::Field;
     use sha2::{Digest, Sha256};
-    use zkcoins_program_plonky2::circuit::gadgets::curve_types::{CurveScalar, Secp256K1};
 
     use super::*;
 
@@ -1433,18 +1512,6 @@ mod tests {
         asset_id: HashDigest,
         nav_opening: NavOpening,
         signature: TestSignature,
-    }
-
-    fn field_bytes<FF: PrimeField>(value: FF) -> [u8; 32] {
-        let encoded = value.to_canonical_biguint().to_bytes_be();
-        assert!(encoded.len() <= 32);
-        let mut bytes = [0u8; 32];
-        bytes[32 - encoded.len()..].copy_from_slice(&encoded);
-        bytes
-    }
-
-    fn is_odd<FF: PrimeField>(value: FF) -> bool {
-        (&value.to_canonical_biguint() & BigUint::from(1u8)) == BigUint::from(1u8)
     }
 
     fn deterministic_secret(label: &[u8]) -> Secp256K1Scalar {
@@ -1465,15 +1532,6 @@ mod tests {
             public = -public;
         }
         (normalized_secret, public, field_bytes(public.x))
-    }
-
-    fn tagged_hash(tag: &[u8], message: &[u8]) -> [u8; 32] {
-        let tag_hash = Sha256::digest(tag);
-        let mut preimage = Vec::with_capacity(64 + message.len());
-        preimage.extend_from_slice(&tag_hash);
-        preimage.extend_from_slice(&tag_hash);
-        preimage.extend_from_slice(message);
-        Sha256::digest(preimage).into()
     }
 
     fn sign_transition(
