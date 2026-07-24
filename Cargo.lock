@@ -5224,6 +5224,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bincode",
+ "itertools 0.11.0",
  "num-bigint",
  "num-traits",
  "plonky2",
