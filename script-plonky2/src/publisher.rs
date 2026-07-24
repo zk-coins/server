@@ -33,10 +33,19 @@
 //! `MAX_GAP − `[`PublisherConfig::inclusion_delay_margin`]. With margin `m`,
 //! inclusion up to `m + 1` blocks after the pre-broadcast check still
 //! satisfies §3.5; beyond that the batch carries **zero** valid nullifiers
-//! while its fees remain spent. The margin is a **budget**, not a guarantee —
-//! RBF fee-bumping is **not** available for the commit transaction (bumping
-//! would change `commit_txid` and invalidate the pre-built reveal). The only
-//! lever is an adequate `fee_rate_sat_per_vb` up front (and a larger margin).
+//! while its fees remain spent. The margin is a **budget**, not a guarantee of
+//! inclusion. No fee-bump path is **implemented** in this module (see
+//! [`PublisherConfig`] commit-fee note); choosing an adequate
+//! `fee_rate_sat_per_vb` up front (and a sufficient margin) remains the
+//! recommended approach.
+//!
+//! **RPC cost of anchor selection.** After the O(1) structural gates, selection
+//! fetches the node tip once, then applies the effective height window by pure
+//! arithmetic on caller-supplied heights (too old or in the future). A batch
+//! rejected by that pre-filter costs O(1) RPCs (tip only). Only heights that
+//! survive the window are looked up via `getblockhash` — at most
+//! `window + 1` distinct heights for an accepted batch, independent of member
+//! count (`window = MAX_GAP − inclusion_delay_margin`).
 //!
 //! ## Batch size is the caller's policy
 //!
@@ -155,13 +164,18 @@ const MIN_COMMIT_VSIZE_LOWER_BOUND: usize = 100;
 /// password-based RPC auth — missing values fail at the call site that builds
 /// this struct, not inside the publisher.
 ///
-/// ## Commit fee policy (no RBF path)
+/// ## Commit fee policy (no fee-bump path implemented here)
 ///
-/// **RBF fee-bumping is not available for the commit transaction.** Bumping
-/// the commit would change `commit_txid` and invalidate the pre-built reveal
-/// (which spends that exact outpoint). The only levers for timely inclusion
-/// are choosing an adequate [`Self::fee_rate_sat_per_vb`] up front and a
-/// sufficient [`Self::inclusion_delay_margin`].
+/// No fee-bump path is **implemented** in this module. The commit transaction
+/// does signal RBF (see [`crate::inscription`]), but replacing it changes
+/// `commit_txid` and therefore invalidates the **pre-built** reveal that spends
+/// that exact outpoint. Because the reveal is signature-free, a replacement
+/// commit can be paired with a **newly built** reveal — rebuilding is cheap,
+/// unlike re-signing a signed child. The reveal can also act as a replaceable
+/// CPFP child of the commit. Those paths are physically available on the wire;
+/// this publisher simply does not implement them. Choosing an adequate
+/// [`Self::fee_rate_sat_per_vb`] up front (and a sufficient
+/// [`Self::inclusion_delay_margin`]) remains the recommended approach.
 #[derive(Clone, Debug)]
 pub struct PublisherConfig {
     /// Base RPC URL, e.g. `http://127.0.0.1:18443`. The wallet path is appended.
@@ -171,8 +185,8 @@ pub struct PublisherConfig {
     /// Name of the loaded descriptor wallet that funds the commit.
     pub wallet_name: String,
     /// Fee rate in satoshis per virtual byte. Applied to measured vsizes.
-    /// Must be set high enough for timely inclusion — see struct-level note
-    /// on the absence of a commit RBF path.
+    /// Prefer setting this high enough for timely inclusion — see struct-level
+    /// note on fee policy (no bump path implemented in this module).
     pub fee_rate_sat_per_vb: u64,
     /// Explicit value of the reveal transaction's single output. Must sit
     /// at or above the dust limit of its scriptPubKey.
@@ -199,7 +213,7 @@ pub struct PublisherConfig {
     /// **zero** valid nullifiers under a conformant scanner while the commit
     /// and reveal fees remain spent. The margin is a budget for mempool lag,
     /// not a guarantee of inclusion within that window — see the struct-level
-    /// note that commit RBF is unavailable.
+    /// commit fee-policy note (no bump path implemented in this module).
     pub inclusion_delay_margin: u32,
 }
 
@@ -212,6 +226,13 @@ pub struct Publisher {
     /// racing the publish path.
     #[cfg(test)]
     pre_broadcast_hook: Mutex<Option<Box<dyn FnMut(&Client) + Send>>>,
+    /// Test-only: counts `getblockhash` RPCs issued for **member** tip
+    /// validation ([`Self::cached_block_hash`]). Tip acquisition via
+    /// [`Self::current_anchor`] and the pre-broadcast identity re-check are
+    /// **not** counted here — this seam observes only the selection-loop cost
+    /// that a weight-valid stale batch must not be allowed to inflate.
+    #[cfg(test)]
+    member_getblockhash_calls: Mutex<u64>,
 }
 
 /// One batch member together with the chain tip its proof was built against (§3.5).
@@ -355,6 +376,8 @@ impl Publisher {
             config,
             #[cfg(test)]
             pre_broadcast_hook: Mutex::new(None),
+            #[cfg(test)]
+            member_getblockhash_calls: Mutex::new(0),
         })
     }
 
@@ -838,12 +861,20 @@ impl Publisher {
 
     /// Choose the §3.5 `block_anchor` from member build tips.
     ///
-    /// - **every** member's `build_tip` is validated: `height ≤ node tip` and
-    ///   `hash == getblockhash(height)` (RPC results cached per height **within
-    ///   this call only** — the pre-broadcast re-check never uses this cache)
-    /// - lowest `build_tip.height` wins among validated tips
-    /// - ties require identical hashes (else members are on different chains)
-    /// - `(tip + 1) − anchor.height ≤ MAX_GAP − config.inclusion_delay_margin`
+    /// Order (deliberate — bounds RPC cost independent of member count):
+    /// 1. Fetch the node tip once.
+    /// 2. **Arithmetic window pre-filter** on every member's claimed height
+    ///    (future or older than the effective publish bound). Pure arithmetic
+    ///    on caller-supplied numbers — **zero** `getblockhash` RPCs. A batch
+    ///    rejected here costs O(1) RPCs (tip only).
+    /// 3. Canonical-hash check for surviving heights only
+    ///    (`hash == getblockhash(height)`), cached per height **within this
+    ///    call only**. At most `window + 1` distinct lookups for an accepted
+    ///    batch (`window = MAX_GAP − inclusion_delay_margin`), regardless of
+    ///    member count. The pre-broadcast re-check never uses this cache.
+    /// 4. Lowest `build_tip.height` wins among validated tips; same-height
+    ///    ties require identical hashes (else members are on different chains).
+    /// 5. Re-assert the effective gap on the selected oldest tip.
     ///
     /// Offending member indices are named in error messages. `build_tip` is a
     /// caller assertion — see [`BatchMember::build_tip`].
@@ -853,12 +884,12 @@ impl Publisher {
             "select_block_anchor requires at least one BatchMember"
         );
 
+        // 1. Tip once — only RPCs needed to reject a fully out-of-window batch.
         let node_tip = self.current_anchor()?;
-        // Cache getblockhash results so multi-member batches at the same height
-        // issue one RPC call per distinct height. This cache is call-local and
-        // is NOT reused by the pre-broadcast identity re-check.
-        let mut hash_cache: HashMap<u32, [u8; 32]> = HashMap::new();
+        let window = publish_max_gap(self.config.inclusion_delay_margin)?;
 
+        // 2. Arithmetic pre-filter: every claimed height must lie in
+        //    [tip + 1 − window, tip]. No getblockhash yet.
         for (index, member) in members.iter().enumerate() {
             let tip = member.build_tip;
             ensure!(
@@ -869,6 +900,27 @@ impl Publisher {
                 node_tip.height,
                 tip.block_hash
             );
+            // Same bound as ensure_publish_gap_ok, with member index and an
+            // explicit note that this is the pre-RPC arithmetic filter.
+            let gap = publish_inclusion_gap(tip, node_tip)?;
+            ensure!(
+                gap <= window,
+                "members too stale, re-prove: member[{index}] build_tip height {} with node tip {} \
+                 implies inclusion gap ≥ {gap} > effective publish bound {window} \
+                 (§3.5 MAX_GAP={BLOCK_ANCHOR_MAX_GAP} − inclusion_delay_margin {}); \
+                 arithmetic pre-filter (no per-member getblockhash issued); \
+                 refusing to substitute a fresher anchor",
+                tip.height,
+                node_tip.height,
+                self.config.inclusion_delay_margin,
+            );
+        }
+
+        // 3. Canonical-hash validation for heights that survived the window
+        //    (≤ window + 1 distinct heights).
+        let mut hash_cache: HashMap<u32, [u8; 32]> = HashMap::new();
+        for (index, member) in members.iter().enumerate() {
+            let tip = member.build_tip;
             let chain_hash = self.cached_block_hash(tip.height, &mut hash_cache)?;
             ensure!(
                 chain_hash == tip.block_hash,
@@ -880,6 +932,7 @@ impl Publisher {
             );
         }
 
+        // 4. Oldest validated tip is the batch anchor.
         let mut oldest = members[0].build_tip;
         let mut oldest_index = 0usize;
         for (index, member) in members.iter().enumerate().skip(1) {
@@ -899,6 +952,8 @@ impl Publisher {
             }
         }
 
+        // 5. Redundant on the selected oldest (every member already passed),
+        //    but keeps the post-selection guarantee explicit at this site.
         ensure_publish_gap_ok(
             oldest,
             node_tip,
@@ -908,6 +963,10 @@ impl Publisher {
     }
 
     /// `getblockhash(height)` with a per-call-site [`HashMap`] cache.
+    ///
+    /// Used only for member tip validation after the arithmetic window
+    /// pre-filter. Cache hits do not issue RPCs and do not increment the
+    /// test-only member-call counter.
     fn cached_block_hash(
         &self,
         height: u32,
@@ -915,6 +974,16 @@ impl Publisher {
     ) -> Result<[u8; 32]> {
         if let Some(hash) = cache.get(&height) {
             return Ok(*hash);
+        }
+        #[cfg(test)]
+        {
+            let mut count = self
+                .member_getblockhash_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *count = count
+                .checked_add(1)
+                .context("member_getblockhash_calls counter overflowed")?;
         }
         let chain_hash = self
             .rpc
@@ -2186,6 +2255,17 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
     }
 
+    /// Reset and return the previous member-`getblockhash` call count (test seam).
+    fn take_member_getblockhash_calls(publisher: &Publisher) -> u64 {
+        let mut guard = publisher
+            .member_getblockhash_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = *guard;
+        *guard = 0;
+        prev
+    }
+
     fn signed_members(count: usize, m_state_network: Network) -> (Vec<NullifierSig>, &'static [u8]) {
         let mut members = Vec::with_capacity(count);
         for index in 0..count {
@@ -3302,5 +3382,122 @@ mod tests {
             mempool_txids(&publisher),
             "mempool unchanged after oversize reject"
         );
+    }
+
+    /// Finding F1 (hardening round 4): a weight-valid batch whose every member
+    /// height lies far outside the effective window is rejected by the
+    /// **arithmetic** pre-filter with **zero** member `getblockhash` RPCs.
+    ///
+    /// Uses many distinct far-stale heights and deliberately wrong hashes: if
+    /// selection still looked up hashes first, the canonical-hash mismatch
+    /// would fire before the stale error and the call counter would be > 0.
+    /// Also asserts a tip just inside the window still publishes.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_stale_batch_rejected_without_member_getblockhash() {
+        let publisher = live_publisher();
+        let before = mempool_txids(&publisher);
+        let tip = publisher.current_anchor().expect("tip");
+        let window = publish_max_gap(BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN).expect("window");
+        // Chain must be deep enough that height 1 is strictly outside the window.
+        assert!(
+            tip.height > window + 1,
+            "regtest tip {} must be > window+1 ({}) so height 1 is arithmetically stale",
+            tip.height,
+            window + 1
+        );
+
+        // Large enough that a pre-window getblockhash loop would be obvious
+        // (thousands of distinct heights; still under the standard-reveal cap).
+        let max_members = max_half_agg_members_for_standard_reveal().expect("max members");
+        let n = 2_000usize.min(max_members);
+        assert!(
+            n >= 500,
+            "fixture needs a large weight-valid batch; got n={n}, max={max_members}"
+        );
+        let (template, _) = signed_members(1, Network::Regtest);
+        let one = template[0];
+        // Distinct heights 1..n — all far below the window on this chain.
+        // Wrong hashes: a hash-first order would fail on "canonical block"
+        // before ever evaluating the gap, and would issue n getblockhash calls.
+        let stale_members: Vec<BatchMember> = (0..n)
+            .map(|i| {
+                let height = 1u32.saturating_add(i as u32);
+                BatchMember {
+                    sig: one,
+                    build_tip: BlockAnchor {
+                        block_hash: {
+                            let mut h = [0u8; 32];
+                            h[0] = 0xaa;
+                            h[1] = (i % 256) as u8;
+                            h[2] = ((i / 256) % 256) as u8;
+                            h
+                        },
+                        height,
+                    },
+                }
+            })
+            .collect();
+
+        let _ = take_member_getblockhash_calls(&publisher);
+        let err = publisher
+            .publish(&stale_members)
+            .expect_err("far-stale weight-valid batch must fail arithmetic pre-filter");
+        let member_rpc = take_member_getblockhash_calls(&publisher);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("members too stale, re-prove"),
+            "must be the arithmetic stale error (not a chain/hash error): {msg}"
+        );
+        assert!(
+            msg.contains("arithmetic pre-filter")
+                || msg.contains("no per-member getblockhash"),
+            "error must identify the pre-RPC arithmetic filter: {msg}"
+        );
+        assert!(
+            !msg.contains("canonical block")
+                && !msg.contains("for member build tip failed"),
+            "must not reach per-member hash validation: {msg}"
+        );
+        assert_eq!(
+            member_rpc, 0,
+            "far-stale rejection must issue zero member getblockhash RPCs; got {member_rpc}"
+        );
+        assert_eq!(
+            before,
+            mempool_txids(&publisher),
+            "mempool must be unchanged after far-stale reject"
+        );
+
+        // Just inside the window: gap == window still publishes.
+        let min_height = tip
+            .height
+            .checked_add(1)
+            .expect("tip+1")
+            .checked_sub(window)
+            .expect("tip+1 >= window on this chain");
+        let inside_hash = publisher
+            .rpc
+            .get_block_hash(u64::from(min_height))
+            .expect("getblockhash(min in-window height)");
+        let (sigs, m_state) = signed_members(1, Network::Regtest);
+        let inside_members = vec![BatchMember {
+            sig: sigs[0],
+            build_tip: BlockAnchor {
+                block_hash: inside_hash.to_byte_array(),
+                height: min_height,
+            },
+        }];
+        let gap = publish_inclusion_gap(inside_members[0].build_tip, tip).expect("gap");
+        assert_eq!(gap, window, "fixture must sit exactly at the effective bound");
+        let batch = publisher
+            .publish(&inside_members)
+            .expect("batch just inside the window must still publish");
+        assert_eq!(batch.block_anchor.height, min_height);
+        aggregate_verify(&batch.aggregate, m_state).expect("verify inside-window batch");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm inside-window publish");
     }
 }
