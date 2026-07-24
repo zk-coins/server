@@ -6,11 +6,30 @@
 //! Taproot envelope primitives ([`crate::inscription`]); it does **not**
 //! reimplement either.
 //!
+//! ## §3.5 block_anchor selection
+//!
+//! The publisher chooses one `block_anchor` that **MUST be an ancestor of, or
+//! equal to, the oldest member's own build tip** (spec §3.5). Members carry
+//! their proof-time tip in [`BatchMember::build_tip`]; the publisher never
+//! silently substitutes a fresher tip. The inclusion-height gap bound
+//! (`inclusion_height − anchor.height ≤ 100`) is pre-checked against the
+//! current chain tip (`inclusion ≥ tip + 1`).
+//!
+//! ## Batch size is the caller's policy
+//!
+//! This module **never auto-splits** a batch. Which nullifiers share one
+//! inscription is a policy decision (first-occurrence / fee / privacy). If the
+//! resulting reveal exceeds Bitcoin Core's standardness weight limit, publish
+//! fails loudly and the caller must split and re-submit. Use
+//! [`max_half_agg_members_for_standard_reveal`] to learn the bound for a given
+//! payload shape.
+//!
 //! ## Scope deliberately left to P1-G (scanner)
 //!
-//! The §3.5 block-anchor / inclusion-height bound and the §3.6 first-occurrence
-//! policy are **not** enforced here. This module only publishes and can
-//! read back raw inscription payloads for verification.
+//! The on-acceptance re-check of the §3.5 inclusion-height gap against the
+//! mined reveal block, and the §3.6 first-occurrence policy, are **not**
+//! enforced here. This module only publishes and can read back raw inscription
+//! payloads for verification.
 
 use std::path::PathBuf;
 use std::thread;
@@ -20,13 +39,15 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::XOnlyPublicKey;
 use bitcoin::{
-    Amount, Network, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid,
+    Amount, Network as BitcoinNetwork, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid,
 };
 use bitcoincore_rpc::json::AddressType;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
+use zkcoins_program_plonky2::circuit::compliance::Network;
 
 use crate::half_agg::{
-    aggregate_sig_with_anchor, AggregateStateNullifierV3, BlockAnchor, NullifierSig,
+    aggregate_sig_with_anchor, aggregate_verify, AggregateStateNullifierV3, BlockAnchor,
+    NullifierSig, FORMAT_HALF_AGG, PAYLOAD_HEADER_LEN, PAYLOAD_MARKER, PAYLOAD_VERSION_V3,
 };
 use crate::inscription::{build_inscription, extract_payloads_from_reveal, InscriptionRequest};
 
@@ -39,16 +60,32 @@ use crate::inscription::{build_inscription, extract_payloads_from_reveal, Inscri
 /// appendix), so the only way to spend the commit output is the inscription
 /// script leaf. Scanners and operators can therefore treat a spend of this
 /// output as an intentional reveal of the envelope.
+///
+/// Because the key path is unspendable by design, an oversized reveal that
+/// bitcoind rejects after the commit has already been broadcast permanently
+/// burns the commit value. The pre-broadcast standardness weight check is
+/// therefore mandatory — there is no key-path recovery hatch.
 pub const NUMS_INTERNAL_KEY_BYTES: [u8; 32] = [
     0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
     0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
 ];
 
+/// Bitcoin Core standardness policy limit on a single transaction's weight
+/// (`MAX_STANDARD_TX_WEIGHT` = 400 000 weight units).
+pub const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
+
+/// §3.5 maximum gap between `block_anchor.height` and inclusion height.
+pub const BLOCK_ANCHOR_MAX_GAP: u32 = 100;
+
+/// Cap on fee/topology fixed-point rounds before failing loudly.
+const MAX_FEE_CONVERGENCE_ROUNDS: usize = 5;
+
 /// Configuration for a [`Publisher`] talking to one bitcoind wallet.
 ///
 /// Every field is mandatory. There is no default fee rate, no default reveal
-/// output value, and no password-based RPC auth — missing values fail at the
-/// call site that builds this struct, not inside the publisher.
+/// output value, no default network, and no password-based RPC auth — missing
+/// values fail at the call site that builds this struct, not inside the
+/// publisher.
 #[derive(Clone, Debug)]
 pub struct PublisherConfig {
     /// Base RPC URL, e.g. `http://127.0.0.1:18443`. The wallet path is appended.
@@ -60,8 +97,11 @@ pub struct PublisherConfig {
     /// Fee rate in satoshis per virtual byte. Applied to measured vsizes.
     pub fee_rate_sat_per_vb: u64,
     /// Explicit value of the reveal transaction's single output. Must sit
-    /// strictly above the dust limit of its scriptPubKey.
+    /// at or above the dust limit of its scriptPubKey.
     pub reveal_output_value: Amount,
+    /// zkCoins network constant used for aggregate signature verification
+    /// (`m_state`). Must match the network the members signed against.
+    pub network: Network,
 }
 
 /// Connected publisher bound to one wallet RPC endpoint.
@@ -70,15 +110,29 @@ pub struct Publisher {
     config: PublisherConfig,
 }
 
+/// One batch member together with the chain tip its proof was built against (§3.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchMember {
+    /// Half-aggregate contribution (BIP-340 `Pk`, `R`, `s`).
+    pub sig: NullifierSig,
+    /// Proof-time Bitcoin tip this member was built against.
+    pub build_tip: BlockAnchor,
+}
+
 /// Result of a successful `publish` call.
 #[derive(Clone, Debug)]
 pub struct PublishedBatch {
+    /// Half-aggregated payload object that was inscribed.
     pub aggregate: AggregateStateNullifierV3,
+    /// Exact on-chain payload bytes.
     pub payload: Vec<u8>,
+    /// Broadcast commit transaction id.
     pub commit_txid: Txid,
+    /// Broadcast reveal transaction id.
     pub reveal_txid: Txid,
     /// The P2TR commit output that the reveal spends — the scanner's prevout.
     pub commit_output: TxOut,
+    /// Publisher-chosen §3.5 anchor (oldest member's verified build tip).
     pub block_anchor: BlockAnchor,
 }
 
@@ -90,8 +144,11 @@ pub struct PublishedBatch {
 /// `Ok(None)` inputs (no marker envelope) are neither payloads nor errors.
 #[derive(Debug)]
 pub struct RevealPayloads {
+    /// Successfully extracted envelope bodies, in input order among successes.
     pub payloads: Vec<Vec<u8>>,
+    /// Malformed-input error messages (also present in `per_input`).
     pub errors: Vec<String>,
+    /// One result per reveal input.
     pub per_input: Vec<Result<Option<Vec<u8>>, String>>,
 }
 
@@ -171,26 +228,57 @@ impl Publisher {
         })
     }
 
-    /// Half-aggregate `members`, inscribe the payload, sign and broadcast
-    /// commit then reveal to the connected bitcoind.
-    pub fn publish(&self, members: &[NullifierSig]) -> Result<PublishedBatch> {
+    /// Half-aggregate `members`, verify the aggregate under the publisher's
+    /// network constant, inscribe the payload, sign and broadcast commit then
+    /// reveal to the connected bitcoind.
+    ///
+    /// ## Failure modes (nothing is broadcast unless all checks pass)
+    ///
+    /// - empty batch
+    /// - invalid / inconsistent member build tips (§3.5 oldest-tip rule)
+    /// - aggregate verification failure (wrong network, corrupted `s`, …)
+    /// - reveal or commit exceeds [`MAX_STANDARD_TX_WEIGHT`]
+    /// - no eligible funding UTXO covers the final measured fees
+    /// - fee/topology fixed-point does not converge
+    ///
+    /// **Batch composition is never auto-split.** An oversized batch fails
+    /// with an actionable error; the caller decides how to split.
+    pub fn publish(&self, members: &[BatchMember]) -> Result<PublishedBatch> {
         ensure!(
             !members.is_empty(),
-            "publish requires at least one NullifierSig member"
+            "publish requires at least one BatchMember"
         );
 
-        let block_anchor = self.current_anchor()?;
-        let aggregate = aggregate_sig_with_anchor(members, block_anchor)
+        let block_anchor = self.select_block_anchor(members)?;
+        let sigs: Vec<NullifierSig> = members.iter().map(|m| m.sig).collect();
+        let aggregate = aggregate_sig_with_anchor(&sigs, block_anchor)
             .context("half-aggregation failed")?;
+        aggregate_verify(&aggregate, self.config.network.m_state_bytes()).with_context(|| {
+            format!(
+                "aggregate signature verification failed under publisher network {:?} \
+                 (wrong-network or corrupted member signature); refusing to build transactions",
+                self.config.network
+            )
+        })?;
         let payload = aggregate.serialize();
+        let member_count = members.len();
 
-        let network = self.chain_network()?;
+        // Fail before any funding selection / broadcast if the reveal alone is
+        // not standard. The NUMS key path cannot recover a stuck commit.
+        ensure_tx_within_standard_weight(
+            "reveal",
+            measure_reveal_weight(&payload)?,
+            member_count,
+            payload.len(),
+        )?;
+
+        let btc_network = self.chain_network()?;
         let nums_key = nums_internal_key()?;
         let reveal_address = self
             .rpc
             .get_new_address(None, Some(AddressType::Bech32m))
             .context("getnewaddress(bech32m) for reveal output failed")?
-            .require_network(network)
+            .require_network(btc_network)
             .context("reveal address network mismatch")?;
         let reveal_script = reveal_address.script_pubkey();
         ensure_above_dust(self.config.reveal_output_value, &reveal_script).with_context(|| {
@@ -208,118 +296,122 @@ impl Publisher {
             .rpc
             .get_new_address(None, Some(AddressType::Bech32m))
             .context("getnewaddress(bech32m) for change failed")?
-            .require_network(network)
+            .require_network(btc_network)
             .context("change address network mismatch")?;
         let change_script = change_address.script_pubkey();
 
-        // Pass 1 — provisional fees large enough to build + sign + measure.
-        // Over-estimate on purpose so the funding UTXO still covers pass 2.
-        let provisional_commit_vsize = 300usize;
-        let provisional_reveal_vsize = 200usize
-            .checked_add(payload.len().saturating_add(200) / 4)
-            .context("provisional reveal vsize overflow")?;
-        let provisional_commit_fee =
-            fee_for_vsize(provisional_commit_vsize, self.config.fee_rate_sat_per_vb)?;
-        let provisional_reveal_fee =
-            fee_for_vsize(provisional_reveal_vsize, self.config.fee_rate_sat_per_vb)?;
-
-        let required_provisional = sum_amounts(&[
-            self.config.reveal_output_value,
-            provisional_commit_fee,
-            provisional_reveal_fee,
-        ])?;
-        let funding = self.select_funding_utxo(required_provisional)?;
-
-        let pass1 = self.build_and_sign_commit(
-            &payload,
-            &funding,
-            nums_key,
-            reveal_output.clone(),
-            Some(change_script.clone()),
-            provisional_commit_fee,
-            provisional_reveal_fee,
-        )?;
-        let measured_commit_vsize = pass1.signed_commit.vsize();
-        let measured_reveal_vsize = pass1.reveal_tx.vsize();
-
-        let mut commit_fee =
-            fee_for_vsize(measured_commit_vsize, self.config.fee_rate_sat_per_vb)?;
-        let reveal_fee = fee_for_vsize(measured_reveal_vsize, self.config.fee_rate_sat_per_vb)?;
-
-        // Change / dust absorption for the final fee numbers.
-        let spent_core = sum_amounts(&[
-            self.config.reveal_output_value,
-            commit_fee,
-            reveal_fee,
-        ])?;
+        let candidates = self.list_funding_candidates()?;
         ensure!(
-            funding.amount >= spent_core,
-            "funding UTXO {} sat is short of final required {} sat \
-             (reveal_output + commit_fee + reveal_fee); shortfall {} sat",
-            funding.amount.to_sat(),
-            spent_core.to_sat(),
-            spent_core
-                .checked_sub(funding.amount)
-                .map(|a| a.to_sat())
-                .unwrap_or(u64::MAX)
+            !candidates.is_empty(),
+            "no confirmed funding UTXOs with deterministic witness size \
+             (v0 P2WPKH or v1 P2TR key-path) available in wallet '{}'",
+            self.config.wallet_name
         );
-        let change_value = funding
-            .amount
-            .checked_sub(spent_core)
-            .context("change subtraction underflow")?;
-        let change_script_final = if change_value == Amount::ZERO {
-            None
-        } else {
-            let dust = change_script.minimal_non_dust();
-            if change_value < dust {
-                // Absorb dust change into the commit fee so the remainder
-                // pays the miner rather than creating a dust output.
-                let absorbed = change_value;
-                commit_fee = commit_fee
-                    .checked_add(absorbed)
-                    .context("commit fee + absorbed dust overflows")?;
-                eprintln!(
-                    "publisher: change {} sat is below dust limit {} sat; \
-                     absorbed into commit fee (now {} sat)",
-                    absorbed.to_sat(),
-                    dust.to_sat(),
-                    commit_fee.to_sat()
+
+        let mut best_shortfall: Option<(Amount, Amount, usize)> = None;
+        let mut last_non_funding_err: Option<anyhow::Error> = None;
+        let mut built: Option<ConvergedInscription> = None;
+
+        for (index, funding) in candidates.iter().enumerate() {
+            match self.converge_fees_and_build(
+                &payload,
+                funding,
+                nums_key,
+                reveal_output.clone(),
+                change_script.clone(),
+            ) {
+                Ok(converged) => {
+                    built = Some(converged);
+                    break;
+                }
+                Err(err) => {
+                    if let Some((required, have)) = shortfall_amounts(&err) {
+                        let shortfall = required
+                            .checked_sub(have)
+                            .unwrap_or(required);
+                        match &mut best_shortfall {
+                            None => best_shortfall = Some((required, have, index + 1)),
+                            Some((best_req, best_have, tried)) => {
+                                let best_gap = best_req
+                                    .checked_sub(*best_have)
+                                    .unwrap_or(*best_req);
+                                if shortfall < best_gap
+                                    || (shortfall == best_gap && have > *best_have)
+                                {
+                                    *best_req = required;
+                                    *best_have = have;
+                                }
+                                *tried = index + 1;
+                            }
+                        }
+                        continue;
+                    }
+                    // Non-funding errors (signing, drift, …) are fatal.
+                    last_non_funding_err = Some(err);
+                    break;
+                }
+            }
+        }
+
+        let converged = match (built, last_non_funding_err, best_shortfall) {
+            (Some(c), _, _) => c,
+            (None, Some(err), _) => return Err(err),
+            (None, None, Some((required, best, tried))) => {
+                bail!(
+                    "no eligible funding UTXO covers final measured fees of {} sat; \
+                     best candidate has {} sat (shortfall {} sat); tried {} of {} candidate(s)",
+                    required.to_sat(),
+                    best.to_sat(),
+                    required
+                        .checked_sub(best)
+                        .map(|a| a.to_sat())
+                        .unwrap_or(required.to_sat()),
+                    tried,
+                    candidates.len()
                 );
-                None
-            } else {
-                Some(change_script.clone())
+            }
+            (None, None, None) => {
+                bail!(
+                    "no eligible funding UTXO could fund the inscription \
+                     ({} candidate(s) tried)",
+                    candidates.len()
+                );
             }
         };
 
-        // Pass 2 — rebuild with measured fees and sign again.
-        let pass2 = self.build_and_sign_commit(
-            &payload,
-            &funding,
-            nums_key,
-            reveal_output,
-            change_script_final,
-            commit_fee,
-            reveal_fee,
+        // Re-check both transactions after signing — commit is tiny but the
+        // invariant is "nothing broadcasts unless both are standard".
+        ensure_tx_within_standard_weight(
+            "commit",
+            converged.signed_commit.weight().to_wu(),
+            member_count,
+            payload.len(),
+        )?;
+        ensure_tx_within_standard_weight(
+            "reveal",
+            converged.reveal_tx.weight().to_wu(),
+            member_count,
+            payload.len(),
         )?;
 
+        // Final assertion: broadcast vsizes are exactly those the fees were
+        // computed from.
         ensure!(
-            pass2.signed_commit.vsize() == measured_commit_vsize,
-            "signed commit vsize drifted after fee rebuild: pass1={} vB, pass2={} vB \
-             (fees were computed from pass1; refusing to broadcast under/over-paying tx)",
-            measured_commit_vsize,
-            pass2.signed_commit.vsize()
+            converged.signed_commit.vsize() == converged.commit_vsize,
+            "signed commit vsize {} != fee-basis commit vsize {}; refusing unconverged broadcast",
+            converged.signed_commit.vsize(),
+            converged.commit_vsize
         );
         ensure!(
-            pass2.reveal_tx.vsize() == measured_reveal_vsize,
-            "reveal vsize drifted after fee rebuild: pass1={} vB, pass2={} vB \
-             (fees were computed from pass1; refusing to broadcast)",
-            measured_reveal_vsize,
-            pass2.reveal_tx.vsize()
+            converged.reveal_tx.vsize() == converged.reveal_vsize,
+            "reveal vsize {} != fee-basis reveal vsize {}; refusing unconverged broadcast",
+            converged.reveal_tx.vsize(),
+            converged.reveal_vsize
         );
 
-        let commit_txid = pass2.signed_commit.compute_txid();
-        let reveal_txid = pass2.reveal_tx.compute_txid();
-        let commit_output = pass2
+        let commit_txid = converged.signed_commit.compute_txid();
+        let reveal_txid = converged.reveal_tx.compute_txid();
+        let commit_output = converged
             .signed_commit
             .output
             .first()
@@ -327,25 +419,26 @@ impl Publisher {
             .context("commit transaction has no outputs")?;
 
         self.rpc
-            .send_raw_transaction(&pass2.signed_commit)
+            .send_raw_transaction(&converged.signed_commit)
             .with_context(|| format!("sendrawtransaction(commit) failed for {commit_txid}"))?;
 
         self.rpc
-            .send_raw_transaction(&pass2.reveal_tx)
+            .send_raw_transaction(&converged.reveal_tx)
             .with_context(|| {
                 format!(
                     "sendrawtransaction(reveal) failed for {reveal_txid}; \
-                     commit already broadcast as {commit_txid} — operator recovery required"
+                     commit already broadcast as {commit_txid} — operator recovery required \
+                     (NUMS key path is unspendable; oversized reveal is unrecoverable)"
                 )
             })?;
 
         eprintln!(
             "publisher: broadcast commit={commit_txid} ({} vB, fee {} sat) \
-             reveal={reveal_txid} ({} vB, fee {} sat) fee_rate={} sat/vB",
-            measured_commit_vsize,
-            commit_fee.to_sat(),
-            measured_reveal_vsize,
-            reveal_fee.to_sat(),
+             reveal={reveal_txid} ({} vB, fee {} sat) fee_rate={} sat/vB members={member_count}",
+            converged.commit_vsize,
+            converged.commit_fee.to_sat(),
+            converged.reveal_vsize,
+            converged.reveal_fee.to_sat(),
             self.config.fee_rate_sat_per_vb
         );
 
@@ -391,17 +484,12 @@ impl Publisher {
         }
     }
 
-    /// Fetch a reveal transaction and extract every present zkCoins payload.
-    ///
-    /// Uses `getrawtransaction` on the reveal and each parent (requires
-    /// `txindex=1`). Malformed per-input results are not returned inside the
-    /// payload vector; call [`Self::fetch_reveal_payload_details`] to surface
-    /// them.
-    pub fn fetch_reveal_payloads(&self, txid: &Txid) -> Result<Vec<Vec<u8>>> {
-        Ok(self.fetch_reveal_payload_details(txid)?.payloads)
-    }
-
     /// Full reveal extraction including per-input errors (see [`RevealPayloads`]).
+    ///
+    /// Callers that only want payloads **must** inspect `errors` / `per_input`
+    /// first — a reveal with one valid and one malformed marker input surfaces
+    /// both; an all-malformed reveal is `payloads == []` with non-empty
+    /// `errors`, not a silent empty success.
     pub fn fetch_reveal_payload_details(&self, txid: &Txid) -> Result<RevealPayloads> {
         let reveal = self
             .rpc
@@ -457,7 +545,76 @@ impl Publisher {
 
     // ── internal helpers ────────────────────────────────────────────────
 
-    fn chain_network(&self) -> Result<Network> {
+    /// Choose the §3.5 `block_anchor` from member build tips.
+    ///
+    /// - lowest `build_tip.height` wins
+    /// - ties require identical hashes (else members are on different chains)
+    /// - anchor must equal `getblockhash(height)` on this node
+    /// - anchor must not be above the current tip
+    /// - `(tip + 1) - anchor.height ≤ 100` so the inclusion gap can hold
+    fn select_block_anchor(&self, members: &[BatchMember]) -> Result<BlockAnchor> {
+        let mut oldest = members[0].build_tip;
+        for member in &members[1..] {
+            let tip = member.build_tip;
+            if tip.height < oldest.height {
+                oldest = tip;
+            } else if tip.height == oldest.height {
+                ensure!(
+                    tip.block_hash == oldest.block_hash,
+                    "two members claim different block hashes at height {}: {:x?} vs {:x?} \
+                     (built on different chains); refusing to pick an anchor",
+                    tip.height,
+                    tip.block_hash,
+                    oldest.block_hash
+                );
+            }
+        }
+
+        let tip = self.current_anchor()?;
+        ensure!(
+            oldest.height <= tip.height,
+            "member build tip height {} is in the future relative to node tip {} \
+             (hash {:x?})",
+            oldest.height,
+            tip.height,
+            oldest.block_hash
+        );
+
+        let chain_hash = self
+            .rpc
+            .get_block_hash(u64::from(oldest.height))
+            .with_context(|| format!("getblockhash({}) for member build tip failed", oldest.height))?;
+        ensure!(
+            chain_hash.to_byte_array() == oldest.block_hash,
+            "member build tip hash at height {} is not the canonical block on this node: \
+             member={:x?} chain={:x?}",
+            oldest.height,
+            oldest.block_hash,
+            chain_hash.to_byte_array()
+        );
+
+        // Inclusion happens at height ≥ tip + 1.
+        let inclusion_lower = tip
+            .height
+            .checked_add(1)
+            .context("tip height + 1 overflows u32")?;
+        let gap = inclusion_lower
+            .checked_sub(oldest.height)
+            .context("anchor height exceeds inclusion lower bound after tip check")?;
+        ensure!(
+            gap <= BLOCK_ANCHOR_MAX_GAP,
+            "members too stale, re-prove: oldest build tip height {} with node tip {} \
+             implies inclusion gap ≥ {} > §3.5 bound {BLOCK_ANCHOR_MAX_GAP} \
+             (refusing to substitute a fresher anchor)",
+            oldest.height,
+            tip.height,
+            gap
+        );
+
+        Ok(oldest)
+    }
+
+    fn chain_network(&self) -> Result<BitcoinNetwork> {
         let info = self
             .rpc
             .get_blockchain_info()
@@ -465,7 +622,9 @@ impl Publisher {
         Ok(info.chain)
     }
 
-    fn select_funding_utxo(&self, required: Amount) -> Result<FundingUtxo> {
+    /// Confirmed, spendable UTXOs with deterministic witness size, sorted by
+    /// amount ascending (then outpoint) for deterministic selection.
+    fn list_funding_candidates(&self) -> Result<Vec<FundingUtxo>> {
         let unspent = self
             .rpc
             .list_unspent(Some(1), None, None, Some(true), None)
@@ -479,10 +638,9 @@ impl Publisher {
             if entry.confirmations < 1 {
                 continue;
             }
-            // HARD REQUIREMENT: segwit-only funding.
-            if let Err(err) = ensure_segwit_funding(&entry.script_pub_key) {
+            if let Err(err) = ensure_deterministic_funding(&entry.script_pub_key) {
                 eprintln!(
-                    "publisher: skipping non-segwit UTXO {}:{} — {err}",
+                    "publisher: skipping ineligible UTXO {}:{} — {err}",
                     entry.txid, entry.vout
                 );
                 continue;
@@ -497,32 +655,220 @@ impl Publisher {
             });
         }
 
-        // Deterministic: smallest UTXO that covers `required`; ties broken by
-        // outpoint (txid internal bytes, then vout).
         candidates.sort_by(|a, b| {
             a.amount
                 .cmp(&b.amount)
                 .then_with(|| a.outpoint.txid.cmp(&b.outpoint.txid))
                 .then_with(|| a.outpoint.vout.cmp(&b.outpoint.vout))
         });
+        Ok(candidates)
+    }
 
-        for candidate in &candidates {
-            if candidate.amount >= required {
-                return Ok(candidate.clone());
+    /// Fixed-point fee and change-topology iteration for one funding UTXO.
+    ///
+    /// Two phases to avoid dust-boundary oscillation (with-change fees can leave
+    /// residual just below dust; without-change fees free enough residual to
+    /// re-request change):
+    ///
+    /// 1. **With change** — iterate pure fees while leftover ≥ dust.
+    /// 2. **Without change** — if residual would be dust or zero under the
+    ///    with-change fees (or phase 1 never funded), absorb residual into the
+    ///    commit fee and iterate pure fees for the no-change topology.
+    ///
+    /// Caps each phase at [`MAX_FEE_CONVERGENCE_ROUNDS`] and fails loudly if
+    /// either phase oscillates or does not converge.
+    fn converge_fees_and_build(
+        &self,
+        payload: &[u8],
+        funding: &FundingUtxo,
+        internal_key: XOnlyPublicKey,
+        reveal_output: TxOut,
+        change_script: ScriptBuf,
+    ) -> Result<ConvergedInscription> {
+        ensure_deterministic_funding(&funding.script_pubkey)?;
+
+        let provisional_commit_vsize = 300usize;
+        let provisional_reveal_vsize = 200usize
+            .checked_add(payload.len().saturating_add(200) / 4)
+            .context("provisional reveal vsize overflow")?;
+        let provisional_commit_fee =
+            fee_for_vsize(provisional_commit_vsize, self.config.fee_rate_sat_per_vb)?;
+        let provisional_reveal_fee =
+            fee_for_vsize(provisional_reveal_vsize, self.config.fee_rate_sat_per_vb)?;
+        let dust = change_script.minimal_non_dust();
+
+        // ── Phase 1: try with a change output ───────────────────────────
+        let mut commit_fee = provisional_commit_fee;
+        let mut reveal_fee = provisional_reveal_fee;
+        let mut with_change_viable = true;
+        let mut prev_with: Option<(u64, u64)> = None;
+
+        for round in 1..=MAX_FEE_CONVERGENCE_ROUNDS {
+            let spent_core = sum_amounts(&[
+                self.config.reveal_output_value,
+                commit_fee,
+                reveal_fee,
+            ])?;
+            if funding.amount < spent_core {
+                with_change_viable = false;
+                break;
             }
+            let leftover = funding
+                .amount
+                .checked_sub(spent_core)
+                .context("with-change leftover underflow")?;
+            if leftover < dust {
+                eprintln!(
+                    "publisher: change {} sat is below dust limit {} sat under with-change fees; \
+                     switching to no-change topology (round {round})",
+                    leftover.to_sat(),
+                    dust.to_sat()
+                );
+                with_change_viable = false;
+                break;
+            }
+
+            let built = self.build_and_sign_commit(
+                payload,
+                funding,
+                internal_key,
+                reveal_output.clone(),
+                Some(change_script.clone()),
+                commit_fee,
+                reveal_fee,
+            )?;
+            let measured_commit_vsize = built.signed_commit.vsize();
+            let measured_reveal_vsize = built.reveal_tx.vsize();
+            ensure!(
+                built.signed_commit.output.len() > 1,
+                "with-change phase produced no change output on round {round}"
+            );
+
+            let next_commit_fee =
+                fee_for_vsize(measured_commit_vsize, self.config.fee_rate_sat_per_vb)?;
+            let next_reveal_fee =
+                fee_for_vsize(measured_reveal_vsize, self.config.fee_rate_sat_per_vb)?;
+
+            if next_commit_fee == commit_fee && next_reveal_fee == reveal_fee {
+                return Ok(ConvergedInscription {
+                    signed_commit: built.signed_commit,
+                    reveal_tx: built.reveal_tx,
+                    commit_vsize: measured_commit_vsize,
+                    reveal_vsize: measured_reveal_vsize,
+                    commit_fee,
+                    reveal_fee,
+                });
+            }
+
+            let key = (next_commit_fee.to_sat(), next_reveal_fee.to_sat());
+            if prev_with == Some(key) {
+                bail!(
+                    "fee fixed-point oscillated in with-change phase on round {round}: \
+                     commit_fee={} reveal_fee={} commit_vsize={} reveal_vsize={} \
+                     (refusing unconverged broadcast)",
+                    key.0,
+                    key.1,
+                    measured_commit_vsize,
+                    measured_reveal_vsize
+                );
+            }
+            prev_with = Some(key);
+            commit_fee = next_commit_fee;
+            reveal_fee = next_reveal_fee;
         }
 
-        let best = candidates.last().map(|c| c.amount).unwrap_or(Amount::ZERO);
+        if with_change_viable {
+            bail!(
+                "fee fixed-point did not converge in with-change phase within \
+                 {MAX_FEE_CONVERGENCE_ROUNDS} rounds; refusing unconverged broadcast"
+            );
+        }
+
+        // ── Phase 2: no change — residual absorbed into commit fee ──────
+        commit_fee = provisional_commit_fee;
+        reveal_fee = provisional_reveal_fee;
+        let mut prev_without: Option<(u64, u64)> = None;
+
+        for round in 1..=MAX_FEE_CONVERGENCE_ROUNDS {
+            let spent_core = sum_amounts(&[
+                self.config.reveal_output_value,
+                commit_fee,
+                reveal_fee,
+            ])?;
+            if funding.amount < spent_core {
+                bail!(
+                    "funding shortfall: UTXO {} sat < required {} sat \
+                     (reveal_output + commit_fee + reveal_fee) on no-change round {round}",
+                    funding.amount.to_sat(),
+                    spent_core.to_sat()
+                );
+            }
+            let commit_fee_used = funding
+                .amount
+                .checked_sub(self.config.reveal_output_value)
+                .and_then(|v| v.checked_sub(reveal_fee))
+                .context("no-change commit fee accounting underflow")?;
+
+            let built = self.build_and_sign_commit(
+                payload,
+                funding,
+                internal_key,
+                reveal_output.clone(),
+                None,
+                commit_fee_used,
+                reveal_fee,
+            )?;
+            let measured_commit_vsize = built.signed_commit.vsize();
+            let measured_reveal_vsize = built.reveal_tx.vsize();
+            ensure!(
+                built.signed_commit.output.len() == 1,
+                "no-change phase produced a change output on round {round}"
+            );
+
+            let next_commit_fee =
+                fee_for_vsize(measured_commit_vsize, self.config.fee_rate_sat_per_vb)?;
+            let next_reveal_fee =
+                fee_for_vsize(measured_reveal_vsize, self.config.fee_rate_sat_per_vb)?;
+
+            // Pure fees stable; commit_fee_used may exceed pure commit_fee
+            // because dust/exact residual is absorbed into the miner fee.
+            if next_commit_fee == commit_fee && next_reveal_fee == reveal_fee {
+                ensure!(
+                    commit_fee_used >= commit_fee,
+                    "no-change commit fee used {} sat is below pure fee {} sat",
+                    commit_fee_used.to_sat(),
+                    commit_fee.to_sat()
+                );
+                return Ok(ConvergedInscription {
+                    signed_commit: built.signed_commit,
+                    reveal_tx: built.reveal_tx,
+                    commit_vsize: measured_commit_vsize,
+                    reveal_vsize: measured_reveal_vsize,
+                    commit_fee: commit_fee_used,
+                    reveal_fee,
+                });
+            }
+
+            let key = (next_commit_fee.to_sat(), next_reveal_fee.to_sat());
+            if prev_without == Some(key) {
+                bail!(
+                    "fee fixed-point oscillated in no-change phase on round {round}: \
+                     commit_fee={} reveal_fee={} commit_vsize={} reveal_vsize={} \
+                     (refusing unconverged broadcast)",
+                    key.0,
+                    key.1,
+                    measured_commit_vsize,
+                    measured_reveal_vsize
+                );
+            }
+            prev_without = Some(key);
+            commit_fee = next_commit_fee;
+            reveal_fee = next_reveal_fee;
+        }
+
         bail!(
-            "no confirmed segwit UTXO covers required {} sat; best available is {} sat \
-             (shortfall {} sat, {} candidate(s) after segwit filter)",
-            required.to_sat(),
-            best.to_sat(),
-            required
-                .checked_sub(best)
-                .map(|a| a.to_sat())
-                .unwrap_or(required.to_sat()),
-            candidates.len()
+            "fee/topology fixed-point did not converge within {MAX_FEE_CONVERGENCE_ROUNDS} \
+             rounds per phase; refusing to broadcast from an unconverged state"
         );
     }
 
@@ -537,7 +883,7 @@ impl Publisher {
         commit_fee: Amount,
         reveal_fee: Amount,
     ) -> Result<BuiltInscription> {
-        ensure_segwit_funding(&funding.script_pubkey)?;
+        ensure_deterministic_funding(&funding.script_pubkey)?;
 
         let inscription = build_inscription(
             payload,
@@ -601,31 +947,227 @@ struct BuiltInscription {
     reveal_tx: Transaction,
 }
 
-/// Reject non-witness-program funding scripts.
+struct ConvergedInscription {
+    signed_commit: Transaction,
+    reveal_tx: Transaction,
+    commit_vsize: usize,
+    reveal_vsize: usize,
+    commit_fee: Amount,
+    reveal_fee: Amount,
+}
+
+/// Reject funding scripts whose witness size is not deterministic.
 ///
-/// `build_inscription` returns a commit tx whose funding witness is empty and
-/// a reveal that already references `commit_txid`. For a segwit input the
-/// signature lives in the witness, so signing does not change the txid. For a
-/// legacy input the scriptSig is part of the txid, so signing would
-/// **invalidate the pre-built reveal**. Callers must not "fix" that by
-/// rebuilding the reveal after signing — reject the input instead.
-pub fn ensure_segwit_funding(script_pubkey: &Script) -> Result<()> {
+/// Accepted:
+/// - v0 P2WPKH (20-byte program) — fixed signature+pubkey witness
+/// - v1 P2TR key-path (32-byte program) — fixed 64-byte schnorr witness
+///
+/// Rejected (loudly):
+/// - v0 P2WSH (32-byte program) — witness size depends on the redeem script
+/// - legacy / P2SH-wrapped segwit — scriptSig is part of the txid, so signing
+///   would invalidate a pre-built reveal
+/// - any other witness version / program length
+pub fn ensure_deterministic_funding(script_pubkey: &Script) -> Result<()> {
     ensure!(
         script_pubkey.is_witness_program(),
         "funding scriptPubKey is not a segwit witness program (v0 or v1); \
-         legacy inputs cannot fund a pre-built reveal because signing would \
-         change the commit txid"
+         legacy and P2SH-wrapped inputs cannot fund a pre-built reveal because \
+         signing would change the commit txid"
     );
-    // Only v0 / v1 are accepted as "segwit funding" for this publisher.
+
+    if script_pubkey.is_p2wpkh() {
+        return Ok(());
+    }
+    if script_pubkey.is_p2tr() {
+        return Ok(());
+    }
+    if script_pubkey.is_p2wsh() {
+        bail!(
+            "funding scriptPubKey is v0 P2WSH; its witness size is not predictable \
+             (depends on the redeem script), so fee estimation is not sound — \
+             use v0 P2WPKH or v1 P2TR key-path"
+        );
+    }
+
     let version = script_pubkey
         .witness_version()
         .context("witness program without witness version")?;
-    let v = version.to_num();
+    bail!(
+        "funding witness program version {} with non-standard program length is not supported; \
+         only v0 P2WPKH (20-byte) and v1 P2TR (32-byte) have deterministic witness size",
+        version.to_num()
+    );
+}
+
+/// Back-compat name: deterministic segwit funding only (see
+/// [`ensure_deterministic_funding`]).
+pub fn ensure_segwit_funding(script_pubkey: &Script) -> Result<()> {
+    ensure_deterministic_funding(script_pubkey)
+}
+
+/// Measure the weight (WU) of a reveal transaction that carries `payload`.
+///
+/// Uses a dummy funding outpoint and a P2TR reveal output; only the reveal
+/// side is meaningful for the standardness bound (the envelope leaf dominates).
+pub fn measure_reveal_weight(payload: &[u8]) -> Result<u64> {
+    let inscription = sizing_inscription(payload)?;
+    Ok(inscription.reveal_tx.weight().to_wu())
+}
+
+/// Maximum half-aggregate member count whose reveal stays within
+/// [`MAX_STANDARD_TX_WEIGHT`].
+///
+/// Uses a representative on-curve `(Pk, R)` template so the envelope byte
+/// layout matches a real format-`0x01` payload.
+///
+/// **Does not auto-split batches.** Batch composition (which nullifiers share
+/// an inscription) is a policy decision with first-occurrence consequences;
+/// callers that exceed this bound must split themselves and re-submit.
+pub fn max_half_agg_members_for_standard_reveal() -> Result<usize> {
+    // Structure/length is all that matters for weight. Build raw half-agg
+    // payload bytes without per-member curve validation (that would dominate
+    // the binary search at thousands of members).
+    let point = NUMS_INTERNAL_KEY_BYTES;
+    let scalar = {
+        let mut s = [0u8; 32];
+        s[31] = 1;
+        s
+    };
+
+    let weight_for = |n: usize| -> Result<u64> {
+        ensure!(n >= 1, "member count must be >= 1");
+        ensure!(
+            n <= usize::from(u16::MAX),
+            "member count exceeds u16::MAX"
+        );
+        let payload = synthetic_half_agg_payload(n, &point, &point, &scalar)?;
+        measure_reveal_weight(&payload)
+    };
+
+    // At least one member must fit.
+    let w1 = weight_for(1)?;
     ensure!(
-        v == 0 || v == 1,
-        "funding witness program version {v} is not v0 or v1"
+        w1 <= MAX_STANDARD_TX_WEIGHT,
+        "even a 1-member reveal weight {w1} exceeds MAX_STANDARD_TX_WEIGHT={MAX_STANDARD_TX_WEIGHT}"
+    );
+
+    // Exponential search for an upper bound, then binary search. Avoids building
+    // multi-megabyte synthetic payloads at midpoints near u16::MAX.
+    let mut lo = 1usize;
+    let mut hi = 2usize;
+    while hi < usize::from(u16::MAX) {
+        let w = weight_for(hi)?;
+        if w <= MAX_STANDARD_TX_WEIGHT {
+            lo = hi;
+            hi = hi.saturating_mul(2).min(usize::from(u16::MAX));
+            if hi == lo {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if hi > usize::from(u16::MAX) {
+        hi = usize::from(u16::MAX);
+    }
+    // If even u16::MAX fits, that is the bound.
+    if weight_for(hi)? <= MAX_STANDARD_TX_WEIGHT {
+        return Ok(hi);
+    }
+
+    while lo + 1 < hi {
+        let mid = lo
+            .checked_add(hi)
+            .map(|s| s / 2)
+            .context("binary search midpoint overflow")?;
+        let w = weight_for(mid)?;
+        if w <= MAX_STANDARD_TX_WEIGHT {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+/// Fail loudly if `weight_wu` exceeds [`MAX_STANDARD_TX_WEIGHT`].
+pub fn ensure_tx_within_standard_weight(
+    which: &str,
+    weight_wu: u64,
+    member_count: usize,
+    payload_len: usize,
+) -> Result<()> {
+    ensure!(
+        weight_wu <= MAX_STANDARD_TX_WEIGHT,
+        "{which} transaction weight {weight_wu} WU exceeds Bitcoin Core \
+         MAX_STANDARD_TX_WEIGHT={MAX_STANDARD_TX_WEIGHT} WU for batch of {member_count} members \
+         (payload {payload_len} bytes); split the batch — the publisher does not auto-split \
+         (NUMS commit key path is unspendable, so an oversized reveal after commit broadcast \
+         would permanently burn the commit value)"
     );
     Ok(())
+}
+
+/// Exact §3.5 half-agg wire layout for weight measurement (no curve checks).
+fn synthetic_half_agg_payload(
+    member_count: usize,
+    pk: &[u8; 32],
+    r: &[u8; 32],
+    s_agg: &[u8; 32],
+) -> Result<Vec<u8>> {
+    let count = u16::try_from(member_count).context("member count exceeds u16")?;
+    let body_len = member_count
+        .checked_mul(64)
+        .and_then(|n| n.checked_add(32))
+        .context("payload body length overflow")?;
+    let mut bytes = Vec::with_capacity(
+        PAYLOAD_HEADER_LEN
+            .checked_add(body_len)
+            .context("payload length overflow")?,
+    );
+    bytes.extend_from_slice(&PAYLOAD_MARKER);
+    bytes.push(PAYLOAD_VERSION_V3);
+    bytes.push(FORMAT_HALF_AGG);
+    bytes.extend_from_slice(&count.to_be_bytes());
+    bytes.extend_from_slice(&[0u8; 32]); // block_hash
+    bytes.extend_from_slice(&0u32.to_be_bytes()); // height
+    for _ in 0..member_count {
+        bytes.extend_from_slice(pk);
+        bytes.extend_from_slice(r);
+    }
+    bytes.extend_from_slice(s_agg);
+    Ok(bytes)
+}
+
+fn sizing_inscription(payload: &[u8]) -> Result<crate::inscription::Inscription> {
+    let nums = nums_internal_key()?;
+    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+    let reveal_script = ScriptBuf::new_p2tr(&secp, nums, None);
+    let reveal_output = TxOut {
+        value: Amount::from_sat(1_000),
+        script_pubkey: reveal_script,
+    };
+    // funding = reveal_out + reveal_fee + commit_fee (no change).
+    let commit_fee = Amount::from_sat(1_000);
+    let reveal_fee = Amount::from_sat(1_000);
+    let funding_value = reveal_output
+        .value
+        .checked_add(reveal_fee)
+        .and_then(|v| v.checked_add(commit_fee))
+        .context("sizing funding value overflow")?;
+    build_inscription(
+        payload,
+        InscriptionRequest {
+            funding_outpoint: OutPoint::null(),
+            funding_value,
+            internal_key: nums,
+            reveal_output,
+            change_script_pubkey: None,
+            commit_fee,
+            reveal_fee,
+        },
+    )
+    .context("sizing build_inscription failed")
 }
 
 /// `vsize * fee_rate_sat_per_vb`, failing loudly on overflow.
@@ -668,6 +1210,22 @@ fn sum_amounts(parts: &[Amount]) -> Result<Amount> {
     Ok(total)
 }
 
+/// Parse "funding shortfall: UTXO X sat < required Y sat" from an error chain.
+fn shortfall_amounts(err: &anyhow::Error) -> Option<(Amount, Amount)> {
+    for cause in err.chain() {
+        let msg = cause.to_string();
+        if let Some(rest) = msg.strip_prefix("funding shortfall: UTXO ") {
+            // "N sat < required M sat ..."
+            let mut parts = rest.split(" sat");
+            let have = parts.next()?.parse::<u64>().ok()?;
+            let rest2 = parts.next()?.strip_prefix(" < required ")?;
+            let required = rest2.parse::<u64>().ok()?;
+            return Some((Amount::from_sat(required), Amount::from_sat(have)));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,9 +1243,9 @@ mod tests {
     // ── unit tests (no bitcoind) ────────────────────────────────────────
 
     #[test]
-    fn segwit_only_funding_guard_rejects_legacy_accepts_v0_v1() {
+    fn deterministic_funding_rejects_legacy_p2wsh_accepts_p2wpkh_p2tr() {
         let legacy = ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([0x11; 20]));
-        let err = ensure_segwit_funding(&legacy).expect_err("legacy must be rejected");
+        let err = ensure_deterministic_funding(&legacy).expect_err("legacy must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("not a segwit witness program"),
@@ -695,22 +1253,25 @@ mod tests {
         );
 
         let p2wpkh = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x22; 20]));
-        ensure_segwit_funding(&p2wpkh).expect("v0 p2wpkh must pass");
+        ensure_deterministic_funding(&p2wpkh).expect("v0 p2wpkh must pass");
 
         let p2wsh = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0x33; 32]));
-        ensure_segwit_funding(&p2wsh).expect("v0 p2wsh must pass");
+        let err = ensure_deterministic_funding(&p2wsh).expect_err("p2wsh must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("P2WSH") && msg.contains("not predictable"),
+            "unexpected error: {msg}"
+        );
 
         let nums = nums_internal_key().expect("NUMS key");
-        let p2tr = ScriptBuf::new_p2tr(&bitcoin::secp256k1::Secp256k1::verification_only(), nums, None);
-        ensure_segwit_funding(&p2tr).expect("v1 p2tr must pass");
+        let p2tr =
+            ScriptBuf::new_p2tr(&bitcoin::secp256k1::Secp256k1::verification_only(), nums, None);
+        ensure_deterministic_funding(&p2tr).expect("v1 p2tr must pass");
     }
 
     #[test]
     fn fee_for_vsize_arithmetic_and_overflow() {
-        assert_eq!(
-            fee_for_vsize(250, 10).expect("ok").to_sat(),
-            2_500
-        );
+        assert_eq!(fee_for_vsize(250, 10).expect("ok").to_sat(), 2_500);
         assert_eq!(fee_for_vsize(1, 1).expect("ok").to_sat(), 1);
         let err = fee_for_vsize(usize::try_from(u64::MAX).unwrap_or(usize::MAX), 2)
             .expect_err("must overflow");
@@ -725,7 +1286,8 @@ mod tests {
     #[test]
     fn dust_guard_on_reveal_output_value() {
         let nums = nums_internal_key().expect("NUMS");
-        let p2tr = ScriptBuf::new_p2tr(&bitcoin::secp256k1::Secp256k1::verification_only(), nums, None);
+        let p2tr =
+            ScriptBuf::new_p2tr(&bitcoin::secp256k1::Secp256k1::verification_only(), nums, None);
         let dust = p2tr.minimal_non_dust();
         ensure_above_dust(dust, &p2tr).expect("exactly dust must pass (>=)");
         ensure_above_dust(dust + Amount::from_sat(1), &p2tr).expect("above dust");
@@ -742,6 +1304,66 @@ mod tests {
         assert_eq!(key.serialize(), NUMS_INTERNAL_KEY_BYTES);
     }
 
+    /// Finding 1: oversized half-agg batch is rejected by the weight guard
+    /// before any bitcoind interaction. Payload built by repeating one valid
+    /// member (accepted by `aggregate_sig_with_anchor`).
+    #[test]
+    fn oversized_batch_rejected_by_standard_weight_guard() {
+        let (template, _) = signed_members(1, Network::Regtest);
+        let one = template[0];
+
+        let max = max_half_agg_members_for_standard_reveal()
+            .expect("max_half_agg_members_for_standard_reveal");
+        assert!(max >= 1, "max members must be at least 1");
+        assert!(max < usize::from(u16::MAX), "max should be below u16::MAX");
+
+        // Boundary: max fits, max+1 does not. Payload uses the repeated valid
+        // member's (pk, R, s) — same shape `aggregate_sig_with_anchor` emits.
+        let payload_for = |n: usize| {
+            synthetic_half_agg_payload(n, &one.pk, &one.r, &one.s).expect("synthetic payload")
+        };
+
+        let payload_ok = payload_for(max);
+        let w_ok = measure_reveal_weight(&payload_ok).expect("measure max");
+        assert!(
+            w_ok <= MAX_STANDARD_TX_WEIGHT,
+            "max={max} weight {w_ok} should be within limit"
+        );
+        ensure_tx_within_standard_weight("reveal", w_ok, max, payload_ok.len())
+            .expect("max members must pass the guard");
+
+        let over_n = max + 1;
+        let payload_over = payload_for(over_n);
+        let w_over = measure_reveal_weight(&payload_over).expect("measure over");
+        assert!(
+            w_over > MAX_STANDARD_TX_WEIGHT,
+            "max+1={over_n} weight {w_over} should exceed limit"
+        );
+        let err = ensure_tx_within_standard_weight("reveal", w_over, over_n, payload_over.len())
+            .expect_err("oversize must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&MAX_STANDARD_TX_WEIGHT.to_string())
+                || msg.contains("MAX_STANDARD_TX_WEIGHT"),
+            "error must name the limit: {msg}"
+        );
+        assert!(
+            msg.contains(&over_n.to_string()) || msg.contains("members"),
+            "error must mention member count: {msg}"
+        );
+
+        // `aggregate_sig_with_anchor` accepts a repeated valid member (no need
+        // for 65_535 distinct signatures). Aggregate a modest repeated batch
+        // then pad the logical member list in the serialized payload shape via
+        // the structural constructor above for the true oversize case — the
+        // crypto sum of ~max members is intentionally avoided in unit tests.
+        let repeated: Vec<NullifierSig> = std::iter::repeat(one).take(3).collect();
+        let agg = aggregate_sig_with_anchor(&repeated, BlockAnchor::default())
+            .expect("aggregate_sig_with_anchor accepts repeated members");
+        assert_eq!(agg.members.len(), 3);
+        let _ = agg;
+    }
+
     // ── live regtest helpers ────────────────────────────────────────────
 
     fn require_env(name: &str) -> String {
@@ -753,7 +1375,7 @@ mod tests {
         })
     }
 
-    fn live_publisher() -> Publisher {
+    fn live_publisher_with(fee_rate_sat_per_vb: u64, reveal_output_value: Amount) -> Publisher {
         let url = require_env("ZKCOINS_REGTEST_URL");
         let cookie = require_env("ZKCOINS_REGTEST_COOKIE");
         let wallet = require_env("ZKCOINS_REGTEST_WALLET");
@@ -761,10 +1383,15 @@ mod tests {
             rpc_url: url,
             cookie_path: PathBuf::from(cookie),
             wallet_name: wallet,
-            fee_rate_sat_per_vb: 2,
-            reveal_output_value: Amount::from_sat(1_000),
+            fee_rate_sat_per_vb,
+            reveal_output_value,
+            network: Network::Regtest,
         })
         .expect("Publisher::connect to live regtest must succeed")
+    }
+
+    fn live_publisher() -> Publisher {
+        live_publisher_with(2, Amount::from_sat(1_000))
     }
 
     fn signed_members(count: usize, m_state_network: Network) -> (Vec<NullifierSig>, &'static [u8]) {
@@ -791,6 +1418,16 @@ mod tests {
         (members, m_state_network.m_state_bytes())
     }
 
+    fn batch_at_tip(publisher: &Publisher, sigs: &[NullifierSig]) -> Vec<BatchMember> {
+        let tip = publisher.current_anchor().expect("current_anchor");
+        sigs.iter()
+            .map(|sig| BatchMember {
+                sig: *sig,
+                build_tip: tip,
+            })
+            .collect()
+    }
+
     fn mine_one(publisher: &Publisher) {
         let network = publisher.chain_network().expect("network");
         let addr = publisher
@@ -805,7 +1442,30 @@ mod tests {
             .expect("generatetoaddress");
     }
 
-    fn assert_roundtrip(publisher: &Publisher, members: &[NullifierSig], m_state: &[u8]) {
+    fn mine_n(publisher: &Publisher, n: u64) {
+        let network = publisher.chain_network().expect("network");
+        let addr = publisher
+            .rpc
+            .get_new_address(None, Some(AddressType::Bech32m))
+            .expect("getnewaddress")
+            .require_network(network)
+            .expect("address network");
+        publisher
+            .rpc
+            .generate_to_address(n, &addr)
+            .expect("generatetoaddress");
+    }
+
+    fn mempool_txids(publisher: &Publisher) -> std::collections::BTreeSet<Txid> {
+        publisher
+            .rpc
+            .get_raw_mempool()
+            .expect("getrawmempool")
+            .into_iter()
+            .collect()
+    }
+
+    fn assert_roundtrip(publisher: &Publisher, members: &[BatchMember], m_state: &[u8]) {
         let batch = publisher.publish(members).expect("publish");
 
         mine_one(publisher);
@@ -855,7 +1515,6 @@ mod tests {
             "from_byte_array round-trip must recover the chain BlockHash"
         );
 
-        // Reveal is confirmed in a block; the spent commit output is P2TR.
         let reveal_info = publisher
             .rpc
             .get_raw_transaction_info(&batch.reveal_txid, None)
@@ -873,7 +1532,6 @@ mod tests {
             "commit output must be P2TR"
         );
 
-        // Confirm the reveal actually spent that P2TR commit output.
         let reveal_tx = publisher
             .rpc
             .get_raw_transaction(&batch.reveal_txid, None)
@@ -900,7 +1558,8 @@ mod tests {
     #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
     fn regtest_publish_roundtrip() {
         let publisher = live_publisher();
-        let (members, m_state) = signed_members(3, Network::Regtest);
+        let (sigs, m_state) = signed_members(3, Network::Regtest);
+        let members = batch_at_tip(&publisher, &sigs);
         assert_roundtrip(&publisher, &members, m_state);
     }
 
@@ -909,9 +1568,9 @@ mod tests {
     #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
     fn regtest_single_member_roundtrip() {
         let publisher = live_publisher();
-        let (members, m_state) = signed_members(1, Network::Regtest);
+        let (sigs, m_state) = signed_members(1, Network::Regtest);
+        let members = batch_at_tip(&publisher, &sigs);
         let batch = publisher.publish(&members).expect("publish single");
-        // Document actual format: aggregate_sig_with_anchor always emits 0x01.
         assert_eq!(
             batch.aggregate.format, 0x01,
             "aggregate_sig_with_anchor yields FORMAT_HALF_AGG even for one member"
@@ -920,13 +1579,277 @@ mod tests {
         publisher
             .wait_for_confirmation(&batch.reveal_txid, 1, Duration::from_secs(30))
             .expect("confirm");
-        let payloads = publisher
-            .fetch_reveal_payloads(&batch.reveal_txid)
+        let details = publisher
+            .fetch_reveal_payload_details(&batch.reveal_txid)
             .expect("fetch");
-        assert_eq!(payloads, vec![batch.payload.clone()]);
+        assert!(details.errors.is_empty(), "errors: {:?}", details.errors);
+        assert_eq!(details.payloads, vec![batch.payload.clone()]);
         let decoded =
-            AggregateStateNullifierV3::deserialize(&payloads[0]).expect("deserialize");
+            AggregateStateNullifierV3::deserialize(&details.payloads[0]).expect("deserialize");
         assert_eq!(decoded, batch.aggregate);
         aggregate_verify(&decoded, m_state).expect("verify");
+    }
+
+    /// Finding 2: corrupted / wrong-network aggregate is rejected and nothing
+    /// is broadcast.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_rejects_wrong_network_or_corrupted_sig_without_broadcast() {
+        let publisher = live_publisher();
+        let before = mempool_txids(&publisher);
+
+        // Sign against Testnet m_state; publisher verifies under Regtest.
+        let (sigs, _) = signed_members(2, Network::Testnet);
+        let members = batch_at_tip(&publisher, &sigs);
+        let err = publisher
+            .publish(&members)
+            .expect_err("wrong-network members must fail verify");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verification failed") || msg.contains("aggregate"),
+            "unexpected error: {msg}"
+        );
+        let after = mempool_txids(&publisher);
+        assert_eq!(before, after, "mempool must be unchanged after rejected publish");
+
+        // Corrupted s on an otherwise Regtest-valid member.
+        let (mut sigs, _) = signed_members(1, Network::Regtest);
+        sigs[0].s[0] ^= 0x01;
+        let members = batch_at_tip(&publisher, &sigs);
+        let err = publisher
+            .publish(&members)
+            .expect_err("corrupted s must fail verify");
+        assert!(
+            err.to_string().contains("verification failed")
+                || err.to_string().contains("aggregate")
+                || err.to_string().contains("signature"),
+            "unexpected: {err}"
+        );
+        let after2 = mempool_txids(&publisher);
+        assert_eq!(before, after2, "mempool must stay unchanged after corrupted-s reject");
+    }
+
+    /// Finding 3: anchor equals the oldest member's build tip; descendant tips
+    /// still yield the oldest; stale and wrong-hash tips fail loudly.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_block_anchor_selection_and_staleness() {
+        let publisher = live_publisher();
+
+        // Record tip T0, mine one so tip is T0+1, then build mixed tips.
+        let t0 = publisher.current_anchor().expect("t0");
+        mine_one(&publisher);
+        let t1 = publisher.current_anchor().expect("t1");
+        assert!(t1.height > t0.height);
+
+        let (sigs, m_state) = signed_members(2, Network::Regtest);
+        let members = vec![
+            BatchMember {
+                sig: sigs[0],
+                build_tip: t1, // descendant / younger
+            },
+            BatchMember {
+                sig: sigs[1],
+                build_tip: t0, // oldest
+            },
+        ];
+        let batch = publisher.publish(&members).expect("publish with mixed tips");
+        assert_eq!(
+            batch.block_anchor, t0,
+            "anchor must equal the oldest member's build tip"
+        );
+        assert_eq!(batch.aggregate.block_anchor, t0);
+        aggregate_verify(&batch.aggregate, m_state).expect("verify");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm");
+
+        // Wrong hash at a real height.
+        let tip = publisher.current_anchor().expect("tip");
+        let (sigs, _) = signed_members(1, Network::Regtest);
+        let mut bad_hash = tip.block_hash;
+        bad_hash[0] ^= 0xff;
+        let err = publisher
+            .publish(&[BatchMember {
+                sig: sigs[0],
+                build_tip: BlockAnchor {
+                    block_hash: bad_hash,
+                    height: tip.height,
+                },
+            }])
+            .expect_err("wrong hash must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("canonical") || msg.contains("not the canonical"),
+            "unexpected: {msg}"
+        );
+
+        // Stale: mine 101 blocks after recording a tip, then use that tip.
+        let stale_tip = publisher.current_anchor().expect("stale base");
+        mine_n(&publisher, 101);
+        let (sigs, _) = signed_members(1, Network::Regtest);
+        let err = publisher
+            .publish(&[BatchMember {
+                sig: sigs[0],
+                build_tip: stale_tip,
+            }])
+            .expect_err("stale members must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("members too stale, re-prove"),
+            "unexpected stale error: {msg}"
+        );
+    }
+
+    /// Finding 5: at 1 sat/vB, a funding UTXO sized so change lands just below
+    /// dust must still converge and publish (topology drops the change output).
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_fee_convergence_when_change_below_dust() {
+        let publisher = live_publisher_with(1, Amount::from_sat(1_000));
+        let (sigs, m_state) = signed_members(1, Network::Regtest);
+        let members = batch_at_tip(&publisher, &sigs);
+
+        // Measure reveal vsize for this payload shape.
+        let tip = publisher.current_anchor().expect("tip");
+        let agg = aggregate_sig_with_anchor(&[sigs[0]], tip).expect("agg");
+        let payload = agg.serialize();
+        let reveal_vsize = sizing_inscription(&payload)
+            .expect("sizing")
+            .reveal_tx
+            .vsize();
+
+        // Commit with change is typically ~154 vB for P2TR in/out; without ~111.
+        // Size funding so that under the *with-change* fee assumption the change
+        // falls just below dust — fixed-point must drop the change and succeed.
+        let nums = nums_internal_key().expect("nums");
+        let p2tr =
+            ScriptBuf::new_p2tr(&bitcoin::secp256k1::Secp256k1::verification_only(), nums, None);
+        let dust = p2tr.minimal_non_dust();
+        let commit_vsize_with_change = 154usize;
+        let commit_fee = fee_for_vsize(commit_vsize_with_change, 1).expect("cf");
+        let reveal_fee = fee_for_vsize(reveal_vsize, 1).expect("rf");
+        let spent = sum_amounts(&[Amount::from_sat(1_000), commit_fee, reveal_fee]).expect("sum");
+        let funding_amount = spent
+            .checked_add(dust)
+            .expect("add dust")
+            .checked_sub(Amount::from_sat(1))
+            .expect("dust-1");
+
+        // Create a confirmed P2TR UTXO of exactly that value.
+        let btc_net = publisher.chain_network().expect("net");
+        let addr = publisher
+            .rpc
+            .get_new_address(None, Some(AddressType::Bech32m))
+            .expect("addr")
+            .require_network(btc_net)
+            .expect("net");
+        // Exact amount; fee paid from other wallet inputs (no subtractfeefromamount).
+        publisher
+            .rpc
+            .send_to_address(&addr, funding_amount, None, None, None, None, None, None)
+            .expect("sendtoaddress exact funding for dust-change case");
+        mine_one(&publisher);
+
+        // Ensure at least one UTXO of the target size exists; if the wallet
+        // rounded, fall back to creating with createrawtransaction path.
+        let unspent = publisher
+            .rpc
+            .list_unspent(Some(1), None, None, Some(true), None)
+            .expect("listunspent");
+        let has_target = unspent.iter().any(|u| u.amount == funding_amount);
+        if !has_target {
+            // Lock is not needed; send exact again (fee paid from other input).
+            let addr2 = publisher
+                .rpc
+                .get_new_address(None, Some(AddressType::Bech32m))
+                .expect("addr2")
+                .require_network(btc_net)
+                .expect("net");
+            publisher
+                .rpc
+                .send_to_address(&addr2, funding_amount, None, None, None, None, None, None)
+                .expect("sendtoaddress retry");
+            mine_one(&publisher);
+        }
+
+        let batch = publisher
+            .publish(&members)
+            .expect("publish must succeed when change is dust-absorbed via fixed-point");
+        assert_eq!(batch.aggregate.members.len(), 1);
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch.reveal_txid, 1, Duration::from_secs(30))
+            .expect("mined");
+        let details = publisher
+            .fetch_reveal_payload_details(&batch.reveal_txid)
+            .expect("details");
+        assert!(details.errors.is_empty());
+        aggregate_verify(
+            &AggregateStateNullifierV3::deserialize(&details.payloads[0]).expect("dec"),
+            m_state,
+        )
+        .expect("verify");
+    }
+
+    /// Finding 6: publisher skips a too-small eligible UTXO and funds from the
+    /// next candidate.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_funding_retries_next_candidate() {
+        let publisher = live_publisher_with(2, Amount::from_sat(1_000));
+        let btc_net = publisher.chain_network().expect("net");
+
+        // Tiny confirmed UTXO that cannot cover reveal_output + fees.
+        let tiny = Amount::from_sat(1_500);
+        let addr = publisher
+            .rpc
+            .get_new_address(None, Some(AddressType::Bech32m))
+            .expect("addr")
+            .require_network(btc_net)
+            .expect("net");
+        publisher
+            .rpc
+            .send_to_address(&addr, tiny, None, None, None, None, None, None)
+            .expect("create tiny utxo");
+        mine_one(&publisher);
+
+        let before_candidates = publisher.list_funding_candidates().expect("cands");
+        assert!(
+            before_candidates.iter().any(|c| c.amount == tiny)
+                || before_candidates.iter().any(|c| c.amount <= tiny),
+            "expected a tiny candidate among {:?}",
+            before_candidates
+                .iter()
+                .map(|c| c.amount.to_sat())
+                .collect::<Vec<_>>()
+        );
+        // There must also be a larger candidate (wallet coinbase/change).
+        assert!(
+            before_candidates
+                .iter()
+                .any(|c| c.amount > Amount::from_sat(100_000)),
+            "need a large funding candidate"
+        );
+
+        let (sigs, m_state) = signed_members(1, Network::Regtest);
+        let members = batch_at_tip(&publisher, &sigs);
+        let batch = publisher
+            .publish(&members)
+            .expect("must skip tiny UTXO and fund from a larger candidate");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm");
+        let details = publisher
+            .fetch_reveal_payload_details(&batch.reveal_txid)
+            .expect("details");
+        assert!(details.errors.is_empty());
+        aggregate_verify(
+            &AggregateStateNullifierV3::deserialize(&details.payloads[0]).expect("dec"),
+            m_state,
+        )
+        .expect("verify");
     }
 }
