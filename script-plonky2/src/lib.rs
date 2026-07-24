@@ -30,6 +30,7 @@ pub mod half_agg;
 pub mod inscription;
 pub mod prover_bridge;
 pub mod publisher;
+pub mod scanner;
 pub mod state_engine;
 
 use anyhow::Result;
