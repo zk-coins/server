@@ -1,3 +1,5 @@
+use plonky2::field::secp256k1_base::Secp256K1Base;
+use plonky2::field::secp256k1_scalar::Secp256K1Scalar;
 use plonky2::field::types::{Field, Field64};
 use plonky2::hash::hash_types::HashOutTarget;
 use plonky2::hash::poseidon::PoseidonHash;
@@ -5,21 +7,33 @@ use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData};
 
+use crate::circuit::gadgets::bip340::{be_bytes32_to_nonnative, bip340_verify_with_s2c};
+use crate::circuit::gadgets::curve::{AffinePointTarget, CircuitBuilderCurve};
+use crate::circuit::gadgets::curve_types::Secp256K1;
+use crate::circuit::gadgets::nonnative::{CircuitBuilderNonNative, NonNativeTarget};
 use crate::circuit::gadgets::sha256::sha256;
 use crate::{C, D, F};
 
+use super::bindings::{
+    coin_identifier_with_index_target, enforce_input_coin_bindings, hash_proof_data_target,
+    input_nullifiers_root_target, nk_commit_target,
+};
 use super::serialize::{
     be_bytes32_to_u32_limbs, digest_to_be_bytes_target, encode_byte_string_target,
     strict_be_bytes_less_than, tag_targets, u128_to_be_bytes_target, u64_to_be_bytes_target,
 };
 use super::targets::{
-    virtual_bytes, AccountStateTarget, CoinTarget, OutputTemplateTarget, ProofDataTarget,
-    MAX_ACCOUNT_ASSETS,
+    virtual_bytes, AccountStateTarget, CoinTarget, InputAuthTarget, InputCoinTarget,
+    OutputTemplateTarget, ProofDataTarget, MAX_ACCOUNT_ASSETS,
 };
 use super::{
-    NETWORK_TAG_MAINNET, NETWORK_TAG_REGTEST, NETWORK_TAG_TESTNET, TAG_ACCOUNT_STATE, TAG_COIN,
-    TAG_COINS_ROOT_LEAF, TAG_COINS_ROOT_NODE, TAG_NETWORK, TAG_NPK_COMMIT,
+    M_STATE_MAINNET, M_STATE_REGTEST, M_STATE_TESTNET, NETWORK_TAG_MAINNET, NETWORK_TAG_REGTEST,
+    NETWORK_TAG_TESTNET, TAG_ACCOUNT_STATE, TAG_COINS_ROOT_LEAF, TAG_COINS_ROOT_NODE, TAG_NETWORK,
+    TAG_NPK_COMMIT,
 };
+
+/// Fixed input-slot bound from spec §2.5.
+pub const MAX_TX_INPUTS: usize = 8;
 
 /// Fixed output-slot bound from spec §2.5.
 pub const MAX_TX_OUTPUTS: usize = 8;
@@ -40,18 +54,32 @@ impl Network {
             Self::Regtest => NETWORK_TAG_REGTEST,
         }
     }
+
+    pub fn m_state_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Mainnet => M_STATE_MAINNET,
+            Self::Testnet => M_STATE_TESTNET,
+            Self::Regtest => M_STATE_REGTEST,
+        }
+    }
 }
 
 /// All witness and derived targets exposed to a host-side witness setter.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ComplianceTargets {
     pub prev_account_state: AccountStateTarget,
     pub new_account_state: AccountStateTarget,
     pub prev_account_state_hash: HashOutTarget,
+    pub nk: [Target; 32],
+    pub input_coins: [InputCoinTarget; MAX_TX_INPUTS],
+    pub input_auth: [InputAuthTarget; MAX_TX_INPUTS],
     pub output_templates: [OutputTemplateTarget; MAX_TX_OUTPUTS],
     pub output_coins: [CoinTarget; MAX_TX_OUTPUTS],
     pub next_pubkey: [Target; 32],
     pub npk_rand: [Target; 32],
+    pub txn_sig_rx: NonNativeTarget<Secp256K1Base>,
+    pub txn_sig_s: NonNativeTarget<Secp256K1Scalar>,
+    pub s2c_r_prime: AffinePointTarget<Secp256K1>,
     pub proof_data: ProofDataTarget,
     pub consumed_pubkey: [Target; 32],
     pub network_id: HashOutTarget,
@@ -194,14 +222,15 @@ pub(crate) fn coin_identifier_target(
     template: OutputTemplateTarget,
     coin_index: usize,
 ) -> HashOutTarget {
-    let amount_bytes = u128_to_be_bytes_target(builder, template.amount);
-    let mut elements = tag_targets(builder, TAG_COIN);
-    elements.extend(prev_account_state_hash.elements);
-    elements.extend(encode_byte_string_target(builder, &template.recipient));
-    elements.extend(template.asset_id.elements);
-    elements.extend(encode_byte_string_target(builder, &amount_bytes));
-    elements.push(builder.constant(F::from_canonical_usize(coin_index)));
-    builder.hash_n_to_hash_no_pad::<PoseidonHash>(elements)
+    let coin_index = builder.constant(F::from_canonical_usize(coin_index));
+    coin_identifier_with_index_target(
+        builder,
+        prev_account_state_hash,
+        &template.recipient,
+        template.asset_id,
+        template.amount,
+        coin_index,
+    )
 }
 
 fn coins_leaf_hash(builder: &mut CircuitBuilder<F, D>, value: HashOutTarget) -> HashOutTarget {
@@ -313,10 +342,16 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
     let prev_account_state = AccountStateTarget::new_virtual(&mut builder);
     let new_account_state = AccountStateTarget::new_virtual(&mut builder);
     let prev_account_state_hash = builder.add_virtual_hash();
+    let nk = virtual_bytes(&mut builder);
+    let input_coins = std::array::from_fn(|_| InputCoinTarget::new_virtual(&mut builder));
+    let input_auth = std::array::from_fn(|_| InputAuthTarget::new_virtual(&mut builder));
     let output_templates = std::array::from_fn(|_| OutputTemplateTarget::new_virtual(&mut builder));
     let next_pubkey = virtual_bytes(&mut builder);
     let npk_rand = virtual_bytes(&mut builder);
     let consumed_pubkey = virtual_bytes(&mut builder);
+    let txn_sig_rx = builder.add_virtual_nonnative_target();
+    let txn_sig_s = builder.add_virtual_nonnative_target();
+    let s2c_r_prime = builder.add_virtual_affine_point_target();
 
     connect_unchanged_state(
         &mut builder,
@@ -329,6 +364,19 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
         &consumed_pubkey,
         &prev_account_state.current_pubkey,
     );
+    let computed_nk_commit = nk_commit_target(&mut builder, &nk);
+    builder.connect_hashes(computed_nk_commit, prev_account_state.nk_commit);
+    enforce_input_coin_bindings(
+        &mut builder,
+        &prev_account_state.owner,
+        &input_coins,
+        &input_auth,
+    );
+
+    let input_active = input_coins.map(|coin| coin.active);
+    let input_identifiers = input_coins.map(|coin| coin.identifier);
+    let (input_nullifiers_root, _nullifiers, _input_count) =
+        input_nullifiers_root_target(&mut builder, &nk, &input_active, &input_identifiers);
 
     let output_coins = std::array::from_fn(|index| {
         let template = output_templates[index];
@@ -362,11 +410,22 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
     let proof_data = ProofDataTarget {
         new_account_state_hash,
         output_coins_root,
-        input_nullifiers_root: builder.add_virtual_hash(),
+        input_nullifiers_root,
         coin_history_root: builder.add_virtual_hash(),
         nav_commitment: builder.add_virtual_hash(),
         npk_commit,
     };
+    let h_proof_data = hash_proof_data_target(&mut builder, &proof_data);
+    let pk_x = be_bytes32_to_nonnative::<Secp256K1Base, F, D>(&mut builder, &consumed_pubkey);
+    let _signature_opening = bip340_verify_with_s2c(
+        &mut builder,
+        &pk_x,
+        &txn_sig_rx,
+        &txn_sig_s,
+        network.m_state_bytes(),
+        &s2c_r_prime,
+        &h_proof_data,
+    );
     let network_id = network_id_target(&mut builder, network);
 
     // Clause-9 application PI order: 20 native Poseidon elements, then the
@@ -396,10 +455,16 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
         prev_account_state,
         new_account_state,
         prev_account_state_hash,
+        nk,
+        input_coins,
+        input_auth,
         output_templates,
         output_coins,
         next_pubkey,
         npk_rand,
+        txn_sig_rx,
+        txn_sig_s,
+        s2c_r_prime,
         proof_data,
         consumed_pubkey,
         network_id,

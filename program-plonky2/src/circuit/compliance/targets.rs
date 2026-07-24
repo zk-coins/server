@@ -77,6 +77,46 @@ impl OutputTemplateTarget {
     }
 }
 
+/// One fixed-array input-coin slot.
+#[derive(Clone, Copy, Debug)]
+pub struct InputCoinTarget {
+    pub active: BoolTarget,
+    pub identifier: HashOutTarget,
+    pub recipient: [Target; 32],
+    pub amount: U128Target,
+    pub asset_id: HashOutTarget,
+}
+
+impl InputCoinTarget {
+    pub(crate) fn new_virtual(builder: &mut CircuitBuilder<F, D>) -> Self {
+        Self {
+            active: builder.add_virtual_bool_target_safe(),
+            identifier: builder.add_virtual_hash(),
+            recipient: virtual_bytes(builder),
+            amount: U128Target::new_virtual(builder),
+            asset_id: builder.add_virtual_hash(),
+        }
+    }
+}
+
+/// Clause-2 authorization data needed to recompute an input coin identifier.
+#[derive(Clone, Copy, Debug)]
+pub struct InputAuthTarget {
+    pub creating_prev_ash: HashOutTarget,
+    pub coin_index: Target,
+}
+
+impl InputAuthTarget {
+    pub(crate) fn new_virtual(builder: &mut CircuitBuilder<F, D>) -> Self {
+        let coin_index = builder.add_virtual_target();
+        builder.range_check(coin_index, 32);
+        Self {
+            creating_prev_ash: builder.add_virtual_hash(),
+            coin_index,
+        }
+    }
+}
+
 /// In-circuit form of spec-v1.1 `Coin`.
 #[derive(Clone, Copy, Debug)]
 pub struct CoinTarget {
