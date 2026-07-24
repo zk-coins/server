@@ -124,6 +124,7 @@ pub struct SkeletonCircuit {
     pub data: CircuitData<F, C, D>,
     pub targets: ComplianceTargets,
     pub gate_count: usize,
+    pub network: Network,
     pub base_proof: ProofWithPublicInputs<F, C, D>,
     pub base_verifier_data: VerifierOnlyCircuitData<C, D>,
 }
@@ -199,16 +200,16 @@ fn hash_from_pis(pis: &[Target], offset: usize) -> HashOutTarget {
     }
 }
 
-#[derive(Clone, Copy)]
-struct PrevProofPublicInputsTarget {
-    proof_data: ProofDataTarget,
-    consumed_pubkey: [Target; 32],
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ComplianceProofPublicInputsTarget {
+    pub proof_data: ProofDataTarget,
+    pub consumed_pubkey: [Target; 32],
 }
 
-fn unpack_prev_proof_pis(
+pub(crate) fn unpack_compliance_proof_pis(
     builder: &mut CircuitBuilder<F, D>,
     proof: &ProofWithPublicInputsTarget<D>,
-) -> PrevProofPublicInputsTarget {
+) -> ComplianceProofPublicInputsTarget {
     assert_eq!(
         proof.public_inputs.len(),
         108,
@@ -220,7 +221,7 @@ fn unpack_prev_proof_pis(
     let consumed_limbs: [Target; 8] = proof.public_inputs[28..36]
         .try_into()
         .expect("consumed_pubkey has eight limbs");
-    PrevProofPublicInputsTarget {
+    ComplianceProofPublicInputsTarget {
         proof_data: ProofDataTarget {
             new_account_state_hash: hash_from_pis(&proof.public_inputs, 0),
             output_coins_root: hash_from_pis(&proof.public_inputs, 4),
@@ -299,7 +300,7 @@ fn enforce_balance_discipline(
     builder.add_many(balances.map(|slot| slot.active.target))
 }
 
-fn account_state_hash_target(
+pub(crate) fn account_state_hash_target(
     builder: &mut CircuitBuilder<F, D>,
     state: &AccountStateTarget,
 ) -> (HashOutTarget, Target) {
@@ -346,6 +347,24 @@ fn account_state_hash_target(
         candidates.push(builder.hash_n_to_hash_no_pad::<PoseidonHash>(elements));
     }
     (select_exact_hash(builder, count, &candidates), count)
+}
+
+/// Looks up one asset in the canonical fixed-slot AccountState balance map.
+///
+/// [`account_state_hash_target`] enforces left alignment, strict asset order,
+/// non-zero active amounts, and therefore uniqueness. This helper reuses the
+/// same masked wide-sum relation as the compliance balance-fold constraints;
+/// an absent asset has balance zero.
+pub(crate) fn account_balance_target(
+    builder: &mut CircuitBuilder<F, D>,
+    state: &AccountStateTarget,
+    asset_id: HashOutTarget,
+) -> U128Target {
+    let balance = U128Target::new_virtual(builder);
+    let actual = masked_balance_sum(builder, &state.balances, asset_id);
+    let claimed = WideSum::from_u128(builder, &balance);
+    connect_wide(builder, &actual, &claimed);
+    balance
 }
 
 pub(crate) fn coin_identifier_target(
@@ -825,7 +844,7 @@ fn enforce_received_admission(
         let coin = received_coins[index];
         let auth = &received_auth[index];
         let active = coin.active;
-        let creating_pis = unpack_prev_proof_pis(builder, &auth.creating_proof);
+        let creating_pis = unpack_compliance_proof_pis(builder, &auth.creating_proof);
 
         let recomputed_identifier = coin_identifier_with_index_target(
             builder,
@@ -902,7 +921,10 @@ fn enforce_received_admission(
     }
 }
 
-fn network_id_target(builder: &mut CircuitBuilder<F, D>, network: Network) -> HashOutTarget {
+pub(crate) fn network_id_target(
+    builder: &mut CircuitBuilder<F, D>,
+    network: Network,
+) -> HashOutTarget {
     let tag_bytes: Vec<Target> = network
         .tag_bytes()
         .iter()
@@ -1197,7 +1219,7 @@ fn build_with_common(
     let prev_proof = builder.add_virtual_proof_with_pis(common);
     let base_proof = builder.add_virtual_proof_with_pis(common);
     let base_verifier_data = builder.add_virtual_verifier_data(common.config.fri_config.cap_height);
-    let prev_pis = unpack_prev_proof_pis(&mut builder, &prev_proof);
+    let prev_pis = unpack_compliance_proof_pis(&mut builder, &prev_proof);
 
     enforce_received_admission(
         &mut builder,
@@ -1414,6 +1436,7 @@ fn build_skeleton_circuit_inner(config: CircuitConfig, network: Network) -> Skel
         data,
         targets,
         gate_count,
+        network,
     }
 }
 

@@ -73,7 +73,10 @@ fn less_than_constant_bits(
 /// `split_le(_, 64)` alone admits a second 64-bit representative for some
 /// field values. The explicit `< ORDER` check makes the emitted bytes match
 /// host `to_canonical_u64()` byte-for-byte for every proof.
-fn canonical_u64_bits(builder: &mut CircuitBuilder<F, D>, value: Target) -> Vec<BoolTarget> {
+pub(crate) fn canonical_u64_bits(
+    builder: &mut CircuitBuilder<F, D>,
+    value: Target,
+) -> Vec<BoolTarget> {
     let bits = builder.split_le(value, 64);
     let canonical = less_than_constant_bits(builder, &bits, F::ORDER);
     builder.assert_one(canonical.target);
