@@ -16,8 +16,9 @@ pub use skeleton::{
     MAX_TX_OUTPUTS,
 };
 pub use targets::{
-    AccountStateTarget, BalanceSlotTarget, CoinTarget, InputAuthTarget, InputCoinTarget,
-    OutputTemplateTarget, ProofDataTarget, MAX_ACCOUNT_ASSETS,
+    AccountStateTarget, AssetIssuanceTarget, BalanceSlotTarget, CoinTarget,
+    HistoryUpdatePathTarget, InputAuthTarget, InputCoinTarget, OutputTemplateTarget,
+    ProofDataTarget, MAX_ACCOUNT_ASSETS, MAX_HISTORY_UPDATES_D3,
 };
 
 const TAG_ACCOUNT_STATE: &str = "zkCoins/v1/AccountState";
@@ -29,7 +30,12 @@ const TAG_NULLIFIER: &str = "zkCoins/v1/Nullifier";
 const TAG_NULLIFIERS_ROOT_LEAF: &str = "zkCoins/v1/NullifiersRoot/Leaf";
 const TAG_NULLIFIERS_ROOT_NODE: &str = "zkCoins/v1/NullifiersRoot/Node";
 const TAG_NETWORK: &str = "zkCoins/v1/Network";
+const TAG_ASSET_ID: &str = "zkCoins/v1/AssetId";
+const TAG_ASSET_ID_V2: &str = "zkCoins/v1/AssetIdV2";
+const TAG_ISSUANCE_TERMS: &str = "zkCoins/v1/IssuanceTerms";
+const TAG_ISSUANCE_TERMS_V2: &str = "zkCoins/v1/IssuanceTermsV2";
 const TAG_NPK_COMMIT: &[u8] = b"zkCoins/v1/NpkCommit";
+const GENESIS_TAG: &[u8] = b"zkCoins/v1/genesis";
 
 const NETWORK_TAG_MAINNET: &[u8] = b"zkCoins/v1/mainnet";
 const NETWORK_TAG_TESTNET: &[u8] = b"zkCoins/v1/testnet";

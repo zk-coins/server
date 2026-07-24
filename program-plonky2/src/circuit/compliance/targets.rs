@@ -8,6 +8,62 @@ use crate::{D, F};
 /// Maximum number of distinct non-zero balances in a spec-v1.1 account.
 pub const MAX_ACCOUNT_ASSETS: usize = 32;
 
+/// Coin-history updates in this increment: eight spends plus eight self admissions.
+///
+/// P1-D.5 extends this fixed array to the normative 20 slots when the four
+/// clause-10 received-coin admissions are introduced.
+pub const MAX_HISTORY_UPDATES_D3: usize = 16;
+
+/// One witnessed 256-level CoinHist sibling path.
+#[derive(Clone, Copy, Debug)]
+pub struct HistoryUpdatePathTarget {
+    pub siblings: [HashOutTarget; crate::circuit::gadgets::coinhist::COINHIST_DEPTH],
+}
+
+impl HistoryUpdatePathTarget {
+    pub(crate) fn new_virtual(builder: &mut CircuitBuilder<F, D>) -> Self {
+        Self {
+            siblings: std::array::from_fn(|_| builder.add_virtual_hash()),
+        }
+    }
+}
+
+/// Optional v1/v2 issuance witness.
+#[derive(Clone, Copy, Debug)]
+pub struct AssetIssuanceTarget {
+    pub present: BoolTarget,
+    pub asset_id: HashOutTarget,
+    pub creator_pubkey: [Target; 32],
+    pub issuance_version: Target,
+    pub name_hash: [Target; 32],
+    pub decimals: Target,
+    pub amount: U128Target,
+    pub terms_hash: HashOutTarget,
+    pub cap_total: U128Target,
+    pub terms_salt: [Target; 32],
+}
+
+impl AssetIssuanceTarget {
+    pub(crate) fn new_virtual(builder: &mut CircuitBuilder<F, D>) -> Self {
+        let issuance_version = builder.add_virtual_target();
+        builder.range_check(issuance_version, 8);
+        let decimals = builder.add_virtual_target();
+        builder.range_check(decimals, 8);
+        Self {
+            present: builder.add_virtual_bool_target_safe(),
+            asset_id: builder.add_virtual_hash(),
+            creator_pubkey: virtual_bytes(builder),
+            issuance_version,
+            name_hash: virtual_bytes(builder),
+            decimals,
+            amount: U128Target::new_virtual(builder),
+            terms_hash: builder.add_virtual_hash(),
+            cap_total: U128Target::new_virtual(builder),
+            terms_salt: virtual_bytes(builder),
+        }
+    }
+}
+
 /// One fixed-array balance slot.
 #[derive(Clone, Copy, Debug)]
 pub struct BalanceSlotTarget {
