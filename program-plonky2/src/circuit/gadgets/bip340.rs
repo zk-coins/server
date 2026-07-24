@@ -159,6 +159,16 @@ fn bip340_verify_with_rx_bytes<F: RichField + Extendable<D>, const D: usize>(
         m_state.is_ascii(),
         "the fixed BIP-340 state message must be ASCII"
     );
+    let canonical_s = builder.nonnative_to_canonical_biguint(s);
+    let zero = builder.zero();
+    let mut s_is_zero = builder.constant_bool(true);
+    for limb in canonical_s.limbs {
+        let limb_is_zero = builder.is_equal(limb.0, zero);
+        s_is_zero = builder.and(s_is_zero, limb_is_zero);
+    }
+    let s_is_nonzero = builder.not(s_is_zero);
+    builder.assert_one(s_is_nonzero.target);
+
     let p = lift_x_even_y_target(builder, pk_x);
     let pk_bytes = nonnative_to_be_bytes32(builder, pk_x);
     let mut challenge_preimage = Vec::with_capacity(64 + m_state.len());
@@ -530,6 +540,16 @@ mod tests {
         assert_rejected(
             "tampered-s",
             fixture_witness(&targets, PK_1, R_1, &tampered_s, M_SC),
+        );
+        assert_rejected(
+            "zero-s",
+            fixture_witness(
+                &targets,
+                PK_1,
+                R_1,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                M_SC,
+            ),
         );
 
         let mut tampered_pk = PK_1.to_owned();
