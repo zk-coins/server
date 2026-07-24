@@ -1651,8 +1651,13 @@ struct SharedCircuit {
     build_time: Duration,
 }
 
+struct SharedGenesisProof {
+    proof: ProofWithPublicInputs<F, C, D>,
+    prove_time: Duration,
+}
+
 static SHARED_CIRCUIT: OnceLock<SharedCircuit> = OnceLock::new();
-static GENESIS_PROOF: OnceLock<ProofWithPublicInputs<F, C, D>> = OnceLock::new();
+static GENESIS_PROOF: OnceLock<SharedGenesisProof> = OnceLock::new();
 static FULL_CIRCUIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn shared_circuit() -> &'static SharedCircuit {
@@ -1670,22 +1675,82 @@ fn shared_circuit() -> &'static SharedCircuit {
 }
 
 fn shared_genesis_proof(circuit: &SkeletonCircuit) -> &'static ProofWithPublicInputs<F, C, D> {
-    GENESIS_PROOF.get_or_init(|| {
-        let fixture = ComplianceFixture::genesis_fixture();
-        let witness = fixture.witness(circuit, BalanceLayout::Valid, WitnessMutation::None);
-        let proof = circuit
-            .data
-            .prove(witness)
-            .expect("canonical genesis fixture must prove");
-        check_cyclic_proof_verifier_data(&proof, &circuit.data.verifier_only, &circuit.data.common)
+    &GENESIS_PROOF
+        .get_or_init(|| {
+            let fixture = ComplianceFixture::genesis_fixture();
+            let witness = fixture.witness(circuit, BalanceLayout::Valid, WitnessMutation::None);
+            let started = Instant::now();
+            let proof = circuit
+                .data
+                .prove(witness)
+                .expect("canonical genesis fixture must prove");
+            let prove_time = started.elapsed();
+            check_cyclic_proof_verifier_data(
+                &proof,
+                &circuit.data.verifier_only,
+                &circuit.data.common,
+            )
             .expect("genesis proof must pin cyclic verifier data");
-        circuit
-            .data
-            .verify(proof.clone())
-            .expect("canonical genesis fixture must verify");
-        println!("recursive genesis InitialProof: PASS");
-        proof
-    })
+            circuit
+                .data
+                .verify(proof.clone())
+                .expect("canonical genesis fixture must verify");
+            println!("recursive genesis InitialProof: PASS");
+            SharedGenesisProof { proof, prove_time }
+        })
+        .proof
+}
+
+/// Test-only view of D.5's one cached, genuine compliance proof.
+///
+/// `C_balance` uses this rather than re-proving `C` for each positive or
+/// negative case.
+pub(crate) struct BalanceComplianceTestFixture {
+    pub circuit: &'static SkeletonCircuit,
+    pub proof: &'static ProofWithPublicInputs<F, C, D>,
+    pub account_state: AccountState,
+    pub proof_data: ProofData,
+    pub asset_id: HashDigest,
+    pub balance: u128,
+    pub nav: host::Nav,
+    pub nav_rand: [u8; 32],
+    pub consumed_pubkey: [u8; 32],
+    pub r_anchor: [u8; 32],
+    pub r_prime: AffinePoint<Secp256K1>,
+    pub c_build_time: Duration,
+    pub c_prove_time: Duration,
+}
+
+pub(crate) fn balance_compliance_test_fixture() -> BalanceComplianceTestFixture {
+    let shared = shared_circuit();
+    let proof = shared_genesis_proof(&shared.circuit);
+    let fixture = ComplianceFixture::genesis_fixture();
+    let (&asset_id_bytes, &balance) = fixture
+        .new_state
+        .balances
+        .iter()
+        .next()
+        .expect("D.5 genesis fixture must carry one non-zero balance");
+    let asset_id =
+        host::digest_from_bytes(&asset_id_bytes).expect("fixture asset_id must be canonical");
+    BalanceComplianceTestFixture {
+        circuit: &shared.circuit,
+        proof,
+        account_state: fixture.new_state,
+        proof_data: fixture.proof_data,
+        asset_id,
+        balance,
+        nav: fixture.nav,
+        nav_rand: fixture.nav_rand,
+        consumed_pubkey: fixture.prev_state.current_pubkey,
+        r_anchor: field_bytes(fixture.signature.rx),
+        r_prime: fixture.signature.r_prime,
+        c_build_time: shared.build_time,
+        c_prove_time: GENESIS_PROOF
+            .get()
+            .expect("shared genesis proof was initialized")
+            .prove_time,
+    }
 }
 
 fn assert_rejected(label: &str, mutation: WitnessMutation) {
