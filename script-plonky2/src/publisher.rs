@@ -11,9 +11,18 @@
 //! The publisher chooses one `block_anchor` that **MUST be an ancestor of, or
 //! equal to, the oldest member's own build tip** (spec §3.5). Members carry
 //! their proof-time tip in [`BatchMember::build_tip`]; the publisher never
-//! silently substitutes a fresher tip. The inclusion-height gap bound
-//! (`inclusion_height − anchor.height ≤ 100`) is pre-checked against the
-//! current chain tip (`inclusion ≥ tip + 1`).
+//! silently substitutes a fresher tip.
+//!
+//! **Every** member's `build_tip` is validated against this node's chain view
+//! (`height ≤ tip` and `hash == getblockhash(height)`), including members that
+//! are not selected as the batch anchor. `build_tip` is a **caller assertion**,
+//! not a crypto-bound field of the half-aggregate (see [`BatchMember`]).
+//!
+//! The consensus inclusion-height gap bound is
+//! `inclusion_height − anchor.height ≤ `[`BLOCK_ANCHOR_MAX_GAP`] (`100`). At
+//! publish time the tip can still advance before the reveal is mined, so
+//! selection and the pre-broadcast re-check use the stricter effective bound
+//! [`BLOCK_ANCHOR_PUBLISH_MAX_GAP`] (`MAX_GAP − `[`BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN`]).
 //!
 //! ## Batch size is the caller's policy
 //!
@@ -31,6 +40,7 @@
 //! enforced here. This module only publishes and can read back raw inscription
 //! payloads for verification.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -75,7 +85,25 @@ pub const NUMS_INTERNAL_KEY_BYTES: [u8; 32] = [
 pub const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 
 /// §3.5 maximum gap between `block_anchor.height` and inclusion height.
+///
+/// Scanner consensus bound: `inclusion_height − block_anchor.height ≤ 100`.
 pub const BLOCK_ANCHOR_MAX_GAP: u32 = 100;
+
+/// Blocks reserved so inclusion can lag the tip after publish selection.
+///
+/// Publish-time selection cannot know the eventual inclusion height. This
+/// margin is subtracted from [`BLOCK_ANCHOR_MAX_GAP`] to form
+/// [`BLOCK_ANCHOR_PUBLISH_MAX_GAP`].
+pub const BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN: u32 = 6;
+
+/// Effective max gap at selection and pre-broadcast re-check:
+/// [`BLOCK_ANCHOR_MAX_GAP`] − [`BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN`] = 94.
+///
+/// If `(tip + 1) − anchor.height` exceeds this bound, members must re-prove
+/// against a fresher tip. The consensus scanner bound remains
+/// [`BLOCK_ANCHOR_MAX_GAP`].
+pub const BLOCK_ANCHOR_PUBLISH_MAX_GAP: u32 =
+    BLOCK_ANCHOR_MAX_GAP - BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN;
 
 /// Cap on fee/topology fixed-point rounds before failing loudly.
 const MAX_FEE_CONVERGENCE_ROUNDS: usize = 5;
@@ -116,6 +144,21 @@ pub struct BatchMember {
     /// Half-aggregate contribution (BIP-340 `Pk`, `R`, `s`).
     pub sig: NullifierSig,
     /// Proof-time Bitcoin tip this member was built against.
+    ///
+    /// **Caller assertion, not crypto-bound.** NISSHAC half-aggregation does
+    /// not commit to `build_tip`; the aggregate signature only covers the
+    /// publisher-chosen batch `block_anchor` in the payload header. The
+    /// publisher validates **every** member's tip against this node's chain
+    /// (`height ≤ tip`, `hash == getblockhash(height)`) as an operational
+    /// precondition before selecting the oldest tip as the batch anchor.
+    ///
+    /// A dishonest submitter can **overstate freshness** by claiming a tip that
+    /// exists on-chain but is newer than the real proof-time height. The
+    /// scanner cannot observe that lie from the half-aggregate alone, so there
+    /// is no consensus divergence at the inscription layer; closing the gap
+    /// requires proof-layer tip supply (out of scope for the v1 publisher).
+    /// Cryptographic binding of proof-time height lives in the per-account
+    /// proof, not here.
     pub build_tip: BlockAnchor,
 }
 
@@ -132,7 +175,10 @@ pub struct PublishedBatch {
     pub reveal_txid: Txid,
     /// The P2TR commit output that the reveal spends — the scanner's prevout.
     pub commit_output: TxOut,
-    /// Publisher-chosen §3.5 anchor (oldest member's verified build tip).
+    /// Publisher-chosen §3.5 anchor: the chain-consistency-checked oldest
+    /// member tip (`height ≤ node tip`, `hash == getblockhash(height)`).
+    /// Not a crypto-bound field of the half-aggregate — only the selected
+    /// anchor is covered by the aggregate signature in the payload header.
     pub block_anchor: BlockAnchor,
 }
 
@@ -155,8 +201,9 @@ pub struct RevealPayloads {
 impl Publisher {
     /// Connect to `{rpc_url}/wallet/{wallet_name}` with cookie-file auth.
     ///
-    /// Fails loudly if the cookie cannot be read, the node is unreachable, or
-    /// the named wallet is not loaded / not accessible.
+    /// Fails loudly if the cookie cannot be read, the node is unreachable, the
+    /// named wallet is not loaded / not accessible, or bitcoind's chain does
+    /// not match [`PublisherConfig::network`] (see [`chain_matches_config`]).
     pub fn connect(config: PublisherConfig) -> Result<Self> {
         ensure!(
             !config.rpc_url.is_empty(),
@@ -189,9 +236,10 @@ impl Publisher {
                 )
             })?;
 
-        rpc.get_blockchain_info().with_context(|| {
+        let chain_info = rpc.get_blockchain_info().with_context(|| {
             format!("bitcoind unreachable or RPC auth failed at {wallet_url}")
         })?;
+        ensure_chain_matches_config(chain_info.chain, config.network)?;
         rpc.get_balances().with_context(|| {
             format!(
                 "wallet '{}' is not loaded or not accessible at {wallet_url}",
@@ -409,6 +457,19 @@ impl Publisher {
             converged.reveal_vsize
         );
 
+        // Re-check tip immediately before broadcast — the chain may have
+        // advanced during fee convergence / signing.
+        let tip_now = self.current_anchor().context(
+            "get tip before sendrawtransaction failed; refusing to broadcast without freshness re-check",
+        )?;
+        ensure_publish_gap_ok(block_anchor, tip_now).with_context(|| {
+            format!(
+                "block_anchor became too stale before sendrawtransaction \
+                 (anchor height {}, tip now {}); refusing broadcast",
+                block_anchor.height, tip_now.height
+            )
+        })?;
+
         let commit_txid = converged.signed_commit.compute_txid();
         let reveal_txid = converged.reveal_tx.compute_txid();
         let commit_output = converged
@@ -547,22 +608,60 @@ impl Publisher {
 
     /// Choose the §3.5 `block_anchor` from member build tips.
     ///
-    /// - lowest `build_tip.height` wins
+    /// - **every** member's `build_tip` is validated: `height ≤ node tip` and
+    ///   `hash == getblockhash(height)` (RPC results cached per height)
+    /// - lowest `build_tip.height` wins among validated tips
     /// - ties require identical hashes (else members are on different chains)
-    /// - anchor must equal `getblockhash(height)` on this node
-    /// - anchor must not be above the current tip
-    /// - `(tip + 1) - anchor.height ≤ 100` so the inclusion gap can hold
+    /// - `(tip + 1) − anchor.height ≤ `[`BLOCK_ANCHOR_PUBLISH_MAX_GAP`] so the
+    ///   §3.5 inclusion gap can still hold after
+    ///   [`BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN`] blocks of tip advance
+    ///
+    /// Offending member indices are named in error messages. `build_tip` is a
+    /// caller assertion — see [`BatchMember::build_tip`].
     fn select_block_anchor(&self, members: &[BatchMember]) -> Result<BlockAnchor> {
+        ensure!(
+            !members.is_empty(),
+            "select_block_anchor requires at least one BatchMember"
+        );
+
+        let node_tip = self.current_anchor()?;
+        // Cache getblockhash results so multi-member batches at the same height
+        // issue one RPC call per distinct height.
+        let mut hash_cache: HashMap<u32, [u8; 32]> = HashMap::new();
+
+        for (index, member) in members.iter().enumerate() {
+            let tip = member.build_tip;
+            ensure!(
+                tip.height <= node_tip.height,
+                "member[{index}] build_tip height {} is in the future relative to node tip {} \
+                 (hash {:x?})",
+                tip.height,
+                node_tip.height,
+                tip.block_hash
+            );
+            let chain_hash = self.cached_block_hash(tip.height, &mut hash_cache)?;
+            ensure!(
+                chain_hash == tip.block_hash,
+                "member[{index}] build_tip hash at height {} is not the canonical block on this node: \
+                 member={:x?} chain={:x?}",
+                tip.height,
+                tip.block_hash,
+                chain_hash
+            );
+        }
+
         let mut oldest = members[0].build_tip;
-        for member in &members[1..] {
+        let mut oldest_index = 0usize;
+        for (index, member) in members.iter().enumerate().skip(1) {
             let tip = member.build_tip;
             if tip.height < oldest.height {
                 oldest = tip;
+                oldest_index = index;
             } else if tip.height == oldest.height {
                 ensure!(
                     tip.block_hash == oldest.block_hash,
-                    "two members claim different block hashes at height {}: {:x?} vs {:x?} \
-                     (built on different chains); refusing to pick an anchor",
+                    "member[{index}] and member[{oldest_index}] claim different block hashes at \
+                     height {}: {:x?} vs {:x?} (built on different chains); refusing to pick an anchor",
                     tip.height,
                     tip.block_hash,
                     oldest.block_hash
@@ -570,48 +669,26 @@ impl Publisher {
             }
         }
 
-        let tip = self.current_anchor()?;
-        ensure!(
-            oldest.height <= tip.height,
-            "member build tip height {} is in the future relative to node tip {} \
-             (hash {:x?})",
-            oldest.height,
-            tip.height,
-            oldest.block_hash
-        );
+        ensure_publish_gap_ok(oldest, node_tip)?;
+        Ok(oldest)
+    }
 
+    /// `getblockhash(height)` with a per-call-site [`HashMap`] cache.
+    fn cached_block_hash(
+        &self,
+        height: u32,
+        cache: &mut HashMap<u32, [u8; 32]>,
+    ) -> Result<[u8; 32]> {
+        if let Some(hash) = cache.get(&height) {
+            return Ok(*hash);
+        }
         let chain_hash = self
             .rpc
-            .get_block_hash(u64::from(oldest.height))
-            .with_context(|| format!("getblockhash({}) for member build tip failed", oldest.height))?;
-        ensure!(
-            chain_hash.to_byte_array() == oldest.block_hash,
-            "member build tip hash at height {} is not the canonical block on this node: \
-             member={:x?} chain={:x?}",
-            oldest.height,
-            oldest.block_hash,
-            chain_hash.to_byte_array()
-        );
-
-        // Inclusion happens at height ≥ tip + 1.
-        let inclusion_lower = tip
-            .height
-            .checked_add(1)
-            .context("tip height + 1 overflows u32")?;
-        let gap = inclusion_lower
-            .checked_sub(oldest.height)
-            .context("anchor height exceeds inclusion lower bound after tip check")?;
-        ensure!(
-            gap <= BLOCK_ANCHOR_MAX_GAP,
-            "members too stale, re-prove: oldest build tip height {} with node tip {} \
-             implies inclusion gap ≥ {} > §3.5 bound {BLOCK_ANCHOR_MAX_GAP} \
-             (refusing to substitute a fresher anchor)",
-            oldest.height,
-            tip.height,
-            gap
-        );
-
-        Ok(oldest)
+            .get_block_hash(u64::from(height))
+            .with_context(|| format!("getblockhash({height}) for member build tip failed"))?;
+        let bytes = chain_hash.to_byte_array();
+        cache.insert(height, bytes);
+        Ok(bytes)
     }
 
     fn chain_network(&self) -> Result<BitcoinNetwork> {
@@ -666,17 +743,21 @@ impl Publisher {
 
     /// Fixed-point fee and change-topology iteration for one funding UTXO.
     ///
-    /// Two phases to avoid dust-boundary oscillation (with-change fees can leave
-    /// residual just below dust; without-change fees free enough residual to
-    /// re-request change):
+    /// Two phases to avoid dust-boundary topology ping-pong (with-change fees
+    /// can leave residual just below dust; without-change fees free enough
+    /// residual to re-request change):
     ///
     /// 1. **With change** — iterate pure fees while leftover ≥ dust.
     /// 2. **Without change** — if residual would be dust or zero under the
     ///    with-change fees (or phase 1 never funded), absorb residual into the
     ///    commit fee and iterate pure fees for the no-change topology.
     ///
-    /// Caps each phase at [`MAX_FEE_CONVERGENCE_ROUNDS`] and fails loudly if
-    /// either phase oscillates or does not converge.
+    /// **Provisional fees are seed only** — they never gate UTXO admission.
+    /// Seeds are clamped so a signed measure is always attempted when
+    /// `funding ≥ reveal_output`. Rejection uses **measured** pure fees only.
+    ///
+    /// Cycle detection uses a [`HashSet`] of `(commit_fee, reveal_fee)` states
+    /// via [`note_fee_state`]. Caps each phase at [`MAX_FEE_CONVERGENCE_ROUNDS`].
     fn converge_fees_and_build(
         &self,
         payload: &[u8],
@@ -696,19 +777,28 @@ impl Publisher {
         let provisional_reveal_fee =
             fee_for_vsize(provisional_reveal_vsize, self.config.fee_rate_sat_per_vb)?;
         let dust = change_script.minimal_non_dust();
+        let reveal_out = self.config.reveal_output_value;
 
         // ── Phase 1: try with a change output ───────────────────────────
-        let mut commit_fee = provisional_commit_fee;
-        let mut reveal_fee = provisional_reveal_fee;
+        // Seed only — clamp so we can build+measure even when the provisional
+        // estimate exceeds the UTXO (e.g. 1600 sat @ 2 sat/vB).
+        let (mut commit_fee, mut reveal_fee) = clamp_seed_fees(
+            funding.amount,
+            reveal_out,
+            provisional_commit_fee,
+            provisional_reveal_fee,
+        )?;
         let mut with_change_viable = true;
-        let mut prev_with: Option<(u64, u64)> = None;
+        let mut seen_with: HashSet<(u64, u64)> = HashSet::new();
 
         for round in 1..=MAX_FEE_CONVERGENCE_ROUNDS {
-            let spent_core = sum_amounts(&[
-                self.config.reveal_output_value,
-                commit_fee,
-                reveal_fee,
-            ])?;
+            note_fee_state(&mut seen_with, commit_fee, reveal_fee, "with-change", round)?;
+
+            let (build_commit_fee, build_reveal_fee) =
+                clamp_seed_fees(funding.amount, reveal_out, commit_fee, reveal_fee)?;
+            let spent_core = sum_amounts(&[reveal_out, build_commit_fee, build_reveal_fee])?;
+            // Topology probe only — not an admission shortfall. Measured fees
+            // decide rejection in phase 2.
             if funding.amount < spent_core {
                 with_change_viable = false;
                 break;
@@ -734,8 +824,8 @@ impl Publisher {
                 internal_key,
                 reveal_output.clone(),
                 Some(change_script.clone()),
-                commit_fee,
-                reveal_fee,
+                build_commit_fee,
+                build_reveal_fee,
             )?;
             let measured_commit_vsize = built.signed_commit.vsize();
             let measured_reveal_vsize = built.reveal_tx.vsize();
@@ -749,6 +839,23 @@ impl Publisher {
             let next_reveal_fee =
                 fee_for_vsize(measured_reveal_vsize, self.config.fee_rate_sat_per_vb)?;
 
+            // Measured pure fees must still leave change ≥ dust.
+            let next_spent = sum_amounts(&[reveal_out, next_commit_fee, next_reveal_fee])?;
+            if funding.amount < next_spent
+                || funding
+                    .amount
+                    .checked_sub(next_spent)
+                    .context("with-change measured leftover underflow")?
+                    < dust
+            {
+                eprintln!(
+                    "publisher: measured with-change fees leave residual below dust or shortfall \
+                     on round {round}; switching to no-change topology"
+                );
+                with_change_viable = false;
+                break;
+            }
+
             if next_commit_fee == commit_fee && next_reveal_fee == reveal_fee {
                 return Ok(ConvergedInscription {
                     signed_commit: built.signed_commit,
@@ -760,19 +867,6 @@ impl Publisher {
                 });
             }
 
-            let key = (next_commit_fee.to_sat(), next_reveal_fee.to_sat());
-            if prev_with == Some(key) {
-                bail!(
-                    "fee fixed-point oscillated in with-change phase on round {round}: \
-                     commit_fee={} reveal_fee={} commit_vsize={} reveal_vsize={} \
-                     (refusing unconverged broadcast)",
-                    key.0,
-                    key.1,
-                    measured_commit_vsize,
-                    measured_reveal_vsize
-                );
-            }
-            prev_with = Some(key);
             commit_fee = next_commit_fee;
             reveal_fee = next_reveal_fee;
         }
@@ -785,28 +879,34 @@ impl Publisher {
         }
 
         // ── Phase 2: no change — residual absorbed into commit fee ──────
-        commit_fee = provisional_commit_fee;
-        reveal_fee = provisional_reveal_fee;
-        let mut prev_without: Option<(u64, u64)> = None;
+        // Fresh provisional seed (clamped); admission uses measured fees only.
+        let (mut commit_fee, mut reveal_fee) = clamp_seed_fees(
+            funding.amount,
+            reveal_out,
+            provisional_commit_fee,
+            provisional_reveal_fee,
+        )?;
+        let mut seen_without: HashSet<(u64, u64)> = HashSet::new();
 
         for round in 1..=MAX_FEE_CONVERGENCE_ROUNDS {
-            let spent_core = sum_amounts(&[
-                self.config.reveal_output_value,
-                commit_fee,
-                reveal_fee,
-            ])?;
-            if funding.amount < spent_core {
+            note_fee_state(&mut seen_without, commit_fee, reveal_fee, "no-change", round)?;
+
+            if funding.amount < reveal_out {
                 bail!(
                     "funding shortfall: UTXO {} sat < required {} sat \
                      (reveal_output + commit_fee + reveal_fee) on no-change round {round}",
                     funding.amount.to_sat(),
-                    spent_core.to_sat()
+                    reveal_out.to_sat()
                 );
             }
+
+            // Clamp seed for construction only — pure fee state is separate.
+            let (_build_commit_seed, build_reveal_fee) =
+                clamp_seed_fees(funding.amount, reveal_out, commit_fee, reveal_fee)?;
             let commit_fee_used = funding
                 .amount
-                .checked_sub(self.config.reveal_output_value)
-                .and_then(|v| v.checked_sub(reveal_fee))
+                .checked_sub(reveal_out)
+                .and_then(|v| v.checked_sub(build_reveal_fee))
                 .context("no-change commit fee accounting underflow")?;
 
             let built = self.build_and_sign_commit(
@@ -816,7 +916,7 @@ impl Publisher {
                 reveal_output.clone(),
                 None,
                 commit_fee_used,
-                reveal_fee,
+                build_reveal_fee,
             )?;
             let measured_commit_vsize = built.signed_commit.vsize();
             let measured_reveal_vsize = built.reveal_tx.vsize();
@@ -830,6 +930,18 @@ impl Publisher {
             let next_reveal_fee =
                 fee_for_vsize(measured_reveal_vsize, self.config.fee_rate_sat_per_vb)?;
 
+            // Admission gate: measured pure fees only.
+            let measured_required =
+                sum_amounts(&[reveal_out, next_commit_fee, next_reveal_fee])?;
+            if funding.amount < measured_required {
+                bail!(
+                    "funding shortfall: UTXO {} sat < required {} sat \
+                     (reveal_output + commit_fee + reveal_fee) on no-change round {round}",
+                    funding.amount.to_sat(),
+                    measured_required.to_sat()
+                );
+            }
+
             // Pure fees stable; commit_fee_used may exceed pure commit_fee
             // because dust/exact residual is absorbed into the miner fee.
             if next_commit_fee == commit_fee && next_reveal_fee == reveal_fee {
@@ -839,6 +951,56 @@ impl Publisher {
                     commit_fee_used.to_sat(),
                     commit_fee.to_sat()
                 );
+                // Rebuild once more with pure reveal fee if the build used a
+                // clamped seed (so the commit output carries pure reveal_fee).
+                if build_reveal_fee != reveal_fee {
+                    let commit_fee_final = funding
+                        .amount
+                        .checked_sub(reveal_out)
+                        .and_then(|v| v.checked_sub(reveal_fee))
+                        .context("no-change final commit fee accounting underflow")?;
+                    ensure!(
+                        commit_fee_final >= commit_fee,
+                        "no-change final commit fee used {} sat is below pure fee {} sat",
+                        commit_fee_final.to_sat(),
+                        commit_fee.to_sat()
+                    );
+                    let final_built = self.build_and_sign_commit(
+                        payload,
+                        funding,
+                        internal_key,
+                        reveal_output.clone(),
+                        None,
+                        commit_fee_final,
+                        reveal_fee,
+                    )?;
+                    ensure!(
+                        final_built.signed_commit.output.len() == 1,
+                        "no-change final build produced a change output"
+                    );
+                    let final_commit_vsize = final_built.signed_commit.vsize();
+                    let final_reveal_vsize = final_built.reveal_tx.vsize();
+                    let final_commit_fee =
+                        fee_for_vsize(final_commit_vsize, self.config.fee_rate_sat_per_vb)?;
+                    let final_reveal_fee =
+                        fee_for_vsize(final_reveal_vsize, self.config.fee_rate_sat_per_vb)?;
+                    ensure!(
+                        final_commit_fee == commit_fee && final_reveal_fee == reveal_fee,
+                        "no-change final rebuild fees drifted: pure=({}, {}) final=({}, {})",
+                        commit_fee.to_sat(),
+                        reveal_fee.to_sat(),
+                        final_commit_fee.to_sat(),
+                        final_reveal_fee.to_sat()
+                    );
+                    return Ok(ConvergedInscription {
+                        signed_commit: final_built.signed_commit,
+                        reveal_tx: final_built.reveal_tx,
+                        commit_vsize: final_commit_vsize,
+                        reveal_vsize: final_reveal_vsize,
+                        commit_fee: commit_fee_final,
+                        reveal_fee,
+                    });
+                }
                 return Ok(ConvergedInscription {
                     signed_commit: built.signed_commit,
                     reveal_tx: built.reveal_tx,
@@ -849,19 +1011,6 @@ impl Publisher {
                 });
             }
 
-            let key = (next_commit_fee.to_sat(), next_reveal_fee.to_sat());
-            if prev_without == Some(key) {
-                bail!(
-                    "fee fixed-point oscillated in no-change phase on round {round}: \
-                     commit_fee={} reveal_fee={} commit_vsize={} reveal_vsize={} \
-                     (refusing unconverged broadcast)",
-                    key.0,
-                    key.1,
-                    measured_commit_vsize,
-                    measured_reveal_vsize
-                );
-            }
-            prev_without = Some(key);
             commit_fee = next_commit_fee;
             reveal_fee = next_reveal_fee;
         }
@@ -1200,6 +1349,132 @@ pub fn nums_internal_key() -> Result<XOnlyPublicKey> {
         .context("NUMS_INTERNAL_KEY_BYTES is not a valid x-only public key")
 }
 
+/// Whether bitcoind's chain matches the zkCoins [`Network`] config constant.
+///
+/// Mapping (both sides named in connect errors):
+/// - [`Network::Mainnet`] ↔ [`BitcoinNetwork::Bitcoin`]
+/// - [`Network::Testnet`] ↔ [`BitcoinNetwork::Testnet`],
+///   [`BitcoinNetwork::Testnet4`], or [`BitcoinNetwork::Signet`]
+/// - [`Network::Regtest`] ↔ [`BitcoinNetwork::Regtest`]
+pub fn chain_matches_config(chain: BitcoinNetwork, config_network: Network) -> bool {
+    match (config_network, chain) {
+        (Network::Mainnet, BitcoinNetwork::Bitcoin) => true,
+        (
+            Network::Testnet,
+            BitcoinNetwork::Testnet | BitcoinNetwork::Testnet4 | BitcoinNetwork::Signet,
+        ) => true,
+        (Network::Regtest, BitcoinNetwork::Regtest) => true,
+        _ => false,
+    }
+}
+
+/// Fail if bitcoind's chain and [`PublisherConfig::network`] disagree.
+///
+/// Error names both sides and documents the expected mapping.
+pub fn ensure_chain_matches_config(
+    chain: BitcoinNetwork,
+    config_network: Network,
+) -> Result<()> {
+    ensure!(
+        chain_matches_config(chain, config_network),
+        "bitcoind chain {chain:?} does not match PublisherConfig.network {config_network:?} \
+         (expected mapping: Bitcoin↔Mainnet, Testnet|Testnet4|Signet↔Testnet, Regtest↔Regtest)"
+    );
+    Ok(())
+}
+
+/// Minimum inclusion gap if the reveal is mined in the next block:
+/// `(node_tip.height + 1) − anchor.height`.
+pub fn publish_inclusion_gap(anchor: BlockAnchor, node_tip: BlockAnchor) -> Result<u32> {
+    ensure!(
+        anchor.height <= node_tip.height,
+        "anchor height {} is above node tip {}",
+        anchor.height,
+        node_tip.height
+    );
+    let inclusion_lower = node_tip
+        .height
+        .checked_add(1)
+        .context("tip height + 1 overflows u32")?;
+    inclusion_lower
+        .checked_sub(anchor.height)
+        .context("anchor height exceeds inclusion lower bound after tip check")
+}
+
+/// Enforce [`BLOCK_ANCHOR_PUBLISH_MAX_GAP`] at selection and pre-broadcast.
+///
+/// On failure the message is `"members too stale, re-prove"` and includes the
+/// actual gap and the effective publish bound (not the consensus
+/// [`BLOCK_ANCHOR_MAX_GAP`] alone).
+pub fn ensure_publish_gap_ok(anchor: BlockAnchor, node_tip: BlockAnchor) -> Result<()> {
+    let gap = publish_inclusion_gap(anchor, node_tip)?;
+    ensure!(
+        gap <= BLOCK_ANCHOR_PUBLISH_MAX_GAP,
+        "members too stale, re-prove: oldest build tip height {} with node tip {} \
+         implies inclusion gap ≥ {} > effective publish bound {BLOCK_ANCHOR_PUBLISH_MAX_GAP} \
+         (§3.5 MAX_GAP={BLOCK_ANCHOR_MAX_GAP} − inclusion-delay margin \
+         {BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN}); refusing to substitute a fresher anchor",
+        anchor.height,
+        node_tip.height,
+        gap
+    );
+    Ok(())
+}
+
+/// Clamp provisional/pure fee seeds so a signed measure can be built.
+///
+/// Seeds never gate UTXO admission — they only initialise fixed-point
+/// iteration. When `funding < reveal_output`, both seeds are zero (the
+/// subsequent measured-fee check reports the shortfall). When the sum of
+/// seeds exceeds `funding − reveal_output`, fees are reduced (preferring to
+/// keep the reveal seed) so `build_inscription` can construct a transaction.
+pub fn clamp_seed_fees(
+    funding: Amount,
+    reveal_output: Amount,
+    commit_fee: Amount,
+    reveal_fee: Amount,
+) -> Result<(Amount, Amount)> {
+    let Some(fee_budget) = funding.checked_sub(reveal_output) else {
+        return Ok((Amount::ZERO, Amount::ZERO));
+    };
+    let total = sum_amounts(&[commit_fee, reveal_fee])?;
+    if total <= fee_budget {
+        return Ok((commit_fee, reveal_fee));
+    }
+    if reveal_fee <= fee_budget {
+        let commit = fee_budget
+            .checked_sub(reveal_fee)
+            .context("clamp_seed_fees commit underflow")?;
+        return Ok((commit, reveal_fee));
+    }
+    // Entire budget goes to the reveal seed; commit seed is zero.
+    Ok((Amount::ZERO, fee_budget))
+}
+
+/// Record a `(commit_fee, reveal_fee)` pure-fee state for cycle detection.
+///
+/// Returns an error if this pair was already seen in the current phase
+/// (period-≥2 fee oscillation that the previous single-prev detector missed).
+pub fn note_fee_state(
+    seen: &mut HashSet<(u64, u64)>,
+    commit_fee: Amount,
+    reveal_fee: Amount,
+    phase: &str,
+    round: usize,
+) -> Result<()> {
+    let key = (commit_fee.to_sat(), reveal_fee.to_sat());
+    if !seen.insert(key) {
+        bail!(
+            "fee fixed-point cycle detected in {phase} phase on round {round}: \
+             revisited (commit_fee={}, reveal_fee={}) sat \
+             (refusing unconverged broadcast)",
+            key.0,
+            key.1
+        );
+    }
+    Ok(())
+}
+
 fn sum_amounts(parts: &[Amount]) -> Result<Amount> {
     let mut total = Amount::ZERO;
     for part in parts {
@@ -1362,6 +1637,42 @@ mod tests {
             .expect("aggregate_sig_with_anchor accepts repeated members");
         assert_eq!(agg.members.len(), 3);
         let _ = agg;
+    }
+
+    /// Finding F5: `note_fee_state` detects period-≥2 fee oscillation by
+    /// rejecting a revisited `(commit_fee, reveal_fee)` pair.
+    #[test]
+    fn note_fee_state_detects_repeated_fee_pair() {
+        let mut seen = HashSet::new();
+        note_fee_state(
+            &mut seen,
+            Amount::from_sat(100),
+            Amount::from_sat(200),
+            "with-change",
+            0,
+        )
+        .expect("first (100,200) must be accepted");
+        let err = note_fee_state(
+            &mut seen,
+            Amount::from_sat(100),
+            Amount::from_sat(200),
+            "with-change",
+            1,
+        )
+        .expect_err("repeated (100,200) must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fee fixed-point cycle detected"),
+            "unexpected cycle error: {msg}"
+        );
+        note_fee_state(
+            &mut seen,
+            Amount::from_sat(101),
+            Amount::from_sat(200),
+            "with-change",
+            2,
+        )
+        .expect("different pair (101,200) must be accepted");
     }
 
     // ── live regtest helpers ────────────────────────────────────────────
@@ -1700,6 +2011,307 @@ mod tests {
             msg.contains("members too stale, re-prove"),
             "unexpected stale error: {msg}"
         );
+        assert!(
+            msg.contains(&BLOCK_ANCHOR_PUBLISH_MAX_GAP.to_string())
+                || msg.contains("effective publish bound")
+                || msg.contains("94"),
+            "stale error must mention effective publish bound: {msg}"
+        );
+    }
+
+    /// Finding F1: non-selected member with future height fails validation
+    /// (oldest selection would otherwise pick the valid tip); nothing broadcasts.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_rejects_nonselected_member_bad_build_tip() {
+        let publisher = live_publisher();
+        let before = mempool_txids(&publisher);
+        let tip = publisher.current_anchor().expect("tip");
+        let (sigs, _) = signed_members(2, Network::Regtest);
+
+        // member[0] = current tip (would be selected as oldest if validation
+        // skipped); member[1] = future height so it must fail naming index 1.
+        let members = vec![
+            BatchMember {
+                sig: sigs[0],
+                build_tip: tip,
+            },
+            BatchMember {
+                sig: sigs[1],
+                build_tip: BlockAnchor {
+                    block_hash: tip.block_hash,
+                    height: tip
+                        .height
+                        .checked_add(100)
+                        .expect("tip.height + 100 must fit u32"),
+                },
+            },
+        ];
+        let err = publisher
+            .publish(&members)
+            .expect_err("future-height non-selected member must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("member[1]"),
+            "error must name member index 1: {msg}"
+        );
+        let after = mempool_txids(&publisher);
+        assert_eq!(
+            before, after,
+            "mempool must be unchanged after non-selected bad tip reject"
+        );
+    }
+
+    /// Finding F2: connect fails when PublisherConfig.network disagrees with
+    /// the live bitcoind chain (Mainnet config against regtest).
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_connect_rejects_network_mismatch() {
+        let url = require_env("ZKCOINS_REGTEST_URL");
+        let cookie = require_env("ZKCOINS_REGTEST_COOKIE");
+        let wallet = require_env("ZKCOINS_REGTEST_WALLET");
+        let result = Publisher::connect(PublisherConfig {
+            rpc_url: url,
+            cookie_path: PathBuf::from(cookie),
+            wallet_name: wallet,
+            fee_rate_sat_per_vb: 2,
+            reveal_output_value: Amount::from_sat(1_000),
+            network: Network::Mainnet,
+        });
+        let err = match result {
+            Ok(_) => panic!("Mainnet config against regtest must fail connect"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            (msg.contains("Mainnet") || msg.contains("Bitcoin"))
+                && (msg.contains("Regtest") || msg.contains("regtest")),
+            "connect error must name both config and chain sides: {msg}"
+        );
+    }
+
+    /// Finding F3a: publish gap exactly at BLOCK_ANCHOR_PUBLISH_MAX_GAP (94)
+    /// still succeeds: mine 93 after recording H → gap = (H+93+1)−H = 94.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_publish_gap_exactly_publish_max_succeeds() {
+        let publisher = live_publisher();
+        let build_tip = publisher.current_anchor().expect("record tip H");
+        // Exactly 93 blocks → inclusion gap lower bound = 94 = PUBLISH_MAX.
+        mine_n(&publisher, 93);
+        let tip_after = publisher.current_anchor().expect("tip after mine");
+        assert_eq!(
+            tip_after.height,
+            build_tip
+                .height
+                .checked_add(93)
+                .expect("height + 93"),
+            "must advance tip by exactly 93"
+        );
+
+        let (sigs, m_state) = signed_members(1, Network::Regtest);
+        let members = vec![BatchMember {
+            sig: sigs[0],
+            build_tip,
+        }];
+        let batch = publisher
+            .publish(&members)
+            .expect("gap == BLOCK_ANCHOR_PUBLISH_MAX_GAP must succeed");
+        assert_eq!(batch.block_anchor, build_tip);
+        aggregate_verify(&batch.aggregate, m_state).expect("verify");
+        // Optional confirm so the wallet settles cleanly for later tests.
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm boundary publish");
+    }
+
+    /// Finding F3b: publish gap one past BLOCK_ANCHOR_PUBLISH_MAX_GAP fails
+    /// loudly: mine 94 after H → gap = 95 > 94; mempool unchanged.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_publish_gap_over_publish_max_fails_loudly() {
+        let publisher = live_publisher();
+        let before = mempool_txids(&publisher);
+        let build_tip = publisher.current_anchor().expect("record tip H");
+        mine_n(&publisher, 94);
+        let tip_after = publisher.current_anchor().expect("tip after mine");
+        assert_eq!(
+            tip_after.height,
+            build_tip
+                .height
+                .checked_add(94)
+                .expect("height + 94"),
+            "must advance tip by exactly 94"
+        );
+
+        let expected_gap = publish_inclusion_gap(build_tip, tip_after).expect("gap");
+        assert_eq!(
+            expected_gap,
+            BLOCK_ANCHOR_PUBLISH_MAX_GAP + 1,
+            "gap must be exactly one over the publish max"
+        );
+
+        let (sigs, _) = signed_members(1, Network::Regtest);
+        let err = publisher
+            .publish(&[BatchMember {
+                sig: sigs[0],
+                build_tip,
+            }])
+            .expect_err("gap > BLOCK_ANCHOR_PUBLISH_MAX_GAP must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("members too stale, re-prove"),
+            "unexpected over-gap error: {msg}"
+        );
+        assert!(
+            msg.contains(&expected_gap.to_string())
+                || msg.contains(&(BLOCK_ANCHOR_PUBLISH_MAX_GAP + 1).to_string()),
+            "error must mention actual gap: {msg}"
+        );
+        assert!(
+            msg.contains(&BLOCK_ANCHOR_PUBLISH_MAX_GAP.to_string())
+                || msg.contains("effective publish bound")
+                || msg.contains("94"),
+            "error must mention effective publish bound: {msg}"
+        );
+        let after = mempool_txids(&publisher);
+        assert_eq!(
+            before, after,
+            "mempool must be unchanged after over-gap reject"
+        );
+    }
+
+    /// Finding F4: provisional fee seeds never gate UTXO admission — a confirmed
+    /// 1600 sat P2TR UTXO at 2 sat/vB + 1000 sat reveal must publish (measured
+    /// fees fit; provisional estimate alone would look ~568 sat short).
+    ///
+    /// Larger wallet UTXOs are locked for the duration so publish **must** fund
+    /// from the 1600-sat candidate (otherwise the test would pass via a large
+    /// coinbase even without the F4 fix).
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_provisional_fees_do_not_gate_1600_sat_utxo() {
+        let publisher = live_publisher_with(2, Amount::from_sat(1_000));
+        let btc_net = publisher.chain_network().expect("net");
+
+        // Exact 1600 sat confirmed P2TR UTXO.
+        let exact = Amount::from_sat(1_600);
+        let addr = publisher
+            .rpc
+            .get_new_address(None, Some(AddressType::Bech32m))
+            .expect("get_new_address Bech32m")
+            .require_network(btc_net)
+            .expect("address network");
+        publisher
+            .rpc
+            .send_to_address(&addr, exact, None, None, None, None, None, None)
+            .expect("send_to_address 1600 sat");
+        mine_one(&publisher);
+
+        let unspent = publisher
+            .rpc
+            .list_unspent(Some(1), None, None, Some(true), None)
+            .expect("listunspent");
+        let exact_utxos: Vec<_> = unspent.iter().filter(|u| u.amount == exact).collect();
+        assert!(
+            !exact_utxos.is_empty(),
+            "expected a confirmed 1600 sat UTXO among {:?}",
+            unspent
+                .iter()
+                .map(|u| u.amount.to_sat())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            unspent
+                .iter()
+                .any(|u| u.amount > Amount::from_sat(100_000)),
+            "need a large funding candidate to remain for other tests after unlock"
+        );
+
+        // Lock every confirmed UTXO except one exact 1600-sat outpoint so the
+        // publisher cannot fall back to a large coinbase/change input.
+        let keep = OutPoint {
+            txid: exact_utxos[0].txid,
+            vout: exact_utxos[0].vout,
+        };
+        let to_lock: Vec<OutPoint> = unspent
+            .iter()
+            .filter(|u| !(u.txid == keep.txid && u.vout == keep.vout))
+            .map(|u| OutPoint {
+                txid: u.txid,
+                vout: u.vout,
+            })
+            .collect();
+        if !to_lock.is_empty() {
+            publisher
+                .rpc
+                .lock_unspent(&to_lock)
+                .expect("lock_unspent all but 1600-sat UTXO");
+        }
+
+        let publish_result = (|| {
+            let (sigs, m_state) = signed_members(1, Network::Regtest);
+            let members = batch_at_tip(&publisher, &sigs);
+            let batch = publisher.publish(&members).map_err(|e| {
+                format!(
+                    "publish must succeed funding solely from the 1600 sat UTXO \
+                     (provisional seeds must not gate admission): {e}"
+                )
+            })?;
+            assert_eq!(batch.aggregate.members.len(), 1);
+
+            // Prove the commit spent the locked-out-except 1600-sat prevout.
+            let commit_tx = publisher
+                .rpc
+                .get_raw_transaction(&batch.commit_txid, None)
+                .map_err(|e| format!("get_raw_transaction(commit): {e}"))?;
+            assert_eq!(
+                commit_tx.input.len(),
+                1,
+                "publisher builds single-input commits"
+            );
+            let funding_prev = commit_tx.input[0].previous_output;
+            assert_eq!(
+                funding_prev, keep,
+                "commit must spend the 1600-sat UTXO {keep:?}, spent {funding_prev:?}"
+            );
+            let parent = publisher
+                .rpc
+                .get_raw_transaction(&funding_prev.txid, None)
+                .map_err(|e| format!("get_raw_transaction(funding parent): {e}"))?;
+            let spent_value = parent
+                .output
+                .get(funding_prev.vout as usize)
+                .map(|o| o.value)
+                .ok_or_else(|| format!("funding parent missing vout {}", funding_prev.vout))?;
+            assert_eq!(
+                spent_value, exact,
+                "funding prevout must be exactly 1600 sat, got {}",
+                spent_value.to_sat()
+            );
+
+            mine_one(&publisher);
+            publisher
+                .wait_for_confirmation(&batch.reveal_txid, 1, Duration::from_secs(30))
+                .map_err(|e| format!("confirm 1600-sat path: {e}"))?;
+            let details = publisher
+                .fetch_reveal_payload_details(&batch.reveal_txid)
+                .map_err(|e| format!("fetch details: {e}"))?;
+            assert!(details.errors.is_empty(), "errors: {:?}", details.errors);
+            aggregate_verify(
+                &AggregateStateNullifierV3::deserialize(&details.payloads[0])
+                    .map_err(|e| format!("deserialize: {e}"))?,
+                m_state,
+            )
+            .map_err(|e| format!("verify: {e}"))?;
+            Ok::<(), String>(())
+        })();
+
+        // Always unlock so later tests see the full wallet again.
+        let _ = publisher.rpc.unlock_unspent_all();
+
+        publish_result.expect("F4 1600-sat sole-funding path");
     }
 
     /// Finding 5: at 1 sat/vB, a funding UTXO sized so change lands just below
