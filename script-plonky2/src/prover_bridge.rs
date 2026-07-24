@@ -1329,7 +1329,7 @@ fn set_point(
     set_nonnative(witness, &target.y, point.y)
 }
 
-fn field_bytes<FF: PrimeField>(value: FF) -> [u8; 32] {
+pub(crate) fn field_bytes<FF: PrimeField>(value: FF) -> [u8; 32] {
     let encoded = value.to_canonical_biguint().to_bytes_be();
     assert!(encoded.len() <= 32);
     let mut bytes = [0u8; 32];
@@ -1337,11 +1337,11 @@ fn field_bytes<FF: PrimeField>(value: FF) -> [u8; 32] {
     bytes
 }
 
-fn is_odd<FF: PrimeField>(value: FF) -> bool {
+pub(crate) fn is_odd<FF: PrimeField>(value: FF) -> bool {
     (&value.to_canonical_biguint() & BigUint::from(1u8)) == BigUint::from(1u8)
 }
 
-fn tagged_hash(tag: &[u8], message: &[u8]) -> [u8; 32] {
+pub(crate) fn tagged_hash(tag: &[u8], message: &[u8]) -> [u8; 32] {
     let tag_hash = Sha256::digest(tag);
     let mut preimage = Vec::with_capacity(64 + message.len());
     preimage.extend_from_slice(&tag_hash);
@@ -1411,7 +1411,10 @@ fn canonical_base(bytes: &[u8; 32], label: &str) -> Result<Secp256K1Base> {
     Ok(Secp256K1Base::from_noncanonical_biguint(integer))
 }
 
-fn canonical_scalar(bytes: &[u8; 32], label: &str) -> Result<Secp256K1Scalar> {
+pub(crate) fn canonical_scalar(
+    bytes: &[u8; 32],
+    label: &str,
+) -> Result<Secp256K1Scalar> {
     let integer = BigUint::from_bytes_be(bytes);
     ensure!(
         integer < Secp256K1Scalar::order(),
@@ -1420,7 +1423,10 @@ fn canonical_scalar(bytes: &[u8; 32], label: &str) -> Result<Secp256K1Scalar> {
     Ok(Secp256K1Scalar::from_noncanonical_biguint(integer))
 }
 
-fn canonical_x_point(bytes: &[u8; 32], label: &str) -> Result<AffinePoint<Secp256K1>> {
+pub(crate) fn canonical_x_point(
+    bytes: &[u8; 32],
+    label: &str,
+) -> Result<AffinePoint<Secp256K1>> {
     lift_x_even_y(canonical_base(bytes, label)?)
         .with_context(|| format!("{label} does not lift to an even-y secp256k1 point"))
 }

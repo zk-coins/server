@@ -26,6 +26,7 @@
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod half_agg;
 pub mod prover_bridge;
 pub mod state_engine;
 
