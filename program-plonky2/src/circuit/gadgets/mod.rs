@@ -1,6 +1,7 @@
 //! Reusable primitive circuit gadgets.
 
 pub mod biguint;
+pub mod bip340;
 pub mod curve;
 pub mod curve_fixed_base;
 pub mod curve_msm;
