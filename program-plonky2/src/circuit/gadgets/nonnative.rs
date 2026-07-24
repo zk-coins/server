@@ -1,938 +1,859 @@
-//! Canonical non-native arithmetic for the secp256k1 base and scalar fields.
-//!
-//! Values use eight little-endian, range-checked `u32` limbs. Every public
-//! constructor and arithmetic result also enforces strict reduction modulo the
-//! selected secp256k1 modulus. Multiplication proves the integer identity
-//! `a * b = q * modulus + r` over exact 512-bit limb arrays; generators only
-//! supply the quotient, remainder, and inverse witnesses.
+//! Non-native field arithmetic backed by variable-width custom-gated u32 integers.
 
 use std::any::type_name;
-use std::fmt::Debug;
 use std::marker::PhantomData;
 
 use anyhow::Result;
+use num::{BigUint, Integer, One, Zero};
 use plonky2::field::extension::Extendable;
-use plonky2::field::types::{Field, PrimeField64};
+use plonky2::field::types::{Field, PrimeField};
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::generator::{GeneratedValues, SimpleGenerator};
 use plonky2::iop::target::{BoolTarget, Target};
-use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
+use plonky2::iop::witness::{PartitionWitness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::CommonCircuitData;
 use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
-const LIMBS: usize = 8;
-const WIDE_LIMBS: usize = 9;
-const PRODUCT_LIMBS: usize = 16;
-const LIMB_BITS: usize = 32;
-const LIMB_BASE: u64 = 1u64 << LIMB_BITS;
+use crate::circuit::gadgets::biguint::{
+    BigUintTarget, CircuitBuilderBiguint, GeneratedValuesBigUint, WitnessBigUint,
+};
+use crate::u32_lib::gadgets::arithmetic_u32::{CircuitBuilderU32, U32Target};
+use crate::u32_lib::gadgets::range_check::range_check_u32_circuit;
+use crate::u32_lib::witness::GeneratedValuesU32;
 
-/// Selects the foreign-field modulus used by a [`NonNativeTarget`].
-pub trait NonNativeModulus: Clone + Copy + Debug + 'static {
-    /// The modulus as eight little-endian 32-bit limbs.
-    const MODULUS_LIMBS: [u32; LIMBS];
+#[derive(Clone, Debug)]
+pub struct NonNativeTarget<FF: Field> {
+    pub(crate) value: BigUintTarget,
+    pub(crate) _phantom: PhantomData<FF>,
 }
 
-/// The secp256k1 base field `Fp`.
-#[derive(Clone, Copy, Debug)]
-pub struct Secp256k1Base;
-
-impl NonNativeModulus for Secp256k1Base {
-    const MODULUS_LIMBS: [u32; LIMBS] = [
-        0xfffffc2f, 0xfffffffe, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
-        0xffffffff,
-    ];
-}
-
-/// The secp256k1 scalar field `Fn`.
-#[derive(Clone, Copy, Debug)]
-pub struct Secp256k1Scalar;
-
-impl NonNativeModulus for Secp256k1Scalar {
-    const MODULUS_LIMBS: [u32; LIMBS] = [
-        0xd0364141, 0xbfd25e8c, 0xaf48a03b, 0xbaaedce6, 0xfffffffe, 0xffffffff, 0xffffffff,
-        0xffffffff,
-    ];
-}
-
-/// A canonical foreign-field element represented by eight little-endian limbs.
-///
-/// Values returned by this module have every limb constrained to 32 bits and
-/// the full 256-bit integer constrained to be strictly less than `M`'s modulus.
-#[derive(Clone, Copy, Debug)]
-pub struct NonNativeTarget<M: NonNativeModulus> {
-    /// Limb 0 contains bits 0..31 and limb 7 contains bits 224..255.
-    pub limbs: [Target; LIMBS],
-    _marker: PhantomData<M>,
-}
-
-impl<M: NonNativeModulus> NonNativeTarget<M> {
-    fn from_raw_limbs(limbs: [Target; LIMBS]) -> Self {
-        Self {
-            limbs,
-            _marker: PhantomData,
-        }
+pub trait CircuitBuilderNonNative<F: RichField + Extendable<D>, const D: usize> {
+    fn num_nonnative_limbs<FF: Field>() -> usize {
+        FF::BITS.div_ceil(32)
     }
 
-    /// Registers a fresh canonical foreign-field witness.
-    pub fn new_virtual<F: RichField + Extendable<D>, const D: usize>(
-        builder: &mut CircuitBuilder<F, D>,
-    ) -> Self {
-        let limbs = builder.add_virtual_target_arr();
-        from_limbs_checked(builder, limbs)
-    }
-
-    /// Registers a compile-time constant in the canonical limb representation.
-    pub fn constant<F: RichField + Extendable<D>, const D: usize>(
-        builder: &mut CircuitBuilder<F, D>,
-        limbs: [u32; LIMBS],
-    ) -> Self {
-        constant(builder, limbs)
-    }
-}
-
-/// Registers a fresh canonical foreign-field witness.
-pub fn new_virtual<F: RichField + Extendable<D>, const D: usize, M: NonNativeModulus>(
-    builder: &mut CircuitBuilder<F, D>,
-) -> NonNativeTarget<M> {
-    NonNativeTarget::new_virtual(builder)
-}
-
-/// Applies the canonical range constraint to existing little-endian limbs.
-pub fn from_limbs_checked<F: RichField + Extendable<D>, const D: usize, M: NonNativeModulus>(
-    builder: &mut CircuitBuilder<F, D>,
-    limbs: [Target; LIMBS],
-) -> NonNativeTarget<M> {
-    // `split_le(limb, 32)` is both the exact u32 range check and the bit
-    // decomposition consumed by the MSB-first strict comparison.
-    let canonical = less_than_constant_limbs(builder, &limbs, &M::MODULUS_LIMBS);
-    builder.assert_one(canonical.target);
-    NonNativeTarget::from_raw_limbs(limbs)
-}
-
-/// Registers a compile-time canonical foreign-field constant.
-pub fn constant<F: RichField + Extendable<D>, const D: usize, M: NonNativeModulus>(
-    builder: &mut CircuitBuilder<F, D>,
-    limbs: [u32; LIMBS],
-) -> NonNativeTarget<M> {
-    assert!(
-        cmp_limbs(&limbs, &M::MODULUS_LIMBS).is_lt(),
-        "non-native constant must be strictly smaller than its modulus"
+    fn biguint_to_nonnative<FF: Field>(&mut self, x: &BigUintTarget) -> NonNativeTarget<FF>;
+    fn nonnative_to_canonical_biguint<FF: Field>(
+        &mut self,
+        x: &NonNativeTarget<FF>,
+    ) -> BigUintTarget;
+    fn constant_nonnative<FF: PrimeField>(&mut self, x: FF) -> NonNativeTarget<FF>;
+    fn zero_nonnative<FF: PrimeField>(&mut self) -> NonNativeTarget<FF>;
+    fn connect_nonnative<FF: Field>(
+        &mut self,
+        lhs: &NonNativeTarget<FF>,
+        rhs: &NonNativeTarget<FF>,
     );
-    let targets = limbs.map(|limb| builder.constant(F::from_canonical_u32(limb)));
-    from_limbs_checked(builder, targets)
+    fn add_virtual_nonnative_target<FF: Field>(&mut self) -> NonNativeTarget<FF>;
+    fn add_virtual_nonnative_target_sized<FF: Field>(
+        &mut self,
+        num_limbs: usize,
+    ) -> NonNativeTarget<FF>;
+    fn add_nonnative<FF: PrimeField>(
+        &mut self,
+        a: &NonNativeTarget<FF>,
+        b: &NonNativeTarget<FF>,
+    ) -> NonNativeTarget<FF>;
+    fn mul_nonnative_by_bool<FF: Field>(
+        &mut self,
+        a: &NonNativeTarget<FF>,
+        b: BoolTarget,
+    ) -> NonNativeTarget<FF>;
+    fn if_nonnative<FF: PrimeField>(
+        &mut self,
+        b: BoolTarget,
+        x: &NonNativeTarget<FF>,
+        y: &NonNativeTarget<FF>,
+    ) -> NonNativeTarget<FF>;
+    fn add_many_nonnative<FF: PrimeField>(
+        &mut self,
+        to_add: &[NonNativeTarget<FF>],
+    ) -> NonNativeTarget<FF>;
+    fn sub_nonnative<FF: PrimeField>(
+        &mut self,
+        a: &NonNativeTarget<FF>,
+        b: &NonNativeTarget<FF>,
+    ) -> NonNativeTarget<FF>;
+    fn mul_nonnative<FF: PrimeField>(
+        &mut self,
+        a: &NonNativeTarget<FF>,
+        b: &NonNativeTarget<FF>,
+    ) -> NonNativeTarget<FF>;
+    fn mul_many_nonnative<FF: PrimeField>(
+        &mut self,
+        to_mul: &[NonNativeTarget<FF>],
+    ) -> NonNativeTarget<FF>;
+    fn neg_nonnative<FF: PrimeField>(&mut self, x: &NonNativeTarget<FF>) -> NonNativeTarget<FF>;
+    fn inv_nonnative<FF: PrimeField>(&mut self, x: &NonNativeTarget<FF>) -> NonNativeTarget<FF>;
+    fn reduce<FF: Field>(&mut self, x: &BigUintTarget) -> NonNativeTarget<FF>;
+    fn reduce_nonnative<FF: Field>(&mut self, x: &NonNativeTarget<FF>) -> NonNativeTarget<FF>;
+    fn bool_to_nonnative<FF: Field>(&mut self, b: &BoolTarget) -> NonNativeTarget<FF>;
+    fn split_nonnative_to_bits<FF: Field>(&mut self, x: &NonNativeTarget<FF>) -> Vec<BoolTarget>;
+    fn nonnative_conditional_neg<FF: PrimeField>(
+        &mut self,
+        x: &NonNativeTarget<FF>,
+        b: BoolTarget,
+    ) -> NonNativeTarget<FF>;
 }
 
-/// Exact strict comparison of little-endian u32 limbs against a constant.
-///
-/// The scan is lexicographic from the most-significant bit, matching the
-/// comparison pattern used by `u128_arith::geq`.
-fn less_than_constant_limbs<F: RichField + Extendable<D>, const D: usize, const N: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    lhs: &[Target; N],
-    rhs: &[u32; N],
-) -> BoolTarget {
-    let mut lhs_bits = Vec::with_capacity(N * LIMB_BITS);
-    for &limb in lhs {
-        lhs_bits.extend(builder.split_le(limb, LIMB_BITS));
-    }
-
-    let mut equal_so_far = builder.constant_bool(true);
-    let mut lhs_less = builder.constant_bool(false);
-    for bit_index in (0..N * LIMB_BITS).rev() {
-        let rhs_bit = builder
-            .constant_bool(((rhs[bit_index / LIMB_BITS] >> (bit_index % LIMB_BITS)) & 1) == 1);
-        let not_lhs = builder.not(lhs_bits[bit_index]);
-        let less_at_bit = builder.and(not_lhs, rhs_bit);
-        let first_difference_is_less = builder.and(equal_so_far, less_at_bit);
-        lhs_less = builder.or(lhs_less, first_difference_is_less);
-
-        let bits_equal = builder.is_equal(lhs_bits[bit_index].target, rhs_bit.target);
-        equal_so_far = builder.and(equal_so_far, bits_equal);
-    }
-    lhs_less
-}
-
-/// Adds two 256-bit integers into an exact nine-limb representation.
-fn add_256_wide<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    lhs: &[Target; LIMBS],
-    rhs: &[Target; LIMBS],
-) -> [Target; WIDE_LIMBS] {
-    let mut output = [builder.zero(); WIDE_LIMBS];
-    let mut carry = builder.zero();
-    for i in 0..LIMBS {
-        builder.range_check(lhs[i], LIMB_BITS);
-        builder.range_check(rhs[i], LIMB_BITS);
-        let total = builder.add_many([lhs[i], rhs[i], carry]);
-
-        // Two u32 limbs plus a carry bit are at most
-        // 2 * (2^32 - 1) + 1 = 2^33 - 1, exactly 33 bits and far below
-        // the Goldilocks modulus.
-        let bits = builder.split_le(total, 33);
-        output[i] = builder.le_sum(bits[..LIMB_BITS].iter());
-        builder.range_check(output[i], LIMB_BITS);
-        carry = bits[LIMB_BITS].target;
-    }
-    output[LIMBS] = carry;
-    output
-}
-
-/// Subtracts equal-width limb arrays and returns `(difference, borrow_out)`.
-fn sub_limbs<F: RichField + Extendable<D>, const D: usize, const N: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    lhs: &[Target; N],
-    rhs: &[Target; N],
-) -> ([Target; N], BoolTarget) {
-    let mut output = [builder.zero(); N];
-    let mut borrow = builder.constant_bool(false);
-    let base = F::from_canonical_u64(LIMB_BASE);
-
-    for i in 0..N {
-        builder.range_check(lhs[i], LIMB_BITS);
-        builder.range_check(rhs[i], LIMB_BITS);
-        let with_base = builder.add_const(lhs[i], base);
-        let minus_rhs = builder.sub(with_base, rhs[i]);
-        let total = builder.sub(minus_rhs, borrow.target);
-
-        // 2^32 + lhs - rhs - borrow is always in 0..=2^33-1. It is
-        // nonnegative before entering the native field, so the 33-bit split
-        // is an exact integer equation rather than a wrapped subtraction.
-        let bits = builder.split_le(total, 33);
-        output[i] = builder.le_sum(bits[..LIMB_BITS].iter());
-        builder.range_check(output[i], LIMB_BITS);
-        // The high bit is one exactly when this limb did not borrow.
-        borrow = builder.not(bits[LIMB_BITS]);
-    }
-    (output, borrow)
-}
-
-/// Reduces a value known to be below twice the modulus by one conditional
-/// subtraction.
-fn reduce_once<F: RichField + Extendable<D>, const D: usize, M: NonNativeModulus>(
-    builder: &mut CircuitBuilder<F, D>,
-    wide: &[Target; WIDE_LIMBS],
-) -> NonNativeTarget<M> {
-    let modulus_wide = [
-        M::MODULUS_LIMBS[0],
-        M::MODULUS_LIMBS[1],
-        M::MODULUS_LIMBS[2],
-        M::MODULUS_LIMBS[3],
-        M::MODULUS_LIMBS[4],
-        M::MODULUS_LIMBS[5],
-        M::MODULUS_LIMBS[6],
-        M::MODULUS_LIMBS[7],
-        0,
-    ];
-    let below_modulus = less_than_constant_limbs(builder, wide, &modulus_wide);
-    let subtract_modulus = builder.not(below_modulus);
-    let selected_modulus = std::array::from_fn(|i| {
-        builder.mul_const(
-            F::from_canonical_u32(modulus_wide[i]),
-            subtract_modulus.target,
-        )
-    });
-    let (reduced_wide, borrow) = sub_limbs(builder, wide, &selected_modulus);
-    builder.assert_zero(borrow.target);
-    builder.assert_zero(reduced_wide[LIMBS]);
-
-    let reduced = std::array::from_fn(|i| reduced_wide[i]);
-    from_limbs_checked(builder, reduced)
-}
-
-/// Computes `(a + b) mod M`.
-pub fn add_mod<F: RichField + Extendable<D>, const D: usize, M: NonNativeModulus>(
-    builder: &mut CircuitBuilder<F, D>,
-    a: &NonNativeTarget<M>,
-    b: &NonNativeTarget<M>,
-) -> NonNativeTarget<M> {
-    let sum = add_256_wide(builder, &a.limbs, &b.limbs);
-    reduce_once(builder, &sum)
-}
-
-/// Computes `(a - b) mod M`.
-pub fn sub_mod<F: RichField + Extendable<D>, const D: usize, M: NonNativeModulus>(
-    builder: &mut CircuitBuilder<F, D>,
-    a: &NonNativeTarget<M>,
-    b: &NonNativeTarget<M>,
-) -> NonNativeTarget<M> {
-    let modulus_targets =
-        M::MODULUS_LIMBS.map(|limb| builder.constant(F::from_canonical_u32(limb)));
-    let a_plus_modulus = add_256_wide(builder, &a.limbs, &modulus_targets);
-    let b_wide = [
-        b.limbs[0],
-        b.limbs[1],
-        b.limbs[2],
-        b.limbs[3],
-        b.limbs[4],
-        b.limbs[5],
-        b.limbs[6],
-        b.limbs[7],
-        builder.zero(),
-    ];
-    let (unreduced, borrow) = sub_limbs(builder, &a_plus_modulus, &b_wide);
-    // Canonical b is strictly below the modulus, so a + modulus - b >= 1.
-    builder.assert_zero(borrow.target);
-    reduce_once(builder, &unreduced)
-}
-
-/// Splits one exact u32 product into its low and high u32 halves.
-fn mul_u32_exact<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    x: Target,
-    y: Target,
-) -> (Target, Target) {
-    builder.range_check(x, LIMB_BITS);
-    builder.range_check(y, LIMB_BITS);
-    let product = builder.mul(x, y);
-
-    // (2^32 - 1)^2 = 2^64 - 2^33 + 1, which is strictly below the
-    // Goldilocks prime 2^64 - 2^32 + 1. Thus the native multiplication
-    // itself cannot wrap. A 64-bit split over Goldilocks could otherwise
-    // represent a small value plus the native modulus, so we additionally
-    // constrain its bit pattern to the canonical interval below that prime.
-    let bits = builder.split_le(product, 64);
-    let goldilocks_limbs = [1u32, 0xffff_ffff];
-    let product_limbs = [
-        builder.le_sum(bits[..LIMB_BITS].iter()),
-        builder.le_sum(bits[LIMB_BITS..].iter()),
-    ];
-    let canonical_product = less_than_constant_limbs(builder, &product_limbs, &goldilocks_limbs);
-    builder.assert_one(canonical_product.target);
-    builder.range_check(product_limbs[0], LIMB_BITS);
-    builder.range_check(product_limbs[1], LIMB_BITS);
-    (product_limbs[0], product_limbs[1])
-}
-
-/// Computes an exact 512-bit schoolbook product.
-fn product_256<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    lhs: &[Target; LIMBS],
-    rhs: &[Target; LIMBS],
-) -> [Target; PRODUCT_LIMBS] {
-    let mut columns: [Vec<Target>; PRODUCT_LIMBS] = std::array::from_fn(|_| Vec::new());
-    for i in 0..LIMBS {
-        for j in 0..LIMBS {
-            let (low, high) = mul_u32_exact(builder, lhs[i], rhs[j]);
-            columns[i + j].push(low);
-            columns[i + j + 1].push(high);
+impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderNonNative<F, D>
+    for CircuitBuilder<F, D>
+{
+    fn biguint_to_nonnative<FF: Field>(&mut self, x: &BigUintTarget) -> NonNativeTarget<FF> {
+        assert_canonical_biguint::<F, D, FF>(self, x);
+        NonNativeTarget {
+            value: x.clone(),
+            _phantom: PhantomData,
         }
     }
 
-    let mut output = [builder.zero(); PRODUCT_LIMBS];
-    let mut carry = builder.zero();
-    for column in 0..PRODUCT_LIMBS {
-        let mut summands = columns[column].clone();
-        summands.push(carry);
-        let total = builder.add_many(summands);
-
-        // A schoolbook column has at most 15 u32 half-products. Inductively,
-        // its incoming carry is at most 14, so the total is at most
-        // 15 * (2^32 - 1) + 14 = 15 * 2^32 - 1 < 2^36. The 36-bit split is
-        // therefore exact and comfortably below the Goldilocks modulus.
-        let bits = builder.split_le(total, 36);
-        output[column] = builder.le_sum(bits[..LIMB_BITS].iter());
-        builder.range_check(output[column], LIMB_BITS);
-        carry = builder.le_sum(bits[LIMB_BITS..].iter());
-        builder.range_check(carry, 4);
+    fn nonnative_to_canonical_biguint<FF: Field>(
+        &mut self,
+        x: &NonNativeTarget<FF>,
+    ) -> BigUintTarget {
+        x.value.clone()
     }
-    // Both inputs are below 2^256, so their product is below 2^512.
-    builder.assert_zero(carry);
-    output
-}
 
-/// Adds a 256-bit value to a 512-bit value without discarding overflow.
-fn add_256_to_512<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    wide: &[Target; PRODUCT_LIMBS],
-    addend: &[Target; LIMBS],
-) -> [Target; PRODUCT_LIMBS] {
-    let mut output = [builder.zero(); PRODUCT_LIMBS];
-    let mut carry = builder.zero();
-    for i in 0..PRODUCT_LIMBS {
-        builder.range_check(wide[i], LIMB_BITS);
-        let rhs = if i < LIMBS {
-            builder.range_check(addend[i], LIMB_BITS);
-            addend[i]
-        } else {
-            builder.zero()
+    fn constant_nonnative<FF: PrimeField>(&mut self, x: FF) -> NonNativeTarget<FF> {
+        let value = self.constant_biguint(&x.to_canonical_biguint());
+        self.biguint_to_nonnative(&value)
+    }
+
+    fn zero_nonnative<FF: PrimeField>(&mut self) -> NonNativeTarget<FF> {
+        self.constant_nonnative(FF::ZERO)
+    }
+
+    fn connect_nonnative<FF: Field>(
+        &mut self,
+        lhs: &NonNativeTarget<FF>,
+        rhs: &NonNativeTarget<FF>,
+    ) {
+        self.connect_biguint(&lhs.value, &rhs.value);
+    }
+
+    fn add_virtual_nonnative_target<FF: Field>(&mut self) -> NonNativeTarget<FF> {
+        self.add_virtual_nonnative_target_sized(Self::num_nonnative_limbs::<FF>())
+    }
+
+    fn add_virtual_nonnative_target_sized<FF: Field>(
+        &mut self,
+        num_limbs: usize,
+    ) -> NonNativeTarget<FF> {
+        let value = self.add_virtual_biguint_target(num_limbs);
+        self.biguint_to_nonnative(&value)
+    }
+
+    fn add_nonnative<FF: PrimeField>(
+        &mut self,
+        a: &NonNativeTarget<FF>,
+        b: &NonNativeTarget<FF>,
+    ) -> NonNativeTarget<FF> {
+        let sum = self.add_virtual_nonnative_target::<FF>();
+        let overflow = self.add_virtual_bool_target_safe();
+        self.add_simple_generator(NonNativeAdditionGenerator::<F, D, FF> {
+            a: a.clone(),
+            b: b.clone(),
+            sum: sum.clone(),
+            overflow,
+            _phantom: PhantomData,
+        });
+
+        let expected = self.add_biguint(&a.value, &b.value);
+        let modulus = self.constant_biguint(&FF::order());
+        let modulus_if_overflow = self.mul_biguint_by_bool(&modulus, overflow);
+        let actual = self.add_biguint(&sum.value, &modulus_if_overflow);
+        self.connect_biguint(&expected, &actual);
+        sum
+    }
+
+    fn mul_nonnative_by_bool<FF: Field>(
+        &mut self,
+        a: &NonNativeTarget<FF>,
+        b: BoolTarget,
+    ) -> NonNativeTarget<FF> {
+        NonNativeTarget {
+            value: self.mul_biguint_by_bool(&a.value, b),
+            _phantom: PhantomData,
+        }
+    }
+
+    fn if_nonnative<FF: PrimeField>(
+        &mut self,
+        b: BoolTarget,
+        x: &NonNativeTarget<FF>,
+        y: &NonNativeTarget<FF>,
+    ) -> NonNativeTarget<FF> {
+        let not_b = self.not(b);
+        let maybe_x = self.mul_nonnative_by_bool(x, b);
+        let maybe_y = self.mul_nonnative_by_bool(y, not_b);
+        self.add_nonnative(&maybe_x, &maybe_y)
+    }
+
+    fn add_many_nonnative<FF: PrimeField>(
+        &mut self,
+        to_add: &[NonNativeTarget<FF>],
+    ) -> NonNativeTarget<FF> {
+        match to_add.len() {
+            0 => return self.zero_nonnative(),
+            1 => return to_add[0].clone(),
+            _ => {}
+        }
+
+        let sum = self.add_virtual_nonnative_target::<FF>();
+        let overflow = self.add_virtual_u32_target();
+        let summands = to_add.to_vec();
+        self.add_simple_generator(NonNativeMultipleAddsGenerator::<F, D, FF> {
+            summands: summands.clone(),
+            sum: sum.clone(),
+            overflow,
+            _phantom: PhantomData,
+        });
+
+        range_check_u32_circuit(self, vec![overflow]);
+        let expected = summands.iter().fold(self.zero_biguint(), |acc, value| {
+            self.add_biguint(&acc, &value.value)
+        });
+        let modulus = self.constant_biguint(&FF::order());
+        let overflow_biguint = BigUintTarget {
+            limbs: vec![overflow],
         };
-        let total = builder.add_many([wide[i], rhs, carry]);
-
-        // Two u32 limbs and one carry bit fit exactly in 33 bits:
-        // 2 * (2^32 - 1) + 1 = 2^33 - 1.
-        let bits = builder.split_le(total, 33);
-        output[i] = builder.le_sum(bits[..LIMB_BITS].iter());
-        builder.range_check(output[i], LIMB_BITS);
-        carry = bits[LIMB_BITS].target;
+        let modulus_multiple = self.mul_biguint(&modulus, &overflow_biguint);
+        let actual = self.add_biguint(&sum.value, &modulus_multiple);
+        self.connect_biguint(&expected, &actual);
+        sum
     }
-    // q < modulus and r < modulus imply q * modulus + r < modulus^2 < 2^512.
-    builder.assert_zero(carry);
-    output
+
+    fn sub_nonnative<FF: PrimeField>(
+        &mut self,
+        a: &NonNativeTarget<FF>,
+        b: &NonNativeTarget<FF>,
+    ) -> NonNativeTarget<FF> {
+        let difference = self.add_virtual_nonnative_target::<FF>();
+        let overflow = self.add_virtual_bool_target_safe();
+        self.add_simple_generator(NonNativeSubtractionGenerator::<F, D, FF> {
+            a: a.clone(),
+            b: b.clone(),
+            difference: difference.clone(),
+            overflow,
+            _phantom: PhantomData,
+        });
+
+        let difference_plus_b = self.add_biguint(&difference.value, &b.value);
+        let modulus = self.constant_biguint(&FF::order());
+        let modulus_if_overflow = self.mul_biguint_by_bool(&modulus, overflow);
+        let reduced = self.sub_biguint(&difference_plus_b, &modulus_if_overflow);
+        self.connect_biguint(&a.value, &reduced);
+        difference
+    }
+
+    fn mul_nonnative<FF: PrimeField>(
+        &mut self,
+        a: &NonNativeTarget<FF>,
+        b: &NonNativeTarget<FF>,
+    ) -> NonNativeTarget<FF> {
+        let product = self.add_virtual_nonnative_target::<FF>();
+        let modulus = self.constant_biguint(&FF::order());
+        // For canonical field inputs the quotient is always smaller than the modulus.
+        // A fixed modulus-width target also handles short constants (including zero).
+        let overflow = self.add_virtual_biguint_target(modulus.num_limbs());
+        self.add_simple_generator(NonNativeMultiplicationGenerator::<F, D, FF> {
+            a: a.clone(),
+            b: b.clone(),
+            product: product.clone(),
+            overflow: overflow.clone(),
+            _phantom: PhantomData,
+        });
+
+        range_check_u32_circuit(self, overflow.limbs.clone());
+        constrain_product_reduction(self, a, b, &overflow, &product);
+        product
+    }
+
+    fn mul_many_nonnative<FF: PrimeField>(
+        &mut self,
+        to_mul: &[NonNativeTarget<FF>],
+    ) -> NonNativeTarget<FF> {
+        assert!(
+            !to_mul.is_empty(),
+            "mul_many_nonnative requires at least one factor"
+        );
+        if to_mul.len() == 1 {
+            return to_mul[0].clone();
+        }
+        let mut product = self.mul_nonnative(&to_mul[0], &to_mul[1]);
+        for factor in &to_mul[2..] {
+            product = self.mul_nonnative(&product, factor);
+        }
+        product
+    }
+
+    fn neg_nonnative<FF: PrimeField>(&mut self, x: &NonNativeTarget<FF>) -> NonNativeTarget<FF> {
+        let zero = self.zero_nonnative();
+        self.sub_nonnative(&zero, x)
+    }
+
+    fn inv_nonnative<FF: PrimeField>(&mut self, x: &NonNativeTarget<FF>) -> NonNativeTarget<FF> {
+        let inverse = self.add_virtual_nonnative_target::<FF>();
+        let quotient = self.add_virtual_biguint_target(x.value.num_limbs());
+        self.add_simple_generator(NonNativeInverseGenerator::<F, D, FF> {
+            x: x.clone(),
+            inverse: inverse.clone(),
+            quotient: quotient.clone(),
+            _phantom: PhantomData,
+        });
+
+        range_check_u32_circuit(self, quotient.limbs.clone());
+        let product = self.mul_biguint(&x.value, &inverse.value);
+        let modulus = self.constant_biguint(&FF::order());
+        let modulus_multiple = self.mul_biguint(&modulus, &quotient);
+        let one = self.constant_biguint(&BigUint::one());
+        let expected = self.add_biguint(&modulus_multiple, &one);
+        self.connect_biguint(&product, &expected);
+        inverse
+    }
+
+    fn reduce<FF: Field>(&mut self, x: &BigUintTarget) -> NonNativeTarget<FF> {
+        let modulus = self.constant_biguint(&FF::order());
+        let remainder = self.rem_biguint(x, &modulus);
+        self.biguint_to_nonnative(&remainder)
+    }
+
+    fn reduce_nonnative<FF: Field>(&mut self, x: &NonNativeTarget<FF>) -> NonNativeTarget<FF> {
+        self.reduce(&x.value)
+    }
+
+    fn bool_to_nonnative<FF: Field>(&mut self, b: &BoolTarget) -> NonNativeTarget<FF> {
+        NonNativeTarget {
+            value: BigUintTarget {
+                limbs: vec![U32Target(b.target)],
+            },
+            _phantom: PhantomData,
+        }
+    }
+
+    fn split_nonnative_to_bits<FF: Field>(&mut self, x: &NonNativeTarget<FF>) -> Vec<BoolTarget> {
+        x.value
+            .limbs
+            .iter()
+            .flat_map(|limb| {
+                self.split_le_base::<2>(limb.0, 32)
+                    .into_iter()
+                    .map(BoolTarget::new_unsafe)
+            })
+            .collect()
+    }
+
+    fn nonnative_conditional_neg<FF: PrimeField>(
+        &mut self,
+        x: &NonNativeTarget<FF>,
+        b: BoolTarget,
+    ) -> NonNativeTarget<FF> {
+        let not_b = self.not(b);
+        let negative = self.neg_nonnative(x);
+        let maybe_negative = self.mul_nonnative_by_bool(&negative, b);
+        let maybe_positive = self.mul_nonnative_by_bool(x, not_b);
+        self.add_nonnative(&maybe_negative, &maybe_positive)
+    }
 }
 
-/// Constrains `a * b = q * modulus + r` as an exact 512-bit integer identity.
-pub(crate) fn assert_product_reduction<
-    F: RichField + Extendable<D>,
-    const D: usize,
-    M: NonNativeModulus,
->(
+fn assert_canonical_biguint<F: RichField + Extendable<D>, const D: usize, FF: Field>(
     builder: &mut CircuitBuilder<F, D>,
-    a: &NonNativeTarget<M>,
-    b: &NonNativeTarget<M>,
-    q: &NonNativeTarget<M>,
-    r: &NonNativeTarget<M>,
+    value: &BigUintTarget,
 ) {
-    let actual = product_256(builder, &a.limbs, &b.limbs);
-    let modulus = M::MODULUS_LIMBS.map(|limb| builder.constant(F::from_canonical_u32(limb)));
-    let q_times_modulus = product_256(builder, &q.limbs, &modulus);
-    let claimed = add_256_to_512(builder, &q_times_modulus, &r.limbs);
-    for i in 0..PRODUCT_LIMBS {
-        builder.connect(actual[i], claimed[i]);
+    if !value.limbs.is_empty() {
+        range_check_u32_circuit(builder, value.limbs.clone());
     }
+    let maximum = FF::order() - BigUint::one();
+    let maximum = builder.constant_biguint(&maximum);
+    let is_canonical = builder.cmp_biguint(value, &maximum);
+    builder.assert_one(is_canonical.target);
 }
 
-/// Computes `(a * b) mod M`, witnessing and then constraining quotient and remainder.
-pub fn mul_mod<F: RichField + Extendable<D>, const D: usize, M: NonNativeModulus>(
+fn constrain_product_reduction<F: RichField + Extendable<D>, const D: usize, FF: PrimeField>(
     builder: &mut CircuitBuilder<F, D>,
-    a: &NonNativeTarget<M>,
-    b: &NonNativeTarget<M>,
-) -> NonNativeTarget<M> {
-    let q = NonNativeTarget::<M>::new_virtual(builder);
-    let r = NonNativeTarget::<M>::new_virtual(builder);
-    builder.add_simple_generator(MulReductionGenerator::<M> {
-        a: a.limbs,
-        b: b.limbs,
-        q: q.limbs,
-        r: r.limbs,
-        _marker: PhantomData,
-    });
-    assert_product_reduction(builder, a, b, &q, &r);
-    r
+    a: &NonNativeTarget<FF>,
+    b: &NonNativeTarget<FF>,
+    quotient: &BigUintTarget,
+    remainder: &NonNativeTarget<FF>,
+) {
+    let expected = builder.mul_biguint(&a.value, &b.value);
+    let modulus = builder.constant_biguint(&FF::order());
+    let modulus_multiple = builder.mul_biguint(&modulus, quotient);
+    let actual = builder.add_biguint(&remainder.value, &modulus_multiple);
+    builder.connect_biguint(&expected, &actual);
 }
 
-/// Computes the multiplicative inverse modulo `M`.
-///
-/// The inverse is witnessed by Fermat exponentiation and verified by a fully
-/// constrained modular multiplication. A zero input makes witness generation
-/// panic rather than producing a meaningless value.
-pub fn inverse_mod<F: RichField + Extendable<D>, const D: usize, M: NonNativeModulus>(
-    builder: &mut CircuitBuilder<F, D>,
-    a: &NonNativeTarget<M>,
-) -> NonNativeTarget<M> {
-    let inverse = NonNativeTarget::<M>::new_virtual(builder);
-    builder.add_simple_generator(InverseGenerator::<M> {
-        a: a.limbs,
-        inverse: inverse.limbs,
-        _marker: PhantomData,
-    });
-
-    let product = mul_mod(builder, a, &inverse);
-    let one = constant::<F, D, M>(builder, [1, 0, 0, 0, 0, 0, 0, 0]);
-    for i in 0..LIMBS {
-        builder.connect(product.limbs[i], one.limbs[i]);
-    }
-    inverse
-}
-
-/// Returns one exactly when all canonical limbs of `a` are zero.
-pub fn is_zero<F: RichField + Extendable<D>, const D: usize, M: NonNativeModulus>(
-    builder: &mut CircuitBuilder<F, D>,
-    a: &NonNativeTarget<M>,
-) -> BoolTarget {
-    let zero = builder.zero();
-    let mut result = builder.constant_bool(true);
-    for &limb in &a.limbs {
-        let limb_is_zero = builder.is_equal(limb, zero);
-        result = builder.and(result, limb_is_zero);
-    }
-    result
-}
-
-/// Returns one exactly when two canonical foreign-field values are equal.
-pub fn equal<F: RichField + Extendable<D>, const D: usize, M: NonNativeModulus>(
-    builder: &mut CircuitBuilder<F, D>,
-    a: &NonNativeTarget<M>,
-    b: &NonNativeTarget<M>,
-) -> BoolTarget {
-    let mut result = builder.constant_bool(true);
-    for i in 0..LIMBS {
-        let limbs_equal = builder.is_equal(a.limbs[i], b.limbs[i]);
-        result = builder.and(result, limbs_equal);
-    }
-    result
-}
-
-#[derive(Debug)]
-struct MulReductionGenerator<M: NonNativeModulus> {
-    a: [Target; LIMBS],
-    b: [Target; LIMBS],
-    q: [Target; LIMBS],
-    r: [Target; LIMBS],
-    _marker: PhantomData<fn() -> M>,
-}
-
-impl<F: RichField + Extendable<D>, const D: usize, M: NonNativeModulus> SimpleGenerator<F, D>
-    for MulReductionGenerator<M>
-{
-    fn id(&self) -> String {
-        format!("MulReductionGenerator<{}>", type_name::<M>())
-    }
-
-    fn dependencies(&self) -> Vec<Target> {
-        self.a.into_iter().chain(self.b).collect()
-    }
-
-    fn run_once(
-        &self,
-        witness: &PartitionWitness<F>,
-        out_buffer: &mut GeneratedValues<F>,
-    ) -> Result<()> {
-        let a = read_u32_limbs(witness, &self.a, "mul_mod left input");
-        let b = read_u32_limbs(witness, &self.b, "mul_mod right input");
-        assert!(
-            cmp_limbs(&a, &M::MODULUS_LIMBS).is_lt(),
-            "mul_mod generator received a non-canonical left input"
-        );
-        assert!(
-            cmp_limbs(&b, &M::MODULUS_LIMBS).is_lt(),
-            "mul_mod generator received a non-canonical right input"
-        );
-        let product = mul_256_host(&a, &b);
-        let (q, r) = div_rem_512_by_256(&product, &M::MODULUS_LIMBS);
-        assert!(
-            cmp_limbs(&q, &M::MODULUS_LIMBS).is_lt(),
-            "mul_mod quotient unexpectedly exceeded the modulus"
-        );
-        write_u32_limbs(out_buffer, &self.q, &q)?;
-        write_u32_limbs(out_buffer, &self.r, &r)
-    }
-
-    fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
-        dst.write_target_array(&self.a)?;
-        dst.write_target_array(&self.b)?;
-        dst.write_target_array(&self.q)?;
-        dst.write_target_array(&self.r)
-    }
-
-    fn deserialize(src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
-        Ok(Self {
-            a: src.read_target_array()?,
-            b: src.read_target_array()?,
-            q: src.read_target_array()?,
-            r: src.read_target_array()?,
-            _marker: PhantomData,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct InverseGenerator<M: NonNativeModulus> {
-    a: [Target; LIMBS],
-    inverse: [Target; LIMBS],
-    _marker: PhantomData<fn() -> M>,
-}
-
-impl<F: RichField + Extendable<D>, const D: usize, M: NonNativeModulus> SimpleGenerator<F, D>
-    for InverseGenerator<M>
-{
-    fn id(&self) -> String {
-        format!("InverseGenerator<{}>", type_name::<M>())
-    }
-
-    fn dependencies(&self) -> Vec<Target> {
-        self.a.to_vec()
-    }
-
-    fn run_once(
-        &self,
-        witness: &PartitionWitness<F>,
-        out_buffer: &mut GeneratedValues<F>,
-    ) -> Result<()> {
-        let a = read_u32_limbs(witness, &self.a, "inverse_mod input");
-        assert!(
-            cmp_limbs(&a, &M::MODULUS_LIMBS).is_lt(),
-            "inverse_mod generator received a non-canonical input"
-        );
-        assert!(
-            a.iter().any(|&limb| limb != 0),
-            "inverse_mod has no inverse for zero"
-        );
-
-        let exponent = sub_small(M::MODULUS_LIMBS, 2);
-        let inverse = pow_mod_host(a, exponent, M::MODULUS_LIMBS);
-        let check = mul_mod_host(&a, &inverse, &M::MODULUS_LIMBS);
-        assert_eq!(
-            check,
-            [1, 0, 0, 0, 0, 0, 0, 0],
-            "inverse_mod generator produced an invalid inverse"
-        );
-        write_u32_limbs(out_buffer, &self.inverse, &inverse)
-    }
-
-    fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
-        dst.write_target_array(&self.a)?;
-        dst.write_target_array(&self.inverse)
-    }
-
-    fn deserialize(src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
-        Ok(Self {
-            a: src.read_target_array()?,
-            inverse: src.read_target_array()?,
-            _marker: PhantomData,
-        })
-    }
-}
-
-fn read_u32_limbs<F: PrimeField64>(
-    witness: &impl Witness<F>,
-    targets: &[Target; LIMBS],
+fn read_canonical<FF: Field, F: RichField>(
+    witness: &PartitionWitness<F>,
+    target: &NonNativeTarget<FF>,
     context: &str,
-) -> [u32; LIMBS] {
-    std::array::from_fn(|i| {
-        let value = witness.get_target(targets[i]).to_canonical_u64();
-        assert!(
-            value <= u32::MAX as u64,
-            "{context} limb {i} is not a u32: {value}"
-        );
-        value as u32
-    })
-}
-
-fn write_u32_limbs<F: Field>(
-    out_buffer: &mut GeneratedValues<F>,
-    targets: &[Target; LIMBS],
-    limbs: &[u32; LIMBS],
-) -> Result<()> {
-    for i in 0..LIMBS {
-        out_buffer.set_target(targets[i], F::from_canonical_u32(limbs[i]))?;
-    }
-    Ok(())
-}
-
-fn cmp_limbs<const N: usize>(lhs: &[u32; N], rhs: &[u32; N]) -> std::cmp::Ordering {
-    for i in (0..N).rev() {
-        match lhs[i].cmp(&rhs[i]) {
-            std::cmp::Ordering::Equal => {}
-            ordering => return ordering,
-        }
-    }
-    std::cmp::Ordering::Equal
-}
-
-/// Dependency-free exact 256-by-256-bit schoolbook multiplication.
-fn mul_256_host(lhs: &[u32; LIMBS], rhs: &[u32; LIMBS]) -> [u32; PRODUCT_LIMBS] {
-    let mut output = [0u32; PRODUCT_LIMBS];
-    for i in 0..LIMBS {
-        let mut carry = 0u64;
-        for j in 0..LIMBS {
-            let k = i + j;
-            let total = output[k] as u128 + lhs[i] as u128 * rhs[j] as u128 + carry as u128;
-            output[k] = total as u32;
-            carry = (total >> LIMB_BITS) as u64;
-        }
-        assert_eq!(
-            output[i + LIMBS],
-            0,
-            "host schoolbook multiplication carry slot was already occupied"
-        );
-        output[i + LIMBS] = carry as u32;
-    }
-    output
-}
-
-fn geq_9(lhs: &[u32; WIDE_LIMBS], modulus: &[u32; LIMBS]) -> bool {
-    if lhs[LIMBS] != 0 {
-        return true;
-    }
-    cmp_limbs(&std::array::from_fn::<_, LIMBS, _>(|i| lhs[i]), modulus).is_ge()
-}
-
-fn sub_modulus_9(value: &mut [u32; WIDE_LIMBS], modulus: &[u32; LIMBS]) {
-    let mut borrow = 0u64;
-    for i in 0..WIDE_LIMBS {
-        let rhs = if i < LIMBS { modulus[i] as u64 } else { 0 };
-        let subtrahend = rhs + borrow;
-        let lhs = value[i] as u64;
-        if lhs >= subtrahend {
-            value[i] = (lhs - subtrahend) as u32;
-            borrow = 0;
-        } else {
-            value[i] = (LIMB_BASE + lhs - subtrahend) as u32;
-            borrow = 1;
-        }
-    }
-    assert_eq!(borrow, 0, "host long division subtraction underflowed");
-}
-
-/// Bit-serial 512-by-256 division. The running remainder has a ninth limb so
-/// shifting a value below the modulus never loses its possible 257th bit.
-fn div_rem_512_by_256(
-    numerator: &[u32; PRODUCT_LIMBS],
-    modulus: &[u32; LIMBS],
-) -> ([u32; LIMBS], [u32; LIMBS]) {
+) -> BigUint {
+    let value = witness.get_biguint_target(target.value.clone());
     assert!(
-        modulus[LIMBS - 1] >> 31 == 1,
-        "host long division expects a full-width 256-bit modulus"
+        value < FF::order(),
+        "{context} received a non-canonical input"
     );
-    let mut quotient = [0u32; LIMBS];
-    let mut remainder = [0u32; WIDE_LIMBS];
-
-    for bit_index in (0..PRODUCT_LIMBS * LIMB_BITS).rev() {
-        let mut incoming =
-            ((numerator[bit_index / LIMB_BITS] >> (bit_index % LIMB_BITS)) & 1) as u64;
-        for limb in &mut remainder {
-            let shifted = (*limb as u64) * 2 + incoming;
-            *limb = shifted as u32;
-            incoming = shifted >> LIMB_BITS;
-        }
-        assert_eq!(
-            incoming, 0,
-            "host long division remainder exceeded 288 bits"
-        );
-
-        if geq_9(&remainder, modulus) {
-            sub_modulus_9(&mut remainder, modulus);
-            assert!(
-                bit_index < LIMBS * LIMB_BITS,
-                "host long division quotient exceeded 256 bits"
-            );
-            quotient[bit_index / LIMB_BITS] |= 1u32 << (bit_index % LIMB_BITS);
-        }
-    }
-
-    assert_eq!(
-        remainder[LIMBS], 0,
-        "host long division retained a 257th remainder bit"
-    );
-    let remainder_256 = std::array::from_fn(|i| remainder[i]);
-    assert!(
-        cmp_limbs(&remainder_256, modulus).is_lt(),
-        "host long division produced a non-canonical remainder"
-    );
-
-    let recomposed_product = mul_256_host(&quotient, modulus);
-    let recomposed_product = add_host_256_to_512(recomposed_product, &remainder_256);
-    assert_eq!(
-        &recomposed_product, numerator,
-        "host long division failed quotient/remainder recomposition"
-    );
-    (quotient, remainder_256)
-}
-
-fn add_host_256_to_512(
-    mut wide: [u32; PRODUCT_LIMBS],
-    addend: &[u32; LIMBS],
-) -> [u32; PRODUCT_LIMBS] {
-    let mut carry = 0u64;
-    for i in 0..PRODUCT_LIMBS {
-        let rhs = if i < LIMBS { addend[i] as u64 } else { 0 };
-        let total = wide[i] as u64 + rhs + carry;
-        wide[i] = total as u32;
-        carry = total >> LIMB_BITS;
-    }
-    assert_eq!(carry, 0, "host 512-bit addition overflowed");
-    wide
-}
-
-fn mul_mod_host(lhs: &[u32; LIMBS], rhs: &[u32; LIMBS], modulus: &[u32; LIMBS]) -> [u32; LIMBS] {
-    let product = mul_256_host(lhs, rhs);
-    div_rem_512_by_256(&product, modulus).1
-}
-
-fn sub_small(mut value: [u32; LIMBS], amount: u32) -> [u32; LIMBS] {
-    let (low, mut borrow) = value[0].overflowing_sub(amount);
-    value[0] = low;
-    for limb in value.iter_mut().skip(1) {
-        if !borrow {
-            break;
-        }
-        let (next, next_borrow) = limb.overflowing_sub(1);
-        *limb = next;
-        borrow = next_borrow;
-    }
-    assert!(!borrow, "host small subtraction underflowed");
     value
 }
 
-fn pow_mod_host(base: [u32; LIMBS], exponent: [u32; LIMBS], modulus: [u32; LIMBS]) -> [u32; LIMBS] {
-    let mut result = [1, 0, 0, 0, 0, 0, 0, 0];
-    let mut power = base;
-    for bit_index in 0..LIMBS * LIMB_BITS {
-        if ((exponent[bit_index / LIMB_BITS] >> (bit_index % LIMB_BITS)) & 1) == 1 {
-            result = mul_mod_host(&result, &power, &modulus);
-        }
-        if bit_index + 1 != LIMBS * LIMB_BITS {
-            power = mul_mod_host(&power, &power, &modulus);
-        }
+#[derive(Debug)]
+struct NonNativeAdditionGenerator<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> {
+    a: NonNativeTarget<FF>,
+    b: NonNativeTarget<FF>,
+    sum: NonNativeTarget<FF>,
+    overflow: BoolTarget,
+    _phantom: PhantomData<F>,
+}
+
+impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerator<F, D>
+    for NonNativeAdditionGenerator<F, D, FF>
+{
+    fn id(&self) -> String {
+        format!("{}<{}>", type_name::<Self>(), type_name::<FF>())
     }
-    result
+
+    fn dependencies(&self) -> Vec<Target> {
+        binary_dependencies(&self.a, &self.b)
+    }
+
+    fn run_once(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> Result<()> {
+        let sum = read_canonical(witness, &self.a, "nonnative addition left input")
+            + read_canonical(witness, &self.b, "nonnative addition right input");
+        let modulus = FF::order();
+        let (overflow, reduced) = if sum >= modulus {
+            (true, sum - modulus)
+        } else {
+            (false, sum)
+        };
+        out_buffer.set_biguint_target(&self.sum.value, &reduced)?;
+        out_buffer.set_bool_target(self.overflow, overflow)
+    }
+
+    fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
+        write_nonnative(dst, &self.a)?;
+        write_nonnative(dst, &self.b)?;
+        write_nonnative(dst, &self.sum)?;
+        dst.write_target_bool(self.overflow)
+    }
+
+    fn deserialize(src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
+        Ok(Self {
+            a: read_nonnative(src)?,
+            b: read_nonnative(src)?,
+            sum: read_nonnative(src)?,
+            overflow: src.read_target_bool()?,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct NonNativeMultipleAddsGenerator<F: RichField + Extendable<D>, const D: usize, FF: PrimeField>
+{
+    summands: Vec<NonNativeTarget<FF>>,
+    sum: NonNativeTarget<FF>,
+    overflow: U32Target,
+    _phantom: PhantomData<F>,
+}
+
+impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerator<F, D>
+    for NonNativeMultipleAddsGenerator<F, D, FF>
+{
+    fn id(&self) -> String {
+        format!("{}<{}>", type_name::<Self>(), type_name::<FF>())
+    }
+
+    fn dependencies(&self) -> Vec<Target> {
+        self.summands
+            .iter()
+            .flat_map(|summand| summand.value.limbs.iter().map(|limb| limb.0))
+            .collect()
+    }
+
+    fn run_once(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> Result<()> {
+        let sum = self.summands.iter().fold(BigUint::zero(), |acc, summand| {
+            acc + read_canonical(witness, summand, "nonnative multiple-add input")
+        });
+        let (overflow, reduced) = sum.div_rem(&FF::order());
+        let overflow_digits = overflow.to_u32_digits();
+        assert!(
+            overflow_digits.len() <= 1,
+            "nonnative multiple-add quotient does not fit in u32"
+        );
+        out_buffer.set_biguint_target(&self.sum.value, &reduced)?;
+        out_buffer.set_u32_target(self.overflow, overflow_digits.first().copied().unwrap_or(0))
+    }
+
+    fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
+        dst.write_usize(self.summands.len())?;
+        for summand in &self.summands {
+            write_nonnative(dst, summand)?;
+        }
+        write_nonnative(dst, &self.sum)?;
+        dst.write_target(self.overflow.0)
+    }
+
+    fn deserialize(src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
+        let len = src.read_usize()?;
+        let mut summands = Vec::with_capacity(len);
+        for _ in 0..len {
+            summands.push(read_nonnative(src)?);
+        }
+        Ok(Self {
+            summands,
+            sum: read_nonnative(src)?,
+            overflow: U32Target(src.read_target()?),
+            _phantom: PhantomData,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct NonNativeSubtractionGenerator<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> {
+    a: NonNativeTarget<FF>,
+    b: NonNativeTarget<FF>,
+    difference: NonNativeTarget<FF>,
+    overflow: BoolTarget,
+    _phantom: PhantomData<F>,
+}
+
+impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerator<F, D>
+    for NonNativeSubtractionGenerator<F, D, FF>
+{
+    fn id(&self) -> String {
+        format!("{}<{}>", type_name::<Self>(), type_name::<FF>())
+    }
+
+    fn dependencies(&self) -> Vec<Target> {
+        binary_dependencies(&self.a, &self.b)
+    }
+
+    fn run_once(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> Result<()> {
+        let a = read_canonical(witness, &self.a, "nonnative subtraction left input");
+        let b = read_canonical(witness, &self.b, "nonnative subtraction right input");
+        let (difference, overflow) = if a >= b {
+            (a - b, false)
+        } else {
+            (FF::order() + a - b, true)
+        };
+        out_buffer.set_biguint_target(&self.difference.value, &difference)?;
+        out_buffer.set_bool_target(self.overflow, overflow)
+    }
+
+    fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
+        write_nonnative(dst, &self.a)?;
+        write_nonnative(dst, &self.b)?;
+        write_nonnative(dst, &self.difference)?;
+        dst.write_target_bool(self.overflow)
+    }
+
+    fn deserialize(src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
+        Ok(Self {
+            a: read_nonnative(src)?,
+            b: read_nonnative(src)?,
+            difference: read_nonnative(src)?,
+            overflow: src.read_target_bool()?,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct NonNativeMultiplicationGenerator<
+    F: RichField + Extendable<D>,
+    const D: usize,
+    FF: PrimeField,
+> {
+    a: NonNativeTarget<FF>,
+    b: NonNativeTarget<FF>,
+    product: NonNativeTarget<FF>,
+    overflow: BigUintTarget,
+    _phantom: PhantomData<F>,
+}
+
+impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerator<F, D>
+    for NonNativeMultiplicationGenerator<F, D, FF>
+{
+    fn id(&self) -> String {
+        format!("{}<{}>", type_name::<Self>(), type_name::<FF>())
+    }
+
+    fn dependencies(&self) -> Vec<Target> {
+        binary_dependencies(&self.a, &self.b)
+    }
+
+    fn run_once(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> Result<()> {
+        let a = read_canonical(witness, &self.a, "nonnative multiplication left input");
+        let b = read_canonical(witness, &self.b, "nonnative multiplication right input");
+        let (overflow, product) = (a * b).div_rem(&FF::order());
+        out_buffer.set_biguint_target(&self.product.value, &product)?;
+        out_buffer.set_biguint_target(&self.overflow, &overflow)
+    }
+
+    fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
+        write_nonnative(dst, &self.a)?;
+        write_nonnative(dst, &self.b)?;
+        write_nonnative(dst, &self.product)?;
+        write_biguint(dst, &self.overflow)
+    }
+
+    fn deserialize(src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
+        Ok(Self {
+            a: read_nonnative(src)?,
+            b: read_nonnative(src)?,
+            product: read_nonnative(src)?,
+            overflow: read_biguint(src)?,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct NonNativeInverseGenerator<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> {
+    x: NonNativeTarget<FF>,
+    inverse: NonNativeTarget<FF>,
+    quotient: BigUintTarget,
+    _phantom: PhantomData<F>,
+}
+
+impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerator<F, D>
+    for NonNativeInverseGenerator<F, D, FF>
+{
+    fn id(&self) -> String {
+        format!("{}<{}>", type_name::<Self>(), type_name::<FF>())
+    }
+
+    fn dependencies(&self) -> Vec<Target> {
+        self.x.value.limbs.iter().map(|limb| limb.0).collect()
+    }
+
+    fn run_once(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> Result<()> {
+        let x_biguint = read_canonical(witness, &self.x, "nonnative inverse input");
+        assert!(!x_biguint.is_zero(), "nonnative inverse of zero");
+        let x = FF::from_noncanonical_biguint(x_biguint.clone());
+        let inverse = x.inverse().to_canonical_biguint();
+        let (quotient, remainder) = (x_biguint * &inverse).div_rem(&FF::order());
+        assert_eq!(
+            remainder,
+            BigUint::one(),
+            "field inverse did not satisfy x * inverse = 1 mod modulus"
+        );
+        out_buffer.set_biguint_target(&self.inverse.value, &inverse)?;
+        out_buffer.set_biguint_target(&self.quotient, &quotient)
+    }
+
+    fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
+        write_nonnative(dst, &self.x)?;
+        write_nonnative(dst, &self.inverse)?;
+        write_biguint(dst, &self.quotient)
+    }
+
+    fn deserialize(src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
+        Ok(Self {
+            x: read_nonnative(src)?,
+            inverse: read_nonnative(src)?,
+            quotient: read_biguint(src)?,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+fn binary_dependencies<FF: Field>(a: &NonNativeTarget<FF>, b: &NonNativeTarget<FF>) -> Vec<Target> {
+    a.value
+        .limbs
+        .iter()
+        .chain(&b.value.limbs)
+        .map(|limb| limb.0)
+        .collect()
+}
+
+fn write_biguint(dst: &mut Vec<u8>, value: &BigUintTarget) -> IoResult<()> {
+    let targets: Vec<_> = value.limbs.iter().map(|limb| limb.0).collect();
+    dst.write_target_vec(&targets)
+}
+
+fn read_biguint(src: &mut Buffer) -> IoResult<BigUintTarget> {
+    Ok(BigUintTarget {
+        limbs: src.read_target_vec()?.into_iter().map(U32Target).collect(),
+    })
+}
+
+fn write_nonnative<FF: Field>(dst: &mut Vec<u8>, value: &NonNativeTarget<FF>) -> IoResult<()> {
+    write_biguint(dst, &value.value)
+}
+
+fn read_nonnative<FF: Field>(src: &mut Buffer) -> IoResult<NonNativeTarget<FF>> {
+    Ok(NonNativeTarget {
+        value: read_biguint(src)?,
+        _phantom: PhantomData,
+    })
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{C, D, F};
-    use num_bigint::BigUint;
-    use num_traits::{One, Zero};
-    use plonky2::field::types::{Field, PrimeField64};
-    use plonky2::iop::witness::{PartialWitness, WitnessWrite};
+    use num::{BigUint, One, Zero};
+    use plonky2::field::secp256k1_base::Secp256K1Base;
+    use plonky2::field::secp256k1_scalar::Secp256K1Scalar;
+    use plonky2::field::types::{Field, PrimeField};
+    use plonky2::iop::witness::PartialWitness;
     use plonky2::plonk::circuit_data::CircuitConfig;
 
-    fn biguint_from_limbs(limbs: &[u32; LIMBS]) -> BigUint {
-        let mut bytes = Vec::with_capacity(32);
-        for limb in limbs {
-            bytes.extend_from_slice(&limb.to_le_bytes());
-        }
-        BigUint::from_bytes_le(&bytes)
-    }
+    use super::*;
+    use crate::{C, D, F};
 
-    fn limbs_from_biguint(value: &BigUint) -> [u32; LIMBS] {
-        let digits = value.to_u32_digits();
-        assert!(digits.len() <= LIMBS);
-        std::array::from_fn(|i| digits.get(i).copied().unwrap_or(0))
-    }
-
-    fn set_target<M: NonNativeModulus>(
-        witness: &mut PartialWitness<F>,
-        target: NonNativeTarget<M>,
-        value: &BigUint,
+    fn register_nonnative<FF: Field>(
+        builder: &mut CircuitBuilder<F, D>,
+        value: &NonNativeTarget<FF>,
     ) {
-        let limbs = limbs_from_biguint(value);
-        for i in 0..LIMBS {
-            witness
-                .set_target(target.limbs[i], F::from_canonical_u32(limbs[i]))
-                .unwrap();
+        for limb in &value.value.limbs {
+            builder.register_public_input(limb.0);
         }
     }
 
     fn outputs_as_biguint(public_inputs: &[F]) -> Vec<BigUint> {
         public_inputs
-            .chunks_exact(LIMBS)
+            .chunks_exact(8)
             .map(|chunk| {
-                let limbs: [u32; LIMBS] =
-                    std::array::from_fn(|i| u32::try_from(chunk[i].to_canonical_u64()).unwrap());
-                biguint_from_limbs(&limbs)
+                chunk.iter().rev().fold(BigUint::zero(), |acc, limb| {
+                    (acc << 32) + limb.to_canonical_biguint()
+                })
             })
             .collect()
     }
 
-    fn arithmetic_cases<M: NonNativeModulus>() {
-        let modulus = biguint_from_limbs(&M::MODULUS_LIMBS);
+    fn arithmetic_cases<FF: PrimeField>() {
+        let modulus = FF::order();
         let one = BigUint::one();
-        let m1 = &modulus - &one;
-        let m2 = &modulus - BigUint::from(2u32);
-        let mid_a = BigUint::from_bytes_be(&[
-            0x42, 0x11, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00, 0xfe, 0xdc,
-            0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
-        ]);
-        let mid_b = BigUint::from_bytes_be(&[
-            0x13, 0x37, 0xca, 0xfe, 0xba, 0xbe, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x23, 0x45, 0x67,
-            0x89, 0xab,
-        ]);
-        let cases = vec![
+        let values = [
             (BigUint::zero(), BigUint::zero()),
-            (one.clone(), m1.clone()),
-            (m1.clone(), m2.clone()),
-            (m2, one),
-            (mid_a, mid_b),
+            (one.clone(), &modulus - &one),
+            (&modulus - &one, &modulus - BigUint::from(2u32)),
+            (
+                BigUint::parse_bytes(b"421199887766554433221100fedcba9876543210", 16).unwrap(),
+                BigUint::parse_bytes(b"1337cafebabedeadbeef0123456789ab", 16).unwrap(),
+            ),
         ];
 
-        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_ecc_config());
         let mut witness = PartialWitness::new();
         let mut expected = Vec::new();
-        for (a_value, b_value) in cases {
-            let a = NonNativeTarget::<M>::new_virtual(&mut builder);
-            let b = NonNativeTarget::<M>::new_virtual(&mut builder);
-            set_target(&mut witness, a, &a_value);
-            set_target(&mut witness, b, &b_value);
+        for (a_value, b_value) in values {
+            let a = builder.add_virtual_nonnative_target::<FF>();
+            let b = builder.add_virtual_nonnative_target::<FF>();
+            witness
+                .set_biguint_target(&a.value, &a_value)
+                .expect("a must fit");
+            witness
+                .set_biguint_target(&b.value, &b_value)
+                .expect("b must fit");
 
-            let sum = add_mod(&mut builder, &a, &b);
-            let difference = sub_mod(&mut builder, &a, &b);
-            let product = mul_mod(&mut builder, &a, &b);
-            builder.register_public_inputs(&sum.limbs);
-            builder.register_public_inputs(&difference.limbs);
-            builder.register_public_inputs(&product.limbs);
+            let sum = builder.add_nonnative(&a, &b);
+            let difference = builder.sub_nonnative(&a, &b);
+            let product = builder.mul_nonnative(&a, &b);
+            register_nonnative(&mut builder, &sum);
+            register_nonnative(&mut builder, &difference);
+            register_nonnative(&mut builder, &product);
 
             expected.push((&a_value + &b_value) % &modulus);
             expected.push((&a_value + &modulus - &b_value) % &modulus);
             expected.push((&a_value * &b_value) % &modulus);
         }
 
+        let zero = builder.zero_nonnative::<FF>();
+        let seven = builder.constant_nonnative::<FF>(FF::from_canonical_u64(7));
+        let zero_product = builder.mul_nonnative(&zero, &seven);
+        register_nonnative(&mut builder, &zero_product);
+        expected.push(BigUint::zero());
+
         let data = builder.build::<C>();
         let proof = data
             .prove(witness)
-            .expect("valid non-native arithmetic witness must prove");
+            .expect("valid nonnative arithmetic witness must prove");
         assert_eq!(outputs_as_biguint(&proof.public_inputs), expected);
         data.verify(proof)
-            .expect("valid non-native arithmetic proof must verify");
+            .expect("valid nonnative arithmetic proof must verify");
     }
 
     #[test]
-    fn fp_arithmetic_matches_num_bigint() {
-        arithmetic_cases::<Secp256k1Base>();
+    fn fp_nonnative_arithmetic_matches_biguint() {
+        arithmetic_cases::<Secp256K1Base>();
     }
 
     #[test]
-    fn fn_arithmetic_matches_num_bigint() {
-        arithmetic_cases::<Secp256k1Scalar>();
+    fn fn_nonnative_arithmetic_matches_biguint() {
+        arithmetic_cases::<Secp256K1Scalar>();
     }
 
-    fn inverse_cases<M: NonNativeModulus>() {
-        let modulus = biguint_from_limbs(&M::MODULUS_LIMBS);
-        let one = BigUint::one();
+    fn inverse_cases<FF: PrimeField>() {
+        let modulus = FF::order();
         let values = [
-            one.clone(),
-            &modulus - &one,
-            BigUint::from_bytes_be(&[
-                0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70,
-                0x80, 0x90,
-            ]),
+            BigUint::one(),
+            &modulus - BigUint::one(),
+            BigUint::parse_bytes(b"23456789abcdef102030405060708090", 16).unwrap(),
         ];
         let exponent = &modulus - BigUint::from(2u32);
-
-        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_ecc_config());
         let mut witness = PartialWitness::new();
         let mut expected = Vec::new();
         for value in values {
-            let a = NonNativeTarget::<M>::new_virtual(&mut builder);
-            set_target(&mut witness, a, &value);
-            // `inverse_mod` internally constrains this exact product to one.
-            let inverse = inverse_mod(&mut builder, &a);
-            builder.register_public_inputs(&inverse.limbs);
+            let target = builder.add_virtual_nonnative_target::<FF>();
+            witness
+                .set_biguint_target(&target.value, &value)
+                .expect("input must fit");
+            let inverse = builder.inv_nonnative(&target);
+            register_nonnative(&mut builder, &inverse);
             expected.push(value.modpow(&exponent, &modulus));
         }
 
         let data = builder.build::<C>();
         let proof = data
             .prove(witness)
-            .expect("valid non-native inverse witness must prove");
+            .expect("valid nonnative inverse witness must prove");
         assert_eq!(outputs_as_biguint(&proof.public_inputs), expected);
         data.verify(proof)
-            .expect("valid non-native inverse proof must verify");
+            .expect("valid nonnative inverse proof must verify");
     }
 
     #[test]
-    fn fp_inverse_matches_num_bigint() {
-        inverse_cases::<Secp256k1Base>();
+    fn fp_nonnative_inverse_matches_biguint() {
+        inverse_cases::<Secp256K1Base>();
     }
 
     #[test]
-    fn fn_inverse_matches_num_bigint() {
-        inverse_cases::<Secp256k1Scalar>();
+    fn fn_nonnative_inverse_matches_biguint() {
+        inverse_cases::<Secp256K1Scalar>();
     }
 
-    fn rejects_noncanonical<M: NonNativeModulus>() {
-        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
-        let value = NonNativeTarget::<M>::new_virtual(&mut builder);
+    fn rejects_noncanonical<FF: PrimeField>() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_ecc_config());
+        let value = builder.add_virtual_nonnative_target::<FF>();
         let data = builder.build::<C>();
         let mut witness = PartialWitness::new();
-        for i in 0..LIMBS {
-            witness
-                .set_target(value.limbs[i], F::from_canonical_u32(M::MODULUS_LIMBS[i]))
-                .unwrap();
-        }
+        witness
+            .set_biguint_target(&value.value, &FF::order())
+            .expect("modulus fits the limb array");
         assert!(
             data.prove(witness).is_err(),
             "the modulus itself must not be accepted as canonical"
@@ -940,27 +861,32 @@ mod tests {
     }
 
     #[test]
-    fn fp_rejects_noncanonical_witness() {
-        rejects_noncanonical::<Secp256k1Base>();
+    fn fp_nonnative_rejects_noncanonical_witness() {
+        rejects_noncanonical::<Secp256K1Base>();
     }
 
     #[test]
-    fn fn_rejects_noncanonical_witness() {
-        rejects_noncanonical::<Secp256k1Scalar>();
+    fn fn_nonnative_rejects_noncanonical_witness() {
+        rejects_noncanonical::<Secp256K1Scalar>();
     }
 
-    fn rejects_wrong_reduction<M: NonNativeModulus>() {
-        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
-        let a = constant::<F, D, M>(&mut builder, [7, 0, 0, 0, 0, 0, 0, 0]);
-        let b = constant::<F, D, M>(&mut builder, [9, 0, 0, 0, 0, 0, 0, 0]);
-        let q = NonNativeTarget::<M>::new_virtual(&mut builder);
-        let r = NonNativeTarget::<M>::new_virtual(&mut builder);
-        assert_product_reduction(&mut builder, &a, &b, &q, &r);
+    fn rejects_wrong_reduction<FF: PrimeField>() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_ecc_config());
+        let a = builder.constant_nonnative::<FF>(FF::from_canonical_u64(7));
+        let b = builder.constant_nonnative::<FF>(FF::from_canonical_u64(9));
+        let quotient = builder.add_virtual_biguint_target(8);
+        range_check_u32_circuit(&mut builder, quotient.limbs.clone());
+        let remainder = builder.add_virtual_nonnative_target::<FF>();
+        constrain_product_reduction(&mut builder, &a, &b, &quotient, &remainder);
         let data = builder.build::<C>();
 
         let mut witness = PartialWitness::new();
-        set_target(&mut witness, q, &BigUint::zero());
-        set_target(&mut witness, r, &BigUint::from(62u32));
+        witness
+            .set_biguint_target(&quotient, &BigUint::zero())
+            .expect("zero quotient fits");
+        witness
+            .set_biguint_target(&remainder.value, &BigUint::from(62u32))
+            .expect("wrong remainder fits");
         assert!(
             data.prove(witness).is_err(),
             "a canonical but incorrect quotient/remainder pair must fail"
@@ -968,12 +894,26 @@ mod tests {
     }
 
     #[test]
-    fn fp_rejects_wrong_product_reduction() {
-        rejects_wrong_reduction::<Secp256k1Base>();
+    fn fp_nonnative_rejects_wrong_product_reduction() {
+        rejects_wrong_reduction::<Secp256K1Base>();
     }
 
     #[test]
-    fn fn_rejects_wrong_product_reduction() {
-        rejects_wrong_reduction::<Secp256k1Scalar>();
+    fn fn_nonnative_rejects_wrong_product_reduction() {
+        rejects_wrong_reduction::<Secp256K1Scalar>();
+    }
+
+    #[test]
+    fn one_nonnative_mul_mod_gate_count() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_ecc_config());
+        let a = builder.add_virtual_nonnative_target::<Secp256K1Base>();
+        let b = builder.add_virtual_nonnative_target::<Secp256K1Base>();
+        let _product = builder.mul_nonnative(&a, &b);
+        let gate_count = builder.num_gates();
+        println!("one nonnative mul mod gate count: {gate_count}");
+        assert!(
+            gate_count <= 1_000,
+            "one nonnative multiplication used {gate_count} gates"
+        );
     }
 }
