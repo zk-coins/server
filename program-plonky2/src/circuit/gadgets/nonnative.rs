@@ -28,6 +28,14 @@ pub struct NonNativeTarget<FF: Field> {
     pub(crate) _phantom: PhantomData<FF>,
 }
 
+impl<FF: Field> NonNativeTarget<FF> {
+    /// Underlying canonical big-integer target, exposed for host-side witness
+    /// assignment. This does not add or alter circuit constraints.
+    pub fn value(&self) -> &BigUintTarget {
+        &self.value
+    }
+}
+
 pub trait CircuitBuilderNonNative<F: RichField + Extendable<D>, const D: usize> {
     fn num_nonnative_limbs<FF: Field>() -> usize {
         FF::BITS.div_ceil(32)
