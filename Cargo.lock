@@ -5229,6 +5229,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "plonky2",
+ "secp256k1",
  "serde",
  "sha2",
  "shared",
