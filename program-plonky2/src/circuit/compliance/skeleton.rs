@@ -8,10 +8,14 @@ use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData};
 
 use crate::circuit::gadgets::bip340::{be_bytes32_to_nonnative, bip340_verify_with_s2c};
+use crate::circuit::gadgets::coinhist::coinhist_update_roots;
 use crate::circuit::gadgets::curve::{AffinePointTarget, CircuitBuilderCurve};
 use crate::circuit::gadgets::curve_types::Secp256K1;
 use crate::circuit::gadgets::nonnative::{CircuitBuilderNonNative, NonNativeTarget};
 use crate::circuit::gadgets::sha256::sha256;
+use crate::circuit::gadgets::u128_arith::{
+    accumulate, add_wide, connect_wide, geq, select_wide, zero_wide, U128Target, WideSum,
+};
 use crate::{C, D, F};
 
 use super::bindings::{
@@ -19,17 +23,20 @@ use super::bindings::{
     input_nullifiers_root_target, nk_commit_target,
 };
 use super::serialize::{
-    be_bytes32_to_u32_limbs, digest_to_be_bytes_target, encode_byte_string_target,
-    strict_be_bytes_less_than, tag_targets, u128_to_be_bytes_target, u64_to_be_bytes_target,
+    address_from_pk0_and_nk_commit, be_bytes32_to_u32_limbs, digest_to_be_bytes_target,
+    encode_byte_string_target, strict_be_bytes_less_than, tag_targets, u128_to_be_bytes_target,
+    u64_to_be_bytes_target,
 };
 use super::targets::{
-    virtual_bytes, AccountStateTarget, CoinTarget, InputAuthTarget, InputCoinTarget,
-    OutputTemplateTarget, ProofDataTarget, MAX_ACCOUNT_ASSETS,
+    virtual_bytes, AccountStateTarget, AssetIssuanceTarget, BalanceSlotTarget, CoinTarget,
+    HistoryUpdatePathTarget, InputAuthTarget, InputCoinTarget, OutputTemplateTarget,
+    ProofDataTarget, MAX_ACCOUNT_ASSETS, MAX_HISTORY_UPDATES_D3,
 };
 use super::{
-    M_STATE_MAINNET, M_STATE_REGTEST, M_STATE_TESTNET, NETWORK_TAG_MAINNET, NETWORK_TAG_REGTEST,
-    NETWORK_TAG_TESTNET, TAG_ACCOUNT_STATE, TAG_COINS_ROOT_LEAF, TAG_COINS_ROOT_NODE, TAG_NETWORK,
-    TAG_NPK_COMMIT,
+    GENESIS_TAG, M_STATE_MAINNET, M_STATE_REGTEST, M_STATE_TESTNET, NETWORK_TAG_MAINNET,
+    NETWORK_TAG_REGTEST, NETWORK_TAG_TESTNET, TAG_ACCOUNT_STATE, TAG_ASSET_ID, TAG_ASSET_ID_V2,
+    TAG_COINS_ROOT_LEAF, TAG_COINS_ROOT_NODE, TAG_ISSUANCE_TERMS, TAG_ISSUANCE_TERMS_V2,
+    TAG_NETWORK, TAG_NPK_COMMIT,
 };
 
 /// Fixed input-slot bound from spec §2.5.
@@ -75,6 +82,8 @@ pub struct ComplianceTargets {
     pub input_auth: [InputAuthTarget; MAX_TX_INPUTS],
     pub output_templates: [OutputTemplateTarget; MAX_TX_OUTPUTS],
     pub output_coins: [CoinTarget; MAX_TX_OUTPUTS],
+    pub asset_issuance: AssetIssuanceTarget,
+    pub history_update_paths: [HistoryUpdatePathTarget; MAX_HISTORY_UPDATES_D3],
     pub next_pubkey: [Target; 32],
     pub npk_rand: [Target; 32],
     pub txn_sig_rx: NonNativeTarget<Secp256K1Base>,
@@ -105,6 +114,32 @@ fn select_hash(
             builder.select(condition, when_true.elements[i], when_false.elements[i])
         }),
     }
+}
+
+fn hashes_equal(
+    builder: &mut CircuitBuilder<F, D>,
+    lhs: HashOutTarget,
+    rhs: HashOutTarget,
+) -> BoolTarget {
+    let mut equal = builder.constant_bool(true);
+    for (&lhs_element, &rhs_element) in lhs.elements.iter().zip(&rhs.elements) {
+        let element_equal = builder.is_equal(lhs_element, rhs_element);
+        equal = builder.and(equal, element_equal);
+    }
+    equal
+}
+
+fn bytes_equal(
+    builder: &mut CircuitBuilder<F, D>,
+    lhs: &[Target; 32],
+    rhs: &[Target; 32],
+) -> BoolTarget {
+    let mut equal = builder.constant_bool(true);
+    for (&lhs_byte, &rhs_byte) in lhs.iter().zip(rhs) {
+        let byte_equal = builder.is_equal(lhs_byte, rhs_byte);
+        equal = builder.and(equal, byte_equal);
+    }
+    equal
 }
 
 fn select_exact_hash(
@@ -142,29 +177,26 @@ fn assert_active_implies_nonzero_amount(
 
 fn enforce_balance_discipline(
     builder: &mut CircuitBuilder<F, D>,
-    state: &AccountStateTarget,
+    balances: &[BalanceSlotTarget; MAX_ACCOUNT_ASSETS],
     asset_id_bytes: &[[Target; 32]; MAX_ACCOUNT_ASSETS],
 ) -> Target {
-    for slot in state.balances {
+    for slot in *balances {
         assert_active_implies_nonzero_amount(builder, slot.active, slot.amount);
     }
     for index in 0..MAX_ACCOUNT_ASSETS - 1 {
         // A false slot forces every later slot false.
-        let not_current = builder.not(state.balances[index].active);
-        let gap = builder.and(not_current, state.balances[index + 1].active);
+        let not_current = builder.not(balances[index].active);
+        let gap = builder.and(not_current, balances[index + 1].active);
         builder.assert_zero(gap.target);
 
-        let both_active = builder.and(
-            state.balances[index].active,
-            state.balances[index + 1].active,
-        );
+        let both_active = builder.and(balances[index].active, balances[index + 1].active);
         let ascending =
             strict_be_bytes_less_than(builder, &asset_id_bytes[index], &asset_id_bytes[index + 1]);
         let not_ascending = builder.not(ascending);
         let bad_order = builder.and(both_active, not_ascending);
         builder.assert_zero(bad_order.target);
     }
-    builder.add_many(state.balances.map(|slot| slot.active.target))
+    builder.add_many(balances.map(|slot| slot.active.target))
 }
 
 fn account_state_hash_target(
@@ -178,7 +210,7 @@ fn account_state_hash_target(
         std::array::from_fn(|i| digest_to_be_bytes_target(builder, state.balances[i].asset_id));
     let amount_bytes: [[Target; 16]; MAX_ACCOUNT_ASSETS] =
         std::array::from_fn(|i| u128_to_be_bytes_target(builder, state.balances[i].amount));
-    let count = enforce_balance_discipline(builder, state, &asset_id_bytes);
+    let count = enforce_balance_discipline(builder, &state.balances, &asset_id_bytes);
 
     let mut fixed_prefix = Vec::with_capacity(136);
     fixed_prefix.extend_from_slice(&state.owner);
@@ -300,18 +332,6 @@ fn connect_unchanged_state(
 ) {
     connect_bytes(builder, &previous.owner, &new.owner);
     builder.connect_hashes(previous.nk_commit, new.nk_commit);
-    for (previous_slot, new_slot) in previous.balances.iter().zip(&new.balances) {
-        builder.connect(previous_slot.active.target, new_slot.active.target);
-        builder.connect_hashes(previous_slot.asset_id, new_slot.asset_id);
-        for (&previous_limb, &new_limb) in previous_slot
-            .amount
-            .limbs
-            .iter()
-            .zip(&new_slot.amount.limbs)
-        {
-            builder.connect(previous_limb, new_limb);
-        }
-    }
     connect_bytes(builder, &new.current_pubkey, next_pubkey);
 
     // Both counters are canonical Goldilocks integers and the predecessor
@@ -322,6 +342,296 @@ fn connect_unchanged_state(
     builder.assert_zero(at_largest.target);
     let incremented = builder.add_const(previous.send_counter, F::ONE);
     builder.connect(new.send_counter, incremented);
+}
+
+fn masked_balance_sum(
+    builder: &mut CircuitBuilder<F, D>,
+    balances: &[BalanceSlotTarget; MAX_ACCOUNT_ASSETS],
+    asset_id: HashOutTarget,
+) -> WideSum {
+    let masked: [U128Target; MAX_ACCOUNT_ASSETS] = balances.map(|slot| {
+        let same_asset = hashes_equal(builder, slot.asset_id, asset_id);
+        let include = builder.and(slot.active, same_asset);
+        U128Target::mask(builder, include, &slot.amount)
+    });
+    let partials: [WideSum; 4] =
+        std::array::from_fn(|i| accumulate(builder, &masked[i * 8..(i + 1) * 8]));
+    let left = add_wide(builder, &partials[0], &partials[1]);
+    let right = add_wide(builder, &partials[2], &partials[3]);
+    add_wide(builder, &left, &right)
+}
+
+fn masked_input_sum(
+    builder: &mut CircuitBuilder<F, D>,
+    inputs: &[InputCoinTarget; MAX_TX_INPUTS],
+    asset_id: HashOutTarget,
+) -> WideSum {
+    let masked = inputs.map(|coin| {
+        let same_asset = hashes_equal(builder, coin.asset_id, asset_id);
+        let include = builder.and(coin.active, same_asset);
+        U128Target::mask(builder, include, &coin.amount)
+    });
+    accumulate(builder, &masked)
+}
+
+fn masked_output_sum(
+    builder: &mut CircuitBuilder<F, D>,
+    outputs: &[OutputTemplateTarget; MAX_TX_OUTPUTS],
+    owner: Option<&[Target; 32]>,
+    asset_id: HashOutTarget,
+) -> WideSum {
+    let masked = outputs.map(|output| {
+        let same_asset = hashes_equal(builder, output.asset_id, asset_id);
+        let mut include = builder.and(output.active, same_asset);
+        if let Some(owner) = owner {
+            let is_self = bytes_equal(builder, &output.recipient, owner);
+            include = builder.and(include, is_self);
+        }
+        U128Target::mask(builder, include, &output.amount)
+    });
+    accumulate(builder, &masked)
+}
+
+fn masked_mint_sum(
+    builder: &mut CircuitBuilder<F, D>,
+    issuance: &AssetIssuanceTarget,
+    asset_id: HashOutTarget,
+) -> WideSum {
+    let same_asset = hashes_equal(builder, issuance.asset_id, asset_id);
+    let include = builder.and(issuance.present, same_asset);
+    let masked = U128Target::mask(builder, include, &issuance.amount);
+    WideSum::from_u128(builder, &masked)
+}
+
+fn asset_id_v1_target(
+    builder: &mut CircuitBuilder<F, D>,
+    issuance: &AssetIssuanceTarget,
+) -> HashOutTarget {
+    let genesis: Vec<_> = GENESIS_TAG
+        .iter()
+        .map(|&byte| builder.constant(F::from_canonical_u8(byte)))
+        .collect();
+    let mut elements = tag_targets(builder, TAG_ASSET_ID);
+    elements.extend(encode_byte_string_target(builder, &genesis));
+    elements.extend(encode_byte_string_target(builder, &issuance.creator_pubkey));
+    elements.extend(encode_byte_string_target(builder, &issuance.name_hash));
+    elements.push(issuance.decimals);
+    elements.push(issuance.issuance_version);
+    builder.hash_n_to_hash_no_pad::<PoseidonHash>(elements)
+}
+
+fn asset_id_v2_target(
+    builder: &mut CircuitBuilder<F, D>,
+    issuance: &AssetIssuanceTarget,
+) -> HashOutTarget {
+    let genesis: Vec<_> = GENESIS_TAG
+        .iter()
+        .map(|&byte| builder.constant(F::from_canonical_u8(byte)))
+        .collect();
+    let cap_bytes = u128_to_be_bytes_target(builder, issuance.cap_total);
+    let mut elements = tag_targets(builder, TAG_ASSET_ID_V2);
+    elements.extend(encode_byte_string_target(builder, &genesis));
+    elements.extend(encode_byte_string_target(builder, &issuance.creator_pubkey));
+    elements.extend(encode_byte_string_target(builder, &issuance.name_hash));
+    elements.push(issuance.decimals);
+    elements.push(issuance.issuance_version);
+    elements.extend(encode_byte_string_target(builder, &cap_bytes));
+    elements.extend(encode_byte_string_target(builder, &issuance.terms_salt));
+    builder.hash_n_to_hash_no_pad::<PoseidonHash>(elements)
+}
+
+fn terms_hash_v1_target(
+    builder: &mut CircuitBuilder<F, D>,
+    issuance: &AssetIssuanceTarget,
+) -> HashOutTarget {
+    let mut elements = tag_targets(builder, TAG_ISSUANCE_TERMS);
+    elements.extend(issuance.asset_id.elements);
+    elements.push(issuance.issuance_version);
+    builder.hash_n_to_hash_no_pad::<PoseidonHash>(elements)
+}
+
+fn terms_hash_v2_target(
+    builder: &mut CircuitBuilder<F, D>,
+    issuance: &AssetIssuanceTarget,
+) -> HashOutTarget {
+    let cap_bytes = u128_to_be_bytes_target(builder, issuance.cap_total);
+    let mut elements = tag_targets(builder, TAG_ISSUANCE_TERMS_V2);
+    elements.extend(issuance.asset_id.elements);
+    elements.push(issuance.issuance_version);
+    elements.extend(encode_byte_string_target(builder, &cap_bytes));
+    elements.extend(encode_byte_string_target(builder, &issuance.terms_salt));
+    builder.hash_n_to_hash_no_pad::<PoseidonHash>(elements)
+}
+
+fn enforce_mint(
+    builder: &mut CircuitBuilder<F, D>,
+    issuance: &AssetIssuanceTarget,
+    previous: &AccountStateTarget,
+    outputs: &[OutputTemplateTarget; MAX_TX_OUTPUTS],
+    inputs: &[InputCoinTarget; MAX_TX_INPUTS],
+) {
+    let one = builder.one();
+    let two = builder.constant(F::from_canonical_u8(2));
+    let is_v1 = builder.is_equal(issuance.issuance_version, one);
+    let is_v2 = builder.is_equal(issuance.issuance_version, two);
+    let supported = builder.or(is_v1, is_v2);
+    let unsupported = builder.not(supported);
+    let bad_version = builder.and(issuance.present, unsupported);
+    builder.assert_zero(bad_version.target);
+
+    let creator_address =
+        address_from_pk0_and_nk_commit(builder, &issuance.creator_pubkey, previous.nk_commit);
+    let owner_matches = bytes_equal(builder, &creator_address, &previous.owner);
+    let owner_mismatch = builder.not(owner_matches);
+    let bad_owner = builder.and(issuance.present, owner_mismatch);
+    builder.assert_zero(bad_owner.target);
+
+    let asset_v1 = asset_id_v1_target(builder, issuance);
+    let asset_v2 = asset_id_v2_target(builder, issuance);
+    let expected_asset = select_hash(builder, is_v1, asset_v1, asset_v2);
+    let selected_asset = select_hash(builder, issuance.present, issuance.asset_id, expected_asset);
+    builder.connect_hashes(selected_asset, expected_asset);
+
+    let terms_v1 = terms_hash_v1_target(builder, issuance);
+    let terms_v2 = terms_hash_v2_target(builder, issuance);
+    let expected_terms = select_hash(builder, is_v1, terms_v1, terms_v2);
+    let selected_terms = select_hash(
+        builder,
+        issuance.present,
+        issuance.terms_hash,
+        expected_terms,
+    );
+    builder.connect_hashes(selected_terms, expected_terms);
+
+    let apply_v2 = builder.and(issuance.present, is_v2);
+    let cap = WideSum::from_u128(builder, &issuance.cap_total);
+    let amount = WideSum::from_u128(builder, &issuance.amount);
+    let cap_holds = geq(builder, &cap, &amount);
+    let cap_fails = builder.not(cap_holds);
+    let bad_cap = builder.and(apply_v2, cap_fails);
+    builder.assert_zero(bad_cap.target);
+
+    let zero_target = builder.zero();
+    let counter_zero = builder.is_equal(previous.send_counter, zero_target);
+    let counter_nonzero = builder.not(counter_zero);
+    let bad_counter = builder.and(apply_v2, counter_nonzero);
+    builder.assert_zero(bad_counter.target);
+    let creator_is_current =
+        bytes_equal(builder, &previous.current_pubkey, &issuance.creator_pubkey);
+    let creator_not_current = builder.not(creator_is_current);
+    let bad_current = builder.and(apply_v2, creator_not_current);
+    builder.assert_zero(bad_current.target);
+
+    let out = masked_output_sum(builder, outputs, None, issuance.asset_id);
+    let selected_out = select_wide(builder, apply_v2, &out, &amount);
+    connect_wide(builder, &selected_out, &amount);
+    let input = masked_input_sum(builder, inputs, issuance.asset_id);
+    let zero = zero_wide(builder);
+    let selected_input = select_wide(builder, apply_v2, &input, &zero);
+    connect_wide(builder, &selected_input, &zero);
+
+    for output in outputs {
+        let same_asset = hashes_equal(builder, output.asset_id, issuance.asset_id);
+        let self_addressed = bytes_equal(builder, &output.recipient, &previous.owner);
+        let active_asset = builder.and(output.active, same_asset);
+        let forbidden_output = builder.and(active_asset, self_addressed);
+        let forbidden_v2 = builder.and(apply_v2, forbidden_output);
+        builder.assert_zero(forbidden_v2.target);
+    }
+}
+
+fn enforce_conservation(
+    builder: &mut CircuitBuilder<F, D>,
+    inputs: &[InputCoinTarget; MAX_TX_INPUTS],
+    outputs: &[OutputTemplateTarget; MAX_TX_OUTPUTS],
+    issuance: &AssetIssuanceTarget,
+) {
+    let candidates: [HashOutTarget; 2 * MAX_TX_INPUTS + 1] = std::array::from_fn(|i| {
+        if i < MAX_TX_INPUTS {
+            inputs[i].asset_id
+        } else if i < MAX_TX_INPUTS + MAX_TX_OUTPUTS {
+            outputs[i - MAX_TX_INPUTS].asset_id
+        } else {
+            issuance.asset_id
+        }
+    });
+    for asset_id in candidates {
+        let input = masked_input_sum(builder, inputs, asset_id);
+        let mint = masked_mint_sum(builder, issuance, asset_id);
+        let output = masked_output_sum(builder, outputs, None, asset_id);
+        let available = add_wide(builder, &input, &mint);
+        let holds = geq(builder, &available, &output);
+        builder.assert_one(holds.target);
+    }
+}
+
+fn enforce_balance_fold(
+    builder: &mut CircuitBuilder<F, D>,
+    previous: &AccountStateTarget,
+    new: &AccountStateTarget,
+    inputs: &[InputCoinTarget; MAX_TX_INPUTS],
+    outputs: &[OutputTemplateTarget; MAX_TX_OUTPUTS],
+) {
+    let candidates: [HashOutTarget; 2 * MAX_ACCOUNT_ASSETS + 2 * MAX_TX_INPUTS] =
+        std::array::from_fn(|i| {
+            if i < MAX_ACCOUNT_ASSETS {
+                previous.balances[i].asset_id
+            } else if i < 2 * MAX_ACCOUNT_ASSETS {
+                new.balances[i - MAX_ACCOUNT_ASSETS].asset_id
+            } else if i < 2 * MAX_ACCOUNT_ASSETS + MAX_TX_INPUTS {
+                inputs[i - 2 * MAX_ACCOUNT_ASSETS].asset_id
+            } else {
+                outputs[i - 2 * MAX_ACCOUNT_ASSETS - MAX_TX_INPUTS].asset_id
+            }
+        });
+    for asset_id in candidates {
+        let prev = masked_balance_sum(builder, &previous.balances, asset_id);
+        let new = masked_balance_sum(builder, &new.balances, asset_id);
+        let input = masked_input_sum(builder, inputs, asset_id);
+        let self_output = masked_output_sum(builder, outputs, Some(&previous.owner), asset_id);
+        let lhs = add_wide(builder, &prev, &self_output);
+        let rhs = add_wide(builder, &new, &input);
+        connect_wide(builder, &lhs, &rhs);
+    }
+}
+
+fn coin_history_update_target(
+    builder: &mut CircuitBuilder<F, D>,
+    previous: &AccountStateTarget,
+    new: &AccountStateTarget,
+    inputs: &[InputCoinTarget; MAX_TX_INPUTS],
+    outputs: &[OutputTemplateTarget; MAX_TX_OUTPUTS],
+    output_coins: &[CoinTarget; MAX_TX_OUTPUTS],
+    paths: &[HistoryUpdatePathTarget; MAX_HISTORY_UPDATES_D3],
+) -> HashOutTarget {
+    let mut current_root = previous.coin_history_root;
+    for index in 0..MAX_HISTORY_UPDATES_D3 {
+        let (key, old_state, new_state, apply) = if index < MAX_TX_INPUTS {
+            (inputs[index].identifier, 1, 2, inputs[index].active)
+        } else {
+            let output_index = index - MAX_TX_INPUTS;
+            let is_self = bytes_equal(builder, &outputs[output_index].recipient, &previous.owner);
+            (
+                output_coins[output_index].identifier,
+                0,
+                1,
+                builder.and(outputs[output_index].active, is_self),
+            )
+        };
+        let key_bytes = digest_to_be_bytes_target(builder, key);
+        let (root_old, root_new) = coinhist_update_roots(
+            builder,
+            &key_bytes,
+            old_state,
+            new_state,
+            &paths[index].siblings,
+        );
+        let required_old = select_hash(builder, apply, current_root, root_old);
+        builder.connect_hashes(root_old, required_old);
+        current_root = select_hash(builder, apply, root_new, current_root);
+    }
+    builder.connect_hashes(current_root, new.coin_history_root);
+    current_root
 }
 
 fn network_id_target(builder: &mut CircuitBuilder<F, D>, network: Network) -> HashOutTarget {
@@ -346,6 +656,9 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
     let input_coins = std::array::from_fn(|_| InputCoinTarget::new_virtual(&mut builder));
     let input_auth = std::array::from_fn(|_| InputAuthTarget::new_virtual(&mut builder));
     let output_templates = std::array::from_fn(|_| OutputTemplateTarget::new_virtual(&mut builder));
+    let asset_issuance = AssetIssuanceTarget::new_virtual(&mut builder);
+    let history_update_paths =
+        std::array::from_fn(|_| HistoryUpdatePathTarget::new_virtual(&mut builder));
     let next_pubkey = virtual_bytes(&mut builder);
     let npk_rand = virtual_bytes(&mut builder);
     let consumed_pubkey = virtual_bytes(&mut builder);
@@ -372,6 +685,14 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
         &input_coins,
         &input_auth,
     );
+    let prev_asset_id_bytes = std::array::from_fn(|i| {
+        digest_to_be_bytes_target(&mut builder, prev_account_state.balances[i].asset_id)
+    });
+    let _prev_balance_count = enforce_balance_discipline(
+        &mut builder,
+        &prev_account_state.balances,
+        &prev_asset_id_bytes,
+    );
 
     let input_active = input_coins.map(|coin| coin.active);
     let input_identifiers = input_coins.map(|coin| coin.identifier);
@@ -394,6 +715,35 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
     });
     let (output_coins_root, output_count) =
         output_coins_root_target(&mut builder, &output_templates, &output_coins);
+    enforce_mint(
+        &mut builder,
+        &asset_issuance,
+        &prev_account_state,
+        &output_templates,
+        &input_coins,
+    );
+    enforce_conservation(
+        &mut builder,
+        &input_coins,
+        &output_templates,
+        &asset_issuance,
+    );
+    enforce_balance_fold(
+        &mut builder,
+        &prev_account_state,
+        &new_account_state,
+        &input_coins,
+        &output_templates,
+    );
+    let coin_history_root = coin_history_update_target(
+        &mut builder,
+        &prev_account_state,
+        &new_account_state,
+        &input_coins,
+        &output_templates,
+        &output_coins,
+        &history_update_paths,
+    );
     let (new_account_state_hash, balance_count) =
         account_state_hash_target(&mut builder, &new_account_state);
 
@@ -411,7 +761,7 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
         new_account_state_hash,
         output_coins_root,
         input_nullifiers_root,
-        coin_history_root: builder.add_virtual_hash(),
+        coin_history_root,
         nav_commitment: builder.add_virtual_hash(),
         npk_commit,
     };
@@ -460,6 +810,8 @@ pub fn build_skeleton_circuit(config: CircuitConfig, network: Network) -> Skelet
         input_auth,
         output_templates,
         output_coins,
+        asset_issuance,
+        history_update_paths,
         next_pubkey,
         npk_rand,
         txn_sig_rx,

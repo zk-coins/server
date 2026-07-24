@@ -32,6 +32,20 @@ impl U128Target {
         }
         Self { limbs }
     }
+
+    /// Selects the real value when `condition` is true and zero otherwise.
+    pub fn mask<F: RichField + Extendable<D>, const D: usize>(
+        builder: &mut CircuitBuilder<F, D>,
+        condition: BoolTarget,
+        value: &Self,
+    ) -> Self {
+        let zero = builder.zero();
+        Self {
+            limbs: value
+                .limbs
+                .map(|limb| builder.select(condition, limb, zero)),
+        }
+    }
 }
 
 /// A 160-bit non-negative integer as five little-endian `u32` limbs.
@@ -64,6 +78,40 @@ impl WideSum {
                 zero,
             ],
         }
+    }
+}
+
+/// Returns the all-zero 160-bit value.
+pub fn zero_wide<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+) -> WideSum {
+    WideSum {
+        limbs: [builder.zero(); WIDE_LIMBS],
+    }
+}
+
+/// Selects one of two 160-bit values limb-by-limb.
+pub fn select_wide<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    condition: BoolTarget,
+    when_true: &WideSum,
+    when_false: &WideSum,
+) -> WideSum {
+    WideSum {
+        limbs: std::array::from_fn(|i| {
+            builder.select(condition, when_true.limbs[i], when_false.limbs[i])
+        }),
+    }
+}
+
+/// Constrains two 160-bit values to be exactly equal.
+pub fn connect_wide<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    lhs: &WideSum,
+    rhs: &WideSum,
+) {
+    for i in 0..WIDE_LIMBS {
+        builder.connect(lhs.limbs[i], rhs.limbs[i]);
     }
 }
 
