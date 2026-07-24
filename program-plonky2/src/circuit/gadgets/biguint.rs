@@ -17,6 +17,7 @@ use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
 
 use crate::u32_lib::gadgets::arithmetic_u32::{CircuitBuilderU32, U32Target};
 use crate::u32_lib::gadgets::multiple_comparison::list_le_u32_circuit;
+use crate::u32_lib::gadgets::range_check::range_check_u32_circuit;
 use crate::u32_lib::witness::{GeneratedValuesU32, WitnessU32};
 
 #[derive(Clone, Debug)]
@@ -207,6 +208,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderBiguint<F, D>
             a.num_limbs() - b.num_limbs() + 1
         };
         let div = self.add_virtual_biguint_target(div_num_limbs);
+        range_check_u32_circuit(self, div.limbs.clone());
         let rem = self.add_virtual_biguint_target(b.num_limbs());
 
         self.add_simple_generator(BigUintDivRemGenerator::<F, D> {
@@ -360,13 +362,84 @@ fn read_biguint_target(src: &mut Buffer) -> IoResult<BigUintTarget> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
     use anyhow::Result;
     use num::{BigUint, Integer, One, Zero};
-    use plonky2::iop::witness::PartialWitness;
-    use plonky2::plonk::circuit_data::CircuitConfig;
+    use plonky2::field::types::Field;
+    use plonky2::iop::generator::{GeneratedValues, SimpleGenerator, WitnessGeneratorRef};
+    use plonky2::iop::target::Target;
+    use plonky2::iop::witness::{PartialWitness, PartitionWitness, WitnessWrite};
+    use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
 
     use super::*;
     use crate::{C, D, F};
+
+    #[derive(Debug)]
+    struct NonCanonicalDivGenerator {
+        a: BigUintTarget,
+        b: BigUintTarget,
+        div: BigUintTarget,
+        rem: BigUintTarget,
+    }
+
+    impl SimpleGenerator<F, D> for NonCanonicalDivGenerator {
+        fn id(&self) -> String {
+            "NonCanonicalDivGenerator".to_owned()
+        }
+
+        fn dependencies(&self) -> Vec<Target> {
+            self.a
+                .limbs
+                .iter()
+                .chain(&self.b.limbs)
+                .map(|limb| limb.0)
+                .collect()
+        }
+
+        fn run_once(
+            &self,
+            witness: &PartitionWitness<F>,
+            out_buffer: &mut GeneratedValues<F>,
+        ) -> Result<()> {
+            assert_eq!(
+                witness.get_biguint_target(self.a.clone()),
+                BigUint::one() << 40,
+                "the malicious division fixture requires a = 2^40"
+            );
+            assert_eq!(
+                witness.get_biguint_target(self.b.clone()),
+                BigUint::one(),
+                "the malicious division fixture requires b = 1"
+            );
+            assert_eq!(self.div.num_limbs(), 1);
+            out_buffer.set_target(self.div.limbs[0].0, F::from_canonical_u64(1u64 << 40))?;
+            out_buffer.set_biguint_target(&self.rem, &BigUint::zero())
+        }
+
+        fn serialize(
+            &self,
+            dst: &mut Vec<u8>,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<()> {
+            write_biguint_target(dst, &self.a)?;
+            write_biguint_target(dst, &self.b)?;
+            write_biguint_target(dst, &self.div)?;
+            write_biguint_target(dst, &self.rem)
+        }
+
+        fn deserialize(
+            src: &mut Buffer,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<Self> {
+            Ok(Self {
+                a: read_biguint_target(src)?,
+                b: read_biguint_target(src)?,
+                div: read_biguint_target(src)?,
+                rem: read_biguint_target(src)?,
+            })
+        }
+    }
 
     fn limb_len(value: &BigUint) -> usize {
         value.to_u32_digits().len().max(1)
@@ -452,5 +525,45 @@ mod tests {
         let data = builder.build::<C>();
         let proof = data.prove(witness)?;
         data.verify(proof)
+    }
+
+    /// A raw quotient limb of 2^40 can satisfy `div * 1 + 0 = 2^40`
+    /// across two canonical input limbs, but it is not a canonical u32 limb.
+    #[test]
+    fn div_rem_biguint_rejects_noncanonical_quotient_limb() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let a = builder.add_virtual_biguint_target(2);
+        let b = builder.add_virtual_biguint_target(2);
+        let (div, rem) = builder.div_rem_biguint(&a, &b);
+        assert_eq!(div.num_limbs(), 1);
+        let mut data = builder.build::<C>();
+
+        let generator_index = data
+            .prover_only
+            .generators
+            .iter()
+            .position(|generator| generator.0.id().contains("BigUintDivRemGenerator"))
+            .expect("BigUint division generator must be present");
+        data.prover_only.generators[generator_index] =
+            WitnessGeneratorRef::new(NonCanonicalDivGenerator {
+                a: a.clone(),
+                b: b.clone(),
+                div,
+                rem,
+            }
+            .adapter());
+
+        let mut witness = PartialWitness::new();
+        witness
+            .set_biguint_target(&a, &(BigUint::one() << 40))
+            .expect("a fits in two canonical limbs");
+        witness
+            .set_biguint_target(&b, &BigUint::one())
+            .expect("b fits in two canonical limbs");
+        let failed = catch_unwind(AssertUnwindSafe(|| data.prove(witness)));
+        assert!(
+            failed.is_err() || failed.expect("checked panic").is_err(),
+            "a noncanonical quotient limb unexpectedly satisfied the circuit"
+        );
     }
 }

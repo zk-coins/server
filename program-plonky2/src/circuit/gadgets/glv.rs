@@ -60,8 +60,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderGlv<F, D>
     ) {
         let k1 = self.add_virtual_nonnative_target_sized::<Secp256K1Scalar>(4);
         let k2 = self.add_virtual_nonnative_target_sized::<Secp256K1Scalar>(4);
-        let k1_neg = self.add_virtual_bool_target_unsafe();
-        let k2_neg = self.add_virtual_bool_target_unsafe();
+        let k1_neg = self.add_virtual_bool_target_safe();
+        let k2_neg = self.add_virtual_bool_target_safe();
         self.add_simple_generator(GlvDecompositionGenerator::<F, D> {
             k: k.clone(),
             k1: k1.clone(),
@@ -186,19 +186,79 @@ mod curve_tests {
     use plonky2::field::secp256k1_base::Secp256K1Base;
     use plonky2::field::secp256k1_scalar::Secp256K1Scalar;
     use plonky2::field::types::{Field, PrimeField};
-    use plonky2::iop::witness::PartialWitness;
+    use plonky2::iop::generator::{GeneratedValues, SimpleGenerator, WitnessGeneratorRef};
+    use plonky2::iop::target::{BoolTarget, Target};
+    use plonky2::iop::witness::{PartialWitness, PartitionWitness, WitnessWrite};
     use plonky2::plonk::circuit_builder::CircuitBuilder;
-    use plonky2::plonk::circuit_data::CircuitConfig;
+    use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
+    use plonky2::util::serialization::{Buffer, IoResult, Read, Write};
     use secp256k1::{Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
 
-    use super::CircuitBuilderGlv;
-    use crate::circuit::gadgets::biguint::WitnessBigUint;
+    use super::{read_nonnative, write_nonnative, CircuitBuilderGlv};
+    use crate::circuit::gadgets::biguint::{GeneratedValuesBigUint, WitnessBigUint};
     use crate::circuit::gadgets::curve::{AffinePointTarget, CircuitBuilderCurve};
     use crate::circuit::gadgets::curve_types::{
         lift_x_even_y, AffinePoint, Curve, CurveScalar, Secp256K1,
     };
     use crate::circuit::gadgets::nonnative::{CircuitBuilderNonNative, NonNativeTarget};
     use crate::{C, D, F};
+
+    #[derive(Debug)]
+    struct NonBooleanGlvDecompositionGenerator {
+        k: NonNativeTarget<Secp256K1Scalar>,
+        k1: NonNativeTarget<Secp256K1Scalar>,
+        k2: NonNativeTarget<Secp256K1Scalar>,
+        k1_neg: BoolTarget,
+        k2_neg: BoolTarget,
+    }
+
+    impl SimpleGenerator<F, D> for NonBooleanGlvDecompositionGenerator {
+        fn id(&self) -> String {
+            "NonBooleanGlvDecompositionGenerator".to_owned()
+        }
+
+        fn dependencies(&self) -> Vec<Target> {
+            self.k.value.limbs.iter().map(|limb| limb.0).collect()
+        }
+
+        fn run_once(
+            &self,
+            witness: &PartitionWitness<F>,
+            out_buffer: &mut GeneratedValues<F>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(
+                witness.get_biguint_target(self.k.value.clone()),
+                BigUint::from(0u8),
+                "the malicious GLV fixture requires k = 0"
+            );
+            out_buffer.set_biguint_target(&self.k1.value, &BigUint::from(0u8))?;
+            out_buffer.set_biguint_target(&self.k2.value, &BigUint::from(0u8))?;
+            out_buffer.set_target(self.k1_neg.target, F::from_canonical_u64(2))?;
+            out_buffer.set_bool_target(self.k2_neg, false)
+        }
+
+        fn serialize(
+            &self,
+            dst: &mut Vec<u8>,
+            _common: &CommonCircuitData<F, D>,
+        ) -> IoResult<()> {
+            write_nonnative(dst, &self.k)?;
+            write_nonnative(dst, &self.k1)?;
+            write_nonnative(dst, &self.k2)?;
+            dst.write_target_bool(self.k1_neg)?;
+            dst.write_target_bool(self.k2_neg)
+        }
+
+        fn deserialize(src: &mut Buffer, _common: &CommonCircuitData<F, D>) -> IoResult<Self> {
+            Ok(Self {
+                k: read_nonnative(src)?,
+                k1: read_nonnative(src)?,
+                k2: read_nonnative(src)?,
+                k1_neg: src.read_target_bool()?,
+                k2_neg: src.read_target_bool()?,
+            })
+        }
+    }
 
     fn scalar_from_bytes(bytes: [u8; 32]) -> Secp256K1Scalar {
         Secp256K1Scalar::from_noncanonical_biguint(BigUint::from_bytes_be(&bytes))
@@ -315,6 +375,44 @@ mod curve_tests {
         assert!(
             proof_failure(failed),
             "an off-curve constant unexpectedly satisfied the circuit"
+        );
+    }
+
+    /// A malicious GLV generator setting a sign flag to 2 must fail proving.
+    ///
+    /// With `k = k1 = k2 = 0`, the non-Boolean flag does not disturb any of
+    /// the pre-existing scalar-reconstruction equations, so this regression
+    /// fails before the production sign allocation is made Boolean-safe.
+    #[test]
+    fn glv_decomposition_rejects_non_boolean_sign_flag() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_ecc_config());
+        let k = builder.add_virtual_nonnative_target::<Secp256K1Scalar>();
+        let (k1, k2, k1_neg, k2_neg) = builder.decompose_secp256k1_scalar(&k);
+        let mut data = builder.build::<C>();
+
+        let generator_index = data
+            .prover_only
+            .generators
+            .iter()
+            .position(|generator| generator.0.id().contains("GlvDecompositionGenerator"))
+            .expect("GLV decomposition generator must be present");
+        data.prover_only.generators[generator_index] = WitnessGeneratorRef::new(
+            NonBooleanGlvDecompositionGenerator {
+                k: k.clone(),
+                k1,
+                k2,
+                k1_neg,
+                k2_neg,
+            }
+            .adapter(),
+        );
+
+        let mut witness = PartialWitness::new();
+        set_nonnative(&mut witness, &k, Secp256K1Scalar::ZERO);
+        let failed = catch_unwind(AssertUnwindSafe(|| data.prove(witness)));
+        assert!(
+            proof_failure(failed),
+            "a non-Boolean GLV sign flag unexpectedly satisfied the circuit"
         );
     }
 
