@@ -2,6 +2,24 @@
 //!
 //! The circuit shape is fixed at the maximum depth of a `u64`-sized log.
 //! Inactive levels are selected away, so unused witness slots are unread.
+//!
+//! # Canonical size / position representation
+//!
+//! Protocol log sizes and positions are `u64` values in `0 … 2^64 − 1` (§2.5,
+//! `H_MAX = 64`). Goldilocks has `p = 2^64 − 2^32 + 1 < 2^64`, so a bare
+//! `split_le(x, 64)` is **not** injective: the bit patterns of `1` and
+//! `p + 1` both reconstruct to the same field element. A malicious prover can
+//! therefore feed the bits of a large size into one consumer (e.g. a tagged
+//! byte encoding) while another consumer reads the same `Target` as a small
+//! field value (e.g. the `n == 1` base case) and accepts an empty path.
+//!
+//! Every size-carrying wire is therefore decomposed through
+//! [`canonical_u64_bits`], which range-checks the 64 bits as two `u32` limbs
+//! and asserts the bit-integer is `< p`. That representative is unique for
+//! every field element and matches host `to_canonical_u64()`. Values that
+//! do not fit in a single Goldilocks element cannot be carried as a lone
+//! `Target` at all (pre-existing API bound); within that API the bit form is
+//! the injective canonical encoding of the protocol integer.
 
 use plonky2::field::extension::Extendable;
 use plonky2::hash::hash_types::{HashOutTarget, RichField};
@@ -127,6 +145,7 @@ fn encode_byte_string_target<F: RichField + Extendable<D>, const D: usize>(
     for chunk in bytes.chunks(7) {
         let mut encoded = builder.zero();
         for (i, &byte) in chunk.iter().enumerate() {
+            // Bytes are already width-8; 8-bit splits are injective in Goldilocks.
             builder.split_le(byte, 8);
             let weight = F::from_canonical_u64(1u64 << (8 * (6 - i)));
             encoded = builder.mul_const_add(weight, byte, encoded);
@@ -136,11 +155,60 @@ fn encode_byte_string_target<F: RichField + Extendable<D>, const D: usize>(
     out
 }
 
+/// Strict bit-integer comparison `bits_le < bound` (MSB-first scan).
+fn less_than_constant_bits<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    bits_le: &[BoolTarget],
+    bound: u64,
+) -> BoolTarget {
+    let mut equal = builder.constant_bool(true);
+    let mut less = builder.constant_bool(false);
+    for i in (0..bits_le.len()).rev() {
+        let bound_bit = ((bound >> i) & 1) != 0;
+        if bound_bit {
+            let not_bit = builder.not(bits_le[i]);
+            let first_less = builder.and(equal, not_bit);
+            less = builder.or(less, first_less);
+            equal = builder.and(equal, bits_le[i]);
+        } else {
+            let not_bit = builder.not(bits_le[i]);
+            equal = builder.and(equal, not_bit);
+        }
+    }
+    less
+}
+
+/// Canonically decomposes a protocol size/position carried as a Goldilocks
+/// element into 64 little-endian bits.
+///
+/// `split_le(_, 64)` alone admits a second 64-bit representative for some
+/// field values (classically the bits of `p + 1` for the element `1`). The
+/// explicit bit-integer `< ORDER` check restores injectivity. Packing the
+/// bits into two range-checked `u32` limbs `(lo, hi)` yields the same unique
+/// representative: every limb is in `0 … 2^32 − 1` by construction, and
+/// `lo + hi·2^32` equals the unique integer in `0 … p − 1` that reduces to
+/// `value`.
+fn canonical_u64_bits<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    value: Target,
+) -> Vec<BoolTarget> {
+    let bits = builder.split_le(value, 64);
+    // Two range-checked u32 limbs — equivalent packing of the same bits.
+    let lo = builder.le_sum(bits[..32].iter());
+    let hi = builder.le_sum(bits[32..].iter());
+    builder.range_check(lo, 32);
+    builder.range_check(hi, 32);
+    // Reject non-canonical bit patterns such as `p + 1` for the element `1`.
+    let canonical = less_than_constant_bits(builder, &bits, F::ORDER);
+    builder.assert_one(canonical.target);
+    bits
+}
+
 fn u64_to_be_bytes_target<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     value: Target,
 ) -> [Target; 8] {
-    let bits = builder.split_le(value, 64);
+    let bits = canonical_u64_bits(builder, value);
     std::array::from_fn(|i| {
         let hi = 63 - i * 8;
         let lo = hi - 7;
@@ -186,11 +254,15 @@ pub fn nflog_empty_target<F: RichField + Extendable<D>, const D: usize>(
 }
 
 /// Highest set bit of `x`, represented as its power-of-two value.
+///
+/// `x` is a size-derived intermediate (e.g. `n − 1` for split-point
+/// derivation); its bit form is forced canonical so a non-canonical
+/// decomposition cannot steer the RFC-6962 recursion.
 fn highest_set_bit_pow2<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     x: Target,
 ) -> Target {
-    let bits = builder.split_le(x, 64);
+    let bits = canonical_u64_bits(builder, x);
     let mut any_higher = builder.constant_bool(false);
     let mut result = builder.zero();
     for j in (0..64).rev() {
@@ -202,14 +274,14 @@ fn highest_set_bit_pow2<F: RichField + Extendable<D>, const D: usize>(
     result
 }
 
-/// Strict 64-bit comparison using an MSB-first Boolean scan.
+/// Strict 64-bit comparison using an MSB-first Boolean scan over canonical bits.
 fn less_than_64<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     a: Target,
     b: Target,
 ) -> BoolTarget {
-    let a_bits = builder.split_le(a, 64);
-    let b_bits = builder.split_le(b, 64);
+    let a_bits = canonical_u64_bits(builder, a);
+    let b_bits = canonical_u64_bits(builder, b);
     let mut equal_so_far = builder.constant_bool(true);
     let mut a_less = builder.constant_bool(false);
     for i in (0..64).rev() {
@@ -396,7 +468,7 @@ mod tests {
     use super::*;
     use crate::hash::{hash_bytes, HashDigest, ZERO_HASH};
     use crate::{C, D, F};
-    use plonky2::field::types::{Field, PrimeField64};
+    use plonky2::field::types::{Field, Field64, PrimeField64};
     use plonky2::hash::hash_types::HashOutTarget;
     use plonky2::iop::witness::{PartialWitness, WitnessWrite};
     use plonky2::plonk::circuit_data::{CircuitConfig, CircuitData};
@@ -676,6 +748,150 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(encode_ascii_tag_elements(local), expected);
         }
+    }
+
+    /// Soundness: the classical non-canonical 64-bit representative of `1`
+    /// (`p + 1 = 0xffffffff00000002`) must be rejected.
+    ///
+    /// Bare `split_le(_, 64)` accepts both the bits of `1` and the bits of
+    /// `p + 1` for the field element `1`, because they agree mod `p`. The
+    /// gadget's [`canonical_u64_bits`] closes that hole. This test builds a
+    /// minimal circuit that exposes the bit wires, assigns the malicious
+    /// decomposition, and asserts `prove` fails. An honest decomposition of
+    /// the same element succeeds — so the failure is specifically the
+    /// canonicity check, not an unrelated constraint.
+    ///
+    /// The high-level inclusion/consistency witness API only assigns the size
+    /// `Target`; Plonky2's prover then synthesises canonical bits itself. The
+    /// malicious bit pattern is therefore not expressible through that API —
+    /// it has to be injected on the free bit wires, which is what this test
+    /// does.
+    #[test]
+    fn rejects_noncanonical_p_plus_one_bit_decomposition() {
+        // p + 1 ≡ 1 (mod p). Its 64-bit pattern is a second representative of 1.
+        let p_plus_one: u64 = F::ORDER.wrapping_add(1);
+        assert_eq!(
+            F::from_noncanonical_u64(p_plus_one),
+            F::ONE,
+            "precondition: p+1 must reduce to 1"
+        );
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let value = builder.add_virtual_target();
+        // The bit wires returned by the gadget helper are the free witnesses
+        // allocated by split_le; assigning them injects a chosen decomposition.
+        let bits = canonical_u64_bits(&mut builder, value);
+        builder.register_public_input(value);
+        let data = builder.build::<C>();
+
+        // Malicious witness: value = 1, bits = bits(p+1). Reconstruction holds
+        // mod p; canonicity must reject.
+        let mut bad = PartialWitness::new();
+        bad.set_target(value, F::ONE).unwrap();
+        for i in 0..64 {
+            let bit = F::from_canonical_u64((p_plus_one >> i) & 1);
+            bad.set_target(bits[i].target, bit).unwrap();
+        }
+        assert!(
+            data.prove(bad).is_err(),
+            "non-canonical bits of p+1 for the element 1 must be rejected"
+        );
+
+        // Honest witness: value = 1, bits = bits(1). Must prove.
+        let mut good = PartialWitness::new();
+        good.set_target(value, F::ONE).unwrap();
+        for i in 0..64 {
+            let bit = F::from_canonical_u64((1u64 >> i) & 1);
+            good.set_target(bits[i].target, bit).unwrap();
+        }
+        let proof = data
+            .prove(good)
+            .expect("canonical bits of 1 must prove");
+        data.verify(proof).expect("canonical proof must verify");
+    }
+
+    /// End-to-end: a size `Target` equal to 1 with an honest (empty) inclusion
+    /// path proves, while feeding the same element through the leaf-position
+    /// byte encoder under the non-canonical bit pattern is impossible once
+    /// [`canonical_u64_bits`] is applied — covered by the bit-wire test above.
+    /// Here we only pin that the gadget still accepts the honest `n = 1` base
+    /// case, which is the case the attack would have abused.
+    #[test]
+    fn inclusion_size_one_base_case_accepts_empty_path() {
+        let (data, targets) = build_inclusion_circuit();
+        let entry = &synthetic_entries(1)[0];
+        let leaf = nflog_leaf_hash(0, entry);
+        let mth = nflog_mth(std::slice::from_ref(entry));
+        assert!(prove_inclusion(
+            &data,
+            targets,
+            leaf,
+            0,
+            &[],
+            1,
+            mth,
+        ));
+    }
+
+    /// Cheap circuit-shape report (not a correctness check). Canonical size
+    /// handling moves gate count / degree bits; this prints them for the
+    /// isolated inclusion and consistency wrappers used by the suite.
+    #[test]
+    fn report_gadget_circuit_dimensions() {
+        let mut inclusion_builder =
+            CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        {
+            let targets = InclusionTargets {
+                leaf: inclusion_builder.add_virtual_hash(),
+                position: inclusion_builder.add_virtual_target(),
+                path: std::array::from_fn(|_| inclusion_builder.add_virtual_hash()),
+                size: inclusion_builder.add_virtual_target(),
+                mth: inclusion_builder.add_virtual_hash(),
+            };
+            verify_nflog_inclusion(
+                &mut inclusion_builder,
+                targets.leaf,
+                targets.position,
+                &targets.path,
+                targets.size,
+                targets.mth,
+            );
+        }
+        let inclusion_gates = inclusion_builder.num_gates();
+        let inclusion_data = inclusion_builder.build::<C>();
+
+        let mut consistency_builder =
+            CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        {
+            let targets = ConsistencyTargets {
+                m: consistency_builder.add_virtual_target(),
+                mth_a: consistency_builder.add_virtual_hash(),
+                n: consistency_builder.add_virtual_target(),
+                mth_b: consistency_builder.add_virtual_hash(),
+                proof: std::array::from_fn(|_| consistency_builder.add_virtual_hash()),
+            };
+            verify_nflog_consistency(
+                &mut consistency_builder,
+                targets.m,
+                targets.mth_a,
+                targets.n,
+                targets.mth_b,
+                &targets.proof,
+            );
+        }
+        let consistency_gates = consistency_builder.num_gates();
+        let consistency_data = consistency_builder.build::<C>();
+
+        eprintln!(
+            "nflog inclusion: num_gates={} degree_bits={}",
+            inclusion_gates,
+            inclusion_data.common.degree_bits()
+        );
+        eprintln!(
+            "nflog consistency: num_gates={} degree_bits={}",
+            consistency_gates,
+            consistency_data.common.degree_bits()
+        );
     }
 
     #[test]
