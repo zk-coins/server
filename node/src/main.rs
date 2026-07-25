@@ -26,6 +26,7 @@ use node::scanner_runtime::scan_for_inscriptions;
 use node::scanner_ws::{run_scanner_ws, ScannerWsConfig};
 use node::state::State;
 use node::username;
+use node::v11::{self, ProverMode};
 use node::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
 use shared::commitment::Commitment;
 use std::error::Error as StdError;
@@ -103,10 +104,47 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     );
     println!("Connected to Postgres state-layer");
 
+    // Cutover Stage 1: select prove/state stack. Default is legacy
+    // (unset / empty / "legacy"). `ZKCOINS_PROVER=v11` loads the
+    // StateEngine adapter against the additive v11 tables; missing
+    // pins fail loud — never fall back to the legacy prover.
+    let prover_mode = v11::mode::prover_mode_from_env().unwrap_or_else(|e| {
+        panic!("{e}");
+    });
+    // Keep the adapter alive for Stage 2 wiring; Stage 1 does not yet
+    // replace AccountNode / publisher / scanner.
+    let _v11_adapter: Option<node::v11::EngineAdapter> = match prover_mode {
+        ProverMode::Legacy => {
+            println!("Prover mode: legacy (ZKCOINS_PROVER unset or legacy)");
+            None
+        }
+        ProverMode::V11 => {
+            println!("Prover mode: v11 (StateEngine + v11 persistence)");
+            let adapter = node::v11::EngineAdapter::load_or_create_from_env((*pool).clone())
+                .await
+                .expect("v11 EngineAdapter bootstrap");
+            // Digests are available via ProverBridge::circuit_digest_bytes /
+            // balance_circuit_digest_bytes (§1.7.1). Do not compute them here:
+            // each forces a multi-minute circuit build, and Stage 1 still boots
+            // the legacy Prover for AccountNode/REST until Stage 3.
+            println!(
+                "v11 EngineAdapter ready (network={:?}, activation_height={})",
+                adapter.network(),
+                adapter.activation_height()
+            );
+            Some(adapter)
+        }
+    };
+
     // Build the Plonky2 prover ONCE, up front. Its
     // `circuit_digest_bytes` drives the boot-time self-heal below, and
     // the same instance is reused by the `AccountNode` rehydration so we
     // pay the ~14 s circuit build exactly once.
+    //
+    // Stage 1 still boots the legacy AccountNode/REST surface even under
+    // `ZKCOINS_PROVER=v11` (Stage 3 swaps prove call-sites). The v11
+    // adapter above is the flag-gated StateEngine path; the legacy
+    // Prover remains required for the existing REST flows until then.
     let prover = zkcoins_prover::Prover::new();
     let live_digest = prover.circuit_digest_bytes();
     println!("Built Plonky2 prover (circuit ready)");

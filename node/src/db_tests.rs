@@ -79,6 +79,8 @@ async fn connect_and_migrate_creates_all_tables() {
     //   * After 0018 (asset_creators):   25 tables + 1 view (the
     //     off-circuit per-asset creator binding — sorts between
     //     `accounts` and `block_log`.)
+    //   * After 0019 (v1.1 persistence): 31 tables + 1 view (additive
+    //     NfLog / CoinHist / multi-asset account tables; all `v11_*`).
     assert_eq!(
         names,
         vec![
@@ -108,6 +110,12 @@ async fn connect_and_migrate_creates_all_tables() {
             "tx_mining_log".to_string(),
             "username_claim_log".to_string(),
             "usernames".to_string(),
+            "v11_accounts".to_string(),
+            "v11_engine_meta".to_string(),
+            "v11_nflog_entries".to_string(),
+            "v11_nullifier_index".to_string(),
+            "v11_spendable_coins".to_string(),
+            "v11_spent_coins".to_string(),
         ]
     );
 }

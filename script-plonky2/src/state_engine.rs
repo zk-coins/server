@@ -221,6 +221,136 @@ impl StateEngine {
         &self.nflog
     }
 
+    pub fn activation_height(&self) -> u64 {
+        self.activation_height
+    }
+
+    pub fn fold_seq(&self) -> u32 {
+        self.fold_seq
+    }
+
+    pub fn bridge(&self) -> &ProverBridge {
+        &self.bridge
+    }
+
+    /// NfLog mirror in absolute position order: `(ChainPosition, entry)`.
+    ///
+    /// The sequence is the normative reconstruction input: reloading by
+    /// folding these pairs in order yields a byte-identical NfLog root.
+    pub fn nflog_mirror(&self) -> Vec<(ChainPosition, NfLogEntry)> {
+        self.nflog_positions
+            .iter()
+            .copied()
+            .zip(self.nflog_entries.iter().copied())
+            .collect()
+    }
+
+    /// Iterate accounts currently held by the engine.
+    pub fn accounts(&self) -> impl Iterator<Item = (&Address, &AccountRecord)> {
+        self.accounts.iter()
+    }
+
+    /// Rebuild an engine from a complete persisted snapshot.
+    ///
+    /// Fails loud if:
+    /// - NfLog positions are not a dense `0..n` sequence when folded,
+    /// - any fold is duplicate / pre-activation,
+    /// - account coinhist roots disagree with `AccountState`,
+    /// - the rebuilt NfLog root disagrees with the source entries.
+    ///
+    /// Does **not** fall back to an empty engine on partial data.
+    pub fn from_persisted(
+        network: Network,
+        activation_height: u64,
+        tip_height: u64,
+        fold_seq: u32,
+        nflog: Vec<(ChainPosition, NfLogEntry)>,
+        accounts: Vec<(Address, AccountRecord)>,
+    ) -> Result<Self> {
+        let mut engine = Self::new(network, activation_height);
+        // Do not call `set_tip_height` here: it zeroes `fold_seq`.
+        engine.tip_height = tip_height;
+        engine.fold_seq = fold_seq;
+
+        for (expected_pos, (chain_pos, entry)) in nflog.iter().copied().enumerate() {
+            match engine
+                .nflog
+                .fold(chain_pos, entry.pk, entry.r)
+                .context("from_persisted: NfLog fold failed")?
+            {
+                FoldOutcome::Appended(pos) => ensure!(
+                    pos == expected_pos as u64,
+                    "from_persisted: NfLog position gap or reorder at expected {expected_pos}, got {pos}"
+                ),
+                FoldOutcome::DuplicateIgnored => {
+                    bail!("from_persisted: NfLog snapshot contains a duplicate Pk at position {expected_pos}")
+                }
+                FoldOutcome::BelowActivationHeight => {
+                    bail!(
+                        "from_persisted: NfLog snapshot entry at position {expected_pos} \
+                         is below activation_height {activation_height}"
+                    )
+                }
+            }
+            engine.nflog_entries.push(entry);
+            engine.nflog_positions.push(chain_pos);
+        }
+
+        ensure!(
+            engine.nflog.nav().size == engine.nflog_entries.len() as u64,
+            "from_persisted: NfLog size drifted from entry count"
+        );
+        ensure!(
+            engine.nflog.nav().mth == host::nflog_mth(&engine.nflog_entries),
+            "from_persisted: NfLog MTH disagrees with full-sequence recomputation"
+        );
+
+        for (owner, record) in accounts {
+            engine.insert_account(owner, record)?;
+        }
+        Ok(engine)
+    }
+
+    /// Append a published nullifier at a known chain position (scanner / tests).
+    ///
+    /// Updates the live accumulator and its entry/position mirrors together.
+    /// Fails loud on out-of-order positions, pre-activation folds, and
+    /// first-occurrence duplicates (does not silently ignore duplicates —
+    /// the scanner is expected to classify those before calling this).
+    pub fn append_nullifier(
+        &mut self,
+        chain_pos: ChainPosition,
+        pk: [u8; 32],
+        r: [u8; 32],
+    ) -> Result<u64> {
+        let expected_pos = self.nflog_entries.len() as u64;
+        match self
+            .nflog
+            .fold(chain_pos, pk, r)
+            .context("append_nullifier: fold failed")?
+        {
+            FoldOutcome::Appended(pos) => {
+                ensure!(
+                    pos == expected_pos,
+                    "append_nullifier: position mismatch expected {expected_pos}, got {pos}"
+                );
+                self.nflog_entries.push(NfLogEntry { pk, r });
+                self.nflog_positions.push(chain_pos);
+                Ok(pos)
+            }
+            FoldOutcome::DuplicateIgnored => {
+                bail!("append_nullifier: Pk already present (first-occurrence would ignore)")
+            }
+            FoldOutcome::BelowActivationHeight => {
+                bail!(
+                    "append_nullifier: height {} is below activation_height {}",
+                    chain_pos.height,
+                    self.activation_height
+                )
+            }
+        }
+    }
+
     /// Insert a pre-built account (e.g. funded fixture for tests / recovery).
     ///
     /// Fails if `owner` is already present.
