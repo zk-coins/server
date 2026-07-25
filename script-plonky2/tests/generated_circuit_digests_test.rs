@@ -30,10 +30,7 @@ use zkcoins_program_plonky2::hash::HashDigest;
 fn hex32(bytes: &[u8; 32]) -> String {
     format!(
         "0x{}",
-        bytes
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     )
 }
 
@@ -79,10 +76,8 @@ fn generate_circuit_digests() {
         let label = network_label(network);
         println!("building C for {label}…");
         // Same construction as `prover_bridge::compliance_circuit`.
-        let compliance = build_skeleton_circuit(
-            CircuitConfig::standard_recursion_zk_config(),
-            network,
-        );
+        let compliance =
+            build_skeleton_circuit(CircuitConfig::standard_recursion_zk_config(), network);
         assert_eq!(
             compliance.network, network,
             "built C network must match requested Network::{label}"
@@ -141,7 +136,9 @@ fn generate_circuit_digests() {
             b_digest_hex.clone(),
         );
         println!("circuit_digest_c_balance_{label} = {b_digest_hex}");
-        println!("circuit_c_balance_{label}_gates = {b_gates} (shape metric; emitted once if equal)");
+        println!(
+            "circuit_c_balance_{label}_gates = {b_gates} (shape metric; emitted once if equal)"
+        );
         println!(
             "circuit_c_balance_{label}_degree_bits = {b_degree_bits} (shape metric; emitted once if equal)"
         );

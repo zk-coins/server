@@ -243,45 +243,21 @@ mod tests {
 
     #[test]
     fn new_rejects_non_six_finality() {
-        let err = NetworkParams::new(
-            "tag".to_string(),
-            [0u8; 32],
-            [0u8; 32],
-            0,
-            5,
-            [0u8; 32],
-        )
-        .expect_err("must reject");
-        assert_eq!(
-            err,
-            SpecError::InvalidFinalityConfirmations { value: 5 }
-        );
+        let err = NetworkParams::new("tag".to_string(), [0u8; 32], [0u8; 32], 0, 5, [0u8; 32])
+            .expect_err("must reject");
+        assert_eq!(err, SpecError::InvalidFinalityConfirmations { value: 5 });
     }
 
     #[test]
     fn new_rejects_tag_over_255_accepts_exactly_255() {
         let too_long = "a".repeat(256);
-        let err = NetworkParams::new(
-            too_long,
-            [0u8; 32],
-            [0u8; 32],
-            0,
-            6,
-            [0u8; 32],
-        )
-        .expect_err("must reject");
+        let err = NetworkParams::new(too_long, [0u8; 32], [0u8; 32], 0, 6, [0u8; 32])
+            .expect_err("must reject");
         assert_eq!(err, SpecError::NetworkTagTooLong { len: 256 });
 
         let exactly = "b".repeat(255);
-        let ok = NetworkParams::new(
-            exactly,
-            [0u8; 32],
-            [0u8; 32],
-            0,
-            6,
-            [0u8; 32],
-        )
-        .expect("255-byte tag is valid");
+        let ok = NetworkParams::new(exactly, [0u8; 32], [0u8; 32], 0, 6, [0u8; 32])
+            .expect("255-byte tag is valid");
         assert_eq!(ok.network_tag().len(), 255);
         assert_eq!(ok.canonical_encoding().expect("valid")[0], 255);
     }

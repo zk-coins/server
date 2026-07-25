@@ -428,10 +428,7 @@ mod tests {
             write_biguint_target(dst, &self.rem)
         }
 
-        fn deserialize(
-            src: &mut Buffer,
-            _common_data: &CommonCircuitData<F, D>,
-        ) -> IoResult<Self> {
+        fn deserialize(src: &mut Buffer, _common_data: &CommonCircuitData<F, D>) -> IoResult<Self> {
             Ok(Self {
                 a: read_biguint_target(src)?,
                 b: read_biguint_target(src)?,
@@ -544,14 +541,15 @@ mod tests {
             .iter()
             .position(|generator| generator.0.id().contains("BigUintDivRemGenerator"))
             .expect("BigUint division generator must be present");
-        data.prover_only.generators[generator_index] =
-            WitnessGeneratorRef::new(NonCanonicalDivGenerator {
+        data.prover_only.generators[generator_index] = WitnessGeneratorRef::new(
+            NonCanonicalDivGenerator {
                 a: a.clone(),
                 b: b.clone(),
                 div,
                 rem,
             }
-            .adapter());
+            .adapter(),
+        );
 
         let mut witness = PartialWitness::new();
         witness

@@ -713,10 +713,8 @@ mod tests {
             }
 
             // Consistency for adjacent pairs (2^k - 1, 2^k) and (2^k, 2^k + 1)
-            let pairs: [(usize, usize); 2] = [
-                (pow.saturating_sub(1), pow),
-                (pow, pow.saturating_add(1)),
-            ];
+            let pairs: [(usize, usize); 2] =
+                [(pow.saturating_sub(1), pow), (pow, pow.saturating_add(1))];
             for (m, n) in pairs {
                 if m == 0 || n == 0 || m >= n {
                     // m==0 covered elsewhere; skip degenerate when pow==1 etc.

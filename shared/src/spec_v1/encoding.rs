@@ -200,16 +200,8 @@ mod tests {
 
     #[test]
     fn hc_is_deterministic() {
-        let a = hc(
-            "zkCoins/v1/NkCommit",
-            &[HcInput::ByteString(&[1u8; 32])],
-        )
-        .unwrap();
-        let b = hc(
-            "zkCoins/v1/NkCommit",
-            &[HcInput::ByteString(&[1u8; 32])],
-        )
-        .unwrap();
+        let a = hc("zkCoins/v1/NkCommit", &[HcInput::ByteString(&[1u8; 32])]).unwrap();
+        let b = hc("zkCoins/v1/NkCommit", &[HcInput::ByteString(&[1u8; 32])]).unwrap();
         assert_eq!(a, b);
     }
 
@@ -312,7 +304,9 @@ mod tests {
     fn nflog_empty_vs_coinsroot_empty_leaf_shapes_differ() {
         // NfLog/Empty: tag + small-numeric 0 → tag_elems + 1
         // CoinsRoot/Leaf with ZERO_HASH: tag + 4 digest limbs → tag_elems + 4
-        let tag_elems = encode_byte_string(TAG_NFLOG_EMPTY.as_bytes()).unwrap().len();
+        let tag_elems = encode_byte_string(TAG_NFLOG_EMPTY.as_bytes())
+            .unwrap()
+            .len();
         let empty_log = hc(TAG_NFLOG_EMPTY, &[HcInput::SmallNumeric(0)]).unwrap();
         let empty_leaf = hc(TAG_COINS_ROOT_LEAF, &[HcInput::Digest(ZERO_HASH)]).unwrap();
         assert_ne!(empty_log, empty_leaf);
@@ -373,11 +367,7 @@ mod tests {
             digest_from_bytes(&[0u8; 32]).unwrap().elements,
             [F::ZERO; 4]
         );
-        let some = hc(
-            "zkCoins/v1/NkCommit",
-            &[HcInput::ByteString(&[1u8; 32])],
-        )
-        .unwrap();
+        let some = hc("zkCoins/v1/NkCommit", &[HcInput::ByteString(&[1u8; 32])]).unwrap();
         let roundtrip = digest_from_bytes(&digest_to_bytes(&some)).unwrap();
         assert_eq!(roundtrip, some);
     }

@@ -19,11 +19,7 @@ pub enum CoinHistState {
 
 /// `H'_leaf(s) = Hc("CoinHist/Leaf", SmallNumeric(s))`.
 pub fn coinhist_leaf_hash(state: CoinHistState) -> HashDigest {
-    hc(
-        TAG_COINHIST_LEAF,
-        &[HcInput::SmallNumeric(state as u64)],
-    )
-    .expect("state in {0,1,2}")
+    hc(TAG_COINHIST_LEAF, &[HcInput::SmallNumeric(state as u64)]).expect("state in {0,1,2}")
 }
 
 /// `H'_node(i, l, r) = Hc("CoinHist/Node", SmallNumeric(i), Digest(l), Digest(r))`.
@@ -218,7 +214,11 @@ fn build_subtree(occupied: &[(&[u8; 32], CoinHistState)], depth_from_root: u32) 
         return coinhist_empty_subtree_roots()[(256 - depth_from_root) as usize];
     }
     if depth_from_root == 256 {
-        debug_assert_eq!(occupied.len(), 1, "distinct keys can't collide at full depth");
+        debug_assert_eq!(
+            occupied.len(),
+            1,
+            "distinct keys can't collide at full depth"
+        );
         return coinhist_leaf_hash(occupied[0].1);
     }
     let bit_index = 255 - depth_from_root;

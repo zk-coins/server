@@ -10,12 +10,11 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 use shared::spec_v1::{
-    account_state_hash, address, asset_id_v1, asset_id_v2, coinhist_empty_root,
-    coinhist_root_after_first_insert, coin_identifier, detect_tag, digest_to_bytes, hash_proof_data,
-    merkle_root, name_hash, nav_commitment, network_id_mainnet, network_id_regtest,
-    network_id_testnet, nflog_empty, nflog_root, nk_commit, npk_commit, nullifier,
-    serialize_proof_data, terms_hash_v1, terms_hash_v2, AccountState, Address, CoinHistState,
-    ProofData, TreeKind, GENESIS_TAG,
+    account_state_hash, address, asset_id_v1, asset_id_v2, coin_identifier, coinhist_empty_root,
+    coinhist_root_after_first_insert, detect_tag, digest_to_bytes, hash_proof_data, merkle_root,
+    name_hash, nav_commitment, network_id_mainnet, network_id_regtest, network_id_testnet,
+    nflog_empty, nflog_root, nk_commit, npk_commit, nullifier, serialize_proof_data, terms_hash_v1,
+    terms_hash_v2, AccountState, Address, CoinHistState, ProofData, TreeKind, GENESIS_TAG,
 };
 
 fn sha256_label(label: &str) -> [u8; 32] {
@@ -156,18 +155,16 @@ fn generate_poseidon_vectors_file() {
     // 18 — V.10 note-encryption fixture pins (spec V.10; fully pinned SHA-256/HKDF/secp256k1)
     // ss  = ECDH(esk, IVPK) = x(esk·lift_x(IVPK))
     // epk = x-only(esk·G)
-    let v10_ss: [u8; 32] = hex::decode(
-        "842f5821fa577c0374ae48e4c5afa887e3e0900df7245370e5675d88466fa05f",
-    )
-    .expect("V.10 ss hex")
-    .try_into()
-    .expect("V.10 ss is 32 bytes");
-    let v10_epk: [u8; 32] = hex::decode(
-        "e15129c95c4e7528810d91bdc9312389a1c6466bee0237147540c426926af154",
-    )
-    .expect("V.10 epk hex")
-    .try_into()
-    .expect("V.10 epk is 32 bytes");
+    let v10_ss: [u8; 32] =
+        hex::decode("842f5821fa577c0374ae48e4c5afa887e3e0900df7245370e5675d88466fa05f")
+            .expect("V.10 ss hex")
+            .try_into()
+            .expect("V.10 ss is 32 bytes");
+    let v10_epk: [u8; 32] =
+        hex::decode("e15129c95c4e7528810d91bdc9312389a1c6466bee0237147540c426926af154")
+            .expect("V.10 epk hex")
+            .try_into()
+            .expect("V.10 epk is 32 bytes");
     let detect_tag_fixture = detect_tag(&v10_ss, &v10_epk);
     // 19
     let asset_id_v2_v = asset_id_v2(
@@ -210,18 +207,12 @@ fn generate_poseidon_vectors_file() {
     lines.push(format!("nf_sample = {}", hex_digest(&nf_sample)));
     lines.push(format!("ocr_0 = {}", hex_digest(&ocr_0)));
     lines.push(format!("inr_0 = {}", hex_digest(&inr_0)));
-    lines.push(format!(
-        "nav_root_empty = {}",
-        hex_digest(&nav_root_empty)
-    ));
+    lines.push(format!("nav_root_empty = {}", hex_digest(&nav_root_empty)));
     lines.push(format!(
         "nav_commitment_0 = {}",
         hex_digest(&nav_commitment_0)
     ));
-    lines.push(format!(
-        "h_proof_data_0 = {}",
-        hex32(&h_proof_data_0)
-    ));
+    lines.push(format!("h_proof_data_0 = {}", hex32(&h_proof_data_0)));
     lines.push(format!(
         "network_id_mainnet = {}",
         hex_digest(&network_id_mainnet_v)
@@ -239,14 +230,8 @@ fn generate_poseidon_vectors_file() {
         hex_digest(&detect_tag_fixture)
     ));
     lines.push(format!("asset_id_v2 = {}", hex_digest(&asset_id_v2_v)));
-    lines.push(format!(
-        "terms_hash_v1 = {}",
-        hex_digest(&terms_hash_v1_v)
-    ));
-    lines.push(format!(
-        "terms_hash_v2 = {}",
-        hex_digest(&terms_hash_v2_v)
-    ));
+    lines.push(format!("terms_hash_v1 = {}", hex_digest(&terms_hash_v1_v)));
+    lines.push(format!("terms_hash_v2 = {}", hex_digest(&terms_hash_v2_v)));
     lines.push(String::new()); // trailing newline
 
     let path = PathBuf::from(concat!(

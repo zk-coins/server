@@ -11,6 +11,7 @@
 //! on the `program-plonky2` side (dependency direction forbids linking the
 //! gadget from `shared`).
 
+use shared::spec_v1::nflog_boundary::fixture_range;
 use shared::spec_v1::nflog_boundary::{
     adjacent_consistency_pairs, bag_peaks_swapped, boundary_sizes, case_id_consistency,
     case_id_inclusion, case_id_peaks, find_inclusion_wrong_pivot, fixture_peaks,
@@ -20,7 +21,6 @@ use shared::spec_v1::nflog_boundary::{
     ref_verify_inclusion, try_consistency_wrong_pivot, try_inclusion_wrong_pivot,
     ConsistencyPivotMutation, PivotMutation,
 };
-use shared::spec_v1::nflog_boundary::fixture_range;
 use shared::spec_v1::{nflog_empty, verify_consistency, verify_inclusion, HashDigest};
 
 #[test]
@@ -43,7 +43,8 @@ fn nflog_boundary_suite_k0_to_63() {
     // 64-bit host that is lossless for every in-scope n. The independent
     // reference stays on u64 regardless.
     assert_eq!(
-        usize::BITS, 64,
+        usize::BITS,
+        64,
         "this suite exercises n up to ~2^63; production verify_* uses usize \
          and would truncate on a 32-bit host"
     );
@@ -196,7 +197,6 @@ fn nflog_boundary_suite_k0_to_63() {
                         );
                     }
                 }
-
             }
             // Wrong pivot (NL-B1) for this size: search O(1) interior positions
             // so the mutation stays same-length (Accept positions alone almost
@@ -239,9 +239,7 @@ fn nflog_boundary_suite_k0_to_63() {
                 }
             } else {
                 skip_wrong_pivot_inc += 1;
-                eprintln!(
-                    "skip wrong-pivot inclusion: k={k} n={n} — size < 3"
-                );
+                eprintln!("skip wrong-pivot inclusion: k={k} n={n} — size < 3");
             }
         }
 
@@ -415,9 +413,7 @@ fn nflog_boundary_suite_k0_to_63() {
                 }
                 ConsistencyPivotMutation::Unreachable { reason } => {
                     skip_wrong_pivot_con += 1;
-                    eprintln!(
-                        "skip wrong-pivot consistency: k={k} m={m} n={n} — {reason}"
-                    );
+                    eprintln!("skip wrong-pivot consistency: k={k} m={m} n={n} — {reason}");
                 }
             }
         }
@@ -508,4 +504,3 @@ fn wrong_pivot_mutation_never_reseeds() {
         }
     }
 }
-

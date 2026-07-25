@@ -894,8 +894,7 @@ fn enforce_received_admission(
 
         let creating_leaf =
             nflog_leaf_hash_target(builder, auth.pos_create, &auth.pk_create, &auth.r_create);
-        let effective_position =
-            U64LimbsTarget::select(builder, active, auth.pos_create, zero);
+        let effective_position = U64LimbsTarget::select(builder, active, auth.pos_create, zero);
         let one = U64LimbsTarget::one(builder);
         let effective_inclusion_size = U64LimbsTarget::select(builder, active, nav.size, one);
         let effective_inclusion_mth = select_hash(builder, active, nav.mth, creating_leaf);
@@ -1285,17 +1284,18 @@ fn build_with_common(
         empty_history,
     );
     let size_zero = zero_u64;
-    let size_prev_zero = prev_nav_opening
-        .nav
-        .size
-        .is_equal(&mut builder, size_zero);
+    let size_prev_zero = prev_nav_opening.nav.size.is_equal(&mut builder, size_zero);
     let size_prev_nonzero = builder.not(size_prev_zero);
     let bad_size_prev = builder.and(is_initial, size_prev_nonzero);
     builder.assert_zero(bad_size_prev.target);
 
     let empty_nflog = nflog_empty_target(&mut builder);
-    let consistency_m =
-        U64LimbsTarget::select(&mut builder, is_account_update, prev_nav_opening.nav.size, size_zero);
+    let consistency_m = U64LimbsTarget::select(
+        &mut builder,
+        is_account_update,
+        prev_nav_opening.nav.size,
+        size_zero,
+    );
     let consistency_mth = select_hash(
         &mut builder,
         is_account_update,
@@ -1324,8 +1324,7 @@ fn build_with_common(
         size_zero,
     );
     let one = U64LimbsTarget::one(&mut builder);
-    let effective_size =
-        U64LimbsTarget::select(&mut builder, is_account_update, nav.size, one);
+    let effective_size = U64LimbsTarget::select(&mut builder, is_account_update, nav.size, one);
     let effective_mth = select_hash(&mut builder, is_account_update, nav.mth, prev_leaf);
     verify_nflog_inclusion(
         &mut builder,

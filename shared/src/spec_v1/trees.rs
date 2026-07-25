@@ -42,11 +42,8 @@ pub fn empty_leaf_hash(kind: TreeKind) -> HashDigest {
 
 /// `P = Hc("<T>/Node", Digest(l), Digest(r))`.
 pub fn node_hash(kind: TreeKind, l: HashDigest, r: HashDigest) -> HashDigest {
-    hc(
-        kind.node_tag(),
-        &[HcInput::Digest(l), HcInput::Digest(r)],
-    )
-    .expect("digest inputs are fixed-width")
+    hc(kind.node_tag(), &[HcInput::Digest(l), HcInput::Digest(r)])
+        .expect("digest inputs are fixed-width")
 }
 
 /// Poseidon Merkle root over `leaves` (§1.7.5).

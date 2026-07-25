@@ -680,15 +680,7 @@ mod tests {
         let entry = &synthetic_entries(1)[0];
         let leaf = nflog_leaf_hash(0, entry);
         let mth = nflog_mth(std::slice::from_ref(entry));
-        assert!(prove_inclusion(
-            &data,
-            targets,
-            leaf,
-            0,
-            &[],
-            1,
-            mth,
-        ));
+        assert!(prove_inclusion(&data, targets, leaf, 0, &[], 1, mth,));
     }
 
     /// Protocol sizes in the previously unrepresentable band `p … 2^64 − 1`
@@ -701,9 +693,7 @@ mod tests {
         let sizes = [p - 1, p, p + 1, u64::MAX];
         for &n in &sizes {
             for &position in &inclusion_positions(n) {
-                let case_id = 0x2e11_u64
-                    ^ n.wrapping_mul(0x9e37)
-                    ^ position.wrapping_mul(0x85eb);
+                let case_id = 0x2e11_u64 ^ n.wrapping_mul(0x9e37) ^ position.wrapping_mul(0x85eb);
                 let w = ref_build_inclusion(case_id, position, n);
                 assert!(
                     ref_verify_inclusion(w.leaf, position, &w.path, n, w.mth),
@@ -714,15 +704,7 @@ mod tests {
                     "host inclusion n={n:#x} p={position:#x}"
                 );
                 assert!(
-                    prove_inclusion(
-                        &data,
-                        targets,
-                        w.leaf,
-                        position,
-                        &w.path,
-                        n,
-                        w.mth,
-                    ),
+                    prove_inclusion(&data, targets, w.leaf, position, &w.path, n, w.mth,),
                     "gadget inclusion Accept n={n:#x} position={position:#x}"
                 );
             }
@@ -739,15 +721,7 @@ mod tests {
         // m = 0 special case: empty proof, mth_a = empty, arbitrary n.
         for &n in &[p - 1, p, p + 1, u64::MAX] {
             assert!(
-                prove_consistency(
-                    &data,
-                    targets,
-                    0,
-                    nflog_empty(),
-                    n,
-                    nflog_empty(),
-                    &[],
-                ),
+                prove_consistency(&data, targets, 0, nflog_empty(), n, nflog_empty(), &[],),
                 "gadget consistency m=0 n={n:#x}"
             );
         }
@@ -765,15 +739,7 @@ mod tests {
                 "host consistency m={m:#x} n={n:#x}"
             );
             assert!(
-                prove_consistency(
-                    &data,
-                    targets,
-                    m,
-                    w.mth_a,
-                    n,
-                    w.mth_b,
-                    &w.proof,
-                ),
+                prove_consistency(&data, targets, m, w.mth_a, n, w.mth_b, &w.proof,),
                 "gadget consistency Accept m={m:#x} n={n:#x}"
             );
         }
@@ -1347,9 +1313,7 @@ mod tests {
                     if n >= 2 {
                         let mut overlong = w.path.clone();
                         overlong.push(fixture_range(case_id, u64::MAX - 1, 1));
-                        assert!(!ref_verify_inclusion(
-                            w.leaf, position, &overlong, n, w.mth
-                        ));
+                        assert!(!ref_verify_inclusion(w.leaf, position, &overlong, n, w.mth));
                         ref_reject += 1;
                         assert!(!verify_inclusion(w.leaf, position, &overlong, n, w.mth));
                         host_reject += 1;
@@ -1370,9 +1334,7 @@ mod tests {
                         Some(bad) => {
                             assert_eq!(bad.path.len(), w.path.len());
                             assert_eq!(bad.leaf, w.leaf);
-                            assert!(!ref_verify_inclusion(
-                                w.leaf, position, &w.path, n, bad.mth
-                            ));
+                            assert!(!ref_verify_inclusion(w.leaf, position, &w.path, n, bad.mth));
                             ref_reject += 1;
                             assert!(!verify_inclusion(w.leaf, position, &w.path, n, bad.mth));
                             host_reject += 1;
@@ -1389,12 +1351,9 @@ mod tests {
                         }
                         None => {
                             skip_swapped_inc += 1;
-                            eprintln!(
-                                "skip swapped-top inclusion: k={k} n={n} p={position}"
-                            );
+                            eprintln!("skip swapped-top inclusion: k={k} n={n} p={position}");
                         }
                     }
-
                 }
                 // Wrong pivot (NL-B1) once per size: same fixtures, same path length.
                 if n >= 3 {
@@ -1428,13 +1387,7 @@ mod tests {
                                 honest.mth,
                             ));
                             assert!(
-                                !ref_verify_inclusion(
-                                    bad.leaf,
-                                    position,
-                                    &bad.path,
-                                    n,
-                                    honest.mth
-                                ),
+                                !ref_verify_inclusion(bad.leaf, position, &bad.path, n, honest.mth),
                                 "ref wrong-pivot k={k} n={n} p={position} k'={wrong_pivot}"
                             );
                             ref_reject += 1;
@@ -1653,9 +1606,7 @@ mod tests {
                     }
                     ConsistencyPivotMutation::Unreachable { reason } => {
                         skip_wrong_pivot_con += 1;
-                        eprintln!(
-                            "skip wrong-pivot consistency: k={k} m={m} n={n} — {reason}"
-                        );
+                        eprintln!("skip wrong-pivot consistency: k={k} m={m} n={n} — {reason}");
                     }
                 }
             }
@@ -1699,5 +1650,4 @@ mod tests {
             "expected 66 single-peak sizes × (dup+drop) = 132, got {built_peak_dup_drop}"
         );
     }
-
 }

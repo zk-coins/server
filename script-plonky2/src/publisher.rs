@@ -360,9 +360,9 @@ impl Publisher {
                 )
             })?;
 
-        let chain_info = rpc.get_blockchain_info().with_context(|| {
-            format!("bitcoind unreachable or RPC auth failed at {wallet_url}")
-        })?;
+        let chain_info = rpc
+            .get_blockchain_info()
+            .with_context(|| format!("bitcoind unreachable or RPC auth failed at {wallet_url}"))?;
         ensure_chain_matches_config(chain_info.chain, config.network)?;
         rpc.get_balances().with_context(|| {
             format!(
@@ -392,10 +392,7 @@ impl Publisher {
     /// Round-trip: `BlockHash::from_byte_array(anchor.block_hash)` recovers
     /// the same `BlockHash` that `getblockhash(height)` returns.
     pub fn current_anchor(&self) -> Result<BlockAnchor> {
-        let height_u64 = self
-            .rpc
-            .get_block_count()
-            .context("getblockcount failed")?;
+        let height_u64 = self.rpc.get_block_count().context("getblockcount failed")?;
         let height = u32::try_from(height_u64).context("block height does not fit in u32")?;
         let hash = self
             .rpc
@@ -465,8 +462,8 @@ impl Publisher {
         // ── Per-member chain validation + anchor selection (RPC) ────────
         let block_anchor = self.select_block_anchor(members)?;
         let sigs: Vec<NullifierSig> = members.iter().map(|m| m.sig).collect();
-        let aggregate = aggregate_sig_with_anchor(&sigs, block_anchor)
-            .context("half-aggregation failed")?;
+        let aggregate =
+            aggregate_sig_with_anchor(&sigs, block_anchor).context("half-aggregation failed")?;
         aggregate_verify(&aggregate, self.config.network.m_state_bytes()).with_context(|| {
             format!(
                 "aggregate signature verification failed under publisher network {:?} \
@@ -550,11 +547,7 @@ impl Publisher {
                 before_count = before_count
                     .checked_add(1)
                     .context("before_count overflow")?;
-                record_best_shortfall(
-                    &mut best_before,
-                    theoretical_min,
-                    funding.amount,
-                );
+                record_best_shortfall(&mut best_before, theoretical_min, funding.amount);
                 continue;
             }
 
@@ -594,9 +587,7 @@ impl Publisher {
                         record_best_shortfall(&mut best_before, required, have);
                     }
                     Some(FundingRejectKind::AfterMeasurement { have, required }) => {
-                        after_count = after_count
-                            .checked_add(1)
-                            .context("after_count overflow")?;
+                        after_count = after_count.checked_add(1).context("after_count overflow")?;
                         record_best_shortfall(&mut best_after, required, have);
                     }
                     None => {
@@ -751,18 +742,15 @@ impl Publisher {
             anchor.height,
             live_bytes
         );
-        ensure_publish_gap_ok(
-            anchor,
-            tip_now,
-            self.config.inclusion_delay_margin,
-        )
-        .with_context(|| {
-            format!(
-                "block_anchor became too stale before sendrawtransaction \
+        ensure_publish_gap_ok(anchor, tip_now, self.config.inclusion_delay_margin).with_context(
+            || {
+                format!(
+                    "block_anchor became too stale before sendrawtransaction \
                  (anchor height {}, tip now {}); refusing broadcast",
-                anchor.height, tip_now.height
-            )
-        })?;
+                    anchor.height, tip_now.height
+                )
+            },
+        )?;
         Ok(())
     }
 
@@ -954,11 +942,7 @@ impl Publisher {
 
         // 5. Redundant on the selected oldest (every member already passed),
         //    but keeps the post-selection guarantee explicit at this site.
-        ensure_publish_gap_ok(
-            oldest,
-            node_tip,
-            self.config.inclusion_delay_margin,
-        )?;
+        ensure_publish_gap_ok(oldest, node_tip, self.config.inclusion_delay_margin)?;
         Ok(oldest)
     }
 
@@ -1192,7 +1176,13 @@ impl Publisher {
         let mut seen_without: HashSet<(u64, u64)> = HashSet::new();
 
         for round in 1..=MAX_FEE_CONVERGENCE_ROUNDS {
-            note_fee_state(&mut seen_without, commit_fee, reveal_fee, "no-change", round)?;
+            note_fee_state(
+                &mut seen_without,
+                commit_fee,
+                reveal_fee,
+                "no-change",
+                round,
+            )?;
 
             if funding.amount < reveal_out {
                 bail!(
@@ -1236,8 +1226,7 @@ impl Publisher {
                 fee_for_vsize(measured_reveal_vsize, self.config.fee_rate_sat_per_vb)?;
 
             // Admission gate: measured pure fees only.
-            let measured_required =
-                sum_amounts(&[reveal_out, next_commit_fee, next_reveal_fee])?;
+            let measured_required = sum_amounts(&[reveal_out, next_commit_fee, next_reveal_fee])?;
             if funding.amount < measured_required {
                 bail!(
                     "funding rejected after measurement: UTXO {} sat < measured requirement {} sat \
@@ -1491,10 +1480,7 @@ pub fn max_half_agg_members_for_standard_reveal() -> Result<usize> {
 
     let weight_for = |n: usize| -> Result<u64> {
         ensure!(n >= 1, "member count must be >= 1");
-        ensure!(
-            n <= usize::from(u16::MAX),
-            "member count exceeds u16::MAX"
-        );
+        ensure!(n <= usize::from(u16::MAX), "member count exceeds u16::MAX");
         let payload = synthetic_half_agg_payload(n, &point, &point, &scalar)?;
         measure_reveal_weight(&payload)
     };
@@ -1674,10 +1660,7 @@ pub fn chain_matches_config(chain: BitcoinNetwork, config_network: Network) -> b
 /// Fail if bitcoind's chain and [`PublisherConfig::network`] disagree.
 ///
 /// Error names both the configured network and the chain bitcoind reported.
-pub fn ensure_chain_matches_config(
-    chain: BitcoinNetwork,
-    config_network: Network,
-) -> Result<()> {
+pub fn ensure_chain_matches_config(chain: BitcoinNetwork, config_network: Network) -> Result<()> {
     ensure!(
         chain_matches_config(chain, config_network),
         "bitcoind chain {chain:?} does not match PublisherConfig.network {config_network:?} \
@@ -1861,11 +1844,7 @@ fn parse_utxo_vs_required(rest: &str, middle: &str) -> Option<(Amount, Amount)> 
     Some((Amount::from_sat(have), Amount::from_sat(required)))
 }
 
-fn record_best_shortfall(
-    best: &mut Option<(Amount, Amount)>,
-    required: Amount,
-    have: Amount,
-) {
+fn record_best_shortfall(best: &mut Option<(Amount, Amount)>, required: Amount, have: Amount) {
     let shortfall = required.checked_sub(have).unwrap_or(required);
     match best {
         None => *best = Some((required, have)),
@@ -1899,8 +1878,8 @@ mod tests {
     use super::*;
     use bitcoin::hashes::Hash;
     use bitcoin::{BlockHash, PubkeyHash, WPubkeyHash, WScriptHash};
-    use shared::spec_v1::{ProofData, ZERO_HASH};
     use sha2::{Digest, Sha256};
+    use shared::spec_v1::{ProofData, ZERO_HASH};
     use zkcoins_program_plonky2::circuit::compliance::Network;
 
     use crate::half_agg::{aggregate_verify, AggregateStateNullifierV3};
@@ -1932,8 +1911,11 @@ mod tests {
         );
 
         let nums = nums_internal_key().expect("NUMS key");
-        let p2tr =
-            ScriptBuf::new_p2tr(&bitcoin::secp256k1::Secp256k1::verification_only(), nums, None);
+        let p2tr = ScriptBuf::new_p2tr(
+            &bitcoin::secp256k1::Secp256k1::verification_only(),
+            nums,
+            None,
+        );
         ensure_deterministic_funding(&p2tr).expect("v1 p2tr must pass");
     }
 
@@ -1954,8 +1936,11 @@ mod tests {
     #[test]
     fn dust_guard_on_reveal_output_value() {
         let nums = nums_internal_key().expect("NUMS");
-        let p2tr =
-            ScriptBuf::new_p2tr(&bitcoin::secp256k1::Secp256k1::verification_only(), nums, None);
+        let p2tr = ScriptBuf::new_p2tr(
+            &bitcoin::secp256k1::Secp256k1::verification_only(),
+            nums,
+            None,
+        );
         let dust = p2tr.minimal_non_dust();
         ensure_above_dust(dust, &p2tr).expect("exactly dust must pass (>=)");
         ensure_above_dust(dust + Amount::from_sat(1), &p2tr).expect("above dust");
@@ -2022,14 +2007,13 @@ mod tests {
     /// Finding 4: margin ≥ MAX_GAP is rejected loudly (no silent clamp).
     #[test]
     fn inclusion_delay_margin_must_be_below_max_gap() {
-        let err = publish_max_gap(BLOCK_ANCHOR_MAX_GAP)
-            .expect_err("margin == MAX_GAP must fail");
+        let err = publish_max_gap(BLOCK_ANCHOR_MAX_GAP).expect_err("margin == MAX_GAP must fail");
         assert!(
             err.to_string().contains("inclusion_delay_margin"),
             "unexpected: {err}"
         );
-        let err = publish_max_gap(BLOCK_ANCHOR_MAX_GAP + 1)
-            .expect_err("margin > MAX_GAP must fail");
+        let err =
+            publish_max_gap(BLOCK_ANCHOR_MAX_GAP + 1).expect_err("margin > MAX_GAP must fail");
         assert!(
             err.to_string().contains("BLOCK_ANCHOR_MAX_GAP"),
             "unexpected: {err}"
@@ -2038,7 +2022,10 @@ mod tests {
             publish_max_gap(BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN).expect("recommended"),
             BLOCK_ANCHOR_PUBLISH_MAX_GAP
         );
-        assert_eq!(publish_max_gap(0).expect("zero margin"), BLOCK_ANCHOR_MAX_GAP);
+        assert_eq!(
+            publish_max_gap(0).expect("zero margin"),
+            BLOCK_ANCHOR_MAX_GAP
+        );
         assert_eq!(publish_max_gap(10).expect("custom 10"), 90);
     }
 
@@ -2085,16 +2072,13 @@ mod tests {
         .expect("synthetic");
         let w = measure_reveal_weight(&sizing_payload).expect("measure");
         assert!(w > MAX_STANDARD_TX_WEIGHT, "fixture must be oversize");
-        let err = ensure_tx_within_standard_weight(
-            "reveal",
-            w,
-            members.len(),
-            sizing_payload.len(),
-        )
-        .expect_err("oversize must fail weight guard");
+        let err =
+            ensure_tx_within_standard_weight("reveal", w, members.len(), sizing_payload.len())
+                .expect_err("oversize must fail weight guard");
         let msg = err.to_string();
         assert!(
-            msg.contains("MAX_STANDARD_TX_WEIGHT") || msg.contains(&MAX_STANDARD_TX_WEIGHT.to_string()),
+            msg.contains("MAX_STANDARD_TX_WEIGHT")
+                || msg.contains(&MAX_STANDARD_TX_WEIGHT.to_string()),
             "must be weight error, not chain error: {msg}"
         );
         assert!(
@@ -2266,7 +2250,10 @@ mod tests {
         prev
     }
 
-    fn signed_members(count: usize, m_state_network: Network) -> (Vec<NullifierSig>, &'static [u8]) {
+    fn signed_members(
+        count: usize,
+        m_state_network: Network,
+    ) -> (Vec<NullifierSig>, &'static [u8]) {
         let mut members = Vec::with_capacity(count);
         for index in 0..count {
             let label = format!("zkCoins/v1/publisher/regtest-secret-{index}");
@@ -2391,10 +2378,7 @@ mod tests {
             .rpc
             .get_raw_transaction_info(&batch.reveal_txid, None)
             .expect("reveal raw tx info");
-        assert!(
-            reveal_info.blockhash.is_some(),
-            "reveal must be in a block"
-        );
+        assert!(reveal_info.blockhash.is_some(), "reveal must be in a block");
         assert!(
             reveal_info.confirmations.unwrap_or(0) >= 1,
             "reveal confirmations"
@@ -2482,7 +2466,10 @@ mod tests {
             "unexpected error: {msg}"
         );
         let after = mempool_txids(&publisher);
-        assert_eq!(before, after, "mempool must be unchanged after rejected publish");
+        assert_eq!(
+            before, after,
+            "mempool must be unchanged after rejected publish"
+        );
 
         // Corrupted s on an otherwise Regtest-valid member.
         let (mut sigs, _) = signed_members(1, Network::Regtest);
@@ -2498,7 +2485,10 @@ mod tests {
             "unexpected: {err}"
         );
         let after2 = mempool_txids(&publisher);
-        assert_eq!(before, after2, "mempool must stay unchanged after corrupted-s reject");
+        assert_eq!(
+            before, after2,
+            "mempool must stay unchanged after corrupted-s reject"
+        );
     }
 
     /// Finding 3: anchor equals the oldest member's build tip; descendant tips
@@ -2525,7 +2515,9 @@ mod tests {
                 build_tip: t0, // oldest
             },
         ];
-        let batch = publisher.publish(&members).expect("publish with mixed tips");
+        let batch = publisher
+            .publish(&members)
+            .expect("publish with mixed tips");
         assert_eq!(
             batch.block_anchor, t0,
             "anchor must equal the oldest member's build tip"
@@ -2701,14 +2693,11 @@ mod tests {
 
         // Custom margin 10 → effective bound 90. Mine 89 after H → gap 90.
         let custom_margin = 10u32;
-        let publisher =
-            live_publisher_with_margin(2, Amount::from_sat(1_000), custom_margin);
+        let publisher = live_publisher_with_margin(2, Amount::from_sat(1_000), custom_margin);
         let bound = publish_max_gap(custom_margin).expect("bound");
         assert_eq!(bound, 90);
         let build_tip = publisher.current_anchor().expect("record tip H");
-        let mine_n_blocks = bound
-            .checked_sub(1)
-            .expect("bound >= 1");
+        let mine_n_blocks = bound.checked_sub(1).expect("bound >= 1");
         mine_n(&publisher, u64::from(mine_n_blocks));
         let tip_after = publisher.current_anchor().expect("tip after mine");
         assert_eq!(
@@ -2752,10 +2741,7 @@ mod tests {
         set_pre_broadcast_hook(&publisher, move |rpc| {
             rpc.invalidate_block(&orphaned_hash)
                 .expect("invalidateblock of selected anchor");
-            let network = rpc
-                .get_blockchain_info()
-                .expect("getblockchaininfo")
-                .chain;
+            let network = rpc.get_blockchain_info().expect("getblockchaininfo").chain;
             let addr = rpc
                 .get_new_address(None, Some(AddressType::Bech32m))
                 .expect("getnewaddress")
@@ -2790,8 +2776,7 @@ mod tests {
             "error must name the identity failure: {msg}"
         );
         assert!(
-            msg.contains(&format!("{orphaned_height}"))
-                || msg.contains("height"),
+            msg.contains(&format!("{orphaned_height}")) || msg.contains("height"),
             "error must mention the anchor height: {msg}"
         );
         let after = mempool_txids(&publisher);
@@ -2813,10 +2798,7 @@ mod tests {
         let tip_after = publisher.current_anchor().expect("tip after mine");
         assert_eq!(
             tip_after.height,
-            build_tip
-                .height
-                .checked_add(93)
-                .expect("height + 93"),
+            build_tip.height.checked_add(93).expect("height + 93"),
             "must advance tip by exactly 93"
         );
 
@@ -2849,10 +2831,7 @@ mod tests {
         let tip_after = publisher.current_anchor().expect("tip after mine");
         assert_eq!(
             tip_after.height,
-            build_tip
-                .height
-                .checked_add(94)
-                .expect("height + 94"),
+            build_tip.height.checked_add(94).expect("height + 94"),
             "must advance tip by exactly 94"
         );
 
@@ -2934,9 +2913,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(
-            unspent
-                .iter()
-                .any(|u| u.amount > Amount::from_sat(100_000)),
+            unspent.iter().any(|u| u.amount > Amount::from_sat(100_000)),
             "need a large funding candidate to remain for other tests after unlock"
         );
 
@@ -2997,7 +2974,8 @@ mod tests {
                 .map(|o| o.value)
                 .ok_or_else(|| format!("funding parent missing vout {}", funding_prev.vout))?;
             assert_eq!(
-                spent_value, exact,
+                spent_value,
+                exact,
                 "funding prevout must be exactly 1600 sat, got {}",
                 spent_value.to_sat()
             );
@@ -3047,8 +3025,11 @@ mod tests {
         // Size funding so that under the *with-change* fee assumption the change
         // falls just below dust — fixed-point must drop the change and succeed.
         let nums = nums_internal_key().expect("nums");
-        let p2tr =
-            ScriptBuf::new_p2tr(&bitcoin::secp256k1::Secp256k1::verification_only(), nums, None);
+        let p2tr = ScriptBuf::new_p2tr(
+            &bitcoin::secp256k1::Secp256k1::verification_only(),
+            nums,
+            None,
+        );
         let dust = p2tr.minimal_non_dust();
         let commit_vsize_with_change = 154usize;
         let commit_fee = fee_for_vsize(commit_vsize_with_change, 1).expect("cf");
@@ -3228,10 +3209,12 @@ mod tests {
         let result = (|| {
             let candidates = publisher.list_funding_candidates().expect("cands");
             assert!(
-                candidates.iter().all(|c| c.amount < reveal_out)
-                    && !candidates.is_empty(),
+                candidates.iter().all(|c| c.amount < reveal_out) && !candidates.is_empty(),
                 "after lock, only below-reveal candidates should remain: {:?}",
-                candidates.iter().map(|c| c.amount.to_sat()).collect::<Vec<_>>()
+                candidates
+                    .iter()
+                    .map(|c| c.amount.to_sat())
+                    .collect::<Vec<_>>()
             );
 
             let (sigs, _) = signed_members(1, Network::Regtest);
@@ -3319,8 +3302,7 @@ mod tests {
                 "error must name unmeasured arithmetic shortfall: {msg}"
             );
             assert!(
-                !msg.to_lowercase().contains("measured fees")
-                    && !msg.contains("final measured"),
+                !msg.to_lowercase().contains("measured fees") && !msg.contains("final measured"),
                 "must not describe unmeasured rejection as measured: {msg}"
             );
             assert!(
@@ -3450,13 +3432,11 @@ mod tests {
             "must be the arithmetic stale error (not a chain/hash error): {msg}"
         );
         assert!(
-            msg.contains("arithmetic pre-filter")
-                || msg.contains("no per-member getblockhash"),
+            msg.contains("arithmetic pre-filter") || msg.contains("no per-member getblockhash"),
             "error must identify the pre-RPC arithmetic filter: {msg}"
         );
         assert!(
-            !msg.contains("canonical block")
-                && !msg.contains("for member build tip failed"),
+            !msg.contains("canonical block") && !msg.contains("for member build tip failed"),
             "must not reach per-member hash validation: {msg}"
         );
         assert_eq!(
@@ -3489,7 +3469,10 @@ mod tests {
             },
         }];
         let gap = publish_inclusion_gap(inside_members[0].build_tip, tip).expect("gap");
-        assert_eq!(gap, window, "fixture must sit exactly at the effective bound");
+        assert_eq!(
+            gap, window,
+            "fixture must sit exactly at the effective bound"
+        );
         let batch = publisher
             .publish(&inside_members)
             .expect("batch just inside the window must still publish");
