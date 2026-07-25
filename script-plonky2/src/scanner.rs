@@ -22,7 +22,9 @@
 //!   violation, signature failure, missing vout on a resolved parent) are
 //!   deterministic rejections: zero nullifiers, recorded reason, scan continues.
 //! - **Infrastructure failures** (RPC error, timeout, lagging/missing `txindex`)
-//!   abort the scan loudly and leave the checkpoint untouched so work is retried.
+//!   abort the scan loudly at the failing block. Earlier blocks already
+//!   committed in the same call remain durable (per-block atomicity); the
+//!   failing block is not checkpointed, so retry resumes there.
 //!
 //! These are distinct types ([`DataFailure`] vs [`InfrastructureError`]); only
 //! data failures can become a [`RejectedInscription`].
@@ -37,11 +39,27 @@
 //!
 //! # Reorg atomicity invariant
 //!
-//! The reorg path collects the entire replacement range into local state first
-//! and only then applies truncate + replay + checkpoint updates in one step.
-//! Any failure during collection leaves the scanner exactly as it was, so a
-//! retry starts from the same consistent point and cannot permanently skip a
-//! replacement block's nullifiers.
+//! **Collection** of the entire replacement range into local state completes
+//! before any mutation of `scanned_blocks`, `survivors`, `scanned_through`, or
+//! the accumulator. Any failure during collection leaves the scanner exactly
+//! as it was, so a retry starts from the same consistent point and cannot
+//! permanently skip a replacement block's nullifiers.
+//!
+//! **Apply** after a successful collection: truncate + `reorg_replay` of the
+//! retained prefix, then fold each replacement block via the same per-block
+//! path as forward scanning. A failure mid-apply leaves the fork prefix and
+//! any fully folded replacement blocks committed (per-block atomicity); retry
+//! resumes from that checkpoint without re-mixing forks.
+//!
+//! # Per-block atomicity (forward scan)
+//!
+//! A single [`Scanner::scan_to_tip`] call is **not** all-or-nothing across
+//! blocks. Each forward block is committed (folded + checkpointed) only after
+//! it has been fully processed. An infrastructure failure aborts at the
+//! failing block; earlier blocks committed in the same call remain durable.
+//! Retry resumes at the failed block. When a call aborts after partial
+//! progress, [`InfrastructureError::partial_report`] carries the committed
+//! work so callers can observe what landed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -112,17 +130,37 @@ impl DataFailure {
 /// Node-local infrastructure / environment failure.
 ///
 /// Propagates out of [`Scanner::scan_to_tip`] as `Err`. Must never be recorded
-/// as a rejection and must never be followed by checkpointing the block.
+/// as a rejection and must never be followed by checkpointing the **failing**
+/// block. Earlier blocks already committed in the same call remain durable
+/// (per-block atomicity); see [`InfrastructureError::partial_report`].
 #[derive(Debug)]
 pub struct InfrastructureError {
     message: String,
+    /// Committed progress from the same `scan_to_tip` call before the abort,
+    /// when any block was fully processed. `None` when nothing was committed.
+    partial_report: Option<Box<ScanReport>>,
 }
 
 impl InfrastructureError {
+    /// Infrastructure failure with no committed partial progress.
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            partial_report: None,
         }
+    }
+
+    /// Infrastructure failure after one or more blocks were committed this call.
+    fn with_partial(message: impl Into<String>, report: ScanReport) -> Self {
+        Self {
+            message: message.into(),
+            partial_report: Some(Box::new(report)),
+        }
+    }
+
+    /// Committed [`ScanReport`] fragment from the aborted call, if any.
+    pub fn partial_report(&self) -> Option<&ScanReport> {
+        self.partial_report.as_deref()
     }
 }
 
@@ -213,14 +251,22 @@ pub struct ScanReport {
     pub from_height: Option<u64>,
     /// Last height scanned in this call, if any block was processed.
     pub to_height: Option<u64>,
-    /// Chain tip after the scan.
+    /// Tip height reflected by the scanner accumulator / checkpoint.
+    ///
+    /// When the scanner has scanned at least one block, this is
+    /// [`Scanner::scanned_through`]'s height — never a live RPC tip the
+    /// accumulator does not yet reflect. Only when nothing has ever been
+    /// scanned (`scanned_through == None`) is the live RPC tip reported.
     pub tip_height: u64,
+    /// Block hash paired with [`Self::tip_height`] under the same rule.
     pub tip_hash: BlockHash,
     /// Per-block results in ascending height order (forward scan **and**
     /// reorg-replacement blocks — nothing is dropped quietly).
     pub blocks: Vec<BlockScanResult>,
-    /// Present when a reorg was detected and replayed before scanning forward.
-    /// Callers MUST inspect `finality_broken` and stop crediting when set.
+    /// Present when one or more reorgs were handled in this call.
+    /// Outcomes are merged (sticky `finality_broken`, summed
+    /// `displaced_final_count`) — a later shallow reorg never erases an
+    /// earlier finality break. Callers MUST inspect `finality_broken`.
     pub reorg: Option<ReorgOutcome>,
     /// Sum of `inscriptions_seen` across blocks.
     pub inscriptions_seen: usize,
@@ -255,16 +301,25 @@ pub struct Scanner {
     parent_tx_cache: HashMap<Txid, Transaction>,
     /// Per-scan-run cache of `getblockhash(height)` for anchor identity checks.
     ///
-    /// Bound: at most one RPC per distinct anchor height per scan run.
-    /// **Invalidated on every reorg** (fork may change the canonical hash at a
-    /// height) — must not survive across the reorg path.
+    /// Bound: at most one RPC per distinct anchor height per connected-chain
+    /// view. **Invariant:** valid only for a single connected chain. Cleared
+    /// the moment a reorg is detected — **before** any replacement-block
+    /// validation or anchor `getblockhash` — so a stale orphaned hash can never
+    /// be used to admit a payload on the new fork.
     anchor_hash_cache: HashMap<u64, BlockHash>,
     /// Test seam: next prevout fetch fails as infrastructure (then clears).
     #[cfg(test)]
     inject_prevout_infra_failure: bool,
-    /// Test seam: `collect_block_nullifiers` at this height fails as infrastructure.
+    /// Test seam: `fetch_block_linked` at this height fails as infrastructure.
     #[cfg(test)]
     inject_infra_fail_at_height: Option<u64>,
+    /// Test seam: force `ChainBroken` during linked fetch at this height (one-shot).
+    #[cfg(test)]
+    inject_broken_link_at_height: Option<u64>,
+    /// Test seam: after committing the forward block at this height, invalidate
+    /// it and mine an empty replacement via RPC (one-shot).
+    #[cfg(test)]
+    inject_reorg_after_commit_height: Option<u64>,
     /// Test counter: how many `getrawtransaction` RPCs this scan run issued.
     #[cfg(test)]
     prevout_rpc_count: usize,
@@ -335,6 +390,10 @@ impl Scanner {
             #[cfg(test)]
             inject_infra_fail_at_height: None,
             #[cfg(test)]
+            inject_broken_link_at_height: None,
+            #[cfg(test)]
+            inject_reorg_after_commit_height: None,
+            #[cfg(test)]
             prevout_rpc_count: 0,
             #[cfg(test)]
             anchor_hash_rpc_count: 0,
@@ -346,18 +405,31 @@ impl Scanner {
     /// Before scanning forward, verifies the previously scanned tip is still
     /// canonical. On reorg: finds the highest common ancestor, drops survivors
     /// above it, re-collects nullifiers on the new canonical fork, and calls
-    /// [`NfLogAccumulator::reorg_replay`]. `ReorgOutcome::finality_broken` is
-    /// surfaced in the report — never swallowed.
+    /// [`NfLogAccumulator::reorg_replay`] then folds replacement blocks.
+    /// `ReorgOutcome::finality_broken` is surfaced in the report — never
+    /// swallowed. Multiple reorgs in one call are merged (sticky finality).
     ///
     /// While scanning forward, verifies each block links to the previous one
     /// (`prev_blockhash`). On mismatch the reorg path runs instead of mixing
     /// forks into the accumulator.
     ///
-    /// Infrastructure failures abort with `Err` and leave the checkpoint
-    /// unchanged. Data failures are recorded as rejections and the scan continues.
+    /// # Per-block atomicity
+    ///
+    /// Each forward block is fully processed and checkpointed, or not at all.
+    /// An infrastructure failure aborts at the failing block; earlier commits
+    /// from this call remain. Retry resumes at the failed block. On abort after
+    /// partial progress, the error is [`InfrastructureError`] with
+    /// [`InfrastructureError::partial_report`] set.
+    ///
+    /// # Tip reporting
+    ///
+    /// `tip_height` / `tip_hash` always reflect the accumulator checkpoint
+    /// (`scanned_through`) when any block has been scanned — never a live RPC
+    /// tip the accumulator does not reflect.
     pub fn scan_to_tip(&mut self) -> Result<ScanReport> {
         // Fresh per-run parent cache. Anchor-hash cache survives across forward
-        // progress within a connected chain but is wiped by the reorg path.
+        // progress within a connected chain but is wiped the moment a reorg is
+        // detected (before replacement validation).
         self.parent_tx_cache.clear();
         #[cfg(test)]
         {
@@ -375,12 +447,75 @@ impl Scanner {
         let mut to_height = None;
         let mut reorg: Option<ReorgOutcome> = None;
 
+        // Build a partial report from committed work so far (for infra aborts).
+        let build_partial = |blocks: &[BlockScanResult],
+                             inscriptions_seen: usize,
+                             admitted_count: usize,
+                             rejected_count: usize,
+                             duplicates: usize,
+                             duplicate_details: &[DuplicateNullifier],
+                             from_height: Option<u64>,
+                             to_height: Option<u64>,
+                             reorg: &Option<ReorgOutcome>,
+                             scanned_through: Option<(u64, BlockHash)>,
+                             live_tip_height: u64,
+                             live_tip_hash: BlockHash|
+         -> ScanReport {
+            let (tip_height, tip_hash) = match scanned_through {
+                Some((h, hash)) => (h, hash),
+                None => (live_tip_height, live_tip_hash),
+            };
+            ScanReport {
+                from_height,
+                to_height,
+                tip_height,
+                tip_hash,
+                blocks: blocks.to_vec(),
+                reorg: reorg.clone(),
+                inscriptions_seen,
+                admitted_count,
+                rejected_count,
+                duplicates,
+                duplicate_details: duplicate_details.to_vec(),
+            }
+        };
+
         // May need more than one pass: a mid-scan chain break re-runs reorg then
         // continues forward from the repaired checkpoint.
         loop {
-            let (reorg_outcome, reorg_blocks) = self.detect_and_handle_reorg()?;
+            let reorg_result = self.detect_and_handle_reorg();
+            let (reorg_outcome, reorg_blocks) = match reorg_result {
+                Ok(v) => v,
+                Err(e) => {
+                    if blocks.is_empty() {
+                        return Err(e);
+                    }
+                    // Committed work implies a checkpoint; report that tip only.
+                    let (tip_h, tip_hash) = self.scanned_through.ok_or_else(|| {
+                        anyhow!(
+                            "internal: blocks committed this call but scanned_through is None \
+                             while attaching partial report after reorg failure"
+                        )
+                    })?;
+                    let partial = build_partial(
+                        &blocks,
+                        inscriptions_seen,
+                        admitted_count,
+                        rejected_count,
+                        duplicates,
+                        &duplicate_details,
+                        from_height,
+                        to_height,
+                        &reorg,
+                        Some((tip_h, tip_hash)),
+                        tip_h,
+                        tip_hash,
+                    );
+                    return Err(InfrastructureError::with_partial(format!("{e:#}"), partial).into());
+                }
+            };
             if let Some(outcome) = reorg_outcome {
-                reorg = Some(outcome);
+                merge_reorg_outcome(&mut reorg, outcome);
             }
             for result in reorg_blocks {
                 Self::accumulate_block_into_report(
@@ -414,8 +549,9 @@ impl Scanner {
             let mut chain_broke_at: Option<u64> = None;
             if start <= tip_height {
                 for height in start..=tip_height {
-                    match self.scan_block_linked(height, expected_prev)? {
-                        ScanBlockOutcome::Scanned(result) => {
+                    let scan_result = self.scan_block_linked(height, expected_prev);
+                    match scan_result {
+                        Ok(ScanBlockOutcome::Scanned(result)) => {
                             expected_prev = Some(result.block_hash);
                             Self::accumulate_block_into_report(
                                 &result,
@@ -429,11 +565,41 @@ impl Scanner {
                             )?;
                             blocks.push(result);
                         }
-                        ScanBlockOutcome::ChainBroken => {
+                        Ok(ScanBlockOutcome::ChainBroken) => {
                             // Stop advancing; re-enter so the reorg path can
                             // repair state, then continue on the new fork.
                             chain_broke_at = Some(height);
                             break;
+                        }
+                        Err(e) => {
+                            // Per-block atomicity: earlier commits stay; attach
+                            // partial report when this call already committed.
+                            if blocks.is_empty() {
+                                return Err(e);
+                            }
+                            let (tip_h, tip_hash) = self.scanned_through.ok_or_else(|| {
+                                anyhow!(
+                                    "internal: blocks committed this call but scanned_through \
+                                     is None while attaching partial report"
+                                )
+                            })?;
+                            let partial = build_partial(
+                                &blocks,
+                                inscriptions_seen,
+                                admitted_count,
+                                rejected_count,
+                                duplicates,
+                                &duplicate_details,
+                                from_height,
+                                to_height,
+                                &reorg,
+                                Some((tip_h, tip_hash)),
+                                tip_h,
+                                tip_hash,
+                            );
+                            return Err(
+                                InfrastructureError::with_partial(format!("{e:#}"), partial).into(),
+                            );
                         }
                     }
                 }
@@ -462,19 +628,52 @@ impl Scanner {
                 continue;
             }
 
-            let tip_hash = self
+            // Tip must match the accumulator: never report a live tip the
+            // scanner has not fully reflected.
+            let live_tip = self
                 .rpc
-                .get_block_hash(tip_height)
-                .with_context(|| format!("getblockhash({tip_height}) failed"))
-                .map_err(|e| {
-                    InfrastructureError::new(format!("getblockhash({tip_height}): {e:#}"))
+                .get_block_count()
+                .context("getblockcount (post-scan tip re-read) failed")?;
+            if let Some((scanned_h, _)) = self.scanned_through {
+                if scanned_h < live_tip {
+                    // New blocks appeared after the forward pass — continue.
+                    continue;
+                }
+                let live_hash = self.rpc.get_block_hash(scanned_h).map_err(|e| {
+                    InfrastructureError::new(format!(
+                        "getblockhash({scanned_h}) post-scan tip check: {e}"
+                    ))
                 })?;
+                let scanned_hash = self
+                    .scanned_through
+                    .map(|(_, h)| h)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "internal: scanned_through became None during post-scan tip check \
+                             at height {scanned_h}"
+                        )
+                    })?;
+                if live_hash != scanned_hash {
+                    // Reorg under us after the forward pass — repair next loop.
+                    continue;
+                }
+            }
+
+            let (report_tip_height, report_tip_hash) = match self.scanned_through {
+                Some((h, hash)) => (h, hash),
+                None => {
+                    let tip_hash = self.rpc.get_block_hash(live_tip).map_err(|e| {
+                        InfrastructureError::new(format!("getblockhash({live_tip}): {e}"))
+                    })?;
+                    (live_tip, tip_hash)
+                }
+            };
 
             return Ok(ScanReport {
                 from_height,
                 to_height,
-                tip_height,
-                tip_hash,
+                tip_height: report_tip_height,
+                tip_hash: report_tip_hash,
                 blocks,
                 reorg,
                 inscriptions_seen,
@@ -543,10 +742,23 @@ impl Scanner {
         self.inject_prevout_infra_failure = true;
     }
 
-    /// Test seam: collecting nullifiers at `height` aborts as infrastructure.
+    /// Test seam: fetching/collecting the block at `height` aborts as infrastructure.
     #[cfg(test)]
     pub fn inject_infra_fail_at_height(&mut self, height: u64) {
         self.inject_infra_fail_at_height = Some(height);
+    }
+
+    /// Test seam: force a chain-link break at `height` (one-shot) during linked fetch.
+    #[cfg(test)]
+    pub fn inject_broken_link_at_height(&mut self, height: u64) {
+        self.inject_broken_link_at_height = Some(height);
+    }
+
+    /// Test seam: after committing the forward block at `height`, invalidate it
+    /// and mine an empty replacement (one-shot).
+    #[cfg(test)]
+    pub fn inject_reorg_after_commit_height(&mut self, height: u64) {
+        self.inject_reorg_after_commit_height = Some(height);
     }
 
     /// Test observation: `getrawtransaction` RPC count for the current/last scan run.
@@ -567,6 +779,32 @@ impl Scanner {
         self.anchor_hash_cache.len()
     }
 }
+
+/// Merge a reorg outcome into an accumulator of outcomes for one scan call.
+///
+/// Sticky finality: once `finality_broken` is true it stays true.
+/// `displaced_final_count` is summed with checked arithmetic (fail-loud on overflow).
+///
+/// Returns `Some(ReorgOutcome{...})` in `acc` after the first merge; subsequent
+/// calls update that value in place.
+pub fn merge_reorg_outcome(acc: &mut Option<ReorgOutcome>, next: ReorgOutcome) {
+    match acc {
+        None => *acc = Some(next),
+        Some(existing) => {
+            existing.finality_broken |= next.finality_broken;
+            existing.displaced_final_count = existing
+                .displaced_final_count
+                .checked_add(next.displaced_final_count)
+                .expect(
+                    "displaced_final_count overflow while merging reorg outcomes — refuse to wrap",
+                );
+        }
+    }
+}
+
+/// Maximum times the reorg path may abandon a replacement collection and
+/// restart from the current chain tip after a mid-collection linkage break.
+const MAX_REORG_COLLECTION_RESTARTS: u32 = 16;
 
 // ── §3.6 pure helpers (unit-testable without bitcoind) ───────────────────
 
@@ -709,6 +947,20 @@ enum ScanBlockOutcome {
     ChainBroken,
 }
 
+/// A block fetched via RPC and verified against the expected parent hash.
+struct LinkedFetch {
+    height: u64,
+    block_hash: BlockHash,
+    block: Block,
+}
+
+/// Result of [`Scanner::fetch_block_linked`]: linked block or chain break.
+enum LinkedFetchOutcome {
+    Linked(LinkedFetch),
+    /// `prev_blockhash` mismatch (or test-injected break) — do not fold.
+    ChainBroken,
+}
+
 /// Collected replacement-block data before the reorg path mutates scanner state.
 struct CollectedBlock {
     height: u64,
@@ -724,133 +976,173 @@ impl Scanner {
     ///
     /// # Atomicity invariant
     ///
-    /// Collection of every replacement block into local state completes
+    /// **Collection** of every replacement block into local state completes
     /// **before** any mutation of `scanned_blocks`, `survivors`,
     /// `scanned_through`, or the accumulator. Failure during collection leaves
     /// the scanner exactly as it was so a retry starts from the same point
     /// and cannot permanently skip a replacement block's nullifiers.
+    ///
+    /// **Apply** truncates to the fork, replays the retained stream, then folds
+    /// each collected block with the shared forward fold helper (real
+    /// admissions/duplicates). Mid-apply failure leaves already-folded
+    /// replacement blocks committed; retry continues from that checkpoint.
+    ///
+    /// # Anchor-hash cache
+    ///
+    /// The cache is valid only for a single connected-chain view. It is cleared
+    /// the moment a reorg is detected (`still_canonical == false`), **before**
+    /// any replacement-block validation or anchor `getblockhash`.
+    ///
+    /// # Replacement linkage
+    ///
+    /// Each collected replacement block is chain-linked via
+    /// [`Self::fetch_block_linked`]. A mid-collection linkage break abandons
+    /// the entire collection (no APPLY) and restarts from the current chain
+    /// state, bounded by [`MAX_REORG_COLLECTION_RESTARTS`].
     fn detect_and_handle_reorg(
         &mut self,
     ) -> Result<(Option<ReorgOutcome>, Vec<BlockScanResult>)> {
-        let Some((scanned_h, scanned_hash)) = self.scanned_through else {
-            return Ok((None, Vec::new()));
-        };
+        let mut restarts = 0u32;
+        loop {
+            let Some((scanned_h, scanned_hash)) = self.scanned_through else {
+                return Ok((None, Vec::new()));
+            };
 
-        let tip = self.rpc.get_block_count().map_err(|e| {
-            InfrastructureError::new(format!("getblockcount during reorg check: {e}"))
-        })?;
+            let tip = self.rpc.get_block_count().map_err(|e| {
+                InfrastructureError::new(format!("getblockcount during reorg check: {e}"))
+            })?;
 
-        let still_canonical = if scanned_h > tip {
-            false
-        } else {
-            match self.rpc.get_block_hash(scanned_h) {
-                Ok(live) => live == scanned_hash,
-                // Cannot tell whether the tip is canonical — abort, do not
-                // treat an RPC failure as "reorg happened".
-                Err(e) => {
+            let still_canonical = if scanned_h > tip {
+                false
+            } else {
+                match self.rpc.get_block_hash(scanned_h) {
+                    Ok(live) => live == scanned_hash,
+                    // Cannot tell whether the tip is canonical — abort, do not
+                    // treat an RPC failure as "reorg happened".
+                    Err(e) => {
+                        return Err(InfrastructureError::new(format!(
+                            "getblockhash({scanned_h}) during reorg check: {e}"
+                        ))
+                        .into());
+                    }
+                }
+            };
+            if still_canonical {
+                return Ok((None, Vec::new()));
+            }
+
+            // Finding 1: clear anchor cache the moment reorg is detected —
+            // BEFORE any replacement-block validation / getblockhash for anchors.
+            // Invariant: cache is valid only for a single connected-chain view.
+            self.anchor_hash_cache.clear();
+
+            // Highest common ancestor: walk down stored hashes.
+            let mut fork_height: Option<u64> = None;
+            for (&height, old_hash) in self.scanned_blocks.iter().rev() {
+                if height > tip {
+                    continue;
+                }
+                match self.rpc.get_block_hash(height) {
+                    Ok(live) if live == *old_hash => {
+                        fork_height = Some(height);
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        return Err(InfrastructureError::new(format!(
+                            "getblockhash({height}) while finding common ancestor: {e}"
+                        ))
+                        .into());
+                    }
+                }
+            }
+
+            // If no common block remains, replay from empty (everything above
+            // activation is re-collected). `fork_height = None` means retained = [].
+            let old_tip_height = scanned_h;
+            let retained: Vec<PublishedNullifier> = match fork_height {
+                Some(fork) => self
+                    .survivors
+                    .iter()
+                    .filter(|n| n.chain_pos.height <= fork)
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            };
+
+            let rescan_from = match fork_height {
+                Some(fork) => fork
+                    .checked_add(1)
+                    .context("fork height + 1 overflowed")?,
+                None => self.config.activation_height,
+            };
+            let recollect_through = tip.min(old_tip_height);
+
+            // ── COLLECT (no scanner-state mutation yet) ──────────────────
+            // First block links to the fork point; subsequent blocks chain.
+            let mut expected_prev: Option<BlockHash> = match fork_height {
+                Some(fork) => Some(
+                    *self.scanned_blocks.get(&fork).ok_or_else(|| {
+                        anyhow!("internal: missing scanned hash at fork {fork}")
+                    })?,
+                ),
+                // From activation: no parent link required for the first block.
+                None => None,
+            };
+
+            let mut collected: Vec<CollectedBlock> = Vec::new();
+            let mut collection_restart = false;
+            if rescan_from <= recollect_through {
+                for height in rescan_from..=recollect_through {
+                    match self.fetch_block_linked(height, expected_prev)? {
+                        LinkedFetchOutcome::ChainBroken => {
+                            // Abandon entire collection (no APPLY); restart from
+                            // current chain state. Scanner state untouched.
+                            collection_restart = true;
+                            break;
+                        }
+                        LinkedFetchOutcome::Linked(fetch) => {
+                            let (verified, rejected, inscriptions_seen) = self
+                                .collect_block_nullifiers_from(height, &fetch.block)?;
+                            expected_prev = Some(fetch.block_hash);
+                            collected.push(CollectedBlock {
+                                height: fetch.height,
+                                block_hash: fetch.block_hash,
+                                verified,
+                                rejected,
+                                inscriptions_seen,
+                            });
+                        }
+                    }
+                }
+            }
+
+            if collection_restart {
+                restarts = restarts.checked_add(1).context("reorg restart counter overflow")?;
+                if restarts > MAX_REORG_COLLECTION_RESTARTS {
                     return Err(InfrastructureError::new(format!(
-                        "getblockhash({scanned_h}) during reorg check: {e}"
+                        "reorg replacement collection exceeded MAX_REORG_COLLECTION_RESTARTS \
+                         ({MAX_REORG_COLLECTION_RESTARTS}) after mid-collection chain breaks"
                     ))
                     .into());
                 }
-            }
-        };
-        if still_canonical {
-            return Ok((None, Vec::new()));
-        }
-
-        // Highest common ancestor: walk down stored hashes.
-        let mut fork_height: Option<u64> = None;
-        for (&height, old_hash) in self.scanned_blocks.iter().rev() {
-            if height > tip {
+                // Re-read chain state from the top of the loop.
                 continue;
             }
-            match self.rpc.get_block_hash(height) {
-                Ok(live) if live == *old_hash => {
-                    fork_height = Some(height);
-                    break;
-                }
-                Ok(_) => continue,
-                Err(e) => {
-                    return Err(InfrastructureError::new(format!(
-                        "getblockhash({height}) while finding common ancestor: {e}"
-                    ))
-                    .into());
-                }
-            }
-        }
 
-        // If no common block remains, replay from empty (everything above
-        // activation is re-collected). `fork_height = None` means retained = [].
-        let old_tip_height = scanned_h;
-        let retained: Vec<PublishedNullifier> = match fork_height {
-            Some(fork) => self
-                .survivors
-                .iter()
-                .filter(|n| n.chain_pos.height <= fork)
-                .cloned()
-                .collect(),
-            None => Vec::new(),
-        };
+            // ── APPLY (single atomic step after full collection succeeded) ─
+            // Anchor cache already cleared at reorg detection (Finding 1).
 
-        let rescan_from = match fork_height {
-            Some(fork) => fork
-                .checked_add(1)
-                .context("fork height + 1 overflowed")?,
-            None => self.config.activation_height,
-        };
-        let recollect_through = tip.min(old_tip_height);
+            // 1–3: retain survivors, replay retained stream, assign survivors.
+            let outcome = self
+                .accumulator
+                .reorg_replay(old_tip_height, retained.clone())
+                .map_err(|e| anyhow!("accumulator reorg_replay failed: {e}"))?;
+            self.survivors = retained;
 
-        // ── COLLECT (no scanner-state mutation yet) ──────────────────────
-        let mut collected: Vec<CollectedBlock> = Vec::new();
-        if rescan_from <= recollect_through {
-            for height in rescan_from..=recollect_through {
-                let (block_hash, verified, rejected, inscriptions_seen) =
-                    self.collect_block_nullifiers(height)?;
-                collected.push(CollectedBlock {
-                    height,
-                    block_hash,
-                    verified,
-                    rejected,
-                    inscriptions_seen,
-                });
-            }
-        }
-
-        // ── APPLY (single atomic step after full collection succeeded) ───
-        // Anchor hashes may differ on the new fork — drop the cache.
-        self.anchor_hash_cache.clear();
-
-        self.scanned_blocks
-            .retain(|&h, _| fork_height.map(|fork| h <= fork).unwrap_or(false));
-
-        let mut stream = retained;
-        let mut block_reports = Vec::new();
-        for block in collected {
-            stream.extend(block.verified.iter().copied());
-            self.scanned_blocks.insert(block.height, block.block_hash);
-            block_reports.push(BlockScanResult {
-                height: block.height,
-                block_hash: block.block_hash,
-                inscriptions_seen: block.inscriptions_seen,
-                rejected: block.rejected,
-                // Folding is done by reorg_replay below; admissions appear there.
-                admitted: Vec::new(),
-                duplicates: 0,
-                duplicate_details: Vec::new(),
-            });
-        }
-
-        if rescan_from <= recollect_through {
-            let hash = *self
-                .scanned_blocks
-                .get(&recollect_through)
-                .ok_or_else(|| {
-                    anyhow!("internal: missing collected hash at {recollect_through}")
-                })?;
-            self.scanned_through = Some((recollect_through, hash));
-        } else {
-            // Chain tip is at or below fork; nothing to recollect.
+            // 4: truncate checkpoints to fork.
+            self.scanned_blocks
+                .retain(|&h, _| fork_height.map(|fork| h <= fork).unwrap_or(false));
             self.scanned_through = match fork_height {
                 Some(fork) => {
                     let hash = *self.scanned_blocks.get(&fork).ok_or_else(|| {
@@ -860,34 +1152,67 @@ impl Scanner {
                 }
                 None => None,
             };
+
+            // 5: fold each collected block (real admissions / duplicates).
+            let mut block_reports = Vec::new();
+            for block in collected {
+                let (admitted, duplicates, duplicate_details) =
+                    self.fold_verified_nullifiers(&block.verified)?;
+                self.scanned_blocks.insert(block.height, block.block_hash);
+                self.scanned_through = Some((block.height, block.block_hash));
+                block_reports.push(BlockScanResult {
+                    height: block.height,
+                    block_hash: block.block_hash,
+                    inscriptions_seen: block.inscriptions_seen,
+                    rejected: block.rejected,
+                    admitted,
+                    duplicates,
+                    duplicate_details,
+                });
+            }
+
+            if outcome.finality_broken {
+                // Loud surface: finality assumption broken — caller must stop crediting.
+                eprintln!(
+                    "zkCoins scanner: FINALITY BROKEN after reorg — \
+                     displaced_final_count={}, old_tip_height={old_tip_height}, \
+                     fork={fork_height:?}. Callers MUST stop crediting against the \
+                     broken state (§3.9).",
+                    outcome.displaced_final_count
+                );
+            }
+
+            return Ok((Some(outcome), block_reports));
         }
-
-        let outcome = self
-            .accumulator
-            .reorg_replay(old_tip_height, stream.clone())
-            .map_err(|e| anyhow!("accumulator reorg_replay failed: {e}"))?;
-        self.survivors = stream;
-
-        if outcome.finality_broken {
-            // Loud surface: finality assumption broken — caller must stop crediting.
-            eprintln!(
-                "zkCoins scanner: FINALITY BROKEN after reorg — \
-                 displaced_final_count={}, old_tip_height={old_tip_height}, \
-                 fork={fork_height:?}. Callers MUST stop crediting against the \
-                 broken state (§3.9).",
-                outcome.displaced_final_count
-            );
-        }
-
-        Ok((Some(outcome), block_reports))
     }
 
-    /// Scan one block after verifying its `prev_blockhash` link.
-    fn scan_block_linked(
+    /// Fetch a block at `height` and verify its `prev_blockhash` link.
+    ///
+    /// Returns [`LinkedFetchOutcome::ChainBroken`] on parent mismatch (do not
+    /// fold). Infrastructure failures (RPC, injected) return `Err`.
+    ///
+    /// Honours `inject_infra_fail_at_height` and `inject_broken_link_at_height`
+    /// on entry (test seams).
+    fn fetch_block_linked(
         &mut self,
         height: u64,
         expected_prev: Option<BlockHash>,
-    ) -> Result<ScanBlockOutcome> {
+    ) -> Result<LinkedFetchOutcome> {
+        #[cfg(test)]
+        if self.inject_infra_fail_at_height == Some(height) {
+            self.inject_infra_fail_at_height = None;
+            return Err(InfrastructureError::new(format!(
+                "injected infrastructure failure at height {height}"
+            ))
+            .into());
+        }
+
+        #[cfg(test)]
+        if self.inject_broken_link_at_height == Some(height) {
+            self.inject_broken_link_at_height = None;
+            return Ok(LinkedFetchOutcome::ChainBroken);
+        }
+
         let block_hash = self.rpc.get_block_hash(height).map_err(|e| {
             InfrastructureError::new(format!("getblockhash({height}): {e}"))
         })?;
@@ -897,32 +1222,52 @@ impl Scanner {
 
         if let Some(expected) = expected_prev {
             if block.header.prev_blockhash != expected {
-                // Connected-chain invariant broken mid-scan — do not fold this
-                // block; caller must run the reorg path.
-                return Ok(ScanBlockOutcome::ChainBroken);
+                // Distinct from infrastructure: connected-chain mismatch.
+                return Ok(LinkedFetchOutcome::ChainBroken);
             }
         }
 
-        let result = self.scan_block_contents(height, block_hash, &block)?;
-        Ok(ScanBlockOutcome::Scanned(result))
+        Ok(LinkedFetchOutcome::Linked(LinkedFetch {
+            height,
+            block_hash,
+            block,
+        }))
     }
 
-    /// Fold verified nullifiers from an already-fetched, chain-linked block.
-    fn scan_block_contents(
+    /// Scan one block after verifying its `prev_blockhash` link.
+    fn scan_block_linked(
         &mut self,
         height: u64,
-        block_hash: BlockHash,
-        block: &Block,
-    ) -> Result<BlockScanResult> {
-        let (verified, rejected, inscriptions_seen) =
-            self.collect_block_nullifiers_from(height, block)?;
+        expected_prev: Option<BlockHash>,
+    ) -> Result<ScanBlockOutcome> {
+        match self.fetch_block_linked(height, expected_prev)? {
+            LinkedFetchOutcome::ChainBroken => Ok(ScanBlockOutcome::ChainBroken),
+            LinkedFetchOutcome::Linked(fetch) => {
+                let result =
+                    self.scan_block_contents(fetch.height, fetch.block_hash, &fetch.block)?;
+                Ok(ScanBlockOutcome::Scanned(result))
+            }
+        }
+    }
 
+    /// Fold verified nullifiers into the accumulator and append them to
+    /// `survivors`. Shared by the forward path and reorg APPLY after truncate.
+    ///
+    /// Returns `(admitted, duplicates, duplicate_details)`.
+    fn fold_verified_nullifiers(
+        &mut self,
+        verified: &[PublishedNullifier],
+    ) -> Result<(
+        Vec<(ChainPosition, u64)>,
+        usize,
+        Vec<DuplicateNullifier>,
+    )> {
         let mut admitted = Vec::new();
         let mut duplicates = 0usize;
         let mut duplicate_details = Vec::new();
 
         // §3.6 steps 4–5: fold in strictly ascending ChainPosition order.
-        for nf in &verified {
+        for nf in verified {
             let outcome = self
                 .accumulator
                 .fold(nf.chain_pos, nf.pk, nf.r)
@@ -940,15 +1285,13 @@ impl Scanner {
                     duplicates = duplicates
                         .checked_add(1)
                         .context("duplicates counter overflow")?;
-                    let winner_position = self
-                        .winner_chain_position(nf.pk)
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "DuplicateIgnored for pk but no winner in survivors/admitted \
-                                 (internal invariant broken) at {:?}",
-                                nf.chain_pos
-                            )
-                        })?;
+                    let winner_position = self.winner_chain_position(nf.pk).ok_or_else(|| {
+                        anyhow!(
+                            "DuplicateIgnored for pk but no winner in survivors/admitted \
+                             (internal invariant broken) at {:?}",
+                            nf.chain_pos
+                        )
+                    })?;
                     duplicate_details.push(DuplicateNullifier {
                         position: nf.chain_pos,
                         winner_position,
@@ -966,8 +1309,42 @@ impl Scanner {
             self.survivors.push(*nf);
         }
 
+        Ok((admitted, duplicates, duplicate_details))
+    }
+
+    /// Fold verified nullifiers from an already-fetched, chain-linked block.
+    ///
+    /// Collect + fold + checkpoint. On success the block is fully committed
+    /// (per-block atomicity).
+    fn scan_block_contents(
+        &mut self,
+        height: u64,
+        block_hash: BlockHash,
+        block: &Block,
+    ) -> Result<BlockScanResult> {
+        let (verified, rejected, inscriptions_seen) =
+            self.collect_block_nullifiers_from(height, block)?;
+
+        let (admitted, duplicates, duplicate_details) =
+            self.fold_verified_nullifiers(&verified)?;
+
         self.scanned_blocks.insert(height, block_hash);
         self.scanned_through = Some((height, block_hash));
+
+        #[cfg(test)]
+        if self.inject_reorg_after_commit_height == Some(height) {
+            self.inject_reorg_after_commit_height = None;
+            self.rpc.invalidate_block(&block_hash).map_err(|e| {
+                InfrastructureError::new(format!(
+                    "inject_reorg_after_commit invalidateblock({block_hash}): {e}"
+                ))
+            })?;
+            Self::mine_empty_block_via_rpc(&self.rpc).map_err(|e| {
+                InfrastructureError::new(format!(
+                    "inject_reorg_after_commit mine empty replacement: {e}"
+                ))
+            })?;
+        }
 
         Ok(BlockScanResult {
             height,
@@ -980,53 +1357,39 @@ impl Scanner {
         })
     }
 
+    /// Mine one empty (coinbase-only) block via `generateblock` on the base RPC.
+    #[cfg(test)]
+    fn mine_empty_block_via_rpc(rpc: &Client) -> Result<BlockHash> {
+        use bitcoin::{Address, Network as BtcNetwork, ScriptBuf, WPubkeyHash};
+        // Deterministic unspendable-ish p2wpkh for the coinbase; only needs to
+        // be a valid regtest address for generateblock.
+        let script = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x42; 20]));
+        let addr = Address::from_script(&script, BtcNetwork::Regtest)
+            .context("p2wpkh script must form a regtest address")?;
+        let result: bitcoincore_rpc::jsonrpc::serde_json::Value = rpc
+            .call(
+                "generateblock",
+                &[
+                    bitcoincore_rpc::jsonrpc::serde_json::Value::String(addr.to_string()),
+                    bitcoincore_rpc::jsonrpc::serde_json::Value::Array(vec![]),
+                ],
+            )
+            .context("generateblock empty for inject_reorg")?;
+        let hash_hex = result
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .context("generateblock response missing hash")?;
+        hash_hex
+            .parse()
+            .context("parse generateblock hash")
+    }
+
     /// Chain position of the first-occurrence winner for `pk`, if any.
     fn winner_chain_position(&self, pk: [u8; 32]) -> Option<ChainPosition> {
         self.survivors
             .iter()
             .find(|n| n.pk == pk)
             .map(|n| n.chain_pos)
-    }
-
-    /// Discover → parse/bound-check → verify for one block height (RPC fetch).
-    ///
-    /// Does **not** fold into the accumulator. Infrastructure errors propagate;
-    /// data failures become entries in the returned rejection list.
-    fn collect_block_nullifiers(
-        &mut self,
-        height: u64,
-    ) -> Result<(
-        BlockHash,
-        Vec<PublishedNullifier>,
-        Vec<RejectedInscription>,
-        usize,
-    )> {
-        #[cfg(test)]
-        if self.inject_infra_fail_at_height == Some(height) {
-            self.inject_infra_fail_at_height = None;
-            return Err(InfrastructureError::new(format!(
-                "injected infrastructure failure at height {height}"
-            ))
-            .into());
-        }
-
-        ensure!(
-            height >= self.config.activation_height,
-            "collect_block_nullifiers called below activation_height \
-             ({height} < {})",
-            self.config.activation_height
-        );
-
-        let block_hash = self.rpc.get_block_hash(height).map_err(|e| {
-            InfrastructureError::new(format!("getblockhash({height}): {e}"))
-        })?;
-        let block: Block = self.rpc.get_block(&block_hash).map_err(|e| {
-            InfrastructureError::new(format!("getblock({block_hash}): {e}"))
-        })?;
-
-        let (verified, rejected, inscriptions_seen) =
-            self.collect_block_nullifiers_from(height, &block)?;
-        Ok((block_hash, verified, rejected, inscriptions_seen))
     }
 
     /// Discover → parse/bound-check → verify against an already-loaded block.
@@ -1469,6 +1832,59 @@ mod tests {
     fn pinned_activation_height_regtest_is_zero() {
         let h = pinned_activation_height(Network::Regtest).expect("regtest pin");
         assert_eq!(h, 0, "§3.6 regtest activation_height = 0");
+    }
+
+    /// F4 unit: sticky finality across merged reorg outcomes.
+    #[test]
+    fn merge_reorg_outcome_sticky_finality() {
+        // Deep then shallow → finality stays broken; displaced counts sum.
+        let mut acc: Option<ReorgOutcome> = None;
+        merge_reorg_outcome(
+            &mut acc,
+            ReorgOutcome {
+                finality_broken: true,
+                displaced_final_count: 2,
+            },
+        );
+        merge_reorg_outcome(
+            &mut acc,
+            ReorgOutcome {
+                finality_broken: false,
+                displaced_final_count: 0,
+            },
+        );
+        let deep_then_shallow = acc.expect("merged");
+        assert!(
+            deep_then_shallow.finality_broken,
+            "deep then shallow must keep finality_broken"
+        );
+        assert_eq!(deep_then_shallow.displaced_final_count, 2);
+
+        // Shallow then deep → same sticky result with summed displaced.
+        let mut acc2: Option<ReorgOutcome> = None;
+        merge_reorg_outcome(
+            &mut acc2,
+            ReorgOutcome {
+                finality_broken: false,
+                displaced_final_count: 0,
+            },
+        );
+        merge_reorg_outcome(
+            &mut acc2,
+            ReorgOutcome {
+                finality_broken: true,
+                displaced_final_count: 2,
+            },
+        );
+        let shallow_then_deep = acc2.expect("merged");
+        assert!(
+            shallow_then_deep.finality_broken,
+            "shallow then deep must set finality_broken"
+        );
+        assert_eq!(
+            shallow_then_deep.displaced_final_count, 2,
+            "displaced counts must sum"
+        );
     }
 
     #[test]
@@ -2013,22 +2429,33 @@ mod tests {
     /// This is what makes a real reorg actually drop a nullifier rather than
     /// immediately re-admit it from the mempool.
     fn mine_empty_block(rpc: &Client) -> BlockHash {
+        mine_block_with_txids(rpc, &[])
+    }
+
+    /// Mine one block via `generateblock` that includes **exactly** the given
+    /// mempool txids (in order) plus coinbase. Unlike `generatetoaddress`, this
+    /// does not pull other mempool txs — critical after `invalidateblock` when
+    /// orphaned inscriptions would otherwise re-enter the replacement block.
+    fn mine_block_with_txids(rpc: &Client, txids: &[Txid]) -> BlockHash {
         let network = rpc.get_blockchain_info().expect("chain").chain;
         let addr = rpc
             .get_new_address(None, Some(AddressType::Bech32m))
             .expect("addr")
             .require_network(network)
             .expect("net");
-        // generateblock "address" [] — empty tx list ⇒ coinbase only.
+        let tx_list: Vec<bitcoincore_rpc::jsonrpc::serde_json::Value> = txids
+            .iter()
+            .map(|t| bitcoincore_rpc::jsonrpc::serde_json::Value::String(t.to_string()))
+            .collect();
         let result: bitcoincore_rpc::jsonrpc::serde_json::Value = rpc
             .call(
                 "generateblock",
                 &[
                     bitcoincore_rpc::jsonrpc::serde_json::Value::String(addr.to_string()),
-                    bitcoincore_rpc::jsonrpc::serde_json::Value::Array(vec![]),
+                    bitcoincore_rpc::jsonrpc::serde_json::Value::Array(tx_list),
                 ],
             )
-            .expect("generateblock empty");
+            .expect("generateblock with txids");
         let hash_hex = result
             .get("hash")
             .and_then(|v| v.as_str())
@@ -2801,6 +3228,529 @@ mod tests {
             batch.reveal_txid,
             batch2.commit_txid,
             batch2.reveal_txid,
+        ] {
+            let _ = rpc.call::<bitcoincore_rpc::jsonrpc::serde_json::Value>(
+                "abandontransaction",
+                &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(txid.to_string())],
+            );
+        }
+        let _ = scanner.scan_to_tip();
+    }
+
+    /// Extract [`InfrastructureError`] from an anyhow error chain.
+    fn infra_from_err(err: &anyhow::Error) -> Option<&InfrastructureError> {
+        for cause in err.chain() {
+            if let Some(infra) = cause.downcast_ref::<InfrastructureError>() {
+                return Some(infra);
+            }
+        }
+        None
+    }
+
+    /// F1: after reorg, anchor-hash cache must not accept an orphaned-fork hash.
+    ///
+    /// Catch up, publish+mine nullifier on A_H, scan (fills cache). Invalidate
+    /// A_H; mine empty B_H. Broadcast good (anchor B_H) and bad (anchor orphaned
+    /// A_H) for inclusion in B_{H+1}. Mine. scan_to_tip admits good, rejects bad.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_scanner_replacement_anchor_cache() {
+        let publisher = live_publisher();
+        let mut scanner = live_scanner();
+        let _ = catch_up(&mut scanner);
+        let rpc = wallet_rpc();
+
+        let sigs = signed_members(1, &unique_tag("f1-anchor-cache"));
+        let batch = publisher
+            .publish(&batch_at_tip(&publisher, &sigs))
+            .expect("publish");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm");
+        let report0 = scanner.scan_to_tip().expect("scan A_H");
+        assert!(report0.admitted_count >= 1);
+        assert!(
+            scanner.anchor_hash_cache_len() >= 1,
+            "scan must populate anchor-hash cache"
+        );
+        let (orphaned_h, orphaned_hash) = scanner.scanned_through().expect("tip A_H");
+        let orphaned_bytes = orphaned_hash.to_byte_array();
+
+        // Reorg A_H → empty B_H.
+        rpc.invalidate_block(&orphaned_hash).expect("invalidate");
+        let new_at_h = mine_empty_block(&rpc);
+        assert_ne!(new_at_h, orphaned_hash);
+        let live_h = rpc.get_block_hash(orphaned_h).expect("live at H");
+        assert_eq!(live_h, new_at_h);
+
+        // Good payload: anchors to new B_H. Bad: anchors to orphaned A_H hash.
+        let good_sigs = signed_members(1, &unique_tag("f1-anchor-good"));
+        let good_pk = good_sigs[0].pk;
+        let good_anchor = BlockAnchor {
+            block_hash: new_at_h.to_byte_array(),
+            height: u32::try_from(orphaned_h).expect("height fits u32"),
+        };
+        let good_agg =
+            aggregate_sig_with_anchor(&good_sigs, good_anchor).expect("good aggregate");
+        let (_gc, good_reveal) = broadcast_raw_payload(&good_agg.serialize());
+
+        let bad_sigs = signed_members(1, &unique_tag("f1-anchor-bad"));
+        let bad_pk = bad_sigs[0].pk;
+        let bad_anchor = BlockAnchor {
+            block_hash: orphaned_bytes,
+            height: u32::try_from(orphaned_h).expect("height fits u32"),
+        };
+        let bad_agg = aggregate_sig_with_anchor(&bad_sigs, bad_anchor).expect("bad aggregate");
+        let (_bc, bad_reveal) = broadcast_raw_payload(&bad_agg.serialize());
+
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&good_reveal, 1, Duration::from_secs(30))
+            .expect("confirm good");
+        publisher
+            .wait_for_confirmation(&bad_reveal, 1, Duration::from_secs(30))
+            .expect("confirm bad");
+
+        let report = scanner.scan_to_tip().expect("scan after reorg + B_H+1");
+        assert!(
+            report.reorg.is_some(),
+            "reorg of A_H must be reported"
+        );
+        assert!(
+            matches!(
+                scanner.accumulator().lookup(good_pk),
+                shared::spec_v1::LookupResult::Present { .. }
+            ),
+            "good payload (anchor B_H) must be admitted"
+        );
+        assert!(
+            matches!(
+                scanner.accumulator().lookup(bad_pk),
+                shared::spec_v1::LookupResult::Absent
+            ),
+            "bad payload (anchor orphaned A_H) must not be admitted"
+        );
+        let reasons: Vec<&str> = report
+            .blocks
+            .iter()
+            .flat_map(|b| b.rejected.iter().map(|r| r.reason.as_str()))
+            .collect();
+        assert!(
+            reasons.iter().any(|r| {
+                r.contains("canonical") || r.contains("chain") || r.contains("hash")
+            }),
+            "bad-anchor rejection must mention canonical/chain/hash; got: {reasons:?}"
+        );
+
+        let mut fresh = live_scanner();
+        let _ = catch_up(&mut fresh);
+        assert_eq!(
+            scanner.accumulator().nav().mth,
+            fresh.accumulator().nav().mth,
+            "running scanner must match fresh scan after anchor-cache reorg"
+        );
+
+        let _ = mine_empty_block(&rpc);
+        for txid in [
+            batch.commit_txid,
+            batch.reveal_txid,
+            good_reveal,
+            bad_reveal,
+        ] {
+            let _ = rpc.call::<bitcoincore_rpc::jsonrpc::serde_json::Value>(
+                "abandontransaction",
+                &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(txid.to_string())],
+            );
+        }
+        let _ = scanner.scan_to_tip();
+    }
+
+    /// F2: mid-replacement-collection chain break restarts; final state matches fresh.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_scanner_mid_replacement_collection_chain_break() {
+        let publisher = live_publisher();
+        let mut scanner = live_scanner();
+        let _ = catch_up(&mut scanner);
+        let rpc = wallet_rpc();
+
+        let sigs_a = signed_members(1, &unique_tag("f2-link-a"));
+        let batch_a = publisher
+            .publish(&batch_at_tip(&publisher, &sigs_a))
+            .expect("publish a");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch_a.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm a");
+        let _ = scanner.scan_to_tip().expect("scan a");
+        let height_a = scanner.scanned_through().expect("tip a").0;
+
+        let sigs_b = signed_members(1, &unique_tag("f2-link-b"));
+        let batch_b = publisher
+            .publish(&batch_at_tip(&publisher, &sigs_b))
+            .expect("publish b");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch_b.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm b");
+        let _ = scanner.scan_to_tip().expect("scan b");
+        let (tip_h, tip_hash) = scanner.scanned_through().expect("tip b");
+        let hash_a = rpc.get_block_hash(height_a).expect("hash a");
+
+        rpc.invalidate_block(&tip_hash).expect("invalidate tip");
+        rpc.invalidate_block(&hash_a).expect("invalidate a");
+        let _ = mine_empty_block(&rpc);
+        let _ = mine_empty_block(&rpc);
+
+        // Break linkage on the second replacement height (one-shot).
+        let break_at = height_a
+            .checked_add(1)
+            .expect("height+1")
+            .min(tip_h);
+        scanner.inject_broken_link_at_height(break_at);
+
+        let report = scanner
+            .scan_to_tip()
+            .expect("chain-break restart must still succeed");
+        assert!(
+            report.reorg.is_some(),
+            "reorg must complete after collection restart"
+        );
+
+        let mut fresh = live_scanner();
+        let _ = catch_up(&mut fresh);
+        assert_eq!(
+            scanner.accumulator().nav().mth,
+            fresh.accumulator().nav().mth,
+            "after mid-collection chain break, mth must equal fresh scanner"
+        );
+
+        // Checkpoint hashes must match live chain.
+        if let Some((h, hash)) = scanner.scanned_through() {
+            let live = rpc.get_block_hash(h).expect("live hash at checkpoint");
+            assert_eq!(hash, live, "checkpoint hash must match live at {h}");
+        }
+
+        let _ = mine_empty_block(&rpc);
+        for txid in [
+            batch_a.commit_txid,
+            batch_a.reveal_txid,
+            batch_b.commit_txid,
+            batch_b.reveal_txid,
+        ] {
+            let _ = rpc.call::<bitcoincore_rpc::jsonrpc::serde_json::Value>(
+                "abandontransaction",
+                &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(txid.to_string())],
+            );
+        }
+        let _ = scanner.scan_to_tip();
+    }
+
+    /// F3: tip_hash after scan equals accumulator checkpoint, never a wrong-fork tip.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_scanner_tip_equals_accumulator_after_post_commit_reorg() {
+        let publisher = live_publisher();
+        let mut scanner = live_scanner();
+        let _ = catch_up(&mut scanner);
+        let rpc = wallet_rpc();
+
+        let sigs = signed_members(1, &unique_tag("f3-tip-match"));
+        let batch = publisher
+            .publish(&batch_at_tip(&publisher, &sigs))
+            .expect("publish");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm");
+
+        // Nullifier is in the current tip block; reorg that height after commit.
+        let nullifier_height = rpc.get_block_count().expect("tip");
+        scanner.inject_reorg_after_commit_height(nullifier_height);
+
+        let report = scanner
+            .scan_to_tip()
+            .expect("scan_to_tip Ok despite post-commit reorg");
+        let (scanned_h, scanned_hash) = scanner.scanned_through().expect("must have checkpoint");
+        assert_eq!(
+            report.tip_height, scanned_h,
+            "report tip_height must equal scanned_through height"
+        );
+        assert_eq!(
+            report.tip_hash, scanned_hash,
+            "report tip_hash must equal scanned_through hash"
+        );
+        // After inject reorg + outer-loop repair, checkpoint is on the live chain.
+        let live_at_scanned = rpc
+            .get_block_hash(scanned_h)
+            .expect("getblockhash scanned");
+        assert_eq!(
+            scanned_hash, live_at_scanned,
+            "scanned_through must be on the live chain after repair"
+        );
+
+        let _ = mine_empty_block(&rpc);
+        for txid in [batch.commit_txid, batch.reveal_txid] {
+            let _ = rpc.call::<bitcoincore_rpc::jsonrpc::serde_json::Value>(
+                "abandontransaction",
+                &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(txid.to_string())],
+            );
+        }
+        let _ = scanner.scan_to_tip();
+    }
+
+    /// F5: replacement BlockScanResult reports real admissions and duplicates.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_scanner_replacement_admissions_and_duplicates() {
+        let publisher = live_publisher();
+        let mut scanner = live_scanner();
+        let _ = catch_up(&mut scanner);
+        let rpc = wallet_rpc();
+
+        // Winner at H-1 stays across reorg of H.
+        let winner = signed_members(1, &unique_tag("f5-winner"));
+        let batch_w = publisher
+            .publish(&batch_at_tip(&publisher, &winner))
+            .expect("publish winner");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch_w.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm winner");
+        let _ = scanner.scan_to_tip().expect("scan winner");
+        let winner_pk = winner[0].pk;
+        let winner_r = winner[0].r;
+
+        // Garbage (unique nullifier) at H — will be reorged away.
+        let garbage = signed_members(1, &unique_tag("f5-garbage"));
+        let batch_g = publisher
+            .publish(&batch_at_tip(&publisher, &garbage))
+            .expect("publish garbage");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch_g.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm garbage");
+        let _ = scanner.scan_to_tip().expect("scan garbage");
+        let (h, hash_h) = scanner.scanned_through().expect("tip H");
+
+        // Invalidate H. Orphaned garbage returns to the mempool — a normal
+        // `generatetoaddress` would re-include it (same pitfall as
+        // `regtest_scanner_real_reorg`). Abandon garbage, broadcast new
+        // first-occurrence + same-pk duplicate, then mine H' with an **explicit**
+        // txid list so garbage cannot re-enter the replacement.
+        rpc.invalidate_block(&hash_h).expect("invalidate H");
+        for txid in [batch_g.commit_txid, batch_g.reveal_txid] {
+            let _ = rpc.call::<bitcoincore_rpc::jsonrpc::serde_json::Value>(
+                "abandontransaction",
+                &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(txid.to_string())],
+            );
+        }
+
+        let (first_r, second_r) = double_spend_pair(&unique_tag("f5-repl-dup"));
+        let batch_new = publisher
+            .publish(&batch_at_tip(&publisher, &[first_r]))
+            .expect("publish new first");
+        let batch_dup = publisher
+            .publish(&batch_at_tip(&publisher, &[second_r]))
+            .expect("publish dup");
+        // Commit before reveal for each inscription; only new+dup — not garbage.
+        let repl_hash = mine_block_with_txids(
+            &rpc,
+            &[
+                batch_new.commit_txid,
+                batch_new.reveal_txid,
+                batch_dup.commit_txid,
+                batch_dup.reveal_txid,
+            ],
+        );
+        let live = rpc
+            .get_block_hash(h)
+            .expect("getblockhash after reorg");
+        assert_eq!(live, repl_hash, "explicit-txid block must be the new tip at H");
+        assert_ne!(live, hash_h, "reorg must replace the block hash at H");
+        publisher
+            .wait_for_confirmation(&batch_new.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm new");
+        publisher
+            .wait_for_confirmation(&batch_dup.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm dup");
+
+        let report = scanner.scan_to_tip().expect("reorg scan");
+        assert!(report.reorg.is_some(), "reorg must be reported");
+        // Replacement block at H must have real admissions and duplicates.
+        let repl = report
+            .blocks
+            .iter()
+            .find(|b| b.height == h)
+            .expect("replacement block at H must appear in report");
+        assert!(
+            repl.admitted.len() >= 1,
+            "replacement must report admitted>=1; got {}",
+            repl.admitted.len()
+        );
+        assert!(
+            repl.duplicates >= 1,
+            "replacement must report duplicates>=1; got {}",
+            repl.duplicates
+        );
+        assert!(
+            !repl.duplicate_details.is_empty(),
+            "replacement must include duplicate_details"
+        );
+        assert!(
+            report.admitted_count >= 1,
+            "report admitted_count must reflect replacement"
+        );
+        assert!(
+            report.duplicates >= 1,
+            "report duplicates must reflect replacement"
+        );
+        // Original winner at H-1 still present.
+        assert!(
+            matches!(
+                scanner.accumulator().lookup(winner_pk),
+                shared::spec_v1::LookupResult::Present { r, .. } if r == winner_r
+            ),
+            "winner at H-1 must remain after reorg of H"
+        );
+        // Garbage from old H gone.
+        assert!(
+            matches!(
+                scanner.accumulator().lookup(garbage[0].pk),
+                shared::spec_v1::LookupResult::Absent
+            ),
+            "garbage at old H must be absent after reorg"
+        );
+
+        let _ = mine_empty_block(&rpc);
+        for txid in [
+            batch_w.commit_txid,
+            batch_w.reveal_txid,
+            batch_g.commit_txid,
+            batch_g.reveal_txid,
+            batch_new.commit_txid,
+            batch_new.reveal_txid,
+            batch_dup.commit_txid,
+            batch_dup.reveal_txid,
+        ] {
+            let _ = rpc.call::<bitcoincore_rpc::jsonrpc::serde_json::Value>(
+                "abandontransaction",
+                &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(txid.to_string())],
+            );
+        }
+        let _ = scanner.scan_to_tip();
+    }
+
+    /// F6: per-block atomicity — infra fail on second block keeps first commit
+    /// and attaches a partial report; retry completes.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_scanner_per_block_atomicity_partial_report() {
+        let publisher = live_publisher();
+        let mut scanner = live_scanner();
+        let _ = catch_up(&mut scanner);
+        let size_before = scanner.accumulator().nav().size;
+        let checkpoint_before = scanner.scanned_through();
+
+        let sigs_1 = signed_members(1, &unique_tag("f6-atomic-1"));
+        let batch_1 = publisher
+            .publish(&batch_at_tip(&publisher, &sigs_1))
+            .expect("publish 1");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch_1.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm 1");
+
+        let sigs_2 = signed_members(1, &unique_tag("f6-atomic-2"));
+        let batch_2 = publisher
+            .publish(&batch_at_tip(&publisher, &sigs_2))
+            .expect("publish 2");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch_2.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm 2");
+
+        // Both blocks unscanned. Fail on the second (current tip) height.
+        let _ = checkpoint_before;
+        let rpc = wallet_rpc();
+        let tip = rpc.get_block_count().expect("tip");
+        let fail_at = tip; // second (last) unscanned block
+        let first_height = tip.checked_sub(1).expect("tip-1");
+        scanner.inject_infra_fail_at_height(fail_at);
+
+        let err = scanner
+            .scan_to_tip()
+            .expect_err("infra on second block must abort");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("infrastructure") || msg.contains("injected"),
+            "expected infrastructure error, got: {msg}"
+        );
+        let infra = infra_from_err(&err).expect("error must be InfrastructureError");
+        let partial = infra
+            .partial_report()
+            .expect("partial_report must be Some after first block committed");
+        assert!(
+            partial.admitted_count >= 1,
+            "partial must include first-block admissions; admitted={}",
+            partial.admitted_count
+        );
+        assert!(
+            partial.blocks.iter().any(|b| b.height == first_height),
+            "partial blocks must include first height {first_height}; got {:?}",
+            partial.blocks.iter().map(|b| b.height).collect::<Vec<_>>()
+        );
+
+        let (scanned_h, _) = scanner.scanned_through().expect("first block committed");
+        assert_eq!(
+            scanned_h, first_height,
+            "scanned_through must be first block only"
+        );
+        assert!(
+            scanner.accumulator().nav().size >= size_before + 1,
+            "first nullifier must be committed"
+        );
+        assert!(
+            matches!(
+                scanner.accumulator().lookup(sigs_1[0].pk),
+                shared::spec_v1::LookupResult::Present { .. }
+            ),
+            "first pk must be present after partial commit"
+        );
+        assert!(
+            matches!(
+                scanner.accumulator().lookup(sigs_2[0].pk),
+                shared::spec_v1::LookupResult::Absent
+            ),
+            "second pk must not be present yet"
+        );
+
+        // Retry succeeds; final mth equals fresh scanner.
+        let report = scanner.scan_to_tip().expect("retry must succeed");
+        assert!(
+            report.admitted_count >= 1,
+            "retry must admit the second nullifier"
+        );
+        assert!(matches!(
+            scanner.accumulator().lookup(sigs_2[0].pk),
+            shared::spec_v1::LookupResult::Present { .. }
+        ));
+
+        let mut fresh = live_scanner();
+        let _ = catch_up(&mut fresh);
+        assert_eq!(
+            scanner.accumulator().nav().mth,
+            fresh.accumulator().nav().mth,
+            "after retry, mth must equal fresh scanner"
+        );
+
+        let _ = mine_empty_block(&rpc);
+        for txid in [
+            batch_1.commit_txid,
+            batch_1.reveal_txid,
+            batch_2.commit_txid,
+            batch_2.reveal_txid,
         ] {
             let _ = rpc.call::<bitcoincore_rpc::jsonrpc::serde_json::Value>(
                 "abandontransaction",
