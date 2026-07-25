@@ -1406,8 +1406,8 @@ fn verify_transition_signature(
     let tweak = Secp256K1Scalar::from_noncanonical_biguint(tweak_integer);
 
     let r_prime = canonical_x_point(&sig.r_prime, "transition signature R'")?;
-    let r = (r_prime + (CurveScalar(tweak) * Secp256K1::GENERATOR_PROJECTIVE).to_affine())
-        .to_affine();
+    let r =
+        (r_prime + (CurveScalar(tweak) * Secp256K1::GENERATOR_PROJECTIVE).to_affine()).to_affine();
     ensure!(
         !r.zero,
         "transition signature S2C nonce is the point at infinity"
@@ -1424,9 +1424,10 @@ fn verify_transition_signature(
     challenge_preimage.extend_from_slice(&rx_bytes);
     challenge_preimage.extend_from_slice(&sig.pk_i);
     challenge_preimage.extend_from_slice(m_state);
-    let e = Secp256K1Scalar::from_noncanonical_biguint(BigUint::from_bytes_be(
-        &tagged_hash(b"BIP0340/challenge", &challenge_preimage),
-    ));
+    let e = Secp256K1Scalar::from_noncanonical_biguint(BigUint::from_bytes_be(&tagged_hash(
+        b"BIP0340/challenge",
+        &challenge_preimage,
+    )));
 
     let p = canonical_x_point(&sig.pk_i, "transition signature Pk_i")?;
     let s = canonical_scalar(&sig.signature_s(), "transition signature s")?;
@@ -1446,10 +1447,7 @@ fn canonical_base(bytes: &[u8; 32], label: &str) -> Result<Secp256K1Base> {
     Ok(Secp256K1Base::from_noncanonical_biguint(integer))
 }
 
-pub(crate) fn canonical_scalar(
-    bytes: &[u8; 32],
-    label: &str,
-) -> Result<Secp256K1Scalar> {
+pub(crate) fn canonical_scalar(bytes: &[u8; 32], label: &str) -> Result<Secp256K1Scalar> {
     let integer = BigUint::from_bytes_be(bytes);
     ensure!(
         integer < Secp256K1Scalar::order(),
@@ -1458,10 +1456,7 @@ pub(crate) fn canonical_scalar(
     Ok(Secp256K1Scalar::from_noncanonical_biguint(integer))
 }
 
-pub(crate) fn canonical_x_point(
-    bytes: &[u8; 32],
-    label: &str,
-) -> Result<AffinePoint<Secp256K1>> {
+pub(crate) fn canonical_x_point(bytes: &[u8; 32], label: &str) -> Result<AffinePoint<Secp256K1>> {
     lift_x_even_y(canonical_base(bytes, label)?)
         .with_context(|| format!("{label} does not lift to an even-y secp256k1 point"))
 }
