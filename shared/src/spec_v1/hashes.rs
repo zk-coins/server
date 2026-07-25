@@ -10,8 +10,8 @@ use super::encoding::{digest_to_bytes, hc, HcInput};
 use super::error::SpecError;
 use super::tags::{
     NETWORK_TAG_MAINNET, NETWORK_TAG_REGTEST, NETWORK_TAG_TESTNET, TAG_ACCOUNT_STATE, TAG_ASSET_ID,
-    TAG_ASSET_ID_V2, TAG_COIN, TAG_ISSUANCE_TERMS, TAG_ISSUANCE_TERMS_V2, TAG_NAV_COMMIT,
-    TAG_NETWORK, TAG_NK_COMMIT, TAG_NPK_COMMIT, TAG_NULLIFIER,
+    TAG_ASSET_ID_V2, TAG_COIN, TAG_DETECT_TAG, TAG_ISSUANCE_TERMS, TAG_ISSUANCE_TERMS_V2,
+    TAG_NAV_COMMIT, TAG_NETWORK, TAG_NK_COMMIT, TAG_NPK_COMMIT, TAG_NULLIFIER,
 };
 use zkcoins_program::hash::HashDigest;
 
@@ -182,6 +182,20 @@ pub fn nav_commitment(nav_root: HashDigest, nav_rand: &[u8; 32]) -> HashDigest {
         ],
     )
     .expect("fixed-size inputs")
+}
+
+/// `detect_tag = Hc("DetectTag", ByteString(ss), ByteString(epk))` (§1.3).
+///
+/// Per §1.7.2, `‖` inside an `Hc` call site separates the input list — each of
+/// `ss` and `epk` is absorbed as its own 32-byte byte-string input (not as a
+/// single 64-byte concatenation). Both are raw ECDH/x-only material, not prior
+/// `Hc` digests.
+pub fn detect_tag(ss: &[u8; 32], epk: &[u8; 32]) -> HashDigest {
+    hc(
+        TAG_DETECT_TAG,
+        &[HcInput::ByteString(ss), HcInput::ByteString(epk)],
+    )
+    .expect("ss and epk are fixed 32 bytes")
 }
 
 /// Asset name hash: `H(name) = SHA-256(name)`. Rejects names longer than 255 bytes.

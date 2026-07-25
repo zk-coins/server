@@ -17,6 +17,7 @@ pub const TAG_NK_COMMIT: &str = "zkCoins/v1/NkCommit";
 pub const TAG_NULLIFIER: &str = "zkCoins/v1/Nullifier";
 pub const TAG_NETWORK: &str = "zkCoins/v1/Network";
 pub const TAG_NAV_COMMIT: &str = "zkCoins/v1/NavCommit";
+pub const TAG_DETECT_TAG: &str = "zkCoins/v1/DetectTag";
 
 pub const TAG_COINS_ROOT_LEAF: &str = "zkCoins/v1/CoinsRoot/Leaf";
 pub const TAG_COINS_ROOT_NODE: &str = "zkCoins/v1/CoinsRoot/Node";

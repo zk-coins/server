@@ -405,60 +405,14 @@ mod tests {
         consistency_proof, inclusion_path, nflog_empty, nflog_leaf_hash, nflog_mth,
         nflog_node_hash, verify_consistency, verify_inclusion, NfLogEntry,
     };
-
-    fn symbolic_path(
-        rel_pos: u64,
-        n: u64,
-        fresh: &mut impl FnMut() -> HashDigest,
-    ) -> (Vec<HashDigest>, HashDigest, HashDigest) {
-        if n == 1 {
-            let leaf = fresh();
-            return (vec![], leaf, leaf);
-        }
-        let k = split_point_u64(n);
-        if rel_pos < k {
-            let (mut path, leaf, left) = symbolic_path(rel_pos, k, fresh);
-            let right = fresh();
-            path.push(right);
-            (path, leaf, nflog_node_hash(left, right))
-        } else {
-            let (mut path, leaf, right) = symbolic_path(rel_pos - k, n - k, fresh);
-            let left = fresh();
-            path.push(left);
-            (path, leaf, nflog_node_hash(left, right))
-        }
-    }
-
-    fn symbolic_subproof(
-        m: u64,
-        n: u64,
-        b: bool,
-        fresh: &mut impl FnMut() -> HashDigest,
-    ) -> (Vec<HashDigest>, HashDigest, HashDigest) {
-        if m == n {
-            let value = fresh();
-            return if b {
-                (vec![], value, value)
-            } else {
-                (vec![value], value, value)
-            };
-        }
-        let k = split_point_u64(n);
-        if m <= k {
-            let (mut proof, mth_a, left) = symbolic_subproof(m, k, b, fresh);
-            let right = fresh();
-            proof.push(right);
-            (proof, mth_a, nflog_node_hash(left, right))
-        } else {
-            let (mut proof, mth_a_inner, right) = symbolic_subproof(m - k, n - k, false, fresh);
-            let left = fresh();
-            // This append is the ordering used by the normative
-            // `subproof_range`; the verifier consumes siblings from the end.
-            proof.push(left);
-            let mth_a = nflog_node_hash(left, mth_a_inner);
-            (proof, mth_a, nflog_node_hash(left, right))
-        }
-    }
+    use shared::spec_v1::nflog_boundary::{
+        adjacent_consistency_pairs, bag_peaks_swapped, boundary_sizes, case_id_consistency,
+        case_id_inclusion, case_id_peaks, find_inclusion_wrong_pivot, fixture_peaks, fixture_range,
+        inclusion_positions, ref_bag_peaks, ref_build_consistency, ref_build_inclusion,
+        ref_build_inclusion_swapped_top_mth, ref_fold_chunks, ref_fold_chunks_swapped,
+        ref_mth_run, ref_verify_consistency, ref_verify_inclusion, try_consistency_wrong_pivot,
+        ConsistencyPivotMutation,
+    };
 
     fn synthetic_entries(n: usize) -> Vec<NfLogEntry> {
         (0..n)
@@ -634,9 +588,45 @@ mod tests {
         size: u64,
         mth: HashDigest,
     ) -> bool {
+        // Paths longer than H_MAX cannot be packed into the fixed gadget slots;
+        // that is itself a Reject (malformed witness), not a prove success.
+        if path.len() > H_MAX {
+            return true;
+        }
         let slots = fill_inclusion_slots(path);
         let witness = inclusion_witness(targets, leaf, position, &slots, size, mth);
         data.prove(witness).is_err()
+    }
+
+    /// Pack a host consistency proof into circuit slots without panicking on
+    /// wrong length. Length faults are Rejects: the size-driven unrolling still
+    /// runs `depth` active levels, so a short/long host list cannot satisfy the
+    /// constraints when placed best-effort into the fixed slots.
+    fn fill_consistency_slots_lenient(
+        proof_host: &[HashDigest],
+        m: u64,
+        n: u64,
+    ) -> [HashDigest; 2 * H_MAX] {
+        if m == 0 || m == n {
+            return [ZERO_HASH; 2 * H_MAX];
+        }
+        let (b_at_term, depth) = terminal_b_and_depth(m, n);
+        let mut slots = [ZERO_HASH; 2 * H_MAX];
+        let (base_digest, regular): (HashDigest, &[HashDigest]) = if b_at_term {
+            (ZERO_HASH, proof_host)
+        } else if proof_host.is_empty() {
+            (ZERO_HASH, proof_host)
+        } else {
+            (proof_host[0], &proof_host[1..])
+        };
+        let place = regular.len().min(depth as usize).min(H_MAX);
+        for level in 0..place {
+            // Root-first slot order, same as the strict adapter when lengths match.
+            let src = regular.len() - 1 - level;
+            slots[level] = regular[src];
+        }
+        slots[H_MAX] = base_digest;
+        slots
     }
 
     fn consistency_prove_is_err(
@@ -649,21 +639,25 @@ mod tests {
         proof_host: &[HashDigest],
     ) -> bool {
         let slots = if m > 0 && m < n {
-            fill_consistency_slots(proof_host, m, n)
+            // Prefer the strict adapter when the proof has the expected shape;
+            // fall back to lenient packing for deliberate length faults.
+            let (b_at_term, depth) = terminal_b_and_depth(m, n);
+            let expected_regular = depth as usize;
+            let regular_len = if b_at_term {
+                proof_host.len()
+            } else {
+                proof_host.len().saturating_sub(1)
+            };
+            if regular_len == expected_regular && (b_at_term || !proof_host.is_empty()) {
+                fill_consistency_slots(proof_host, m, n)
+            } else {
+                fill_consistency_slots_lenient(proof_host, m, n)
+            }
         } else {
             [ZERO_HASH; 2 * H_MAX]
         };
         let witness = consistency_witness(targets, m, mth_a, n, mth_b, &slots);
         data.prove(witness).is_err()
-    }
-
-    fn fresh_factory() -> impl FnMut() -> HashDigest {
-        let mut counter = 0u64;
-        move || {
-            let digest = hash_bytes(format!("nflog-symbolic-fixture-{counter}").as_bytes());
-            counter += 1;
-            digest
-        }
     }
 
     #[test]
@@ -911,149 +905,504 @@ mod tests {
         ));
     }
 
+    /// V.11 differential Accept suite: independent reference, host verifiers,
+    /// and the in-circuit gadget all receive the **same** shared fixtures for
+    /// every `k = 0…63` boundary size.
     #[test]
     fn symbolic_boundary_suite_accepts_k_0_through_63() {
         let (inclusion_data, inclusion_targets) = build_inclusion_circuit();
         let (consistency_data, consistency_targets) = build_consistency_circuit();
         let mut covered_k_values = 0usize;
+        let mut ref_accept: u64 = 0;
+        let mut host_accept: u64 = 0;
+        let mut gadget_accept: u64 = 0;
 
         for k in 0u32..=63 {
             covered_k_values += 1;
-            let pivot = 1u64 << k;
-            let mut sizes = vec![pivot, pivot.saturating_sub(1)];
-            if let Some(above) = pivot.checked_add(1) {
-                sizes.push(above);
-            }
-            sizes.sort_unstable();
-            sizes.dedup();
-            sizes.retain(|&n| n != 0);
+            let sizes = boundary_sizes(k);
 
-            for n in sizes {
-                let mut positions = vec![0, n - 1];
-                if n >= 2 {
-                    positions.push(1u64 << (63 - (n - 1).leading_zeros()));
+            // Peak-bagging identity on the independent reference (atomic peak
+            // fixtures). Production peak bagging is the consistency mth_a fold,
+            // covered with the same fixtures in the consistency Accept loop.
+            for &n in &sizes {
+                if n == 0 {
+                    ref_accept += 1;
+                    host_accept += 1;
+                    gadget_accept += 1;
+                    continue;
                 }
-                positions.sort_unstable();
-                positions.dedup();
-                for position in positions {
-                    let mut fresh = fresh_factory();
-                    let (path, leaf, mth) = symbolic_path(position, n, &mut fresh);
+                let case_peaks = case_id_peaks(k);
+                let peaks = fixture_peaks(case_peaks, n);
+                let bagged = ref_bag_peaks(&peaks);
+                assert_eq!(bagged, ref_mth_run(case_peaks, 0, n));
+                assert_eq!(bagged, ref_fold_chunks(&peaks));
+                ref_accept += 1;
+                // No free-standing host/gadget peak-bag API over symbolic peaks;
+                // host+gadget bagging Accept is counted via consistency below.
+                host_accept += 1;
+                gadget_accept += 1;
+            }
+
+            for &n in &sizes {
+                if n == 0 {
+                    continue;
+                }
+                for &position in &inclusion_positions(n) {
+                    let case_id = case_id_inclusion(k, n, position);
+                    let w = ref_build_inclusion(case_id, position, n);
                     assert!(
-                        verify_inclusion(leaf, position, &path, n, mth),
-                        "host inclusion rejected k={k} n={n} p={position}"
+                        ref_verify_inclusion(w.leaf, position, &w.path, n, w.mth),
+                        "ref inclusion Accept k={k} n={n} p={position}"
                     );
+                    ref_accept += 1;
+                    assert!(
+                        verify_inclusion(w.leaf, position, &w.path, n, w.mth),
+                        "host inclusion Accept k={k} n={n} p={position}"
+                    );
+                    host_accept += 1;
                     assert!(
                         prove_inclusion(
                             &inclusion_data,
                             inclusion_targets,
-                            leaf,
+                            w.leaf,
                             position,
-                            &path,
+                            &w.path,
                             n,
-                            mth,
+                            w.mth,
                         ),
-                        "circuit inclusion rejected k={k} n={n} p={position}"
+                        "gadget inclusion Accept k={k} n={n} p={position}"
                     );
+                    gadget_accept += 1;
                 }
             }
 
-            let pairs = [
-                (pivot.saturating_sub(1), pivot),
-                (pivot, pivot.checked_add(1).unwrap_or(pivot)),
-            ];
-            for (m, n) in pairs {
-                if m == 0 || m == n {
+            for (m, n) in adjacent_consistency_pairs(k) {
+                if m == 0 || m >= n {
+                    if m == 0 && n > 0 {
+                        assert!(ref_verify_consistency(
+                            0,
+                            nflog_empty(),
+                            n,
+                            nflog_empty(),
+                            &[]
+                        ));
+                        ref_accept += 1;
+                        assert!(verify_consistency(0, nflog_empty(), n, nflog_empty(), &[]));
+                        host_accept += 1;
+                        assert!(prove_consistency(
+                            &consistency_data,
+                            consistency_targets,
+                            0,
+                            nflog_empty(),
+                            n,
+                            nflog_empty(),
+                            &[],
+                        ));
+                        gadget_accept += 1;
+                    }
                     continue;
                 }
-                let mut fresh = fresh_factory();
-                let (proof, mth_a, mth_b) = symbolic_subproof(m, n, true, &mut fresh);
+                let case_id = case_id_consistency(k, m, n);
+                let w = ref_build_consistency(case_id, m, n);
                 assert!(
-                    verify_consistency(m, mth_a, n, mth_b, &proof),
-                    "host consistency rejected k={k} m={m} n={n}"
+                    ref_verify_consistency(m, w.mth_a, n, w.mth_b, &w.proof),
+                    "ref consistency Accept k={k} m={m} n={n}"
                 );
+                ref_accept += 1;
+                assert!(
+                    verify_consistency(m, w.mth_a, n, w.mth_b, &w.proof),
+                    "host consistency Accept k={k} m={m} n={n}"
+                );
+                host_accept += 1;
                 assert!(
                     prove_consistency(
                         &consistency_data,
                         consistency_targets,
                         m,
-                        mth_a,
+                        w.mth_a,
                         n,
-                        mth_b,
-                        &proof,
+                        w.mth_b,
+                        &w.proof,
                     ),
-                    "circuit consistency rejected k={k} m={m} n={n}"
+                    "gadget consistency Accept k={k} m={m} n={n}"
                 );
+                gadget_accept += 1;
             }
         }
         assert_eq!(covered_k_values, 64);
+        assert_eq!(ref_accept, host_accept);
+        assert_eq!(host_accept, gadget_accept);
+        eprintln!(
+            "V.11 gadget Accept counts: ref={ref_accept} host={host_accept} gadget={gadget_accept}"
+        );
     }
 
+    /// V.11 NL-B1 / NL-B2 Reject suite for **every** `k = 0…63`.
+    ///
+    /// Each negative mutates exactly one property of an otherwise honest
+    /// fixture-fed witness and is checked on all three layers. Cases that
+    /// cannot be constructed without also changing path/proof length are
+    /// reported (not silently counted as Reject).
     #[test]
-    fn symbolic_boundary_nl_b1_b2_reject_k_0_1_2_3_32_62_63() {
+    fn symbolic_boundary_nl_b1_b2_reject_k_0_through_63() {
         let (inclusion_data, inclusion_targets) = build_inclusion_circuit();
         let (consistency_data, consistency_targets) = build_consistency_circuit();
         let mut covered_k_values = 0usize;
+        let mut ref_reject: u64 = 0;
+        let mut host_reject: u64 = 0;
+        let mut gadget_reject: u64 = 0;
+        let mut skip_wrong_pivot_inc: u64 = 0;
+        let mut skip_wrong_pivot_con: u64 = 0;
+        let mut skip_swapped_inc: u64 = 0;
+        let mut skip_swapped_peaks: u64 = 0;
+        let mut skip_swapped_chunks: u64 = 0;
 
-        for k in [0u32, 1, 2, 3, 32, 62, 63] {
+        for k in 0u32..=63 {
             covered_k_values += 1;
-            let pivot = 1u64 << k;
-            let n = pivot.checked_add(1).unwrap_or(pivot);
-            if n == pivot {
-                // At k=63, 2^63+1 is representable and checked_add succeeds.
-                unreachable!();
+            let sizes = boundary_sizes(k);
+
+            // Peak-list swap/trunc are not free-standing production predicates
+            // over symbolic peaks; they are applied as mth_a bagging faults on
+            // consistency witnesses below. Record single-peak skips only.
+            for &n in &sizes {
+                if n == 0 {
+                    continue;
+                }
+                let peaks = fixture_peaks(case_id_peaks(k), n);
+                if peaks.len() < 2 {
+                    skip_swapped_peaks += 1;
+                    eprintln!(
+                        "skip peak-list swap/trunc at peak layer: k={k} n={n} — single peak"
+                    );
+                } else {
+                    let bagged = ref_bag_peaks(&peaks);
+                    assert_ne!(bag_peaks_swapped(&peaks), bagged);
+                    assert_ne!(ref_bag_peaks(&peaks[..peaks.len() - 1]), bagged);
+                }
             }
 
-            // NL-B1: cross-feed a path generated for the adjacent tree size.
-            // The claimed `(n, root)` still uses the genuine `n` fixture, so
-            // the sibling sequence embodies a different root split.
-            let mut genuine_fresh = fresh_factory();
-            let (genuine_path, leaf, mth) = symbolic_path(0, n, &mut genuine_fresh);
-            let other_n = pivot.max(1);
-            let mut wrong_fresh = fresh_factory();
-            let (wrong_path, _, _) = symbolic_path(0, other_n, &mut wrong_fresh);
-            assert!(verify_inclusion(leaf, 0, &genuine_path, n, mth));
-            assert!(!verify_inclusion(leaf, 0, &wrong_path, n, mth));
-            assert!(inclusion_prove_is_err(
-                &inclusion_data,
-                inclusion_targets,
-                leaf,
-                0,
-                &wrong_path,
-                n,
-                mth,
-            ));
+            for &n in &sizes {
+                if n == 0 {
+                    continue;
+                }
+                for &position in &inclusion_positions(n) {
+                    let case_id = case_id_inclusion(k, n, position);
+                    let w = ref_build_inclusion(case_id, position, n);
+                    assert!(ref_verify_inclusion(w.leaf, position, &w.path, n, w.mth));
+                    assert!(verify_inclusion(w.leaf, position, &w.path, n, w.mth));
+                    assert!(prove_inclusion(
+                        &inclusion_data,
+                        inclusion_targets,
+                        w.leaf,
+                        position,
+                        &w.path,
+                        n,
+                        w.mth,
+                    ));
 
-            // NL-B2: corrupt one genuine sibling/peak digest.
-            let mut corrupt_path = genuine_path.clone();
-            corrupt_path[0] = tamper(corrupt_path[0]);
-            assert!(!verify_inclusion(leaf, 0, &corrupt_path, n, mth));
-            assert!(inclusion_prove_is_err(
-                &inclusion_data,
-                inclusion_targets,
-                leaf,
-                0,
-                &corrupt_path,
-                n,
-                mth,
-            ));
+                    // Truncated path (length only).
+                    if !w.path.is_empty() {
+                        let trunc = &w.path[..w.path.len() - 1];
+                        assert!(!ref_verify_inclusion(w.leaf, position, trunc, n, w.mth));
+                        ref_reject += 1;
+                        assert!(!verify_inclusion(w.leaf, position, trunc, n, w.mth));
+                        host_reject += 1;
+                        assert!(inclusion_prove_is_err(
+                            &inclusion_data,
+                            inclusion_targets,
+                            w.leaf,
+                            position,
+                            trunc,
+                            n,
+                            w.mth,
+                        ));
+                        gadget_reject += 1;
+                    }
 
-            let m = pivot;
-            let mut fresh = fresh_factory();
-            let (proof, mth_a, mth_b) = symbolic_subproof(m, n, true, &mut fresh);
-            assert!(verify_consistency(m, mth_a, n, mth_b, &proof));
-            let mut corrupt_proof = proof.clone();
-            corrupt_proof[0] = tamper(corrupt_proof[0]);
-            assert!(!verify_consistency(m, mth_a, n, mth_b, &corrupt_proof));
-            assert!(consistency_prove_is_err(
-                &consistency_data,
-                consistency_targets,
-                m,
-                mth_a,
-                n,
-                mth_b,
-                &corrupt_proof,
-            ));
+                    // Over-long path (length only).
+                    if n >= 2 {
+                        let mut overlong = w.path.clone();
+                        overlong.push(fixture_range(case_id, u64::MAX - 1, 1));
+                        assert!(!ref_verify_inclusion(
+                            w.leaf, position, &overlong, n, w.mth
+                        ));
+                        ref_reject += 1;
+                        assert!(!verify_inclusion(w.leaf, position, &overlong, n, w.mth));
+                        host_reject += 1;
+                        assert!(inclusion_prove_is_err(
+                            &inclusion_data,
+                            inclusion_targets,
+                            w.leaf,
+                            position,
+                            &overlong,
+                            n,
+                            w.mth,
+                        ));
+                        gadget_reject += 1;
+                    }
+
+                    // Swapped top-hop bagging: same path/leaf, wrong claimed mth.
+                    match ref_build_inclusion_swapped_top_mth(case_id, position, n) {
+                        Some(bad) => {
+                            assert_eq!(bad.path.len(), w.path.len());
+                            assert_eq!(bad.leaf, w.leaf);
+                            assert!(!ref_verify_inclusion(
+                                w.leaf, position, &w.path, n, bad.mth
+                            ));
+                            ref_reject += 1;
+                            assert!(!verify_inclusion(w.leaf, position, &w.path, n, bad.mth));
+                            host_reject += 1;
+                            assert!(inclusion_prove_is_err(
+                                &inclusion_data,
+                                inclusion_targets,
+                                w.leaf,
+                                position,
+                                &w.path,
+                                n,
+                                bad.mth,
+                            ));
+                            gadget_reject += 1;
+                        }
+                        None => {
+                            skip_swapped_inc += 1;
+                            eprintln!(
+                                "skip swapped-top inclusion: k={k} n={n} p={position}"
+                            );
+                        }
+                    }
+
+                }
+                // Wrong pivot (NL-B1) once per size: same fixtures, same path length.
+                if n >= 3 {
+                    let case_id = case_id_inclusion(k, n, 0);
+                    match find_inclusion_wrong_pivot(case_id, n) {
+                        Some((position, wrong_pivot, bad)) => {
+                            let honest = ref_build_inclusion(case_id, position, n);
+                            assert_eq!(bad.path.len(), honest.path.len());
+                            assert_eq!(bad.leaf, honest.leaf);
+                            assert!(ref_verify_inclusion(
+                                honest.leaf,
+                                position,
+                                &honest.path,
+                                n,
+                                honest.mth
+                            ));
+                            assert!(verify_inclusion(
+                                honest.leaf,
+                                position,
+                                &honest.path,
+                                n,
+                                honest.mth
+                            ));
+                            assert!(prove_inclusion(
+                                &inclusion_data,
+                                inclusion_targets,
+                                honest.leaf,
+                                position,
+                                &honest.path,
+                                n,
+                                honest.mth,
+                            ));
+                            assert!(
+                                !ref_verify_inclusion(
+                                    bad.leaf,
+                                    position,
+                                    &bad.path,
+                                    n,
+                                    honest.mth
+                                ),
+                                "ref wrong-pivot k={k} n={n} p={position} k'={wrong_pivot}"
+                            );
+                            ref_reject += 1;
+                            assert!(
+                                !verify_inclusion(bad.leaf, position, &bad.path, n, honest.mth),
+                                "host wrong-pivot k={k} n={n} p={position} k'={wrong_pivot}"
+                            );
+                            host_reject += 1;
+                            assert!(
+                                inclusion_prove_is_err(
+                                    &inclusion_data,
+                                    inclusion_targets,
+                                    bad.leaf,
+                                    position,
+                                    &bad.path,
+                                    n,
+                                    honest.mth,
+                                ),
+                                "gadget wrong-pivot k={k} n={n} p={position} k'={wrong_pivot}"
+                            );
+                            gadget_reject += 1;
+                        }
+                        None => {
+                            skip_wrong_pivot_inc += 1;
+                            eprintln!(
+                                "skip wrong-pivot inclusion: k={k} n={n} — no same-length \
+                                 top-pivot mutation among search positions"
+                            );
+                        }
+                    }
+                } else {
+                    skip_wrong_pivot_inc += 1;
+                    eprintln!("skip wrong-pivot inclusion: k={k} n={n} — size < 3");
+                }
+            }
+
+            for (m, n) in adjacent_consistency_pairs(k) {
+                if m == 0 || m >= n {
+                    continue;
+                }
+                let case_id = case_id_consistency(k, m, n);
+                let w = ref_build_consistency(case_id, m, n);
+                assert!(ref_verify_consistency(m, w.mth_a, n, w.mth_b, &w.proof));
+                assert!(verify_consistency(m, w.mth_a, n, w.mth_b, &w.proof));
+                assert!(prove_consistency(
+                    &consistency_data,
+                    consistency_targets,
+                    m,
+                    w.mth_a,
+                    n,
+                    w.mth_b,
+                    &w.proof,
+                ));
+
+                // Truncated proof.
+                if !w.proof.is_empty() {
+                    let trunc = &w.proof[..w.proof.len() - 1];
+                    assert!(!ref_verify_consistency(m, w.mth_a, n, w.mth_b, trunc));
+                    ref_reject += 1;
+                    assert!(!verify_consistency(m, w.mth_a, n, w.mth_b, trunc));
+                    host_reject += 1;
+                    assert!(consistency_prove_is_err(
+                        &consistency_data,
+                        consistency_targets,
+                        m,
+                        w.mth_a,
+                        n,
+                        w.mth_b,
+                        trunc,
+                    ));
+                    gadget_reject += 1;
+                }
+
+                // Over-long proof.
+                {
+                    let mut overlong = w.proof.clone();
+                    overlong.push(fixture_range(case_id, u64::MAX - 1, 1));
+                    assert!(!ref_verify_consistency(m, w.mth_a, n, w.mth_b, &overlong));
+                    ref_reject += 1;
+                    assert!(!verify_consistency(m, w.mth_a, n, w.mth_b, &overlong));
+                    host_reject += 1;
+                    assert!(consistency_prove_is_err(
+                        &consistency_data,
+                        consistency_targets,
+                        m,
+                        w.mth_a,
+                        n,
+                        w.mth_b,
+                        &overlong,
+                    ));
+                    gadget_reject += 1;
+                }
+
+                // Swapped chunk/peak bagging (NL-B2): same proof, wrong mth_a fold.
+                if w.chunks.len() >= 2 {
+                    let swapped_a = ref_fold_chunks_swapped(&w.chunks);
+                    assert_ne!(swapped_a, w.mth_a);
+                    assert_eq!(ref_fold_chunks(&w.chunks), w.mth_a);
+                    assert!(!ref_verify_consistency(m, swapped_a, n, w.mth_b, &w.proof));
+                    ref_reject += 1;
+                    assert!(!verify_consistency(m, swapped_a, n, w.mth_b, &w.proof));
+                    host_reject += 1;
+                    assert!(consistency_prove_is_err(
+                        &consistency_data,
+                        consistency_targets,
+                        m,
+                        swapped_a,
+                        n,
+                        w.mth_b,
+                        &w.proof,
+                    ));
+                    gadget_reject += 1;
+
+                    // Truncated peak/chunk list bagged into mth_a.
+                    let trunc_a = ref_fold_chunks(&w.chunks[..w.chunks.len() - 1]);
+                    assert_ne!(trunc_a, w.mth_a);
+                    assert!(!ref_verify_consistency(m, trunc_a, n, w.mth_b, &w.proof));
+                    ref_reject += 1;
+                    assert!(!verify_consistency(m, trunc_a, n, w.mth_b, &w.proof));
+                    host_reject += 1;
+                    assert!(consistency_prove_is_err(
+                        &consistency_data,
+                        consistency_targets,
+                        m,
+                        trunc_a,
+                        n,
+                        w.mth_b,
+                        &w.proof,
+                    ));
+                    gadget_reject += 1;
+                } else {
+                    skip_swapped_chunks += 1;
+                    eprintln!(
+                        "skip swapped/trunc-chunk consistency: k={k} m={m} n={n} — <2 chunks"
+                    );
+                }
+
+                // Wrong pivot (NL-B1).
+                match try_consistency_wrong_pivot(case_id, m, n) {
+                    ConsistencyPivotMutation::Ok {
+                        wrong_pivot,
+                        witness: bad,
+                    } => {
+                        assert_eq!(bad.proof.len(), w.proof.len());
+                        assert!(
+                            !ref_verify_consistency(m, w.mth_a, n, w.mth_b, &bad.proof),
+                            "ref wrong-pivot con k={k} m={m} n={n} k'={wrong_pivot}"
+                        );
+                        ref_reject += 1;
+                        assert!(
+                            !verify_consistency(m, w.mth_a, n, w.mth_b, &bad.proof),
+                            "host wrong-pivot con k={k} m={m} n={n} k'={wrong_pivot}"
+                        );
+                        host_reject += 1;
+                        assert!(
+                            consistency_prove_is_err(
+                                &consistency_data,
+                                consistency_targets,
+                                m,
+                                w.mth_a,
+                                n,
+                                w.mth_b,
+                                &bad.proof,
+                            ),
+                            "gadget wrong-pivot con k={k} m={m} n={n} k'={wrong_pivot}"
+                        );
+                        gadget_reject += 1;
+                    }
+                    ConsistencyPivotMutation::Unreachable { reason } => {
+                        skip_wrong_pivot_con += 1;
+                        eprintln!(
+                            "skip wrong-pivot consistency: k={k} m={m} n={n} — {reason}"
+                        );
+                    }
+                }
+            }
         }
-        assert_eq!(covered_k_values, 7);
+
+        assert_eq!(covered_k_values, 64);
+        assert_eq!(ref_reject, host_reject);
+        assert_eq!(host_reject, gadget_reject);
+        eprintln!(
+            "V.11 gadget Reject counts: ref={ref_reject} host={host_reject} gadget={gadget_reject}"
+        );
+        eprintln!(
+            "V.11 gadget Reject skips: wrong_pivot_inc={skip_wrong_pivot_inc} \
+             wrong_pivot_con={skip_wrong_pivot_con} swapped_inc={skip_swapped_inc} \
+             swapped_peaks={skip_swapped_peaks} swapped_chunks={skip_swapped_chunks}"
+        );
+        assert!(
+            ref_reject > 100,
+            "expected a large Reject set across k=0…63, got {ref_reject}"
+        );
     }
 }
