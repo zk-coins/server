@@ -69,10 +69,14 @@ impl Nav {
 }
 
 /// Largest power of two strictly less than `n`. Requires `n >= 2`.
-fn split_point(n: usize) -> usize {
+///
+/// Protocol sizes are `u64` (log capacity up to `2^H_MAX − 1`, `H_MAX = 64`).
+/// Keeping the split arithmetic in `u64` avoids silent truncation of those
+/// sizes when the host `usize` is narrower (e.g. `wasm32`).
+fn split_point(n: u64) -> u64 {
     debug_assert!(n >= 2);
-    let bit_length = 64 - (n as u64 - 1).leading_zeros();
-    1usize << (bit_length - 1)
+    let bit_length = 64 - (n - 1).leading_zeros();
+    1u64 << (bit_length - 1)
 }
 
 /// RFC 6962 MTH over a fully materialised leaf sequence (small logs).
@@ -182,7 +186,8 @@ fn mth_range(entries: &[NfLogEntry], start_pos: u64) -> HashDigest {
     if n == 1 {
         return nflog_leaf_hash(start_pos, &entries[0]);
     }
-    let k = split_point(n);
+    // `k < n = entries.len()`, so the split always fits in `usize`.
+    let k = split_point(n as u64) as usize;
     let left = mth_range(&entries[..k], start_pos);
     let right = mth_range(&entries[k..], start_pos + k as u64);
     nflog_node_hash(left, right)
@@ -208,7 +213,8 @@ fn path_range(rel_pos: usize, entries: &[NfLogEntry], start_pos: u64) -> Vec<Has
     if n == 1 {
         return vec![];
     }
-    let k = split_point(n);
+    // `k < n = entries.len()`, so the split always fits in `usize`.
+    let k = split_point(n as u64) as usize;
     if rel_pos < k {
         let mut path = path_range(rel_pos, &entries[..k], start_pos);
         path.push(mth_range(&entries[k..], start_pos + k as u64));
@@ -222,6 +228,10 @@ fn path_range(rel_pos: usize, entries: &[NfLogEntry], start_pos: u64) -> Vec<Has
 
 /// `leaf` is the position-bound leaf hash `nflog_leaf_hash(position, entry)`.
 /// Pure predicate: no panics on malformed `path`.
+///
+/// `position` and `size` stay `u64` end-to-end (protocol type). They are never
+/// narrowed to `usize`, so a 32-bit host cannot silently truncate a large size
+/// into a small one and false-accept.
 pub fn verify_inclusion(
     leaf: HashDigest,
     position: u64,
@@ -232,7 +242,7 @@ pub fn verify_inclusion(
     if size == 0 || position >= size {
         return false;
     }
-    match verify_path_range(position as usize, size as usize, leaf, path) {
+    match verify_path_range(position, size, leaf, path) {
         Some(recomputed) => recomputed == mth,
         None => false,
     }
@@ -240,9 +250,11 @@ pub fn verify_inclusion(
 
 /// Mirrors `path_range`'s recursion, consuming `path` from its END inward.
 /// Returns `None` for any malformed/wrong-length path instead of panicking.
+///
+/// `rel_pos` / `n` are protocol sizes (`u64`), not host pointer widths.
 fn verify_path_range(
-    rel_pos: usize,
-    n: usize,
+    rel_pos: u64,
+    n: u64,
     leaf: HashDigest,
     path: &[HashDigest],
 ) -> Option<HashDigest> {
@@ -288,7 +300,8 @@ fn subproof_range(m: usize, entries: &[NfLogEntry], start_pos: u64, b: bool) -> 
             vec![mth_range(entries, start_pos)]
         };
     }
-    let k = split_point(n);
+    // `k < n = entries.len()`, so the split always fits in `usize`.
+    let k = split_point(n as u64) as usize;
     if m <= k {
         let mut proof = subproof_range(m, &entries[..k], start_pos, b);
         proof.push(mth_range(&entries[k..], start_pos + k as u64));
@@ -301,6 +314,10 @@ fn subproof_range(m: usize, entries: &[NfLogEntry], start_pos: u64, b: bool) -> 
 }
 
 /// `prefix(a, b)` for `a = (m, mth_a)`, `b = (n, mth_b)`.
+///
+/// `m` and `n` stay `u64` end-to-end (protocol type). They are never narrowed
+/// to `usize`, so a 32-bit host cannot silently truncate both sizes to the
+/// same small value and false-accept a non-prefix consistency claim.
 pub fn verify_consistency(
     m: u64,
     mth_a: HashDigest,
@@ -319,7 +336,7 @@ pub fn verify_consistency(
     if m == n {
         return proof.is_empty() && mth_a == mth_b;
     }
-    match verify_subproof(m as usize, n as usize, true, mth_a, proof) {
+    match verify_subproof(m, n, true, mth_a, proof) {
         Some((chunks, n_side)) => {
             if n_side != mth_b {
                 return false;
@@ -352,9 +369,11 @@ fn fold_chunks(chunks: &[HashDigest]) -> HashDigest {
 /// Returns `(chunks, local_value)`:
 ///  - `local_value` = recomputed MTH of this call's sub-range
 ///  - `chunks` = ordered list of prefix-closing contributions to `mth_a`
+///
+/// `m` / `n` are protocol sizes (`u64`), not host pointer widths.
 fn verify_subproof(
-    m: usize,
-    n: usize,
+    m: u64,
+    n: u64,
     b: bool,
     mth_a_hint: HashDigest,
     proof: &[HashDigest],
@@ -516,6 +535,31 @@ mod tests {
         ));
     }
 
+    /// Counterexample for silent `size as usize` truncation on 32-bit hosts.
+    ///
+    /// On a 32-bit `usize`, `2^32 + 1` narrows to `1`. The outer guards
+    /// (`size == 0`, `position >= size`) still see the full `u64`, so they
+    /// pass; the base case `n == 1` then accepts an empty path and returns
+    /// `leaf`, matching `mth == leaf` — a false accept.
+    ///
+    /// With protocol sizes carried as `u64` end-to-end, `n` stays `2^32 + 1`,
+    /// the empty path is rejected for `n > 1`, and verification fails on both
+    /// 32-bit and 64-bit hosts. Meaningful on a 64-bit host: it exercises the
+    /// large-size path, not a platform-gated try-from branch.
+    #[test]
+    fn verify_inclusion_rejects_size_beyond_u32_max_with_empty_path() {
+        let leaf = nflog_empty();
+        let size = (u32::MAX as u64) + 1; // 2^32 + 1
+        assert!(
+            !verify_inclusion(leaf, 0, &[], size, leaf),
+            "size=2^32+1 with empty path must never verify (would false-accept under usize truncation)"
+        );
+        // Same class: any size that exceeds u32::MAX must not be silently
+        // narrowed; empty path still fails for every n > 1.
+        let size2 = (u32::MAX as u64) + 2;
+        assert!(!verify_inclusion(leaf, 0, &[], size2, leaf));
+    }
+
     #[test]
     fn consistency_prefix_holds_for_m_less_than_n() {
         let entries = synthetic_entries(8);
@@ -576,6 +620,31 @@ mod tests {
             consistency_proof(6, &entries),
             Err(SpecError::ConsistencyRangeInvalid { m: 6, n: 5 })
         ));
+    }
+
+    /// Counterexample for silent `m as usize` / `n as usize` truncation on
+    /// 32-bit hosts.
+    ///
+    /// On a 32-bit `usize`, `n = 2^32 + 1` narrows to `1`. With `m = 1` the
+    /// outer `m == n` check still sees the full `u64` values and does not
+    /// short-circuit; after narrowing both become `1`, the subproof base case
+    /// `m == n && b` accepts an empty proof — a false accept of a non-prefix.
+    ///
+    /// With protocol sizes carried as `u64` end-to-end, `m != n` remains true,
+    /// the empty proof is rejected, and verification fails on both 32-bit and
+    /// 64-bit hosts. Meaningful on a 64-bit host: it exercises the large-size
+    /// path, not a platform-gated try-from branch.
+    #[test]
+    fn verify_consistency_rejects_sizes_beyond_u32_max_with_empty_proof() {
+        let mth = nflog_empty();
+        let n = (u32::MAX as u64) + 1; // 2^32 + 1
+        assert!(
+            !verify_consistency(1, mth, n, mth, &[]),
+            "m=1, n=2^32+1 with empty proof must never verify (would false-accept under usize truncation)"
+        );
+        // Same class with a non-matching digest pair (still must reject).
+        let other = nflog_root(0, mth);
+        assert!(!verify_consistency(1, mth, n, other, &[]));
     }
 
     #[test]
