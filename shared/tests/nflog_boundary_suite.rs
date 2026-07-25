@@ -14,23 +14,30 @@
 use shared::spec_v1::nflog_boundary::{
     adjacent_consistency_pairs, bag_peaks_swapped, boundary_sizes, case_id_consistency,
     case_id_inclusion, case_id_peaks, find_inclusion_wrong_pivot, fixture_peaks,
-    inclusion_positions, peak_sizes, ref_bag_peaks, ref_build_consistency, ref_build_inclusion,
-    ref_build_inclusion_swapped_top_mth, ref_fold_chunks, ref_fold_chunks_swapped, ref_mth_run,
-    ref_split_point, ref_verify_consistency, ref_verify_inclusion, try_consistency_wrong_pivot,
-    try_inclusion_wrong_pivot, ConsistencyPivotMutation, PivotMutation,
+    inclusion_positions, mth_a_dropped_to_empty, mth_a_duplicated_singleton, peak_sizes,
+    ref_bag_peaks, ref_build_consistency, ref_build_inclusion, ref_build_inclusion_swapped_top_mth,
+    ref_fold_chunks, ref_fold_chunks_swapped, ref_mth_run, ref_split_point, ref_verify_consistency,
+    ref_verify_inclusion, try_consistency_wrong_pivot, try_inclusion_wrong_pivot,
+    ConsistencyPivotMutation, PivotMutation,
 };
 use shared::spec_v1::nflog_boundary::fixture_range;
 use shared::spec_v1::{nflog_empty, verify_consistency, verify_inclusion, HashDigest};
 
 #[test]
 fn nflog_boundary_suite_k0_to_63() {
+    // Three-layer-capable counters: only checks that ran host verify + ref.
     let mut accept_count: u64 = 0;
     let mut reject_count: u64 = 0;
+    // Peak-bag identity is reference-only (no free-standing host peak-bag API).
+    let mut ref_only_peak_accept: u64 = 0;
+    let mut ref_only_peak_nl_b2: u64 = 0;
     let mut skip_wrong_pivot_inc: u64 = 0;
     let mut skip_wrong_pivot_con: u64 = 0;
     let mut skip_swapped_inc: u64 = 0;
-    let mut skip_swapped_peaks: u64 = 0;
-    let mut skip_trunc_peaks: u64 = 0;
+    let skip_swapped_peaks: u64 = 0;
+    let skip_swapped_chunks: u64 = 0;
+    let mut built_peak_dup_drop: u64 = 0;
+    let mut built_chunk_dup_drop: u64 = 0;
 
     // Platform note: production `verify_*` cast sizes to `usize`. On this
     // 64-bit host that is lossless for every in-scope n. The independent
@@ -46,14 +53,11 @@ fn nflog_boundary_suite_k0_to_63() {
 
         // --- Peak-bagging Accept: independent bag of fixture peaks equals
         // ref_mth_run (same peak decomposition). Symbolic peak fixtures are
-        // atomic and intentionally *not* equal to the expanded inclusion MTH
-        // of the same range — production peak bagging is exercised via the
-        // consistency mth_a chunk-fold below (host +, on the gadget side, the
-        // in-circuit fold). ---
+        // atomic — production peak bagging is the consistency mth_a chunk-
+        // fold below (host verify). Counted as ref_only, never as three-
+        // layer Accept. Empty-log bagging is the m=0 consistency Accept. ---
         for &n in &sizes {
             if n == 0 {
-                assert_eq!(nflog_empty(), nflog_empty());
-                accept_count += 1;
                 continue;
             }
             let case_peaks = case_id_peaks(k);
@@ -70,21 +74,26 @@ fn nflog_boundary_suite_k0_to_63() {
                 ref_fold_chunks(&peaks),
                 "bag_peaks != fold_chunks k={k} n={n}"
             );
-            accept_count += 1;
+            ref_only_peak_accept += 1;
 
-            // Structural Reject note for swapped/truncated peak *lists* alone
-            // is not a production predicate; those mutations are applied as
-            // mth_a bagging faults on consistency witnesses below. Here we
-            // only record that the independent digests differ (sanity), and
-            // count a Reject only when we also have a multi-chunk consistency
-            // pair later. Track single-peak skips for the report.
+            // NL-B2 peak-list mutations (ref digest). Production three-layer
+            // reject is the consistency mth_a bagging fault below.
+            // Single-peak: swap is a no-op — use duplicate / drop.
             if peaks.len() < 2 {
-                skip_swapped_peaks += 1;
-                skip_trunc_peaks += 1;
-                eprintln!(
-                    "skip peak-list swap/trunc at peak layer: k={k} n={n} — single peak \
-                     (swap/trunc no-op; multi-chunk bagging covered via consistency)"
+                let p = peaks[0];
+                assert_eq!(bagged, p, "singleton bag is identity k={k} n={n}");
+                let dup = mth_a_duplicated_singleton(p);
+                assert_ne!(
+                    dup, bagged,
+                    "duplicated singleton peak must differ from honest bag k={k} n={n}"
                 );
+                let dropped = mth_a_dropped_to_empty();
+                assert_ne!(
+                    dropped, bagged,
+                    "dropped singleton peak must differ from honest bag k={k} n={n}"
+                );
+                ref_only_peak_nl_b2 += 2;
+                built_peak_dup_drop += 2;
             } else {
                 let swapped = bag_peaks_swapped(&peaks);
                 assert_ne!(
@@ -96,8 +105,6 @@ fn nflog_boundary_suite_k0_to_63() {
                     mth_trunc, bagged,
                     "truncated peaks collided with honest mth k={k} n={n}"
                 );
-                // Rejects are counted when consistency applies the same fold
-                // fault to an honest proof (production predicate).
             }
         }
 
@@ -304,16 +311,15 @@ fn nflog_boundary_suite_k0_to_63() {
                 reject_count += 1;
             }
 
-            // --- Consistency Reject: swapped peak-/chunk-bagging order.
-            // Same proof, same mth_b; only mth_a uses swapped Node fold. ---
+            // --- Consistency Reject: peak-/chunk-bagging faults (NL-B2).
+            // Same proof, same mth_b; only mth_a is wrong (single property). ---
+            assert_eq!(ref_fold_chunks(&w.chunks), w.mth_a);
             if w.chunks.len() >= 2 {
                 let swapped_a = ref_fold_chunks_swapped(&w.chunks);
                 assert_ne!(
                     swapped_a, w.mth_a,
                     "swapped chunk fold collided with honest mth_a k={k} m={m} n={n}"
                 );
-                // Sanity: honest fold matches.
-                assert_eq!(ref_fold_chunks(&w.chunks), w.mth_a);
                 assert!(
                     ref_verify_consistency(m, w.mth_a, n, w.mth_b, &w.proof),
                     "honest counterpart must Accept before swapped-bag Reject k={k} m={m} n={n}"
@@ -344,10 +350,42 @@ fn nflog_boundary_suite_k0_to_63() {
                 );
                 reject_count += 1;
             } else {
-                eprintln!(
-                    "skip swapped/trunc-chunk consistency: k={k} m={m} n={n} — \
-                     fewer than 2 chunks (swap/trunc is a no-op)"
+                // Single chunk: swap/trunc no-ops. Use duplicate / drop.
+                assert_eq!(w.chunks.len(), 1);
+                let c = w.chunks[0];
+                assert_eq!(c, w.mth_a);
+
+                let dup_a = mth_a_duplicated_singleton(c);
+                assert_ne!(
+                    dup_a, w.mth_a,
+                    "duplicated singleton mth_a collided with honest k={k} m={m} n={n}"
                 );
+                assert!(
+                    !ref_verify_consistency(m, dup_a, n, w.mth_b, &w.proof),
+                    "ref must reject duplicated mth_a k={k} m={m} n={n}"
+                );
+                assert!(
+                    !verify_consistency(m, dup_a, n, w.mth_b, &w.proof),
+                    "prod must reject duplicated mth_a k={k} m={m} n={n}"
+                );
+                reject_count += 1;
+                built_chunk_dup_drop += 1;
+
+                let drop_a = mth_a_dropped_to_empty();
+                assert_ne!(
+                    drop_a, w.mth_a,
+                    "dropped mth_a collided with honest k={k} m={m} n={n}"
+                );
+                assert!(
+                    !ref_verify_consistency(m, drop_a, n, w.mth_b, &w.proof),
+                    "ref must reject dropped mth_a k={k} m={m} n={n}"
+                );
+                assert!(
+                    !verify_consistency(m, drop_a, n, w.mth_b, &w.proof),
+                    "prod must reject dropped mth_a k={k} m={m} n={n}"
+                );
+                reject_count += 1;
+                built_chunk_dup_drop += 1;
             }
 
             // --- Consistency Reject: wrong pivot (same fixtures, same proof
@@ -385,13 +423,34 @@ fn nflog_boundary_suite_k0_to_63() {
         }
     }
 
+    assert_eq!(
+        skip_swapped_peaks, 0,
+        "single-peak NL-B2 must be built as duplicate/drop, not skipped"
+    );
+    assert_eq!(
+        skip_swapped_chunks, 0,
+        "single-chunk NL-B2 must be built as duplicate/drop, not skipped"
+    );
+    assert_eq!(
+        built_chunk_dup_drop, 130,
+        "expected 65 single-chunk pairs × (dup+drop) = 130, got {built_chunk_dup_drop}"
+    );
+    assert_eq!(
+        built_peak_dup_drop, 132,
+        "expected 66 single-peak sizes × (dup+drop) = 132, got {built_peak_dup_drop}"
+    );
     eprintln!(
-        "V.11 boundary suite (host+ref) counts: Accept={accept_count} Reject={reject_count}"
+        "V.11 boundary suite (host+ref) counts: Accept={accept_count} Reject={reject_count} \
+         ref_only_peak_accept={ref_only_peak_accept} ref_only_peak_nl_b2={ref_only_peak_nl_b2}"
     );
     eprintln!(
         "V.11 boundary suite skips: wrong_pivot_inc={skip_wrong_pivot_inc} \
          wrong_pivot_con={skip_wrong_pivot_con} swapped_inc={skip_swapped_inc} \
-         swapped_peaks={skip_swapped_peaks} trunc_peaks={skip_trunc_peaks}"
+         swapped_peaks={skip_swapped_peaks} swapped_chunks={skip_swapped_chunks}"
+    );
+    eprintln!(
+        "V.11 boundary suite NL-B2 built: peak_dup_drop={built_peak_dup_drop} \
+         chunk_dup_drop={built_chunk_dup_drop}"
     );
     assert!(
         accept_count > 100,
