@@ -1,6 +1,6 @@
 use plonky2::field::secp256k1_base::Secp256K1Base;
 use plonky2::field::secp256k1_scalar::Secp256K1Scalar;
-use plonky2::field::types::{Field, Field64};
+use plonky2::field::types::Field;
 use plonky2::gates::noop::NoopGate;
 use plonky2::hash::hash_types::HashOutTarget;
 use plonky2::hash::poseidon::PoseidonHash;
@@ -29,6 +29,7 @@ use crate::circuit::gadgets::sha256::sha256;
 use crate::circuit::gadgets::u128_arith::{
     accumulate, add_wide, connect_wide, geq, select_wide, zero_wide, U128Target, WideSum,
 };
+use crate::circuit::gadgets::u64_limbs::U64LimbsTarget;
 use crate::{C, D, F};
 
 use super::bindings::{
@@ -38,7 +39,7 @@ use super::bindings::{
 use super::serialize::{
     address_from_pk0_and_nk_commit, be_bytes32_to_u32_limbs, digest_to_be_bytes_target,
     encode_byte_string_target, strict_be_bytes_less_than, tag_targets, u128_to_be_bytes_target,
-    u32_limbs_to_be_bytes32, u64_to_be_bytes_target,
+    u32_limbs_to_be_bytes32, u64_limbs_to_be_bytes_target,
 };
 use super::targets::{
     virtual_bytes, AccountStateTarget, AssetIssuanceTarget, BalanceSlotTarget, CoinTarget,
@@ -305,7 +306,7 @@ pub(crate) fn account_state_hash_target(
     state: &AccountStateTarget,
 ) -> (HashOutTarget, Target) {
     let nk_commit_bytes = digest_to_be_bytes_target(builder, state.nk_commit);
-    let send_counter_bytes = u64_to_be_bytes_target(builder, state.send_counter);
+    let send_counter_bytes = u64_limbs_to_be_bytes_target(builder, state.send_counter);
     let history_root_bytes = digest_to_be_bytes_target(builder, state.coin_history_root);
     let asset_id_bytes =
         std::array::from_fn(|i| digest_to_be_bytes_target(builder, state.balances[i].asset_id));
@@ -499,14 +500,11 @@ fn connect_unchanged_state(
     builder.connect_hashes(previous.nk_commit, new.nk_commit);
     connect_bytes(builder, &new.current_pubkey, next_pubkey);
 
-    // Both counters are canonical Goldilocks integers and the predecessor
-    // cannot be ORDER-1, so field addition is exact integer `+ 1`.
-    let _previous_counter_bytes = u64_to_be_bytes_target(builder, previous.send_counter);
-    let largest = builder.constant(F::from_canonical_u64(F::ORDER - 1));
-    let at_largest = builder.is_equal(previous.send_counter, largest);
-    builder.assert_zero(at_largest.target);
-    let incremented = builder.add_const(previous.send_counter, F::ONE);
-    builder.connect(new.send_counter, incremented);
+    // Protocol send_counter is a full u64 (two limbs). Increment with explicit
+    // carry and reject wrap past u64::MAX — never field addition mod p.
+    let _previous_counter_bytes = u64_limbs_to_be_bytes_target(builder, previous.send_counter);
+    let incremented = previous.send_counter.add_one(builder);
+    new.send_counter.connect(builder, incremented);
 }
 
 fn masked_balance_sum(
@@ -689,8 +687,8 @@ fn enforce_mint(
     let bad_cap = builder.and(apply_v2, cap_fails);
     builder.assert_zero(bad_cap.target);
 
-    let zero_target = builder.zero();
-    let counter_zero = builder.is_equal(previous.send_counter, zero_target);
+    let zero_counter = U64LimbsTarget::zero(builder);
+    let counter_zero = previous.send_counter.is_equal(builder, zero_counter);
     let counter_nonzero = builder.not(counter_zero);
     let bad_counter = builder.and(apply_v2, counter_nonzero);
     builder.assert_zero(bad_counter.target);
@@ -878,11 +876,12 @@ fn enforce_received_admission(
             opened_creating_nav,
         );
         let empty = nflog_empty_target(builder);
-        let zero = builder.zero();
-        let effective_r_size = builder.select(active, auth.creating_nav_opening.nav.size, zero);
+        let zero = U64LimbsTarget::zero(builder);
+        let effective_r_size =
+            U64LimbsTarget::select(builder, active, auth.creating_nav_opening.nav.size, zero);
         let effective_r_mth =
             select_hash(builder, active, auth.creating_nav_opening.nav.mth, empty);
-        let effective_size = builder.select(active, nav.size, zero);
+        let effective_size = U64LimbsTarget::select(builder, active, nav.size, zero);
         let effective_mth = select_hash(builder, active, nav.mth, empty);
         verify_nflog_consistency(
             builder,
@@ -895,9 +894,10 @@ fn enforce_received_admission(
 
         let creating_leaf =
             nflog_leaf_hash_target(builder, auth.pos_create, &auth.pk_create, &auth.r_create);
-        let effective_position = builder.select(active, auth.pos_create, zero);
-        let one = builder.one();
-        let effective_inclusion_size = builder.select(active, nav.size, one);
+        let effective_position =
+            U64LimbsTarget::select(builder, active, auth.pos_create, zero);
+        let one = U64LimbsTarget::one(builder);
+        let effective_inclusion_size = U64LimbsTarget::select(builder, active, nav.size, one);
         let effective_inclusion_mth = select_hash(builder, active, nav.mth, creating_leaf);
         verify_nflog_inclusion(
             builder,
@@ -1270,7 +1270,10 @@ fn build_with_common(
     let balance_count_nonzero = builder.not(balance_count_zero);
     let bad_balance_count = builder.and(is_initial, balance_count_nonzero);
     builder.assert_zero(bad_balance_count.target);
-    let counter_zero = builder.is_equal(prev_account_state.send_counter, zero);
+    let zero_u64 = U64LimbsTarget::zero(&mut builder);
+    let counter_zero = prev_account_state
+        .send_counter
+        .is_equal(&mut builder, zero_u64);
     let counter_nonzero = builder.not(counter_zero);
     let bad_counter = builder.and(is_initial, counter_nonzero);
     builder.assert_zero(bad_counter.target);
@@ -1281,13 +1284,18 @@ fn build_with_common(
         prev_account_state.coin_history_root,
         empty_history,
     );
-    let size_prev_zero = builder.is_equal(prev_nav_opening.nav.size, zero);
+    let size_zero = zero_u64;
+    let size_prev_zero = prev_nav_opening
+        .nav
+        .size
+        .is_equal(&mut builder, size_zero);
     let size_prev_nonzero = builder.not(size_prev_zero);
     let bad_size_prev = builder.and(is_initial, size_prev_nonzero);
     builder.assert_zero(bad_size_prev.target);
 
     let empty_nflog = nflog_empty_target(&mut builder);
-    let consistency_m = builder.select(is_account_update, prev_nav_opening.nav.size, zero);
+    let consistency_m =
+        U64LimbsTarget::select(&mut builder, is_account_update, prev_nav_opening.nav.size, size_zero);
     let consistency_mth = select_hash(
         &mut builder,
         is_account_update,
@@ -1309,9 +1317,15 @@ fn build_with_common(
         &prev_state_nullifier.pk_prev,
         &prev_state_nullifier.r_prev,
     );
-    let effective_position = builder.select(is_account_update, prev_state_nullifier.pos_prev, zero);
-    let one = builder.one();
-    let effective_size = builder.select(is_account_update, nav.size, one);
+    let effective_position = U64LimbsTarget::select(
+        &mut builder,
+        is_account_update,
+        prev_state_nullifier.pos_prev,
+        size_zero,
+    );
+    let one = U64LimbsTarget::one(&mut builder);
+    let effective_size =
+        U64LimbsTarget::select(&mut builder, is_account_update, nav.size, one);
     let effective_mth = select_hash(&mut builder, is_account_update, nav.mth, prev_leaf);
     verify_nflog_inclusion(
         &mut builder,

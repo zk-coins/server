@@ -14,3 +14,4 @@ pub mod nonnative;
 pub mod sha256;
 pub mod split_nonnative;
 pub mod u128_arith;
+pub mod u64_limbs;

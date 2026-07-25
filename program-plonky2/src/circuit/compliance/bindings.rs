@@ -12,7 +12,7 @@ use crate::{D, F};
 
 use super::serialize::{
     digest_to_be_bytes_target, encode_byte_string_target, tag_targets, u128_to_be_bytes_target,
-    u64_to_be_bytes_target,
+    u64_limbs_to_be_bytes_target,
 };
 use super::targets::{InputAuthTarget, InputCoinTarget, NavTarget, ProofDataTarget};
 use super::{
@@ -105,7 +105,7 @@ pub(crate) fn nk_commit_target(
 }
 
 pub(crate) fn nav_root_target(builder: &mut CircuitBuilder<F, D>, nav: NavTarget) -> HashOutTarget {
-    let size_bytes = u64_to_be_bytes_target(builder, nav.size);
+    let size_bytes = u64_limbs_to_be_bytes_target(builder, nav.size);
     let mut elements = tag_targets(builder, TAG_NFLOG_ROOT);
     elements.extend(encode_byte_string_target(builder, &size_bytes));
     elements.extend(nav.mth.elements);

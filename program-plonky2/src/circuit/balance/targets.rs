@@ -5,7 +5,7 @@ use plonky2::plonk::circuit_data::{CommonCircuitData, VerifierOnlyCircuitData};
 use plonky2::plonk::proof::ProofWithPublicInputsTarget;
 
 use crate::circuit::compliance::{
-    account_balance_target, account_state_hash_target, be_bytes32_to_u32_limbs, canonical_u64_bits,
+    account_balance_target, account_state_hash_target, be_bytes32_to_u32_limbs,
     hash_proof_data_target, nav_commitment_target, nav_root_target, network_id_target,
     unpack_compliance_proof_pis, AccountStateTarget, NavTarget, Network,
 };
@@ -14,6 +14,7 @@ use crate::circuit::gadgets::curve::{AffinePointTarget, CircuitBuilderCurve};
 use crate::circuit::gadgets::curve_types::Secp256K1;
 use crate::circuit::gadgets::nflog_consistency::{verify_nflog_consistency, H_MAX};
 use crate::circuit::gadgets::u128_arith::U128Target;
+use crate::circuit::gadgets::u64_limbs::U64LimbsTarget;
 use crate::{C, D, F};
 
 /// The frozen 60-element application public-input layout of `C_balance`.
@@ -23,8 +24,10 @@ pub struct BalancePublicInputsTarget {
     pub asset_id: HashOutTarget,
     pub balance: U128Target,
     pub nav_ceiling: HashOutTarget,
-    pub size_ceiling: Target,
-    pub size_ceiling_limbs: [Target; 2],
+    /// Protocol size ceiling as two little-endian u32 limbs (also the public
+    /// PI pair). Limbs are the representation — not a view of a single field
+    /// element — so the full `0 … 2^64 − 1` domain is available.
+    pub size_ceiling: U64LimbsTarget,
     pub anchor_txid: [Target; 32],
     pub anchor_block_hash: [Target; 32],
     pub anchor_height_limbs: [Target; 2],
@@ -81,18 +84,6 @@ fn connect_bytes(builder: &mut CircuitBuilder<F, D>, lhs: &[Target; 32], rhs: &[
     for (&lhs, &rhs) in lhs.iter().zip(rhs) {
         builder.connect(lhs, rhs);
     }
-}
-
-fn canonical_u64_to_u32_le_limbs(builder: &mut CircuitBuilder<F, D>, value: Target) -> [Target; 2] {
-    let bits = canonical_u64_bits(builder, value);
-    let limbs = [
-        builder.le_sum(bits[..32].iter()),
-        builder.le_sum(bits[32..].iter()),
-    ];
-    for limb in limbs {
-        builder.range_check(limb, 32);
-    }
-    limbs
 }
 
 fn pin_compliance_verifier_data_tail(
@@ -161,8 +152,8 @@ pub(super) fn add_balance_statement(
     let subject = virtual_bytes(builder);
     let asset_id = builder.add_virtual_hash();
     let nav_ceiling = builder.add_virtual_hash();
-    let size_ceiling = builder.add_virtual_target();
-    let size_ceiling_limbs = canonical_u64_to_u32_le_limbs(builder, size_ceiling);
+    // Limbs first: the public size_ceiling is the limb pair itself.
+    let size_ceiling = U64LimbsTarget::new_virtual(builder);
     let anchor_txid = virtual_bytes(builder);
     let anchor_block_hash = virtual_bytes(builder);
     let anchor_height_limbs = builder.add_virtual_target_arr();
@@ -225,7 +216,7 @@ pub(super) fn add_balance_statement(
     connect_bytes(builder, &anchor_pk, &compliance_pis.consumed_pubkey);
 
     // 6. Open π.nav_commitment, bind both log roots, and prove the hidden nav
-    // is an RFC-6962 prefix of the public ceiling.
+    // is an RFC-6962 prefix of the public ceiling. Size wires stay as limbs.
     let opened_nav_commitment = nav_commitment_target(builder, nav, &nav_rand);
     builder.connect_hashes(
         compliance_pis.proof_data.nav_commitment,
@@ -261,7 +252,8 @@ pub(super) fn add_balance_statement(
     builder.register_public_inputs(&asset_id.elements);
     builder.register_public_inputs(&balance.limbs);
     builder.register_public_inputs(&nav_ceiling.elements);
-    builder.register_public_inputs(&size_ceiling_limbs);
+    builder.register_public_input(size_ceiling.lo);
+    builder.register_public_input(size_ceiling.hi);
     builder.register_public_inputs(&txid_limbs);
     builder.register_public_inputs(&block_hash_limbs);
     builder.register_public_inputs(&anchor_height_limbs);
@@ -281,7 +273,6 @@ pub(super) fn add_balance_statement(
             balance,
             nav_ceiling,
             size_ceiling,
-            size_ceiling_limbs,
             anchor_txid,
             anchor_block_hash,
             anchor_height_limbs,

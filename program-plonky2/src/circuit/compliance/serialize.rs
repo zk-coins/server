@@ -102,6 +102,20 @@ pub(crate) fn digest_to_be_bytes_target(
         .expect("four Goldilocks limbs always encode as 32 bytes")
 }
 
+/// 8-byte big-endian encoding of a protocol `u64` carried as two limbs.
+///
+/// Prefer this over decomposing a single field element: limbs cover the full
+/// `0 … 2^64 − 1` domain and stay free of the Goldilocks alias/narrowing trade-off.
+pub(crate) fn u64_limbs_to_be_bytes_target(
+    builder: &mut CircuitBuilder<F, D>,
+    value: crate::circuit::gadgets::u64_limbs::U64LimbsTarget,
+) -> [Target; 8] {
+    value.to_be_bytes(builder)
+}
+
+/// Legacy helper: 8-byte big-endian encoding of a **field element** that is
+/// known to be a canonical Goldilocks integer (`< p`). Not for protocol sizes.
+#[allow(dead_code)]
 pub(crate) fn u64_to_be_bytes_target(
     builder: &mut CircuitBuilder<F, D>,
     value: Target,

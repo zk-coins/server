@@ -8,6 +8,7 @@ use crate::circuit::gadgets::curve::{AffinePointTarget, CircuitBuilderCurve};
 use crate::circuit::gadgets::curve_types::Secp256K1;
 use crate::circuit::gadgets::nflog_consistency::H_MAX;
 use crate::circuit::gadgets::u128_arith::U128Target;
+use crate::circuit::gadgets::u64_limbs::U64LimbsTarget;
 use crate::{D, F};
 
 /// Maximum number of distinct non-zero balances in a spec-v1.1 account.
@@ -97,7 +98,7 @@ pub struct AccountStateTarget {
     pub nk_commit: HashOutTarget,
     pub balances: [BalanceSlotTarget; MAX_ACCOUNT_ASSETS],
     pub current_pubkey: [Target; 32],
-    pub send_counter: Target,
+    pub send_counter: U64LimbsTarget,
     pub coin_history_root: HashOutTarget,
 }
 
@@ -107,8 +108,7 @@ impl AccountStateTarget {
         let nk_commit = builder.add_virtual_hash();
         let balances = std::array::from_fn(|_| BalanceSlotTarget::new_virtual(builder));
         let current_pubkey = virtual_bytes(builder);
-        let send_counter = builder.add_virtual_target();
-        builder.split_le(send_counter, 64);
+        let send_counter = U64LimbsTarget::new_virtual(builder);
         let coin_history_root = builder.add_virtual_hash();
         Self {
             owner,
@@ -226,16 +226,14 @@ pub struct ProofDataTarget {
 /// A witnessed conditional NfLog accumulator value.
 #[derive(Clone, Copy, Debug)]
 pub struct NavTarget {
-    pub size: Target,
+    pub size: U64LimbsTarget,
     pub mth: HashOutTarget,
 }
 
 impl NavTarget {
     pub(crate) fn new_virtual(builder: &mut CircuitBuilder<F, D>) -> Self {
-        let size = builder.add_virtual_target();
-        builder.split_le(size, 64);
         Self {
-            size,
+            size: U64LimbsTarget::new_virtual(builder),
             mth: builder.add_virtual_hash(),
         }
     }
@@ -269,7 +267,7 @@ pub struct ReceivedAuthTarget {
     pub r_create: [Target; 32],
     pub r_prime_create: AffinePointTarget<Secp256K1>,
     pub creating_nav_inclusion: [HashOutTarget; H_MAX],
-    pub pos_create: Target,
+    pub pos_create: U64LimbsTarget,
     pub creating_nav_opening: NavOpeningTarget,
     pub creating_nav_consistency: [HashOutTarget; 2 * H_MAX],
 }
@@ -283,8 +281,6 @@ impl ReceivedAuthTarget {
         builder.range_check(inclusion_leaf_index, 32);
         let inclusion_depth = builder.add_virtual_target();
         builder.range_check(inclusion_depth, 8);
-        let pos_create = builder.add_virtual_target();
-        builder.split_le(pos_create, 64);
         Self {
             creating_proof: builder.add_virtual_proof_with_pis(common),
             inclusion_leaf_index,
@@ -295,7 +291,7 @@ impl ReceivedAuthTarget {
             r_create: virtual_bytes(builder),
             r_prime_create: builder.add_virtual_affine_point_target(),
             creating_nav_inclusion: std::array::from_fn(|_| builder.add_virtual_hash()),
-            pos_create,
+            pos_create: U64LimbsTarget::new_virtual(builder),
             creating_nav_opening: NavOpeningTarget::new_virtual(builder),
             creating_nav_consistency: std::array::from_fn(|_| builder.add_virtual_hash()),
         }
@@ -309,19 +305,17 @@ pub struct PrevStateNullifierTarget {
     pub r_prev: [Target; 32],
     pub r_prime_prev: AffinePointTarget<Secp256K1>,
     pub nav_inclusion: [HashOutTarget; H_MAX],
-    pub pos_prev: Target,
+    pub pos_prev: U64LimbsTarget,
 }
 
 impl PrevStateNullifierTarget {
     pub(crate) fn new_virtual(builder: &mut CircuitBuilder<F, D>) -> Self {
-        let pos_prev = builder.add_virtual_target();
-        builder.split_le(pos_prev, 64);
         Self {
             pk_prev: virtual_bytes(builder),
             r_prev: virtual_bytes(builder),
             r_prime_prev: builder.add_virtual_affine_point_target(),
             nav_inclusion: std::array::from_fn(|_| builder.add_virtual_hash()),
-            pos_prev,
+            pos_prev: U64LimbsTarget::new_virtual(builder),
         }
     }
 }
