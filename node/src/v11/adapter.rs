@@ -15,9 +15,17 @@ use zkcoins_prover::state_engine::StateEngine;
 use super::db_v11::{self, EngineSnapshot};
 use super::mode::{network_label, v11_boot_pins_from_env, V11_BOOT_CONFIG_ERROR};
 
-/// Flag-gated handle: node process ↔ v1.1 StateEngine + persistence.
+/// In-memory engine plus the tip block hash the StateEngine does not yet
+/// carry (Stage 1: hash lives on the adapter / snapshot so equal-height
+/// forks stay distinguishable across persist/reload).
+struct LiveEngine {
+    engine: StateEngine,
+    tip_hash: [u8; 32],
+}
+
+/// Flag-gated handle: node process ↔ v1.1 StateEngine + shadow persistence.
 pub struct EngineAdapter {
-    engine: Mutex<StateEngine>,
+    live: Mutex<LiveEngine>,
     pool: PgPool,
     network: Network,
     activation_height: u64,
@@ -26,7 +34,8 @@ pub struct EngineAdapter {
 impl EngineAdapter {
     /// Load from Postgres, or create an empty engine when the v11 tables are
     /// empty. Fails loud if meta is present but inconsistent with the caller's
-    /// pins (network / activation height).
+    /// pins (network / activation height), or if meta is missing while data
+    /// rows remain (see [`db_v11::load_engine_snapshot`]).
     pub async fn load_or_create(
         pool: PgPool,
         network: Network,
@@ -39,7 +48,10 @@ impl EngineAdapter {
             None => {
                 let engine = StateEngine::new(network, activation_height);
                 let adapter = Self {
-                    engine: Mutex::new(engine),
+                    live: Mutex::new(LiveEngine {
+                        engine,
+                        tip_hash: [0u8; 32],
+                    }),
                     pool,
                     network,
                     activation_height,
@@ -66,11 +78,12 @@ impl EngineAdapter {
                         activation_height
                     );
                 }
+                let tip_hash = snap.tip_hash;
                 let engine = snap
                     .into_engine()
                     .context("EngineAdapter: reconstruct StateEngine from snapshot")?;
                 Ok(Self {
-                    engine: Mutex::new(engine),
+                    live: Mutex::new(LiveEngine { engine, tip_hash }),
                     pool,
                     network,
                     activation_height,
@@ -79,18 +92,18 @@ impl EngineAdapter {
         }
     }
 
-    /// Bootstrap from `ZKCOINS_NETWORK` + `ZKCOINS_ACTIVATION_HEIGHT`.
+    /// Bootstrap from env pins (`ZKCOINS_NETWORK`, `ZKCOINS_ACTIVATION_HEIGHT`,
+    /// published params identity, …).
     ///
-    /// Call only when `ZKCOINS_PROVER=v11`. Missing env vars fail with
+    /// Call only when `ZKCOINS_V11_SHADOW=1`. Missing env vars fail with
     /// [`V11_BOOT_CONFIG_ERROR`] — never fall back to legacy pins.
     pub async fn load_or_create_from_env(pool: PgPool) -> Result<Self> {
-        let (network, activation_height) =
-            v11_boot_pins_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pins = v11_boot_pins_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
         // Re-surface the canonical message if either pin was empty after trim.
-        if network_label(network).is_empty() {
+        if network_label(pins.network).is_empty() {
             bail!("{V11_BOOT_CONFIG_ERROR}");
         }
-        Self::load_or_create(pool, network, activation_height).await
+        Self::load_or_create(pool, pins.network, pins.activation_height).await
     }
 
     pub fn network(&self) -> Network {
@@ -99,6 +112,22 @@ impl EngineAdapter {
 
     pub fn activation_height(&self) -> u64 {
         self.activation_height
+    }
+
+    pub fn tip_hash(&self) -> [u8; 32] {
+        self.live
+            .lock()
+            .expect("EngineAdapter mutex poisoned")
+            .tip_hash
+    }
+
+    /// Update the tip block hash (height remains on the engine via
+    /// `set_tip_height`). Together they form the reorg-detectable cursor.
+    pub fn set_tip_hash(&self, tip_hash: [u8; 32]) {
+        self.live
+            .lock()
+            .expect("EngineAdapter mutex poisoned")
+            .tip_hash = tip_hash;
     }
 
     pub fn bridge(&self) -> ProverBridge {
@@ -116,29 +145,20 @@ impl EngineAdapter {
     }
 
     pub fn with_engine<R>(&self, f: impl FnOnce(&StateEngine) -> R) -> R {
-        let guard = self
-            .engine
-            .lock()
-            .expect("EngineAdapter mutex poisoned");
-        f(&guard)
+        let guard = self.live.lock().expect("EngineAdapter mutex poisoned");
+        f(&guard.engine)
     }
 
     pub fn with_engine_mut<R>(&self, f: impl FnOnce(&mut StateEngine) -> R) -> R {
-        let mut guard = self
-            .engine
-            .lock()
-            .expect("EngineAdapter mutex poisoned");
-        f(&mut guard)
+        let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");
+        f(&mut guard.engine)
     }
 
     /// Snapshot the live engine and write it atomically to Postgres.
     pub async fn persist(&self) -> Result<()> {
         let snap = {
-            let guard = self
-                .engine
-                .lock()
-                .expect("EngineAdapter mutex poisoned");
-            EngineSnapshot::from_engine(&guard)
+            let guard = self.live.lock().expect("EngineAdapter mutex poisoned");
+            EngineSnapshot::from_engine_with_tip_hash(&guard.engine, guard.tip_hash)
         };
         db_v11::persist_engine_snapshot(&self.pool, &snap)
             .await
@@ -153,7 +173,7 @@ impl EngineAdapter {
             .await
             .context("EngineAdapter::reload_from_db load")?
             .context(
-                "EngineAdapter::reload_from_db: v11_engine_meta is empty — \
+                "EngineAdapter::reload_from_db: v11 tables are empty — \
                  cannot reload (no silent re-init to empty engine)",
             )?;
         if snap.network != self.network {
@@ -170,14 +190,13 @@ impl EngineAdapter {
                 self.activation_height
             );
         }
+        let tip_hash = snap.tip_hash;
         let engine = snap
             .into_engine()
             .context("EngineAdapter::reload_from_db reconstruct")?;
-        let mut guard = self
-            .engine
-            .lock()
-            .expect("EngineAdapter mutex poisoned");
-        *guard = engine;
+        let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");
+        guard.engine = engine;
+        guard.tip_hash = tip_hash;
         Ok(())
     }
 

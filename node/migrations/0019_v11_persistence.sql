@@ -25,12 +25,18 @@
 -- names and so Stage-4 drop is a mechanical `DROP TABLE v11_*`.
 
 -- Singleton engine meta (network pin + tip cursor).
+-- tip_hash is the Bitcoin block hash at tip_height (internal/consensus
+-- byte order, 32 bytes). Height alone cannot distinguish equal-height
+-- forks; a reorg that lands on another block at the same height is only
+-- detectable when the hash is stored too. All-zero means "no tip yet"
+-- (fresh engine before the scanner advances the cursor).
 CREATE TABLE v11_engine_meta (
     id SMALLINT PRIMARY KEY CHECK (id = 1),
     -- Closed vocabulary: mainnet | testnet | regtest (application-enforced).
     network TEXT NOT NULL,
     activation_height BIGINT NOT NULL CHECK (activation_height >= 0),
     tip_height BIGINT NOT NULL CHECK (tip_height >= 0),
+    tip_hash BYTEA NOT NULL CHECK (octet_length(tip_hash) = 32),
     -- Engine fold ordinal at the current tip (u32; stored as BIGINT).
     fold_seq BIGINT NOT NULL CHECK (fold_seq >= 0 AND fold_seq <= 4294967295),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

@@ -2,7 +2,8 @@
 //!
 //! All writes that replace the engine snapshot run in a single transaction so
 //! a crash cannot leave NfLog entries without a matching nullifier index (or
-//! accounts without their coin sets).
+//! accounts without their coin sets). Loads use an equivalent transactional
+//! snapshot so a concurrent write cannot produce a mixed old/new state.
 
 use anyhow::{bail, Context, Result};
 use shared::spec_v1::{
@@ -36,13 +37,21 @@ pub struct EngineSnapshot {
     pub network: Network,
     pub activation_height: u64,
     pub tip_height: u64,
+    /// Bitcoin block hash at `tip_height` (consensus byte order). All-zero
+    /// means "no tip yet" (fresh engine). Required so equal-height forks are
+    /// distinguishable on reload.
+    pub tip_hash: [u8; 32],
     pub fold_seq: u32,
     pub nflog: Vec<(ChainPosition, NfLogEntry)>,
     pub accounts: Vec<AccountSnapshot>,
 }
 
 impl EngineSnapshot {
-    pub fn from_engine(engine: &StateEngine) -> Self {
+    /// Snapshot an engine together with its tip block hash.
+    ///
+    /// Stage 1: the hash is not yet on [`StateEngine`]; callers that persist
+    /// after a load must pass the reloaded hash so it is not zeroed.
+    pub fn from_engine_with_tip_hash(engine: &StateEngine, tip_hash: [u8; 32]) -> Self {
         let accounts = engine
             .accounts()
             .map(|(owner, record)| AccountSnapshot {
@@ -66,6 +75,7 @@ impl EngineSnapshot {
             network: engine.network(),
             activation_height: engine.activation_height(),
             tip_height: engine.tip_height(),
+            tip_hash,
             fold_seq: engine.fold_seq(),
             nflog: engine.nflog_mirror(),
             accounts,
@@ -200,31 +210,88 @@ fn fixed_32(bytes: &[u8], field: &str) -> Result<[u8; 32]> {
         .with_context(|| format!("{field} has length {}, expected 32", bytes.len()))
 }
 
-/// Load the full engine snapshot, or `None` if `v11_engine_meta` is empty
+/// Count any row across the v1.1 tables (meta + data). Used to distinguish a
+/// genuinely empty database from an inconsistent one that lost its meta row.
+async fn count_any_v11_rows(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT \
+            (SELECT COUNT(*) FROM v11_engine_meta) \
+          + (SELECT COUNT(*) FROM v11_nflog_entries) \
+          + (SELECT COUNT(*) FROM v11_nullifier_index) \
+          + (SELECT COUNT(*) FROM v11_accounts) \
+          + (SELECT COUNT(*) FROM v11_spendable_coins) \
+          + (SELECT COUNT(*) FROM v11_spent_coins)",
+    )
+    .fetch_one(&mut **tx)
+    .await
+    .context("count v11 rows for empty/inconsistent check")?;
+    Ok(n)
+}
+
+/// Load the full engine snapshot, or `None` if every v1.1 table is empty
 /// (fresh DB — caller must initialise).
+///
+/// ## Snapshot consistency
+///
+/// The load runs inside a single Postgres transaction at **REPEATABLE READ**.
+/// Postgres RR is snapshot isolation: all statements see the database as of
+/// the transaction's first query. That is sufficient here because the write
+/// path replaces every v11 table in one committing transaction — a concurrent
+/// reader therefore observes either the complete pre-write state or the
+/// complete post-write state, never a mixture of old meta with new leaves
+/// (or empty tables mid-clear). Read Committed would re-snapshot per
+/// statement and could interleave those commits.
+///
+/// ## Empty vs inconsistent
+///
+/// - No meta row **and** no other v11 rows → `Ok(None)` (genuinely empty).
+/// - No meta row **but** other v11 data exists → `Err` (inconsistent DB).
+/// - Meta present → load the full snapshot (data tables may be empty).
 pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot>> {
-    let meta: Option<(String, i64, i64, i64)> = sqlx::query_as(
-        "SELECT network, activation_height, tip_height, fold_seq \
+    let mut tx = pool.begin().await.context("begin v11 load tx")?;
+    // REPEATABLE READ = snapshot isolation in Postgres: one MVCC snapshot for
+    // the whole transaction. Must be the first statement after BEGIN.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await
+        .context("set v11 load isolation to REPEATABLE READ")?;
+
+    let meta: Option<(String, i64, i64, Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT network, activation_height, tip_height, tip_hash, fold_seq \
          FROM v11_engine_meta WHERE id = 1",
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .context("load v11_engine_meta")?;
 
-    let Some((network_s, activation_height, tip_height, fold_seq)) = meta else {
+    let Some((network_s, activation_height, tip_height, tip_hash_b, fold_seq)) = meta else {
+        let n = count_any_v11_rows(&mut tx).await?;
+        if n != 0 {
+            // Roll back before returning; the transaction is not needed further.
+            tx.rollback()
+                .await
+                .context("rollback v11 load tx after inconsistent meta")?;
+            bail!(
+                "v11_engine_meta is missing but {n} other v11 row(s) exist — \
+                 the database is inconsistent (refusing to load as an empty engine; \
+                 no silent fall-back)"
+            );
+        }
+        tx.commit().await.context("commit empty v11 load tx")?;
         return Ok(None);
     };
 
     let network = parse_network_label(&network_s).map_err(|e| anyhow::anyhow!(e))?;
     let activation_height = u64_from_i64(activation_height, "activation_height")?;
     let tip_height = u64_from_i64(tip_height, "tip_height")?;
+    let tip_hash = fixed_32(&tip_hash_b, "tip_hash")?;
     let fold_seq = u32_from_i64(fold_seq, "fold_seq")?;
 
     let nflog_rows: Vec<(i64, i64, i64, i64, i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
         "SELECT position, height, tx_index, vin_index, member_index, pk, r \
          FROM v11_nflog_entries ORDER BY position ASC",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .context("load v11_nflog_entries")?;
 
@@ -255,7 +322,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
     // Nullifier index must agree with the first-occurrence fold of the log.
     let index_rows: Vec<(Vec<u8>, i64, Vec<u8>)> =
         sqlx::query_as("SELECT pk, position, r FROM v11_nullifier_index")
-            .fetch_all(pool)
+            .fetch_all(&mut *tx)
             .await
             .context("load v11_nullifier_index")?;
     let mut expected_index: std::collections::BTreeMap<[u8; 32], (u64, [u8; 32])> =
@@ -307,7 +374,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
                 last_nav_opening, last_nullifier, last_nullifier_pos, coin_history_root \
          FROM v11_accounts ORDER BY owner",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .context("load v11_accounts")?;
 
@@ -326,8 +393,9 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
     {
         let owner_bytes = fixed_32(&owner_b, "account.owner")?;
         let owner = Address(owner_bytes);
-        let state: AccountState = bincode::deserialize(&state_b)
-            .with_context(|| format!("deserialize AccountState for {}", hex::encode(owner_bytes)))?;
+        let state: AccountState = bincode::deserialize(&state_b).with_context(|| {
+            format!("deserialize AccountState for {}", hex::encode(owner_bytes))
+        })?;
         if state.owner != owner {
             bail!(
                 "AccountState.owner does not match v11_accounts.owner key for {}",
@@ -347,7 +415,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
              FROM v11_spendable_coins WHERE owner = $1 ORDER BY coin_id",
         )
         .bind(&owner_b)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await
         .with_context(|| format!("load spendable for {}", hex::encode(owner_bytes)))?;
 
@@ -361,8 +429,9 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
                     hex::encode(owner_bytes)
                 );
             }
-            let creating_prev_ash = host::digest_from_bytes(&fixed_32(&ash_b, "creating_prev_ash")?)
-                .map_err(|e| anyhow::anyhow!("creating_prev_ash: {e}"))?;
+            let creating_prev_ash =
+                host::digest_from_bytes(&fixed_32(&ash_b, "creating_prev_ash")?)
+                    .map_err(|e| anyhow::anyhow!("creating_prev_ash: {e}"))?;
             if coin_index < 0 {
                 bail!("spendable.coin_index is negative");
             }
@@ -379,7 +448,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
         let spent_rows: Vec<(Vec<u8>,)> =
             sqlx::query_as("SELECT coin_id FROM v11_spent_coins WHERE owner = $1 ORDER BY coin_id")
                 .bind(&owner_b)
-                .fetch_all(pool)
+                .fetch_all(&mut *tx)
                 .await
                 .with_context(|| format!("load spent for {}", hex::encode(owner_bytes)))?;
         let mut spent_ids = Vec::with_capacity(spent_rows.len());
@@ -389,10 +458,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
 
         let last_proof = match last_proof_b {
             None => None,
-            Some(b) => Some(
-                bincode::deserialize(&b)
-                    .context("deserialize last ComplianceProof")?,
-            ),
+            Some(b) => Some(bincode::deserialize(&b).context("deserialize last ComplianceProof")?),
         };
         let last_nav_opening = match last_nav_b {
             None => None,
@@ -421,10 +487,13 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
         });
     }
 
+    tx.commit().await.context("commit v11 load tx")?;
+
     Ok(Some(EngineSnapshot {
         network,
         activation_height,
         tip_height,
+        tip_hash,
         fold_seq,
         nflog,
         accounts,
@@ -469,12 +538,13 @@ async fn clear_all(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
 async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) -> Result<()> {
     sqlx::query(
         "INSERT INTO v11_engine_meta \
-         (id, network, activation_height, tip_height, fold_seq, updated_at) \
-         VALUES (1, $1, $2, $3, $4, NOW())",
+         (id, network, activation_height, tip_height, tip_hash, fold_seq, updated_at) \
+         VALUES (1, $1, $2, $3, $4, $5, NOW())",
     )
     .bind(network_label(snap.network))
     .bind(as_i64_u64(snap.activation_height, "activation_height")?)
     .bind(as_i64_u64(snap.tip_height, "tip_height")?)
+    .bind(snap.tip_hash.as_slice())
     .bind(as_i64_u32(snap.fold_seq, "fold_seq")?)
     .execute(&mut **tx)
     .await
@@ -505,20 +575,17 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
     }
 
     for (pk, (position, r)) in &first_occ {
-        sqlx::query(
-            "INSERT INTO v11_nullifier_index (pk, position, r) VALUES ($1, $2, $3)",
-        )
-        .bind(pk.as_slice())
-        .bind(as_i64_u64(*position, "index.position")?)
-        .bind(r.as_slice())
-        .execute(&mut **tx)
-        .await
-        .with_context(|| format!("insert v11_nullifier_index pk={}", hex::encode(pk)))?;
+        sqlx::query("INSERT INTO v11_nullifier_index (pk, position, r) VALUES ($1, $2, $3)")
+            .bind(pk.as_slice())
+            .bind(as_i64_u64(*position, "index.position")?)
+            .bind(r.as_slice())
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("insert v11_nullifier_index pk={}", hex::encode(pk)))?;
     }
 
     for account in &snap.accounts {
-        let state_bytes =
-            bincode::serialize(&account.state).context("serialize AccountState")?;
+        let state_bytes = bincode::serialize(&account.state).context("serialize AccountState")?;
         let last_proof = match &account.last_proof {
             None => None,
             Some(p) => Some(bincode::serialize(p).context("serialize ComplianceProof")?),
@@ -553,12 +620,7 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
         .bind(digest_bytes(&account.state.coin_history_root).as_slice())
         .execute(&mut **tx)
         .await
-        .with_context(|| {
-            format!(
-                "insert v11_accounts owner={}",
-                hex::encode(account.owner.0)
-            )
-        })?;
+        .with_context(|| format!("insert v11_accounts owner={}", hex::encode(account.owner.0)))?;
 
         for (coin_id, tracked) in &account.spendable {
             let coin_bytes = bincode::serialize(&tracked.coin).context("serialize Coin")?;
@@ -584,20 +646,18 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
         }
 
         for coin_id in &account.spent_ids {
-            sqlx::query(
-                "INSERT INTO v11_spent_coins (owner, coin_id) VALUES ($1, $2)",
-            )
-            .bind(account.owner.0.as_slice())
-            .bind(coin_id.as_slice())
-            .execute(&mut **tx)
-            .await
-            .with_context(|| {
-                format!(
-                    "insert spent owner={} coin={}",
-                    hex::encode(account.owner.0),
-                    hex::encode(coin_id)
-                )
-            })?;
+            sqlx::query("INSERT INTO v11_spent_coins (owner, coin_id) VALUES ($1, $2)")
+                .bind(account.owner.0.as_slice())
+                .bind(coin_id.as_slice())
+                .execute(&mut **tx)
+                .await
+                .with_context(|| {
+                    format!(
+                        "insert spent owner={} coin={}",
+                        hex::encode(account.owner.0),
+                        hex::encode(coin_id)
+                    )
+                })?;
         }
     }
 
