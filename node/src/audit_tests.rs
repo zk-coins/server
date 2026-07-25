@@ -152,6 +152,8 @@ async fn build_state_with_pool() -> (AppState, SchemaScope) {
         job_store: Arc::new(crate::job_store::JobStore::new((*pool_arc).clone())),
         job_tx: tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8).0,
         job_notify_map: Arc::new(dashmap::DashMap::new()),
+        v11_scan_caught_up: None,
+        v11_finality_ok: None,
     };
     // tempdir lives until the test ends (Drop on test exit).
     std::mem::forget(tmp);

@@ -126,7 +126,15 @@ async fn start_rest_node_binds_and_serves_health() {
     let pool = Arc::new(scope.pool.clone());
 
     let handle = tokio::spawn(async move {
-        start_rest_node(account_node, username_store, &addr, pool, &proofs_dir).await
+        start_rest_node(
+            account_node,
+            username_store,
+            &addr,
+            pool,
+            &proofs_dir,
+            crate::runtime::V11Readiness::default(),
+        )
+        .await
     });
 
     // Wait for the listener to come up. axum binds within ~hundreds of

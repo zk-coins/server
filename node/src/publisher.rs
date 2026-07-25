@@ -791,6 +791,15 @@ pub async fn resume_pending_inscriptions(
     pool: &PgPool,
     config: &EsploraConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Cutover Stage 2: every legacy publish entry point — including boot
+    // recovery — must refuse under a v1.1 stack claim. Without this guard a
+    // v1.1-claimed database that still holds an old/injected pending row
+    // would broadcast a bincode Commitment through Esplora.
+    crate::v11::ensure_legacy_publisher_allowed().map_err(|e| {
+        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            as Box<dyn std::error::Error + Send + Sync>
+    })?;
+
     let rows = db::load_pending_in_progress(pool).await?;
     if rows.is_empty() {
         println!("resume_pending_inscriptions: no pending rows");

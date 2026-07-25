@@ -20,11 +20,23 @@ use tokio::net::TcpListener;
 use crate::job_dispatcher::{self, JobNotifier, DEFAULT_AWAITING_SIGNATURE_TIMEOUT};
 use crate::job_store::{JobStatus, JobStore};
 use crate::publisher::resume_pending_inscriptions;
+use crate::v11::{process_stack_mode, ScanStackMode};
 use crate::NETWORK_CONFIG;
 
 use crate::account_node::AccountNode;
 use crate::router::{create_router, AppState, ProofStore};
 use crate::username::UsernameStore;
+
+/// Optional v1.1 readiness handles shared with the exclusive scan loop.
+///
+/// Under the legacy stack both fields are `None` and readiness ignores
+/// NfLog catch-up / deep-reorg. Under `ZKCOINS_V11_SHADOW=1` main wires
+/// `Some` atomics so `/health/ready` reflects the NfLog view.
+#[derive(Clone, Default)]
+pub struct V11Readiness {
+    pub scan_caught_up: Option<Arc<AtomicBool>>,
+    pub finality_ok: Option<Arc<AtomicBool>>,
+}
 
 pub async fn start_rest_node(
     account_node: AccountNode,
@@ -32,6 +44,7 @@ pub async fn start_rest_node(
     addr: &str,
     pool: Arc<PgPool>,
     proofs_dir: &str,
+    v11_readiness: V11Readiness,
 ) -> anyhow::Result<()> {
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -90,6 +103,8 @@ pub async fn start_rest_node(
         job_store: Arc::clone(&job_store),
         job_tx: job_tx.clone(),
         job_notify_map: Arc::clone(&job_notify_map),
+        v11_scan_caught_up: v11_readiness.scan_caught_up,
+        v11_finality_ok: v11_readiness.finality_ok,
     };
 
     // No minting-account bootstrap: the neutral model has no
@@ -114,10 +129,20 @@ pub async fn start_rest_node(
     // operators do not see a stuck UTXO until the next mint triggers
     // the resumer.
     //
+    // Under the v1.1 stack claim this path is **skipped**: resuming
+    // would broadcast stored bincode Commitments into a database claimed
+    // for AggregateStateNullifierV3. The function itself also refuses
+    // (defense in depth); we skip here so boot logs stay clean.
+    //
     // Failures here are LOGGED and SWALLOWED — the operator's escape
     // hatch is the PR #106 CLI recovery tool, and a transient
     // Esplora outage on boot must not crash-loop the container.
-    if let Err(e) = resume_pending_inscriptions(&pool, &NETWORK_CONFIG).await {
+    if matches!(process_stack_mode(), Some(ScanStackMode::V11)) {
+        println!(
+            "resume_pending_inscriptions: skipped (process claimed v1.1 scan stack; \
+             legacy Commitment recovery is forbidden)"
+        );
+    } else if let Err(e) = resume_pending_inscriptions(&pool, &NETWORK_CONFIG).await {
         eprintln!(
             "Failed to resume pending inscriptions on bootstrap (continuing anyway): {}",
             e
