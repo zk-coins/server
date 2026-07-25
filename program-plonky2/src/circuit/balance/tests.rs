@@ -17,6 +17,7 @@ use crate::circuit::gadgets::curve::AffinePointTarget;
 use crate::circuit::gadgets::curve_types::{AffinePoint, Secp256K1};
 use crate::circuit::gadgets::nflog_consistency::{fill_consistency_slots, H_MAX};
 use crate::circuit::gadgets::u128_arith::U128Target;
+use crate::circuit::gadgets::u64_limbs::set_u64_limbs_unwrap;
 use crate::F;
 
 use super::{build_c_balance_circuit, BalanceCircuit};
@@ -47,12 +48,7 @@ fn set_account_state(
         .set_hash_target(target.nk_commit, state.nk_commit)
         .expect("nk_commit assignment");
     set_bytes(witness, &target.current_pubkey, &state.current_pubkey);
-    witness
-        .set_target(
-            target.send_counter,
-            F::from_canonical_u64(state.send_counter),
-        )
-        .expect("send_counter assignment");
+    set_u64_limbs_unwrap(witness, target.send_counter, state.send_counter);
     witness
         .set_hash_target(target.coin_history_root, state.coin_history_root)
         .expect("coin_history_root assignment");
@@ -196,28 +192,17 @@ fn balance_witness(
     witness
         .set_hash_target(targets.public.nav_ceiling, nav_ceiling)
         .expect("nav_ceiling assignment");
-    witness
-        .set_target(
-            targets.public.size_ceiling,
-            F::from_canonical_u64(size_ceiling),
-        )
-        .expect("size_ceiling assignment");
-    if matches!(mutation, Mutation::NonCanonicalSizeCeiling) {
+    // Limbs are the size_ceiling representation. The NonCanonical mutation
+    // still assigns a wrong pair (valid_size + p) so the consistency proof
+    // built for the honest ceiling cannot satisfy the limb-driven recursion.
+    let assigned_ceiling = if matches!(mutation, Mutation::NonCanonicalSizeCeiling) {
         let noncanonical = size_ceiling as u128 + F::ORDER as u128;
         assert!(noncanonical <= u64::MAX as u128);
-        witness
-            .set_target(
-                targets.public.size_ceiling_limbs[0],
-                F::from_canonical_u32(noncanonical as u32),
-            )
-            .expect("non-canonical size_ceiling low limb assignment");
-        witness
-            .set_target(
-                targets.public.size_ceiling_limbs[1],
-                F::from_canonical_u32((noncanonical >> 32) as u32),
-            )
-            .expect("non-canonical size_ceiling high limb assignment");
-    }
+        noncanonical as u64
+    } else {
+        size_ceiling
+    };
+    set_u64_limbs_unwrap(&mut witness, targets.public.size_ceiling, assigned_ceiling);
     set_bytes(&mut witness, &targets.public.anchor_txid, &[0x31; 32]);
     set_bytes(&mut witness, &targets.public.anchor_block_hash, &[0x42; 32]);
     witness
@@ -258,12 +243,7 @@ fn balance_witness(
     witness
         .set_proof_with_pis_target(&targets.witness.compliance_proof, &compliance_proof)
         .expect("C proof assignment");
-    witness
-        .set_target(
-            targets.witness.nav.size,
-            F::from_canonical_u64(fixture.nav.size),
-        )
-        .expect("nav size assignment");
+    set_u64_limbs_unwrap(&mut witness, targets.witness.nav.size, fixture.nav.size);
     witness
         .set_hash_target(targets.witness.nav.mth, fixture.nav.mth)
         .expect("nav mth assignment");

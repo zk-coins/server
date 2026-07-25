@@ -29,6 +29,7 @@ use crate::circuit::gadgets::nflog_consistency::{
 };
 use crate::circuit::gadgets::nonnative::NonNativeTarget;
 use crate::circuit::gadgets::u128_arith::U128Target;
+use crate::circuit::gadgets::u64_limbs::set_u64_limbs_unwrap;
 use crate::{C, D, F};
 
 use super::bindings::{
@@ -82,12 +83,7 @@ fn set_account_state_fixed(
         .set_hash_target(target.nk_commit, state.nk_commit)
         .expect("nk_commit witness assignment must succeed");
     set_bytes(witness, &target.current_pubkey, &state.current_pubkey);
-    witness
-        .set_target(
-            target.send_counter,
-            F::from_canonical_u64(state.send_counter),
-        )
-        .expect("send_counter witness assignment must succeed");
+    set_u64_limbs_unwrap(witness, target.send_counter, state.send_counter);
     witness
         .set_hash_target(target.coin_history_root, state.coin_history_root)
         .expect("coin-history-root witness assignment must succeed");
@@ -312,18 +308,17 @@ fn set_received_slot(
             )
             .expect("received NAV inclusion assignment");
     }
-    witness
-        .set_target(
-            auth_target.pos_create,
-            F::from_canonical_u64(received.map_or(0, |received| {
-                if matches!(mutation, WitnessMutation::CreatingPositionOutOfRange) {
-                    2
-                } else {
-                    received.pos_create
-                }
-            })),
-        )
-        .expect("received creating position assignment");
+    set_u64_limbs_unwrap(
+        witness,
+        auth_target.pos_create,
+        received.map_or(0, |received| {
+            if matches!(mutation, WitnessMutation::CreatingPositionOutOfRange) {
+                2
+            } else {
+                received.pos_create
+            }
+        }),
+    );
     let creating_nav = received.map_or(
         host::Nav {
             size: 0,
@@ -331,12 +326,11 @@ fn set_received_slot(
         },
         |received| received.creating_nav,
     );
-    witness
-        .set_target(
-            auth_target.creating_nav_opening.nav.size,
-            F::from_canonical_u64(creating_nav.size),
-        )
-        .expect("received creating NAV size assignment");
+    set_u64_limbs_unwrap(
+        witness,
+        auth_target.creating_nav_opening.nav.size,
+        creating_nav.size,
+    );
     witness
         .set_hash_target(auth_target.creating_nav_opening.nav.mth, creating_nav.mth)
         .expect("received creating NAV mth assignment");
@@ -1525,9 +1519,7 @@ impl ComplianceFixture {
                 &circuit.data.verifier_only,
             )
             .expect("own verifier-data assignment");
-        witness
-            .set_target(targets.nav.size, F::from_canonical_u64(self.nav.size))
-            .expect("nav size assignment");
+        set_u64_limbs_unwrap(&mut witness, targets.nav.size, self.nav.size);
         witness
             .set_hash_target(targets.nav.mth, self.nav.mth)
             .expect("nav mth assignment");
@@ -1536,12 +1528,11 @@ impl ComplianceFixture {
             nav_rand[0] ^= 1;
         }
         set_bytes(&mut witness, &targets.nav_rand, &nav_rand);
-        witness
-            .set_target(
-                targets.prev_nav_opening.nav.size,
-                F::from_canonical_u64(self.prev_nav.size),
-            )
-            .expect("previous nav size assignment");
+        set_u64_limbs_unwrap(
+            &mut witness,
+            targets.prev_nav_opening.nav.size,
+            self.prev_nav.size,
+        );
         witness
             .set_hash_target(targets.prev_nav_opening.nav.mth, self.prev_nav.mth)
             .expect("previous nav mth assignment");
@@ -1588,18 +1579,15 @@ impl ComplianceFixture {
                 .set_hash_target(target, value)
                 .expect("predecessor inclusion assignment");
         }
-        witness
-            .set_target(
-                targets.prev_state_nullifier.pos_prev,
-                F::from_canonical_u64(
-                    if matches!(mutation, WitnessMutation::PrevPositionOutOfRange) {
-                        self.nav.size
-                    } else {
-                        self.prev_nullifier_pos
-                    },
-                ),
-            )
-            .expect("predecessor position assignment");
+        set_u64_limbs_unwrap(
+            &mut witness,
+            targets.prev_state_nullifier.pos_prev,
+            if matches!(mutation, WitnessMutation::PrevPositionOutOfRange) {
+                self.nav.size
+            } else {
+                self.prev_nullifier_pos
+            },
+        );
         witness
     }
 
@@ -1981,9 +1969,7 @@ fn compliance_nav_binding_gadgets_match_host() {
     let data = builder.build::<C>();
 
     let mut witness = PartialWitness::new();
-    witness
-        .set_target(nav_target.size, F::from_canonical_u64(nav.size))
-        .unwrap();
+    set_u64_limbs_unwrap(&mut witness, nav_target.size, nav.size);
     witness.set_hash_target(nav_target.mth, nav.mth).unwrap();
     set_bytes(&mut witness, &rand_target, &nav_rand);
     let proof = data.prove(witness).expect("NAV parity witness must prove");

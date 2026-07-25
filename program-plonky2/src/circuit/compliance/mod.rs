@@ -12,7 +12,7 @@ mod targets;
 
 pub(crate) use bindings::{hash_proof_data_target, nav_commitment_target, nav_root_target};
 pub use serialize::address_from_pk0_and_nk_commit;
-pub(crate) use serialize::{be_bytes32_to_u32_limbs, canonical_u64_bits};
+pub(crate) use serialize::be_bytes32_to_u32_limbs;
 pub(crate) use skeleton::{
     account_balance_target, account_state_hash_target, network_id_target,
     unpack_compliance_proof_pis,

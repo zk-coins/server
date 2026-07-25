@@ -40,6 +40,7 @@ use zkcoins_program_plonky2::circuit::gadgets::curve_types::{
 use zkcoins_program_plonky2::circuit::gadgets::nflog_consistency::H_MAX;
 use zkcoins_program_plonky2::circuit::gadgets::nonnative::NonNativeTarget;
 use zkcoins_program_plonky2::circuit::gadgets::u128_arith::U128Target;
+use zkcoins_program_plonky2::circuit::gadgets::u64_limbs::set_u64_limbs;
 use zkcoins_program_plonky2::{C, D, F};
 
 /// A proof emitted by the frozen cyclic compliance circuit `C`.
@@ -868,7 +869,7 @@ fn assemble_transition_witness(
     )?;
     witness.set_verifier_data_target(&targets.recursion.own_verifier_data, own_verifier_data)?;
 
-    witness.set_target(targets.nav.size, F::from_canonical_u64(w.nav.size))?;
+    set_u64_limbs(&mut witness, targets.nav.size, w.nav.size)?;
     witness.set_hash_target(targets.nav.mth, w.nav.mth)?;
     set_bytes(&mut witness, &targets.nav_rand, &w.nav_rand)?;
     let prev_nav = w.prev_nav_opening.unwrap_or(NavOpening {
@@ -878,9 +879,10 @@ fn assemble_transition_witness(
         },
         nav_rand: [0u8; 32],
     });
-    witness.set_target(
+    set_u64_limbs(
+        &mut witness,
         targets.prev_nav_opening.nav.size,
-        F::from_canonical_u64(prev_nav.nav.size),
+        prev_nav.nav.size,
     )?;
     witness.set_hash_target(targets.prev_nav_opening.nav.mth, prev_nav.nav.mth)?;
     set_bytes(
@@ -925,9 +927,10 @@ fn assemble_transition_witness(
     {
         witness.set_hash_target(target, value)?;
     }
-    witness.set_target(
+    set_u64_limbs(
+        &mut witness,
         targets.prev_state_nullifier.pos_prev,
-        F::from_canonical_u64(predecessor.map_or(0, |value| value.position)),
+        predecessor.map_or(0, |value| value.position),
     )?;
     Ok(witness)
 }
@@ -947,9 +950,10 @@ fn assemble_attestation_witness(
     witness.set_hash_target(targets.public.asset_id, w.statement.asset_id)?;
     set_u128(&mut witness, targets.public.balance, w.statement.balance)?;
     witness.set_hash_target(targets.public.nav_ceiling, w.statement.nav_ceiling.root())?;
-    witness.set_target(
+    set_u64_limbs(
+        &mut witness,
         targets.public.size_ceiling,
-        F::from_canonical_u64(w.statement.nav_ceiling.size),
+        w.statement.nav_ceiling.size,
     )?;
     set_bytes(
         &mut witness,
@@ -987,9 +991,10 @@ fn assemble_attestation_witness(
         &w.account_state,
     )?;
     witness.set_proof_with_pis_target(&targets.witness.compliance_proof, &w.compliance_proof)?;
-    witness.set_target(
+    set_u64_limbs(
+        &mut witness,
         targets.witness.nav.size,
-        F::from_canonical_u64(w.nav_opening.nav.size),
+        w.nav_opening.nav.size,
     )?;
     witness.set_hash_target(targets.witness.nav.mth, w.nav_opening.nav.mth)?;
     set_bytes(
@@ -1050,10 +1055,7 @@ fn set_account_state(
     set_bytes(witness, &target.owner, &state.owner.0)?;
     witness.set_hash_target(target.nk_commit, state.nk_commit)?;
     set_bytes(witness, &target.current_pubkey, &state.current_pubkey)?;
-    witness.set_target(
-        target.send_counter,
-        F::from_canonical_u64(state.send_counter),
-    )?;
+    set_u64_limbs(witness, target.send_counter, state.send_counter)?;
     witness.set_hash_target(target.coin_history_root, state.coin_history_root)?;
     let balances: Vec<_> = state.balances.iter().collect();
     ensure!(
@@ -1183,9 +1185,10 @@ fn set_received_slot(
     for (&target, &value) in auth_target.creating_nav_inclusion.iter().zip(&inclusion) {
         witness.set_hash_target(target, value)?;
     }
-    witness.set_target(
+    set_u64_limbs(
+        witness,
         auth_target.pos_create,
-        F::from_canonical_u64(auth.map_or(0, |auth| auth.pos_create)),
+        auth.map_or(0, |auth| auth.pos_create),
     )?;
     let creating_nav = auth.map_or(
         Nav {
@@ -1194,9 +1197,10 @@ fn set_received_slot(
         },
         |auth| auth.creating_nav_opening.nav,
     );
-    witness.set_target(
+    set_u64_limbs(
+        witness,
         auth_target.creating_nav_opening.nav.size,
-        F::from_canonical_u64(creating_nav.size),
+        creating_nav.size,
     )?;
     witness.set_hash_target(auth_target.creating_nav_opening.nav.mth, creating_nav.mth)?;
     set_bytes(

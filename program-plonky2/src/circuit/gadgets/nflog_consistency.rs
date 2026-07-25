@@ -7,19 +7,15 @@
 //!
 //! Protocol log sizes and positions are `u64` values in `0 … 2^64 − 1` (§2.5,
 //! `H_MAX = 64`). Goldilocks has `p = 2^64 − 2^32 + 1 < 2^64`, so a bare
-//! `split_le(x, 64)` is **not** injective: the bit patterns of `1` and
-//! `p + 1` both reconstruct to the same field element. A malicious prover can
-//! therefore feed the bits of a large size into one consumer (e.g. a tagged
-//! byte encoding) while another consumer reads the same `Target` as a small
-//! field value (e.g. the `n == 1` base case) and accepts an empty path.
+//! field `Target` cannot carry every protocol value: packing into one element
+//! either reintroduces the `1`/`p+1` alias or, with a `< p` canonicity check,
+//! makes every value in `p … 2^64 − 1` unrepresentable.
 //!
-//! Every size-carrying wire is therefore decomposed through
-//! [`canonical_u64_bits`], which range-checks the 64 bits as two `u32` limbs
-//! and asserts the bit-integer is `< p`. That representative is unique for
-//! every field element and matches host `to_canonical_u64()`. Values that
-//! do not fit in a single Goldilocks element cannot be carried as a lone
-//! `Target` at all (pre-existing API bound); within that API the bit form is
-//! the injective canonical encoding of the protocol integer.
+//! Every size-carrying wire is therefore a [`U64LimbsTarget`]: two
+//! range-checked little-endian `u32` limbs. Comparisons, subtraction, the
+//! split-point derivation, the bit-driven recursion, and the 8-byte big-endian
+//! encoding for hashing all operate on that limb pair. Limbs are the
+//! representation, not a view onto a single field element.
 
 use plonky2::field::extension::Extendable;
 use plonky2::hash::hash_types::{HashOutTarget, RichField};
@@ -27,6 +23,7 @@ use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 
+use crate::circuit::gadgets::u64_limbs::U64LimbsTarget;
 use crate::circuit::util::swap_if;
 use crate::hash::{HashDigest, ZERO_HASH};
 
@@ -155,77 +152,40 @@ fn encode_byte_string_target<F: RichField + Extendable<D>, const D: usize>(
     out
 }
 
-/// Strict bit-integer comparison `bits_le < bound` (MSB-first scan).
-fn less_than_constant_bits<F: RichField + Extendable<D>, const D: usize>(
+fn select_hash<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
-    bits_le: &[BoolTarget],
-    bound: u64,
+    cond: BoolTarget,
+    x: HashOutTarget,
+    y: HashOutTarget,
+) -> HashOutTarget {
+    HashOutTarget {
+        elements: std::array::from_fn(|i| builder.select(cond, x.elements[i], y.elements[i])),
+    }
+}
+
+fn hashes_equal<F: RichField + Extendable<D>, const D: usize>(
+    builder: &mut CircuitBuilder<F, D>,
+    a: HashOutTarget,
+    b: HashOutTarget,
 ) -> BoolTarget {
     let mut equal = builder.constant_bool(true);
-    let mut less = builder.constant_bool(false);
-    for i in (0..bits_le.len()).rev() {
-        let bound_bit = ((bound >> i) & 1) != 0;
-        if bound_bit {
-            let not_bit = builder.not(bits_le[i]);
-            let first_less = builder.and(equal, not_bit);
-            less = builder.or(less, first_less);
-            equal = builder.and(equal, bits_le[i]);
-        } else {
-            let not_bit = builder.not(bits_le[i]);
-            equal = builder.and(equal, not_bit);
-        }
+    for i in 0..4 {
+        let limb_equal = builder.is_equal(a.elements[i], b.elements[i]);
+        equal = builder.and(equal, limb_equal);
     }
-    less
-}
-
-/// Canonically decomposes a protocol size/position carried as a Goldilocks
-/// element into 64 little-endian bits.
-///
-/// `split_le(_, 64)` alone admits a second 64-bit representative for some
-/// field values (classically the bits of `p + 1` for the element `1`). The
-/// explicit bit-integer `< ORDER` check restores injectivity. Packing the
-/// bits into two range-checked `u32` limbs `(lo, hi)` yields the same unique
-/// representative: every limb is in `0 … 2^32 − 1` by construction, and
-/// `lo + hi·2^32` equals the unique integer in `0 … p − 1` that reduces to
-/// `value`.
-fn canonical_u64_bits<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    value: Target,
-) -> Vec<BoolTarget> {
-    let bits = builder.split_le(value, 64);
-    // Two range-checked u32 limbs — equivalent packing of the same bits.
-    let lo = builder.le_sum(bits[..32].iter());
-    let hi = builder.le_sum(bits[32..].iter());
-    builder.range_check(lo, 32);
-    builder.range_check(hi, 32);
-    // Reject non-canonical bit patterns such as `p + 1` for the element `1`.
-    let canonical = less_than_constant_bits(builder, &bits, F::ORDER);
-    builder.assert_one(canonical.target);
-    bits
-}
-
-fn u64_to_be_bytes_target<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    value: Target,
-) -> [Target; 8] {
-    let bits = canonical_u64_bits(builder, value);
-    std::array::from_fn(|i| {
-        let hi = 63 - i * 8;
-        let lo = hi - 7;
-        builder.le_sum(bits[lo..=hi].iter())
-    })
+    equal
 }
 
 /// Computes the position-bound NfLog leaf hash using the protocol's tagged
 /// `Hc` encoding. Every supplied byte is constrained to `0..=255`.
 pub fn nflog_leaf_hash_target<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
-    position: Target,
+    position: U64LimbsTarget,
     pk_bytes: &[Target; 32],
     r_bytes: &[Target; 32],
 ) -> HashOutTarget {
     let mut elements = tag_targets(builder, TAG_NFLOG_LEAF);
-    let position_bytes = u64_to_be_bytes_target(builder, position);
+    let position_bytes = position.to_be_bytes(builder);
     elements.extend(encode_byte_string_target(builder, &position_bytes));
     elements.extend(encode_byte_string_target(builder, pk_bytes));
     elements.extend(encode_byte_string_target(builder, r_bytes));
@@ -253,72 +213,6 @@ pub fn nflog_empty_target<F: RichField + Extendable<D>, const D: usize>(
     builder.hash_n_to_hash_no_pad::<PoseidonHash>(elements)
 }
 
-/// Highest set bit of `x`, represented as its power-of-two value.
-///
-/// `x` is a size-derived intermediate (e.g. `n − 1` for split-point
-/// derivation); its bit form is forced canonical so a non-canonical
-/// decomposition cannot steer the RFC-6962 recursion.
-fn highest_set_bit_pow2<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    x: Target,
-) -> Target {
-    let bits = canonical_u64_bits(builder, x);
-    let mut any_higher = builder.constant_bool(false);
-    let mut result = builder.zero();
-    for j in (0..64).rev() {
-        let not_higher = builder.not(any_higher);
-        let is_msb_j = builder.and(bits[j], not_higher);
-        result = builder.mul_const_add(F::from_canonical_u64(1u64 << j), is_msb_j.target, result);
-        any_higher = builder.or(any_higher, bits[j]);
-    }
-    result
-}
-
-/// Strict 64-bit comparison using an MSB-first Boolean scan over canonical bits.
-fn less_than_64<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    a: Target,
-    b: Target,
-) -> BoolTarget {
-    let a_bits = canonical_u64_bits(builder, a);
-    let b_bits = canonical_u64_bits(builder, b);
-    let mut equal_so_far = builder.constant_bool(true);
-    let mut a_less = builder.constant_bool(false);
-    for i in (0..64).rev() {
-        let not_a = builder.not(a_bits[i]);
-        let less_at_bit = builder.and(not_a, b_bits[i]);
-        let first_diff_less = builder.and(equal_so_far, less_at_bit);
-        a_less = builder.or(a_less, first_diff_less);
-        let bits_equal = builder.is_equal(a_bits[i].target, b_bits[i].target);
-        equal_so_far = builder.and(equal_so_far, bits_equal);
-    }
-    a_less
-}
-
-fn select_hash<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    cond: BoolTarget,
-    x: HashOutTarget,
-    y: HashOutTarget,
-) -> HashOutTarget {
-    HashOutTarget {
-        elements: std::array::from_fn(|i| builder.select(cond, x.elements[i], y.elements[i])),
-    }
-}
-
-fn hashes_equal<F: RichField + Extendable<D>, const D: usize>(
-    builder: &mut CircuitBuilder<F, D>,
-    a: HashOutTarget,
-    b: HashOutTarget,
-) -> BoolTarget {
-    let mut equal = builder.constant_bool(true);
-    for i in 0..4 {
-        let limb_equal = builder.is_equal(a.elements[i], b.elements[i]);
-        equal = builder.and(equal, limb_equal);
-    }
-    equal
-}
-
 /// Verifies an RFC-6962 NfLog inclusion path.
 ///
 /// The host path is deepest-first. For a host path of length `d`, fixed
@@ -327,33 +221,33 @@ fn hashes_equal<F: RichField + Extendable<D>, const D: usize>(
 pub fn verify_nflog_inclusion<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     leaf: HashOutTarget,
-    position: Target,
+    position: U64LimbsTarget,
     path: &[HashOutTarget; H_MAX],
-    size: Target,
+    size: U64LimbsTarget,
     mth: HashOutTarget,
 ) {
-    let ok = less_than_64(builder, position, size);
+    let ok = position.less_than(builder, size);
     builder.assert_one(ok.target);
 
-    let one = builder.one();
+    let one = U64LimbsTarget::one(builder);
     let mut cur_size = size;
     let mut cur_pos = position;
     let mut active = Vec::with_capacity(H_MAX);
     let mut branch = Vec::with_capacity(H_MAX);
 
     for _ in 0..H_MAX {
-        let is_one = builder.is_equal(cur_size, one);
+        let is_one = cur_size.is_equal(builder, one);
         let active_l = builder.not(is_one);
-        let x = builder.sub(cur_size, one);
-        let k = highest_set_bit_pow2(builder, x);
-        let branch_l = less_than_64(builder, cur_pos, k);
+        let x = cur_size.sub(builder, one);
+        let k = x.highest_set_bit_pow2(builder);
+        let branch_l = cur_pos.less_than(builder, k);
 
-        let right_next_size = builder.sub(cur_size, k);
-        let right_next_pos = builder.sub(cur_pos, k);
-        let cand_size = builder.select(branch_l, k, right_next_size);
-        let cand_pos = builder.select(branch_l, cur_pos, right_next_pos);
-        cur_size = builder.select(active_l, cand_size, cur_size);
-        cur_pos = builder.select(active_l, cand_pos, cur_pos);
+        let right_next_size = cur_size.sub(builder, k);
+        let right_next_pos = cur_pos.sub(builder, k);
+        let cand_size = U64LimbsTarget::select(builder, branch_l, k, right_next_size);
+        let cand_pos = U64LimbsTarget::select(builder, branch_l, cur_pos, right_next_pos);
+        cur_size = U64LimbsTarget::select(builder, active_l, cand_size, cur_size);
+        cur_pos = U64LimbsTarget::select(builder, active_l, cand_pos, cur_pos);
         active.push(active_l);
         branch.push(branch_l);
     }
@@ -376,18 +270,18 @@ pub fn verify_nflog_inclusion<F: RichField + Extendable<D>, const D: usize>(
 /// `proof[H_MAX + 1..2 * H_MAX]` is reserved and never read.
 pub fn verify_nflog_consistency<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
-    m: Target,
+    m: U64LimbsTarget,
     mth_a: HashOutTarget,
-    n: Target,
+    n: U64LimbsTarget,
     mth_b: HashOutTarget,
     proof: &[HashOutTarget; 2 * H_MAX],
 ) {
-    let m_gt_n = less_than_64(builder, n, m);
+    let m_gt_n = n.less_than(builder, m);
     builder.assert_zero(m_gt_n.target);
 
-    let zero = builder.zero();
-    let is_m_zero = builder.is_equal(m, zero);
-    let is_m_eq_n = builder.is_equal(m, n);
+    let zero = U64LimbsTarget::zero(builder);
+    let is_m_zero = m.is_equal(builder, zero);
+    let is_m_eq_n = m.is_equal(builder, n);
     let not_m_zero = builder.not(is_m_zero);
     let not_m_eq_n = builder.not(is_m_eq_n);
     let case_zero = is_m_zero;
@@ -398,7 +292,7 @@ pub fn verify_nflog_consistency<F: RichField + Extendable<D>, const D: usize>(
     let cond_zero_holds = hashes_equal(builder, mth_a, empty);
     let cond_eqn_holds = hashes_equal(builder, mth_a, mth_b);
 
-    let one = builder.one();
+    let one = U64LimbsTarget::one(builder);
     let mut cur_m = m;
     let mut cur_n = n;
     let mut cur_b = builder.constant_bool(true);
@@ -406,23 +300,23 @@ pub fn verify_nflog_consistency<F: RichField + Extendable<D>, const D: usize>(
     let mut branch = Vec::with_capacity(H_MAX);
 
     for _ in 0..H_MAX {
-        let is_term = builder.is_equal(cur_m, cur_n);
+        let is_term = cur_m.is_equal(builder, cur_n);
         let active_l = builder.not(is_term);
-        let x = builder.sub(cur_n, one);
-        let k = highest_set_bit_pow2(builder, x);
-        let strictly_greater = less_than_64(builder, k, cur_m);
+        let x = cur_n.sub(builder, one);
+        let k = x.highest_set_bit_pow2(builder);
+        let strictly_greater = k.less_than(builder, cur_m);
         let branch_l = builder.not(strictly_greater);
 
-        let right_next_m = builder.sub(cur_m, k);
-        let right_next_n = builder.sub(cur_n, k);
+        let right_next_m = cur_m.sub(builder, k);
+        let right_next_n = cur_n.sub(builder, k);
         let false_b = builder.constant_bool(false);
-        let cand_m = builder.select(branch_l, cur_m, right_next_m);
-        let cand_n = builder.select(branch_l, k, right_next_n);
+        let cand_m = U64LimbsTarget::select(builder, branch_l, cur_m, right_next_m);
+        let cand_n = U64LimbsTarget::select(builder, branch_l, k, right_next_n);
         let cand_b_target = builder.select(branch_l, cur_b.target, false_b.target);
         let cand_b = BoolTarget::new_unsafe(cand_b_target);
 
-        cur_m = builder.select(active_l, cand_m, cur_m);
-        cur_n = builder.select(active_l, cand_n, cur_n);
+        cur_m = U64LimbsTarget::select(builder, active_l, cand_m, cur_m);
+        cur_n = U64LimbsTarget::select(builder, active_l, cand_n, cur_n);
         let next_b_target = builder.select(active_l, cand_b.target, cur_b.target);
         cur_b = BoolTarget::new_unsafe(next_b_target);
         active.push(active_l);
@@ -466,6 +360,7 @@ pub fn verify_nflog_consistency<F: RichField + Extendable<D>, const D: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::circuit::gadgets::u64_limbs::{set_u64_limbs_unwrap, U64LimbsTarget};
     use crate::hash::{hash_bytes, HashDigest, ZERO_HASH};
     use crate::{C, D, F};
     use plonky2::field::types::{Field, Field64, PrimeField64};
@@ -504,9 +399,9 @@ mod tests {
     #[derive(Clone, Copy)]
     struct InclusionTargets {
         leaf: HashOutTarget,
-        position: Target,
+        position: U64LimbsTarget,
         path: [HashOutTarget; H_MAX],
-        size: Target,
+        size: U64LimbsTarget,
         mth: HashOutTarget,
     }
 
@@ -514,9 +409,9 @@ mod tests {
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
         let targets = InclusionTargets {
             leaf: builder.add_virtual_hash(),
-            position: builder.add_virtual_target(),
+            position: U64LimbsTarget::new_virtual(&mut builder),
             path: std::array::from_fn(|_| builder.add_virtual_hash()),
-            size: builder.add_virtual_target(),
+            size: U64LimbsTarget::new_virtual(&mut builder),
             mth: builder.add_virtual_hash(),
         };
         verify_nflog_inclusion(
@@ -528,8 +423,10 @@ mod tests {
             targets.mth,
         );
         builder.register_public_inputs(&targets.leaf.elements);
-        builder.register_public_input(targets.position);
-        builder.register_public_input(targets.size);
+        builder.register_public_input(targets.position.lo);
+        builder.register_public_input(targets.position.hi);
+        builder.register_public_input(targets.size.lo);
+        builder.register_public_input(targets.size.hi);
         builder.register_public_inputs(&targets.mth.elements);
         (builder.build::<C>(), targets)
     }
@@ -544,12 +441,8 @@ mod tests {
     ) -> PartialWitness<F> {
         let mut witness = PartialWitness::new();
         witness.set_hash_target(targets.leaf, leaf).unwrap();
-        witness
-            .set_target(targets.position, F::from_canonical_u64(position))
-            .unwrap();
-        witness
-            .set_target(targets.size, F::from_canonical_u64(size))
-            .unwrap();
+        set_u64_limbs_unwrap(&mut witness, targets.position, position);
+        set_u64_limbs_unwrap(&mut witness, targets.size, size);
         witness.set_hash_target(targets.mth, mth).unwrap();
         for (target, digest) in targets.path.iter().zip(slots) {
             witness.set_hash_target(*target, *digest).unwrap();
@@ -559,9 +452,9 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct ConsistencyTargets {
-        m: Target,
+        m: U64LimbsTarget,
         mth_a: HashOutTarget,
-        n: Target,
+        n: U64LimbsTarget,
         mth_b: HashOutTarget,
         proof: [HashOutTarget; 2 * H_MAX],
     }
@@ -569,9 +462,9 @@ mod tests {
     fn build_consistency_circuit() -> (CircuitData<F, C, D>, ConsistencyTargets) {
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
         let targets = ConsistencyTargets {
-            m: builder.add_virtual_target(),
+            m: U64LimbsTarget::new_virtual(&mut builder),
             mth_a: builder.add_virtual_hash(),
-            n: builder.add_virtual_target(),
+            n: U64LimbsTarget::new_virtual(&mut builder),
             mth_b: builder.add_virtual_hash(),
             proof: std::array::from_fn(|_| builder.add_virtual_hash()),
         };
@@ -583,9 +476,11 @@ mod tests {
             targets.mth_b,
             &targets.proof,
         );
-        builder.register_public_input(targets.m);
+        builder.register_public_input(targets.m.lo);
+        builder.register_public_input(targets.m.hi);
         builder.register_public_inputs(&targets.mth_a.elements);
-        builder.register_public_input(targets.n);
+        builder.register_public_input(targets.n.lo);
+        builder.register_public_input(targets.n.hi);
         builder.register_public_inputs(&targets.mth_b.elements);
         (builder.build::<C>(), targets)
     }
@@ -599,13 +494,9 @@ mod tests {
         slots: &[HashDigest; 2 * H_MAX],
     ) -> PartialWitness<F> {
         let mut witness = PartialWitness::new();
-        witness
-            .set_target(targets.m, F::from_canonical_u64(m))
-            .unwrap();
+        set_u64_limbs_unwrap(&mut witness, targets.m, m);
         witness.set_hash_target(targets.mth_a, mth_a).unwrap();
-        witness
-            .set_target(targets.n, F::from_canonical_u64(n))
-            .unwrap();
+        set_u64_limbs_unwrap(&mut witness, targets.n, n);
         witness.set_hash_target(targets.mth_b, mth_b).unwrap();
         for (target, digest) in targets.proof.iter().zip(slots) {
             witness.set_hash_target(*target, *digest).unwrap();
@@ -750,72 +641,39 @@ mod tests {
         }
     }
 
-    /// Soundness: the classical non-canonical 64-bit representative of `1`
-    /// (`p + 1 = 0xffffffff00000002`) must be rejected.
-    ///
-    /// Bare `split_le(_, 64)` accepts both the bits of `1` and the bits of
-    /// `p + 1` for the field element `1`, because they agree mod `p`. The
-    /// gadget's [`canonical_u64_bits`] closes that hole. This test builds a
-    /// minimal circuit that exposes the bit wires, assigns the malicious
-    /// decomposition, and asserts `prove` fails. An honest decomposition of
-    /// the same element succeeds — so the failure is specifically the
-    /// canonicity check, not an unrelated constraint.
-    ///
-    /// The high-level inclusion/consistency witness API only assigns the size
-    /// `Target`; Plonky2's prover then synthesises canonical bits itself. The
-    /// malicious bit pattern is therefore not expressible through that API —
-    /// it has to be injected on the free bit wires, which is what this test
-    /// does.
+    /// Limb range-checks reject a high limb that is not a 32-bit integer
+    /// (the classical non-canonical residue class of a field element). A
+    /// malicious prover cannot smuggle `p + 1` through a size limb.
     #[test]
-    fn rejects_noncanonical_p_plus_one_bit_decomposition() {
-        // p + 1 ≡ 1 (mod p). Its 64-bit pattern is a second representative of 1.
-        let p_plus_one: u64 = F::ORDER.wrapping_add(1);
-        assert_eq!(
-            F::from_noncanonical_u64(p_plus_one),
-            F::ONE,
-            "precondition: p+1 must reduce to 1"
-        );
-
+    fn rejects_noncanonical_limb_outside_u32() {
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
-        let value = builder.add_virtual_target();
-        // The bit wires returned by the gadget helper are the free witnesses
-        // allocated by split_le; assigning them injects a chosen decomposition.
-        let bits = canonical_u64_bits(&mut builder, value);
-        builder.register_public_input(value);
+        let size = U64LimbsTarget::new_virtual(&mut builder);
+        // Force a consumer so the limb wires are constrained through the gadget.
+        let position = U64LimbsTarget::zero(&mut builder);
+        let leaf = builder.add_virtual_hash();
+        let path: [HashOutTarget; H_MAX] = std::array::from_fn(|_| builder.add_virtual_hash());
+        let mth = builder.add_virtual_hash();
+        verify_nflog_inclusion(&mut builder, leaf, position, &path, size, mth);
         let data = builder.build::<C>();
 
-        // Malicious witness: value = 1, bits = bits(p+1). Reconstruction holds
-        // mod p; canonicity must reject.
         let mut bad = PartialWitness::new();
-        bad.set_target(value, F::ONE).unwrap();
-        for i in 0..64 {
-            let bit = F::from_canonical_u64((p_plus_one >> i) & 1);
-            bad.set_target(bits[i].target, bit).unwrap();
+        // lo is fine; hi = 2^32 (not a u32). range_check(hi, 32) must reject.
+        bad.set_target(size.lo, F::ZERO).unwrap();
+        bad.set_target(size.hi, F::from_canonical_u64(1u64 << 32))
+            .unwrap();
+        // Remaining witnesses are dummies; the range check fails regardless.
+        bad.set_hash_target(leaf, ZERO_HASH).unwrap();
+        bad.set_hash_target(mth, ZERO_HASH).unwrap();
+        for slot in path {
+            bad.set_hash_target(slot, ZERO_HASH).unwrap();
         }
         assert!(
             data.prove(bad).is_err(),
-            "non-canonical bits of p+1 for the element 1 must be rejected"
+            "hi limb equal to 2^32 (outside u32) must be rejected"
         );
-
-        // Honest witness: value = 1, bits = bits(1). Must prove.
-        let mut good = PartialWitness::new();
-        good.set_target(value, F::ONE).unwrap();
-        for i in 0..64 {
-            let bit = F::from_canonical_u64((1u64 >> i) & 1);
-            good.set_target(bits[i].target, bit).unwrap();
-        }
-        let proof = data
-            .prove(good)
-            .expect("canonical bits of 1 must prove");
-        data.verify(proof).expect("canonical proof must verify");
     }
 
-    /// End-to-end: a size `Target` equal to 1 with an honest (empty) inclusion
-    /// path proves, while feeding the same element through the leaf-position
-    /// byte encoder under the non-canonical bit pattern is impossible once
-    /// [`canonical_u64_bits`] is applied — covered by the bit-wire test above.
-    /// Here we only pin that the gadget still accepts the honest `n = 1` base
-    /// case, which is the case the attack would have abused.
+    /// End-to-end: a size of 1 with an honest (empty) inclusion path proves.
     #[test]
     fn inclusion_size_one_base_case_accepts_empty_path() {
         let (data, targets) = build_inclusion_circuit();
@@ -833,7 +691,95 @@ mod tests {
         ));
     }
 
-    /// Cheap circuit-shape report (not a correctness check). Canonical size
+    /// Protocol sizes in the previously unrepresentable band `p … 2^64 − 1`
+    /// must prove under the limb encoding. Symbolic fixtures keep the witness
+    /// O(log n); no material log of size `p` is required.
+    #[test]
+    fn inclusion_accepts_sizes_at_and_above_field_order() {
+        let (data, targets) = build_inclusion_circuit();
+        let p = F::ORDER;
+        let sizes = [p - 1, p, p + 1, u64::MAX];
+        for &n in &sizes {
+            for &position in &inclusion_positions(n) {
+                let case_id = 0x2e11_u64
+                    ^ n.wrapping_mul(0x9e37)
+                    ^ position.wrapping_mul(0x85eb);
+                let w = ref_build_inclusion(case_id, position, n);
+                assert!(
+                    ref_verify_inclusion(w.leaf, position, &w.path, n, w.mth),
+                    "ref inclusion n={n:#x} p={position:#x}"
+                );
+                assert!(
+                    verify_inclusion(w.leaf, position, &w.path, n, w.mth),
+                    "host inclusion n={n:#x} p={position:#x}"
+                );
+                assert!(
+                    prove_inclusion(
+                        &data,
+                        targets,
+                        w.leaf,
+                        position,
+                        &w.path,
+                        n,
+                        w.mth,
+                    ),
+                    "gadget inclusion Accept n={n:#x} position={position:#x}"
+                );
+            }
+        }
+    }
+
+    /// Consistency across the same ≥ p band, including the m = 0 special case
+    /// at n = u64::MAX and a general pair (p, p + 1).
+    #[test]
+    fn consistency_accepts_sizes_at_and_above_field_order() {
+        let (data, targets) = build_consistency_circuit();
+        let p = F::ORDER;
+
+        // m = 0 special case: empty proof, mth_a = empty, arbitrary n.
+        for &n in &[p - 1, p, p + 1, u64::MAX] {
+            assert!(
+                prove_consistency(
+                    &data,
+                    targets,
+                    0,
+                    nflog_empty(),
+                    n,
+                    nflog_empty(),
+                    &[],
+                ),
+                "gadget consistency m=0 n={n:#x}"
+            );
+        }
+
+        // General case: symbolic fixtures for (p, p+1) and (u64::MAX-1, u64::MAX).
+        for &(m, n) in &[(p, p + 1), (u64::MAX - 1, u64::MAX), (p - 1, p)] {
+            let case_id = 0x2e11_u64 ^ m.wrapping_mul(0x9e37) ^ n;
+            let w = ref_build_consistency(case_id, m, n);
+            assert!(
+                ref_verify_consistency(m, w.mth_a, n, w.mth_b, &w.proof),
+                "ref consistency m={m:#x} n={n:#x}"
+            );
+            assert!(
+                verify_consistency(m, w.mth_a, n, w.mth_b, &w.proof),
+                "host consistency m={m:#x} n={n:#x}"
+            );
+            assert!(
+                prove_consistency(
+                    &data,
+                    targets,
+                    m,
+                    w.mth_a,
+                    n,
+                    w.mth_b,
+                    &w.proof,
+                ),
+                "gadget consistency Accept m={m:#x} n={n:#x}"
+            );
+        }
+    }
+
+    /// Cheap circuit-shape report (not a correctness check). Limb size
     /// handling moves gate count / degree bits; this prints them for the
     /// isolated inclusion and consistency wrappers used by the suite.
     #[test]
@@ -843,9 +789,9 @@ mod tests {
         {
             let targets = InclusionTargets {
                 leaf: inclusion_builder.add_virtual_hash(),
-                position: inclusion_builder.add_virtual_target(),
+                position: U64LimbsTarget::new_virtual(&mut inclusion_builder),
                 path: std::array::from_fn(|_| inclusion_builder.add_virtual_hash()),
-                size: inclusion_builder.add_virtual_target(),
+                size: U64LimbsTarget::new_virtual(&mut inclusion_builder),
                 mth: inclusion_builder.add_virtual_hash(),
             };
             verify_nflog_inclusion(
@@ -864,9 +810,9 @@ mod tests {
             CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
         {
             let targets = ConsistencyTargets {
-                m: consistency_builder.add_virtual_target(),
+                m: U64LimbsTarget::new_virtual(&mut consistency_builder),
                 mth_a: consistency_builder.add_virtual_hash(),
-                n: consistency_builder.add_virtual_target(),
+                n: U64LimbsTarget::new_virtual(&mut consistency_builder),
                 mth_b: consistency_builder.add_virtual_hash(),
                 proof: std::array::from_fn(|_| consistency_builder.add_virtual_hash()),
             };
@@ -897,7 +843,7 @@ mod tests {
     #[test]
     fn hash_targets_match_shared_field_element_for_field_element() {
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
-        let position = builder.add_virtual_target();
+        let position = U64LimbsTarget::new_virtual(&mut builder);
         let pk: [Target; 32] = std::array::from_fn(|_| builder.add_virtual_target());
         let r: [Target; 32] = std::array::from_fn(|_| builder.add_virtual_target());
         let left = builder.add_virtual_hash();
@@ -917,9 +863,7 @@ mod tests {
         let left_value = hash_bytes(b"nflog-hash-parity-left");
         let right_value = hash_bytes(b"nflog-hash-parity-right");
         let mut witness = PartialWitness::new();
-        witness
-            .set_target(position, F::from_canonical_u64(0x0102_0304_0506_0708))
-            .unwrap();
+        set_u64_limbs_unwrap(&mut witness, position, 0x0102_0304_0506_0708);
         for i in 0..32 {
             witness
                 .set_target(pk[i], F::from_canonical_u8(entry.pk[i]))
@@ -944,6 +888,47 @@ mod tests {
             .flat_map(|digest| digest.elements)
             .collect::<Vec<_>>();
         assert_eq!(proof.public_inputs, expected_elements);
+    }
+
+    /// Leaf hash at positions ≥ p must still match the host encoding.
+    #[test]
+    fn leaf_hash_at_and_above_field_order_matches_host() {
+        let p = F::ORDER;
+        for &position in &[p - 1, p, p + 1, u64::MAX] {
+            let mut builder =
+                CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+            let pos = U64LimbsTarget::new_virtual(&mut builder);
+            let pk: [Target; 32] = std::array::from_fn(|_| builder.add_virtual_target());
+            let r: [Target; 32] = std::array::from_fn(|_| builder.add_virtual_target());
+            let leaf_out = nflog_leaf_hash_target(&mut builder, pos, &pk, &r);
+            builder.register_public_inputs(&leaf_out.elements);
+            let data = builder.build::<C>();
+
+            let entry = NfLogEntry {
+                pk: [0xab; 32],
+                r: [0xcd; 32],
+            };
+            let mut witness = PartialWitness::new();
+            set_u64_limbs_unwrap(&mut witness, pos, position);
+            for i in 0..32 {
+                witness
+                    .set_target(pk[i], F::from_canonical_u8(entry.pk[i]))
+                    .unwrap();
+                witness
+                    .set_target(r[i], F::from_canonical_u8(entry.r[i]))
+                    .unwrap();
+            }
+            let proof = data
+                .prove(witness)
+                .unwrap_or_else(|_| panic!("leaf hash at {position:#x} must prove"));
+            data.verify(proof.clone()).expect("verify");
+            let expected = nflog_leaf_hash(position, &entry);
+            assert_eq!(
+                proof.public_inputs,
+                expected.elements.to_vec(),
+                "leaf hash mismatch at position {position:#x}"
+            );
+        }
     }
 
     fn tamper(digest: HashDigest) -> HashDigest {
@@ -1714,4 +1699,5 @@ mod tests {
             "expected 66 single-peak sizes × (dup+drop) = 132, got {built_peak_dup_drop}"
         );
     }
+
 }
