@@ -61,7 +61,7 @@
 //! progress, [`InfrastructureError::partial_report`] carries the committed
 //! work so callers can observe what landed.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -72,6 +72,8 @@ use bitcoincore_rpc::{Auth, Client, RpcApi};
 use shared::spec_v1::accumulator::ReorgOutcome;
 use shared::spec_v1::network_params::NetworkParams;
 use shared::spec_v1::tags::NETWORK_TAG_REGTEST;
+#[cfg(test)]
+use shared::spec_v1::tags::{NETWORK_TAG_MAINNET, NETWORK_TAG_TESTNET};
 use shared::spec_v1::{ChainPosition, FoldOutcome, NfLogAccumulator, PublishedNullifier};
 use zkcoins_program_plonky2::circuit::compliance::Network;
 
@@ -86,15 +88,23 @@ use crate::publisher::ensure_chain_matches_config;
 /// inclusion block and the height gap must not exceed this constant.
 pub const MAX_ANCHOR_GAP: u64 = 100;
 
+/// Number of verified block hashes retained for ancestry lookups
+/// (`MAX_ANCHOR_GAP` ancestors plus the inclusion block itself).
+const VERIFIED_CHAIN_CAPACITY: usize = (MAX_ANCHOR_GAP as usize) + 1;
+
 /// OP_FALSE (`0x00`) followed by OP_IF (`0x63`) — the §3.5 envelope opener.
 const ENVELOPE_OPENER: [u8; 2] = [0x00, 0x63];
 
 /// Scanner configuration. Every field is mandatory — no silent defaults.
 ///
 /// `activation_height` is a pinned consensus parameter (§3.6 "Scan origin").
-/// [`Scanner::connect`] **rejects** a value that does not match the pinned
-/// network parameter (via [`pinned_activation_height`]); it never silently
-/// substitutes the pinned value for a wrong configuration.
+/// It must equal [`NetworkParams::activation_height`] of the supplied
+/// [`Self::network_params`]. [`Scanner::connect`] **rejects** disagreement;
+/// it never silently substitutes the pinned value for a wrong configuration.
+///
+/// For **mainnet** and **testnet** the pin is deployment-observed and must be
+/// supplied via `network_params` (there is no compile-time constant). For
+/// **regtest** §3.6 pins `0` and connect enforces that.
 #[derive(Clone, Debug)]
 pub struct ScannerConfig {
     /// Base RPC URL, e.g. `http://127.0.0.1:18443` (no wallet path required).
@@ -105,8 +115,13 @@ pub struct ScannerConfig {
     /// (§3.6 step 3). Must match the connected chain.
     pub network: Network,
     /// First Bitcoin height at which zkCoins nullifiers are recognised
-    /// (§3.6 Scan origin). Consensus-critical; must equal the pinned network value.
+    /// (§3.6 Scan origin). Consensus-critical; must equal
+    /// `network_params.activation_height()`.
     pub activation_height: u64,
+    /// Pinned network-parameter set (§3.6). Required for every network —
+    /// never optional, never defaulted. Its `activation_height` is the
+    /// consensus pin that [`Self::activation_height`] must match.
+    pub network_params: NetworkParams,
 }
 
 /// Deterministic inscription rejection (a pure function of chain content).
@@ -288,6 +303,15 @@ pub struct Scanner {
     /// All signature-verified, bound-checked nullifiers in canonical order
     /// (including first-occurrence losers). Input for [`NfLogAccumulator::reorg_replay`].
     survivors: Vec<PublishedNullifier>,
+    /// First-occurrence winner position per `Pk` among `survivors`.
+    ///
+    /// Maintained alongside `survivors` so duplicate handling is **O(1)** per
+    /// repeated member rather than a linear scan of prior survivors
+    /// (`Θ(D·S)` → `Θ(D + S)` over a stream of `S` survivors and `D` duplicates).
+    /// Duplicates remain in `survivors` (a reorg can promote one to winner);
+    /// this index only stores the current winner. Rebuilt from retained
+    /// survivors on reorg apply.
+    winner_by_pk: HashMap<[u8; 32], ChainPosition>,
     /// Highest fully-scanned height and its block hash at scan time.
     scanned_through: Option<(u64, BlockHash)>,
     /// Every height → hash observed while scanning (for reorg common-ancestor).
@@ -299,14 +323,17 @@ pub struct Scanner {
     /// transaction with many inputs spending the same parent therefore costs
     /// one RPC, not one per input.
     parent_tx_cache: HashMap<Txid, Transaction>,
-    /// Per-scan-run cache of `getblockhash(height)` for anchor identity checks.
-    ///
-    /// Bound: at most one RPC per distinct anchor height per connected-chain
-    /// view. **Invariant:** valid only for a single connected chain. Cleared
-    /// the moment a reorg is detected — **before** any replacement-block
-    /// validation or anchor `getblockhash` — so a stale orphaned hash can never
-    /// be used to admit a payload on the new fork.
-    anchor_hash_cache: HashMap<u64, BlockHash>,
+    /// Hashes of the last [`VERIFIED_CHAIN_CAPACITY`] blocks this scanner has
+    /// actually validated (via `prev_blockhash` linkage). Used for
+    /// `block_anchor` ancestry checks relative to the inclusion block —
+    /// **never** against the live tip. Front = oldest, back = newest.
+    verified_chain: VecDeque<(u64, BlockHash)>,
+    /// Ancestor walks keyed by the **descendant** (inclusion) block hash they
+    /// were derived from. Maps `inclusion_hash → (height → hash)` for ancestors
+    /// resolved by walking `prev_blockhash` from that inclusion block. An entry
+    /// can never be reused under a different fork because the key is the
+    /// inclusion block's own hash.
+    ancestor_walk_cache: HashMap<BlockHash, BTreeMap<u64, BlockHash>>,
     /// Test seam: next prevout fetch fails as infrastructure (then clears).
     #[cfg(test)]
     inject_prevout_infra_failure: bool,
@@ -320,12 +347,19 @@ pub struct Scanner {
     /// it and mine an empty replacement via RPC (one-shot).
     #[cfg(test)]
     inject_reorg_after_commit_height: Option<u64>,
+    /// Test seam: after at least one block is committed this call, the next
+    /// post-commit tip query (`getblockcount` / `getblockhash`) fails (one-shot).
+    #[cfg(test)]
+    inject_post_commit_rpc_failure: bool,
     /// Test counter: how many `getrawtransaction` RPCs this scan run issued.
     #[cfg(test)]
     prevout_rpc_count: usize,
-    /// Test counter: how many anchor `getblockhash` RPCs this scan run issued.
+    /// Test counter: how many O(1) winner-index lookups this scan run issued.
     #[cfg(test)]
-    anchor_hash_rpc_count: usize,
+    winner_index_lookups: usize,
+    /// Test counter: how many `getblock` RPCs ancestry walks issued this run.
+    #[cfg(test)]
+    ancestor_walk_rpc_count: usize,
 }
 
 impl Scanner {
@@ -333,7 +367,9 @@ impl Scanner {
     /// [`ScannerConfig::network`].
     ///
     /// Also enforces:
-    /// - `activation_height` equals the pinned network value (§3.6 Scan origin);
+    /// - `activation_height` equals `network_params.activation_height()`
+    ///   (§3.6 Scan origin — load the published pin and compare);
+    /// - regtest pin is `0` (§3.6);
     /// - `txindex` is enabled **and** fully synchronized (`getindexinfo`).
     pub fn connect(config: ScannerConfig) -> Result<Self> {
         ensure!(
@@ -345,10 +381,18 @@ impl Scanner {
             "ScannerConfig.cookie_path must not be empty"
         );
 
-        let pinned = pinned_activation_height(config.network)?;
+        let pinned = config.network_params.activation_height();
+        // §3.6: regtest activation_height is pinned at 0.
+        if config.network == Network::Regtest {
+            ensure!(
+                pinned == 0,
+                "ScannerConfig.network_params.activation_height {pinned} is not the \
+                 §3.6 regtest pin (0) — refuse to start rather than fold a divergent log"
+            );
+        }
         ensure!(
             config.activation_height == pinned,
-            "ScannerConfig.activation_height {} does not match pinned network value {} \
+            "ScannerConfig.activation_height {} does not match network_params.activation_height {} \
              for {:?} (§3.6 Scan origin — refuse to start rather than fold a divergent log)",
             config.activation_height,
             pinned,
@@ -381,10 +425,12 @@ impl Scanner {
             config,
             accumulator,
             survivors: Vec::new(),
+            winner_by_pk: HashMap::new(),
             scanned_through: None,
             scanned_blocks: BTreeMap::new(),
             parent_tx_cache: HashMap::new(),
-            anchor_hash_cache: HashMap::new(),
+            verified_chain: VecDeque::new(),
+            ancestor_walk_cache: HashMap::new(),
             #[cfg(test)]
             inject_prevout_infra_failure: false,
             #[cfg(test)]
@@ -394,9 +440,13 @@ impl Scanner {
             #[cfg(test)]
             inject_reorg_after_commit_height: None,
             #[cfg(test)]
+            inject_post_commit_rpc_failure: false,
+            #[cfg(test)]
             prevout_rpc_count: 0,
             #[cfg(test)]
-            anchor_hash_rpc_count: 0,
+            winner_index_lookups: 0,
+            #[cfg(test)]
+            ancestor_walk_rpc_count: 0,
         })
     }
 
@@ -427,58 +477,21 @@ impl Scanner {
     /// (`scanned_through`) when any block has been scanned — never a live RPC
     /// tip the accumulator does not reflect.
     pub fn scan_to_tip(&mut self) -> Result<ScanReport> {
-        // Fresh per-run parent cache. Anchor-hash cache survives across forward
-        // progress within a connected chain but is wiped the moment a reorg is
-        // detected (before replacement validation).
+        // Fresh per-run parent cache. Verified-chain history and ancestor-walk
+        // cache are fork-keyed / linkage-verified and survive across calls;
+        // reorg handling truncates / clears them explicitly.
         self.parent_tx_cache.clear();
         #[cfg(test)]
         {
             self.prevout_rpc_count = 0;
-            self.anchor_hash_rpc_count = 0;
+            self.winner_index_lookups = 0;
+            self.ancestor_walk_rpc_count = 0;
         }
 
-        let mut blocks = Vec::new();
-        let mut inscriptions_seen = 0usize;
-        let mut admitted_count = 0usize;
-        let mut rejected_count = 0usize;
-        let mut duplicates = 0usize;
-        let mut duplicate_details = Vec::new();
-        let mut from_height = None;
-        let mut to_height = None;
-        let mut reorg: Option<ReorgOutcome> = None;
-
-        // Build a partial report from committed work so far (for infra aborts).
-        let build_partial = |blocks: &[BlockScanResult],
-                             inscriptions_seen: usize,
-                             admitted_count: usize,
-                             rejected_count: usize,
-                             duplicates: usize,
-                             duplicate_details: &[DuplicateNullifier],
-                             from_height: Option<u64>,
-                             to_height: Option<u64>,
-                             reorg: &Option<ReorgOutcome>,
-                             scanned_through: Option<(u64, BlockHash)>,
-                             live_tip_height: u64,
-                             live_tip_hash: BlockHash|
-         -> ScanReport {
-            let (tip_height, tip_hash) = match scanned_through {
-                Some((h, hash)) => (h, hash),
-                None => (live_tip_height, live_tip_hash),
-            };
-            ScanReport {
-                from_height,
-                to_height,
-                tip_height,
-                tip_hash,
-                blocks: blocks.to_vec(),
-                reorg: reorg.clone(),
-                inscriptions_seen,
-                admitted_count,
-                rejected_count,
-                duplicates,
-                duplicate_details: duplicate_details.to_vec(),
-            }
-        };
+        // Single accumulator for committed work this call. Every error exit
+        // after the first committed block attaches a partial report from this
+        // state — newly added RPC call sites cannot forget it.
+        let mut acc = ScanCallAccumulator::new();
 
         // May need more than one pass: a mid-scan chain break re-runs reorg then
         // continues forward from the repaired checkpoint.
@@ -486,60 +499,25 @@ impl Scanner {
             let reorg_result = self.detect_and_handle_reorg();
             let (reorg_outcome, reorg_blocks) = match reorg_result {
                 Ok(v) => v,
-                Err(e) => {
-                    if blocks.is_empty() {
-                        return Err(e);
-                    }
-                    // Committed work implies a checkpoint; report that tip only.
-                    let (tip_h, tip_hash) = self.scanned_through.ok_or_else(|| {
-                        anyhow!(
-                            "internal: blocks committed this call but scanned_through is None \
-                             while attaching partial report after reorg failure"
-                        )
-                    })?;
-                    let partial = build_partial(
-                        &blocks,
-                        inscriptions_seen,
-                        admitted_count,
-                        rejected_count,
-                        duplicates,
-                        &duplicate_details,
-                        from_height,
-                        to_height,
-                        &reorg,
-                        Some((tip_h, tip_hash)),
-                        tip_h,
-                        tip_hash,
-                    );
-                    return Err(InfrastructureError::with_partial(format!("{e:#}"), partial).into());
-                }
+                Err(e) => return Err(acc.fail_err(e, self.scanned_through)),
             };
             if let Some(outcome) = reorg_outcome {
-                merge_reorg_outcome(&mut reorg, outcome);
+                merge_reorg_outcome(&mut acc.reorg, outcome);
             }
             for result in reorg_blocks {
-                Self::accumulate_block_into_report(
-                    &result,
-                    &mut inscriptions_seen,
-                    &mut admitted_count,
-                    &mut rejected_count,
-                    &mut duplicates,
-                    &mut duplicate_details,
-                    &mut from_height,
-                    &mut to_height,
-                )?;
-                blocks.push(result);
+                acc.push_block(result)?;
             }
 
-            let tip_height = self
-                .rpc
-                .get_block_count()
-                .context("getblockcount failed")?;
+            let tip_height = match self.rpc_get_block_count_post_commit(&acc, "getblockcount") {
+                Ok(h) => h,
+                Err(e) => return Err(e),
+            };
 
             let start = match self.scanned_through {
                 Some((h, _)) => h
                     .checked_add(1)
-                    .context("scanned height + 1 overflowed u64")?,
+                    .context("scanned height + 1 overflowed u64")
+                    .map_err(|e| acc.fail_err(e, self.scanned_through))?,
                 None => self.config.activation_height,
             };
 
@@ -553,17 +531,7 @@ impl Scanner {
                     match scan_result {
                         Ok(ScanBlockOutcome::Scanned(result)) => {
                             expected_prev = Some(result.block_hash);
-                            Self::accumulate_block_into_report(
-                                &result,
-                                &mut inscriptions_seen,
-                                &mut admitted_count,
-                                &mut rejected_count,
-                                &mut duplicates,
-                                &mut duplicate_details,
-                                &mut from_height,
-                                &mut to_height,
-                            )?;
-                            blocks.push(result);
+                            acc.push_block(result)?;
                         }
                         Ok(ScanBlockOutcome::ChainBroken) => {
                             // Stop advancing; re-enter so the reorg path can
@@ -571,36 +539,7 @@ impl Scanner {
                             chain_broke_at = Some(height);
                             break;
                         }
-                        Err(e) => {
-                            // Per-block atomicity: earlier commits stay; attach
-                            // partial report when this call already committed.
-                            if blocks.is_empty() {
-                                return Err(e);
-                            }
-                            let (tip_h, tip_hash) = self.scanned_through.ok_or_else(|| {
-                                anyhow!(
-                                    "internal: blocks committed this call but scanned_through \
-                                     is None while attaching partial report"
-                                )
-                            })?;
-                            let partial = build_partial(
-                                &blocks,
-                                inscriptions_seen,
-                                admitted_count,
-                                rejected_count,
-                                duplicates,
-                                &duplicate_details,
-                                from_height,
-                                to_height,
-                                &reorg,
-                                Some((tip_h, tip_hash)),
-                                tip_h,
-                                tip_hash,
-                            );
-                            return Err(
-                                InfrastructureError::with_partial(format!("{e:#}"), partial).into(),
-                            );
-                        }
+                        Err(e) => return Err(acc.fail_err(e, self.scanned_through)),
                     }
                 }
             }
@@ -611,18 +550,26 @@ impl Scanner {
                 // link break is an inconsistent tip view — fail loud rather
                 // than spin forever.
                 if let Some((scanned_h, scanned_hash)) = self.scanned_through {
-                    let live = self.rpc.get_block_hash(scanned_h).map_err(|e| {
-                        InfrastructureError::new(format!(
-                            "getblockhash({scanned_h}) after chain break at {broke_height}: {e}"
-                        ))
-                    })?;
+                    let live = match self.rpc_get_block_hash_post_commit(
+                        &acc,
+                        scanned_h,
+                        &format!(
+                            "getblockhash({scanned_h}) after chain break at {broke_height}"
+                        ),
+                    ) {
+                        Ok(h) => h,
+                        Err(e) => return Err(e),
+                    };
                     if live == scanned_hash {
-                        bail!(
-                            "chain link broken at height {broke_height}: block prev_blockhash \
-                             does not match checkpoint {scanned_hash} at height {scanned_h}, \
-                             yet that checkpoint is still the live canonical hash — refuse to \
-                             mix forks or spin"
-                        );
+                        return Err(acc.fail_msg(
+                            format!(
+                                "chain link broken at height {broke_height}: block prev_blockhash \
+                                 does not match checkpoint {scanned_hash} at height {scanned_h}, \
+                                 yet that checkpoint is still the live canonical hash — refuse to \
+                                 mix forks or spin"
+                            ),
+                            self.scanned_through,
+                        ));
                     }
                 }
                 continue;
@@ -630,29 +577,32 @@ impl Scanner {
 
             // Tip must match the accumulator: never report a live tip the
             // scanner has not fully reflected.
-            let live_tip = self
-                .rpc
-                .get_block_count()
-                .context("getblockcount (post-scan tip re-read) failed")?;
+            let live_tip = match self.rpc_get_block_count_post_commit(
+                &acc,
+                "getblockcount (post-scan tip re-read)",
+            ) {
+                Ok(h) => h,
+                Err(e) => return Err(e),
+            };
             if let Some((scanned_h, _)) = self.scanned_through {
                 if scanned_h < live_tip {
                     // New blocks appeared after the forward pass — continue.
                     continue;
                 }
-                let live_hash = self.rpc.get_block_hash(scanned_h).map_err(|e| {
-                    InfrastructureError::new(format!(
-                        "getblockhash({scanned_h}) post-scan tip check: {e}"
-                    ))
+                let live_hash = match self.rpc_get_block_hash_post_commit(
+                    &acc,
+                    scanned_h,
+                    &format!("getblockhash({scanned_h}) post-scan tip check"),
+                ) {
+                    Ok(h) => h,
+                    Err(e) => return Err(e),
+                };
+                let scanned_hash = self.scanned_through.map(|(_, h)| h).ok_or_else(|| {
+                    anyhow!(
+                        "internal: scanned_through became None during post-scan tip check \
+                         at height {scanned_h}"
+                    )
                 })?;
-                let scanned_hash = self
-                    .scanned_through
-                    .map(|(_, h)| h)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "internal: scanned_through became None during post-scan tip check \
-                             at height {scanned_h}"
-                        )
-                    })?;
                 if live_hash != scanned_hash {
                     // Reorg under us after the forward pass — repair next loop.
                     continue;
@@ -662,57 +612,98 @@ impl Scanner {
             let (report_tip_height, report_tip_hash) = match self.scanned_through {
                 Some((h, hash)) => (h, hash),
                 None => {
-                    let tip_hash = self.rpc.get_block_hash(live_tip).map_err(|e| {
-                        InfrastructureError::new(format!("getblockhash({live_tip}): {e}"))
-                    })?;
+                    let tip_hash = match self.rpc_get_block_hash_post_commit(
+                        &acc,
+                        live_tip,
+                        &format!("getblockhash({live_tip})"),
+                    ) {
+                        Ok(h) => h,
+                        Err(e) => return Err(e),
+                    };
                     (live_tip, tip_hash)
                 }
             };
 
-            return Ok(ScanReport {
-                from_height,
-                to_height,
-                tip_height: report_tip_height,
-                tip_hash: report_tip_hash,
-                blocks,
-                reorg,
-                inscriptions_seen,
-                admitted_count,
-                rejected_count,
-                duplicates,
-                duplicate_details,
-            });
+            return Ok(acc.into_report(report_tip_height, report_tip_hash));
         }
     }
 
-    fn accumulate_block_into_report(
-        result: &BlockScanResult,
-        inscriptions_seen: &mut usize,
-        admitted_count: &mut usize,
-        rejected_count: &mut usize,
-        duplicates: &mut usize,
-        duplicate_details: &mut Vec<DuplicateNullifier>,
-        from_height: &mut Option<u64>,
-        to_height: &mut Option<u64>,
-    ) -> Result<()> {
-        *inscriptions_seen = inscriptions_seen
-            .checked_add(result.inscriptions_seen)
-            .context("inscriptions_seen overflow")?;
-        *admitted_count = admitted_count
-            .checked_add(result.admitted.len())
-            .context("admitted_count overflow")?;
-        *rejected_count = rejected_count
-            .checked_add(result.rejected.len())
-            .context("rejected_count overflow")?;
-        *duplicates = duplicates
-            .checked_add(result.duplicates)
-            .context("duplicates overflow")?;
-        duplicate_details.extend(result.duplicate_details.iter().cloned());
-        if from_height.is_none() {
-            *from_height = Some(result.height);
+    /// `getblockcount` that attaches a partial report when this call already
+    /// committed work (structural post-commit error path).
+    fn rpc_get_block_count_post_commit(
+        &mut self,
+        acc: &ScanCallAccumulator,
+        context: &str,
+    ) -> Result<u64> {
+        #[cfg(test)]
+        if self.inject_post_commit_rpc_failure && acc.has_committed() {
+            self.inject_post_commit_rpc_failure = false;
+            return Err(acc.fail_msg(
+                format!("injected post-commit RPC failure: {context}"),
+                self.scanned_through,
+            ));
         }
-        *to_height = Some(result.height);
-        Ok(())
+        self.rpc.get_block_count().map_err(|e| {
+            acc.fail_msg(
+                format!("{context} failed: {e}"),
+                self.scanned_through,
+            )
+        })
+    }
+
+    /// `getblockhash` that attaches a partial report when this call already
+    /// committed work (structural post-commit error path).
+    fn rpc_get_block_hash_post_commit(
+        &mut self,
+        acc: &ScanCallAccumulator,
+        height: u64,
+        context: &str,
+    ) -> Result<BlockHash> {
+        #[cfg(test)]
+        if self.inject_post_commit_rpc_failure && acc.has_committed() {
+            self.inject_post_commit_rpc_failure = false;
+            return Err(acc.fail_msg(
+                format!("injected post-commit RPC failure: {context}"),
+                self.scanned_through,
+            ));
+        }
+        self.rpc.get_block_hash(height).map_err(|e| {
+            acc.fail_msg(
+                format!("{context}: {e}"),
+                self.scanned_through,
+            )
+        })
+    }
+
+    /// Test seam: after committing ≥1 block this call, the next post-commit
+    /// tip RPC fails with a partial report (one-shot).
+    #[cfg(test)]
+    pub fn inject_post_commit_rpc_failure(&mut self) {
+        self.inject_post_commit_rpc_failure = true;
+    }
+
+    /// Test observation: O(1) winner-index lookups this scan run.
+    #[cfg(test)]
+    pub fn winner_index_lookups(&self) -> usize {
+        self.winner_index_lookups
+    }
+
+    /// Test observation: ancestry-walk `getblock` RPCs this scan run.
+    #[cfg(test)]
+    pub fn ancestor_walk_rpc_count(&self) -> usize {
+        self.ancestor_walk_rpc_count
+    }
+
+    /// Test observation: verified-chain history length.
+    #[cfg(test)]
+    pub fn verified_chain_len(&self) -> usize {
+        self.verified_chain.len()
+    }
+
+    /// Test observation: winner index size.
+    #[cfg(test)]
+    pub fn winner_index_len(&self) -> usize {
+        self.winner_by_pk.len()
     }
 
     /// Borrow the in-memory Path-A accumulator rebuilt from the chain.
@@ -766,17 +757,146 @@ impl Scanner {
     pub fn prevout_rpc_count(&self) -> usize {
         self.prevout_rpc_count
     }
+}
 
-    /// Test observation: anchor `getblockhash` RPC count for the current/last scan run.
-    #[cfg(test)]
-    pub fn anchor_hash_rpc_count(&self) -> usize {
-        self.anchor_hash_rpc_count
+/// Per-`scan_to_tip` accumulator of committed block reports.
+///
+/// Centralises partial-report construction so every error path after the first
+/// committed block attaches the same report — newly added RPC call sites cannot
+/// forget it. Rule: work already committed to the accumulator is always reported.
+struct ScanCallAccumulator {
+    blocks: Vec<BlockScanResult>,
+    inscriptions_seen: usize,
+    admitted_count: usize,
+    rejected_count: usize,
+    duplicates: usize,
+    duplicate_details: Vec<DuplicateNullifier>,
+    from_height: Option<u64>,
+    to_height: Option<u64>,
+    reorg: Option<ReorgOutcome>,
+}
+
+impl ScanCallAccumulator {
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            inscriptions_seen: 0,
+            admitted_count: 0,
+            rejected_count: 0,
+            duplicates: 0,
+            duplicate_details: Vec::new(),
+            from_height: None,
+            to_height: None,
+            reorg: None,
+        }
     }
 
-    /// Test observation: size of the anchor-hash cache.
-    #[cfg(test)]
-    pub fn anchor_hash_cache_len(&self) -> usize {
-        self.anchor_hash_cache.len()
+    fn has_committed(&self) -> bool {
+        !self.blocks.is_empty()
+    }
+
+    fn push_block(&mut self, result: BlockScanResult) -> Result<()> {
+        self.inscriptions_seen = self
+            .inscriptions_seen
+            .checked_add(result.inscriptions_seen)
+            .context("inscriptions_seen overflow")?;
+        self.admitted_count = self
+            .admitted_count
+            .checked_add(result.admitted.len())
+            .context("admitted_count overflow")?;
+        self.rejected_count = self
+            .rejected_count
+            .checked_add(result.rejected.len())
+            .context("rejected_count overflow")?;
+        self.duplicates = self
+            .duplicates
+            .checked_add(result.duplicates)
+            .context("duplicates overflow")?;
+        self.duplicate_details
+            .extend(result.duplicate_details.iter().cloned());
+        if self.from_height.is_none() {
+            self.from_height = Some(result.height);
+        }
+        self.to_height = Some(result.height);
+        self.blocks.push(result);
+        Ok(())
+    }
+
+    fn to_report(&self, tip_height: u64, tip_hash: BlockHash) -> ScanReport {
+        ScanReport {
+            from_height: self.from_height,
+            to_height: self.to_height,
+            tip_height,
+            tip_hash,
+            blocks: self.blocks.clone(),
+            reorg: self.reorg.clone(),
+            inscriptions_seen: self.inscriptions_seen,
+            admitted_count: self.admitted_count,
+            rejected_count: self.rejected_count,
+            duplicates: self.duplicates,
+            duplicate_details: self.duplicate_details.clone(),
+        }
+    }
+
+    fn into_report(self, tip_height: u64, tip_hash: BlockHash) -> ScanReport {
+        ScanReport {
+            from_height: self.from_height,
+            to_height: self.to_height,
+            tip_height,
+            tip_hash,
+            blocks: self.blocks,
+            reorg: self.reorg,
+            inscriptions_seen: self.inscriptions_seen,
+            admitted_count: self.admitted_count,
+            rejected_count: self.rejected_count,
+            duplicates: self.duplicates,
+            duplicate_details: self.duplicate_details,
+        }
+    }
+
+    /// Attach a partial report when any block was committed; otherwise pass through.
+    fn fail_err(
+        &self,
+        err: impl Into<anyhow::Error>,
+        scanned_through: Option<(u64, BlockHash)>,
+    ) -> anyhow::Error {
+        let err = err.into();
+        if !self.has_committed() {
+            return err;
+        }
+        let (tip_h, tip_hash) = match scanned_through {
+            Some(v) => v,
+            None => {
+                return anyhow!(
+                    "internal: blocks committed this call but scanned_through is None \
+                     while attaching partial report: {err:#}"
+                );
+            }
+        };
+        InfrastructureError::with_partial(format!("{err:#}"), self.to_report(tip_h, tip_hash))
+            .into()
+    }
+
+    /// Infrastructure failure, with partial report when committed work exists.
+    fn fail_msg(
+        &self,
+        message: impl Into<String>,
+        scanned_through: Option<(u64, BlockHash)>,
+    ) -> anyhow::Error {
+        let message = message.into();
+        if !self.has_committed() {
+            return InfrastructureError::new(message).into();
+        }
+        let (tip_h, tip_hash) = match scanned_through {
+            Some(v) => v,
+            None => {
+                return anyhow!(
+                    "internal: blocks committed this call but scanned_through is None \
+                     while attaching partial report: {message}"
+                );
+            }
+        };
+        InfrastructureError::with_partial(message, self.to_report(tip_h, tip_hash)).into()
     }
 }
 
@@ -808,37 +928,40 @@ const MAX_REORG_COLLECTION_RESTARTS: u32 = 16;
 
 // ── §3.6 pure helpers (unit-testable without bitcoind) ───────────────────
 
-/// Pinned `activation_height` for `network` from the frozen network-parameter
-/// set ([`NetworkParams`], §3.6 Scan origin).
+/// §3.6-pinned [`NetworkParams`] for regtest (`activation_height = 0`).
 ///
-/// Regtest pins `0`. Mainnet/testnet pins are deployment-observed and are not
-/// inventable here — refuse rather than guess.
-pub fn pinned_activation_height(network: Network) -> Result<u64> {
+/// Circuit digests and bootstrap pubkey are zero placeholders — only the
+/// activation-height pin is consensus-critical for the scanner gate. Mainnet
+/// and testnet must be constructed by the deployer from the published
+/// `network-params.json`; they are never invented here.
+pub fn regtest_network_params() -> Result<NetworkParams> {
+    let tag = std::str::from_utf8(NETWORK_TAG_REGTEST)
+        .context("NETWORK_TAG_REGTEST is not valid UTF-8")?
+        .to_string();
+    NetworkParams::new(
+        tag,
+        [0u8; 32],
+        [0u8; 32],
+        0, // §3.6: regtest activation_height = 0
+        6,
+        [0u8; 32],
+    )
+    .map_err(|e| anyhow!("internal: regtest NetworkParams construction failed: {e}"))
+}
+
+/// Activation height from supplied [`NetworkParams`], with the §3.6 regtest pin
+/// check. Mainnet/testnet use the parameter set as-is — no compile-time constant.
+pub fn pinned_activation_height(network: Network, params: &NetworkParams) -> Result<u64> {
+    let h = params.activation_height();
     match network {
         Network::Regtest => {
-            // Bind the pin through NetworkParams so the value is the
-            // `activation_height` field of that type, not a free constant.
-            let tag = std::str::from_utf8(NETWORK_TAG_REGTEST)
-                .context("NETWORK_TAG_REGTEST is not valid UTF-8")?
-                .to_string();
-            let params = NetworkParams::new(
-                tag,
-                [0u8; 32], // circuit digests not required for the height field
-                [0u8; 32],
-                0, // §3.6: regtest activation_height = 0
-                6,
-                [0u8; 32],
-            )
-            .map_err(|e| anyhow!("internal: regtest NetworkParams construction failed: {e}"))?;
-            Ok(params.activation_height())
+            ensure!(
+                h == 0,
+                "regtest NetworkParams.activation_height must be 0 per §3.6, got {h}"
+            );
+            Ok(0)
         }
-        Network::Testnet | Network::Mainnet => {
-            bail!(
-                "pinned activation_height for {network:?} is deployment-observed \
-                 and not available as a compile-time NetworkParams fixture yet; \
-                 refuse to start rather than invent a value"
-            )
-        }
+        Network::Mainnet | Network::Testnet => Ok(h),
     }
 }
 
@@ -903,17 +1026,19 @@ pub fn may_contain_zkcoins_envelope(input: &TxIn) -> bool {
 
 /// Pure §3.5 `block_anchor` bound predicate (all three parts).
 ///
-/// `canonical_hash_at_anchor` must be `getblockhash(anchor.height)` under the
+/// `ancestor_hash_at_anchor` is the hash of the block at `anchor.height` on
+/// the **inclusion block's own ancestor chain** (not the live tip), under the
 /// normative byte order ([`BlockHash::to_byte_array`]).
 ///
 /// Rejects when:
 /// 1. `anchor.height >= inclusion_height` (not a strict ancestor by height);
 /// 2. `inclusion_height - anchor.height > MAX_ANCHOR_GAP`;
-/// 3. `anchor.block_hash != canonical_hash_at_anchor` (not this chain).
+/// 3. `anchor.block_hash != ancestor_hash_at_anchor` (not an ancestor of the
+///    inclusion block).
 pub fn evaluate_anchor_bound(
     anchor: &BlockAnchor,
     inclusion_height: u64,
-    canonical_hash_at_anchor: [u8; 32],
+    ancestor_hash_at_anchor: [u8; 32],
 ) -> Result<(), String> {
     let anchor_height = u64::from(anchor.height);
     if anchor_height >= inclusion_height {
@@ -929,10 +1054,11 @@ pub fn evaluate_anchor_bound(
              inclusion {inclusion_height}, anchor {anchor_height}"
         ));
     }
-    if anchor.block_hash != canonical_hash_at_anchor {
+    if anchor.block_hash != ancestor_hash_at_anchor {
         return Err(format!(
-            "block_anchor.block_hash is not the canonical block at height {anchor_height} \
-             (anchor names a hash that is not on this chain)"
+            "block_anchor.block_hash is not an ancestor of the inclusion block at \
+             height {anchor_height} (anchor names a hash that is not on the \
+             inclusion block's chain)"
         ));
     }
     Ok(())
@@ -987,11 +1113,14 @@ impl Scanner {
     /// admissions/duplicates). Mid-apply failure leaves already-folded
     /// replacement blocks committed; retry continues from that checkpoint.
     ///
-    /// # Anchor-hash cache
+    /// # Anchor ancestry on reorg
     ///
-    /// The cache is valid only for a single connected-chain view. It is cleared
-    /// the moment a reorg is detected (`still_canonical == false`), **before**
-    /// any replacement-block validation or anchor `getblockhash`.
+    /// Anchor admissibility is a pure function of the inclusion block and its
+    /// ancestors (never the live tip). On reorg detection the ancestor-walk
+    /// cache is cleared (keys are inclusion hashes of the orphaned view) and
+    /// `verified_chain` is truncated to the fork before APPLY. Replacement
+    /// blocks resolve anchors by walking `prev_blockhash` from the inclusion
+    /// block itself.
     ///
     /// # Replacement linkage
     ///
@@ -1031,10 +1160,10 @@ impl Scanner {
                 return Ok((None, Vec::new()));
             }
 
-            // Finding 1: clear anchor cache the moment reorg is detected —
-            // BEFORE any replacement-block validation / getblockhash for anchors.
-            // Invariant: cache is valid only for a single connected-chain view.
-            self.anchor_hash_cache.clear();
+            // Finding 1: clear inclusion-keyed ancestor walks the moment reorg
+            // is detected — BEFORE any replacement-block validation. Verified
+            // chain history is truncated at APPLY (after fork is known).
+            self.ancestor_walk_cache.clear();
 
             // Highest common ancestor: walk down stored hashes.
             let mut fork_height: Option<u64> = None;
@@ -1131,18 +1260,21 @@ impl Scanner {
             }
 
             // ── APPLY (single atomic step after full collection succeeded) ─
-            // Anchor cache already cleared at reorg detection (Finding 1).
+            // Ancestor-walk cache already cleared at reorg detection (Finding 1).
 
-            // 1–3: retain survivors, replay retained stream, assign survivors.
+            // 1–3: retain survivors, replay retained stream, rebuild winner index.
             let outcome = self
                 .accumulator
                 .reorg_replay(old_tip_height, retained.clone())
                 .map_err(|e| anyhow!("accumulator reorg_replay failed: {e}"))?;
             self.survivors = retained;
+            self.rebuild_winner_index();
 
-            // 4: truncate checkpoints to fork.
+            // 4: truncate checkpoints and verified-chain history to fork.
             self.scanned_blocks
                 .retain(|&h, _| fork_height.map(|fork| h <= fork).unwrap_or(false));
+            self.verified_chain
+                .retain(|(h, _)| fork_height.map(|fork| *h <= fork).unwrap_or(false));
             self.scanned_through = match fork_height {
                 Some(fork) => {
                     let hash = *self.scanned_blocks.get(&fork).ok_or_else(|| {
@@ -1160,6 +1292,7 @@ impl Scanner {
                     self.fold_verified_nullifiers(&block.verified)?;
                 self.scanned_blocks.insert(block.height, block.block_hash);
                 self.scanned_through = Some((block.height, block.block_hash));
+                self.record_verified_block(block.height, block.block_hash);
                 block_reports.push(BlockScanResult {
                     height: block.height,
                     block_hash: block.block_hash,
@@ -1253,6 +1386,10 @@ impl Scanner {
     /// Fold verified nullifiers into the accumulator and append them to
     /// `survivors`. Shared by the forward path and reorg APPLY after truncate.
     ///
+    /// Duplicate winner lookup is **O(1)** via `winner_by_pk` (not a linear
+    /// scan of prior survivors). Complexity over a stream of `S` survivors
+    /// and `D` duplicates: `Θ(S + D)` total, not `Θ(D·S)`.
+    ///
     /// Returns `(admitted, duplicates, duplicate_details)`.
     fn fold_verified_nullifiers(
         &mut self,
@@ -1279,19 +1416,33 @@ impl Scanner {
                 })?;
             match outcome {
                 FoldOutcome::Appended(pos) => {
+                    // First occurrence: record winner position for O(1) duplicate lookup.
+                    if self.winner_by_pk.insert(nf.pk, nf.chain_pos).is_some() {
+                        bail!(
+                            "Appended nullifier but pk already present in winner_by_pk \
+                             (internal invariant broken) at {:?}",
+                            nf.chain_pos
+                        );
+                    }
                     admitted.push((nf.chain_pos, pos));
                 }
                 FoldOutcome::DuplicateIgnored => {
                     duplicates = duplicates
                         .checked_add(1)
                         .context("duplicates counter overflow")?;
-                    let winner_position = self.winner_chain_position(nf.pk).ok_or_else(|| {
-                        anyhow!(
-                            "DuplicateIgnored for pk but no winner in survivors/admitted \
-                             (internal invariant broken) at {:?}",
-                            nf.chain_pos
-                        )
-                    })?;
+                    #[cfg(test)]
+                    {
+                        self.winner_index_lookups =
+                            self.winner_index_lookups.saturating_add(1);
+                    }
+                    let winner_position =
+                        self.winner_by_pk.get(&nf.pk).copied().ok_or_else(|| {
+                            anyhow!(
+                                "DuplicateIgnored for pk but no winner in winner_by_pk \
+                                 (internal invariant broken) at {:?}",
+                                nf.chain_pos
+                            )
+                        })?;
                     duplicate_details.push(DuplicateNullifier {
                         position: nf.chain_pos,
                         winner_position,
@@ -1306,10 +1457,27 @@ impl Scanner {
                     );
                 }
             }
+            // Keep duplicates in survivors — a reorg can promote one to winner.
             self.survivors.push(*nf);
         }
 
         Ok((admitted, duplicates, duplicate_details))
+    }
+
+    /// Rebuild `winner_by_pk` from `survivors` in canonical order (first occurrence wins).
+    fn rebuild_winner_index(&mut self) {
+        self.winner_by_pk.clear();
+        for nf in &self.survivors {
+            self.winner_by_pk.entry(nf.pk).or_insert(nf.chain_pos);
+        }
+    }
+
+    /// Record a validated block in the verified-chain ancestry window.
+    fn record_verified_block(&mut self, height: u64, hash: BlockHash) {
+        self.verified_chain.push_back((height, hash));
+        while self.verified_chain.len() > VERIFIED_CHAIN_CAPACITY {
+            self.verified_chain.pop_front();
+        }
     }
 
     /// Fold verified nullifiers from an already-fetched, chain-linked block.
@@ -1330,6 +1498,7 @@ impl Scanner {
 
         self.scanned_blocks.insert(height, block_hash);
         self.scanned_through = Some((height, block_hash));
+        self.record_verified_block(height, block_hash);
 
         #[cfg(test)]
         if self.inject_reorg_after_commit_height == Some(height) {
@@ -1384,14 +1553,6 @@ impl Scanner {
             .context("parse generateblock hash")
     }
 
-    /// Chain position of the first-occurrence winner for `pk`, if any.
-    fn winner_chain_position(&self, pk: [u8; 32]) -> Option<ChainPosition> {
-        self.survivors
-            .iter()
-            .find(|n| n.pk == pk)
-            .map(|n| n.chain_pos)
-    }
-
     /// Discover → parse/bound-check → verify against an already-loaded block.
     fn collect_block_nullifiers_from(
         &mut self,
@@ -1408,6 +1569,10 @@ impl Scanner {
              ({height} < {})",
             self.config.activation_height
         );
+
+        // Inclusion block hash is a pure function of the block contents — used
+        // as the key for ancestry walks (never the live tip).
+        let inclusion_hash = block.block_hash();
 
         let mut verified = Vec::new();
         let mut rejected = Vec::new();
@@ -1476,7 +1641,12 @@ impl Scanner {
                     }
                 };
 
-                match self.check_anchor_on_chain(&agg.block_anchor, height) {
+                match self.check_anchor_for_inclusion(
+                    &agg.block_anchor,
+                    height,
+                    inclusion_hash,
+                    block,
+                ) {
                     Ok(()) => {}
                     Err(ScanOpError::Infrastructure(e)) => return Err(e.into()),
                     Err(ScanOpError::Data(failure)) => {
@@ -1524,13 +1694,34 @@ impl Scanner {
         Ok((verified, rejected, inscriptions_seen))
     }
 
-    fn check_anchor_on_chain(
+    /// §3.5 `block_anchor` bound against the **inclusion block's own ancestry**.
+    ///
+    /// # Invariant
+    ///
+    /// **Anchor admissibility is a pure function of the inclusion block and its
+    /// ancestors, and is never influenced by the current tip.** Two nodes that
+    /// agree on the inclusion block therefore agree on whether its payload's
+    /// anchor is admissible — even if one of them observed a transient fork of
+    /// the live tip during the scan (A → B → A). Resolving
+    /// `getblockhash(anchor_height)` against the live chain would couple the
+    /// decision to the tip and permanently diverge checkpoints; this path never
+    /// does that.
+    ///
+    /// Resolution order:
+    /// 1. Look up `anchor_height` in [`Self::verified_chain`] when that history
+    ///    is the parent chain of the inclusion block (already linkage-verified).
+    /// 2. Otherwise walk `prev_blockhash` from the inclusion block (at most
+    ///    [`MAX_ANCHOR_GAP`] steps) and cache the walk under the inclusion
+    ///    block hash so it cannot be reused on a different fork.
+    fn check_anchor_for_inclusion(
         &mut self,
         anchor: &BlockAnchor,
         inclusion_height: u64,
+        inclusion_hash: BlockHash,
+        inclusion_block: &Block,
     ) -> Result<(), ScanOpError> {
         let anchor_height = u64::from(anchor.height);
-        // Height/gap first so unit-testable messages stay stable; then chain identity.
+        // Height/gap first so unit-testable messages stay stable; then ancestry.
         if anchor_height >= inclusion_height {
             return Err(DataFailure::new(format!(
                 "block_anchor height {anchor_height} is not a strict ancestor of \
@@ -1547,25 +1738,178 @@ impl Scanner {
             .into());
         }
 
-        let canonical = match self.anchor_hash_cache.get(&anchor_height) {
-            Some(h) => *h,
-            None => {
-                let hash = self.rpc.get_block_hash(anchor_height).map_err(|e| {
+        let ancestor_hash = self.resolve_ancestor_hash(
+            inclusion_height,
+            inclusion_hash,
+            inclusion_block,
+            anchor_height,
+        )?;
+        evaluate_anchor_bound(anchor, inclusion_height, ancestor_hash.to_byte_array())
+            .map_err(|reason| ScanOpError::Data(DataFailure::new(reason)))
+    }
+
+    /// Hash of the block at `target_height` on the inclusion block's ancestor
+    /// chain. Never uses `getblockhash(height)` against the live tip.
+    fn resolve_ancestor_hash(
+        &mut self,
+        inclusion_height: u64,
+        inclusion_hash: BlockHash,
+        inclusion_block: &Block,
+        target_height: u64,
+    ) -> Result<BlockHash, ScanOpError> {
+        debug_assert!(target_height < inclusion_height);
+
+        // Fast path: parent of inclusion is exactly the target.
+        if target_height
+            .checked_add(1)
+            .expect("target_height + 1")
+            == inclusion_height
+        {
+            return Ok(inclusion_block.header.prev_blockhash);
+        }
+
+        // Prefer verified-chain history when it is the parent chain of inclusion.
+        if let Some(&(tip_h, tip_hash)) = self.verified_chain.back() {
+            let history_is_parent = tip_h
+                .checked_add(1)
+                .is_some_and(|h| h == inclusion_height)
+                && inclusion_block.header.prev_blockhash == tip_hash;
+            if history_is_parent {
+                if let Some((_, h)) = self
+                    .verified_chain
+                    .iter()
+                    .find(|(h, _)| *h == target_height)
+                {
+                    return Ok(*h);
+                }
+            }
+            // Inclusion itself already recorded (e.g. re-check) — look below it.
+            if let Some(idx) = self
+                .verified_chain
+                .iter()
+                .position(|(h, hash)| *h == inclusion_height && *hash == inclusion_hash)
+            {
+                if let Some((_, h)) = self.verified_chain.iter().take(idx).find(|(h, _)| {
+                    *h == target_height
+                }) {
+                    return Ok(*h);
+                }
+            }
+        }
+
+        // Walk-cache keyed by inclusion hash (fork-safe).
+        if let Some(map) = self.ancestor_walk_cache.get(&inclusion_hash) {
+            if let Some(h) = map.get(&target_height) {
+                return Ok(*h);
+            }
+        }
+
+        // Walk prev_blockhash from the inclusion block — deterministic function
+        // of the inclusion block, not of the live chain tip.
+        let mut walk: BTreeMap<u64, BlockHash> = self
+            .ancestor_walk_cache
+            .remove(&inclusion_hash)
+            .unwrap_or_default();
+        walk.insert(inclusion_height, inclusion_hash);
+
+        let mut cur_height = inclusion_height;
+        let mut cur_prev = inclusion_block.header.prev_blockhash;
+        let mut steps = 0u64;
+
+        while cur_height > target_height {
+            steps = match steps.checked_add(1) {
+                Some(s) => s,
+                None => {
+                    return Err(InfrastructureError::new(
+                        "ancestor walk step counter overflowed u64",
+                    )
+                    .into());
+                }
+            };
+            if steps > MAX_ANCHOR_GAP {
+                self.ancestor_walk_cache.insert(inclusion_hash, walk);
+                return Err(DataFailure::new(format!(
+                    "ancestor walk from inclusion {inclusion_height} exceeded \
+                     MAX_ANCHOR_GAP ({MAX_ANCHOR_GAP}) before reaching anchor \
+                     height {target_height}"
+                ))
+                .into());
+            }
+
+            let parent_height = match cur_height.checked_sub(1) {
+                Some(h) => h,
+                None => {
+                    return Err(InfrastructureError::new(
+                        "ancestor walk height underflowed u64",
+                    )
+                    .into());
+                }
+            };
+
+            // Short-circuit via verified_chain if we reconnect to known history.
+            if let Some((_, known)) = self
+                .verified_chain
+                .iter()
+                .find(|(h, hash)| *h == parent_height && *hash == cur_prev)
+            {
+                walk.insert(parent_height, *known);
+                if parent_height == target_height {
+                    self.ancestor_walk_cache.insert(inclusion_hash, walk);
+                    return Ok(*known);
+                }
+                // Remaining ancestors in the same verified window.
+                if let Some((_, deeper)) = self
+                    .verified_chain
+                    .iter()
+                    .find(|(h, _)| *h == target_height)
+                {
+                    walk.insert(target_height, *deeper);
+                    self.ancestor_walk_cache.insert(inclusion_hash, walk);
+                    return Ok(*deeper);
+                }
+                // History does not reach target; continue walking from known parent.
+                let parent_block: Block = self.rpc.get_block(known).map_err(|e| {
                     InfrastructureError::new(format!(
-                        "getblockhash({anchor_height}) for anchor identity check: {e}"
+                        "getblock({known}) during inclusion-ancestry walk for \
+                         anchor height {target_height}: {e}"
                     ))
                 })?;
                 #[cfg(test)]
                 {
-                    self.anchor_hash_rpc_count = self.anchor_hash_rpc_count.saturating_add(1);
+                    self.ancestor_walk_rpc_count =
+                        self.ancestor_walk_rpc_count.saturating_add(1);
                 }
-                self.anchor_hash_cache.insert(anchor_height, hash);
-                hash
+                cur_height = parent_height;
+                cur_prev = parent_block.header.prev_blockhash;
+                continue;
             }
-        };
-        let canonical_bytes = canonical.to_byte_array();
-        evaluate_anchor_bound(anchor, inclusion_height, canonical_bytes)
-            .map_err(|reason| ScanOpError::Data(DataFailure::new(reason)))
+
+            let parent_hash = cur_prev;
+            let parent_block: Block = self.rpc.get_block(&parent_hash).map_err(|e| {
+                InfrastructureError::new(format!(
+                    "getblock({parent_hash}) during inclusion-ancestry walk for \
+                     anchor height {target_height}: {e}"
+                ))
+            })?;
+            #[cfg(test)]
+            {
+                self.ancestor_walk_rpc_count = self.ancestor_walk_rpc_count.saturating_add(1);
+            }
+            walk.insert(parent_height, parent_hash);
+            if parent_height == target_height {
+                self.ancestor_walk_cache.insert(inclusion_hash, walk);
+                return Ok(parent_hash);
+            }
+            cur_height = parent_height;
+            cur_prev = parent_block.header.prev_blockhash;
+        }
+
+        self.ancestor_walk_cache.insert(inclusion_hash, walk);
+        Err(DataFailure::new(format!(
+            "ancestor walk from inclusion {inclusion_height} failed to reach \
+             anchor height {target_height}"
+        ))
+        .into())
     }
 
     /// Resolve the prevout for a reveal input.
@@ -1830,8 +2174,227 @@ mod tests {
 
     #[test]
     fn pinned_activation_height_regtest_is_zero() {
-        let h = pinned_activation_height(Network::Regtest).expect("regtest pin");
+        let params = regtest_network_params().expect("regtest params");
+        let h = pinned_activation_height(Network::Regtest, &params).expect("regtest pin");
         assert_eq!(h, 0, "§3.6 regtest activation_height = 0");
+    }
+
+    /// F2: mainnet/testnet accept a supplied NetworkParams pin (no compile-time invent).
+    #[test]
+    fn connect_accepts_mainnet_and_testnet_when_params_match() {
+        for (network, tag_bytes, height) in [
+            (Network::Mainnet, NETWORK_TAG_MAINNET, 840_000u64),
+            (Network::Testnet, NETWORK_TAG_TESTNET, 2_500_000u64),
+        ] {
+            let tag = std::str::from_utf8(tag_bytes)
+                .expect("tag utf8")
+                .to_string();
+            let params = NetworkParams::new(tag, [1u8; 32], [2u8; 32], height, 6, [3u8; 32])
+                .expect("params");
+            // Pin agreement runs before RPC — dummy URL/cookie still exercises the gate.
+            let result = Scanner::connect(ScannerConfig {
+                rpc_url: "http://127.0.0.1:1".into(),
+                cookie_path: PathBuf::from("/nonexistent-cookie-for-network-params-test"),
+                network,
+                activation_height: height,
+                network_params: params,
+            });
+            let err = match result {
+                Ok(_) => panic!("{network:?}: RPC must fail after pin check passes"),
+                Err(e) => e,
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                !msg.contains("does not match network_params")
+                    && !msg.contains("does not match pinned")
+                    && !msg.contains("deployment-observed"),
+                "{network:?}: pin agreement must pass; got: {msg}"
+            );
+            // Must not invent a refusal for mainnet/testnet when params are supplied.
+            assert!(
+                msg.contains("cookie")
+                    || msg.contains("RPC")
+                    || msg.contains("failed")
+                    || msg.contains("Connection")
+                    || msg.contains("os error")
+                    || msg.contains("No such file"),
+                "{network:?}: expected RPC/cookie failure after pin gate; got: {msg}"
+            );
+        }
+    }
+
+    /// F2: configured height that disagrees with NetworkParams is refused loudly.
+    #[test]
+    fn connect_rejects_mainnet_params_height_mismatch() {
+        let params = NetworkParams::new(
+            std::str::from_utf8(NETWORK_TAG_MAINNET)
+                .expect("utf8")
+                .to_string(),
+            [0u8; 32],
+            [0u8; 32],
+            840_000,
+            6,
+            [0u8; 32],
+        )
+        .expect("params");
+        let result = Scanner::connect(ScannerConfig {
+            rpc_url: "http://127.0.0.1:1".into(),
+            cookie_path: PathBuf::from("/nonexistent-cookie-for-mainnet-mismatch"),
+            network: Network::Mainnet,
+            activation_height: 840_001,
+            network_params: params,
+        });
+        let err = match result {
+            Ok(_) => panic!("mismatched mainnet activation_height must be refused"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("840001") && msg.contains("840000"),
+            "error must name both values; got: {msg}"
+        );
+        assert!(
+            msg.contains("activation_height") || msg.contains("network_params"),
+            "unexpected: {msg}"
+        );
+    }
+
+    /// F2: regtest NetworkParams with non-zero activation_height is refused.
+    #[test]
+    fn connect_rejects_regtest_nonzero_network_params() {
+        let tag = std::str::from_utf8(NETWORK_TAG_REGTEST)
+            .expect("utf8")
+            .to_string();
+        let params = NetworkParams::new(tag, [0u8; 32], [0u8; 32], 7, 6, [0u8; 32]).expect("ok");
+        let result = Scanner::connect(ScannerConfig {
+            rpc_url: "http://127.0.0.1:1".into(),
+            cookie_path: PathBuf::from("/nonexistent-cookie-for-regtest-nonzero"),
+            network: Network::Regtest,
+            activation_height: 7,
+            network_params: params,
+        });
+        let err = match result {
+            Ok(_) => panic!("nonzero regtest pin must be refused"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("regtest") && (msg.contains('0') || msg.contains("pin")),
+            "unexpected: {msg}"
+        );
+    }
+
+    /// F2 unit: chain/network rejection is independent of the activation pin.
+    #[test]
+    fn ensure_chain_matches_config_rejects_cross_network() {
+        // Bitcoin ↔ Mainnet; Regtest config must refuse a Bitcoin chain.
+        let err = ensure_chain_matches_config(bitcoin::Network::Bitcoin, Network::Regtest)
+            .expect_err("mainnet chain vs regtest config");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not match") || msg.contains("chain"),
+            "unexpected: {msg}"
+        );
+    }
+
+    /// F3: duplicate winner lookup is index-based (O(1) per duplicate).
+    #[test]
+    fn winner_lookup_is_index_based_not_linear() {
+        // Build a scanner without a live chain. UserPass auth avoids cookie I/O
+        // at Client construction; fold_verified_nullifiers never touches RPC.
+        let params = regtest_network_params().expect("params");
+        let rpc = Client::new(
+            "http://127.0.0.1:1",
+            Auth::UserPass("unit".into(), "test".into()),
+        )
+        .expect("client with userpass auth");
+        let mut scanner = Scanner {
+            rpc,
+            config: ScannerConfig {
+                rpc_url: "http://127.0.0.1:1".into(),
+                cookie_path: PathBuf::from("/nonexistent-for-winner-index-unit"),
+                network: Network::Regtest,
+                activation_height: 0,
+                network_params: params,
+            },
+            accumulator: NfLogAccumulator::new(0),
+            survivors: Vec::new(),
+            winner_by_pk: HashMap::new(),
+            scanned_through: None,
+            scanned_blocks: BTreeMap::new(),
+            parent_tx_cache: HashMap::new(),
+            verified_chain: VecDeque::new(),
+            ancestor_walk_cache: HashMap::new(),
+            inject_prevout_infra_failure: false,
+            inject_infra_fail_at_height: None,
+            inject_broken_link_at_height: None,
+            inject_reorg_after_commit_height: None,
+            inject_post_commit_rpc_failure: false,
+            prevout_rpc_count: 0,
+            winner_index_lookups: 0,
+            ancestor_walk_rpc_count: 0,
+        };
+
+        let pk = [0xABu8; 32];
+        let n_dups = 200usize;
+        let mut stream = Vec::with_capacity(1 + n_dups);
+        // Winner at position 0.
+        stream.push(PublishedNullifier {
+            chain_pos: ChainPosition {
+                height: 1,
+                tx_index: 0,
+                vin_index: 0,
+                member_index: 0,
+            },
+            pk,
+            r: [0x01; 32],
+        });
+        // Many duplicates of the same pk with distinct R — stay in survivors.
+        for i in 0..n_dups {
+            stream.push(PublishedNullifier {
+                chain_pos: ChainPosition {
+                    height: 1,
+                    tx_index: 0,
+                    vin_index: 0,
+                    member_index: u32::try_from(i + 1).expect("fits"),
+                },
+                pk,
+                r: {
+                    let mut r = [0u8; 32];
+                    r[0] = 0x02;
+                    r[1] = (i % 256) as u8;
+                    r[2] = (i / 256) as u8;
+                    r
+                },
+            });
+        }
+
+        let (admitted, duplicates, details) = scanner
+            .fold_verified_nullifiers(&stream)
+            .expect("fold stream");
+        assert_eq!(admitted.len(), 1, "one winner");
+        assert_eq!(duplicates, n_dups);
+        assert_eq!(details.len(), n_dups);
+        assert_eq!(
+            scanner.winner_index_lookups(),
+            n_dups,
+            "each duplicate must use exactly one O(1) index lookup"
+        );
+        assert_eq!(scanner.winner_index_len(), 1);
+        assert_eq!(
+            scanner.survivors().len(),
+            1 + n_dups,
+            "duplicates remain in survivors for reorg promotion"
+        );
+        // Structural: winner index holds the first occurrence, not a late loser.
+        assert_eq!(
+            details[0].winner_position,
+            stream[0].chain_pos,
+            "winner position must be the first occurrence"
+        );
+        for d in &details {
+            assert_eq!(d.winner_position, stream[0].chain_pos);
+        }
     }
 
     /// F4 unit: sticky finality across merged reorg outcomes.
@@ -1890,13 +2453,19 @@ mod tests {
     #[test]
     fn connect_rejects_activation_height_mismatch() {
         // Pin check runs before RPC — dummy URL/cookie still exercises the gate.
-        let pinned = pinned_activation_height(Network::Regtest).expect("pin");
+        // Configured height disagrees with network_params (and with regtest pin 0).
+        let params = regtest_network_params().expect("params");
+        let pinned = params.activation_height();
         let wrong = pinned.saturating_add(7);
+        // Use non-zero wrong height: regtest gate rejects params pin first when
+        // params say 0 and config says 7. Construct params with height 0 and
+        // mismatched config field.
         let result = Scanner::connect(ScannerConfig {
             rpc_url: "http://127.0.0.1:1".into(),
             cookie_path: PathBuf::from("/nonexistent-cookie-for-activation-height-test"),
             network: Network::Regtest,
             activation_height: wrong,
+            network_params: params,
         });
         let err = match result {
             Ok(_) => panic!("mismatched activation_height must be refused at connect"),
@@ -1908,7 +2477,9 @@ mod tests {
             "error must name both configured and pinned values; got: {msg}"
         );
         assert!(
-            msg.contains("activation_height") || msg.contains("pinned"),
+            msg.contains("activation_height")
+                || msg.contains("network_params")
+                || msg.contains("pinned"),
             "unexpected: {msg}"
         );
     }
@@ -1921,6 +2492,7 @@ mod tests {
             cookie_path: PathBuf::from("/nonexistent-cookie-for-activation-height-test"),
             network: Network::Regtest,
             activation_height: 0,
+            network_params: regtest_network_params().expect("params"),
         });
         let err = match result {
             Ok(_) => panic!("RPC/cookie must fail after pin check passes"),
@@ -1928,7 +2500,7 @@ mod tests {
         };
         let msg = format!("{err:#}");
         assert!(
-            !msg.contains("does not match pinned"),
+            !msg.contains("does not match network_params") && !msg.contains("does not match pinned"),
             "pinned height must be accepted; got: {msg}"
         );
     }
@@ -1968,6 +2540,7 @@ mod tests {
             cookie_path: PathBuf::from(cookie),
             network: Network::Regtest,
             activation_height: 0, // §3.6 regtest pin — passed explicitly
+            network_params: regtest_network_params().expect("regtest NetworkParams"),
         })
         .expect("Scanner::connect to live regtest must succeed")
     }
@@ -3142,7 +3715,8 @@ mod tests {
         let _ = scanner.scan_to_tip();
     }
 
-    /// F6: repeated parent fetched once per scan run; anchor-hash cache dropped on reorg.
+    /// F6: repeated parent fetched once per scan run; verified-chain history
+    /// tracks scanned blocks; ancestry walks are keyed by inclusion hash.
     #[test]
     #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
     fn regtest_scanner_prevout_and_anchor_caches() {
@@ -3164,25 +3738,22 @@ mod tests {
         let report = scanner.scan_to_tip().expect("scan");
         assert!(report.admitted_count >= 1);
         let prevout_rpcs = scanner.prevout_rpc_count();
-        let anchor_rpcs = scanner.anchor_hash_rpc_count();
-        let anchor_cache_len = scanner.anchor_hash_cache_len();
         assert!(
             prevout_rpcs >= 1,
             "at least one prevout RPC expected, got {prevout_rpcs}"
         );
         assert!(
-            anchor_rpcs >= 1,
-            "at least one anchor hash RPC expected, got {anchor_rpcs}"
+            scanner.verified_chain_len() >= 1,
+            "verified-chain history must record scanned blocks"
         );
-        assert!(
-            anchor_cache_len >= 1,
-            "anchor cache should hold entries after scan"
+        // Gap-1 anchors resolve from inclusion.prev_blockhash — zero walk RPCs.
+        assert_eq!(
+            scanner.ancestor_walk_rpc_count(),
+            0,
+            "gap-1 anchor must not need ancestry walk RPCs"
         );
 
-        // Second inscription sharing nothing new still uses the per-run cache
-        // reset — each scan_to_tip clears parent cache. Within a single block
-        // with one reveal input, count is 1. Publish another and scan; counts
-        // reset per run.
+        // Second inscription: per-run parent cache resets each scan_to_tip.
         let sigs2 = signed_members(1, &unique_tag("f6-cache-2"));
         let batch2 = publisher
             .publish(&batch_at_tip(&publisher, &sigs2))
@@ -3192,7 +3763,6 @@ mod tests {
             .wait_for_confirmation(&batch2.reveal_txid, 1, Duration::from_secs(30))
             .expect("confirm2");
         let _ = scanner.scan_to_tip().expect("scan2");
-        // One reveal input → one parent fetch for this run.
         assert_eq!(
             scanner.prevout_rpc_count(),
             1,
@@ -3200,26 +3770,16 @@ mod tests {
             scanner.prevout_rpc_count()
         );
 
-        // Reorg drops the anchor-hash cache.
-        let (tip_h, tip_hash) = scanner.scanned_through().expect("tip");
-        let _ = tip_h;
-        assert!(scanner.anchor_hash_cache_len() >= 1);
+        // Reorg onto empty replacement: verified history truncates to fork;
+        // no new inscriptions → no new walk RPCs this run.
+        let (_tip_h, tip_hash) = scanner.scanned_through().expect("tip");
         rpc.invalidate_block(&tip_hash).expect("invalidate");
         let _ = mine_empty_block(&rpc);
         let _ = scanner.scan_to_tip().expect("reorg scan");
-        // After reorg apply, cache was cleared then may re-fill for any new
-        // anchors seen during recollect/forward. The seam is that clear ran:
-        // if recollect has no inscriptions, cache stays empty.
-        // Force a known clear observation by checking reorg path was taken.
-        // (If replacement had no envelopes, cache length is 0.)
-        // Accept either empty or re-filled; the proving property is no panic
-        // and reorg completed. Stronger: inject by checking cache was cleared
-        // mid-path via unit observation after reorg of empty blocks.
-        // With empty replacement, no anchor RPCs during recollect → cache empty.
         assert_eq!(
-            scanner.anchor_hash_cache_len(),
+            scanner.ancestor_walk_rpc_count(),
             0,
-            "anchor-hash cache must be empty after reorg onto empty blocks"
+            "empty replacement must not issue ancestry walk RPCs"
         );
 
         let _ = mine_empty_block(&rpc);
@@ -3247,11 +3807,11 @@ mod tests {
         None
     }
 
-    /// F1: after reorg, anchor-hash cache must not accept an orphaned-fork hash.
+    /// F1: after reorg, ancestry check must not accept an orphaned-fork hash.
     ///
-    /// Catch up, publish+mine nullifier on A_H, scan (fills cache). Invalidate
-    /// A_H; mine empty B_H. Broadcast good (anchor B_H) and bad (anchor orphaned
-    /// A_H) for inclusion in B_{H+1}. Mine. scan_to_tip admits good, rejects bad.
+    /// Catch up, publish+mine nullifier on A_H, scan. Invalidate A_H; mine empty
+    /// B_H. Broadcast good (anchor B_H) and bad (anchor orphaned A_H) for
+    /// inclusion in B_{H+1}. Mine. scan_to_tip admits good, rejects bad.
     #[test]
     #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
     fn regtest_scanner_replacement_anchor_cache() {
@@ -3271,8 +3831,8 @@ mod tests {
         let report0 = scanner.scan_to_tip().expect("scan A_H");
         assert!(report0.admitted_count >= 1);
         assert!(
-            scanner.anchor_hash_cache_len() >= 1,
-            "scan must populate anchor-hash cache"
+            scanner.verified_chain_len() >= 1,
+            "scan must populate verified-chain history"
         );
         let (orphaned_h, orphaned_hash) = scanner.scanned_through().expect("tip A_H");
         let orphaned_bytes = orphaned_hash.to_byte_array();
@@ -3338,9 +3898,12 @@ mod tests {
             .collect();
         assert!(
             reasons.iter().any(|r| {
-                r.contains("canonical") || r.contains("chain") || r.contains("hash")
+                r.contains("ancestor")
+                    || r.contains("chain")
+                    || r.contains("hash")
+                    || r.contains("block_anchor")
             }),
-            "bad-anchor rejection must mention canonical/chain/hash; got: {reasons:?}"
+            "bad-anchor rejection must mention ancestry/chain/hash; got: {reasons:?}"
         );
 
         let mut fresh = live_scanner();
@@ -3348,7 +3911,7 @@ mod tests {
         assert_eq!(
             scanner.accumulator().nav().mth,
             fresh.accumulator().nav().mth,
-            "running scanner must match fresh scan after anchor-cache reorg"
+            "running scanner must match fresh scan after ancestry reorg"
         );
 
         let _ = mine_empty_block(&rpc);
@@ -3358,6 +3921,265 @@ mod tests {
             good_reveal,
             bad_reveal,
         ] {
+            let _ = rpc.call::<bitcoincore_rpc::jsonrpc::serde_json::Value>(
+                "abandontransaction",
+                &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(txid.to_string())],
+            );
+        }
+        let _ = scanner.scan_to_tip();
+    }
+
+    /// F1 (critical design): A→B→A around a block with an A-ancestor anchor.
+    ///
+    /// Anchor admissibility is a pure function of the inclusion block and its
+    /// ancestors — independent of the live tip. A transient A→B→A reorg must
+    /// not change the admission decision relative to a fresh scanner on final A.
+    /// Converse: a payload naming orphaned B_(h-1) inside a block of chain A is
+    /// rejected by both.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_scanner_anchor_aba_fork_matches_fresh() {
+        let publisher = live_publisher();
+        let mut scanner = live_scanner();
+        let _ = catch_up(&mut scanner);
+        let rpc = wallet_rpc();
+
+        // ── Build orphaned B_parent at height H_parent ────────────────────
+        let a_parent_hash = rpc
+            .get_block_hash(rpc.get_block_count().expect("tip"))
+            .expect("a_parent");
+        let parent_height = rpc.get_block_count().expect("tip");
+        rpc.invalidate_block(&a_parent_hash)
+            .expect("invalidate a_parent");
+        let b_parent_hash = mine_empty_block(&rpc);
+        assert_ne!(b_parent_hash, a_parent_hash);
+        // Return to A: invalidate B, reconsider A.
+        rpc.invalidate_block(&b_parent_hash)
+            .expect("invalidate b_parent");
+        let _: bitcoincore_rpc::jsonrpc::serde_json::Value = rpc
+            .call(
+                "reconsiderblock",
+                &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(
+                    a_parent_hash.to_string(),
+                )],
+            )
+            .expect("reconsider a_parent");
+        let live_parent = rpc.get_block_hash(parent_height).expect("live parent");
+        assert_eq!(live_parent, a_parent_hash, "must be back on A at parent");
+        // Catch up after the tip oscillated (scanner may still be at old tip).
+        let _ = scanner.scan_to_tip().expect("catch up after parent fork");
+
+        // ── Good payload (anchor A_parent) + bad payload (anchor B_parent) ─
+        let good_sigs = signed_members(1, &unique_tag("f1-aba-good"));
+        let good_pk = good_sigs[0].pk;
+        let good_anchor = BlockAnchor {
+            block_hash: a_parent_hash.to_byte_array(),
+            height: u32::try_from(parent_height).expect("fits"),
+        };
+        let good_agg =
+            aggregate_sig_with_anchor(&good_sigs, good_anchor).expect("good agg");
+        let (_gc, good_reveal) = broadcast_raw_payload(&good_agg.serialize());
+
+        let bad_sigs = signed_members(1, &unique_tag("f1-aba-bad"));
+        let bad_pk = bad_sigs[0].pk;
+        let bad_anchor = BlockAnchor {
+            block_hash: b_parent_hash.to_byte_array(),
+            height: u32::try_from(parent_height).expect("fits"),
+        };
+        let bad_agg = aggregate_sig_with_anchor(&bad_sigs, bad_anchor).expect("bad agg");
+        let (_bc, bad_reveal) = broadcast_raw_payload(&bad_agg.serialize());
+
+        // Mine both into A_h via generatetoaddress (pulls mempool).
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&good_reveal, 1, Duration::from_secs(30))
+            .expect("confirm good");
+        publisher
+            .wait_for_confirmation(&bad_reveal, 1, Duration::from_secs(30))
+            .expect("confirm bad");
+        let inclusion_height = rpc.get_block_count().expect("tip after mine");
+        let a_inclusion = rpc
+            .get_block_hash(inclusion_height)
+            .expect("a inclusion hash");
+
+        // ── A → B → A at the inclusion height ─────────────────────────────
+        // Invalidate A_h, mine two empty B blocks (B longer), then invalidate B
+        // and reconsider A_h so the active tip is again A.
+        rpc.invalidate_block(&a_inclusion)
+            .expect("invalidate a_inclusion");
+        let b_inclusion = mine_empty_block(&rpc);
+        let b_extra = mine_empty_block(&rpc);
+        assert_ne!(b_inclusion, a_inclusion);
+        // Peel B from the tip down to inclusion height, then reconsider A.
+        rpc.invalidate_block(&b_extra).expect("invalidate b_extra");
+        rpc.invalidate_block(&b_inclusion)
+            .expect("invalidate b_inclusion");
+        let _: bitcoincore_rpc::jsonrpc::serde_json::Value = rpc
+            .call(
+                "reconsiderblock",
+                &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(
+                    a_inclusion.to_string(),
+                )],
+            )
+            .expect("reconsider a_inclusion");
+        let live_inc = rpc
+            .get_block_hash(inclusion_height)
+            .expect("live inclusion");
+        assert_eq!(
+            live_inc, a_inclusion,
+            "must be back on A at inclusion height after A→B→A"
+        );
+
+        // ── Scan: long-lived + fresh must agree ───────────────────────────
+        let report = scanner.scan_to_tip().expect("scan after A→B→A");
+        assert!(
+            matches!(
+                scanner.accumulator().lookup(good_pk),
+                shared::spec_v1::LookupResult::Present { .. }
+            ),
+            "good A-anchor payload must be admitted after A→B→A; report={report:?}"
+        );
+        assert!(
+            matches!(
+                scanner.accumulator().lookup(bad_pk),
+                shared::spec_v1::LookupResult::Absent
+            ),
+            "bad B-anchor payload must be rejected on chain A"
+        );
+        let reasons: Vec<&str> = report
+            .blocks
+            .iter()
+            .flat_map(|b| b.rejected.iter().map(|r| r.reason.as_str()))
+            .collect();
+        assert!(
+            reasons.iter().any(|r| {
+                r.contains("ancestor")
+                    || r.contains("chain")
+                    || r.contains("hash")
+                    || r.contains("block_anchor")
+            }),
+            "bad-anchor reason expected; got: {reasons:?}"
+        );
+
+        let mut fresh = live_scanner();
+        let _ = catch_up(&mut fresh);
+        assert_eq!(
+            scanner.accumulator().nav().mth,
+            fresh.accumulator().nav().mth,
+            "scanner that lived through A→B→A must match fresh scan of final A"
+        );
+        assert_eq!(
+            scanner.accumulator().nav().size,
+            fresh.accumulator().nav().size
+        );
+        assert!(
+            matches!(
+                fresh.accumulator().lookup(good_pk),
+                shared::spec_v1::LookupResult::Present { .. }
+            ),
+            "fresh scanner must also admit good"
+        );
+        assert!(
+            matches!(
+                fresh.accumulator().lookup(bad_pk),
+                shared::spec_v1::LookupResult::Absent
+            ),
+            "fresh scanner must also reject bad B-anchor"
+        );
+
+        let _ = mine_empty_block(&rpc);
+        for txid in [good_reveal, bad_reveal] {
+            let _ = rpc.call::<bitcoincore_rpc::jsonrpc::serde_json::Value>(
+                "abandontransaction",
+                &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(txid.to_string())],
+            );
+        }
+        let _ = scanner.scan_to_tip();
+    }
+
+    /// F4: post-commit getblockcount/getblockhash failure carries partial report.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_scanner_post_commit_rpc_failure_partial_report() {
+        let publisher = live_publisher();
+        let mut scanner = live_scanner();
+        let _ = catch_up(&mut scanner);
+        let size_before = scanner.accumulator().nav().size;
+
+        let sigs = signed_members(1, &unique_tag("f4-post-commit-rpc"));
+        let batch = publisher
+            .publish(&batch_at_tip(&publisher, &sigs))
+            .expect("publish");
+        mine_one(&publisher);
+        publisher
+            .wait_for_confirmation(&batch.reveal_txid, 1, Duration::from_secs(30))
+            .expect("confirm");
+
+        // After the block is folded+checkpointed, tip re-read fails.
+        scanner.inject_post_commit_rpc_failure();
+        let err = scanner
+            .scan_to_tip()
+            .expect_err("post-commit RPC failure must abort");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("infrastructure")
+                || msg.contains("injected")
+                || msg.contains("post-commit"),
+            "expected post-commit infra error, got: {msg}"
+        );
+        let infra = infra_from_err(&err).expect("must be InfrastructureError");
+        let partial = infra
+            .partial_report()
+            .expect("partial_report must be Some after block committed");
+        assert!(
+            partial.admitted_count >= 1,
+            "partial must report the committed admissions; admitted={}",
+            partial.admitted_count
+        );
+        assert!(
+            !partial.blocks.is_empty(),
+            "partial must include the committed block report"
+        );
+        // Work is durable: checkpoint advanced, nullifier folded.
+        assert!(
+            matches!(
+                scanner.accumulator().lookup(sigs[0].pk),
+                shared::spec_v1::LookupResult::Present { .. }
+            ),
+            "committed nullifier must remain after post-commit abort"
+        );
+        assert!(
+            scanner.accumulator().nav().size >= size_before + 1,
+            "accumulator must retain the committed admission"
+        );
+
+        // Retry does not re-process the already-checkpointed block; the caller
+        // already observed its admissions/duplicates/rejections in partial_report.
+        let committed_height = partial.blocks[0].height;
+        let report = scanner.scan_to_tip().expect("retry must succeed");
+        assert!(
+            !report.blocks.iter().any(|b| b.height == committed_height),
+            "retry must not re-report the already-checkpointed height {committed_height}; \
+             got heights {:?}",
+            report.blocks.iter().map(|b| b.height).collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(
+                scanner.accumulator().lookup(sigs[0].pk),
+                shared::spec_v1::LookupResult::Present { .. }
+            ),
+            "pk still present after retry"
+        );
+        let mut fresh = live_scanner();
+        let _ = catch_up(&mut fresh);
+        assert_eq!(
+            scanner.accumulator().nav().mth,
+            fresh.accumulator().nav().mth
+        );
+
+        let rpc = wallet_rpc();
+        let _ = mine_empty_block(&rpc);
+        for txid in [batch.commit_txid, batch.reveal_txid] {
             let _ = rpc.call::<bitcoincore_rpc::jsonrpc::serde_json::Value>(
                 "abandontransaction",
                 &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(txid.to_string())],
