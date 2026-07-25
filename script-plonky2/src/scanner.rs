@@ -66,14 +66,12 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use bitcoin::hashes::Hash;
-use bitcoin::{Block, BlockHash, Transaction, TxIn, TxOut, Txid};
+use bitcoin::{Block, BlockHash, TxIn, TxOut, Txid};
 use bitcoincore_rpc::json::GetIndexInfoResult;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use shared::spec_v1::accumulator::ReorgOutcome;
 use shared::spec_v1::network_params::NetworkParams;
-use shared::spec_v1::tags::NETWORK_TAG_REGTEST;
-#[cfg(test)]
-use shared::spec_v1::tags::{NETWORK_TAG_MAINNET, NETWORK_TAG_TESTNET};
+use shared::spec_v1::tags::{NETWORK_TAG_MAINNET, NETWORK_TAG_REGTEST, NETWORK_TAG_TESTNET};
 use shared::spec_v1::{ChainPosition, FoldOutcome, NfLogAccumulator, PublishedNullifier};
 use zkcoins_program_plonky2::circuit::compliance::Network;
 
@@ -92,19 +90,61 @@ pub const MAX_ANCHOR_GAP: u64 = 100;
 /// (`MAX_ANCHOR_GAP` ancestors plus the inclusion block itself).
 const VERIFIED_CHAIN_CAPACITY: usize = (MAX_ANCHOR_GAP as usize) + 1;
 
+/// Maximum number of inclusion-block ancestor maps retained in
+/// [`Scanner`]'s walk cache.
+///
+/// Eviction is deterministic by inclusion [`BlockHash`] ascending (lowest hash
+/// first, never the entry just retained). Evicting only costs a re-walk of that
+/// inclusion block's ancestry; retaining without limit costs memory an attacker
+/// controls during replacement collection (when `verified_chain` is not
+/// advanced until apply).
+const ANCESTOR_WALK_CACHE_CAPACITY: usize = 16;
+
+/// Worst-case `getblock` RPCs issued for ancestry resolution **within one
+/// inclusion block**, when every gap in `2..=MAX_ANCHOR_GAP` is requested once
+/// and `verified_chain` does not cover the walk: **`MAX_ANCHOR_GAP - 1`**.
+///
+/// The walk resumes from the deepest already-cached ancestor of that inclusion
+/// block, so each deeper gap costs one additional RPC rather than re-walking
+/// the prefix. Without resume the same pattern would be
+/// `Θ(MAX_ANCHOR_GAP²)` (`1+2+…+(MAX_ANCHOR_GAP-1)`).
+
 /// OP_FALSE (`0x00`) followed by OP_IF (`0x63`) — the §3.5 envelope opener.
 const ENVELOPE_OPENER: [u8; 2] = [0x00, 0x63];
 
 /// Scanner configuration. Every field is mandatory — no silent defaults.
 ///
-/// `activation_height` is a pinned consensus parameter (§3.6 "Scan origin").
-/// It must equal [`NetworkParams::activation_height`] of the supplied
-/// [`Self::network_params`]. [`Scanner::connect`] **rejects** disagreement;
-/// it never silently substitutes the pinned value for a wrong configuration.
+/// # Scan-origin pin (§3.6)
+///
+/// `activation_height` is a consensus parameter: two nodes that start at
+/// different heights fold different first-occurrence sequences and diverge on
+/// every position and `mth`. The height must equal
+/// [`NetworkParams::activation_height`] of the supplied
+/// [`Self::network_params`], and for **regtest** both must be `0`.
+///
+/// # Why the identifier check carries the cross-node guarantee
+///
+/// Comparing `activation_height` to `network_params.activation_height()` alone
+/// is a **tautology** when both values come from the same caller: a Signet
+/// operator can invent a wrong height, build a matching hand-made
+/// [`NetworkParams`], and connect successfully while a peer using the published
+/// artifact starts elsewhere — permanent divergence.
+///
+/// §3.6 makes the network-parameter set **content-addressed**: its identifier
+/// is `SHA-256` over the canonical encoding of every field (network tag,
+/// circuit digests, `activation_height`, finality confirmations, bootstrap
+/// pubkey), and "two nodes agree iff this byte string is identical".
+/// [`Self::expected_params_identifier`] is that published identity — copied by
+/// the operator from `network-params.json`. [`Scanner::connect`] verifies
+/// `network_params.identifier() == expected_params_identifier`. Any difference
+/// in **any** field, including `activation_height`, changes the identifier, so
+/// a node can no longer diverge by accident. The height comparison and
+/// network-tag check remain as defense-in-depth and clearer error messages;
+/// they do not replace the identifier anchor.
 ///
 /// For **mainnet** and **testnet** the pin is deployment-observed and must be
-/// supplied via `network_params` (there is no compile-time constant). For
-/// **regtest** §3.6 pins `0` and connect enforces that.
+/// supplied via the published `network_params` (there is no compile-time
+/// constant). For **regtest** §3.6 pins `activation_height = 0`.
 #[derive(Clone, Debug)]
 pub struct ScannerConfig {
     /// Base RPC URL, e.g. `http://127.0.0.1:18443` (no wallet path required).
@@ -120,8 +160,17 @@ pub struct ScannerConfig {
     pub activation_height: u64,
     /// Pinned network-parameter set (§3.6). Required for every network —
     /// never optional, never defaulted. Its `activation_height` is the
-    /// consensus pin that [`Self::activation_height`] must match.
+    /// consensus pin that [`Self::activation_height`] must match, and its
+    /// [`NetworkParams::identifier`] must equal
+    /// [`Self::expected_params_identifier`].
     pub network_params: NetworkParams,
+    /// SHA-256 identifier of the **published** `network-params.json` (§3.6).
+    ///
+    /// The operator copies this from the published artifact. `connect` verifies
+    /// `network_params.identifier() == expected_params_identifier` and fails
+    /// loudly with both values on mismatch. This is the external-truth anchor
+    /// that makes self-consistent but unpublished parameter sets unusable.
+    pub expected_params_identifier: [u8; 32],
 }
 
 /// Deterministic inscription rejection (a pure function of chain content).
@@ -316,13 +365,14 @@ pub struct Scanner {
     scanned_through: Option<(u64, BlockHash)>,
     /// Every height → hash observed while scanning (for reorg common-ancestor).
     scanned_blocks: BTreeMap<u64, BlockHash>,
-    /// Per-scan-run cache of parent transactions for prevout resolution.
+    /// Per-scan-run cache of parent **outputs** for prevout resolution.
     ///
     /// Bound: at most one `getrawtransaction` per distinct parent `txid` per
     /// [`Scanner::scan_to_tip`] call (cleared at the start of each call). A
     /// transaction with many inputs spending the same parent therefore costs
-    /// one RPC, not one per input.
-    parent_tx_cache: HashMap<Txid, Transaction>,
+    /// one RPC, not one per input. On a cache hit only the selected [`TxOut`]
+    /// is cloned — never the whole parent transaction.
+    parent_output_cache: HashMap<Txid, Vec<TxOut>>,
     /// Hashes of the last [`VERIFIED_CHAIN_CAPACITY`] blocks this scanner has
     /// actually validated (via `prev_blockhash` linkage). Used for
     /// `block_anchor` ancestry checks relative to the inclusion block —
@@ -333,7 +383,12 @@ pub struct Scanner {
     /// resolved by walking `prev_blockhash` from that inclusion block. An entry
     /// can never be reused under a different fork because the key is the
     /// inclusion block's own hash.
-    ancestor_walk_cache: HashMap<BlockHash, BTreeMap<u64, BlockHash>>,
+    ///
+    /// Bounded by [`ANCESTOR_WALK_CACHE_CAPACITY`] with deterministic eviction
+    /// by inclusion hash ascending. Walks **resume** from the deepest already-
+    /// cached ancestor rather than restarting from the inclusion block
+    /// (ancestry of a fixed inclusion block is immutable).
+    ancestor_walk_cache: BTreeMap<BlockHash, BTreeMap<u64, BlockHash>>,
     /// Test seam: next prevout fetch fails as infrastructure (then clears).
     #[cfg(test)]
     inject_prevout_infra_failure: bool,
@@ -354,6 +409,9 @@ pub struct Scanner {
     /// Test counter: how many `getrawtransaction` RPCs this scan run issued.
     #[cfg(test)]
     prevout_rpc_count: usize,
+    /// Test counter: how many prevout lookups took the output-cache hit path.
+    #[cfg(test)]
+    prevout_cache_hits: usize,
     /// Test counter: how many O(1) winner-index lookups this scan run issued.
     #[cfg(test)]
     winner_index_lookups: usize,
@@ -366,10 +424,14 @@ impl Scanner {
     /// Connect to bitcoind with cookie auth and verify the chain matches
     /// [`ScannerConfig::network`].
     ///
-    /// Also enforces:
-    /// - `activation_height` equals `network_params.activation_height()`
-    ///   (§3.6 Scan origin — load the published pin and compare);
-    /// - regtest pin is `0` (§3.6);
+    /// Also enforces (§3.6 Scan origin / content-addressed parameters):
+    /// - `network_params.identifier() == expected_params_identifier` — the
+    ///   external-truth anchor to the published `network-params.json` (any
+    ///   field change, including `activation_height`, changes the identifier);
+    /// - `network_params.network_tag()` corresponds to `config.network`
+    ///   (a mainnet parameter set cannot be paired with a testnet config);
+    /// - `activation_height` equals `network_params.activation_height()`;
+    /// - regtest pin is `0`;
     /// - `txindex` is enabled **and** fully synchronized (`getindexinfo`).
     pub fn connect(config: ScannerConfig) -> Result<Self> {
         ensure!(
@@ -379,6 +441,35 @@ impl Scanner {
         ensure!(
             !config.cookie_path.as_os_str().is_empty(),
             "ScannerConfig.cookie_path must not be empty"
+        );
+
+        // §3.6 content-addressed identity: the published artifact identifier
+        // is the guarantee. Height equality alone is caller-supplied on both
+        // sides and would accept a self-consistent but unpublished set.
+        let actual_id = config.network_params.identifier().map_err(|e| {
+            anyhow!(
+                "network_params.identifier() failed (canonical encoding / tag): {e}"
+            )
+        })?;
+        ensure!(
+            actual_id == config.expected_params_identifier,
+            "network_params.identifier() {} does not match \
+             ScannerConfig.expected_params_identifier {} \
+             (§3.6 content-addressed network-params — refuse to start rather than \
+             fold a divergent log; any field difference including activation_height \
+             changes the identifier)",
+            bytes_to_hex(&actual_id),
+            bytes_to_hex(&config.expected_params_identifier)
+        );
+
+        let expected_tag = network_tag_for(config.network)?;
+        let actual_tag = config.network_params.network_tag();
+        ensure!(
+            actual_tag == expected_tag,
+            "network_params.network_tag() {actual_tag:?} does not correspond to \
+             ScannerConfig.network {:?} (expected tag {expected_tag:?}) — refuse to \
+             start rather than fold a divergent log",
+            config.network
         );
 
         let pinned = config.network_params.activation_height();
@@ -428,9 +519,9 @@ impl Scanner {
             winner_by_pk: HashMap::new(),
             scanned_through: None,
             scanned_blocks: BTreeMap::new(),
-            parent_tx_cache: HashMap::new(),
+            parent_output_cache: HashMap::new(),
             verified_chain: VecDeque::new(),
-            ancestor_walk_cache: HashMap::new(),
+            ancestor_walk_cache: BTreeMap::new(),
             #[cfg(test)]
             inject_prevout_infra_failure: false,
             #[cfg(test)]
@@ -443,6 +534,8 @@ impl Scanner {
             inject_post_commit_rpc_failure: false,
             #[cfg(test)]
             prevout_rpc_count: 0,
+            #[cfg(test)]
+            prevout_cache_hits: 0,
             #[cfg(test)]
             winner_index_lookups: 0,
             #[cfg(test)]
@@ -477,13 +570,14 @@ impl Scanner {
     /// (`scanned_through`) when any block has been scanned — never a live RPC
     /// tip the accumulator does not reflect.
     pub fn scan_to_tip(&mut self) -> Result<ScanReport> {
-        // Fresh per-run parent cache. Verified-chain history and ancestor-walk
-        // cache are fork-keyed / linkage-verified and survive across calls;
-        // reorg handling truncates / clears them explicitly.
-        self.parent_tx_cache.clear();
+        // Fresh per-run parent-output cache. Verified-chain history and
+        // ancestor-walk cache are fork-keyed / linkage-verified and survive
+        // across calls; reorg handling truncates / clears them explicitly.
+        self.parent_output_cache.clear();
         #[cfg(test)]
         {
             self.prevout_rpc_count = 0;
+            self.prevout_cache_hits = 0;
             self.winner_index_lookups = 0;
             self.ancestor_walk_rpc_count = 0;
         }
@@ -694,16 +788,41 @@ impl Scanner {
         self.ancestor_walk_rpc_count
     }
 
+    /// Test observation: number of inclusion-block maps in the walk cache.
+    #[cfg(test)]
+    pub fn ancestor_walk_cache_len(&self) -> usize {
+        self.ancestor_walk_cache.len()
+    }
+
     /// Test observation: verified-chain history length.
     #[cfg(test)]
     pub fn verified_chain_len(&self) -> usize {
         self.verified_chain.len()
     }
 
+    /// Test seam: drop verified-chain history so ancestry walks must use RPC
+    /// (and the walk cache / resume path) rather than the in-memory window.
+    #[cfg(test)]
+    pub fn clear_verified_chain_for_test(&mut self) {
+        self.verified_chain.clear();
+    }
+
     /// Test observation: winner index size.
     #[cfg(test)]
     pub fn winner_index_len(&self) -> usize {
         self.winner_by_pk.len()
+    }
+
+    /// Test observation: prevout output-cache hits this scan run.
+    #[cfg(test)]
+    pub fn prevout_cache_hits(&self) -> usize {
+        self.prevout_cache_hits
+    }
+
+    /// Test seam: prime the parent-output cache without RPC (unit tests).
+    #[cfg(test)]
+    pub fn inject_parent_outputs_for_test(&mut self, txid: Txid, outputs: Vec<TxOut>) {
+        self.parent_output_cache.insert(txid, outputs);
     }
 
     /// Borrow the in-memory Path-A accumulator rebuilt from the chain.
@@ -756,6 +875,30 @@ impl Scanner {
     #[cfg(test)]
     pub fn prevout_rpc_count(&self) -> usize {
         self.prevout_rpc_count
+    }
+
+    /// Retain an inclusion-keyed ancestor walk under the capacity bound.
+    ///
+    /// Evicts the lowest inclusion [`BlockHash`] among entries other than
+    /// `inclusion_hash` until `len ≤ ANCESTOR_WALK_CACHE_CAPACITY`. Deterministic
+    /// (no randomness, no insertion-time ordering).
+    fn retain_ancestor_walk(
+        &mut self,
+        inclusion_hash: BlockHash,
+        walk: BTreeMap<u64, BlockHash>,
+    ) {
+        self.ancestor_walk_cache.insert(inclusion_hash, walk);
+        while self.ancestor_walk_cache.len() > ANCESTOR_WALK_CACHE_CAPACITY {
+            let victim = self
+                .ancestor_walk_cache
+                .keys()
+                .copied()
+                .find(|k| *k != inclusion_hash)
+                .expect(
+                    "ANCESTOR_WALK_CACHE_CAPACITY >= 1 and an extra entry exists to evict",
+                );
+            self.ancestor_walk_cache.remove(&victim);
+        }
     }
 }
 
@@ -947,6 +1090,28 @@ pub fn regtest_network_params() -> Result<NetworkParams> {
         [0u8; 32],
     )
     .map_err(|e| anyhow!("internal: regtest NetworkParams construction failed: {e}"))
+}
+
+/// Canonical §3.6 network tag string for a [`Network`] configuration value.
+pub fn network_tag_for(network: Network) -> Result<&'static str> {
+    let bytes = match network {
+        Network::Mainnet => NETWORK_TAG_MAINNET,
+        Network::Testnet => NETWORK_TAG_TESTNET,
+        Network::Regtest => NETWORK_TAG_REGTEST,
+    };
+    std::str::from_utf8(bytes).with_context(|| {
+        format!("NETWORK_TAG for {network:?} is not valid UTF-8")
+    })
+}
+
+/// Lower-hex encoding of a 32-byte identifier for fail-loud error messages.
+fn bytes_to_hex(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Activation height from supplied [`NetworkParams`], with the §3.6 regtest pin
@@ -1750,6 +1915,14 @@ impl Scanner {
 
     /// Hash of the block at `target_height` on the inclusion block's ancestor
     /// chain. Never uses `getblockhash(height)` against the live tip.
+    ///
+    /// When the walk cache already holds ancestors of this inclusion block,
+    /// the walk **resumes** from the deepest cached height rather than
+    /// restarting from the inclusion block. Walking the same immutable
+    /// ancestry twice is never necessary. Worst-case `getblock` count per
+    /// inclusion block across gaps `2..=MAX_ANCHOR_GAP` is therefore
+    /// `MAX_ANCHOR_GAP - 1` (see module-level constant docs), not
+    /// `Θ(MAX_ANCHOR_GAP²)`.
     fn resolve_ancestor_hash(
         &mut self,
         inclusion_height: u64,
@@ -1797,24 +1970,63 @@ impl Scanner {
             }
         }
 
-        // Walk-cache keyed by inclusion hash (fork-safe).
+        // Walk-cache keyed by inclusion hash (fork-safe). Exact hit.
         if let Some(map) = self.ancestor_walk_cache.get(&inclusion_hash) {
             if let Some(h) = map.get(&target_height) {
                 return Ok(*h);
             }
         }
 
-        // Walk prev_blockhash from the inclusion block — deterministic function
-        // of the inclusion block, not of the live chain tip.
+        // Resume from the deepest already-cached ancestor of this inclusion
+        // block (lowest height still above the target). Ancestry of a fixed
+        // inclusion block is immutable — never restart from inclusion when a
+        // prefix of the walk is already known.
         let mut walk: BTreeMap<u64, BlockHash> = self
             .ancestor_walk_cache
             .remove(&inclusion_hash)
             .unwrap_or_default();
         walk.insert(inclusion_height, inclusion_hash);
 
-        let mut cur_height = inclusion_height;
-        let mut cur_prev = inclusion_block.header.prev_blockhash;
-        let mut steps = 0u64;
+        if let Some(&h) = walk.get(&target_height) {
+            self.retain_ancestor_walk(inclusion_hash, walk);
+            return Ok(h);
+        }
+
+        let resume_height = walk
+            .keys()
+            .copied()
+            .filter(|h| *h > target_height)
+            .min()
+            .expect("inclusion_height is in walk and strictly above target_height");
+        let resume_hash = *walk
+            .get(&resume_height)
+            .expect("resume_height was taken from walk keys");
+
+        // steps = distance already walked from inclusion down to resume_height.
+        let mut steps = inclusion_height.checked_sub(resume_height).ok_or_else(|| {
+            InfrastructureError::new(
+                "ancestor walk resume_height above inclusion_height (internal invariant)",
+            )
+        })?;
+
+        let (mut cur_height, mut cur_prev) = if resume_height == inclusion_height {
+            (inclusion_height, inclusion_block.header.prev_blockhash)
+        } else {
+            // One getblock to learn prev of the deepest cached ancestor; then
+            // continue. Re-walking the cached prefix is never necessary.
+            let resume_block: Block = self.rpc.get_block(&resume_hash).map_err(|e| {
+                InfrastructureError::new(format!(
+                    "getblock({resume_hash}) during inclusion-ancestry resume for \
+                     anchor height {target_height}: {e}"
+                ))
+            })?;
+            #[cfg(test)]
+            {
+                self.ancestor_walk_rpc_count =
+                    self.ancestor_walk_rpc_count.saturating_add(1);
+            }
+            (resume_height, resume_block.header.prev_blockhash)
+        };
 
         while cur_height > target_height {
             steps = match steps.checked_add(1) {
@@ -1827,7 +2039,7 @@ impl Scanner {
                 }
             };
             if steps > MAX_ANCHOR_GAP {
-                self.ancestor_walk_cache.insert(inclusion_hash, walk);
+                self.retain_ancestor_walk(inclusion_hash, walk);
                 return Err(DataFailure::new(format!(
                     "ancestor walk from inclusion {inclusion_height} exceeded \
                      MAX_ANCHOR_GAP ({MAX_ANCHOR_GAP}) before reaching anchor \
@@ -1847,28 +2059,30 @@ impl Scanner {
             };
 
             // Short-circuit via verified_chain if we reconnect to known history.
-            if let Some((_, known)) = self
+            if let Some(known) = self
                 .verified_chain
                 .iter()
                 .find(|(h, hash)| *h == parent_height && *hash == cur_prev)
+                .map(|(_, hash)| *hash)
             {
-                walk.insert(parent_height, *known);
+                walk.insert(parent_height, known);
                 if parent_height == target_height {
-                    self.ancestor_walk_cache.insert(inclusion_hash, walk);
-                    return Ok(*known);
+                    self.retain_ancestor_walk(inclusion_hash, walk);
+                    return Ok(known);
                 }
                 // Remaining ancestors in the same verified window.
-                if let Some((_, deeper)) = self
+                if let Some(deeper) = self
                     .verified_chain
                     .iter()
                     .find(|(h, _)| *h == target_height)
+                    .map(|(_, hash)| *hash)
                 {
-                    walk.insert(target_height, *deeper);
-                    self.ancestor_walk_cache.insert(inclusion_hash, walk);
-                    return Ok(*deeper);
+                    walk.insert(target_height, deeper);
+                    self.retain_ancestor_walk(inclusion_hash, walk);
+                    return Ok(deeper);
                 }
                 // History does not reach target; continue walking from known parent.
-                let parent_block: Block = self.rpc.get_block(known).map_err(|e| {
+                let parent_block: Block = self.rpc.get_block(&known).map_err(|e| {
                     InfrastructureError::new(format!(
                         "getblock({known}) during inclusion-ancestry walk for \
                          anchor height {target_height}: {e}"
@@ -1884,7 +2098,15 @@ impl Scanner {
                 continue;
             }
 
+            // `cur_prev` is already the parent hash — record it without an RPC.
+            // Fetch only when we must go deeper (need the grandparent).
             let parent_hash = cur_prev;
+            walk.insert(parent_height, parent_hash);
+            if parent_height == target_height {
+                self.retain_ancestor_walk(inclusion_hash, walk);
+                return Ok(parent_hash);
+            }
+
             let parent_block: Block = self.rpc.get_block(&parent_hash).map_err(|e| {
                 InfrastructureError::new(format!(
                     "getblock({parent_hash}) during inclusion-ancestry walk for \
@@ -1895,16 +2117,11 @@ impl Scanner {
             {
                 self.ancestor_walk_rpc_count = self.ancestor_walk_rpc_count.saturating_add(1);
             }
-            walk.insert(parent_height, parent_hash);
-            if parent_height == target_height {
-                self.ancestor_walk_cache.insert(inclusion_hash, walk);
-                return Ok(parent_hash);
-            }
             cur_height = parent_height;
             cur_prev = parent_block.header.prev_blockhash;
         }
 
-        self.ancestor_walk_cache.insert(inclusion_hash, walk);
+        self.retain_ancestor_walk(inclusion_hash, walk);
         Err(DataFailure::new(format!(
             "ancestor walk from inclusion {inclusion_height} failed to reach \
              anchor height {target_height}"
@@ -1914,9 +2131,10 @@ impl Scanner {
 
     /// Resolve the prevout for a reveal input.
     ///
-    /// Parent transactions are cached per scan run (one RPC per distinct
-    /// `txid`). RPC/`txindex` failures are infrastructure; a parent that exists
-    /// but lacks the requested vout is a data failure.
+    /// Parent **outputs** are cached per scan run (one RPC per distinct
+    /// `txid`). On a cache hit only the selected [`TxOut`] is cloned — never
+    /// the whole parent transaction. RPC/`txindex` failures are infrastructure;
+    /// a parent that exists but lacks the requested vout is a data failure.
     fn fetch_prevout(&mut self, input: &TxIn) -> Result<TxOut, ScanOpError> {
         #[cfg(test)]
         if self.inject_prevout_infra_failure {
@@ -1928,30 +2146,41 @@ impl Scanner {
         }
 
         let parent_txid = input.previous_output.txid;
-        let parent = if let Some(tx) = self.parent_tx_cache.get(&parent_txid) {
-            tx.clone()
-        } else {
-            let tx = self
-                .rpc
-                .get_raw_transaction(&parent_txid, None)
-                .map_err(|e| {
-                    InfrastructureError::new(format!(
-                        "getrawtransaction(parent {parent_txid}) failed: {e}"
-                    ))
-                })?;
+        let vout = input.previous_output.vout as usize;
+
+        if let Some(outputs) = self.parent_output_cache.get(&parent_txid) {
             #[cfg(test)]
             {
-                self.prevout_rpc_count = self.prevout_rpc_count.saturating_add(1);
+                self.prevout_cache_hits = self.prevout_cache_hits.saturating_add(1);
             }
-            self.parent_tx_cache.insert(parent_txid, tx.clone());
-            tx
-        };
-        let vout = input.previous_output.vout as usize;
-        parent.output.get(vout).cloned().ok_or_else(|| {
+            return outputs.get(vout).cloned().ok_or_else(|| {
+                ScanOpError::Data(DataFailure::new(format!(
+                    "parent {parent_txid} has no vout {vout}"
+                )))
+            });
+        }
+
+        let tx = self
+            .rpc
+            .get_raw_transaction(&parent_txid, None)
+            .map_err(|e| {
+                InfrastructureError::new(format!(
+                    "getrawtransaction(parent {parent_txid}) failed: {e}"
+                ))
+            })?;
+        #[cfg(test)]
+        {
+            self.prevout_rpc_count = self.prevout_rpc_count.saturating_add(1);
+        }
+        let out = tx.output.get(vout).cloned().ok_or_else(|| {
             ScanOpError::Data(DataFailure::new(format!(
                 "parent {parent_txid} has no vout {vout}"
             )))
-        })
+        })?;
+        // Cache outputs only (not the full transaction) so later hits clone a
+        // single TxOut rather than the whole parent.
+        self.parent_output_cache.insert(parent_txid, tx.output);
+        Ok(out)
     }
 }
 
@@ -2179,6 +2408,13 @@ mod tests {
         assert_eq!(h, 0, "§3.6 regtest activation_height = 0");
     }
 
+    /// Identifier of a parameter set for `ScannerConfig.expected_params_identifier`.
+    fn params_identifier(params: &NetworkParams) -> [u8; 32] {
+        params
+            .identifier()
+            .expect("fixture NetworkParams must have a valid identifier")
+    }
+
     /// F2: mainnet/testnet accept a supplied NetworkParams pin (no compile-time invent).
     #[test]
     fn connect_accepts_mainnet_and_testnet_when_params_match() {
@@ -2191,6 +2427,7 @@ mod tests {
                 .to_string();
             let params = NetworkParams::new(tag, [1u8; 32], [2u8; 32], height, 6, [3u8; 32])
                 .expect("params");
+            let expected = params_identifier(&params);
             // Pin agreement runs before RPC — dummy URL/cookie still exercises the gate.
             let result = Scanner::connect(ScannerConfig {
                 rpc_url: "http://127.0.0.1:1".into(),
@@ -2198,6 +2435,7 @@ mod tests {
                 network,
                 activation_height: height,
                 network_params: params,
+                expected_params_identifier: expected,
             });
             let err = match result {
                 Ok(_) => panic!("{network:?}: RPC must fail after pin check passes"),
@@ -2207,7 +2445,9 @@ mod tests {
             assert!(
                 !msg.contains("does not match network_params")
                     && !msg.contains("does not match pinned")
-                    && !msg.contains("deployment-observed"),
+                    && !msg.contains("deployment-observed")
+                    && !msg.contains("expected_params_identifier")
+                    && !msg.contains("network_tag"),
                 "{network:?}: pin agreement must pass; got: {msg}"
             );
             // Must not invent a refusal for mainnet/testnet when params are supplied.
@@ -2237,12 +2477,14 @@ mod tests {
             [0u8; 32],
         )
         .expect("params");
+        let expected = params_identifier(&params);
         let result = Scanner::connect(ScannerConfig {
             rpc_url: "http://127.0.0.1:1".into(),
             cookie_path: PathBuf::from("/nonexistent-cookie-for-mainnet-mismatch"),
             network: Network::Mainnet,
             activation_height: 840_001,
             network_params: params,
+            expected_params_identifier: expected,
         });
         let err = match result {
             Ok(_) => panic!("mismatched mainnet activation_height must be refused"),
@@ -2266,12 +2508,14 @@ mod tests {
             .expect("utf8")
             .to_string();
         let params = NetworkParams::new(tag, [0u8; 32], [0u8; 32], 7, 6, [0u8; 32]).expect("ok");
+        let expected = params_identifier(&params);
         let result = Scanner::connect(ScannerConfig {
             rpc_url: "http://127.0.0.1:1".into(),
             cookie_path: PathBuf::from("/nonexistent-cookie-for-regtest-nonzero"),
             network: Network::Regtest,
             activation_height: 7,
             network_params: params,
+            expected_params_identifier: expected,
         });
         let err = match result {
             Ok(_) => panic!("nonzero regtest pin must be refused"),
@@ -2281,6 +2525,134 @@ mod tests {
         assert!(
             msg.contains("regtest") && (msg.contains('0') || msg.contains("pin")),
             "unexpected: {msg}"
+        );
+    }
+
+    /// F1: `expected_params_identifier` must match `network_params.identifier()`.
+    #[test]
+    fn connect_rejects_params_identifier_mismatch() {
+        let params = regtest_network_params().expect("params");
+        let actual = params_identifier(&params);
+        let mut wrong = actual;
+        wrong[0] ^= 0xff;
+        let result = Scanner::connect(ScannerConfig {
+            rpc_url: "http://127.0.0.1:1".into(),
+            cookie_path: PathBuf::from("/nonexistent-cookie-for-id-mismatch"),
+            network: Network::Regtest,
+            activation_height: 0,
+            network_params: params,
+            expected_params_identifier: wrong,
+        });
+        let err = match result {
+            Ok(_) => panic!("identifier mismatch must be refused"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("expected_params_identifier") || msg.contains("identifier"),
+            "unexpected: {msg}"
+        );
+        // Both values must appear (lower-hex).
+        assert!(
+            msg.contains(&bytes_to_hex(&actual)) && msg.contains(&bytes_to_hex(&wrong)),
+            "error must name both identifiers; got: {msg}"
+        );
+    }
+
+    /// F1: parameter set network tag must correspond to `config.network`.
+    #[test]
+    fn connect_rejects_network_tag_mismatch() {
+        let params = NetworkParams::new(
+            std::str::from_utf8(NETWORK_TAG_MAINNET)
+                .expect("utf8")
+                .to_string(),
+            [0u8; 32],
+            [0u8; 32],
+            0,
+            6,
+            [0u8; 32],
+        )
+        .expect("params");
+        let expected = params_identifier(&params);
+        // Mainnet tag + regtest config: tag check fails (before regtest height pin).
+        let result = Scanner::connect(ScannerConfig {
+            rpc_url: "http://127.0.0.1:1".into(),
+            cookie_path: PathBuf::from("/nonexistent-cookie-for-tag-mismatch"),
+            network: Network::Regtest,
+            activation_height: 0,
+            network_params: params,
+            expected_params_identifier: expected,
+        });
+        let err = match result {
+            Ok(_) => panic!("network tag mismatch must be refused"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("network_tag") || msg.contains("does not correspond"),
+            "unexpected: {msg}"
+        );
+    }
+
+    /// F1: self-consistent but unpublished wrong-height set is refused by identifier.
+    ///
+    /// Closes the old tautology: `activation_height == network_params.activation_height()`
+    /// both from the same caller is not enough — the published identifier is the anchor.
+    #[test]
+    fn connect_rejects_self_consistent_wrong_height_via_identifier() {
+        let published = NetworkParams::new(
+            std::str::from_utf8(NETWORK_TAG_TESTNET)
+                .expect("utf8")
+                .to_string(),
+            [1u8; 32],
+            [2u8; 32],
+            2_500_000,
+            6,
+            [3u8; 32],
+        )
+        .expect("published");
+        let published_id = params_identifier(&published);
+
+        // Self-consistent wrong pin: height 99 with matching config field, same
+        // other fields as published — but identifier differs because height differs.
+        let wrong = NetworkParams::new(
+            std::str::from_utf8(NETWORK_TAG_TESTNET)
+                .expect("utf8")
+                .to_string(),
+            [1u8; 32],
+            [2u8; 32],
+            99,
+            6,
+            [3u8; 32],
+        )
+        .expect("wrong");
+        assert_ne!(
+            params_identifier(&wrong),
+            published_id,
+            "height change must change the content-addressed identifier"
+        );
+        let result = Scanner::connect(ScannerConfig {
+            rpc_url: "http://127.0.0.1:1".into(),
+            cookie_path: PathBuf::from("/nonexistent-cookie-for-wrong-height-id"),
+            network: Network::Testnet,
+            activation_height: 99, // matches wrong.activation_height() — old tautology
+            network_params: wrong,
+            expected_params_identifier: published_id, // published external truth
+        });
+        let err = match result {
+            Ok(_) => panic!(
+                "self-consistent wrong-height set must be refused via identifier"
+            ),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("expected_params_identifier") || msg.contains("identifier"),
+            "must fail on identifier, not height equality; got: {msg}"
+        );
+        assert!(
+            !msg.contains("does not match network_params.activation_height"),
+            "height fields agree; must not be the height gate; got: {msg}"
         );
     }
 
@@ -2303,6 +2675,7 @@ mod tests {
         // Build a scanner without a live chain. UserPass auth avoids cookie I/O
         // at Client construction; fold_verified_nullifiers never touches RPC.
         let params = regtest_network_params().expect("params");
+        let expected = params_identifier(&params);
         let rpc = Client::new(
             "http://127.0.0.1:1",
             Auth::UserPass("unit".into(), "test".into()),
@@ -2316,21 +2689,23 @@ mod tests {
                 network: Network::Regtest,
                 activation_height: 0,
                 network_params: params,
+                expected_params_identifier: expected,
             },
             accumulator: NfLogAccumulator::new(0),
             survivors: Vec::new(),
             winner_by_pk: HashMap::new(),
             scanned_through: None,
             scanned_blocks: BTreeMap::new(),
-            parent_tx_cache: HashMap::new(),
+            parent_output_cache: HashMap::new(),
             verified_chain: VecDeque::new(),
-            ancestor_walk_cache: HashMap::new(),
+            ancestor_walk_cache: BTreeMap::new(),
             inject_prevout_infra_failure: false,
             inject_infra_fail_at_height: None,
             inject_broken_link_at_height: None,
             inject_reorg_after_commit_height: None,
             inject_post_commit_rpc_failure: false,
             prevout_rpc_count: 0,
+            prevout_cache_hits: 0,
             winner_index_lookups: 0,
             ancestor_walk_rpc_count: 0,
         };
@@ -2397,6 +2772,164 @@ mod tests {
         }
     }
 
+    /// F2: walk cache retains at most `ANCESTOR_WALK_CACHE_CAPACITY` maps.
+    #[test]
+    fn ancestor_walk_cache_honours_capacity_bound() {
+        let params = regtest_network_params().expect("params");
+        let expected = params_identifier(&params);
+        let rpc = Client::new(
+            "http://127.0.0.1:1",
+            Auth::UserPass("unit".into(), "test".into()),
+        )
+        .expect("client");
+        let mut scanner = Scanner {
+            rpc,
+            config: ScannerConfig {
+                rpc_url: "http://127.0.0.1:1".into(),
+                cookie_path: PathBuf::from("/nonexistent-for-walk-cache-cap"),
+                network: Network::Regtest,
+                activation_height: 0,
+                network_params: params,
+                expected_params_identifier: expected,
+            },
+            accumulator: NfLogAccumulator::new(0),
+            survivors: Vec::new(),
+            winner_by_pk: HashMap::new(),
+            scanned_through: None,
+            scanned_blocks: BTreeMap::new(),
+            parent_output_cache: HashMap::new(),
+            verified_chain: VecDeque::new(),
+            ancestor_walk_cache: BTreeMap::new(),
+            inject_prevout_infra_failure: false,
+            inject_infra_fail_at_height: None,
+            inject_broken_link_at_height: None,
+            inject_reorg_after_commit_height: None,
+            inject_post_commit_rpc_failure: false,
+            prevout_rpc_count: 0,
+            prevout_cache_hits: 0,
+            winner_index_lookups: 0,
+            ancestor_walk_rpc_count: 0,
+        };
+
+        let n = ANCESTOR_WALK_CACHE_CAPACITY
+            .checked_add(8)
+            .expect("capacity + 8");
+        for i in 0..n {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i / 256) as u8;
+            bytes[1] = (i % 256) as u8;
+            bytes[2] = 0xA5;
+            let inclusion = BlockHash::from_byte_array(bytes);
+            let mut walk = BTreeMap::new();
+            walk.insert(100u64, inclusion);
+            scanner.retain_ancestor_walk(inclusion, walk);
+            assert!(
+                scanner.ancestor_walk_cache_len() <= ANCESTOR_WALK_CACHE_CAPACITY,
+                "after insert {i}: len {} exceeds capacity {ANCESTOR_WALK_CACHE_CAPACITY}",
+                scanner.ancestor_walk_cache_len()
+            );
+        }
+        assert_eq!(
+            scanner.ancestor_walk_cache_len(),
+            ANCESTOR_WALK_CACHE_CAPACITY,
+            "must sit exactly at the bound after overfill"
+        );
+    }
+
+    /// F3: repeated parent spends hit the output cache and never re-issue RPC.
+    ///
+    /// The cache stores `Vec<TxOut>` and clones only the selected output on hit
+    /// (structural: no full-`Transaction` clone path remains).
+    #[test]
+    fn fetch_prevout_cache_hit_clones_only_selected_txout() {
+        let params = regtest_network_params().expect("params");
+        let expected = params_identifier(&params);
+        let rpc = Client::new(
+            "http://127.0.0.1:1",
+            Auth::UserPass("unit".into(), "test".into()),
+        )
+        .expect("client");
+        let mut scanner = Scanner {
+            rpc,
+            config: ScannerConfig {
+                rpc_url: "http://127.0.0.1:1".into(),
+                cookie_path: PathBuf::from("/nonexistent-for-prevout-cache-unit"),
+                network: Network::Regtest,
+                activation_height: 0,
+                network_params: params,
+                expected_params_identifier: expected,
+            },
+            accumulator: NfLogAccumulator::new(0),
+            survivors: Vec::new(),
+            winner_by_pk: HashMap::new(),
+            scanned_through: None,
+            scanned_blocks: BTreeMap::new(),
+            parent_output_cache: HashMap::new(),
+            verified_chain: VecDeque::new(),
+            ancestor_walk_cache: BTreeMap::new(),
+            inject_prevout_infra_failure: false,
+            inject_infra_fail_at_height: None,
+            inject_broken_link_at_height: None,
+            inject_reorg_after_commit_height: None,
+            inject_post_commit_rpc_failure: false,
+            prevout_rpc_count: 0,
+            prevout_cache_hits: 0,
+            winner_index_lookups: 0,
+            ancestor_walk_rpc_count: 0,
+        };
+
+        let parent_txid = Txid::from_byte_array([0x42u8; 32]);
+        let outputs = vec![
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            },
+            TxOut {
+                value: Amount::from_sat(2_000),
+                script_pubkey: ScriptBuf::new(),
+            },
+            TxOut {
+                value: Amount::from_sat(3_000),
+                script_pubkey: ScriptBuf::new(),
+            },
+        ];
+        scanner.inject_parent_outputs_for_test(parent_txid, outputs);
+
+        let hits = 12usize;
+        for i in 0..hits {
+            let vout = (i % 3) as u32;
+            let input = TxIn {
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            };
+            let out = match scanner.fetch_prevout(&input) {
+                Ok(o) => o,
+                Err(ScanOpError::Data(d)) => panic!("data: {}", d.reason),
+                Err(ScanOpError::Infrastructure(e)) => panic!("infra: {e}"),
+            };
+            assert_eq!(
+                out.value,
+                Amount::from_sat(1_000 * u64::from(vout + 1)),
+                "vout {vout}"
+            );
+        }
+        assert_eq!(
+            scanner.prevout_cache_hits(),
+            hits,
+            "every lookup must be a cache hit"
+        );
+        assert_eq!(
+            scanner.prevout_rpc_count(),
+            0,
+            "primed cache must not issue getrawtransaction"
+        );
+    }
+
     /// F4 unit: sticky finality across merged reorg outcomes.
     #[test]
     fn merge_reorg_outcome_sticky_finality() {
@@ -2455,6 +2988,7 @@ mod tests {
         // Pin check runs before RPC — dummy URL/cookie still exercises the gate.
         // Configured height disagrees with network_params (and with regtest pin 0).
         let params = regtest_network_params().expect("params");
+        let expected = params_identifier(&params);
         let pinned = params.activation_height();
         let wrong = pinned.saturating_add(7);
         // Use non-zero wrong height: regtest gate rejects params pin first when
@@ -2466,6 +3000,7 @@ mod tests {
             network: Network::Regtest,
             activation_height: wrong,
             network_params: params,
+            expected_params_identifier: expected,
         });
         let err = match result {
             Ok(_) => panic!("mismatched activation_height must be refused at connect"),
@@ -2487,12 +3022,15 @@ mod tests {
     #[test]
     fn connect_accepts_pinned_activation_height_reaches_rpc() {
         // Correct pin must not trip the height gate — failure must come from RPC/cookie.
+        let params = regtest_network_params().expect("params");
+        let expected = params_identifier(&params);
         let result = Scanner::connect(ScannerConfig {
             rpc_url: "http://127.0.0.1:1".into(),
             cookie_path: PathBuf::from("/nonexistent-cookie-for-activation-height-test"),
             network: Network::Regtest,
             activation_height: 0,
-            network_params: regtest_network_params().expect("params"),
+            network_params: params,
+            expected_params_identifier: expected,
         });
         let err = match result {
             Ok(_) => panic!("RPC/cookie must fail after pin check passes"),
@@ -2500,7 +3038,9 @@ mod tests {
         };
         let msg = format!("{err:#}");
         assert!(
-            !msg.contains("does not match network_params") && !msg.contains("does not match pinned"),
+            !msg.contains("does not match network_params")
+                && !msg.contains("does not match pinned")
+                && !msg.contains("expected_params_identifier"),
             "pinned height must be accepted; got: {msg}"
         );
     }
@@ -2535,12 +3075,15 @@ mod tests {
     fn live_scanner() -> Scanner {
         let url = require_env("ZKCOINS_REGTEST_URL");
         let cookie = require_env("ZKCOINS_REGTEST_COOKIE");
+        let params = regtest_network_params().expect("regtest NetworkParams");
+        let expected_params_identifier = params_identifier(&params);
         Scanner::connect(ScannerConfig {
             rpc_url: url,
             cookie_path: PathBuf::from(cookie),
             network: Network::Regtest,
             activation_height: 0, // §3.6 regtest pin — passed explicitly
-            network_params: regtest_network_params().expect("regtest NetworkParams"),
+            network_params: params,
+            expected_params_identifier,
         })
         .expect("Scanner::connect to live regtest must succeed")
     }
@@ -3794,6 +4337,117 @@ mod tests {
                 &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(txid.to_string())],
             );
         }
+        let _ = scanner.scan_to_tip();
+    }
+
+    /// F2: ancestry walk resumes from the deepest cached ancestor (O(max_gap)
+    /// RPCs for increasing gaps in one inclusion block, not O(gaps²)).
+    ///
+    /// Verified-chain history is cleared so the walk path is forced. Payloads
+    /// use structurally valid envelopes with increasing anchor gaps; signatures
+    /// need not verify because anchor resolution runs first.
+    #[test]
+    #[ignore = "requires live bitcoind; set ZKCOINS_REGTEST_{URL,COOKIE,WALLET}"]
+    fn regtest_scanner_ancestor_walk_resumes_not_restarts() {
+        let publisher = live_publisher();
+        let mut scanner = live_scanner();
+        let _ = catch_up(&mut scanner);
+        let rpc = wallet_rpc();
+
+        // Ensure enough ancestor depth for gaps 2..=max_gap.
+        const MAX_GAP: u64 = 8;
+        for _ in 0..MAX_GAP {
+            let _ = mine_empty_block(&rpc);
+        }
+        let _ = catch_up(&mut scanner);
+
+        let tip_h = rpc.get_block_count().expect("tip height");
+        // Inclusion will be tip_h+1 after we mine the batch block once.
+        let inclusion_h = tip_h.checked_add(1).expect("inclusion height");
+
+        let mut commit_reveal: Vec<(Txid, Txid)> = Vec::new();
+        for gap in 2u64..=MAX_GAP {
+            let anchor_h = inclusion_h.checked_sub(gap).expect("anchor height");
+            let anchor_hash = rpc.get_block_hash(anchor_h).expect("anchor hash");
+            let sigs = signed_members(1, &unique_tag(&format!("f2-resume-gap-{gap}")));
+            let tip_anchor = publisher.current_anchor().expect("tip for aggregate");
+            let mut agg = aggregate_sig_with_anchor(&sigs, tip_anchor).expect("agg");
+            agg.block_anchor = BlockAnchor {
+                block_hash: anchor_hash.to_byte_array(),
+                height: u32::try_from(anchor_h).expect("anchor height fits u32"),
+            };
+            let payload = agg.serialize();
+            let (c, r) = broadcast_raw_payload(&payload);
+            commit_reveal.push((c, r));
+        }
+
+        // Single mine so all reveals share one inclusion block (required for
+        // the resume cache to apply across gaps).
+        mine_one(&publisher);
+
+        let mut inclusion_heights = Vec::new();
+        for (_, reveal) in &commit_reveal {
+            let info = rpc
+                .get_raw_transaction_info(reveal, None)
+                .expect("reveal tx info");
+            let h = info
+                .blockhash
+                .and_then(|bh| rpc.get_block_header_info(&bh).ok())
+                .map(|hdr| hdr.height as u64)
+                .expect("reveal must be mined in the single generate");
+            inclusion_heights.push(h);
+        }
+        assert!(
+            inclusion_heights.iter().all(|h| *h == inclusion_h),
+            "all gap payloads must share inclusion height {inclusion_h}; got {inclusion_heights:?}"
+        );
+
+        // Force the walk-cache / RPC path (not verified-chain short-circuit).
+        scanner.clear_verified_chain_for_test();
+
+        let report = scanner.scan_to_tip().expect("scan resume gaps");
+        assert!(
+            report.inscriptions_seen >= MAX_GAP as usize - 1,
+            "expected ≥{} inscriptions (gaps 2..={MAX_GAP}), saw {}",
+            MAX_GAP as usize - 1,
+            report.inscriptions_seen
+        );
+
+        let walk_rpcs = scanner.ancestor_walk_rpc_count();
+        // Resume: gaps 2..=MAX_GAP cost MAX_GAP-1 getblocks total (O(max_gap)).
+        // Restart would cost 1+2+…+(MAX_GAP-1) = (MAX_GAP-1)*MAX_GAP/2.
+        let resume_bound = (MAX_GAP as usize).saturating_sub(1);
+        let restart_cost = resume_bound
+            .checked_mul(MAX_GAP as usize)
+            .expect("mul")
+            / 2;
+        // Allow a small constant slack for the one-getblock resume frontier
+        // fetch; still strictly linear and far below quadratic restart cost.
+        let linear_cap = resume_bound
+            .checked_mul(2)
+            .expect("linear cap")
+            .saturating_add(2);
+        assert!(
+            walk_rpcs <= linear_cap,
+            "walk RPCs must be O(max_gap): got {walk_rpcs}, linear cap {linear_cap} \
+             (restart would be {restart_cost})"
+        );
+        assert!(
+            walk_rpcs < restart_cost,
+            "walk RPCs {walk_rpcs} must be strictly below quadratic restart cost {restart_cost}"
+        );
+
+        for (c, r) in commit_reveal {
+            let _ = rpc.call::<bitcoincore_rpc::jsonrpc::serde_json::Value>(
+                "abandontransaction",
+                &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(c.to_string())],
+            );
+            let _ = rpc.call::<bitcoincore_rpc::jsonrpc::serde_json::Value>(
+                "abandontransaction",
+                &[bitcoincore_rpc::jsonrpc::serde_json::Value::String(r.to_string())],
+            );
+        }
+        let _ = mine_empty_block(&rpc);
         let _ = scanner.scan_to_tip();
     }
 
