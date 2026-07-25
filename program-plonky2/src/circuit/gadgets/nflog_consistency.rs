@@ -480,10 +480,10 @@ mod tests {
     use shared::spec_v1::nflog_boundary::{
         adjacent_consistency_pairs, bag_peaks_swapped, boundary_sizes, case_id_consistency,
         case_id_inclusion, case_id_peaks, find_inclusion_wrong_pivot, fixture_peaks, fixture_range,
-        inclusion_positions, ref_bag_peaks, ref_build_consistency, ref_build_inclusion,
-        ref_build_inclusion_swapped_top_mth, ref_fold_chunks, ref_fold_chunks_swapped,
-        ref_mth_run, ref_verify_consistency, ref_verify_inclusion, try_consistency_wrong_pivot,
-        ConsistencyPivotMutation,
+        inclusion_positions, mth_a_dropped_to_empty, mth_a_duplicated_singleton, ref_bag_peaks,
+        ref_build_consistency, ref_build_inclusion, ref_build_inclusion_swapped_top_mth,
+        ref_fold_chunks, ref_fold_chunks_swapped, ref_mth_run, ref_verify_consistency,
+        ref_verify_inclusion, try_consistency_wrong_pivot, ConsistencyPivotMutation,
     };
 
     fn synthetic_entries(n: usize) -> Vec<NfLogEntry> {
@@ -1124,6 +1124,12 @@ mod tests {
     /// V.11 differential Accept suite: independent reference, host verifiers,
     /// and the in-circuit gadget all receive the **same** shared fixtures for
     /// every `k = 0…63` boundary size.
+    ///
+    /// Counters only increment for checks that actually ran on that layer.
+    /// Free-standing peak-bag identity has no host/gadget entry point over
+    /// symbolic peaks — those cells are reported as `ref_only_peak`, never
+    /// folded into the three-layer Accept totals. Host/gadget bagging Accept
+    /// is the consistency `mth_a` fold below (real verify/prove calls).
     #[test]
     fn symbolic_boundary_suite_accepts_k_0_through_63() {
         let (inclusion_data, inclusion_targets) = build_inclusion_circuit();
@@ -1132,19 +1138,17 @@ mod tests {
         let mut ref_accept: u64 = 0;
         let mut host_accept: u64 = 0;
         let mut gadget_accept: u64 = 0;
+        let mut ref_only_peak_accept: u64 = 0;
 
         for k in 0u32..=63 {
             covered_k_values += 1;
             let sizes = boundary_sizes(k);
 
-            // Peak-bagging identity on the independent reference (atomic peak
-            // fixtures). Production peak bagging is the consistency mth_a fold,
-            // covered with the same fixtures in the consistency Accept loop.
+            // Peak-bagging identity — independent reference only (route b).
+            // No free-standing host/gadget peak-bag API over symbolic peaks;
+            // empty-log bagging is the m=0 consistency Accept (three-layer).
             for &n in &sizes {
                 if n == 0 {
-                    ref_accept += 1;
-                    host_accept += 1;
-                    gadget_accept += 1;
                     continue;
                 }
                 let case_peaks = case_id_peaks(k);
@@ -1152,11 +1156,7 @@ mod tests {
                 let bagged = ref_bag_peaks(&peaks);
                 assert_eq!(bagged, ref_mth_run(case_peaks, 0, n));
                 assert_eq!(bagged, ref_fold_chunks(&peaks));
-                ref_accept += 1;
-                // No free-standing host/gadget peak-bag API over symbolic peaks;
-                // host+gadget bagging Accept is counted via consistency below.
-                host_accept += 1;
-                gadget_accept += 1;
+                ref_only_peak_accept += 1;
             }
 
             for &n in &sizes {
@@ -1246,10 +1246,16 @@ mod tests {
             }
         }
         assert_eq!(covered_k_values, 64);
+        // Three-layer counters only reflect checks that ran on every layer.
         assert_eq!(ref_accept, host_accept);
         assert_eq!(host_accept, gadget_accept);
+        assert!(
+            ref_only_peak_accept > 0,
+            "expected ref-only peak identity cells, got {ref_only_peak_accept}"
+        );
         eprintln!(
-            "V.11 gadget Accept counts: ref={ref_accept} host={host_accept} gadget={gadget_accept}"
+            "V.11 gadget Accept counts: ref={ref_accept} host={host_accept} gadget={gadget_accept} \
+             ref_only_peak={ref_only_peak_accept}"
         );
     }
 
@@ -1267,31 +1273,48 @@ mod tests {
         let mut ref_reject: u64 = 0;
         let mut host_reject: u64 = 0;
         let mut gadget_reject: u64 = 0;
+        let mut ref_only_peak_nl_b2: u64 = 0;
         let mut skip_wrong_pivot_inc: u64 = 0;
         let mut skip_wrong_pivot_con: u64 = 0;
         let mut skip_swapped_inc: u64 = 0;
-        let mut skip_swapped_peaks: u64 = 0;
-        let mut skip_swapped_chunks: u64 = 0;
+        let skip_swapped_peaks: u64 = 0;
+        let skip_swapped_chunks: u64 = 0;
+        let mut built_peak_dup_drop: u64 = 0;
+        let mut built_chunk_dup_drop: u64 = 0;
 
         for k in 0u32..=63 {
             covered_k_values += 1;
             let sizes = boundary_sizes(k);
 
-            // Peak-list swap/trunc are not free-standing production predicates
-            // over symbolic peaks; they are applied as mth_a bagging faults on
-            // consistency witnesses below. Record single-peak skips only.
+            // Peak-list bagging mutations (NL-B2) as independent-reference
+            // digest inequalities. Production three-layer reject is the
+            // consistency mth_a bagging fault below (same bagging fold).
+            // Single-peak lists: swap is a no-op — use duplicate / drop.
             for &n in &sizes {
                 if n == 0 {
                     continue;
                 }
                 let peaks = fixture_peaks(case_id_peaks(k), n);
+                let bagged = ref_bag_peaks(&peaks);
                 if peaks.len() < 2 {
-                    skip_swapped_peaks += 1;
-                    eprintln!(
-                        "skip peak-list swap/trunc at peak layer: k={k} n={n} — single peak"
+                    let p = peaks[0];
+                    assert_eq!(bagged, p, "singleton bag is identity k={k} n={n}");
+                    let dup = mth_a_duplicated_singleton(p);
+                    assert_ne!(
+                        dup, bagged,
+                        "duplicated singleton peak must differ from honest bag k={k} n={n}"
                     );
+                    let dropped = mth_a_dropped_to_empty();
+                    assert_ne!(
+                        dropped, bagged,
+                        "dropped singleton peak must differ from honest bag k={k} n={n}"
+                    );
+                    // Two built cases (dup + drop); ref digest only — no free-
+                    // standing host/gadget peak predicate. Three-layer cover
+                    // is the consistency single-chunk dup/drop block below.
+                    ref_only_peak_nl_b2 += 2;
+                    built_peak_dup_drop += 2;
                 } else {
-                    let bagged = ref_bag_peaks(&peaks);
                     assert_ne!(bag_peaks_swapped(&peaks), bagged);
                     assert_ne!(ref_bag_peaks(&peaks[..peaks.len() - 1]), bagged);
                 }
@@ -1520,11 +1543,12 @@ mod tests {
                     gadget_reject += 1;
                 }
 
-                // Swapped chunk/peak bagging (NL-B2): same proof, wrong mth_a fold.
+                // Chunk/peak bagging faults (NL-B2): same proof, sizes, mth_b;
+                // only the claimed mth_a summary is wrong (single property).
+                assert_eq!(ref_fold_chunks(&w.chunks), w.mth_a);
                 if w.chunks.len() >= 2 {
                     let swapped_a = ref_fold_chunks_swapped(&w.chunks);
                     assert_ne!(swapped_a, w.mth_a);
-                    assert_eq!(ref_fold_chunks(&w.chunks), w.mth_a);
                     assert!(!ref_verify_consistency(m, swapped_a, n, w.mth_b, &w.proof));
                     ref_reject += 1;
                     assert!(!verify_consistency(m, swapped_a, n, w.mth_b, &w.proof));
@@ -1558,10 +1582,57 @@ mod tests {
                     ));
                     gadget_reject += 1;
                 } else {
-                    skip_swapped_chunks += 1;
-                    eprintln!(
-                        "skip swapped/trunc-chunk consistency: k={k} m={m} n={n} — <2 chunks"
+                    // Single chunk: swap/trunc are no-ops. NL-B2 still permits
+                    // duplicate (Node(C,C)) and drop (empty summary).
+                    assert_eq!(
+                        w.chunks.len(),
+                        1,
+                        "consistency subproof yields ≥1 chunk k={k} m={m} n={n}"
                     );
+                    let c = w.chunks[0];
+                    assert_eq!(c, w.mth_a, "singleton chunk fold is identity");
+
+                    let dup_a = mth_a_duplicated_singleton(c);
+                    assert_ne!(dup_a, w.mth_a);
+                    assert!(!ref_verify_consistency(m, dup_a, n, w.mth_b, &w.proof));
+                    ref_reject += 1;
+                    assert!(!verify_consistency(m, dup_a, n, w.mth_b, &w.proof));
+                    host_reject += 1;
+                    assert!(
+                        consistency_prove_is_err(
+                            &consistency_data,
+                            consistency_targets,
+                            m,
+                            dup_a,
+                            n,
+                            w.mth_b,
+                            &w.proof,
+                        ),
+                        "gadget must reject duplicated mth_a k={k} m={m} n={n}"
+                    );
+                    gadget_reject += 1;
+                    built_chunk_dup_drop += 1;
+
+                    let drop_a = mth_a_dropped_to_empty();
+                    assert_ne!(drop_a, w.mth_a);
+                    assert!(!ref_verify_consistency(m, drop_a, n, w.mth_b, &w.proof));
+                    ref_reject += 1;
+                    assert!(!verify_consistency(m, drop_a, n, w.mth_b, &w.proof));
+                    host_reject += 1;
+                    assert!(
+                        consistency_prove_is_err(
+                            &consistency_data,
+                            consistency_targets,
+                            m,
+                            drop_a,
+                            n,
+                            w.mth_b,
+                            &w.proof,
+                        ),
+                        "gadget must reject dropped mth_a k={k} m={m} n={n}"
+                    );
+                    gadget_reject += 1;
+                    built_chunk_dup_drop += 1;
                 }
 
                 // Wrong pivot (NL-B1).
@@ -1606,19 +1677,41 @@ mod tests {
         }
 
         assert_eq!(covered_k_values, 64);
+        // Three-layer counters only reflect checks that ran on every layer.
         assert_eq!(ref_reject, host_reject);
         assert_eq!(host_reject, gadget_reject);
+        assert_eq!(
+            skip_swapped_peaks, 0,
+            "single-peak NL-B2 must be built as duplicate/drop, not skipped"
+        );
+        assert_eq!(
+            skip_swapped_chunks, 0,
+            "single-chunk NL-B2 must be built as duplicate/drop, not skipped"
+        );
         eprintln!(
-            "V.11 gadget Reject counts: ref={ref_reject} host={host_reject} gadget={gadget_reject}"
+            "V.11 gadget Reject counts: ref={ref_reject} host={host_reject} gadget={gadget_reject} \
+             ref_only_peak_nl_b2={ref_only_peak_nl_b2}"
         );
         eprintln!(
             "V.11 gadget Reject skips: wrong_pivot_inc={skip_wrong_pivot_inc} \
              wrong_pivot_con={skip_wrong_pivot_con} swapped_inc={skip_swapped_inc} \
              swapped_peaks={skip_swapped_peaks} swapped_chunks={skip_swapped_chunks}"
         );
+        eprintln!(
+            "V.11 gadget NL-B2 built: peak_dup_drop={built_peak_dup_drop} \
+             chunk_dup_drop={built_chunk_dup_drop}"
+        );
         assert!(
             ref_reject > 100,
             "expected a large Reject set across k=0…63, got {ref_reject}"
+        );
+        assert_eq!(
+            built_chunk_dup_drop, 130,
+            "expected 65 single-chunk pairs × (dup+drop) = 130, got {built_chunk_dup_drop}"
+        );
+        assert_eq!(
+            built_peak_dup_drop, 132,
+            "expected 66 single-peak sizes × (dup+drop) = 132, got {built_peak_dup_drop}"
         );
     }
 }

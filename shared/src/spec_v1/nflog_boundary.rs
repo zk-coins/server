@@ -517,6 +517,22 @@ pub fn ref_fold_chunks_swapped(chunks: &[HashDigest]) -> HashDigest {
     acc
 }
 
+/// NL-B2 mutation for a **singleton** peak/chunk list: claim `Node(P, P)`
+/// instead of the honest identity bag `P`.
+///
+/// Swap is a no-op when there is only one peak/chunk; duplication changes
+/// only the bagging summary and is the pure single-property fault for that
+/// shape (proof, sizes, ordering, and `mth_b` stay honest).
+pub fn mth_a_duplicated_singleton(singleton: HashDigest) -> HashDigest {
+    nflog_node_hash(singleton, singleton)
+}
+
+/// NL-B2 mutation: claim the empty-log summary instead of the honest bag of
+/// prefix chunks/peaks. Pure bagging fault — proof and sizes unchanged.
+pub fn mth_a_dropped_to_empty() -> HashDigest {
+    nflog_empty()
+}
+
 fn consistency_proof_len_with_top_pivot(m: u64, n: u64, top_k: u64) -> usize {
     fn honest_len(m: u64, n: u64, b: bool) -> usize {
         if m == n {
