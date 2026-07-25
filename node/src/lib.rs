@@ -52,6 +52,9 @@ pub mod scanner_ws_parse;
 pub mod self_heal;
 pub mod state;
 pub mod username;
+/// v1.1 StateEngine adapter + persistence (Cutover Stage 1). Behind
+/// `ZKCOINS_PROVER=v11`; default remains the legacy stack.
+pub mod v11;
 
 use crate::publisher::EsploraConfig;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};

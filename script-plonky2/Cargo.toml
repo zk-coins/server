@@ -10,6 +10,7 @@ plonky2 = "1.1.0"
 anyhow = "1.0"
 bincode = "1.3"
 num = "0.4"
+serde = { workspace = true }
 sha2 = { workspace = true }
 bitcoin = { workspace = true }
 # Must share the workspace `bitcoin` 0.32.x line — bitcoincore-rpc 0.19

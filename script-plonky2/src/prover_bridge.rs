@@ -57,7 +57,7 @@ pub enum TransitionMode {
 }
 
 /// A conditional-NAV commitment opening.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NavOpening {
     pub nav: Nav,
     pub nav_rand: [u8; 32],
@@ -81,7 +81,7 @@ pub struct OutputInclusionProof {
 }
 
 /// The on-chain nullifier and sign-to-contract opening for a transition.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NullifierOpening {
     pub public_key: [u8; 32],
     pub signature_r: [u8; 32],
@@ -253,9 +253,12 @@ pub struct ProverBridge {
 }
 
 impl ProverBridge {
-    /// Select a network and eagerly initialize its cached compliance circuit.
+    /// Select a network. The compliance / balance circuits are built on first
+    /// use (prove, verify, digest, or gate-count) and then cached process-wide.
+    ///
+    /// Construction itself is cheap so persistence / adapter tests can hold a
+    /// bridge handle without paying the multi-minute circuit build.
     pub fn new(network: Network) -> Self {
-        let _ = compliance_circuit(network);
         Self { network }
     }
 
@@ -269,6 +272,34 @@ impl ProverBridge {
 
     pub fn balance_gate_count(&self) -> usize {
         balance_circuit(self.network).gate_count
+    }
+
+    /// §1.7.1 32-byte encoding of `C`'s `verifier_only.circuit_digest`.
+    ///
+    /// **Encoding differs from the legacy [`crate::Prover::circuit_digest_bytes`]:**
+    /// that method returns `bincode::serialize(HashOut)` (opaque field limbs),
+    /// while this method returns the canonical protocol encoding
+    /// (`shared::spec_v1::digest_to_bytes`: each limb `to_canonical_u64` as
+    /// 8-byte big-endian). Callers that compare against a pinned network
+    /// constant or `/v1/info.circuit_digests.C` MUST use this form.
+    pub fn circuit_digest_bytes(&self) -> [u8; 32] {
+        let digest = compliance_circuit(self.network)
+            .data
+            .verifier_only
+            .circuit_digest;
+        host::digest_to_bytes(&digest)
+    }
+
+    /// §1.7.1 32-byte encoding of `C_balance`'s `verifier_only.circuit_digest`.
+    ///
+    /// Same encoding contract as [`Self::circuit_digest_bytes`]. Eagerly
+    /// initializes the cached balance circuit for this network if needed.
+    pub fn balance_circuit_digest_bytes(&self) -> [u8; 32] {
+        let digest = balance_circuit(self.network)
+            .data
+            .verifier_only
+            .circuit_digest;
+        host::digest_to_bytes(&digest)
     }
 
     /// Assemble all `ComplianceTargets`, then produce a genuine cyclic proof.
