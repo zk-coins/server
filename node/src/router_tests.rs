@@ -94,6 +94,9 @@ fn test_state() -> AppState {
         job_store: Arc::new(crate::job_store::JobStore::new((*dead_pool()).clone())),
         job_tx: tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8).0,
         job_notify_map: Arc::new(dashmap::DashMap::new()),
+        // Legacy-stack tests: no v1.1 readiness gates.
+        v11_scan_caught_up: None,
+        v11_finality_ok: None,
     }
 }
 
@@ -2405,6 +2408,8 @@ fn mint_test_state() -> AppState {
         job_store: Arc::new(crate::job_store::JobStore::new((*dead_pool()).clone())),
         job_tx: tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8).0,
         job_notify_map: Arc::new(dashmap::DashMap::new()),
+        v11_scan_caught_up: None,
+        v11_finality_ok: None,
     }
 }
 

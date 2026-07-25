@@ -8,21 +8,23 @@
 //! SMT first-write and NfLog first-occurrence disagree on which competing
 //! spend wins. Convention ("don't flip the flag") is not enough.
 //!
-//! 1. **Marker row** (`stack_scan_mode`): claimed at boot for the selected
-//!    path so an empty opposite-side database still cannot be reopened
-//!    under the other mode after the first exclusive boot.
-//! 2. **Data presence**: `mmr_root_index` rows mean the legacy scanner has
-//!    folded commitments; `v11_nflog_entries` rows mean the v1.1 scanner
-//!    has folded nullifiers. Either presence blocks the opposite path
-//!    even if the marker were missing (defense in depth after restore
-//!    from a partial backup).
+//! 1. **Marker row** (`stack_scan_mode`): claimed only on a **genuinely
+//!    empty** database. Once claimed, it is a durable capability: every
+//!    writer of stack state must re-validate it **inside the same
+//!    transaction** as the write (`SELECT … FOR UPDATE`). A boot-only
+//!    check cannot close the window between check and write.
+//! 2. **Data presence without a marker is unconditional refusal.** Same-
+//!    side sentinel data must never auto-claim a stack. Only a DB with
+//!    neither marker nor either side's scan rows may claim.
+//! 3. **Opposite-side data** blocks even when the marker matches (defense
+//!    in depth after a partial backup restore).
 //!
 //! Fail loud. Never fall back to the other stack.
 
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 /// Which exclusive scan stack this process / database is running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +98,9 @@ pub fn clear_process_stack_mode_for_test() {
 /// Canonical error prefix for hard-separation refusals (asserted in tests).
 pub const STACK_SEPARATION_REFUSAL: &str = "stack separation: refusing to start";
 
+/// Canonical error prefix when a writer finds no matching marker in-tx.
+pub const STACK_CAPABILITY_REFUSAL: &str = "stack separation: refusing write";
+
 /// True when the legacy scanner has folded at least one commitment into
 /// the global MMR index (the durable signal of SMT-first-write activity).
 pub async fn legacy_scan_state_present(pool: &PgPool) -> Result<bool> {
@@ -106,12 +111,24 @@ pub async fn legacy_scan_state_present(pool: &PgPool) -> Result<bool> {
     Ok(n > 0)
 }
 
-/// True when the v1.1 scanner has folded at least one nullifier into NfLog.
+/// True when any v1.1 stack table has rows (meta, NfLog, index, accounts,
+/// coins). Meta alone is enough: [`crate::v11::adapter::EngineAdapter::
+/// load_or_create`] persists an empty genesis snapshot into
+/// `v11_engine_meta`, and that must bind the database to v1.1 just as
+/// strongly as a non-empty NfLog.
 pub async fn v11_scan_state_present(pool: &PgPool) -> Result<bool> {
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v11_nflog_entries")
-        .fetch_one(pool)
-        .await
-        .context("count v11_nflog_entries for stack separation")?;
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT \
+            (SELECT COUNT(*) FROM v11_engine_meta) \
+          + (SELECT COUNT(*) FROM v11_nflog_entries) \
+          + (SELECT COUNT(*) FROM v11_nullifier_index) \
+          + (SELECT COUNT(*) FROM v11_accounts) \
+          + (SELECT COUNT(*) FROM v11_spendable_coins) \
+          + (SELECT COUNT(*) FROM v11_spent_coins)",
+    )
+    .fetch_one(pool)
+    .await
+    .context("count v11 tables for stack separation")?;
     Ok(n > 0)
 }
 
@@ -157,14 +174,60 @@ pub async fn claim_stack_scan_mode(pool: &PgPool, mode: ScanStackMode) -> Result
     Ok(())
 }
 
+/// Lock the marker row inside an open transaction and require `required`.
+///
+/// Call this as the **first** step of every transaction that writes scan
+/// state. `SELECT … FOR UPDATE` serialises concurrent writers against the
+/// marker and closes the check-then-write window: a concurrent marker
+/// flip (or a missing marker) cannot race past a write that has already
+/// observed an older snapshot outside the transaction.
+///
+/// A missing marker is an unconditional refusal — writers never invent a
+/// claim. Only [`enforce_stack_scan_mode`] on a genuinely empty database
+/// may insert the row.
+pub async fn require_stack_mode_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    required: ScanStackMode,
+) -> Result<()> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT mode FROM stack_scan_mode WHERE id = 1 FOR UPDATE")
+            .fetch_optional(&mut **tx)
+            .await
+            .context("lock stack_scan_mode FOR UPDATE")?;
+
+    match row {
+        None => bail!(
+            "{STACK_CAPABILITY_REFUSAL}: stack_scan_mode marker is missing; \
+             refusing to write {want} scan state without an exclusive claim \
+             (no silent claim-from-write)",
+            want = required.as_str(),
+        ),
+        Some((mode_s,)) => {
+            let mode = ScanStackMode::parse(&mode_s)?;
+            if mode != required {
+                bail!(
+                    "{STACK_CAPABILITY_REFUSAL}: stack_scan_mode is claimed as \
+                     {have}; refusing to write {want} scan state in this \
+                     transaction (no silent cross-stack write)",
+                    have = mode.as_str(),
+                    want = required.as_str(),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Boot gate: selected path must be the only one that has ever scanned
-/// this database. Claims the marker when the DB is still unclaimed.
+/// this database. Claims the marker **only** when the DB is still empty
+/// (no marker, no either-side scan data).
 ///
 /// # Failures (all loud, no fall-back)
 ///
 /// - Marker claims the opposite mode
 /// - Opposite-side scan data is present
 /// - Both sides have scan data (corrupt dual write)
+/// - **Any** stack data exists while the marker is missing (no auto-claim)
 pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> Result<()> {
     let marker = load_stack_scan_mode(pool).await?;
     let legacy_data = legacy_scan_state_present(pool).await?;
@@ -173,9 +236,27 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
     if legacy_data && v11_data {
         bail!(
             "{STACK_SEPARATION_REFUSAL}: database carries BOTH legacy \
-             mmr_root_index rows and v11_nflog_entries — mixed Commitment \
+             mmr_root_index rows and v1.1 tables — mixed Commitment \
              and AggregateStateNullifierV3 accumulators. Manual recovery \
              required; refusing to start either path"
+        );
+    }
+
+    // Missing marker + any stack data is unconditional refusal. Same-side
+    // sentinel rows must never auto-claim (EngineAdapter could otherwise
+    // leave v11_engine_meta under a later legacy claim).
+    if marker.is_none() && (legacy_data || v11_data) {
+        let which = match (legacy_data, v11_data) {
+            (true, false) => "legacy mmr_root_index",
+            (false, true) => "v1.1 tables (meta/NfLog/accounts/coins)",
+            _ => "stack data",
+        };
+        bail!(
+            "{STACK_SEPARATION_REFUSAL} {want} scan stack: stack_scan_mode \
+             marker is missing but {which} already exist. Only a genuinely \
+             empty database may claim a stack — refuse rather than \
+             claim-from-data (manual recovery required)",
+            want = selected.as_str(),
         );
     }
 
@@ -184,7 +265,7 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
             if v11_data {
                 bail!(
                     "{STACK_SEPARATION_REFUSAL} legacy scan stack: \
-                     v1.1 NfLog scan state is present (v11_nflog_entries). \
+                     v1.1 scan state is present (v11 tables). \
                      A commitment scanner must never write into a database \
                      that already folds AggregateStateNullifierV3"
                 );

@@ -218,6 +218,16 @@ pub struct AppState {
     /// dispatcher and the SSE handler share via this map; see
     /// [`stream_job_handler`] for the subscriber-side wiring.
     pub(crate) job_notify_map: JobNotifyMap,
+    /// When `Some`, the v1.1 NfLog scanner has completed at least one
+    /// successful catch-up apply. Under `ZKCOINS_V11_SHADOW=1` readiness
+    /// requires this flag so the node does not report ready while its
+    /// v1.1 view is still empty / behind tip. `None` = legacy stack
+    /// (readiness does not wait on NfLog catch-up).
+    pub(crate) v11_scan_caught_up: Option<Arc<AtomicBool>>,
+    /// When `Some`, set to `false` if the scanner reports
+    /// `ReorgOutcome::finality_broken`. Readiness then fails with
+    /// `"deep_reorg"` and callers must stop crediting. `None` = legacy.
+    pub(crate) v11_finality_ok: Option<Arc<AtomicBool>>,
 }
 
 // Response types for our API
@@ -2712,8 +2722,9 @@ async fn r2_probe_history_handler(
 
 /// JSON body returned by `GET /health/ready`. `failures` is empty on a
 /// fully ready node; each failing dependency contributes one stable
-/// short tag (`"db"`, `"esplora"`, `"prover"`) so a Kuma monitor parses
-/// the cause without having to scrape the status code in isolation.
+/// short tag (`"db"`, `"esplora"`, `"prover"`, and under the v1.1 stack
+/// `"v11_scan"` / `"deep_reorg"`) so a Kuma monitor parses the cause
+/// without having to scrape the status code in isolation.
 ///
 /// `prover` is the background-warmup tag (see `AppState::prover_warm`):
 /// while the bootstrap warmup task is still running, the readiness
@@ -2810,6 +2821,20 @@ pub(crate) async fn ready_handler(State(state): State<AppState>) -> impl IntoRes
     let prover_failing = state.prover_health.is_failing();
     if !prover_warm || prover_failing {
         failures.push("prover");
+    }
+
+    // v1.1 stack readiness: when the process claimed NfLog, do not report
+    // ready until the scanner has caught up at least once, and fail hard
+    // if finality was broken by a deep reorg (§3.9 contract).
+    if let Some(caught_up) = &state.v11_scan_caught_up {
+        if !caught_up.load(Ordering::SeqCst) {
+            failures.push("v11_scan");
+        }
+    }
+    if let Some(finality_ok) = &state.v11_finality_ok {
+        if !finality_ok.load(Ordering::SeqCst) {
+            failures.push("deep_reorg");
+        }
     }
 
     let ready = failures.is_empty();

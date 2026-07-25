@@ -15,6 +15,7 @@ use zkcoins_prover::prover_bridge::{ComplianceProof, NavOpening, NullifierOpenin
 use zkcoins_prover::state_engine::{AccountRecord, StateEngine, TrackedCoin};
 
 use super::mode::{network_label, parse_network_label};
+use super::separation::{require_stack_mode_for_update, ScanStackMode};
 
 /// Serializable snapshot of one account for the DB layer.
 #[derive(Clone, Debug)]
@@ -504,8 +505,19 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
 ///
 /// Deletes previous rows and inserts the new set in one transaction so a
 /// crash cannot leave a partial NfLog or orphaned coin rows.
+///
+/// ## Stack capability (transactional)
+///
+/// The first statement locks `stack_scan_mode` with `SELECT … FOR UPDATE`
+/// and requires mode `v11`. A missing or mismatching marker aborts the
+/// transaction before any v1.1 table is touched. This is the binding
+/// capability check: a process-local boot pin alone cannot close the
+/// window between an advisory check and a later write.
 pub async fn persist_engine_snapshot(pool: &PgPool, snap: &EngineSnapshot) -> Result<()> {
     let mut tx = pool.begin().await.context("begin v11 persist tx")?;
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+        .await
+        .context("v11 persist: stack_scan_mode capability check")?;
     clear_all(&mut tx).await?;
     write_all(&mut tx, snap).await?;
     tx.commit().await.context("commit v11 persist tx")?;

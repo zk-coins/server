@@ -16,8 +16,20 @@ use super::db_v11::{self, EngineSnapshot};
 use super::mode::{
     network_tag_for, resolve_v11_shadow_mode, validate_v11_boot_pins, V11ShadowMode,
 };
+use super::separation::{
+    claim_stack_scan_mode, clear_process_stack_mode_for_test, enforce_stack_scan_mode,
+    ScanStackMode, STACK_CAPABILITY_REFUSAL, STACK_SEPARATION_REFUSAL,
+};
 use super::EngineAdapter;
 use crate::test_db::setup_pool;
+
+/// Claim the v1.1 stack marker on a fresh pool (DB row only; no process
+/// mode side-effect unless the caller also calls `set_process_stack_mode`).
+async fn claim_v11_marker(pool: &sqlx::PgPool) {
+    claim_stack_scan_mode(pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11 marker");
+}
 
 fn pk(byte: u8) -> [u8; 32] {
     let mut p = [0u8; 32];
@@ -220,6 +232,7 @@ fn boot_rejects_params_that_miss_published_identifier() {
 async fn restart_identity_nflog_and_coinhist_roots() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_v11_marker(&pool).await;
 
     let engine = seeded_engine();
     let before_nav = engine.nflog().nav();
@@ -310,6 +323,7 @@ async fn restart_identity_nflog_and_coinhist_roots() {
 async fn load_or_create_fresh_db_then_reload_empty_identity() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_v11_marker(&pool).await;
 
     let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Testnet, 0)
         .await
@@ -333,6 +347,7 @@ async fn load_or_create_fresh_db_then_reload_empty_identity() {
 async fn pin_mismatch_fails_loud() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_v11_marker(&pool).await;
 
     EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
         .await
@@ -361,6 +376,7 @@ async fn pin_mismatch_fails_loud() {
 async fn missing_meta_with_data_rows_fails_loud() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_v11_marker(&pool).await;
 
     // Seed a complete snapshot so child tables have rows.
     let engine = seeded_engine();
@@ -414,6 +430,7 @@ async fn missing_meta_with_data_rows_fails_loud() {
 async fn tip_hash_survives_persist_reload() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_v11_marker(&pool).await;
 
     let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
         .await
@@ -449,11 +466,11 @@ async fn tip_hash_survives_persist_reload() {
 // Stage 2 — hard separation + §3.6 scan-fold
 // ---------------------------------------------------------------------------
 
-use super::scan::{fold_survivors_into_engine, members_to_published, sort_canonical};
-use super::separation::{
-    clear_process_stack_mode_for_test, enforce_stack_scan_mode, ensure_legacy_publisher_allowed,
-    ensure_v11_publisher_allowed, ScanStackMode, STACK_SEPARATION_REFUSAL,
+use super::scan::{
+    apply_canonical_survivors, fold_survivors_into_engine, members_to_published,
+    reconcile_persisted_tip, sort_canonical, PersistedTipReconciliation,
 };
+use super::separation::{ensure_legacy_publisher_allowed, ensure_v11_publisher_allowed};
 use shared::spec_v1::{LookupResult, PublishedNullifier};
 
 /// Seed one `mmr_root_index` row — the durable signal of legacy scan activity.
@@ -470,9 +487,8 @@ async fn seed_legacy_scan_state(pool: &sqlx::PgPool) {
 }
 
 /// Seed one NfLog entry — the durable signal of v1.1 scan activity.
-async fn seed_v11_scan_state(pool: &sqlx::PgPool) {
-    // Meta is required for a coherent snapshot, but separation only checks
-    // v11_nflog_entries count.
+/// Does **not** set the stack_scan_mode marker (for missing-marker tests).
+async fn seed_v11_scan_state_without_marker(pool: &sqlx::PgPool) {
     sqlx::query(
         "INSERT INTO v11_engine_meta \
          (id, network, activation_height, tip_height, tip_hash, fold_seq, updated_at) \
@@ -500,54 +516,103 @@ async fn seed_v11_scan_state(pool: &sqlx::PgPool) {
 async fn hard_separation_refuses_cross_stack_boot() {
     clear_process_stack_mode_for_test();
 
-    // --- legacy data blocks v1.1 ---
+    // --- data without marker: unconditional refusal (no auto-claim) ---
     {
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
         seed_legacy_scan_state(&pool).await;
 
-        let err = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+        let err_v11 = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
             .await
-            .expect_err("v1.1 must refuse a DB with mmr_root_index rows");
-        let msg = format!("{err:#}");
+            .expect_err("v1.1 must refuse missing marker + legacy data");
+        let msg = format!("{err_v11:#}");
         assert!(
-            msg.contains(STACK_SEPARATION_REFUSAL),
-            "must use the canonical refusal prefix; got: {msg}"
-        );
-        assert!(
-            msg.contains("legacy") || msg.contains("mmr_root_index"),
-            "must name the legacy scan state; got: {msg}"
+            msg.contains(STACK_SEPARATION_REFUSAL) && msg.contains("marker is missing"),
+            "missing marker + data must refuse without claiming; got: {msg}"
         );
 
-        // Same DB: legacy path is still allowed and claims the marker.
-        enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
+        let err_legacy = enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
             .await
-            .expect("legacy path must accept its own scan state");
+            .expect_err("legacy must also refuse missing marker + data");
+        assert!(
+            format!("{err_legacy:#}").contains("marker is missing"),
+            "same-side data without marker must not auto-claim; got: {err_legacy:#}"
+        );
         clear_process_stack_mode_for_test();
     }
 
-    // --- v1.1 data blocks legacy ---
     {
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
-        seed_v11_scan_state(&pool).await;
+        seed_v11_scan_state_without_marker(&pool).await;
+
+        let err_legacy = enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
+            .await
+            .expect_err("legacy must refuse missing marker + v11 data");
+        assert!(
+            format!("{err_legacy:#}").contains(STACK_SEPARATION_REFUSAL),
+            "got: {err_legacy:#}"
+        );
+
+        let err_v11 = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect_err("v1.1 must refuse missing marker even with same-side data");
+        assert!(
+            format!("{err_v11:#}").contains("marker is missing"),
+            "no claim-from-data; got: {err_v11:#}"
+        );
+        clear_process_stack_mode_for_test();
+    }
+
+    // --- claimed + same-side data: accepted ---
+    {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
+            .await
+            .expect("fresh DB claims legacy");
+        seed_legacy_scan_state(&pool).await;
+        clear_process_stack_mode_for_test();
+        enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
+            .await
+            .expect("legacy re-boot with own marker + data");
+        clear_process_stack_mode_for_test();
+
+        let err = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect_err("v1.1 must refuse legacy claim + data");
+        assert!(
+            format!("{err:#}").contains(STACK_SEPARATION_REFUSAL),
+            "got: {err:#}"
+        );
+        clear_process_stack_mode_for_test();
+    }
+
+    {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("fresh DB claims v11");
+        // Persist a real snapshot under the claim (transactional writer).
+        let engine = StateEngine::new(Network::Regtest, 0);
+        let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, [0u8; 32]);
+        db_v11::persist_engine_snapshot(&pool, &snap)
+            .await
+            .expect("persist under v11 claim");
+        clear_process_stack_mode_for_test();
+        enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("v1.1 re-boot with own marker + data");
+        clear_process_stack_mode_for_test();
 
         let err = enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
             .await
-            .expect_err("legacy must refuse a DB with v11_nflog_entries");
-        let msg = format!("{err:#}");
+            .expect_err("legacy must refuse v11 claim + data");
         assert!(
-            msg.contains(STACK_SEPARATION_REFUSAL),
-            "must use the canonical refusal prefix; got: {msg}"
+            format!("{err:#}").contains(STACK_SEPARATION_REFUSAL),
+            "got: {err:#}"
         );
-        assert!(
-            msg.contains("v11") || msg.contains("NfLog") || msg.contains("nflog"),
-            "must name the v1.1 scan state; got: {msg}"
-        );
-
-        enforce_stack_scan_mode(&pool, ScanStackMode::V11)
-            .await
-            .expect("v1.1 path must accept its own scan state");
         clear_process_stack_mode_for_test();
     }
 
@@ -586,6 +651,207 @@ async fn hard_separation_refuses_cross_stack_boot() {
         ensure_v11_publisher_allowed().expect("v11 publisher under v11 claim");
         clear_process_stack_mode_for_test();
     }
+}
+
+/// Defect 1: a write to a v1.1 table under a mismatching (or missing)
+/// marker fails **inside** the transaction — nothing is committed.
+#[tokio::test]
+async fn v11_persist_refuses_under_mismatching_marker_in_transaction() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+
+    // Claim legacy first so any v11 write is a capability mismatch.
+    enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
+        .await
+        .expect("claim legacy");
+    clear_process_stack_mode_for_test();
+
+    let engine = StateEngine::new(Network::Regtest, 0);
+    let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, [0x42; 32]);
+    let err = db_v11::persist_engine_snapshot(&pool, &snap)
+        .await
+        .expect_err("v11 persist under legacy marker must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(STACK_CAPABILITY_REFUSAL) || msg.contains("stack_scan_mode"),
+        "must refuse on capability check; got: {msg}"
+    );
+
+    // Transaction rolled back: no v11 meta row committed.
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v11_engine_meta")
+        .fetch_one(&pool)
+        .await
+        .expect("count meta");
+    assert_eq!(n, 0, "failed persist must leave v11 tables empty");
+
+    // Missing marker is also refusal (no silent claim-from-write).
+    let scope2 = setup_pool().await;
+    let pool2 = scope2.pool.clone();
+    let err2 = db_v11::persist_engine_snapshot(&pool2, &snap)
+        .await
+        .expect_err("v11 persist without marker must fail");
+    assert!(
+        format!("{err2:#}").contains("marker is missing")
+            || format!("{err2:#}").contains(STACK_CAPABILITY_REFUSAL),
+        "got: {err2:#}"
+    );
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 2: `resume_pending_inscriptions` refuses under a v1.1 process claim.
+#[tokio::test]
+async fn resume_pending_inscriptions_refuses_under_v11_claim() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    enforce_stack_scan_mode(&scope.pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11");
+
+    let config = crate::publisher::EsploraConfig {
+        url: "http://127.0.0.1:1/api".to_string(),
+        is_mainnet: false,
+        network_name: "regtest".to_string(),
+        ws_url: None,
+    };
+    let err = crate::publisher::resume_pending_inscriptions(&scope.pool, &config)
+        .await
+        .expect_err("resume must refuse under v11 claim");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(STACK_SEPARATION_REFUSAL) || msg.contains("v1.1"),
+        "must name stack separation; got: {msg}"
+    );
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 3: persist state, simulate a reorg that invalidates the tip,
+/// restart apply path, assert accumulator equals a continuously-running
+/// full-replace from the new canonical stream.
+#[tokio::test]
+async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11");
+
+    // --- Persist old-fork state (what a node would hold before crash) ---
+    let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+        .await
+        .expect("adapter");
+    let old_tip_hash = [0xAA; 32];
+    let fork_survivors = members_to_published(
+        10,
+        0,
+        0,
+        &[(pk(1), r_val(1)), (pk(2), r_val(2))],
+    )
+    .expect("old fork members");
+    // Height 11 has a third nullifier that will be orphaned by the reorg.
+    let mut orphaned = members_to_published(11, 0, 0, &[(pk(3), r_val(3))]).expect("orphan");
+    let mut old_stream = fork_survivors.clone();
+    old_stream.append(&mut orphaned);
+
+    apply_canonical_survivors(&adapter, 11, old_tip_hash, &old_stream)
+        .await
+        .expect("persist old fork");
+    let (old_root, _) = adapter.identity_roots();
+    assert_eq!(adapter.with_engine(|e| e.nflog().nav().size), 3);
+
+    // --- New canonical stream after reorg (pk3 orphaned, pk4 wins at 11) ---
+    let new_tip_hash = [0xBB; 32];
+    assert_ne!(old_tip_hash, new_tip_hash);
+    let mut new_stream = fork_survivors;
+    let mut replacement =
+        members_to_published(11, 0, 0, &[(pk(4), r_val(4))]).expect("replacement");
+    new_stream.append(&mut replacement);
+
+    // Continuous-node oracle: pure in-memory full-replace (no DB write yet).
+    let mut continuous_engine = StateEngine::new(Network::Regtest, 0);
+    super::scan::replace_engine_nflog_from_survivors(
+        &mut continuous_engine,
+        11,
+        new_tip_hash,
+        &new_stream,
+    )
+    .expect("continuous replace");
+    let continuous_root =
+        host::digest_to_bytes(&continuous_engine.nflog().nav().root());
+    assert_eq!(continuous_engine.nflog().nav().size, 3);
+    assert!(matches!(
+        continuous_engine.nflog().lookup(pk(3)),
+        LookupResult::Absent
+    ));
+    assert!(matches!(
+        continuous_engine.nflog().lookup(pk(4)),
+        LookupResult::Present { .. }
+    ));
+    assert_ne!(continuous_root, old_root, "reorg must change the NfLog root");
+
+    // --- Restart path: reconciling the persisted tip sees divergence ---
+    let recon = reconcile_persisted_tip(11, old_tip_hash, |_h| Ok(Some(new_tip_hash)))
+        .expect("recon");
+    assert!(
+        matches!(recon, PersistedTipReconciliation::MustFullReplace { .. }),
+        "diverged tip must force full replace; got {recon:?}"
+    );
+
+    // Fresh adapter load (simulates process restart) still holds old tip.
+    let restarted = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+        .await
+        .expect("restart load");
+    assert_eq!(restarted.tip_hash(), old_tip_hash);
+    assert_eq!(restarted.identity_roots().0, old_root);
+
+    let recon2 = reconcile_persisted_tip(
+        restarted.with_engine(|e| e.tip_height()),
+        restarted.tip_hash(),
+        |_h| Ok(Some(new_tip_hash)),
+    )
+    .expect("recon2");
+    assert!(matches!(
+        recon2,
+        PersistedTipReconciliation::MustFullReplace { .. }
+    ));
+
+    // MustFullReplace apply — same as a continuous node after live reorg.
+    apply_canonical_survivors(&restarted, 11, new_tip_hash, &new_stream)
+        .await
+        .expect("restart full replace");
+
+    let (restarted_root, _) = restarted.identity_roots();
+    assert_eq!(
+        restarted_root, continuous_root,
+        "restarted node must match continuous-node NfLog after reorg"
+    );
+    assert_eq!(restarted.tip_hash(), new_tip_hash);
+    restarted.with_engine(|e| {
+        assert!(matches!(e.nflog().lookup(pk(3)), LookupResult::Absent));
+        assert!(matches!(
+            e.nflog().lookup(pk(4)),
+            LookupResult::Present { .. }
+        ));
+    });
+
+    // Still-canonical tip: forward path is selected (no full replace).
+    let recon_ok = reconcile_persisted_tip(11, new_tip_hash, |_h| Ok(Some(new_tip_hash)))
+        .expect("still canonical");
+    assert!(matches!(
+        recon_ok,
+        PersistedTipReconciliation::StillCanonical { .. }
+    ));
+
+    // Ambiguous tip (height>0, zero hash) refuses.
+    let err = reconcile_persisted_tip(5, [0u8; 32], |_| Ok(Some([1u8; 32])))
+        .expect_err("zero hash with height must refuse");
+    assert!(
+        format!("{err:#}").contains("all-zero"),
+        "got: {err:#}"
+    );
+
+    clear_process_stack_mode_for_test();
 }
 
 /// §3.6: multi-member inscription folded in canonical

@@ -3,8 +3,9 @@
 //! The full chain-connectivity loop (bitcoind RPC, envelope parse, anchor
 //! bound, signature verify) lives in `zkcoins_prover::scanner::Scanner`.
 //! This module owns the **node-side apply** of already-validated survivors
-//! into the Stage-1 persistence adapter, plus pure helpers for ordering
-//! and first-occurrence so unit tests can prove §3.6 without a bitcoind.
+//! into the Stage-1 persistence adapter, pure helpers for ordering and
+//! first-occurrence, and **boot tip reconciliation** so a restart across
+//! a reorg cannot fold a new canonical stream into a stale NfLog.
 //!
 //! ## Reorg behaviour (v1.1 path)
 //!
@@ -16,6 +17,23 @@
 //! persisting atomically. Account/CoinHist rows are left intact — only
 //! the nullifier log is a pure function of the confirmed chain.
 //!
+//! ## Restart across a reorg
+//!
+//! Every boot creates a fresh scanner with an empty checkpoint. If Bitcoin
+//! reorganised while the node was down, that scanner cannot report a reorg
+//! (no previous tip). The node therefore reconciles the **persisted** tip
+//! hash against the live chain **before** any fold:
+//!
+//! - tip still canonical → seed folded keys; forward-append only
+//! - tip diverged / missing → full NfLog replace from the rescan survivor
+//!   stream (equivalent to replaying from activation; NfLog is a pure
+//!   function of the confirmed chain's first-occurrence winners)
+//! - tip height > 0 with all-zero hash → refuse (ambiguous cursor)
+//! - live-chain query failure → refuse (never fold onto an unverified tip)
+//!
+//! Property: after any crash or reorg, a restarted node reaches the same
+//! accumulator a continuously running node would hold.
+//!
 //! A mid-apply crash leaves the previous snapshot (persist is
 //! all-or-nothing via [`crate::v11::db_v11::persist_engine_snapshot`]);
 //! retry reloads and re-applies from the scanner checkpoint.
@@ -25,7 +43,7 @@ use shared::spec_v1::{ChainPosition, FoldOutcome, PublishedNullifier};
 use zkcoins_prover::state_engine::StateEngine;
 
 use super::adapter::EngineAdapter;
-use super::separation::{ensure_v11_publisher_allowed, ScanStackMode};
+use super::separation::{ensure_v11_publisher_allowed, process_stack_mode, ScanStackMode};
 
 /// Outcome counters for one fold pass (forward scan or reorg apply).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -197,6 +215,24 @@ pub fn replace_engine_nflog_from_survivors(
     Ok(stats)
 }
 
+/// Require an exclusive v1.1 process claim before mutating NfLog state.
+///
+/// Unset process mode is **not** permitted: an unset mode previously
+/// allowed writes that later left v1.1 data under a legacy marker.
+fn require_v11_process_for_nflog_write() -> Result<()> {
+    match process_stack_mode() {
+        Some(ScanStackMode::V11) => Ok(()),
+        Some(ScanStackMode::Legacy) => bail!(
+            "stack separation: refusing to fold NfLog while process \
+             is claimed as legacy (no silent cross-stack write)"
+        ),
+        None => bail!(
+            "stack separation: refusing to fold NfLog without a process \
+             claim of ScanStackMode::V11 (no silent write under unset mode)"
+        ),
+    }
+}
+
 /// Forward-scan apply on the live adapter: fold new survivors, set tip, persist.
 pub async fn apply_forward_scan(
     adapter: &EngineAdapter,
@@ -204,19 +240,7 @@ pub async fn apply_forward_scan(
     tip_hash: [u8; 32],
     new_survivors: &[PublishedNullifier],
 ) -> Result<FoldStats> {
-    // Structural: only the v1.1 process may write the NfLog.
-    // (Publisher allow-check is the same claim; reuse its error wording.)
-    if super::separation::process_stack_mode() != Some(ScanStackMode::V11) {
-        // Tests may call apply without process claim when they pass adapter
-        // directly; require either process claim OR that caller uses the
-        // adapter only after enforce. Fail if process explicitly claimed legacy.
-        if let Some(ScanStackMode::Legacy) = super::separation::process_stack_mode() {
-            bail!(
-                "stack separation: refusing to fold NfLog while process \
-                 is claimed as legacy (no silent cross-stack write)"
-            );
-        }
-    }
+    require_v11_process_for_nflog_write()?;
 
     let stats = adapter.with_engine_mut(|engine| {
         if tip_height < engine.tip_height() {
@@ -240,19 +264,15 @@ pub async fn apply_forward_scan(
     Ok(stats)
 }
 
-/// Reorg apply: replace NfLog from the full post-reorg survivor stream.
+/// Reorg / full-rebuild apply: replace NfLog from the full post-reorg
+/// (or post-rescan) survivor stream.
 pub async fn apply_canonical_survivors(
     adapter: &EngineAdapter,
     tip_height: u64,
     tip_hash: [u8; 32],
     survivors: &[PublishedNullifier],
 ) -> Result<FoldStats> {
-    if let Some(ScanStackMode::Legacy) = super::separation::process_stack_mode() {
-        bail!(
-            "stack separation: refusing reorg NfLog replace while process \
-             is claimed as legacy"
-        );
-    }
+    require_v11_process_for_nflog_write()?;
     let stats = adapter.with_engine_mut(|engine| {
         replace_engine_nflog_from_survivors(engine, tip_height, tip_hash, survivors)
     })?;
@@ -262,6 +282,101 @@ pub async fn apply_canonical_survivors(
         .await
         .context("apply_canonical_survivors: persist")?;
     Ok(stats)
+}
+
+/// Outcome of reconciling a persisted tip against the live Bitcoin chain.
+///
+/// Decides whether a restarted node may forward-append or must rebuild
+/// the NfLog from the full canonical survivor stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersistedTipReconciliation {
+    /// Engine has no tip yet (height 0, all-zero hash). Scan forward from
+    /// activation; first persist will establish the cursor.
+    Fresh,
+    /// Persisted tip is still the live hash at that height. Seed folded
+    /// keys from the engine and forward-append only new survivors.
+    StillCanonical {
+        tip_height: u64,
+        tip_hash: [u8; 32],
+    },
+    /// Persisted tip is no longer on the canonical chain (hash mismatch,
+    /// height above live tip, or height missing). First apply after the
+    /// rescan **must** full-replace the NfLog — never forward-fold into
+    /// the stale accumulator.
+    MustFullReplace {
+        persisted_height: u64,
+        persisted_hash: [u8; 32],
+    },
+}
+
+/// Reconcile `(tip_height, tip_hash)` from the persisted engine against
+/// the live chain.
+///
+/// `live_hash_at(height)` returns:
+/// - `Ok(Some(hash))` when the height is on the live chain
+/// - `Ok(None)` when the height is above the live tip (or otherwise absent)
+/// - `Err(_)` on RPC / infrastructure failure — this function propagates
+///   the error and **refuses** to classify the tip (never fold blind)
+///
+/// # Failures
+///
+/// - `tip_height > 0` with all-zero `tip_hash` (ambiguous cursor)
+/// - live-chain query failure
+pub fn reconcile_persisted_tip(
+    tip_height: u64,
+    tip_hash: [u8; 32],
+    live_hash_at: impl FnOnce(u64) -> Result<Option<[u8; 32]>>,
+) -> Result<PersistedTipReconciliation> {
+    let zero = [0u8; 32];
+    if tip_height == 0 && tip_hash == zero {
+        return Ok(PersistedTipReconciliation::Fresh);
+    }
+    if tip_hash == zero {
+        bail!(
+            "v1.1 boot tip reconciliation: tip_height={tip_height} but tip_hash \
+             is all-zero — ambiguous cursor; refusing to fold (restore a \
+             snapshot with a real tip_hash or wipe v1.1 tables)"
+        );
+    }
+
+    let live = live_hash_at(tip_height).context(
+        "v1.1 boot tip reconciliation: live-chain query failed; \
+         refusing to fold onto an unverified persisted tip",
+    )?;
+
+    match live {
+        Some(hash) if hash == tip_hash => Ok(PersistedTipReconciliation::StillCanonical {
+            tip_height,
+            tip_hash,
+        }),
+        Some(_) | None => Ok(PersistedTipReconciliation::MustFullReplace {
+            persisted_height: tip_height,
+            persisted_hash: tip_hash,
+        }),
+    }
+}
+
+/// Fold-key type used by the v1.1 scan loop to skip already-applied
+/// survivors after a still-canonical restart.
+pub type FoldedSurvivorKey = (u64, u32, u32, u32, [u8; 32]);
+
+/// Seed the in-process folded-key set from a persisted NfLog mirror so a
+/// still-canonical restart does not re-append first-occurrence winners.
+pub fn folded_keys_from_nflog_mirror(
+    mirror: &[(ChainPosition, shared::spec_v1::NfLogEntry)],
+) -> std::collections::HashSet<FoldedSurvivorKey> {
+    mirror
+        .iter()
+        .map(|(pos, entry)| {
+            (
+                pos.height,
+                pos.tx_index,
+                pos.vin_index,
+                pos.member_index,
+                entry.pk,
+            )
+        })
+        .collect()
 }
 
 /// Build [`PublishedNullifier`] rows for one multi-member inscription at a

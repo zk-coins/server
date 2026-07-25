@@ -21,7 +21,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use node::account_node;
 use node::db;
 use node::publisher::EsploraConfig;
-use node::runtime::start_rest_node;
+use node::runtime::{start_rest_node, V11Readiness};
 use node::scanner_runtime::scan_for_inscriptions;
 use node::scanner_ws::{run_scanner_ws, ScannerWsConfig};
 use node::state::State;
@@ -30,6 +30,7 @@ use node::v11::{self, ScanStackMode, V11ShadowMode};
 use node::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
 use shared::commitment::Commitment;
 use std::error::Error as StdError;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -266,6 +267,24 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // alerting fires on the loop, matching the panic-hook behaviour
     // above (zk-coins/node#89 round-2 MAJOR 2).
     let pool_for_rest = Arc::clone(&pool);
+    // v1.1 readiness handles: under the exclusive NfLog stack, REST binds
+    // before the scanner connects/catches up. Share atomics so
+    // `/health/ready` stays 503 until the first successful apply and
+    // trips on `finality_broken`. Legacy path leaves both `None`.
+    let (v11_readiness, v11_scan_caught_up, v11_finality_ok) = if v11_adapter.is_some() {
+        let caught_up = Arc::new(AtomicBool::new(false));
+        let finality_ok = Arc::new(AtomicBool::new(true));
+        (
+            V11Readiness {
+                scan_caught_up: Some(Arc::clone(&caught_up)),
+                finality_ok: Some(Arc::clone(&finality_ok)),
+            },
+            Some(caught_up),
+            Some(finality_ok),
+        )
+    } else {
+        (V11Readiness::default(), None, None)
+    };
     // `proofs_dir` was already read at the binary edge above (for the
     // self-heal proof-store cleanup) and is moved into the spawned
     // task here. `start_rest_node` no longer touches `std::env` so the
@@ -279,6 +298,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             ACCOUNT_NODE_ADDR,
             pool_for_rest,
             &proofs_dir,
+            v11_readiness,
         )
         .await
         {
@@ -290,7 +310,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // Stage 2 dual stack: either the v1.1 NfLog scanner **or** the legacy
     // Commitment/SMT scanner — never both against the same process state.
     if let Some(adapter) = v11_adapter {
-        run_v11_scan_loop(adapter).await?;
+        run_v11_scan_loop(adapter, v11_scan_caught_up, v11_finality_ok).await?;
         return Ok(());
     }
 
@@ -623,21 +643,35 @@ fn mark_pending_complete_from_sync_context(
 /// **Never** falls back to the Esplora Commitment scanner. Missing RPC
 /// pins, connect failures, or infrastructure errors abort the process.
 ///
-/// ## Reorg
+/// ## Reorg (live)
 /// When `scan_to_tip` reports a reorg, the full post-reorg survivor stream
 /// replaces the engine NfLog ([`v11::apply_canonical_survivors`]). Forward
 /// progress without reorg appends only newly seen survivors.
-async fn run_v11_scan_loop(adapter: node::v11::EngineAdapter) -> Result<(), Box<dyn StdError>> {
+/// `ReorgOutcome::finality_broken` stops crediting and fails readiness.
+///
+/// ## Reorg (restart while down)
+/// A fresh scanner has no checkpoint, so a reorg that happened offline is
+/// invisible to `report.reorg`. Before the first fold we reconcile the
+/// **persisted** tip hash against bitcoind; on divergence the first apply
+/// is a full NfLog replace from the rescan survivor stream.
+async fn run_v11_scan_loop(
+    adapter: node::v11::EngineAdapter,
+    scan_caught_up: Option<Arc<AtomicBool>>,
+    finality_ok: Option<Arc<AtomicBool>>,
+) -> Result<(), Box<dyn StdError>> {
     use std::collections::HashSet;
     use std::time::Duration;
+    use v11::{
+        folded_keys_from_nflog_mirror, reconcile_persisted_tip, PersistedTipReconciliation,
+    };
 
     let pins = v11::mode::v11_boot_pins_from_env().map_err(|e| e.to_string())?;
     let (rpc_url, cookie_path) =
         v11::scan::v11_bitcoind_rpc_from_env().map_err(|e| e.to_string())?;
 
     let scanner_config = zkcoins_prover::scanner::ScannerConfig {
-        rpc_url,
-        cookie_path,
+        rpc_url: rpc_url.clone(),
+        cookie_path: cookie_path.clone(),
         network: pins.network,
         activation_height: pins.activation_height,
         network_params: pins.network_params.clone(),
@@ -663,10 +697,81 @@ async fn run_v11_scan_loop(adapter: node::v11::EngineAdapter) -> Result<(), Box<
         )
     })?;
 
+    // Boot tip reconciliation: compare the persisted tip against the live
+    // chain before any fold. Uses a separate RPC client so we do not depend
+    // on scanner-private state (fresh scanner has scanned_through = None).
+    let persisted_height = adapter.with_engine(|e| e.tip_height());
+    let persisted_hash = adapter.tip_hash();
+    let tip_recon = {
+        let rpc_url = rpc_url.clone();
+        let cookie_path = cookie_path.clone();
+        let height = persisted_height;
+        tokio::task::spawn_blocking(move || {
+            use bitcoincore_rpc::RpcApi;
+            reconcile_persisted_tip(height, persisted_hash, |h| {
+                let client = bitcoincore_rpc::Client::new(
+                    rpc_url.trim_end_matches('/'),
+                    bitcoincore_rpc::Auth::CookieFile(cookie_path.clone()),
+                )
+                .map_err(|e| anyhow::anyhow!("bitcoind RPC open for tip recon: {e}"))?;
+                let tip = client
+                    .get_block_count()
+                    .map_err(|e| anyhow::anyhow!("getblockcount for tip recon: {e}"))?;
+                if h > tip {
+                    return Ok(None);
+                }
+                let hash = client
+                    .get_block_hash(h)
+                    .map_err(|e| anyhow::anyhow!("getblockhash({h}) for tip recon: {e}"))?;
+                Ok(Some(hash.to_byte_array()))
+            })
+        })
+        .await
+        .map_err(|e| format!("v1.1 tip reconciliation join: {e}"))?
+        .map_err(|e| format!("v1.1 tip reconciliation failed: {e:#}"))?
+    };
+
     // Track which survivor chain positions we have already folded so a
     // re-scan of the same tip does not re-append (append_nullifier is
-    // strict). Reorg clears this set and rebuilds from the full stream.
+    // strict). Reorg / full-replace clears this set and rebuilds.
     let mut folded_keys: HashSet<(u64, u32, u32, u32, [u8; 32])> = HashSet::new();
+    // When the persisted tip diverged, the first successful scan must
+    // full-replace NfLog even if the fresh scanner reports no reorg.
+    let mut force_full_replace = matches!(
+        tip_recon,
+        PersistedTipReconciliation::MustFullReplace { .. }
+    );
+
+    match tip_recon {
+        PersistedTipReconciliation::Fresh => {
+            println!("v1.1 boot tip: fresh engine (no persisted tip); forward scan from activation");
+        }
+        PersistedTipReconciliation::StillCanonical {
+            tip_height,
+            tip_hash,
+        } => {
+            let mirror = adapter.with_engine(|e| e.nflog_mirror());
+            folded_keys = folded_keys_from_nflog_mirror(&mirror);
+            println!(
+                "v1.1 boot tip: still canonical at height={} hash={} (seeded {} folded keys)",
+                tip_height,
+                hex::encode(tip_hash),
+                folded_keys.len()
+            );
+        }
+        PersistedTipReconciliation::MustFullReplace {
+            persisted_height,
+            persisted_hash,
+        } => {
+            println!(
+                "v1.1 boot tip: persisted tip height={} hash={} is no longer canonical; \
+                 first apply will full-replace NfLog from the rescan survivor stream \
+                 (never forward-fold into a stale accumulator)",
+                persisted_height,
+                hex::encode(persisted_hash)
+            );
+        }
+    }
 
     loop {
         let scan_result = tokio::task::spawn_blocking(move || {
@@ -689,6 +794,25 @@ async fn run_v11_scan_loop(adapter: node::v11::EngineAdapter) -> Result<(), Box<
             }
         };
 
+        // §3.9: finality_broken means callers must stop crediting and
+        // readiness must fail. Honour the contract — do not continue the
+        // fold loop after a deep reorg displaces final positions.
+        if let Some(ref reorg) = report.reorg {
+            if reorg.finality_broken {
+                if let Some(flag) = &finality_ok {
+                    flag.store(false, Ordering::SeqCst);
+                }
+                return Err(format!(
+                    "v1.1 scanner: FINALITY BROKEN after reorg \
+                     (displaced_final_count={}) — stopping NfLog credit and \
+                     failing readiness (deep_reorg). Manual recovery required; \
+                     refusing to continue folding",
+                    reorg.displaced_final_count
+                )
+                .into());
+            }
+        }
+
         let tip = scanner
             .scanned_through()
             .ok_or("v1.1 scanner has no scanned_through tip after successful scan_to_tip")?;
@@ -696,7 +820,8 @@ async fn run_v11_scan_loop(adapter: node::v11::EngineAdapter) -> Result<(), Box<
         let tip_hash = tip.1.to_byte_array();
         let survivors = scanner.survivors().to_vec();
 
-        if report.reorg.is_some() {
+        let do_full_replace = force_full_replace || report.reorg.is_some();
+        if do_full_replace {
             // Full replace: scanner survivors are the canonical stream.
             let stats = v11::apply_canonical_survivors(
                 &adapter,
@@ -705,7 +830,8 @@ async fn run_v11_scan_loop(adapter: node::v11::EngineAdapter) -> Result<(), Box<
                 &survivors,
             )
             .await
-            .map_err(|e| format!("v1.1 reorg NfLog apply failed: {e:#}"))?;
+            .map_err(|e| format!("v1.1 reorg/full-replace NfLog apply failed: {e:#}"))?;
+            force_full_replace = false;
             folded_keys.clear();
             for nf in &survivors {
                 folded_keys.insert((
@@ -717,7 +843,7 @@ async fn run_v11_scan_loop(adapter: node::v11::EngineAdapter) -> Result<(), Box<
                 ));
             }
             println!(
-                "v1.1 scanner reorg applied: tip={} hash={} appended={} dup_ignored={}",
+                "v1.1 scanner full-replace applied: tip={} hash={} appended={} dup_ignored={}",
                 tip_height,
                 tip.1,
                 stats.appended,
@@ -756,6 +882,15 @@ async fn run_v11_scan_loop(adapter: node::v11::EngineAdapter) -> Result<(), Box<
                         tip_height, stats.appended, stats.duplicate_ignored, stats.below_activation
                     );
                 }
+            }
+        }
+
+        // First successful catch-up: mark readiness so load balancers can
+        // send traffic once the NfLog view reflects the chain tip.
+        if let Some(flag) = &scan_caught_up {
+            if !flag.load(Ordering::SeqCst) {
+                flag.store(true, Ordering::SeqCst);
+                println!("v1.1 scanner: catch-up complete; readiness may pass v11_scan gate");
             }
         }
 

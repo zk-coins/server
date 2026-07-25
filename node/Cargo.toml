@@ -69,6 +69,11 @@ anyhow = "1.0"
 zkcoins-prover = { path = "../script-plonky2/", package = "zkcoins-prover-plonky2" }
 zkcoins-program = { path = "../program-plonky2/", package = "zkcoins-program-plonky2" }
 shared = { path = "../shared/" }
+# Bitcoind JSON-RPC (cookie auth). Used by the v1.1 exclusive scan loop
+# for boot tip reconciliation (persisted tip_hash vs live getblockhash)
+# so a restart across a reorg never forward-folds into a stale NfLog.
+# Same line as script-plonky2's scanner/publisher.
+bitcoincore-rpc = "0.19.0"
 lazy_static = { workspace = true }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 # Postgres state-layer. PR-A1 wires the module + migrations + tests
