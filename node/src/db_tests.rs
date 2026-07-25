@@ -81,6 +81,8 @@ async fn connect_and_migrate_creates_all_tables() {
     //     `accounts` and `block_log`.)
     //   * After 0019 (v1.1 persistence): 31 tables + 1 view (additive
     //     NfLog / CoinHist / multi-asset account tables; all `v11_*`).
+    //   * After 0020 (stack_scan_mode):  32 tables + 1 view (exclusive
+    //     legacy vs v1.1 scan-stack claim for Cutover Stage 2).
     assert_eq!(
         names,
         vec![
@@ -106,6 +108,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "r2_probe_warm_calls".to_string(),
             "request_log".to_string(),
             "smt_state".to_string(),
+            "stack_scan_mode".to_string(),
             "state_update_log".to_string(),
             "tx_mining_log".to_string(),
             "username_claim_log".to_string(),

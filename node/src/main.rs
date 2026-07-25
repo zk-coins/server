@@ -26,7 +26,7 @@ use node::scanner_runtime::scan_for_inscriptions;
 use node::scanner_ws::{run_scanner_ws, ScannerWsConfig};
 use node::state::State;
 use node::username;
-use node::v11::{self, V11ShadowMode};
+use node::v11::{self, ScanStackMode, V11ShadowMode};
 use node::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
 use shared::commitment::Commitment;
 use std::error::Error as StdError;
@@ -104,28 +104,36 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     );
     println!("Connected to Postgres state-layer");
 
-    // Cutover Stage 1: optional v1.1 **shadow persistence**. Default is
-    // off (unset / empty / "off"). `ZKCOINS_V11_SHADOW=1` maintains the
-    // StateEngine against the additive v11 tables alongside the legacy
-    // stack; proving remains legacy until Stage 3. Missing pins fail
-    // loud — never fall back silently.
+    // Cutover Stages 1–2: optional v1.1 **exclusive dual stack**.
+    // Default is off (unset / empty / "off") → legacy Commitment publisher
+    // + Esplora SMT scanner. `ZKCOINS_V11_SHADOW=1` claims the database for
+    // AggregateStateNullifierV3 / NfLog only (hard separation). Proving
+    // remains legacy until Stage 3. Missing pins fail loud — never fall
+    // back silently to the other stack.
     let shadow_mode = v11::mode::v11_shadow_mode_from_env().unwrap_or_else(|e| {
         panic!("{e}");
     });
-    // Keep the adapter alive for Stage 2 wiring; Stage 1 does not yet
-    // replace AccountNode / publisher / scanner.
-    let _v11_adapter: Option<node::v11::EngineAdapter> = match shadow_mode {
+    let v11_adapter: Option<node::v11::EngineAdapter> = match shadow_mode {
         V11ShadowMode::Off => {
+            // Exclusive claim: this DB is the legacy scan stack.
+            v11::enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
+                .await
+                .expect("legacy stack separation gate");
             println!(
-                "v1.1 shadow persistence: off (ZKCOINS_V11_SHADOW unset / empty / off); \
-                 proving remains legacy"
+                "v1.1 dual stack: off (ZKCOINS_V11_SHADOW unset / empty / off); \
+                 legacy Commitment publisher + SMT scanner; proving remains legacy"
             );
             None
         }
         V11ShadowMode::On => {
+            // Exclusive claim before any NfLog write.
+            v11::enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+                .await
+                .expect("v1.1 stack separation gate");
             println!(
-                "v1.1 shadow persistence: on (StateEngine maintained in shadow; \
-                 proving remains legacy until Stage 3)"
+                "v1.1 dual stack: on (AggregateStateNullifierV3 publisher + NfLog \
+                 scanner; proving remains legacy until Stage 3; legacy commitment \
+                 publish is refused)"
             );
             let adapter = node::v11::EngineAdapter::load_or_create_from_env((*pool).clone())
                 .await
@@ -135,7 +143,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             // each forces a multi-minute circuit build, and Stage 1 still boots
             // the legacy Prover for AccountNode/REST until Stage 3.
             println!(
-                "v11 shadow EngineAdapter ready (network={:?}, activation_height={})",
+                "v11 EngineAdapter ready (network={:?}, activation_height={})",
                 adapter.network(),
                 adapter.activation_height()
             );
@@ -279,6 +287,14 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
     });
 
+    // Stage 2 dual stack: either the v1.1 NfLog scanner **or** the legacy
+    // Commitment/SMT scanner — never both against the same process state.
+    if let Some(adapter) = v11_adapter {
+        run_v11_scan_loop(adapter).await?;
+        return Ok(());
+    }
+
+    // —— Legacy path (flag off) — Commitment → SMT/MMR via Esplora ——
     // Try to load the latest block hash from Postgres or fall back to
     // Esplora's current tip. The Postgres row is written atomically
     // alongside the SMT/MMR snapshot in the scanner callback, which is
@@ -599,4 +615,155 @@ fn mark_pending_complete_from_sync_context(
             db::PENDING_STATUS_COMPLETE,
         ))
     })
+}
+
+/// Stage 2 v1.1 exclusive scan loop: bitcoind RPC + script-plonky2
+/// [`zkcoins_prover::scanner::Scanner`] → NfLog fold on [`EngineAdapter`].
+///
+/// **Never** falls back to the Esplora Commitment scanner. Missing RPC
+/// pins, connect failures, or infrastructure errors abort the process.
+///
+/// ## Reorg
+/// When `scan_to_tip` reports a reorg, the full post-reorg survivor stream
+/// replaces the engine NfLog ([`v11::apply_canonical_survivors`]). Forward
+/// progress without reorg appends only newly seen survivors.
+async fn run_v11_scan_loop(adapter: node::v11::EngineAdapter) -> Result<(), Box<dyn StdError>> {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    let pins = v11::mode::v11_boot_pins_from_env().map_err(|e| e.to_string())?;
+    let (rpc_url, cookie_path) =
+        v11::scan::v11_bitcoind_rpc_from_env().map_err(|e| e.to_string())?;
+
+    let scanner_config = zkcoins_prover::scanner::ScannerConfig {
+        rpc_url,
+        cookie_path,
+        network: pins.network,
+        activation_height: pins.activation_height,
+        network_params: pins.network_params.clone(),
+        expected_params_identifier: pins.expected_params_identifier,
+    };
+
+    println!(
+        "v1.1 scanner: connecting bitcoind RPC for AggregateStateNullifierV3 / NfLog \
+         (network={:?}, activation_height={})",
+        pins.network, pins.activation_height
+    );
+
+    // Connect is synchronous (blocking RPC). Keep it off the async worker.
+    let mut scanner = tokio::task::spawn_blocking(move || {
+        zkcoins_prover::scanner::Scanner::connect(scanner_config)
+    })
+    .await
+    .map_err(|e| format!("v1.1 scanner connect join: {e}"))?
+    .map_err(|e| {
+        format!(
+            "v1.1 Scanner::connect failed: {e:#} — refusing to fall back to the \
+             legacy Esplora commitment scanner"
+        )
+    })?;
+
+    // Track which survivor chain positions we have already folded so a
+    // re-scan of the same tip does not re-append (append_nullifier is
+    // strict). Reorg clears this set and rebuilds from the full stream.
+    let mut folded_keys: HashSet<(u64, u32, u32, u32, [u8; 32])> = HashSet::new();
+
+    loop {
+        let scan_result = tokio::task::spawn_blocking(move || {
+            let report = scanner.scan_to_tip();
+            (scanner, report)
+        })
+        .await
+        .map_err(|e| format!("v1.1 scan_to_tip join: {e}"))?;
+
+        scanner = scan_result.0;
+        let report = match scan_result.1 {
+            Ok(r) => r,
+            Err(e) => {
+                // Infrastructure failure: fail loud (no legacy fall-back).
+                return Err(format!(
+                    "v1.1 scanner infrastructure failure: {e:#} — refusing to \
+                     fall back to the legacy commitment scanner"
+                )
+                .into());
+            }
+        };
+
+        let tip = scanner
+            .scanned_through()
+            .ok_or("v1.1 scanner has no scanned_through tip after successful scan_to_tip")?;
+        let tip_height = tip.0;
+        let tip_hash = tip.1.to_byte_array();
+        let survivors = scanner.survivors().to_vec();
+
+        if report.reorg.is_some() {
+            // Full replace: scanner survivors are the canonical stream.
+            let stats = v11::apply_canonical_survivors(
+                &adapter,
+                tip_height,
+                tip_hash,
+                &survivors,
+            )
+            .await
+            .map_err(|e| format!("v1.1 reorg NfLog apply failed: {e:#}"))?;
+            folded_keys.clear();
+            for nf in &survivors {
+                folded_keys.insert((
+                    nf.chain_pos.height,
+                    nf.chain_pos.tx_index,
+                    nf.chain_pos.vin_index,
+                    nf.chain_pos.member_index,
+                    nf.pk,
+                ));
+            }
+            println!(
+                "v1.1 scanner reorg applied: tip={} hash={} appended={} dup_ignored={}",
+                tip_height,
+                tip.1,
+                stats.appended,
+                stats.duplicate_ignored
+            );
+        } else {
+            let new: Vec<_> = survivors
+                .iter()
+                .copied()
+                .filter(|nf| {
+                    !folded_keys.contains(&(
+                        nf.chain_pos.height,
+                        nf.chain_pos.tx_index,
+                        nf.chain_pos.vin_index,
+                        nf.chain_pos.member_index,
+                        nf.pk,
+                    ))
+                })
+                .collect();
+            if !new.is_empty() || tip_height > adapter.with_engine(|e| e.tip_height()) {
+                let stats = v11::apply_forward_scan(&adapter, tip_height, tip_hash, &new)
+                    .await
+                    .map_err(|e| format!("v1.1 forward NfLog apply failed: {e:#}"))?;
+                for nf in &new {
+                    folded_keys.insert((
+                        nf.chain_pos.height,
+                        nf.chain_pos.tx_index,
+                        nf.chain_pos.vin_index,
+                        nf.chain_pos.member_index,
+                        nf.pk,
+                    ));
+                }
+                if stats.appended > 0 || stats.duplicate_ignored > 0 {
+                    println!(
+                        "v1.1 scanner folded: tip={} appended={} dup_ignored={} below_act={}",
+                        tip_height, stats.appended, stats.duplicate_ignored, stats.below_activation
+                    );
+                }
+            }
+        }
+
+        // Event-driven tip advance is owned by bitcoind; poll interval is a
+        // last-resort backoff between successful scan_to_tip calls (no
+        // Esplora WS on this path). Marked so CI lint grandfathering matches
+        // scanner_runtime's HTTP backoff token style.
+        // scanner-polling-ok: v11 bitcoind scan_to_tip idle backoff
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }

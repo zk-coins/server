@@ -1,8 +1,9 @@
-//! Node → [`StateEngine`] adapter (Cutover Stage 1).
+//! Node → [`StateEngine`] adapter (Cutover Stages 1–2).
 //!
 //! Owns a mutex-protected in-memory engine and the Postgres pool used to
-//! snapshot / reload it. Does **not** wire publisher, scanner, wallet
-//! signing, or REST — those are later stages.
+//! snapshot / reload it. Stage 2 folds NfLog survivors through this
+//! adapter (`scan` / `main::run_v11_scan_loop`). Wallet signing and
+//! prove-path REST remain Stage 3.
 
 use std::sync::Mutex;
 
