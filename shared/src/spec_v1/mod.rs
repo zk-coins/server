@@ -2,7 +2,8 @@
 //!
 //! Self-contained namespace for the Poseidon/`Hc` primitive, field encodings,
 //! derivation functions, canonical serializations, and the tree/log/SMT
-//! hashing helpers defined in `.spec-v1.1-reference.md` §§1.1, 1.4–1.7, 2.2,
+//! hashing helpers defined in the normative specification (`docs` repository,
+//! `docs/specification.md` at tag `spec-v1.1`) §§1.1, 1.4–1.7, 2.2,
 //! 2.5, 6.5. Does **not** replace the old-model types in `shared::` root or
 //! `zkcoins_program::types`.
 
@@ -14,6 +15,15 @@ pub mod error;
 pub mod hashes;
 pub mod network_params;
 pub mod nflog;
+/// V.11 boundary-suite fixtures + independent RFC-6962 reference (test support).
+///
+/// Consumed by `shared` integration tests and the `program-plonky2` gadget
+/// differential suite so all three layers share one generator.
+///
+/// Gated behind the `test-fixtures` feature so a normal library build never
+/// compiles or exports a second (non-normative) RFC-6962 derivation path.
+#[cfg(feature = "test-fixtures")]
+pub mod nflog_boundary;
 pub mod serialize;
 pub mod tags;
 pub mod trees;
@@ -36,8 +46,8 @@ pub use encoding::{
 };
 pub use error::SpecError;
 pub use hashes::{
-    account_state_hash, address, asset_id_v1, asset_id_v2, coin_identifier, hash_proof_data,
-    name_hash, nav_commitment, network_id, network_id_mainnet, network_id_regtest,
+    account_state_hash, address, asset_id_v1, asset_id_v2, coin_identifier, detect_tag,
+    hash_proof_data, name_hash, nav_commitment, network_id, network_id_mainnet, network_id_regtest,
     network_id_testnet, nk_commit, npk_commit, nullifier, terms_hash_v1, terms_hash_v2,
 };
 pub use network_params::NetworkParams;

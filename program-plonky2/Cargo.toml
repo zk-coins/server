@@ -16,7 +16,10 @@ num-bigint = "0.4"
 num-traits = "0.2"
 secp256k1 = { version = "0.29", features = ["rand-std"] }
 sha2 = { workspace = true }
-shared = { path = "../shared" }
+# `test-fixtures` exposes `shared::spec_v1::nflog_boundary` (independent
+# RFC-6962 reference + V.11 boundary fixtures) for the gadget differential
+# suite only — never a production dependency of this crate.
+shared = { path = "../shared", features = ["test-fixtures"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

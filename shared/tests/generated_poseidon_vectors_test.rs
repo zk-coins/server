@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 use shared::spec_v1::{
     account_state_hash, address, asset_id_v1, asset_id_v2, coinhist_empty_root,
-    coinhist_root_after_first_insert, coin_identifier, digest_to_bytes, hash_proof_data,
+    coinhist_root_after_first_insert, coin_identifier, detect_tag, digest_to_bytes, hash_proof_data,
     merkle_root, name_hash, nav_commitment, network_id_mainnet, network_id_regtest,
     network_id_testnet, nflog_empty, nflog_root, nk_commit, npk_commit, nullifier,
     serialize_proof_data, terms_hash_v1, terms_hash_v2, AccountState, Address, CoinHistState,
@@ -153,7 +153,23 @@ fn generate_poseidon_vectors_file() {
     );
     let network_id_testnet_v = network_id_testnet();
     let network_id_regtest_v = network_id_regtest();
-    // 18
+    // 18 — V.10 note-encryption fixture pins (spec V.10; fully pinned SHA-256/HKDF/secp256k1)
+    // ss  = ECDH(esk, IVPK) = x(esk·lift_x(IVPK))
+    // epk = x-only(esk·G)
+    let v10_ss: [u8; 32] = hex::decode(
+        "842f5821fa577c0374ae48e4c5afa887e3e0900df7245370e5675d88466fa05f",
+    )
+    .expect("V.10 ss hex")
+    .try_into()
+    .expect("V.10 ss is 32 bytes");
+    let v10_epk: [u8; 32] = hex::decode(
+        "e15129c95c4e7528810d91bdc9312389a1c6466bee0237147540c426926af154",
+    )
+    .expect("V.10 epk hex")
+    .try_into()
+    .expect("V.10 epk is 32 bytes");
+    let detect_tag_fixture = detect_tag(&v10_ss, &v10_epk);
+    // 19
     let asset_id_v2_v = asset_id_v2(
         GENESIS_TAG,
         &pk0,
@@ -163,9 +179,9 @@ fn generate_poseidon_vectors_file() {
         500_000_000u128,
         &terms_salt,
     );
-    // 19
-    let terms_hash_v1_v = terms_hash_v1(asset_id, 1);
     // 20
+    let terms_hash_v1_v = terms_hash_v1(asset_id, 1);
+    // 21
     let terms_hash_v2_v = terms_hash_v2(asset_id_v2_v, 2, 500_000_000u128, &terms_salt);
 
     let mut lines = Vec::new();
@@ -218,6 +234,10 @@ fn generate_poseidon_vectors_file() {
         "network_id_regtest = {}",
         hex_digest(&network_id_regtest_v)
     ));
+    lines.push(format!(
+        "detect_tag_fixture = {}",
+        hex_digest(&detect_tag_fixture)
+    ));
     lines.push(format!("asset_id_v2 = {}", hex_digest(&asset_id_v2_v)));
     lines.push(format!(
         "terms_hash_v1 = {}",
@@ -257,6 +277,7 @@ fn generate_poseidon_vectors_file() {
         "network_id_mainnet",
         "network_id_testnet",
         "network_id_regtest",
+        "detect_tag_fixture",
         "asset_id_v2",
         "terms_hash_v1",
         "terms_hash_v2",

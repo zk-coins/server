@@ -3344,6 +3344,7 @@ dependencies = [
  "plonky2",
  "serde",
  "sha2",
+ "shared",
  "zkcoins-program-plonky2",
 ]
 
