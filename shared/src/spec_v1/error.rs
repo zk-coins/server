@@ -19,7 +19,10 @@ pub enum SpecError {
     /// Input byte length does not match the expected fixed width.
     WrongLength { expected: usize, actual: usize },
     /// Bech32m HRP is not the expected value.
-    Bech32WrongHrp { expected: &'static str, actual: String },
+    Bech32WrongHrp {
+        expected: &'static str,
+        actual: String,
+    },
     /// Bech32m decode failed (checksum / charset / format).
     Bech32DecodeError(String),
     /// Small-numeric value ≥ 2^56 (must use wide/byte-string encoding).

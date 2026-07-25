@@ -89,10 +89,7 @@ fn sample_entries(n: usize) -> Vec<NfLogEntry> {
 }
 
 fn format_path(path: &[shared::spec_v1::HashDigest]) -> String {
-    path.iter()
-        .map(hex_digest)
-        .collect::<Vec<_>>()
-        .join(",")
+    path.iter().map(hex_digest).collect::<Vec<_>>().join(",")
 }
 
 #[test]

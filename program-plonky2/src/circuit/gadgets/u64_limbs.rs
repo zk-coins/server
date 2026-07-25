@@ -202,11 +202,7 @@ impl U64LimbsTarget {
             let not_higher = builder.not(any_higher);
             let is_msb_j = builder.and(bits[j], not_higher);
             if j < 32 {
-                lo = builder.mul_const_add(
-                    F::from_canonical_u64(1u64 << j),
-                    is_msb_j.target,
-                    lo,
-                );
+                lo = builder.mul_const_add(F::from_canonical_u64(1u64 << j), is_msb_j.target, lo);
             } else {
                 hi = builder.mul_const_add(
                     F::from_canonical_u64(1u64 << (j - 32)),
@@ -340,7 +336,14 @@ mod tests {
 
     #[test]
     fn be_bytes_match_host_to_be_bytes() {
-        let values = [0u64, 1, 0x0102_0304_0506_0708, F::ORDER, F::ORDER + 1, u64::MAX];
+        let values = [
+            0u64,
+            1,
+            0x0102_0304_0506_0708,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX,
+        ];
         for &value in &values {
             let mut builder =
                 CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());

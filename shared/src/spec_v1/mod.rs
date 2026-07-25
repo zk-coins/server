@@ -41,8 +41,8 @@ pub use datastructures::{
     MAX_ACCOUNT_ASSETS,
 };
 pub use encoding::{
-    digest_from_bytes, digest_to_bytes, encode_byte_string, encode_digest, encode_small_numeric, hc,
-    HcInput, MAX_BYTE_STRING_LEN, MAX_SMALL_NUMERIC,
+    digest_from_bytes, digest_to_bytes, encode_byte_string, encode_digest, encode_small_numeric,
+    hc, HcInput, MAX_BYTE_STRING_LEN, MAX_SMALL_NUMERIC,
 };
 pub use error::SpecError;
 pub use hashes::{

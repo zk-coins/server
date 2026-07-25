@@ -28,10 +28,7 @@ pub fn nk_commit(nk: &[u8; 32]) -> HashDigest {
 pub fn nullifier(nk: &[u8; 32], coin_identifier: HashDigest) -> HashDigest {
     hc(
         TAG_NULLIFIER,
-        &[
-            HcInput::ByteString(nk),
-            HcInput::Digest(coin_identifier),
-        ],
+        &[HcInput::ByteString(nk), HcInput::Digest(coin_identifier)],
     )
     .expect("fixed-size inputs")
 }
@@ -43,10 +40,8 @@ pub fn nullifier(nk: &[u8; 32], coin_identifier: HashDigest) -> HashDigest {
 /// arbitrary bytes.
 pub fn account_state_hash(state: &AccountState) -> Result<HashDigest, SpecError> {
     let bytes = super::serialize::serialize_account_state(state)?;
-    Ok(
-        hc(TAG_ACCOUNT_STATE, &[HcInput::ByteString(&bytes)])
-            .expect("account state serialization is well below 2^56 bytes"),
-    )
+    Ok(hc(TAG_ACCOUNT_STATE, &[HcInput::ByteString(&bytes)])
+        .expect("account state serialization is well below 2^56 bytes"))
 }
 
 /// `coin.identifier = Hc("Coin", Digest(prev_ash), ByteString(recipient), Digest(asset_id),
@@ -176,10 +171,7 @@ pub fn network_id_regtest() -> HashDigest {
 pub fn nav_commitment(nav_root: HashDigest, nav_rand: &[u8; 32]) -> HashDigest {
     hc(
         TAG_NAV_COMMIT,
-        &[
-            HcInput::Digest(nav_root),
-            HcInput::ByteString(nav_rand),
-        ],
+        &[HcInput::Digest(nav_root), HcInput::ByteString(nav_rand)],
     )
     .expect("fixed-size inputs")
 }

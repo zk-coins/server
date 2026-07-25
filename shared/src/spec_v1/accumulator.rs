@@ -3,9 +3,7 @@
 use std::collections::HashMap;
 
 use super::error::SpecError;
-use super::nflog::{
-    inclusion_path, nflog_empty, nflog_mth, Nav, NfLogEntry, NflogIncrementalMth,
-};
+use super::nflog::{inclusion_path, nflog_empty, nflog_mth, Nav, NfLogEntry, NflogIncrementalMth};
 use zkcoins_program::hash::HashDigest;
 
 /// Protocol-pinned finality depth (§3.9): six confirmations.
@@ -519,14 +517,8 @@ mod tests {
         let full = acc.nav();
         assert!(acc.is_canonical(full.size, full.mth));
         let prefix_mth = nflog_mth(&[
-            NfLogEntry {
-                pk: pk(1),
-                r: r(1),
-            },
-            NfLogEntry {
-                pk: pk(2),
-                r: r(2),
-            },
+            NfLogEntry { pk: pk(1), r: r(1) },
+            NfLogEntry { pk: pk(2), r: r(2) },
         ]);
         assert!(acc.is_canonical(2, prefix_mth));
         assert!(!acc.is_canonical(2, full.mth));
@@ -674,9 +666,7 @@ mod tests {
         assert_eq!(acc.size_final(103), 0);
 
         let e = published(102, 5, 5);
-        let outcome = acc
-            .reorg_replay(103, vec![a, b, e])
-            .expect("reorg_replay");
+        let outcome = acc.reorg_replay(103, vec![a, b, e]).expect("reorg_replay");
         assert!(!outcome.finality_broken);
         assert_eq!(outcome.displaced_final_count, 0);
         assert_eq!(acc.lookup(c.pk), LookupResult::Absent);
@@ -823,10 +813,7 @@ mod tests {
                 pk: pk(1),
                 r: r(20),
             },
-            NfLogEntry {
-                pk: pk(2),
-                r: r(2),
-            },
+            NfLogEntry { pk: pk(2), r: r(2) },
         ];
         assert_eq!(acc.nav().mth, nflog_mth(&expected));
         assert_eq!(acc.nav().size, 2);
@@ -876,15 +863,10 @@ mod tests {
             let expected = nflog_mth(&entries);
             let nav = acc.nav();
             assert_eq!(nav.size, n as u64, "size mismatch at n={n}");
-            assert_eq!(
-                nav.mth, expected,
-                "incremental mth != nflog_mth at n={n}"
-            );
+            assert_eq!(nav.mth, expected, "incremental mth != nflog_mth at n={n}");
             assert!(acc.is_canonical(nav.size, nav.mth));
         }
-        eprintln!(
-            "equivalence sweep: n=0..={MAX_N} all matched nflog_mth byte-for-byte"
-        );
+        eprintln!("equivalence sweep: n=0..={MAX_N} all matched nflog_mth byte-for-byte");
     }
 
     /// Power-of-two boundaries are where split-point / peak-bagging behaviour
@@ -918,16 +900,15 @@ mod tests {
             if next_target < targets.len() && n == targets[next_target] {
                 let expected = nflog_mth(&entries);
                 assert_eq!(
-                    acc.nav().mth, expected,
+                    acc.nav().mth,
+                    expected,
                     "boundary mismatch at n={n} (2^k±1 suite)"
                 );
                 next_target += 1;
             }
         }
         assert_eq!(next_target, targets.len(), "missed boundary sizes");
-        eprintln!(
-            "power-of-two boundaries: checked {targets:?} — all matched"
-        );
+        eprintln!("power-of-two boundaries: checked {targets:?} — all matched");
     }
 
     /// After `reorg_replay`, state equals a fresh sequential fold of the same
@@ -963,9 +944,7 @@ mod tests {
         let mut sorted = stream;
         sorted.sort_by_key(|e| e.chain_pos);
         for e in &sorted {
-            fresh
-                .fold(e.chain_pos, e.pk, e.r)
-                .expect("fresh fold");
+            fresh.fold(e.chain_pos, e.pk, e.r).expect("fresh fold");
             entries.push(NfLogEntry { pk: e.pk, r: e.r });
         }
 
@@ -1009,13 +988,7 @@ mod tests {
                         },
                     );
                     assert!(
-                        verify_inclusion(
-                            leaf,
-                            pos,
-                            &inclusion_proof,
-                            tip.size,
-                            tip.mth
-                        ),
+                        verify_inclusion(leaf, pos, &inclusion_proof, tip.size, tip.mth),
                         "inclusion failed at p={p}"
                     );
                 }
@@ -1065,8 +1038,7 @@ mod tests {
         // Rough projection of old O(N²) cost: each append recomputed MTH over
         // the whole log. A single full MTH at size N took `oracle_elapsed`;
         // summing sizes 1..N is ~N/2 times that work → project N/2 * oracle.
-        let projected_old_ms =
-            oracle_elapsed.as_secs_f64() * 1000.0 * (N as f64 / 2.0);
+        let projected_old_ms = oracle_elapsed.as_secs_f64() * 1000.0 * (N as f64 / 2.0);
         eprintln!(
             "perf N={N}: incremental fold wall={elapsed:?}; \
              one-shot nflog_mth wall={oracle_elapsed:?}; \

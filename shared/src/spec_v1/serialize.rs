@@ -446,8 +446,7 @@ mod tests {
     #[test]
     fn from_bech32m_rejects_legacy_bech32_checksum() {
         let hrp_zk = Hrp::parse("zk").unwrap();
-        let legacy_encoded =
-            bech32::encode::<bech32::Bech32>(hrp_zk, &[0u8; 32]).unwrap();
+        let legacy_encoded = bech32::encode::<bech32::Bech32>(hrp_zk, &[0u8; 32]).unwrap();
         // Checksum is valid Bech32 (non-m) with correct HRP and payload length,
         // but §1.7.7 requires Bech32m only.
         assert!(Address::from_bech32m(&legacy_encoded).is_err());

@@ -237,11 +237,7 @@ mod curve_tests {
             out_buffer.set_bool_target(self.k2_neg, false)
         }
 
-        fn serialize(
-            &self,
-            dst: &mut Vec<u8>,
-            _common: &CommonCircuitData<F, D>,
-        ) -> IoResult<()> {
+        fn serialize(&self, dst: &mut Vec<u8>, _common: &CommonCircuitData<F, D>) -> IoResult<()> {
             write_nonnative(dst, &self.k)?;
             write_nonnative(dst, &self.k1)?;
             write_nonnative(dst, &self.k2)?;

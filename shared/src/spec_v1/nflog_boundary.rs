@@ -175,8 +175,7 @@ pub fn ref_build_inclusion(case_id: u64, position: u64, size: u64) -> InclusionW
             path.push(right_mth);
             (leaf, path, nflog_node_hash(left_mth, right_mth))
         } else {
-            let (leaf, mut path, right_mth) =
-                rec(case_id, rel_pos - k, n - k, abs_start + k);
+            let (leaf, mut path, right_mth) = rec(case_id, rel_pos - k, n - k, abs_start + k);
             let left_mth = ref_mth_run(case_id, abs_start, k);
             path.push(left_mth);
             (leaf, path, nflog_node_hash(left_mth, right_mth))
@@ -361,11 +360,7 @@ pub fn ref_build_inclusion_swapped_top_mth(
     } else {
         // Recompute the sub-root with honest bagging on the prefix path.
         match ref_verify_path(
-            if position < k {
-                position
-            } else {
-                position - k
-            },
+            if position < k { position } else { position - k },
             if position < k { k } else { size - k },
             honest.leaf,
             &honest.path[..honest.path.len() - 1],
@@ -474,8 +469,7 @@ pub fn ref_build_consistency(case_id: u64, m: u64, n: u64) -> ConsistencyWitness
             let local = nflog_node_hash(left_mth, right_mth);
             (proof, local, chunks)
         } else {
-            let (mut proof, right_mth, chunks) =
-                subproof(case_id, m - k, n - k, start + k, false);
+            let (mut proof, right_mth, chunks) = subproof(case_id, m - k, n - k, start + k, false);
             let left_mth = ref_mth_run(case_id, start, k);
             proof.push(left_mth);
             let mut all_chunks = vec![left_mth];
@@ -613,11 +607,7 @@ fn ref_build_consistency_with_top_pivot(
             let (mut proof, left_mth, chunks) = subproof_honest(case_id, m, top_k, 0, true);
             let right_mth = ref_mth_run(case_id, top_k, n - top_k);
             proof.push(right_mth);
-            (
-                proof,
-                nflog_node_hash(left_mth, right_mth),
-                chunks,
-            )
+            (proof, nflog_node_hash(left_mth, right_mth), chunks)
         }
     } else {
         let (mut proof, right_mth, chunks) =
@@ -626,11 +616,7 @@ fn ref_build_consistency_with_top_pivot(
         proof.push(left_mth);
         let mut all_chunks = vec![left_mth];
         all_chunks.extend(chunks);
-        (
-            proof,
-            nflog_node_hash(left_mth, right_mth),
-            all_chunks,
-        )
+        (proof, nflog_node_hash(left_mth, right_mth), all_chunks)
     };
     let mth_a = ref_fold_chunks(&chunks);
     ConsistencyWitness {
@@ -648,7 +634,9 @@ pub enum ConsistencyPivotMutation {
         wrong_pivot: u64,
         witness: ConsistencyWitness,
     },
-    Unreachable { reason: String },
+    Unreachable {
+        reason: String,
+    },
 }
 
 /// Try wrong top-level pivot for consistency, same fixtures, same proof length.
@@ -846,10 +834,7 @@ pub fn wrong_pivot_search_positions(n: u64) -> Vec<u64> {
 
 /// Find one pure wrong-pivot inclusion mutation for `size`, if any exists among
 /// [`wrong_pivot_search_positions`]. Returns `(position, wrong_pivot, witness)`.
-pub fn find_inclusion_wrong_pivot(
-    case_id: u64,
-    size: u64,
-) -> Option<(u64, u64, InclusionWitness)> {
+pub fn find_inclusion_wrong_pivot(case_id: u64, size: u64) -> Option<(u64, u64, InclusionWitness)> {
     for p in wrong_pivot_search_positions(size) {
         match try_inclusion_wrong_pivot(case_id, p, size) {
             PivotMutation::Ok {
@@ -867,10 +852,13 @@ pub fn adjacent_consistency_pairs(k: u32) -> [(u64, u64); 2] {
     let pow = 1u64 << k;
     [
         (pow.saturating_sub(1), pow),
-        (pow, match pow.checked_add(1) {
-            Some(v) => v,
-            None => panic!("2^{k}+1 overflowed"),
-        }),
+        (
+            pow,
+            match pow.checked_add(1) {
+                Some(v) => v,
+                None => panic!("2^{k}+1 overflowed"),
+            },
+        ),
     ]
 }
 

@@ -79,8 +79,7 @@ const V2EXT_SK0_HEX: &str = "4a8e3a83404f1aa99e89af57179dcf033820b816c0d78ac94fc
 const V2EXT_PK0_HEX: &str = "7c9cdde9b8cb1e33a48a5c2b6ab1fa6fd753fa1762f56c0b3e8169e4f2d54630";
 
 // ── V.4 pin: H(ProofData@0) from shared/tests/generated_poseidon_vectors.txt ─
-const H_PROOF_DATA_0_HEX: &str =
-    "db8c60533ba19eba14958f6ce44fd8df2e784d17dac28d8532e66fa938308de4";
+const H_PROOF_DATA_0_HEX: &str = "db8c60533ba19eba14958f6ce44fd8df2e784d17dac28d8532e66fa938308de4";
 
 // ── V.8 synthetic signing fixture (spec V.8; testnet m_state) ───────────────
 const V8_SK_SIG_1_HEX: &str = "22f508c0a93b29fa87ca8d9abcec996f01620656cd7a7e4ab5418b2e76beccf4";
@@ -127,10 +126,7 @@ fn hex_32(value: &str) -> [u8; 32] {
 fn hex64_of(bytes: &[u8]) -> String {
     format!(
         "0x{}",
-        bytes
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     )
 }
 
@@ -150,7 +146,9 @@ fn scalar_mod_n_from_be32(bytes: &[u8; 32]) -> Secp256K1Scalar {
 }
 
 /// BIP-340 key normalisation: even-y public key, matching secret `d`.
-fn bip340_normalise(secret: Secp256K1Scalar) -> (Secp256K1Scalar, AffinePoint<Secp256K1>, [u8; 32]) {
+fn bip340_normalise(
+    secret: Secp256K1Scalar,
+) -> (Secp256K1Scalar, AffinePoint<Secp256K1>, [u8; 32]) {
     let mut d = secret;
     let mut public = (CurveScalar(d) * Secp256K1::GENERATOR_PROJECTIVE).to_affine();
     if is_odd(public.y) {
@@ -257,30 +255,36 @@ fn network_label(network: Network) -> &'static str {
 fn generate_sig_agg_vectors() {
     // ── Sanity: V.8 nonce-rule signer recomputes the pinned fixture ─────────
     let (d1, _, pk1) = bip340_normalise(scalar_from_be32(&hex_32(V8_SK_SIG_1_HEX)));
-    assert_eq!(field_bytes(d1), hex_32(V8_D_1_HEX), "V.8 signer-1 d mismatch");
+    assert_eq!(
+        field_bytes(d1),
+        hex_32(V8_D_1_HEX),
+        "V.8 signer-1 d mismatch"
+    );
     assert_eq!(pk1, hex_32(V8_PK_1_HEX), "V.8 signer-1 Pk mismatch");
     let m_sc_1 = hex_32(V8_M_SC_1_HEX);
-    let signed1 = sign_s2c_v8_nonce(
-        d1,
-        &pk1,
-        &m_sc_1,
-        Network::Testnet.m_state_bytes(),
+    let signed1 = sign_s2c_v8_nonce(d1, &pk1, &m_sc_1, Network::Testnet.m_state_bytes());
+    assert_eq!(
+        signed1.r_prime,
+        hex_32(V8_R_PRIME_1_HEX),
+        "V.8 R'_1 mismatch"
     );
-    assert_eq!(signed1.r_prime, hex_32(V8_R_PRIME_1_HEX), "V.8 R'_1 mismatch");
     assert_eq!(signed1.r, hex_32(V8_R_1_HEX), "V.8 R_1 mismatch");
     assert_eq!(signed1.s, hex_32(V8_S_1_HEX), "V.8 s_1 mismatch");
 
     let (d2, _, pk2) = bip340_normalise(scalar_from_be32(&hex_32(V8_SK_SIG_2_HEX)));
-    assert_eq!(field_bytes(d2), hex_32(V8_D_2_HEX), "V.8 signer-2 d mismatch");
+    assert_eq!(
+        field_bytes(d2),
+        hex_32(V8_D_2_HEX),
+        "V.8 signer-2 d mismatch"
+    );
     assert_eq!(pk2, hex_32(V8_PK_2_HEX), "V.8 signer-2 Pk mismatch");
     let m_sc_2 = hex_32(V8_M_SC_2_HEX);
-    let signed2 = sign_s2c_v8_nonce(
-        d2,
-        &pk2,
-        &m_sc_2,
-        Network::Testnet.m_state_bytes(),
+    let signed2 = sign_s2c_v8_nonce(d2, &pk2, &m_sc_2, Network::Testnet.m_state_bytes());
+    assert_eq!(
+        signed2.r_prime,
+        hex_32(V8_R_PRIME_2_HEX),
+        "V.8 R'_2 mismatch"
     );
-    assert_eq!(signed2.r_prime, hex_32(V8_R_PRIME_2_HEX), "V.8 R'_2 mismatch");
     assert_eq!(signed2.r, hex_32(V8_R_2_HEX), "V.8 R_2 mismatch");
     assert_eq!(signed2.s, hex_32(V8_S_2_HEX), "V.8 s_2 mismatch");
 
@@ -381,29 +385,21 @@ fn generate_sig_agg_vectors() {
     lines.push("# Computed by script-plonky2 generate_sig_agg_vectors; never hand-edit.".into());
     lines.push("#".into());
     lines.push("# V.5 inputs (pinned by the spec / earlier generators):".into());
-    lines.push(
-        "#   sk/Pk = V.2-ext sk₀/Pk₀ (BIP-340-normalised d used for signing)".into(),
-    );
+    lines.push("#   sk/Pk = V.2-ext sk₀/Pk₀ (BIP-340-normalised d used for signing)".into());
     lines.push("#   H(ProofData@0) = V.4 pin from generated_poseidon_vectors.txt".into());
-    lines.push(
-        "#   nonce rule = V.8 fixture rule (deterministic; not production-normative)".into(),
-    );
+    lines
+        .push("#   nonce rule = V.8 fixture rule (deterministic; not production-normative)".into());
     lines.push(
         "#   networks = mainnet | testnet | regtest (V.5 does not pin a single m_state)".into(),
     );
     lines.push("#".into());
     lines.push("# V.6 inputs:".into());
     lines.push("#   member set = V.8 two-signer fixture (m = 2; V.6 layout reuses it)".into());
-    lines.push(
-        "#   s_agg is independent of block_anchor (anchor is payload metadata only)".into(),
-    );
+    lines.push("#   s_agg is independent of block_anchor (anchor is payload metadata only)".into());
     lines.push("#".into());
 
     lines.push(format!("v2ext_pk0 = {}", hex64_of(&pk0)));
-    lines.push(format!(
-        "h_proof_data_0 = {}",
-        hex64_of(&h_proof_data_0)
-    ));
+    lines.push(format!("h_proof_data_0 = {}", hex64_of(&h_proof_data_0)));
 
     for (network, signed) in &v5_openings {
         let label = network_label(*network);
@@ -411,7 +407,10 @@ fn generate_sig_agg_vectors() {
             "v5_r_prime_{label} = {}",
             hex64_of(&signed.r_prime)
         ));
-        lines.push(format!("v5_signature_{label} = {}", hex64_of(&signed.signature)));
+        lines.push(format!(
+            "v5_signature_{label} = {}",
+            hex64_of(&signed.signature)
+        ));
         println!("v5_signature_{label} = {}", hex64_of(&signed.signature));
         println!("v5_r_prime_{label}   = {}", hex64_of(&signed.r_prime));
     }
