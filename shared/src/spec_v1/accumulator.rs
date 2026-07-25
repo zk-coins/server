@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 
 use super::error::SpecError;
-use super::nflog::{inclusion_path, nflog_empty, nflog_mth, Nav, NfLogEntry};
+use super::nflog::{
+    inclusion_path, nflog_empty, nflog_mth, Nav, NfLogEntry, NflogIncrementalMth,
+};
 use zkcoins_program::hash::HashDigest;
 
 /// Protocol-pinned finality depth (§3.9): six confirmations.
@@ -100,6 +102,10 @@ pub struct NfLogAccumulator {
     /// `pk -> (position, r)`
     index: HashMap<[u8; 32], (u64, [u8; 32])>,
     mth: HashDigest,
+    /// Perfect-subtree peaks for O(log n) tip-MTH updates on each append.
+    /// Always in lockstep with `log`: after every successful append,
+    /// `mth_state.mth() == nflog_mth(&log)` and `mth_state.size() == log.len()`.
+    mth_state: NflogIncrementalMth,
     /// Last chain position that reached the duplicate/append decision
     /// (i.e. passed the activation-height filter). Used to enforce
     /// strictly-increasing canonical order (§3.6 step 4).
@@ -114,6 +120,7 @@ impl NfLogAccumulator {
             heights: Vec::new(),
             index: HashMap::new(),
             mth: nflog_empty(),
+            mth_state: NflogIncrementalMth::new(),
             last_position: None,
         }
     }
@@ -121,11 +128,12 @@ impl NfLogAccumulator {
     /// Fold one published nullifier by first-occurrence (section 3.6 step 5).
     ///
     /// Enforces strictly-increasing `ChainPosition` order for every call that
-    /// is not filtered by activation height. Recomputes `mth` from scratch on
-    /// every successful append — O(size) per call. Acceptable for this
-    /// in-memory chunk's scope; bulk fixtures should use the pure `nflog_mth`
-    /// / `inclusion_path` / `consistency_proof` functions on a materialised
-    /// `Vec<NfLogEntry>` instead.
+    /// is not filtered by activation height. On a successful first-occurrence
+    /// append, updates the tip MTH in `O(log n)` Poseidon hashes via the
+    /// perfect-subtree peak stack ([`NflogIncrementalMth`]) — byte-identical
+    /// to recomputing [`nflog_mth`] over the full log. Suitable for bulk
+    /// chain-scan folds; total cost to admit `N` distinct nullifiers is
+    /// `O(N log N)` hashes, not `O(N²)`.
     pub fn fold(
         &mut self,
         chain_pos: ChainPosition,
@@ -151,10 +159,12 @@ impl NfLogAccumulator {
             return Ok(FoldOutcome::DuplicateIgnored);
         }
         let pos = self.log.len() as u64;
-        self.log.push(NfLogEntry { pk, r });
+        let entry = NfLogEntry { pk, r };
+        self.log.push(entry);
         self.heights.push(chain_pos.height);
         self.index.insert(pk, (pos, r));
-        self.mth = nflog_mth(&self.log);
+        self.mth_state.append(&entry);
+        self.mth = self.mth_state.mth();
         Ok(FoldOutcome::Appended(pos))
     }
 
@@ -217,6 +227,7 @@ impl NfLogAccumulator {
         self.log.clear();
         self.heights.clear();
         self.index.clear();
+        self.mth_state.clear();
         self.mth = nflog_empty();
         self.last_position = None;
 
@@ -819,5 +830,254 @@ mod tests {
         ];
         assert_eq!(acc.nav().mth, nflog_mth(&expected));
         assert_eq!(acc.nav().size, 2);
+    }
+
+    // --- Incremental MTH equivalence (the point of the O(log n) change) ---
+
+    /// Distinct deterministic `pk` for bulk folds (duplicates are ignored by
+    /// first-occurrence, so all-identical keys would only exercise size 1).
+    fn pk_u64(i: u64) -> [u8; 32] {
+        let mut p = [0u8; 32];
+        p[..8].copy_from_slice(&i.to_be_bytes());
+        p
+    }
+
+    fn r_u64(i: u64) -> [u8; 32] {
+        let mut v = [0u8; 32];
+        v[24..].copy_from_slice(&i.to_be_bytes());
+        v
+    }
+
+    fn entry_at(i: u64) -> NfLogEntry {
+        NfLogEntry {
+            pk: pk_u64(i),
+            r: r_u64(i.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+        }
+    }
+
+    /// For every size `n` in `0..=max_n`, fold `n` distinct entries and assert
+    /// the accumulator tip MTH equals the normative `nflog_mth` oracle.
+    #[test]
+    fn incremental_mth_matches_nflog_mth_for_every_size_0_to_300() {
+        const MAX_N: usize = 300;
+        let mut acc = NfLogAccumulator::new(0);
+        let mut entries: Vec<NfLogEntry> = Vec::with_capacity(MAX_N);
+
+        // n = 0
+        assert_eq!(acc.nav().mth, nflog_empty());
+        assert_eq!(acc.nav().mth, nflog_mth(&[]));
+        assert_eq!(acc.nav().size, 0);
+
+        for n in 1..=MAX_N {
+            let i = (n - 1) as u64;
+            let e = entry_at(i);
+            acc.fold(pos(100 + i), e.pk, e.r).expect("fold");
+            entries.push(e);
+            let expected = nflog_mth(&entries);
+            let nav = acc.nav();
+            assert_eq!(nav.size, n as u64, "size mismatch at n={n}");
+            assert_eq!(
+                nav.mth, expected,
+                "incremental mth != nflog_mth at n={n}"
+            );
+            assert!(acc.is_canonical(nav.size, nav.mth));
+        }
+        eprintln!(
+            "equivalence sweep: n=0..={MAX_N} all matched nflog_mth byte-for-byte"
+        );
+    }
+
+    /// Power-of-two boundaries are where split-point / peak-bagging behaviour
+    /// changes — assert equality at `2^k − 1`, `2^k`, `2^k + 1`.
+    #[test]
+    fn incremental_mth_matches_at_power_of_two_boundaries() {
+        // Largest boundary size we materialise: 2^9 + 1 = 513 (well under
+        // the 0..=300 sweep's intent but covers extra power-of-two edges).
+        const MAX_K: u32 = 9;
+        let max_n = (1usize << MAX_K) + 1;
+        let mut acc = NfLogAccumulator::new(0);
+        let mut entries: Vec<NfLogEntry> = Vec::with_capacity(max_n);
+
+        let mut targets: Vec<usize> = Vec::new();
+        for k in 0..=MAX_K {
+            let pow = 1usize << k;
+            for n in [pow.saturating_sub(1), pow, pow.saturating_add(1)] {
+                if n > 0 && !targets.contains(&n) {
+                    targets.push(n);
+                }
+            }
+        }
+        targets.sort_unstable();
+
+        let mut next_target = 0usize;
+        for n in 1..=max_n {
+            let i = (n - 1) as u64;
+            let e = entry_at(i.wrapping_add(0x1000));
+            acc.fold(pos(1000 + i), e.pk, e.r).expect("fold");
+            entries.push(e);
+            if next_target < targets.len() && n == targets[next_target] {
+                let expected = nflog_mth(&entries);
+                assert_eq!(
+                    acc.nav().mth, expected,
+                    "boundary mismatch at n={n} (2^k±1 suite)"
+                );
+                next_target += 1;
+            }
+        }
+        assert_eq!(next_target, targets.len(), "missed boundary sizes");
+        eprintln!(
+            "power-of-two boundaries: checked {targets:?} — all matched"
+        );
+    }
+
+    /// After `reorg_replay`, state equals a fresh sequential fold of the same
+    /// canonical stream (nav + mth vs `nflog_mth`).
+    #[test]
+    fn reorg_replay_incremental_state_matches_fresh_fold() {
+        let mut acc = NfLogAccumulator::new(0);
+        // Seed with a longer log so reorg actually rebuilds non-trivial peaks.
+        for i in 0..40u64 {
+            let e = entry_at(i);
+            acc.fold(pos(100 + i), e.pk, e.r).expect("fold");
+        }
+
+        // Canonical stream after reorg: drop some early winners, insert new
+        // ones, keep order by ChainPosition via reorg_replay's sort.
+        let mut stream: Vec<PublishedNullifier> = Vec::new();
+        for i in 0..35u64 {
+            // Shift heights and pks so the peak forest is rebuilt, not merely
+            // truncated-and-extended identically.
+            let e = entry_at(i.wrapping_add(500));
+            stream.push(PublishedNullifier {
+                chain_pos: pos(200 + i),
+                pk: e.pk,
+                r: e.r,
+            });
+        }
+        // tip=234 → max_final=229; heights start at 200 so some may be final,
+        // but we only care about state equality here.
+        acc.reorg_replay(234, stream.clone()).expect("reorg");
+
+        let mut fresh = NfLogAccumulator::new(0);
+        let mut entries: Vec<NfLogEntry> = Vec::new();
+        let mut sorted = stream;
+        sorted.sort_by_key(|e| e.chain_pos);
+        for e in &sorted {
+            fresh
+                .fold(e.chain_pos, e.pk, e.r)
+                .expect("fresh fold");
+            entries.push(NfLogEntry { pk: e.pk, r: e.r });
+        }
+
+        assert_eq!(acc.nav(), fresh.nav(), "nav after reorg != fresh fold");
+        assert_eq!(acc.nav().mth, nflog_mth(&entries));
+        assert_eq!(acc.nav().size, entries.len() as u64);
+    }
+
+    /// Inclusion and consistency proofs over the accumulator log still verify
+    /// against the incrementally maintained tip MTH.
+    #[test]
+    fn inclusion_and_consistency_verify_against_incremental_mth() {
+        use crate::spec_v1::nflog::{consistency_proof, verify_consistency};
+
+        let mut acc = NfLogAccumulator::new(0);
+        let mut entries: Vec<NfLogEntry> = Vec::new();
+        const N: usize = 64;
+        for i in 0..N as u64 {
+            let e = entry_at(i.wrapping_add(0xabc));
+            acc.fold(pos(50 + i), e.pk, e.r).expect("fold");
+            entries.push(e);
+        }
+        let tip = acc.nav();
+        assert_eq!(tip.mth, nflog_mth(&entries));
+
+        // Inclusion at several positions, including power-of-two edges.
+        for &p in &[0u64, 1, 7, 8, 15, 16, 31, 32, 63] {
+            match acc.lookup(entries[p as usize].pk) {
+                LookupResult::Present {
+                    pos,
+                    r: got_r,
+                    inclusion_proof,
+                } => {
+                    assert_eq!(pos, p);
+                    assert_eq!(got_r, entries[p as usize].r);
+                    let leaf = nflog_leaf_hash(
+                        pos,
+                        &NfLogEntry {
+                            pk: entries[p as usize].pk,
+                            r: got_r,
+                        },
+                    );
+                    assert!(
+                        verify_inclusion(
+                            leaf,
+                            pos,
+                            &inclusion_proof,
+                            tip.size,
+                            tip.mth
+                        ),
+                        "inclusion failed at p={p}"
+                    );
+                }
+                LookupResult::Absent => panic!("expected present at p={p}"),
+            }
+        }
+
+        // Consistency for several prefixes against the incremental tip.
+        for &m in &[1u64, 2, 3, 4, 7, 8, 15, 16, 32, 48, 63, 64] {
+            let mth_a = nflog_mth(&entries[..m as usize]);
+            let proof = consistency_proof(m, &entries).expect("m <= n");
+            assert!(
+                verify_consistency(m, mth_a, tip.size, tip.mth, &proof),
+                "consistency failed m={m} n={}",
+                tip.size
+            );
+            // Prefix is also canonical under the accumulator.
+            assert!(acc.is_canonical(m, mth_a));
+        }
+    }
+
+    /// Performance evidence: fold 20_000 distinct entries and report wall time.
+    /// Old behaviour was O(N²) full `nflog_mth` recompute (~2·10⁸ leaf-range
+    /// hashes at N=20k); new is O(N log N) peak updates.
+    #[test]
+    fn fold_20000_entries_reports_non_quadratic_wall_time() {
+        use std::time::Instant;
+
+        const N: u64 = 20_000;
+        let mut acc = NfLogAccumulator::new(0);
+        let t0 = Instant::now();
+        for i in 0..N {
+            let e = entry_at(i);
+            acc.fold(pos(i + 1), e.pk, e.r).expect("fold");
+        }
+        let elapsed = t0.elapsed();
+        let nav = acc.nav();
+        assert_eq!(nav.size, N);
+
+        // Spot-check equivalence at the tip (full oracle over 20k is fine once).
+        let entries: Vec<NfLogEntry> = (0..N).map(entry_at).collect();
+        let t_oracle = Instant::now();
+        let expected = nflog_mth(&entries);
+        let oracle_elapsed = t_oracle.elapsed();
+        assert_eq!(nav.mth, expected, "tip mth diverged at N={N}");
+
+        // Rough projection of old O(N²) cost: each append recomputed MTH over
+        // the whole log. A single full MTH at size N took `oracle_elapsed`;
+        // summing sizes 1..N is ~N/2 times that work → project N/2 * oracle.
+        let projected_old_ms =
+            oracle_elapsed.as_secs_f64() * 1000.0 * (N as f64 / 2.0);
+        eprintln!(
+            "perf N={N}: incremental fold wall={elapsed:?}; \
+             one-shot nflog_mth wall={oracle_elapsed:?}; \
+             projected old O(N²) full-recompute ≈ {projected_old_ms:.0} ms \
+             (≈ N/2 × one-shot MTH)"
+        );
+        // Sanity: incremental fold of N entries should finish well under a
+        // minute on any reasonable host (guards against accidental O(N²)).
+        assert!(
+            elapsed.as_secs() < 60,
+            "fold of {N} took {elapsed:?} — still looks quadratic?"
+        );
     }
 }

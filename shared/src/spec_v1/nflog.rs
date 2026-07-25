@@ -81,8 +81,97 @@ fn split_point(n: usize) -> usize {
 /// - `n = 1` → `nflog_leaf_hash(start_pos, &entries[0])`
 /// - `n > 1` → split at `k = largest power of two strictly less than n`,
 ///   recurse with absolute positions, combine via `nflog_node_hash`.
+///
+/// This is the **normative reference** implementation. Callers that append
+/// many entries SHOULD use [`NflogIncrementalMth`] instead; that type is
+/// required to stay byte-identical to this function for every prefix length.
 pub fn nflog_mth(entries: &[NfLogEntry]) -> HashDigest {
     mth_range(entries, 0)
+}
+
+/// Incremental RFC-6962 Merkle Tree Hash state (perfect-subtree peaks).
+///
+/// Maintains the left-to-right list of complete-subtree roots implied by the
+/// binary representation of the leaf count. Each [`Self::append`] costs
+/// `O(log n)` node hashes; [`Self::mth`] bags the `O(log n)` peaks into the
+/// same root that [`nflog_mth`] would compute over the full sequence.
+///
+/// **Equivalence (normative):** for any sequence `entries`, after appending
+/// each entry in order, `incremental.mth() == nflog_mth(&entries)`. This is
+/// the contract that keeps every inclusion and consistency proof valid against
+/// an incrementally maintained tip.
+#[derive(Clone, Debug, Default)]
+pub struct NflogIncrementalMth {
+    /// Perfect-subtree roots, left-to-right (oldest / largest first).
+    /// After `size` appends, this list is exactly the peaks for the set bits
+    /// of `size` (largest power first).
+    peaks: Vec<HashDigest>,
+    /// Number of leaves represented by `peaks`.
+    size: u64,
+}
+
+impl NflogIncrementalMth {
+    /// Empty log: no peaks, size 0, MTH = [`nflog_empty`].
+    pub fn new() -> Self {
+        Self {
+            peaks: Vec::new(),
+            size: 0,
+        }
+    }
+
+    /// Number of leaves folded so far.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Append one entry at the next absolute position (`self.size`).
+    ///
+    /// Leaf hash binds that position; equal-height peaks on the right are
+    /// merged bottom-up exactly as the recursive MTH split would combine
+    /// perfect power-of-two runs. Cost: `O(log n)` Poseidon hashes.
+    pub fn append(&mut self, entry: &NfLogEntry) {
+        let position = self.size;
+        let mut node = nflog_leaf_hash(position, entry);
+        // Index of the leaf just placed. While it is the right child of its
+        // parent (odd index at this height), merge with the matching left
+        // peak already on the stack and climb one level.
+        let mut i = position;
+        while i & 1 == 1 {
+            let left = self
+                .peaks
+                .pop()
+                .expect("peak-stack invariant: a right-child leaf always has a left sibling peak");
+            node = nflog_node_hash(left, node);
+            i >>= 1;
+        }
+        self.peaks.push(node);
+        self.size = self
+            .size
+            .checked_add(1)
+            .expect("nullifier log size cannot overflow u64");
+    }
+
+    /// Current MTH — byte-identical to [`nflog_mth`] over the same sequence.
+    ///
+    /// Bags peaks right-to-left: for peaks `[P_large, …, P_small]`,
+    /// `Node(P_large, Node(…, P_small))`, matching the RFC-6962 recursion
+    /// that always takes the largest power-of-two split on the left.
+    pub fn mth(&self) -> HashDigest {
+        if self.peaks.is_empty() {
+            return nflog_empty();
+        }
+        let mut acc = self.peaks[self.peaks.len() - 1];
+        for &peak in self.peaks[..self.peaks.len() - 1].iter().rev() {
+            acc = nflog_node_hash(peak, acc);
+        }
+        acc
+    }
+
+    /// Reset to the empty-log state (used by truncate-and-refold reorg).
+    pub fn clear(&mut self) {
+        self.peaks.clear();
+        self.size = 0;
+    }
 }
 
 fn mth_range(entries: &[NfLogEntry], start_pos: u64) -> HashDigest {
@@ -627,6 +716,52 @@ mod tests {
             !verify_consistency(m2, mth_a2, n2, mth_b2, &padded2),
             "prepended garbage must be rejected for power-of-two m={m2}"
         );
+    }
+
+    /// Incremental peak-stack MTH must match the recursive reference for every
+    /// prefix length (including empty and power-of-two boundaries).
+    #[test]
+    fn incremental_mth_matches_reference_for_every_prefix() {
+        const MAX_N: usize = 256;
+        let entries = synthetic_entries(MAX_N);
+        let mut inc = NflogIncrementalMth::new();
+        assert_eq!(inc.mth(), nflog_empty());
+        assert_eq!(inc.size(), 0);
+
+        for n in 1..=MAX_N {
+            inc.append(&entries[n - 1]);
+            assert_eq!(inc.size(), n as u64);
+            assert_eq!(
+                inc.mth(),
+                nflog_mth(&entries[..n]),
+                "incremental != reference at n={n}"
+            );
+        }
+
+        // clear returns to empty
+        inc.clear();
+        assert_eq!(inc.size(), 0);
+        assert_eq!(inc.mth(), nflog_empty());
+        assert_eq!(inc.mth(), nflog_mth(&[]));
+    }
+
+    #[test]
+    fn incremental_mth_power_of_two_boundaries() {
+        let entries = synthetic_entries(257);
+        let mut inc = NflogIncrementalMth::new();
+        for n in 1..=257 {
+            inc.append(&entries[n - 1]);
+            let is_boundary = n.is_power_of_two()
+                || (n + 1).is_power_of_two()
+                || (n > 1 && (n - 1).is_power_of_two());
+            if is_boundary {
+                assert_eq!(
+                    inc.mth(),
+                    nflog_mth(&entries[..n]),
+                    "boundary mismatch at n={n}"
+                );
+            }
+        }
     }
 
     /// Round-trip consistency proofs for prefixes whose binary representation
