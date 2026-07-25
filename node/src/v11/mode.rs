@@ -1,8 +1,9 @@
 //! `ZKCOINS_V11_SHADOW` resolution and §3.6 boot-pin validation.
 //!
-//! Stage 1 maintains the v1.1 StateEngine **in shadow** alongside the legacy
-//! prove path. The flag name and messages must not imply that proving is v1.1
-//! (that is Stage 3).
+//! Stages 1–2: flag-gated v1.1 path. Stage 2 makes publisher/scanner
+//! **exclusive** (legacy Commitment/SMT **or** AggregateStateNullifierV3/NfLog,
+//! never both — see [`super::separation`]). Proving remains legacy until
+//! Stage 3; the flag name must not imply that proving is already v1.1.
 
 use std::env;
 use std::fmt;
@@ -11,11 +12,12 @@ use shared::spec_v1::network_params::NetworkParams;
 use shared::spec_v1::tags::{NETWORK_TAG_MAINNET, NETWORK_TAG_REGTEST, NETWORK_TAG_TESTNET};
 use zkcoins_program::circuit::compliance::Network;
 
-/// Whether Stage-1 v1.1 **shadow persistence** is enabled.
+/// Whether the v1.1 dual stack is enabled (Stage 2: exclusive scan/publish).
 ///
 /// Default is [`V11ShadowMode::Off`]. Selected only by the exact env value
-/// `ZKCOINS_V11_SHADOW=1`. When on, the node maintains v1.1 state alongside
-/// the legacy stack; proving remains legacy until Stage 3.
+/// `ZKCOINS_V11_SHADOW=1`. When on, the node claims the database for the
+/// NfLog / AggregateStateNullifierV3 stack and refuses the legacy
+/// Commitment scanner/publisher. Proving remains legacy until Stage 3.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum V11ShadowMode {
     Off,
@@ -33,9 +35,9 @@ impl fmt::Display for V11ShadowModeError {
         write!(
             f,
             "ZKCOINS_V11_SHADOW={:?} is not supported — use unset / empty / \"off\" \
-             to leave v1.1 shadow persistence disabled (default), or \"1\" to maintain \
-             v1.1 state in shadow while proving remains legacy. \
-             Refusing to start (no silent fall-back)",
+             for the legacy Commitment/SMT stack (default), or \"1\" for the exclusive \
+             v1.1 AggregateStateNullifierV3/NfLog publisher+scanner (proving remains \
+             legacy until Stage 3). Refusing to start (no silent fall-back)",
             self.raw
         )
     }

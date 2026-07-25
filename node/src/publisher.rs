@@ -507,6 +507,14 @@ pub async fn create_and_broadcast_inscription(
     config: &EsploraConfig,
     pool: Option<&PgPool>,
 ) -> Result<(Txid, Txid), Box<dyn std::error::Error + Send + Sync>> {
+    // Cutover Stage 2: exclusive stack. A process that claimed the v1.1
+    // scan stack must never inscribe bincode Commitments — that would mix
+    // SMT first-write objects into a database claimed for NfLog.
+    crate::v11::ensure_legacy_publisher_allowed().map_err(|e| {
+        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            as Box<dyn std::error::Error + Send + Sync>
+    })?;
+
     // Generate publisher address
     let publisher_key = &*crate::PUBLISHER_KEY;
     let secp256k1 = Secp256k1::new();

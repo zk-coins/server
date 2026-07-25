@@ -52,9 +52,10 @@ pub mod scanner_ws_parse;
 pub mod self_heal;
 pub mod state;
 pub mod username;
-/// v1.1 StateEngine adapter + shadow persistence (Cutover Stage 1). Behind
-/// `ZKCOINS_V11_SHADOW=1`; default remains the legacy stack. Proving stays
-/// legacy until Stage 3 — the flag only maintains v1.1 state alongside it.
+/// v1.1 StateEngine adapter, shadow persistence (Stage 1), and exclusive
+/// publisher/scanner dual stack (Stage 2). Behind `ZKCOINS_V11_SHADOW=1`;
+/// default remains the legacy Commitment/SMT stack. Proving stays legacy
+/// until Stage 3.
 pub mod v11;
 
 use crate::publisher::EsploraConfig;

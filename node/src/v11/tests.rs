@@ -444,3 +444,268 @@ async fn tip_hash_survives_persist_reload() {
         "height alone cannot distinguish the fork"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stage 2 — hard separation + §3.6 scan-fold
+// ---------------------------------------------------------------------------
+
+use super::scan::{fold_survivors_into_engine, members_to_published, sort_canonical};
+use super::separation::{
+    clear_process_stack_mode_for_test, enforce_stack_scan_mode, ensure_legacy_publisher_allowed,
+    ensure_v11_publisher_allowed, ScanStackMode, STACK_SEPARATION_REFUSAL,
+};
+use shared::spec_v1::{LookupResult, PublishedNullifier};
+
+/// Seed one `mmr_root_index` row — the durable signal of legacy scan activity.
+async fn seed_legacy_scan_state(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index, created_at) \
+         VALUES ($1, $2, 0, NOW())",
+    )
+    .bind([0x11u8; 32].as_slice())
+    .bind([0x22u8; 32].as_slice())
+    .execute(pool)
+    .await
+    .expect("seed mmr_root_index");
+}
+
+/// Seed one NfLog entry — the durable signal of v1.1 scan activity.
+async fn seed_v11_scan_state(pool: &sqlx::PgPool) {
+    // Meta is required for a coherent snapshot, but separation only checks
+    // v11_nflog_entries count.
+    sqlx::query(
+        "INSERT INTO v11_engine_meta \
+         (id, network, activation_height, tip_height, tip_hash, fold_seq, updated_at) \
+         VALUES (1, 'regtest', 0, 1, $1, 0, NOW())",
+    )
+    .bind([0u8; 32].as_slice())
+    .execute(pool)
+    .await
+    .expect("seed v11 meta");
+    sqlx::query(
+        "INSERT INTO v11_nflog_entries \
+         (position, height, tx_index, vin_index, member_index, pk, r) \
+         VALUES (0, 1, 0, 0, 0, $1, $2)",
+    )
+    .bind(pk(1).as_slice())
+    .bind(r_val(1).as_slice())
+    .execute(pool)
+    .await
+    .expect("seed v11_nflog_entries");
+}
+
+/// Hard separation: v1.1 path must fail against a DB with legacy scan state,
+/// and the reverse must fail too. Assert the failure (not merely observe it).
+#[tokio::test]
+async fn hard_separation_refuses_cross_stack_boot() {
+    clear_process_stack_mode_for_test();
+
+    // --- legacy data blocks v1.1 ---
+    {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        seed_legacy_scan_state(&pool).await;
+
+        let err = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect_err("v1.1 must refuse a DB with mmr_root_index rows");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(STACK_SEPARATION_REFUSAL),
+            "must use the canonical refusal prefix; got: {msg}"
+        );
+        assert!(
+            msg.contains("legacy") || msg.contains("mmr_root_index"),
+            "must name the legacy scan state; got: {msg}"
+        );
+
+        // Same DB: legacy path is still allowed and claims the marker.
+        enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
+            .await
+            .expect("legacy path must accept its own scan state");
+        clear_process_stack_mode_for_test();
+    }
+
+    // --- v1.1 data blocks legacy ---
+    {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        seed_v11_scan_state(&pool).await;
+
+        let err = enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
+            .await
+            .expect_err("legacy must refuse a DB with v11_nflog_entries");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(STACK_SEPARATION_REFUSAL),
+            "must use the canonical refusal prefix; got: {msg}"
+        );
+        assert!(
+            msg.contains("v11") || msg.contains("NfLog") || msg.contains("nflog"),
+            "must name the v1.1 scan state; got: {msg}"
+        );
+
+        enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("v1.1 path must accept its own scan state");
+        clear_process_stack_mode_for_test();
+    }
+
+    // --- marker alone blocks the opposite path (empty opposite data) ---
+    {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
+            .await
+            .expect("fresh DB claims legacy");
+        clear_process_stack_mode_for_test();
+
+        let err = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect_err("v1.1 must refuse a DB claimed as legacy");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(STACK_SEPARATION_REFUSAL) && msg.contains("claimed as legacy"),
+            "marker mismatch must refuse; got: {msg}"
+        );
+        clear_process_stack_mode_for_test();
+    }
+
+    // Publisher guards follow the process claim.
+    {
+        clear_process_stack_mode_for_test();
+        let scope = setup_pool().await;
+        enforce_stack_scan_mode(&scope.pool, ScanStackMode::V11)
+            .await
+            .expect("claim v11");
+        let legacy_err = ensure_legacy_publisher_allowed().expect_err("legacy publish under v11");
+        assert!(
+            legacy_err.to_string().contains(STACK_SEPARATION_REFUSAL),
+            "legacy publisher must refuse under v11 claim"
+        );
+        ensure_v11_publisher_allowed().expect("v11 publisher under v11 claim");
+        clear_process_stack_mode_for_test();
+    }
+}
+
+/// §3.6: multi-member inscription folded in canonical
+/// `(height, tx_index, vin_index, member_index)` order; duplicate `Pk`
+/// keeps the **first** occurrence's `R`.
+#[test]
+fn v11_scan_fold_canonical_order_first_occurrence_wins() {
+    // Three members in one inscription, deliberately **not** in member
+    // order in the input vector — plus a fourth survivor that reuses Pk
+    // of member 0 with a different R (must lose).
+    let pk_a = pk(0xA0);
+    let pk_b = pk(0xB0);
+    let pk_c = pk(0xC0);
+    let r_a_first = r_val(1);
+    let r_a_dup = r_val(99); // loser
+    let r_b = r_val(2);
+    let r_c = r_val(3);
+
+    // Synthetic multi-member inscription at height 50, tx 3, vin 1:
+    // members (A, B, C) then a later tx that republishes A with different R.
+    let mut members = members_to_published(
+        50,
+        3,
+        1,
+        &[(pk_a, r_a_first), (pk_b, r_b), (pk_c, r_c)],
+    )
+    .expect("members");
+    // Shuffle so the fold path must sort by ChainPosition, not input order.
+    members.swap(0, 2); // C, B, A by member_index after swap of ends
+    assert_eq!(members[0].pk, pk_c);
+    assert_eq!(members[2].pk, pk_a);
+
+    // Second inscription later in the block with duplicate Pk=A.
+    let mut later = members_to_published(50, 3, 2, &[(pk_a, r_a_dup)]).expect("later");
+    members.append(&mut later);
+
+    // Also include an earlier height with pk_b so overall stream is out of
+    // height order until sort_canonical runs.
+    let earlier = PublishedNullifier {
+        chain_pos: ChainPosition {
+            height: 49,
+            tx_index: 0,
+            vin_index: 0,
+            member_index: 0,
+        },
+        pk: pk(0xE0),
+        r: r_val(0xE),
+    };
+    members.insert(0, earlier);
+
+    // Prove the pure sort key is §3.6.
+    let mut sorted = members.clone();
+    sort_canonical(&mut sorted);
+    let keys: Vec<_> = sorted
+        .iter()
+        .map(|n| {
+            (
+                n.chain_pos.height,
+                n.chain_pos.tx_index,
+                n.chain_pos.vin_index,
+                n.chain_pos.member_index,
+            )
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            (49, 0, 0, 0),
+            (50, 3, 1, 0), // A first occurrence
+            (50, 3, 1, 1), // B
+            (50, 3, 1, 2), // C
+            (50, 3, 2, 0), // A duplicate — later
+        ]
+    );
+
+    let mut engine = StateEngine::new(Network::Regtest, 0);
+    let stats = fold_survivors_into_engine(&mut engine, &members).expect("fold");
+    assert_eq!(stats.appended, 4, "E, A, B, C — not the A duplicate");
+    assert_eq!(stats.duplicate_ignored, 1, "second A must be ignored");
+
+    // First occurrence of A wins with r_a_first.
+    match engine.nflog().lookup(pk_a) {
+        LookupResult::Present { pos, r, .. } => {
+            assert_eq!(r, r_a_first, "first occurrence R must win");
+            assert_eq!(pos, 1, "A is second leaf after earlier E");
+        }
+        LookupResult::Absent => panic!("pk_a must be present"),
+    }
+    // Duplicate R must not be the winner.
+    assert_ne!(
+        match engine.nflog().lookup(pk_a) {
+            LookupResult::Present { r, .. } => r,
+            LookupResult::Absent => panic!("present"),
+        },
+        r_a_dup
+    );
+
+    // NAV size = four first-occurrence winners.
+    assert_eq!(engine.nflog().nav().size, 4);
+
+    // Mirror order matches absolute positions.
+    let mirror = engine.nflog_mirror();
+    assert_eq!(mirror[0].1.pk, pk(0xE0));
+    assert_eq!(mirror[1].1.pk, pk_a);
+    assert_eq!(mirror[1].1.r, r_a_first);
+    assert_eq!(mirror[2].1.pk, pk_b);
+    assert_eq!(mirror[3].1.pk, pk_c);
+}
+
+/// Flag-off default: pure resolver stays Off; legacy publisher allowed
+/// when process has not claimed v11 (and after an explicit legacy claim).
+#[test]
+fn flag_off_leaves_legacy_publisher_allowed() {
+    clear_process_stack_mode_for_test();
+    assert_eq!(
+        resolve_v11_shadow_mode(None).expect("unset"),
+        V11ShadowMode::Off
+    );
+    // Unclaimed process: legacy publish still allowed (unit-test / pre-boot).
+    ensure_legacy_publisher_allowed().expect("legacy ok when unclaimed");
+    // v1.1 publisher requires an exclusive claim — no silent open.
+    assert!(ensure_v11_publisher_allowed().is_err());
+}
