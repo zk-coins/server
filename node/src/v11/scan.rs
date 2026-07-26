@@ -31,15 +31,20 @@
 //!    ancestor** with the live main chain; reorg depth =
 //!    `persisted_height − ancestor_height`.
 //! 3. **Refuse** when:
-//!    - the ancestor is below `activation_height`, or
 //!    - depth exceeds [`MAX_RECOVERABLE_REORG_DEPTH`] (5; §3.9 ≤5-block
 //!      window), or
-//!    - the tip hash cannot be resolved / mid-walk is unresolvable.
+//!    - the tip hash cannot be resolved / mid-walk is unresolvable, or
+//!    - the live RPC view is **behind** a queried height (`live_hash_at`
+//!      returns `None`) — that is not divergence; wait/retry, never
+//!      treat an incomplete view as a reorg.
 //!    A ≥6-block reorg MAY displace final positions; v1 has **no**
 //!    recovery path — readiness must not report ready (`deep_reorg`).
 //! 4. Only a **shallow** (depth ≤ 5), non-final reorg may full-replace
 //!    NfLog from the rescan survivor stream (equivalent to
-//!    truncate-and-extend from the ancestor).
+//!    truncate-and-extend from the ancestor). A one-block reorg of the
+//!    **activation block** has common ancestor `activation_height − 1`
+//!    (below activation); that is still safely replayable from
+//!    activation (NfLog is empty below the pin) and must not refuse.
 //! 5. Tip still canonical → seed folded keys; forward-append only.
 //! 6. Tip height > 0 with all-zero hash → refuse (ambiguous cursor).
 //! 7. Live-chain / resolve RPC failure → refuse (never fold blind).
@@ -268,7 +273,9 @@ pub async fn apply_forward_scan(
             return Err(e);
         }
     };
-    adapter.set_tip_hash(tip_hash);
+    adapter
+        .set_tip_hash(tip_hash)
+        .context("apply_forward_scan: set_tip_hash")?;
     if let Err(e) = adapter
         .persist()
         .await
@@ -307,7 +314,9 @@ pub async fn apply_canonical_survivors(
             return Err(e);
         }
     };
-    adapter.set_tip_hash(tip_hash);
+    adapter
+        .set_tip_hash(tip_hash)
+        .context("apply_canonical_survivors: set_tip_hash")?;
     if let Err(e) = adapter
         .persist()
         .await
@@ -367,7 +376,8 @@ pub enum PersistedTipReconciliation {
 ///
 /// `live_hash_at(height)` returns:
 /// - `Ok(Some(hash))` when the height is on the live main chain
-/// - `Ok(None)` when the height is above the live tip (or otherwise absent)
+/// - `Ok(None)` when the height is above the live tip (RPC node behind /
+///   height not yet known) — **not** evidence of a reorg
 /// - `Err(_)` on RPC / infrastructure failure — this function propagates
 ///   the error and **refuses** to classify the tip (never fold blind)
 ///
@@ -380,9 +390,18 @@ pub enum PersistedTipReconciliation {
 ///
 /// - `tip_height > 0` with all-zero `tip_hash` (ambiguous cursor)
 /// - persisted tip hash unknown / pruned (depth indeterminate)
-/// - no common ancestor at or above `activation_height`
+/// - no common ancestor with the live main chain (walked to genesis)
 /// - reorg depth > [`MAX_RECOVERABLE_REORG_DEPTH`] (§3.9 ≥6-block fail-stop)
+/// - live RPC view behind a queried height (`live_hash_at` → `None`)
 /// - live-chain or resolve RPC failure
+///
+/// # Activation boundary
+///
+/// A one-block reorg of the activation block has common ancestor
+/// `activation_height − 1`. That height is below the scan origin, but
+/// NfLog is empty below activation (§3.6), so the reorg is non-final and
+/// safely full-replaceable from activation when depth ≤ 5. Do **not**
+/// refuse solely because the ancestor is below `activation_height`.
 pub fn reconcile_persisted_tip(
     tip_height: u64,
     tip_hash: [u8; 32],
@@ -430,16 +449,32 @@ pub fn reconcile_persisted_tip(
     }
 
     // 2. Still on the live main chain at that height?
+    //    Distinguish: Some(same) = canonical; Some(different) = reorg;
+    //    None = RPC behind / height not known yet — never treat as reorg.
     let live_at_tip = live_hash_at(tip_height).context(
         "v1.1 boot tip reconciliation: live-chain query failed; \
          refusing to fold onto an unverified persisted tip",
     )?;
-    if let Some(hash) = live_at_tip {
-        if hash == tip_hash {
+    match live_at_tip {
+        Some(hash) if hash == tip_hash => {
             return Ok(PersistedTipReconciliation::StillCanonical {
                 tip_height,
                 tip_hash,
             });
+        }
+        Some(_) => {
+            // Diverged at the tip — walk for common ancestor below.
+        }
+        None => {
+            bail!(
+                "v1.1 boot tip reconciliation: live chain has no block at \
+                 persisted tip height {tip_height} (hash={}). The RPC node's \
+                 tip is behind the persisted cursor — this is an incomplete \
+                 view, not a confirmed reorg. Refusing to fold until the \
+                 node catches up (no silent assume-canonical, no silent \
+                 assume-reorg).",
+                hex::encode(tip_hash)
+            );
         }
     }
 
@@ -518,17 +553,18 @@ pub fn reconcile_persisted_tip(
         )?;
         match live_parent {
             Some(h) if h == parent_hash => {
-                // Found last common ancestor.
-                if parent_height < activation_height {
-                    bail!(
-                        "v1.1 boot tip reconciliation: last common ancestor at \
-                         height {parent_height} is below activation_height \
-                         {activation_height} (persisted tip height={tip_height}). \
-                         Refusing to fold — scan origin is consensus-critical \
-                         (§3.6); no recovery that rescan-from-activation would \
-                         silently rewrite final positions."
-                    );
-                }
+                // Found last common ancestor on the live chain.
+                //
+                // Ancestor may sit below `activation_height` (e.g. one-block
+                // reorg of the activation block → parent = activation − 1).
+                // NfLog has no entries below activation (§3.6), so a full
+                // replace from the rescan stream is exactly "replay from
+                // activation". Depth is already gated above — do not refuse
+                // solely because `parent_height < activation_height`
+                // (one-block reorg of the activation block: parent =
+                // activation − 1). `activation_height` remains a parameter
+                // for callers and for this contract.
+                let _: bool = parent_height < activation_height;
                 return Ok(PersistedTipReconciliation::ShallowReorg {
                     ancestor_height: parent_height,
                     ancestor_hash: parent_hash,
@@ -537,10 +573,21 @@ pub fn reconcile_persisted_tip(
                     persisted_hash: tip_hash,
                 });
             }
-            Some(_) | None => {
-                // Parent still diverged (or above live tip) — continue walking.
+            Some(_) => {
+                // Parent still diverged from the live main chain — keep walking.
                 walk_hash = parent_hash;
                 walk_height = parent_height;
+            }
+            None => {
+                // Incomplete live view at this height: RPC tip is behind the
+                // walk. That is not evidence the parent is orphaned.
+                bail!(
+                    "v1.1 boot tip reconciliation: live chain has no block at \
+                     height {parent_height} during ancestor walk (persisted tip \
+                     height={tip_height}). The RPC node is behind — incomplete \
+                     view, not confirmed divergence. Refusing to classify as a \
+                     reorg until the node catches up."
+                );
             }
         }
     }

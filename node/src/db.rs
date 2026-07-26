@@ -27,8 +27,21 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
 use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, HashDigest};
+
+use crate::v11::{require_stack_mode_for_update, ScanStackMode};
+
+/// Lock `stack_scan_mode` and require the legacy claim inside an open
+/// write transaction. Maps separation refusals onto `sqlx::Error` so the
+/// existing persist signatures stay stable for call sites.
+async fn require_legacy_stack_mode_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), sqlx::Error> {
+    require_stack_mode_for_update(tx, ScanStackMode::Legacy)
+        .await
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))
+}
 
 /// Semantic classification of a `pending_inscriptions` row.
 ///
@@ -650,6 +663,10 @@ pub async fn persist_state_tx(
     });
 
     let mut tx = pool.begin().await?;
+    // Capability check first (SELECT … FOR UPDATE on stack_scan_mode): a
+    // concurrent v1.1 claim cannot slip past this write, and a missing /
+    // mismatching marker aborts before any SMT/MMR row is touched.
+    require_legacy_stack_mode_in_tx(&mut tx).await?;
     sqlx::query(
         "INSERT INTO smt_state (id, data, updated_at) \
          VALUES (1, $1, NOW()) \
@@ -754,6 +771,7 @@ pub async fn persist_state_and_mark_complete_tx(
     });
 
     let mut tx = pool.begin().await?;
+    require_legacy_stack_mode_in_tx(&mut tx).await?;
     sqlx::query(
         "INSERT INTO smt_state (id, data, updated_at) \
          VALUES (1, $1, NOW()) \
@@ -1482,6 +1500,8 @@ pub async fn insert_root_index(
     // practice); the cast is infallible on 64-bit targets which is our
     // only deployment target.
     let leaf_i64 = leaf_index as i64;
+    let mut tx = pool.begin().await?;
+    require_legacy_stack_mode_in_tx(&mut tx).await?;
     sqlx::query(
         "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index, created_at) \
          VALUES ($1, $2, $3, NOW()) \
@@ -1490,8 +1510,9 @@ pub async fn insert_root_index(
     .bind(&prev_bytes[..])
     .bind(&smt_bytes[..])
     .bind(leaf_i64)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 

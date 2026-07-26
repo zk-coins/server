@@ -56,11 +56,8 @@ use std::str::FromStr;
 use bitcoin::consensus::Encodable;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use bitcoin::{Address, Network, Txid};
-use esplora_client::{
-    r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
-};
 
-use node::publisher;
+use node::publisher::{self, LegacyBroadcastClient};
 
 #[derive(Debug)]
 struct CliArgs {
@@ -309,13 +306,13 @@ async fn run(validated: ValidatedArgs, publisher_key: String) -> Result<(), Stri
         return Ok(());
     }
 
-    // Broadcast via Esplora REST `POST /tx`. The publisher uses the
-    // same `esplora-client` crate to do exactly this on the happy
-    // path (`publisher::broadcast_inscription_txs`).
-    let builder = EsploraBuilder::new(&validated.esplora_url);
-    let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder).map_err(|e| {
+    // Broadcast only through the guarded client. Construction runs the
+    // legacy stack check; the raw Esplora client is not obtainable from
+    // this binary without re-importing `esplora-client` outside the node
+    // crate (which this path deliberately does not do).
+    let client = LegacyBroadcastClient::connect(&validated.esplora_url).map_err(|e| {
         format!(
-            "failed to build esplora client for {}: {e}",
+            "failed to build guarded broadcast client for {}: {e}",
             validated.esplora_url
         )
     })?;
