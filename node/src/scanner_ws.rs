@@ -63,13 +63,11 @@
 use std::time::Duration;
 
 use bitcoin::BlockHash;
-use esplora_client::{
-    r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
-};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::esplora_bound::EsploraReadClient;
 use crate::publisher::EsploraConfig;
 pub use crate::scanner_ws_parse::parse_ws_frame;
 
@@ -259,24 +257,22 @@ pub async fn run_scanner_ws(config: ScannerWsConfig, tip_tx: mpsc::Sender<BlockH
     // `http_client` an `Option`. If construction failed the inner
     // anchor call logs a warning and skips the re-anchor; the next
     // session's first WS-pushed block re-establishes the tip.
-    let http_client: Option<EsploraAsyncClient<DefaultSleeper>> =
-        match EsploraAsyncClient::<DefaultSleeper>::from_builder(EsploraBuilder::new(
-            &config.http_url,
-        )) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                // If the HTTP client cannot even be constructed (e.g.
-                // an unparseable URL) we have no useful fallback.
-                // Stay loud: every reconnect from here on logs that
-                // the re-anchor is skipped.
-                eprintln!(
-                    "scanner_ws: failed to build Esplora HTTP client for {}: {}. \
-                     Re-anchor on reconnect will be skipped.",
-                    config.http_url, e
-                );
-                None
-            }
-        };
+    let http_client: Option<EsploraReadClient> = match EsploraReadClient::connect(&config.http_url)
+    {
+        Ok(c) => Some(c),
+        Err(e) => {
+            // If the HTTP client cannot even be constructed (e.g.
+            // an unparseable URL) we have no useful fallback.
+            // Stay loud: every reconnect from here on logs that
+            // the re-anchor is skipped.
+            eprintln!(
+                "scanner_ws: failed to build Esplora HTTP client for {}: {}. \
+                 Re-anchor on reconnect will be skipped.",
+                config.http_url, e
+            );
+            None
+        }
+    };
 
     let mut backoff = config.reconnect_min;
     loop {
@@ -549,7 +545,7 @@ async fn connect_and_drain(
 /// The Esplora client is owned by `run_scanner_ws` and passed in by
 /// reference so we do not rebuild it on every reconnect.
 async fn anchor_on_current_tip(
-    client: &EsploraAsyncClient<DefaultSleeper>,
+    client: &EsploraReadClient,
     tip_tx: &mpsc::Sender<BlockHash>,
 ) -> Result<(), String> {
     let lookup = tokio::time::timeout(Duration::from_secs(10), client.get_tip_hash());

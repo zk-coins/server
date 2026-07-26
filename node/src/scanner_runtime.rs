@@ -22,13 +22,13 @@
 //! error-backoff, not a poll on the chain tip.
 
 use bitcoin::{BlockHash, Transaction, Txid};
-use esplora_client::r#async::DefaultSleeper;
-use esplora_client::{AsyncClient, Builder, Error as EsploraError, Sleeper};
 use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+use crate::esplora_bound::EsploraReadClient;
 
 /// Hard error returned when the WS-fed `tip_rx` channel closes
 /// unexpectedly mid-scan (issue #84, round-2 MAJOR 2). A closed
@@ -65,8 +65,8 @@ use crate::scanner::{filter_marker_txids, process_transaction_inscriptions, Insc
 /// the next WS event can preempt a stuck HTTP call.
 const HTTP_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
-struct InscriptionScanner<S = DefaultSleeper> {
-    client: AsyncClient<S>,
+struct InscriptionScanner {
+    client: EsploraReadClient,
     processed_blocks: HashSet<BlockHash>,
     current_block_hash: Option<BlockHash>,
     /// Optional Postgres pool for the per-block `block_log` audit row.
@@ -75,8 +75,8 @@ struct InscriptionScanner<S = DefaultSleeper> {
     pool: Option<sqlx::PgPool>,
 }
 
-impl<S: Sleeper> InscriptionScanner<S> {
-    fn new(client: AsyncClient<S>, pool: Option<sqlx::PgPool>) -> Self {
+impl InscriptionScanner {
+    fn new(client: EsploraReadClient, pool: Option<sqlx::PgPool>) -> Self {
         Self {
             client,
             processed_blocks: HashSet::new(),
@@ -170,7 +170,11 @@ impl<S: Sleeper> InscriptionScanner<S> {
 
             self.processed_blocks.insert(current_hash);
 
-            let block_status = self.client.get_block_status(&current_hash).await?;
+            let block_status = self
+                .client
+                .get_block_status(&current_hash)
+                .await
+                .map_err(|e| e as Box<dyn StdError>)?;
 
             // Persist a block_log row for this block: hash, height,
             // inscription count, and processing duration. Fire-and-
@@ -228,7 +232,7 @@ impl<S: Sleeper> InscriptionScanner<S> {
         &self,
         tx: &Transaction,
         callback: &InscriptionCallback,
-    ) -> Result<(), EsploraError> {
+    ) -> Result<(), Box<dyn StdError>> {
         if let Some(current_hash) = self.current_block_hash {
             process_transaction_inscriptions(tx, current_hash, callback);
         }
@@ -248,8 +252,8 @@ pub async fn scan_for_inscriptions(
     callback: &InscriptionCallback,
     mut tip_rx: mpsc::Receiver<BlockHash>,
 ) -> Result<(), Box<dyn StdError>> {
-    let builder = Builder::new(&config.url);
-    let client = AsyncClient::<DefaultSleeper>::from_builder(builder)?;
+    let client =
+        EsploraReadClient::connect(&config.url).map_err(|e| e as Box<dyn StdError>)?;
     let mut scanner = InscriptionScanner::new(client, pool);
 
     scanner

@@ -36,6 +36,9 @@
 pub mod account_node;
 pub mod audit;
 pub mod db;
+/// Sole production owner of the `esplora-client` dependency (read +
+/// guarded broadcast wrappers). Other modules must not import the raw crate.
+pub mod esplora_bound;
 pub mod flow;
 pub mod job_dispatcher;
 pub mod job_store;

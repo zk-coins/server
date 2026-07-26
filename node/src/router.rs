@@ -2868,8 +2868,7 @@ pub(crate) async fn ready_handler(State(state): State<AppState>) -> impl IntoRes
 async fn check_esplora(
     config: &EsploraConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use esplora_client::{r#async::DefaultSleeper, AsyncClient, Builder};
-    let client = AsyncClient::<DefaultSleeper>::from_builder(Builder::new(&config.url))?;
+    let client = crate::esplora_bound::EsploraReadClient::connect(&config.url)?;
     client.get_height().await?;
     Ok(())
 }

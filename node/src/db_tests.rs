@@ -402,6 +402,7 @@ async fn reset_proof_dependent_state_tx_overwrites_existing_digest_row() {
     // before, so a row is present).
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     store_circuit_digest(&pool, b"PREEXISTING").await.unwrap();
     reset_proof_dependent_state_tx(&pool, b"AFTER-RESET")
         .await

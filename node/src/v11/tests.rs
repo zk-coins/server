@@ -481,12 +481,25 @@ async fn tip_hash_survives_persist_reload() {
 // ---------------------------------------------------------------------------
 
 use super::scan::{
-    apply_canonical_survivors, fold_survivors_into_engine, members_to_published,
-    reconcile_persisted_tip, sort_canonical, MAX_RECOVERABLE_REORG_DEPTH,
-    PersistedTipReconciliation, ResolvedBlock,
+    apply_canonical_survivors, first_boot_requires_full_replace, fold_survivors_into_engine,
+    members_to_published, observation_tip_still_live, reconcile_persisted_tip, sort_canonical,
+    MAX_RECOVERABLE_REORG_DEPTH, PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome,
 };
-use super::separation::{ensure_legacy_publisher_allowed, ensure_v11_publisher_allowed};
+use super::separation::{
+    claim_process_stack_from_shadow_mode, ensure_legacy_publisher_allowed,
+    ensure_v11_publisher_allowed,
+};
 use shared::spec_v1::{LookupResult, PublishedNullifier};
+
+/// Unwrap a ready recon for tests that expect a non-retry classification.
+fn expect_ready(outcome: TipReconcileOutcome) -> PersistedTipReconciliation {
+    match outcome {
+        TipReconcileOutcome::Ready(r) => r,
+        TipReconcileOutcome::RetryableIncompleteView { detail, .. } => {
+            panic!("expected Ready recon, got RetryableIncompleteView: {detail}")
+        }
+    }
+}
 
 /// Test double: a linear "old" chain of block hashes for offline recon.
 /// `chain[h]` is the hash at height h; parents link via prev = chain[h-1].
@@ -875,14 +888,16 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     assert_ne!(continuous_root, old_root, "reorg must change the NfLog root");
 
     // --- Restart path: reconciling the persisted tip sees a shallow reorg ---
-    let recon = reconcile_persisted_tip(
-        11,
-        old_tip_hash,
-        0,
-        |h| live_from_chain(&new_chain, h),
-        |hash| resolve_from_chain(&old_chain, hash),
-    )
-    .expect("shallow recon");
+    let recon = expect_ready(
+        reconcile_persisted_tip(
+            11,
+            old_tip_hash,
+            0,
+            |h| live_from_chain(&new_chain, h),
+            |hash| resolve_from_chain(&old_chain, hash),
+        )
+        .expect("shallow recon"),
+    );
     match recon {
         PersistedTipReconciliation::ShallowReorg {
             reorg_depth,
@@ -922,18 +937,21 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     });
 
     // Still-canonical tip: forward path is selected (no full replace).
-    let recon_ok = reconcile_persisted_tip(
-        11,
-        new_tip_hash,
-        0,
-        |h| live_from_chain(&new_chain, h),
-        |hash| resolve_from_chain(&new_chain, hash),
-    )
-    .expect("still canonical");
+    let recon_ok = expect_ready(
+        reconcile_persisted_tip(
+            11,
+            new_tip_hash,
+            0,
+            |h| live_from_chain(&new_chain, h),
+            |hash| resolve_from_chain(&new_chain, hash),
+        )
+        .expect("still canonical"),
+    );
     assert!(matches!(
         recon_ok,
         PersistedTipReconciliation::StillCanonical { .. }
     ));
+    assert!(!first_boot_requires_full_replace(&recon_ok));
 
     // Ambiguous tip (height>0, zero hash) refuses.
     let err = reconcile_persisted_tip(
@@ -1248,19 +1266,158 @@ async fn legacy_write_between_emptiness_check_and_v11_claim_cannot_mix_db() {
     clear_process_stack_mode_for_test();
 }
 
-/// Defect 2 (round 4): the recover_inscription binary path obtains its
-/// client only via [`crate::publisher::LegacyBroadcastClient::connect`],
-/// which refuses under a v1.1 process claim before any Esplora I/O.
+/// Defect 2 (round 5): exercise the **recovery binary's** stack-claim path
+/// (`claim_process_stack_from_shadow_mode` / `ZKCOINS_V11_SHADOW=1`), not a
+/// hand-set `set_process_stack_mode(V11)`. Under that claim,
+/// `LegacyBroadcastClient::connect` refuses before any Esplora I/O.
 #[test]
-fn recover_inscription_broadcast_client_refuses_under_v11_claim() {
+fn recover_inscription_binary_path_refuses_under_v11_shadow() {
     clear_process_stack_mode_for_test();
-    set_process_stack_mode(ScanStackMode::V11);
+    // Same pure step the binary runs after reading ZKCOINS_V11_SHADOW=1.
+    claim_process_stack_from_shadow_mode(super::mode::V11ShadowMode::On);
     let err = crate::publisher::LegacyBroadcastClient::connect("http://127.0.0.1:1/api")
-        .expect_err("recover path must refuse under v11");
+        .expect_err("recover path must refuse under v11 shadow claim");
     let msg = err.to_string();
     assert!(
         msg.contains(STACK_SEPARATION_REFUSAL) || msg.contains("v1.1"),
         "got: {msg}"
+    );
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 1 (round 5): a reorg between a free-standing recon and a later
+/// first scan is the race that StillCanonical + force_full_replace=false
+/// used to miss. Binding recon to the **scan's** live chain closes it:
+/// recon against chain A says StillCanonical; recon against the scan's
+/// chain B says ShallowReorg (full-replace). Tip stability also rejects
+/// applying recon(A) onto scan tip B.
+#[test]
+fn reorg_between_recon_and_first_scan_caught_by_bound_observation() {
+    // Shared prefix 0..=9; old tip at 10 (chain A); live/scan tip at 10 (chain B).
+    let mut chain_a = mock_chain(11, 0xAA);
+    let mut chain_b = mock_chain(11, 0xBB);
+    for h in 0..=9 {
+        let shared = {
+            let mut hash = [0u8; 32];
+            hash[0] = 0x11;
+            hash[1] = h as u8;
+            hash
+        };
+        chain_a[h] = shared;
+        chain_b[h] = shared;
+    }
+    let persisted_hash = chain_a[10];
+    let scan_tip_hash = chain_b[10];
+
+    // Free-standing recon against chain A (the race window's first half):
+    // would seed folded keys and skip full-replace.
+    let free_standing = expect_ready(
+        reconcile_persisted_tip(
+            10,
+            persisted_hash,
+            0,
+            |h| live_from_chain(&chain_a, h),
+            |hash| resolve_from_chain(&chain_a, hash),
+        )
+        .expect("recon on A"),
+    );
+    assert!(
+        matches!(
+            free_standing,
+            PersistedTipReconciliation::StillCanonical { .. }
+        ),
+        "recon alone on A is StillCanonical — the dangerous half of the race"
+    );
+    assert!(!first_boot_requires_full_replace(&free_standing));
+
+    // Bound recon: live view is the **scan's** chain B.
+    let bound = expect_ready(
+        reconcile_persisted_tip(
+            10,
+            persisted_hash,
+            0,
+            |h| live_from_chain(&chain_b, h),
+            |hash| resolve_from_chain(&chain_a, hash),
+        )
+        .expect("bound recon on B"),
+    );
+    assert!(
+        matches!(bound, PersistedTipReconciliation::ShallowReorg { .. }),
+        "bound to scan chain B must see the offline reorg; got {bound:?}"
+    );
+    assert!(
+        first_boot_requires_full_replace(&bound),
+        "first boot must full-replace after ShallowReorg"
+    );
+
+    // Tip-stability pin: free-standing recon tip A must not be applied
+    // onto a scan that observed tip B.
+    assert!(
+        !observation_tip_still_live(persisted_hash, Some(scan_tip_hash)),
+        "scan tip B != recon tip A → discard observation"
+    );
+    assert!(
+        observation_tip_still_live(scan_tip_hash, Some(scan_tip_hash)),
+        "matching pin allows apply"
+    );
+}
+
+/// Defect 3 (round 5): `claim_stack_scan_mode` refuses when stack data is
+/// present without a marker (same invariant as enforce — no auto-claim).
+#[tokio::test]
+async fn claim_stack_scan_mode_refuses_without_emptiness_invariant() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+
+    seed_v11_scan_state_without_marker(&pool).await;
+
+    let err = claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        .await
+        .expect_err("claim over existing data must refuse");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(STACK_SEPARATION_REFUSAL)
+            || msg.contains("already exist")
+            || msg.contains("auto-claim")
+            || msg.contains("marker is missing"),
+        "got: {msg}"
+    );
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 3 (round 5): `reset_proof_dependent_state_tx` refuses without a
+/// legacy stack marker (capability check).
+#[tokio::test]
+async fn reset_proof_dependent_state_tx_refuses_without_legacy_marker() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    // No marker at all.
+    let err = crate::db::reset_proof_dependent_state_tx(&pool, b"DIGEST")
+        .await
+        .expect_err("reset without marker must refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(STACK_CAPABILITY_REFUSAL)
+            || msg.contains("stack_scan_mode")
+            || msg.contains("marker"),
+        "got: {msg}"
+    );
+
+    // V11 marker also refuses (legacy-table mutator).
+    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11 on empty");
+    let err2 = crate::db::reset_proof_dependent_state_tx(&pool, b"DIGEST")
+        .await
+        .expect_err("reset under v11 marker must refuse");
+    let msg2 = err2.to_string();
+    assert!(
+        msg2.contains(STACK_CAPABILITY_REFUSAL)
+            || msg2.contains("v11")
+            || msg2.contains("legacy"),
+        "got: {msg2}"
     );
     clear_process_stack_mode_for_test();
 }
@@ -1300,14 +1457,16 @@ fn one_block_reorg_at_activation_boundary_replays() {
         h
     };
     let old_tip = old_chain[activation as usize];
-    let recon = reconcile_persisted_tip(
-        activation,
-        old_tip,
-        activation,
-        |h| live_from_chain(&live_chain, h),
-        |hash| resolve_from_chain(&old_chain, hash),
-    )
-    .expect("activation-boundary one-block reorg must replay");
+    let recon = expect_ready(
+        reconcile_persisted_tip(
+            activation,
+            old_tip,
+            activation,
+            |h| live_from_chain(&live_chain, h),
+            |hash| resolve_from_chain(&old_chain, hash),
+        )
+        .expect("activation-boundary one-block reorg must replay"),
+    );
     match recon {
         PersistedTipReconciliation::ShallowReorg {
             reorg_depth,
@@ -1316,19 +1475,21 @@ fn one_block_reorg_at_activation_boundary_replays() {
         } => {
             assert_eq!(reorg_depth, 1);
             assert_eq!(ancestor_height, activation - 1);
+            assert!(first_boot_requires_full_replace(&recon));
         }
         other => panic!("expected ShallowReorg at activation boundary, got {other:?}"),
     }
 }
 
-/// Defect 3B (round 4): `live_hash_at` returning `None` means the RPC view
-/// is behind the queried height — not a reorg / divergence.
+/// Defect 3B (round 4) + Defect 4 (round 5): `live_hash_at` returning `None`
+/// means the RPC view is behind — a **retryable** incomplete view, not a
+/// reorg / divergence / crash.
 #[test]
 fn rpc_view_behind_persisted_height_is_not_divergence() {
     let chain = mock_chain(11, 0xAA); // tip height 10
     let tip_hash = chain[10];
     // RPC only knows up to height 8 (behind persisted tip 10).
-    let err = reconcile_persisted_tip(
+    let outcome = reconcile_persisted_tip(
         10,
         tip_hash,
         0,
@@ -1341,19 +1502,67 @@ fn rpc_view_behind_persisted_height_is_not_divergence() {
         },
         |hash| resolve_from_chain(&chain, hash),
     )
-    .expect_err("behind RPC must not be classified as reorg");
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("behind")
-            || msg.contains("incomplete")
-            || msg.contains("catches up")
-            || msg.contains("no block at"),
-        "must name incomplete/behind view; got: {msg}"
+    .expect("behind RPC must not be a fatal Err");
+    match outcome {
+        TipReconcileOutcome::RetryableIncompleteView {
+            queried_height,
+            detail,
+        } => {
+            assert_eq!(queried_height, 10);
+            assert!(
+                detail.contains("behind")
+                    || detail.contains("incomplete")
+                    || detail.contains("no block at")
+                    || detail.contains("retry"),
+                "must name incomplete/behind view; got: {detail}"
+            );
+        }
+        TipReconcileOutcome::Ready(r) => {
+            panic!("behind RPC must not classify as Ready({r:?})")
+        }
+    }
+}
+
+/// Defect 4 (round 5): once the RPC catches up, the same persisted tip
+/// becomes Ready/StillCanonical — the retry path can proceed without
+/// having ever set deep_reorg.
+#[test]
+fn rpc_behind_then_catchup_becomes_ready_still_canonical() {
+    let chain = mock_chain(11, 0xAA);
+    let tip_hash = chain[10];
+    let behind = reconcile_persisted_tip(
+        10,
+        tip_hash,
+        0,
+        |h| {
+            if h > 8 {
+                Ok(None)
+            } else {
+                live_from_chain(&chain, h)
+            }
+        },
+        |hash| resolve_from_chain(&chain, hash),
+    )
+    .expect("behind is Ok(Retryable)");
+    assert!(matches!(
+        behind,
+        TipReconcileOutcome::RetryableIncompleteView { .. }
+    ));
+
+    let caught_up = expect_ready(
+        reconcile_persisted_tip(
+            10,
+            tip_hash,
+            0,
+            |h| live_from_chain(&chain, h),
+            |hash| resolve_from_chain(&chain, hash),
+        )
+        .expect("catch-up recon"),
     );
-    assert!(
-        !msg.contains("ShallowReorg") && !msg.contains("exceeds recoverable"),
-        "must not look like a depth/reorg fail-stop; got: {msg}"
-    );
+    assert!(matches!(
+        caught_up,
+        PersistedTipReconciliation::StillCanonical { .. }
+    ));
 }
 
 /// §3.6: multi-member inscription folded in canonical

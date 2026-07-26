@@ -1007,6 +1007,11 @@ pub async fn reset_proof_dependent_state_tx(
     new_digest: &[u8],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // Capability check first: this mutates the four legacy scan tables
+    // (smt_state / mmr_state / mmr_root_index / latest_block) plus accounts.
+    // Under a missing or v1.1 marker the wipe must refuse — same invariant
+    // as every other legacy stack writer (no silent cross-stack mutate).
+    require_legacy_stack_mode_in_tx(&mut tx).await?;
     sqlx::query("DELETE FROM accounts")
         .execute(&mut *tx)
         .await?;

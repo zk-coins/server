@@ -22,32 +22,36 @@
 //! Every boot creates a fresh scanner with an empty checkpoint. If Bitcoin
 //! reorganised while the node was down, that scanner cannot report a reorg
 //! (no previous tip). The node therefore reconciles the **persisted** tip
-//! against the live chain **before** any fold (§3.9 finality directive):
+//! against the **same chain observation** as the first scan — never
+//! recon-then-scan as two independent observations (§3.9):
 //!
-//! 1. **Resolve the persisted tip hash itself** (by hash, not only by
-//!    height). An unknown / pruned tip is **not** treated as a shallow
-//!    reorg — fail-stop.
-//! 2. Walk the old chain via `previousblockhash` to the **last common
+//! 1. Run `scan_to_tip` to obtain `(tip, survivors)`.
+//! 2. **Resolve the persisted tip hash itself** (by hash, not only by
+//!    height) against that live view. An unknown / pruned tip is **not**
+//!    treated as a shallow reorg — fail-stop.
+//! 3. Walk the old chain via `previousblockhash` to the **last common
 //!    ancestor** with the live main chain; reorg depth =
 //!    `persisted_height − ancestor_height`.
-//! 3. **Refuse** when:
-//!    - depth exceeds [`MAX_RECOVERABLE_REORG_DEPTH`] (5; §3.9 ≤5-block
-//!      window), or
-//!    - the tip hash cannot be resolved / mid-walk is unresolvable, or
-//!    - the live RPC view is **behind** a queried height (`live_hash_at`
-//!      returns `None`) — that is not divergence; wait/retry, never
-//!      treat an incomplete view as a reorg.
-//!    A ≥6-block reorg MAY displace final positions; v1 has **no**
-//!    recovery path — readiness must not report ready (`deep_reorg`).
-//! 4. Only a **shallow** (depth ≤ 5), non-final reorg may full-replace
-//!    NfLog from the rescan survivor stream (equivalent to
-//!    truncate-and-extend from the ancestor). A one-block reorg of the
+//! 4. Re-verify `live_hash_at(scan_tip) == scan_tip_hash`. If the tip
+//!    moved, discard recon + scan and re-observe. The window is **closed**,
+//!    not narrowed: there is no path that commits a recon decision from
+//!    a different observation than the survivors applied.
+//! 5. **Taxonomy of outcomes**:
+//!    - **Ready** ([`PersistedTipReconciliation`]): Fresh / StillCanonical
+//!      / ShallowReorg — apply from **this** scan's survivors.
+//!    - **Retryable incomplete view** (`live_hash_at` → `None`, or tip
+//!      pin failed): RPC behind / lag. Stay unready, leave `finality_ok`
+//!      untouched, back off, full re-verify. Never assume canonical,
+//!      never assume reorg, never conflate lag with deep_reorg.
+//!    - **Fatal** (`Err`): unresolvable tip, no common ancestor, depth
+//!      beyond §3.9, RPC infrastructure failure, ambiguous cursor.
+//!      Fail-stop; deep reorg trips readiness `deep_reorg`.
+//! 6. Only a **shallow** (depth ≤ 5), non-final reorg may full-replace
+//!    NfLog from the rescan survivor stream. A one-block reorg of the
 //!    **activation block** has common ancestor `activation_height − 1`
 //!    (below activation); that is still safely replayable from
 //!    activation (NfLog is empty below the pin) and must not refuse.
-//! 5. Tip still canonical → seed folded keys; forward-append only.
-//! 6. Tip height > 0 with all-zero hash → refuse (ambiguous cursor).
-//! 7. Live-chain / resolve RPC failure → refuse (never fold blind).
+//! 7. Tip still canonical → seed folded keys; forward-append only.
 //!
 //! Property: after any crash or *tolerated* reorg, a restarted node
 //! reaches the same accumulator a continuously running node would hold.
@@ -342,10 +346,13 @@ pub struct ResolvedBlock {
     pub prev_hash: [u8; 32],
 }
 
-/// Outcome of reconciling a persisted tip against the live Bitcoin chain.
+/// Outcome of reconciling a persisted tip against the live Bitcoin chain
+/// when the live view is complete enough to classify.
 ///
 /// Decides whether a restarted node may forward-append, may rebuild from
-/// a shallow offline reorg, or must **fail-stop** (returned as `Err`).
+/// a shallow offline reorg, or must **fail-stop** (returned as `Err` from
+/// [`reconcile_persisted_tip`]). Incomplete live views are **not** this
+/// type — see [`TipReconcileOutcome::RetryableIncompleteView`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistedTipReconciliation {
     /// Engine has no tip yet (height 0, all-zero hash). Scan forward from
@@ -371,13 +378,57 @@ pub enum PersistedTipReconciliation {
     },
 }
 
+/// Full result of tip reconciliation: ready, retryable lag, or fatal (`Err`).
+///
+/// Distinguishes **transient** incomplete RPC views from **corruption /
+/// real divergence** so a syncing bitcoind never crash-loops the node and
+/// a deep reorg never looks like lag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TipReconcileOutcome {
+    /// Live view was complete; proceed with the inner classification.
+    Ready(PersistedTipReconciliation),
+    /// RPC tip behind a queried height / height not yet known.
+    ///
+    /// Caller must: leave `v11_scan` unready, leave `finality_ok` /
+    /// `deep_reorg` untouched, back off, and re-run the full verification.
+    /// Never assume canonical, never assume reorg.
+    RetryableIncompleteView {
+        queried_height: u64,
+        detail: String,
+    },
+}
+
+/// Whether a scan tip is still the live main-chain hash at that height.
+///
+/// Used to pin reconciliation and the first boot scan to **one**
+/// observation: after reconciling against the scan tip, re-read
+/// `live_hash_at(scan_tip_height)`. If it no longer equals
+/// `scan_tip_hash`, discard both recon and scan and re-observe.
+///
+/// This closes (does not merely narrow) the recon/scan race: there is
+/// no path that applies a recon decision from a different chain tip
+/// than the survivors being folded.
+pub fn observation_tip_still_live(
+    scan_tip_hash: [u8; 32],
+    live_at_scan_height: Option<[u8; 32]>,
+) -> bool {
+    matches!(live_at_scan_height, Some(h) if h == scan_tip_hash)
+}
+
+/// Whether the first boot apply for a ready recon must full-replace
+/// NfLog from the bound scan's survivors (vs forward-append with seeded keys).
+pub fn first_boot_requires_full_replace(recon: &PersistedTipReconciliation) -> bool {
+    matches!(recon, PersistedTipReconciliation::ShallowReorg { .. })
+}
+
 /// Reconcile `(tip_height, tip_hash)` from the persisted engine against
 /// the live chain under §3.9 finality rules.
 ///
 /// `live_hash_at(height)` returns:
 /// - `Ok(Some(hash))` when the height is on the live main chain
 /// - `Ok(None)` when the height is above the live tip (RPC node behind /
-///   height not yet known) — **not** evidence of a reorg
+///   height not yet known) — **not** evidence of a reorg; yields
+///   [`TipReconcileOutcome::RetryableIncompleteView`]
 /// - `Err(_)` on RPC / infrastructure failure — this function propagates
 ///   the error and **refuses** to classify the tip (never fold blind)
 ///
@@ -386,14 +437,16 @@ pub enum PersistedTipReconciliation {
 /// - `Ok(None)` when the hash is unknown / pruned
 /// - `Err(_)` on RPC failure — refused, never treated as a shallow reorg
 ///
-/// # Failures (all loud, no silent recovery)
+/// # Failures (`Err` — fatal only, no silent recovery)
 ///
 /// - `tip_height > 0` with all-zero `tip_hash` (ambiguous cursor)
 /// - persisted tip hash unknown / pruned (depth indeterminate)
 /// - no common ancestor with the live main chain (walked to genesis)
 /// - reorg depth > [`MAX_RECOVERABLE_REORG_DEPTH`] (§3.9 ≥6-block fail-stop)
-/// - live RPC view behind a queried height (`live_hash_at` → `None`)
-/// - live-chain or resolve RPC failure
+/// - live-chain or resolve RPC **infrastructure** failure
+///
+/// Incomplete live views (`live_hash_at` → `None`) are **not** failures;
+/// they return [`TipReconcileOutcome::RetryableIncompleteView`].
 ///
 /// # Activation boundary
 ///
@@ -408,10 +461,12 @@ pub fn reconcile_persisted_tip(
     activation_height: u64,
     mut live_hash_at: impl FnMut(u64) -> Result<Option<[u8; 32]>>,
     mut resolve_hash: impl FnMut([u8; 32]) -> Result<Option<ResolvedBlock>>,
-) -> Result<PersistedTipReconciliation> {
+) -> Result<TipReconcileOutcome> {
     let zero = [0u8; 32];
     if tip_height == 0 && tip_hash == zero {
-        return Ok(PersistedTipReconciliation::Fresh);
+        return Ok(TipReconcileOutcome::Ready(
+            PersistedTipReconciliation::Fresh,
+        ));
     }
     if tip_hash == zero {
         bail!(
@@ -450,31 +505,34 @@ pub fn reconcile_persisted_tip(
 
     // 2. Still on the live main chain at that height?
     //    Distinguish: Some(same) = canonical; Some(different) = reorg;
-    //    None = RPC behind / height not known yet — never treat as reorg.
+    //    None = RPC behind / height not known yet — retryable, not reorg.
     let live_at_tip = live_hash_at(tip_height).context(
         "v1.1 boot tip reconciliation: live-chain query failed; \
          refusing to fold onto an unverified persisted tip",
     )?;
     match live_at_tip {
         Some(hash) if hash == tip_hash => {
-            return Ok(PersistedTipReconciliation::StillCanonical {
-                tip_height,
-                tip_hash,
-            });
+            return Ok(TipReconcileOutcome::Ready(
+                PersistedTipReconciliation::StillCanonical {
+                    tip_height,
+                    tip_hash,
+                },
+            ));
         }
         Some(_) => {
             // Diverged at the tip — walk for common ancestor below.
         }
         None => {
-            bail!(
-                "v1.1 boot tip reconciliation: live chain has no block at \
-                 persisted tip height {tip_height} (hash={}). The RPC node's \
-                 tip is behind the persisted cursor — this is an incomplete \
-                 view, not a confirmed reorg. Refusing to fold until the \
-                 node catches up (no silent assume-canonical, no silent \
-                 assume-reorg).",
-                hex::encode(tip_hash)
-            );
+            return Ok(TipReconcileOutcome::RetryableIncompleteView {
+                queried_height: tip_height,
+                detail: format!(
+                    "live chain has no block at persisted tip height {tip_height} \
+                     (hash={}). The RPC node's tip is behind the persisted cursor \
+                     — incomplete view, not a confirmed reorg. Staying unready and \
+                     retrying (no silent assume-canonical, no silent assume-reorg).",
+                    hex::encode(tip_hash)
+                ),
+            });
         }
     }
 
@@ -565,13 +623,15 @@ pub fn reconcile_persisted_tip(
                 // activation − 1). `activation_height` remains a parameter
                 // for callers and for this contract.
                 let _: bool = parent_height < activation_height;
-                return Ok(PersistedTipReconciliation::ShallowReorg {
-                    ancestor_height: parent_height,
-                    ancestor_hash: parent_hash,
-                    reorg_depth,
-                    persisted_height: tip_height,
-                    persisted_hash: tip_hash,
-                });
+                return Ok(TipReconcileOutcome::Ready(
+                    PersistedTipReconciliation::ShallowReorg {
+                        ancestor_height: parent_height,
+                        ancestor_hash: parent_hash,
+                        reorg_depth,
+                        persisted_height: tip_height,
+                        persisted_hash: tip_hash,
+                    },
+                ));
             }
             Some(_) => {
                 // Parent still diverged from the live main chain — keep walking.
@@ -581,13 +641,15 @@ pub fn reconcile_persisted_tip(
             None => {
                 // Incomplete live view at this height: RPC tip is behind the
                 // walk. That is not evidence the parent is orphaned.
-                bail!(
-                    "v1.1 boot tip reconciliation: live chain has no block at \
-                     height {parent_height} during ancestor walk (persisted tip \
-                     height={tip_height}). The RPC node is behind — incomplete \
-                     view, not confirmed divergence. Refusing to classify as a \
-                     reorg until the node catches up."
-                );
+                return Ok(TipReconcileOutcome::RetryableIncompleteView {
+                    queried_height: parent_height,
+                    detail: format!(
+                        "live chain has no block at height {parent_height} during \
+                         ancestor walk (persisted tip height={tip_height}). The RPC \
+                         node is behind — incomplete view, not confirmed divergence. \
+                         Staying unready and retrying (no silent reorg classification)."
+                    ),
+                });
             }
         }
     }

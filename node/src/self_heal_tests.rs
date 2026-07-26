@@ -447,10 +447,15 @@ async fn heal_propagates_error_from_store_digest_on_baseline() {
 #[tokio::test]
 async fn heal_propagates_error_from_reset_tx() {
     // Detector 1 trips a reset (persisted digest differs). Drop the
-    // `accounts` table so the reset transaction's first DELETE errors and
-    // the `?` on `db::reset_proof_dependent_state_tx` propagates.
+    // `accounts` table so the reset transaction's DELETE errors and the
+    // `?` on `db::reset_proof_dependent_state_tx` propagates. Claim the
+    // legacy stack first so the failure is the DROP (not the capability
+    // gate — that path has its own test).
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_stack_scan_mode(&pool, ScanStackMode::Legacy)
+        .await
+        .expect("claim legacy for reset-error test");
     db::store_circuit_digest(&pool, b"OLD")
         .await
         .expect("store old digest");
