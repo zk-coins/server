@@ -21,6 +21,66 @@ use esplora_client::{
 use sqlx::PgPool;
 
 use crate::db;
+use crate::v11::ensure_legacy_publisher_allowed;
+
+/// Broadcast-capable Esplora client for **legacy** commitment inscriptions.
+///
+/// ## Structural choke point
+///
+/// Construction is the only public way to obtain this type, and construction
+/// always runs [`ensure_legacy_publisher_allowed`]. The inner
+/// `EsploraAsyncClient` is **private** and never returned — a caller
+/// (including `bin/recover_inscription`) cannot extract an unguarded
+/// broadcast handle after the fact. Possessing a value of this type already
+/// means the stack check passed at connect time.
+///
+/// What prevents a future caller from reaching the raw client through this
+/// crate: there is no `into_inner` / `as_raw` / public field. A binary that
+/// wants to broadcast legacy commitments must call [`Self::connect`] (or a
+/// helper that does); the old pattern of `EsploraBuilder` + `client.broadcast`
+/// is no longer used on any publisher / recovery path in this crate.
+pub struct LegacyBroadcastClient {
+    inner: EsploraAsyncClient<DefaultSleeper>,
+}
+
+impl std::fmt::Debug for LegacyBroadcastClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LegacyBroadcastClient { /* inner private */ }")
+    }
+}
+
+impl LegacyBroadcastClient {
+    /// Build a broadcast-capable client after the legacy stack check.
+    ///
+    /// Fails loud under a v1.1 process claim (and under any future
+    /// strengthening of [`ensure_legacy_publisher_allowed`]) **before** any
+    /// Esplora I/O.
+    pub fn connect(url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        ensure_legacy_publisher_allowed().map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        let builder = EsploraBuilder::new(url);
+        let inner = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
+        Ok(Self { inner })
+    }
+
+    /// Broadcast a raw transaction via Esplora REST `POST /tx`.
+    pub async fn broadcast(
+        &self,
+        tx: &Transaction,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.broadcast(tx).await.map_err(|e| e.into())
+    }
+
+    /// Fetch a transaction by txid (read path used by recovery confirmation).
+    pub async fn get_tx(
+        &self,
+        txid: &Txid,
+    ) -> Result<Option<Transaction>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.get_tx(txid).await.map_err(|e| e.into())
+    }
+}
 
 // Define a configuration struct for Esplora
 #[derive(Clone, Debug)]
@@ -442,9 +502,9 @@ pub async fn broadcast_inscription_txs(
     commit_tx: &Transaction,
     reveal_tx: &Transaction,
 ) -> Result<(Txid, Txid), Box<dyn std::error::Error + Send + Sync>> {
-    // Create an Esplora client
-    let builder = EsploraBuilder::new(&config.url);
-    let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
+    // Guard is inside `LegacyBroadcastClient::connect` — not a per-call check
+    // that a new path could forget.
+    let client = LegacyBroadcastClient::connect(&config.url)?;
 
     let commit_txid = broadcast_raw_tx(&client, commit_tx, "Commit").await?;
     let reveal_txid = broadcast_raw_tx(&client, reveal_tx, "Reveal").await?;
@@ -452,20 +512,12 @@ pub async fn broadcast_inscription_txs(
     Ok((commit_txid, reveal_txid))
 }
 
-/// Structural choke point for every legacy commitment broadcast.
-///
-/// Stack separation is enforced **here** (not only at public entry points)
-/// so a new caller cannot forget the guard: under a v1.1 process claim the
-/// Esplora `broadcast` never runs.
+/// Broadcast helper for a client that was already stack-checked at connect.
 async fn broadcast_raw_tx(
-    client: &EsploraAsyncClient<DefaultSleeper>,
+    client: &LegacyBroadcastClient,
     tx: &Transaction,
     label: &str,
 ) -> Result<Txid, Box<dyn std::error::Error + Send + Sync>> {
-    crate::v11::ensure_legacy_publisher_allowed().map_err(|e| {
-        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            as Box<dyn std::error::Error + Send + Sync>
-    })?;
     client.broadcast(tx).await?;
     let txid = tx.compute_txid();
     println!("{label} transaction broadcast successfully: {txid}");
@@ -727,10 +779,9 @@ pub async fn broadcast_inscription_txs_with_persistence(
     reveal_tx: &Transaction,
     pool: Option<&PgPool>,
 ) -> Result<(Txid, Txid), Box<dyn std::error::Error + Send + Sync>> {
-    let builder = EsploraBuilder::new(&config.url);
-    let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
+    // Guard is inside `LegacyBroadcastClient::connect`.
+    let client = LegacyBroadcastClient::connect(&config.url)?;
 
-    // Guard lives inside `broadcast_raw_tx` — structural, not per-entry-point.
     let commit_txid = broadcast_raw_tx(&client, commit_tx, "Commit").await?;
     let commit_txid_bytes = *commit_txid.as_byte_array();
     advance_pending_status(
@@ -802,14 +853,11 @@ pub async fn resume_pending_inscriptions(
     pool: &PgPool,
     config: &EsploraConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Cutover Stage 2: every legacy publish entry point — including boot
-    // recovery — must refuse under a v1.1 stack claim. Without this guard a
-    // v1.1-claimed database that still holds an old/injected pending row
-    // would broadcast a bincode Commitment through Esplora.
-    crate::v11::ensure_legacy_publisher_allowed().map_err(|e| {
-        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            as Box<dyn std::error::Error + Send + Sync>
-    })?;
+    // Guard is structural: `LegacyBroadcastClient::connect` (used by every
+    // resume broadcast) refuses under a v1.1 process claim. Fail the whole
+    // resume early when the process claim forbids legacy publish, so we do
+    // not load rows only to fail per-row on connect.
+    let _client_check = LegacyBroadcastClient::connect(&config.url)?;
 
     let rows = db::load_pending_in_progress(pool).await?;
     if rows.is_empty() {
@@ -849,8 +897,8 @@ async fn resume_single_row(
     let reveal_tx: Transaction = bitcoin::consensus::deserialize(&row.reveal_tx)
         .map_err(|e| format!("deserialize reveal_tx: {}", e))?;
 
-    let builder = EsploraBuilder::new(&config.url);
-    let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
+    // Connect is the choke point — no raw EsploraAsyncClient on this path.
+    let client = LegacyBroadcastClient::connect(&config.url)?;
 
     let commit_txid = commit_tx.compute_txid();
 
@@ -869,7 +917,7 @@ async fn resume_single_row(
                     )
                     .await?;
                 }
-                Err(e) if is_inputs_missingorspent_error(&e) => {
+                Err(e) if is_inputs_missingorspent_error(e.as_ref()) => {
                     // The commit already landed on a previous attempt.
                     // Advance and fall through to the reveal step.
                     println!(
@@ -883,7 +931,7 @@ async fn resume_single_row(
                     )
                     .await?;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
             broadcast_reveal_and_complete(pool, &client, &row.commit_txid, &reveal_tx).await?;
         }
@@ -904,13 +952,13 @@ async fn resume_single_row(
             // attempt. Treat that as success.
             match client.broadcast(&reveal_tx).await {
                 Ok(()) => {}
-                Err(e) if is_inputs_missingorspent_error(&e) => {
+                Err(e) if is_inputs_missingorspent_error(e.as_ref()) => {
                     println!(
                         "resume: reveal for {} already on chain (txn-already-known)",
                         commit_txid
                     );
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
             // Phase E: leave the row at `reveal_broadcast`. The scanner
             // will observe the commit on chain, see the non-`complete`
@@ -946,20 +994,20 @@ async fn resume_single_row(
 /// lets the scanner finish the integration.
 async fn broadcast_reveal_and_complete(
     pool: &PgPool,
-    client: &EsploraAsyncClient<DefaultSleeper>,
+    client: &LegacyBroadcastClient,
     commit_txid_bytes: &[u8],
     reveal_tx: &Transaction,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match client.broadcast(reveal_tx).await {
         Ok(()) => {}
-        Err(e) if is_inputs_missingorspent_error(&e) => {
+        Err(e) if is_inputs_missingorspent_error(e.as_ref()) => {
             // Reveal already on chain — proceed to advance the row.
             println!(
                 "resume: reveal {} already on chain (txn-already-known)",
                 reveal_tx.compute_txid()
             );
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e),
     }
     db::update_pending_status(pool, commit_txid_bytes, db::PENDING_STATUS_REVEAL_BROADCAST).await?;
     // Phase E: do not advance to `complete` here either. See the

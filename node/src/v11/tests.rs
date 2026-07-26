@@ -449,7 +449,9 @@ async fn tip_hash_survives_persist_reload() {
     adapter
         .with_engine_mut(|eng| eng.set_tip_height(42))
         .expect("with_engine_mut under v11 claim");
-    adapter.set_tip_hash(fork_a);
+    adapter
+        .set_tip_hash(fork_a)
+        .expect("set_tip_hash under v11 claim");
     adapter.persist().await.expect("persist fork A");
 
     let loaded = db_v11::load_engine_snapshot(&pool)
@@ -460,7 +462,9 @@ async fn tip_hash_survives_persist_reload() {
     assert_eq!(loaded.tip_hash, fork_a);
 
     // Same height, different hash — the whole point of storing tip_hash.
-    adapter.set_tip_hash(fork_b);
+    adapter
+        .set_tip_hash(fork_b)
+        .expect("set_tip_hash under v11 claim");
     adapter.persist().await.expect("persist fork B");
     adapter.reload_from_db().await.expect("reload");
     assert_eq!(adapter.tip_hash(), fork_b);
@@ -1157,6 +1161,199 @@ async fn with_engine_mut_refuses_without_v11_claim() {
         "got: {err:#}"
     );
     clear_process_stack_mode_for_test();
+}
+
+/// Defect 1 (round 4): a legacy write attempted while a v1.1 claim is
+/// mid-flight (emptiness observed, marker not yet committed) must not
+/// produce a mixed database. Writers require the marker inside their own
+/// transaction, so the interleaving cannot land SMT/MMR under a later v11
+/// claim.
+#[tokio::test]
+async fn legacy_write_between_emptiness_check_and_v11_claim_cannot_mix_db() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+
+    // Simulate the claim transaction after emptiness check, before marker
+    // insert: an open transaction that has counted both stacks as empty.
+    let mut claim_tx = pool.begin().await.expect("begin claim-like tx");
+    let (legacy_n,): (i64,) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM mmr_root_index) \
+           + (SELECT COUNT(*) FROM smt_state) \
+           + (SELECT COUNT(*) FROM mmr_state) \
+           + (SELECT COUNT(*) FROM latest_block)",
+    )
+    .fetch_one(&mut *claim_tx)
+    .await
+    .expect("count legacy");
+    let (v11_n,): (i64,) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM v11_engine_meta) \
+           + (SELECT COUNT(*) FROM v11_nflog_entries) \
+           + (SELECT COUNT(*) FROM v11_nullifier_index) \
+           + (SELECT COUNT(*) FROM v11_accounts) \
+           + (SELECT COUNT(*) FROM v11_spendable_coins) \
+           + (SELECT COUNT(*) FROM v11_spent_coins)",
+    )
+    .fetch_one(&mut *claim_tx)
+    .await
+    .expect("count v11");
+    assert_eq!(legacy_n, 0);
+    assert_eq!(v11_n, 0);
+
+    // Concurrent legacy writer (separate connection): must refuse — no
+    // matching stack_scan_mode marker yet.
+    let err = crate::db::persist_state_tx(&pool, b"smt-race", b"mmr-race", &[0xAAu8; 32], None)
+        .await
+        .expect_err("legacy write without marker must refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(STACK_CAPABILITY_REFUSAL) || msg.contains("marker is missing"),
+        "must refuse capability; got: {msg}"
+    );
+
+    // Claim completes as v11.
+    sqlx::query(
+        "INSERT INTO stack_scan_mode (id, mode, claimed_at) VALUES (1, 'v11', NOW()) \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .execute(&mut *claim_tx)
+    .await
+    .expect("insert marker");
+    claim_tx.commit().await.expect("commit claim");
+    set_process_stack_mode(ScanStackMode::V11);
+
+    // Marker is v11; another legacy write still refuses.
+    let err2 = crate::db::persist_state_tx(&pool, b"smt-late", b"mmr-late", &[0xBBu8; 32], None)
+        .await
+        .expect_err("legacy write under v11 marker must refuse");
+    assert!(
+        err2.to_string().contains(STACK_CAPABILITY_REFUSAL)
+            || err2.to_string().contains("claimed as"),
+        "got: {err2}"
+    );
+
+    // No mixed DB: no legacy scan rows; marker is v11.
+    let (legacy_after,): (i64,) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM mmr_root_index) \
+           + (SELECT COUNT(*) FROM smt_state) \
+           + (SELECT COUNT(*) FROM mmr_state) \
+           + (SELECT COUNT(*) FROM latest_block)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("recount legacy");
+    assert_eq!(legacy_after, 0, "legacy write must not have committed");
+    let marker = load_stack_scan_mode(&pool).await.expect("load marker");
+    assert_eq!(marker, Some(ScanStackMode::V11));
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 2 (round 4): the recover_inscription binary path obtains its
+/// client only via [`crate::publisher::LegacyBroadcastClient::connect`],
+/// which refuses under a v1.1 process claim before any Esplora I/O.
+#[test]
+fn recover_inscription_broadcast_client_refuses_under_v11_claim() {
+    clear_process_stack_mode_for_test();
+    set_process_stack_mode(ScanStackMode::V11);
+    let err = crate::publisher::LegacyBroadcastClient::connect("http://127.0.0.1:1/api")
+        .expect_err("recover path must refuse under v11");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(STACK_SEPARATION_REFUSAL) || msg.contains("v1.1"),
+        "got: {msg}"
+    );
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 3A (round 4): one-block reorg of the activation block has common
+/// ancestor `activation_height − 1` and must **replay** (ShallowReorg), not
+/// refuse solely because the ancestor is below activation.
+#[test]
+fn one_block_reorg_at_activation_boundary_replays() {
+    let activation = 100u64;
+    // Old tip = activation block; parent is activation − 1 (shared).
+    let mut old_chain = mock_chain((activation as usize) + 1, 0xAA);
+    let mut live_chain = mock_chain((activation as usize) + 1, 0xBB);
+    // Shared prefix through activation − 1.
+    for h in 0..activation as usize {
+        let shared = {
+            let mut hash = [0u8; 32];
+            hash[0] = 0x11;
+            hash[1] = (h & 0xff) as u8;
+            hash[2] = ((h >> 8) & 0xff) as u8;
+            hash
+        };
+        old_chain[h] = shared;
+        live_chain[h] = shared;
+    }
+    // Activation height diverges (one-block reorg of the activation block).
+    old_chain[activation as usize] = {
+        let mut h = [0u8; 32];
+        h[0] = 0xAA;
+        h[1] = 0xAC;
+        h
+    };
+    live_chain[activation as usize] = {
+        let mut h = [0u8; 32];
+        h[0] = 0xBB;
+        h[1] = 0xAC;
+        h
+    };
+    let old_tip = old_chain[activation as usize];
+    let recon = reconcile_persisted_tip(
+        activation,
+        old_tip,
+        activation,
+        |h| live_from_chain(&live_chain, h),
+        |hash| resolve_from_chain(&old_chain, hash),
+    )
+    .expect("activation-boundary one-block reorg must replay");
+    match recon {
+        PersistedTipReconciliation::ShallowReorg {
+            reorg_depth,
+            ancestor_height,
+            ..
+        } => {
+            assert_eq!(reorg_depth, 1);
+            assert_eq!(ancestor_height, activation - 1);
+        }
+        other => panic!("expected ShallowReorg at activation boundary, got {other:?}"),
+    }
+}
+
+/// Defect 3B (round 4): `live_hash_at` returning `None` means the RPC view
+/// is behind the queried height — not a reorg / divergence.
+#[test]
+fn rpc_view_behind_persisted_height_is_not_divergence() {
+    let chain = mock_chain(11, 0xAA); // tip height 10
+    let tip_hash = chain[10];
+    // RPC only knows up to height 8 (behind persisted tip 10).
+    let err = reconcile_persisted_tip(
+        10,
+        tip_hash,
+        0,
+        |h| {
+            if h > 8 {
+                Ok(None) // incomplete view
+            } else {
+                live_from_chain(&chain, h)
+            }
+        },
+        |hash| resolve_from_chain(&chain, hash),
+    )
+    .expect_err("behind RPC must not be classified as reorg");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("behind")
+            || msg.contains("incomplete")
+            || msg.contains("catches up")
+            || msg.contains("no block at"),
+        "must name incomplete/behind view; got: {msg}"
+    );
+    assert!(
+        !msg.contains("ShallowReorg") && !msg.contains("exceeds recoverable"),
+        "must not look like a depth/reorg fail-stop; got: {msg}"
+    );
 }
 
 /// §3.6: multi-member inscription folded in canonical

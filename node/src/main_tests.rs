@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::test_db::setup_pool;
+use crate::v11::{claim_stack_scan_mode, ScanStackMode};
 
 // --- build_network_config_from_env -------------------------------
 //
@@ -238,6 +239,11 @@ fn build_network_config_panics_on_whitespace_esplora_ws_url() {
 async fn persist_state_from_sync_context_works_from_sync_closure_on_multi_thread() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    // Production boot claims the stack before any scanner write; the
+    // helper under test only bridges sync→async persist.
+    claim_stack_scan_mode(&pool, ScanStackMode::Legacy)
+        .await
+        .expect("claim legacy for sync-context persist test");
 
     let smt = vec![0x11u8; 64];
     let mmr = vec![0x22u8; 128];

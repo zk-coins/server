@@ -24,6 +24,7 @@
 //! module's logic needs to cover.
 
 use super::*;
+use crate::v11::{claim_stack_scan_mode, ScanStackMode};
 use crate::account_node::CanaryOutcome;
 use crate::test_db::setup_pool;
 
@@ -164,6 +165,9 @@ async fn seed_proof_dependent_state(pool: &sqlx::PgPool) {
         .expect("seed account");
     let prev_root = zkcoins_program::hash::digest_from_bytes(&[0x10u8; 32]);
     let smt_root = zkcoins_program::hash::digest_from_bytes(&[0x20u8; 32]);
+    claim_stack_scan_mode(pool, ScanStackMode::Legacy)
+        .await
+        .expect("claim legacy for self_heal seed");
     db::persist_state_tx(
         pool,
         b"smt-blob",

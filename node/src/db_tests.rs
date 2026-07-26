@@ -14,7 +14,17 @@
 
 use super::*;
 use crate::test_db::setup_pool;
+use crate::v11::{claim_stack_scan_mode, ScanStackMode};
 use sqlx::Row;
+
+/// Claim the legacy stack marker so `persist_state_tx` / related writers
+/// pass the in-transaction capability check (boot does this via
+/// `enforce_stack_scan_mode` in production).
+async fn claim_legacy_stack(pool: &sqlx::PgPool) {
+    claim_stack_scan_mode(pool, ScanStackMode::Legacy)
+        .await
+        .expect("claim legacy stack for test");
+}
 
 #[tokio::test]
 async fn connect_and_migrate_creates_all_tables() {
@@ -151,6 +161,7 @@ async fn load_latest_block_returns_none_initially() {
 async fn persist_state_tx_writes_smt_mmr_block_atomically() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let smt = vec![0xAAu8; 64];
     let mmr = vec![0xBBu8; 128];
     let block = [0xCCu8; 32];
@@ -167,6 +178,7 @@ async fn persist_state_tx_writes_smt_mmr_block_atomically() {
 async fn persist_state_tx_is_idempotent_on_conflict() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let smt1 = vec![1u8; 16];
     let mmr1 = vec![2u8; 16];
     let block1 = [3u8; 32];
@@ -196,6 +208,7 @@ async fn persist_state_tx_writes_root_index_in_same_transaction() {
     // story. This test asserts all four landed from one call.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let smt = vec![0xAAu8; 64];
     let mmr = vec![0xBBu8; 128];
     let block = [0xCCu8; 32];
@@ -225,6 +238,7 @@ async fn persist_state_tx_root_index_on_conflict_does_nothing() {
     // would be silently mutated).
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let smt = vec![1u8; 16];
     let mmr = vec![2u8; 16];
     let block = [3u8; 32];
@@ -343,6 +357,7 @@ async fn store_circuit_digest_inserts_then_updates_on_conflict() {
 async fn reset_proof_dependent_state_tx_wipes_state_and_stores_digest() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
 
     // Seed every table the reset touches.
     upsert_account(&pool, &[9u8; 64], b"acct").await.unwrap();
@@ -698,6 +713,7 @@ async fn persist_state_and_mark_complete_tx_writes_state_and_advances_row() {
     // untouched (the scanner is the only legitimate writer).
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0x55u8; 32];
     seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
 
@@ -738,6 +754,7 @@ async fn persist_state_and_mark_complete_tx_preserves_existing_latest_block() {
     // for SMT/MMR/root_index/pending_inscriptions only.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let scanner_block = [0x77u8; 32];
     persist_state_tx(&pool, b"old-smt", b"old-mmr", &scanner_block, None)
         .await
@@ -772,6 +789,7 @@ async fn persist_state_and_mark_complete_tx_accepts_no_root_index() {
     // mmr_root_index table stays empty, no error, latest_block untouched.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0x88u8; 32];
     seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
 
@@ -814,6 +832,7 @@ async fn persist_state_and_mark_complete_tx_rollback_on_failure_leaves_state_unt
     // SMT/MMR back.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0x99u8; 32];
     seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
 
@@ -884,6 +903,7 @@ async fn persist_state_and_mark_complete_tx_idempotent_on_already_complete_row()
     // error caused the caller to retry.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0xAAu8; 32];
     seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
 

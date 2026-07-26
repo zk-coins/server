@@ -125,11 +125,17 @@ impl EngineAdapter {
 
     /// Update the tip block hash (height remains on the engine via
     /// `set_tip_height`). Together they form the reorg-detectable cursor.
-    pub fn set_tip_hash(&self, tip_hash: [u8; 32]) {
+    ///
+    /// Requires an exclusive v1.1 process claim — same capability as
+    /// NfLog mutation so a legacy / unset process cannot move the cursor.
+    pub fn set_tip_hash(&self, tip_hash: [u8; 32]) -> Result<()> {
+        require_v11_process_for_nflog_write()
+            .context("EngineAdapter::set_tip_hash: stack claim required")?;
         self.live
             .lock()
             .expect("EngineAdapter mutex poisoned")
             .tip_hash = tip_hash;
+        Ok(())
     }
 
     pub fn bridge(&self) -> ProverBridge {
@@ -172,7 +178,13 @@ impl EngineAdapter {
     }
 
     /// Replace the live engine from a previously taken [`Self::snapshot_live`].
+    ///
+    /// Requires an exclusive v1.1 process claim. Rollback after a failed
+    /// fold is still a live-engine mutation and must not run under a
+    /// legacy / unset process.
     pub fn restore_live(&self, snap: EngineSnapshot) -> Result<()> {
+        require_v11_process_for_nflog_write()
+            .context("EngineAdapter::restore_live: stack claim required")?;
         if snap.network != self.network {
             bail!(
                 "EngineAdapter::restore_live: network pin mismatch ({} vs {})",
@@ -211,7 +223,11 @@ impl EngineAdapter {
     /// Drop the in-memory engine and rebuild it from Postgres.
     ///
     /// Used by restart-identity tests and by a future reorg/self-heal path.
+    /// Requires an exclusive v1.1 process claim — reloading replaces the
+    /// live engine the same way a fold does.
     pub async fn reload_from_db(&self) -> Result<()> {
+        require_v11_process_for_nflog_write()
+            .context("EngineAdapter::reload_from_db: stack claim required")?;
         let snap = db_v11::load_engine_snapshot(&self.pool)
             .await
             .context("EngineAdapter::reload_from_db load")?
