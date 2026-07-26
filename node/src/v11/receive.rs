@@ -55,10 +55,13 @@
 //!
 //! The snapshot→mutate→persist→restore window holds
 //! [`EngineAdapter::lock_writes`] so a concurrent scanner restore cannot
-//! discard a receive that already committed (and vice versa). **Proving is
-//! outside the gate** (pure witness→proof). Apply re-validates the pending
-//! envelope against the live engine, so a concurrent scan fold during prove
-//! fails loud on collision rather than corrupting state.
+//! discard a receive that already committed (and vice versa). **Proving
+//! holds neither the write gate nor the live-engine mutex** (the pending
+//! witness carries everything the prover needs). Apply re-validates every
+//! live dependency the prove-time decision read (account, tip/`size_final`,
+//! receiver NAV canonicity, creating anchors, CoinHist, own-Pk absence) so
+//! a concurrent scan fold during prove fails loud on collision rather than
+//! committing against a moved world.
 //!
 //! ## Clause 10 is unskippable
 //!
@@ -330,11 +333,14 @@ pub fn verify_and_begin_receive(
 /// broadcast.
 ///
 /// Ordering (crash-consistent; see module docs):
-/// 1. **Prove outside the write gate** (multi-minute; pure witness→proof).
+/// 1. **Prove holding neither write gate nor engine mutex** (multi-minute;
+///    pending witness is self-contained).
 /// 2. Acquire [`EngineAdapter::lock_writes`] (serialises vs scanner restore).
-/// 3. Apply account (NfLog untouched); re-validates envelope after prove.
+/// 3. Apply account (NfLog untouched); full live re-validation after prove.
 /// 4. **Atomic** engine persist + `v11_pending_publishes` `members_ready`.
 /// 5. Release write gate; construct/broadcast outside the gate.
+/// 6. Outcome is decided from **this** transition (applied account +
+///    successful publish), never from a global NfLog size anyone can move.
 ///
 /// The own nullifier enters the canonical NfLog only when the scanner folds
 /// the confirmed on-chain survivor at its real §3.6 position.
@@ -348,22 +354,44 @@ pub async fn finalise_publish_persist(
     require_v11_process_for_nflog_write()
         .context("v1.1 receive finalise: exclusive stack claim required")?;
 
-    let owner = pending.owner;
-    let nflog_size_before = adapter.with_engine(|engine| engine.nflog().nav().size);
-
-    // 1. Prove outside the write gate — does not mutate the engine.
+    // 1. Prove with neither write_gate nor live-engine mutex.
     // Concurrent scanner folds during this multi-minute window are fine:
-    // apply re-validates the pending envelope against the live engine.
-    let proved_pending = adapter
-        .with_engine(|engine| engine.prove_pending_transition(pending, signature.clone()))
-        .context(
-            "v1.1 receive: prove_pending_transition failed — state unchanged, nothing persisted",
-        )?;
+    // apply re-validates every live dependency before commit.
+    let bridge = adapter.bridge();
+    let proved_pending = StateEngine::prove_pending_transition_detached(
+        &bridge,
+        pending,
+        signature.clone(),
+    )
+    .context(
+        "v1.1 receive: prove_pending_transition failed — state unchanged, nothing persisted",
+    )?;
+
+    commit_proved_receive(adapter, proved_pending, signature, publisher, build_tip).await
+}
+
+/// State-critical section after unlocked prove: write-gate → revalidate/apply
+/// → atomic persist → publish. Split out so tests can inject a concurrent
+/// scanner append between prove and apply without a multi-minute circuit.
+pub async fn commit_proved_receive(
+    adapter: &EngineAdapter,
+    proved_pending: zkcoins_prover::state_engine::ProvedPendingTransition,
+    signature: TransitionSignature,
+    publisher: &impl NullifierBatchPublisher,
+    build_tip: BlockAnchor,
+) -> Result<V11ReceiveOutcome> {
+    require_v11_process_for_nflog_write()
+        .context("v1.1 receive commit: exclusive stack claim required")?;
+
+    let owner = proved_pending.pending().owner;
 
     // 2. Write gate covers only snapshot→mutate→persist→restore.
     let applied = {
         let _write_gate = adapter.lock_writes().await;
         let pre = adapter.snapshot_live();
+        // Measure NfLog size *inside* the gate, immediately before apply —
+        // never against a pre-prove snapshot a concurrent scan can move.
+        let nflog_size_pre_apply = adapter.with_engine(|engine| engine.nflog().nav().size);
         let applied = match adapter.with_engine_mut(|engine| {
             engine.apply_proved_transition(proved_pending)
         })? {
@@ -382,9 +410,9 @@ pub async fn finalise_publish_persist(
         let post_apply_ok = (|| -> Result<()> {
             let nflog_size_after_apply = adapter.with_engine(|engine| engine.nflog().nav().size);
             ensure!(
-                nflog_size_after_apply == nflog_size_before,
+                nflog_size_after_apply == nflog_size_pre_apply,
                 "v1.1 receive BUG: apply_proved_transition mutated the canonical NfLog \
-                 (size {nflog_size_before} → {nflog_size_after_apply}); refusing to publish a \
+                 (size {nflog_size_pre_apply} → {nflog_size_after_apply}); refusing to publish a \
                  locally invented accumulator state"
             );
             adapter.with_engine(|engine| {
@@ -472,13 +500,9 @@ pub async fn finalise_publish_persist(
              NfLog unchanged until scanner sees the on-chain nullifier",
         )?;
 
-    let nflog_size_after_publish = adapter.with_engine(|engine| engine.nflog().nav().size);
-    ensure!(
-        nflog_size_after_publish == nflog_size_before,
-        "v1.1 receive BUG: NfLog size changed during publish \
-         ({nflog_size_before} → {nflog_size_after_publish})"
-    );
-
+    // Outcome is what *this* transition did: account credited + nullifier
+    // published. A concurrent scanner append after broadcast must not flip
+    // success into failure via a global NfLog size comparison.
     Ok(V11ReceiveOutcome {
         nullifier: applied.nullifier,
         owner,
@@ -1216,6 +1240,9 @@ mod tests {
         broadcast_err: Mutex<Option<String>>,
         commit_calls: Mutex<u32>,
         reveal_calls: Mutex<u32>,
+        /// Optional side-effect on successful `broadcast_commit` (e.g. concurrent
+        /// scanner append after this receive's broadcast).
+        on_commit: Mutex<Option<Box<dyn Fn() + Send>>>,
     }
 
     impl RecordingPublisher {
@@ -1225,11 +1252,17 @@ mod tests {
                 broadcast_err: Mutex::new(None),
                 commit_calls: Mutex::new(0),
                 reveal_calls: Mutex::new(0),
+                on_commit: Mutex::new(None),
             }
         }
         fn with_broadcast_err(err: &str) -> Self {
             let p = Self::new();
             *p.broadcast_err.lock().expect("lock") = Some(err.to_string());
+            p
+        }
+        fn with_on_commit(on_commit: impl Fn() + Send + 'static) -> Self {
+            let p = Self::new();
+            *p.on_commit.lock().expect("lock") = Some(Box::new(on_commit));
             p
         }
         fn published_members(&self) -> Vec<BatchMember> {
@@ -1329,6 +1362,9 @@ mod tests {
             *self.commit_calls.lock().expect("lock") += 1;
             if let Some(err) = self.broadcast_err.lock().expect("lock").as_ref() {
                 bail!("{err}");
+            }
+            if let Some(hook) = self.on_commit.lock().expect("lock").as_ref() {
+                hook();
             }
             Ok(prepared.commit_txid())
         }
@@ -2473,6 +2509,677 @@ mod tests {
             .expect("mirror entry");
         assert_eq!(p.height, 42, "chain height, not local tip 100");
         assert_eq!(p.tx_index, 7, "chain tx_index, not local fold_seq");
+
+        clear_process_stack_mode_for_test();
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent scan races + production-path e2e helpers
+    // -----------------------------------------------------------------------
+
+    /// Hollow proved envelope: apply re-validates live state but does not
+    /// Plonky2-verify. Lets race tests inject scanner work between prove and
+    /// apply without a multi-minute circuit build.
+    fn hollow_proved_pending(
+        pending: PendingTransition,
+        signature: TransitionSignature,
+    ) -> Result<zkcoins_prover::state_engine::ProvedPendingTransition> {
+        let proved = zkcoins_prover::prover_bridge::ProvedTransition {
+            proof: hollow_compliance_proof_with_pis(&pending.proof_data, signature.pk_i),
+            proof_data: pending.proof_data.clone(),
+            consumed_pubkey: signature.pk_i,
+            network_id: host::network_id_regtest(),
+        };
+        zkcoins_prover::state_engine::ProvedPendingTransition::from_parts(
+            pending, proved, signature,
+        )
+    }
+
+    fn placeholder_rx_signature(pk_i: [u8; 32]) -> TransitionSignature {
+        let r = xonly_from_label(b"v11-rx/race/recv-r");
+        let mut signature = [0u8; 64];
+        signature[..32].copy_from_slice(&r);
+        signature[32..].copy_from_slice(&[0xCD; 32]);
+        TransitionSignature {
+            pk_i,
+            signature,
+            r_prime: xonly_from_label(b"v11-rx/race/recv-rp"),
+        }
+    }
+
+    /// Seed adapter with one creating nullifier + a host-valid InitialProof
+    /// receive pending for `owner`.
+    async fn seeded_receive_pending(
+        adapter: &crate::v11::EngineAdapter,
+    ) -> Result<(PendingTransition, TransitionSignature, Address, [u8; 32])> {
+        let nk: [u8; 32] = Sha256::digest(b"v11-rx/race/nk").into();
+        let current_pubkey = xonly_from_label(b"v11-rx/race/sk0");
+        let next_pubkey = xonly_from_label(b"v11-rx/race/sk1");
+        let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
+
+        // Fold creating nullifier with the R that slot_host_valid_from_folded will sign.
+        let tag = 1u8;
+        let (sk, pk_pt, create_pk) =
+            zkcoins_prover::prover_bridge::test_signing::normalized_key(
+                zkcoins_prover::prover_bridge::test_signing::deterministic_secret(&[
+                    b'K', tag, b's', b'k',
+                ]),
+            );
+        let creating_prev_ash = digest_label(&[b'p', tag]);
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &create_pk, &[tag; 32], 2, 1);
+        let amount = 10u128 + u128::from(tag);
+        let coin_id = host::coin_identifier(creating_prev_ash, &owner.0, asset_id, amount, 0);
+        let ocr = host::merkle_root(TreeKind::CoinsRoot, &[coin_id]);
+        let empty_nav = Nav {
+            size: 0,
+            mth: host::nflog_empty(),
+        };
+        let nav_rand = [tag; 32];
+        let pd = ProofData {
+            new_account_state_hash: digest_label(&[b'a', tag]),
+            output_coins_root: ocr,
+            input_nullifiers_root: host::merkle_root(TreeKind::NullifiersRoot, &[]),
+            coin_history_root: host::coinhist_empty_root(),
+            nav_commitment: host::nav_commitment(empty_nav.root(), &nav_rand),
+            npk_commit: [tag; 32],
+        };
+        let create_sig = zkcoins_prover::prover_bridge::test_signing::sign_transition(
+            sk,
+            pk_pt,
+            &pd,
+            Network::Regtest,
+        );
+        let create_r = create_sig.transition.signature_r();
+        let _ = (sk, pk_pt, create_sig);
+
+        adapter
+            .with_engine_mut(|engine| {
+                engine
+                    .append_nullifier(scanned(20, 0, create_pk, create_r))
+                    .expect("fold creating");
+                engine.set_tip_height(40);
+            })
+            .expect("seed creating nf");
+
+        let slot = adapter
+            .with_engine(|engine| slot_host_valid_from_folded(engine, owner, tag))
+            .expect("host-valid slot");
+        let pending = adapter.with_engine(|engine| {
+            verify_and_begin_receive(
+                engine,
+                V11ReceiveRequest {
+                    owner,
+                    nk,
+                    current_pubkey,
+                    slots: vec![slot],
+                    next_pubkey,
+                    nav_rand: [0x41; 32],
+                    npk_rand: [0x42; 32],
+                },
+            )
+        })?;
+        let signature = placeholder_rx_signature(current_pubkey);
+        Ok((pending, signature, owner, current_pubkey))
+    }
+
+    /// Concurrent scanner append lands **during** the prove window (after
+    /// unlocked prove material is ready, before write-gate apply). Receive
+    /// must still commit: re-validation admits a still-canonical receiver
+    /// NAV as a prefix when size_final only grows / unrelated entries append.
+    #[tokio::test]
+    async fn concurrent_scanner_append_during_prove_still_commits() {
+        use crate::test_db::setup_pool;
+        use crate::v11::db_v11;
+        use crate::v11::separation::claim_stack_scan_mode;
+        use crate::v11::EngineAdapter;
+        use std::sync::Arc;
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim");
+        let adapter = Arc::new(
+            EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+                .await
+                .expect("adapter"),
+        );
+
+        let (pending, signature, owner, current_pubkey) = seeded_receive_pending(&adapter)
+            .await
+            .expect("seed pending");
+        let nflog_size_at_prove = adapter.with_engine(|e| e.nflog().nav().size);
+        assert_eq!(nflog_size_at_prove, 1, "only creating nullifier");
+
+        // Unlocked prove material (hollow — production uses detached real prove).
+        let proved = hollow_proved_pending(pending, signature.clone()).expect("hollow prove");
+
+        // Simulate concurrent scanner append during the prove window:
+        // unrelated nullifier folded while receive holds neither lock.
+        let concurrent_pk = xonly_from_label(b"v11-rx/race/concurrent-pk");
+        let concurrent_r = xonly_from_label(b"v11-rx/race/concurrent-r");
+        adapter
+            .with_engine_mut(|engine| {
+                engine
+                    .append_nullifier(scanned(21, 0, concurrent_pk, concurrent_r))
+                    .expect("concurrent append during prove");
+            })
+            .expect("mutate");
+        let size_after_concurrent = adapter.with_engine(|e| e.nflog().nav().size);
+        assert_eq!(
+            size_after_concurrent, nflog_size_at_prove + 1,
+            "scanner moved the global NfLog during prove"
+        );
+
+        let publisher = RecordingPublisher::new();
+        let build_tip = BlockAnchor {
+            block_hash: [0xBB; 32],
+            height: 40,
+        };
+        let outcome = commit_proved_receive(
+            &adapter,
+            proved,
+            signature,
+            &publisher,
+            build_tip,
+        )
+        .await
+        .expect("receive must commit despite concurrent append during prove");
+
+        assert_eq!(outcome.owner, owner);
+        assert_eq!(outcome.nullifier.0, current_pubkey);
+        assert_eq!(outcome.new_send_counter, 1);
+        assert!(!outcome.admitted_coin_ids.is_empty());
+        // Construct path uses try_prepare + broadcast, not publish_batch.
+        assert_eq!(*publisher.commit_calls.lock().expect("lock"), 1);
+        assert_eq!(*publisher.reveal_calls.lock().expect("lock"), 1);
+        assert_eq!(outcome.published.member_count, 1);
+
+        // Our apply did not invent an NfLog entry; concurrent entry remains.
+        adapter.with_engine(|engine| {
+            assert_eq!(engine.nflog().nav().size, size_after_concurrent);
+            assert!(matches!(
+                engine.nflog().lookup(current_pubkey),
+                LookupResult::Absent
+            ));
+            assert!(matches!(
+                engine.nflog().lookup(concurrent_pk),
+                LookupResult::Present { .. }
+            ));
+            let rec = engine.account(&owner).expect("credited");
+            assert!(rec.last_nullifier.is_some());
+            assert!(rec.last_nullifier_pos.is_none());
+        });
+
+        let pending_row = db_v11::load_pending_publish(&pool, current_pubkey)
+            .await
+            .expect("load")
+            .expect("durable intent");
+        assert_eq!(
+            pending_row.status,
+            db_v11::PENDING_PUBLISH_REVEAL_BROADCAST
+        );
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Concurrent scanner append lands **after** a successful broadcast.
+    /// Outcome must remain success — decided from this transition's apply +
+    /// publish, not from a global NfLog counter anyone can move.
+    #[tokio::test]
+    async fn concurrent_append_after_broadcast_still_reported_success() {
+        use crate::test_db::setup_pool;
+        use crate::v11::separation::claim_stack_scan_mode;
+        use crate::v11::EngineAdapter;
+        use std::sync::Arc;
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim");
+        let adapter = Arc::new(
+            EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+                .await
+                .expect("adapter"),
+        );
+
+        let (pending, signature, owner, current_pubkey) = seeded_receive_pending(&adapter)
+            .await
+            .expect("seed pending");
+        let proved = hollow_proved_pending(pending, signature.clone()).expect("hollow prove");
+
+        let concurrent_pk = xonly_from_label(b"v11-rx/race/post-bc-pk");
+        let concurrent_r = xonly_from_label(b"v11-rx/race/post-bc-r");
+        let adapter_hook = Arc::clone(&adapter);
+        let publisher = RecordingPublisher::with_on_commit(move || {
+            adapter_hook
+                .with_engine_mut(|engine| {
+                    engine
+                        .append_nullifier(scanned(22, 0, concurrent_pk, concurrent_r))
+                        .expect("append after broadcast");
+                })
+                .expect("concurrent post-broadcast append");
+        });
+        let build_tip = BlockAnchor {
+            block_hash: [0xCC; 32],
+            height: 40,
+        };
+
+        let outcome = commit_proved_receive(
+            &adapter,
+            proved,
+            signature,
+            &publisher,
+            build_tip,
+        )
+        .await
+        .expect(
+            "successful broadcast must not be reported as failure when an unrelated \
+             scanner append moves the global NfLog afterwards",
+        );
+
+        assert_eq!(outcome.owner, owner);
+        assert_eq!(outcome.nullifier.0, current_pubkey);
+        assert_eq!(*publisher.commit_calls.lock().expect("lock"), 1);
+        // Concurrent append actually landed after broadcast.
+        adapter.with_engine(|engine| {
+            assert!(
+                matches!(
+                    engine.nflog().lookup(concurrent_pk),
+                    LookupResult::Present { .. }
+                ),
+                "post-broadcast concurrent append must be visible"
+            );
+            // Receive still credited.
+            assert!(engine.account(&owner).is_some());
+        });
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Production entry: [`verify_and_begin_receive`] → hollow prove stand-in
+    /// → [`commit_proved_receive`] (apply + atomic persist + publisher) →
+    /// boot reload. Real Plonky2 prove is covered by the ignored engine e2e;
+    /// this test covers the node orchestration surface without bitcoind.
+    ///
+    /// **Stopping point:** `RecordingPublisher` fakes construct/broadcast —
+    /// no live bitcoind / chain inclusion. Scanner fold of the own nullifier
+    /// is a separate step (asserted Absent here).
+    #[tokio::test]
+    async fn production_path_receive_begin_finalise_publish_persist_reload() {
+        use crate::test_db::setup_pool;
+        use crate::v11::db_v11;
+        use crate::v11::separation::claim_stack_scan_mode;
+        use crate::v11::EngineAdapter;
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim");
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("adapter");
+
+        let (pending, signature, owner, current_pubkey) = seeded_receive_pending(&adapter)
+            .await
+            .expect("verify_and_begin_receive path");
+        // Entry was verify_and_begin_receive (inside helper).
+        assert_eq!(pending.owner, owner);
+        assert_eq!(
+            pending.mode,
+            zkcoins_prover::prover_bridge::TransitionMode::InitialProof
+        );
+
+        let proved = hollow_proved_pending(pending, signature.clone()).expect("prove stand-in");
+        let publisher = RecordingPublisher::new();
+        let build_tip = BlockAnchor {
+            block_hash: [0xDD; 32],
+            height: 40,
+        };
+        let outcome = commit_proved_receive(&adapter, proved, signature, &publisher, build_tip)
+            .await
+            .expect("commit + persist + publish");
+
+        assert_eq!(outcome.nullifier.0, current_pubkey);
+        assert_eq!(outcome.new_send_counter, 1);
+        assert_eq!(*publisher.commit_calls.lock().expect("lock"), 1);
+        assert_eq!(*publisher.reveal_calls.lock().expect("lock"), 1);
+        assert_eq!(outcome.published.member_count, 1);
+
+        // Durable intent + engine snapshot survive reload.
+        let reloaded = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("reload");
+        reloaded.with_engine(|engine| {
+            let rec = engine.account(&owner).expect("account persisted");
+            assert_eq!(rec.state.send_counter, 1);
+            assert!(rec.last_nullifier.is_some());
+            assert!(rec.last_nullifier_pos.is_none());
+            assert!(matches!(
+                engine.nflog().lookup(current_pubkey),
+                LookupResult::Absent
+            ));
+        });
+        let row = db_v11::load_pending_publish(&pool, current_pubkey)
+            .await
+            .expect("load")
+            .expect("pending publish row");
+        assert_eq!(row.status, db_v11::PENDING_PUBLISH_REVEAL_BROADCAST);
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Heavy production path with a **genuine** Plonky2 prove, entered through
+    /// [`verify_and_begin_receive`] and [`finalise_publish_persist`].
+    ///
+    /// **Stopping point:** `RecordingPublisher` substitutes for bitcoind —
+    /// construct/broadcast are faked; chain inclusion / scanner fold are not
+    /// exercised here (engine e2e covers scan-fold of the own nullifier).
+    #[tokio::test]
+    #[ignore = "heavy: real Plonky2 prove for mint+send+receive (minutes); run with --ignored --release"]
+    async fn production_path_receive_with_genuine_prove_via_verify_and_begin() {
+        use crate::test_db::setup_pool;
+        use crate::v11::db_v11;
+        use crate::v11::separation::claim_stack_scan_mode;
+        use crate::v11::EngineAdapter;
+        use zkcoins_prover::prover_bridge::test_signing::{
+            deterministic_secret, normalized_key, sign_transition,
+        };
+        use zkcoins_prover::prover_bridge::{OutputInclusionProof, TransitionMode};
+        use zkcoins_prover::state_engine::{MintRequest, ScannedNullifier, SendRequest};
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim");
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Testnet, 0)
+            .await
+            .expect("adapter");
+
+        let alice_nk: [u8; 32] =
+            Sha256::digest(b"zkCoins/v1/state-engine/receive-e2e/alice-nk").into();
+        let (alice_secret0, alice_public0, alice_pk0) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/receive-e2e/alice-sk0",
+        ));
+        let (_, _, alice_pk1) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/receive-e2e/alice-sk1",
+        ));
+        let alice_owner = Address(host::address(&alice_pk0, host::nk_commit(&alice_nk)));
+
+        let mint_pending = adapter
+            .with_engine(|engine| {
+                engine.begin_mint(MintRequest {
+                    owner: alice_owner,
+                    nk: alice_nk,
+                    current_pubkey: alice_pk0,
+                    next_pubkey: alice_pk1,
+                    name: b"G3 production e2e asset".to_vec(),
+                    decimals: 2,
+                    amount: 100,
+                    issuance_version: 1,
+                    cap_total: 0,
+                    terms_salt: [0u8; 32],
+                    nav_rand: [0x21; 32],
+                    npk_rand: [0x22; 32],
+                })
+            })
+            .expect("begin_mint");
+        let mint_asset = mint_pending
+            .witness_wip
+            .output_coins
+            .first()
+            .expect("mint output")
+            .asset_id;
+        let mint_sig = sign_transition(
+            alice_secret0,
+            alice_public0,
+            &mint_pending.proof_data,
+            Network::Testnet,
+        );
+        adapter
+            .with_engine_mut(|engine| {
+                engine
+                    .finalise(mint_pending, mint_sig.transition.clone())
+                    .expect("finalise mint");
+                let nf = engine
+                    .account(&alice_owner)
+                    .expect("alice")
+                    .last_nullifier
+                    .clone()
+                    .expect("mint nf");
+                engine
+                    .append_nullifier(ScannedNullifier::from_survivor(
+                        &shared::spec_v1::PublishedNullifier {
+                            chain_pos: host::ChainPosition {
+                                height: 100,
+                                tx_index: 0,
+                                vin_index: 0,
+                                member_index: 0,
+                            },
+                            pk: nf.public_key,
+                            r: nf.signature_r,
+                        },
+                    ))
+                    .expect("fold mint");
+                engine.set_tip_height(110);
+            })
+            .expect("mint apply");
+
+        let (alice_secret1, alice_public1, alice_pk1_check) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/receive-e2e/alice-sk1",
+        ));
+        assert_eq!(alice_pk1_check, alice_pk1);
+        let (_, _, alice_pk2) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/receive-e2e/alice-sk2",
+        ));
+
+        let bob_nk: [u8; 32] =
+            Sha256::digest(b"zkCoins/v1/state-engine/receive-e2e/bob-nk").into();
+        let (bob_secret0, bob_public0, bob_pk0) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/receive-e2e/bob-sk0",
+        ));
+        let (_, _, bob_pk1) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/receive-e2e/bob-sk1",
+        ));
+        let bob_owner = Address(host::address(&bob_pk0, host::nk_commit(&bob_nk)));
+
+        let coin_identifier = adapter.with_engine(|engine| {
+            engine
+                .account(&alice_owner)
+                .expect("alice")
+                .spendable
+                .values()
+                .next()
+                .expect("minted coin")
+                .coin
+                .identifier
+        });
+
+        let pending_send = adapter
+            .with_engine(|engine| {
+                engine.begin_send(SendRequest {
+                    owner: alice_owner,
+                    input_coin_ids: vec![coin_identifier],
+                    output_templates: vec![host::CoinTemplate {
+                        recipient: bob_owner,
+                        amount: 30,
+                        asset_id: mint_asset,
+                    }],
+                    next_pubkey: alice_pk2,
+                    nav_rand: [0x3cu8; 32],
+                    npk_rand: [0xa5u8; 32],
+                })
+            })
+            .expect("begin_send");
+        let bob_coin = pending_send
+            .witness_wip
+            .output_coins
+            .iter()
+            .find(|c| c.recipient == bob_owner)
+            .cloned()
+            .expect("Bob coin");
+        let bob_coin_index = pending_send
+            .witness_wip
+            .output_coins
+            .iter()
+            .position(|c| c.recipient == bob_owner)
+            .expect("idx") as u32;
+        let send_creating_prev_ash =
+            host::account_state_hash(&pending_send.witness_wip.prev_account_state).unwrap();
+        let send_nav_opening = pending_send.nav_opening;
+        let send_sig = sign_transition(
+            alice_secret1,
+            alice_public1,
+            &pending_send.proof_data,
+            Network::Testnet,
+        );
+        let applied_send = adapter
+            .with_engine_mut(|engine| {
+                engine
+                    .finalise(pending_send, send_sig.transition.clone())
+                    .expect("finalise send")
+            })
+            .expect("send");
+
+        let send_pos = adapter
+            .with_engine_mut(|engine| {
+                let pos = engine
+                    .append_nullifier(ScannedNullifier::from_survivor(
+                        &shared::spec_v1::PublishedNullifier {
+                            chain_pos: host::ChainPosition {
+                                height: 110,
+                                tx_index: 1,
+                                vin_index: 0,
+                                member_index: 0,
+                            },
+                            pk: applied_send.nullifier.0,
+                            r: applied_send.nullifier.1,
+                        },
+                    ))
+                    .expect("fold send");
+                engine.set_tip_height(120);
+                pos
+            })
+            .expect("fold");
+
+        let (alice_change_id, nflog_entries) = adapter.with_engine(|engine| {
+            let change = engine
+                .account(&alice_owner)
+                .expect("alice")
+                .spendable
+                .values()
+                .next()
+                .expect("change")
+                .coin
+                .identifier;
+            let entries: Vec<NfLogEntry> =
+                engine.nflog_mirror().iter().map(|(_, e)| *e).collect();
+            (change, entries)
+        });
+        let all_output_ids = vec![bob_coin.identifier, alice_change_id];
+        let sibling = host::leaf_hash(TreeKind::CoinsRoot, all_output_ids[1]);
+        let output_inclusion = OutputInclusionProof {
+            leaf_index: bob_coin_index,
+            depth: 1,
+            siblings: vec![sibling],
+        };
+        let creating_nav_inclusion =
+            host::inclusion_path(send_pos, &nflog_entries).expect("inclusion");
+        let creating_nav_consistency =
+            host::consistency_proof(send_nav_opening.nav.size, &nflog_entries)
+                .expect("consistency");
+
+        let slot = ReceivedCoinSlot {
+            coin: bob_coin,
+            creating_proof: applied_send.proved.proof.clone(),
+            output_inclusion,
+            creating_prev_ash: send_creating_prev_ash,
+            creating_nullifier: NullifierOpening {
+                public_key: applied_send.nullifier.0,
+                signature_r: applied_send.nullifier.1,
+                r_prime: send_sig.transition.r_prime,
+            },
+            creating_nav_inclusion,
+            pos_create: send_pos,
+            creating_nav_opening: send_nav_opening,
+            creating_nav_consistency,
+        };
+        let pending_rx = adapter
+            .with_engine(|engine| {
+                verify_and_begin_receive(
+                    engine,
+                    V11ReceiveRequest {
+                        owner: bob_owner,
+                        nk: bob_nk,
+                        current_pubkey: bob_pk0,
+                        slots: vec![slot],
+                        next_pubkey: bob_pk1,
+                        nav_rand: [0x41u8; 32],
+                        npk_rand: [0x42u8; 32],
+                    },
+                )
+            })
+            .expect("verify_and_begin_receive");
+        assert_eq!(pending_rx.mode, TransitionMode::InitialProof);
+
+        let bob_sig = sign_transition(
+            bob_secret0,
+            bob_public0,
+            &pending_rx.proof_data,
+            Network::Testnet,
+        );
+        let publisher = RecordingPublisher::new();
+        let build_tip = BlockAnchor {
+            block_hash: [0xEE; 32],
+            height: 120,
+        };
+        let outcome = finalise_publish_persist(
+            &adapter,
+            pending_rx,
+            bob_sig.transition,
+            &publisher,
+            build_tip,
+        )
+        .await
+        .expect("finalise_publish_persist with genuine prove");
+
+        assert_eq!(outcome.nullifier.0, bob_pk0);
+        assert_eq!(outcome.new_send_counter, 1);
+        assert_eq!(outcome.admitted_coin_ids.len(), 1);
+        adapter.with_engine(|engine| {
+            let bob = engine.account(&bob_owner).expect("Bob");
+            assert_eq!(
+                bob.state
+                    .balances
+                    .get(&host::digest_to_bytes(&mint_asset)),
+                Some(&30)
+            );
+            assert!(bob.last_nullifier_pos.is_none());
+            assert!(matches!(
+                engine.nflog().lookup(bob_pk0),
+                LookupResult::Absent
+            ));
+        });
+        let row = db_v11::load_pending_publish(&pool, bob_pk0)
+            .await
+            .expect("load")
+            .expect("pending");
+        assert_eq!(row.status, db_v11::PENDING_PUBLISH_REVEAL_BROADCAST);
 
         clear_process_stack_mode_for_test();
     }
