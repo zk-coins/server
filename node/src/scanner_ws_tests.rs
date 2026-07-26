@@ -440,14 +440,20 @@ async fn run_scanner_ws_pongs_keep_connection_alive_past_liveness_timeout() {
 /// `liveness_timeout` and the scanner MUST reconnect. Asserts the
 /// brief's "no pong + no event in 90 s = connection genuinely dead"
 /// semantic.
+///
+/// Pass condition is order-based (second TCP accept observed), not a
+/// fixed wall-clock sleep: under load a 1.5 s sleep-then-assert raced
+/// the reconnect sequence and flaked even when the watchdog was right.
 #[tokio::test]
 async fn run_scanner_ws_watchdog_fires_when_pongs_are_dropped() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("ws://{}", addr);
 
-    let connection_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let cc_for_server = std::sync::Arc::clone(&connection_count);
+    // Each accept notifies the test. The pass criterion is "two
+    // accepts happened" (initial + post-watchdog reconnect), not
+    // "enough wall time elapsed".
+    let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel::<()>();
 
     tokio::spawn(async move {
         // Accept connections in a loop and hand each off to a
@@ -455,10 +461,12 @@ async fn run_scanner_ws_watchdog_fires_when_pongs_are_dropped() {
         // accepts can run while earlier connections are still being
         // held open. The scanner reconnects after the watchdog, so
         // the listener must keep accepting beyond the first
-        // connection for the test to observe count ≥ 2.
+        // connection for the test to observe the second accept.
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            cc_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Notify before the per-connection task so a slow WS
+            // upgrade cannot hide an accept from the waiter.
+            let _ = accepted_tx.send(());
             tokio::spawn(async move {
                 let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
                 // Read exactly the subscribe frame so the handshake
@@ -488,18 +496,23 @@ async fn run_scanner_ws_watchdog_fires_when_pongs_are_dropped() {
     };
     let handle = tokio::spawn(run_scanner_ws(config, tx));
 
-    // Allow the watchdog to fire at least once and the scanner to
-    // open a fresh connection. 1.5 s is enough for several watchdog
-    // windows back to back.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-
-    let observed = connection_count.load(std::sync::atomic::Ordering::SeqCst);
-    assert!(
-        observed >= 2,
-        "expected ≥ 2 connections (watchdog must fire when pongs are dropped); \
-         saw {} connections",
-        observed,
-    );
+    // Wait for the initial connection, then the post-watchdog
+    // reconnect. Hang-detector only: if either accept never arrives
+    // the watchdog/reconnect path is broken, not "too slow".
+    for which in ["first (initial)", "second (post-watchdog reconnect)"] {
+        match tokio::time::timeout(Duration::from_secs(5), accepted_rx.recv()).await {
+            Ok(Some(())) => {}
+            Ok(None) => panic!(
+                "accept-notify channel closed before {which} connection; \
+                 server accept loop died"
+            ),
+            Err(_) => panic!(
+                "timed out waiting for {which} connection — watchdog must fire \
+                 when pongs are dropped and the scanner must reconnect \
+                 (liveness_timeout=300ms; hang-detector=5s)"
+            ),
+        }
+    }
 
     // No block frames ever flowed, so the scanner channel must be
     // empty — keepalive doesn't conjure tips out of dropped pongs.
@@ -535,8 +548,10 @@ async fn run_scanner_ws_reconnects_when_ping_send_errors() {
     let addr = listener.local_addr().unwrap();
     let url = format!("ws://{}", addr);
 
-    let connection_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let cc_for_server = std::sync::Arc::clone(&connection_count);
+    // Order-based: wait for the second accept (post-close reconnect).
+    // Hang-detector (5 s) is ≪ liveness_timeout (30 s) so a second
+    // accept inside the detector cannot be a watchdog firing.
+    let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel::<()>();
 
     tokio::spawn(async move {
         // Accept connections in a loop; per-connection handler drops
@@ -545,7 +560,7 @@ async fn run_scanner_ws_reconnects_when_ping_send_errors() {
         // can land cleanly.
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            cc_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = accepted_tx.send(());
             tokio::spawn(async move {
                 let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
                 // Wait for the subscribe frame so the handshake is
@@ -560,20 +575,18 @@ async fn run_scanner_ws_reconnects_when_ping_send_errors() {
                 // the same time. Either way the scanner exits the
                 // current session via a non-watchdog path and the
                 // outer reconnect loop opens a fresh TCP connection
-                // (which lands here, incrementing the counter).
+                // (which lands here, notifying the waiter).
                 drop(ws);
             });
         }
     });
 
     let (tx, mut rx) = mpsc::channel::<BlockHash>(8);
-    // Liveness watchdog is set to a value LARGER than the test budget
-    // below so that a count ≥ 2 within the budget cannot possibly be
-    // attributed to a watchdog firing — the reconnect MUST have come
-    // from the close-detection path (ping-send error or read error).
-    // Ping cadence is tight so the first ping tick fires within a few
-    // ms of the subscribe completing, giving the send-error path the
-    // best chance to be the path that actually drives the reconnect.
+    // Liveness watchdog is far larger than the hang-detector below so
+    // a second accept inside 5 s cannot be attributed to the watchdog
+    // — the reconnect MUST come from close-detection (ping-send error
+    // or read error). Tight ping cadence so the first tick fires soon
+    // after subscribe.
     let config = ScannerWsConfig {
         url,
         http_url: "http://127.0.0.1:1/api".to_string(),
@@ -584,20 +597,20 @@ async fn run_scanner_ws_reconnects_when_ping_send_errors() {
     };
     let handle = tokio::spawn(run_scanner_ws(config, tx));
 
-    // Budget for observing the reconnect. Must be ≫ ping_interval +
-    // reconnect_max but ≪ liveness_timeout, so any observed
-    // reconnect MUST be driven by the close-detection path, not the
-    // watchdog. 2 s comfortably satisfies both.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let observed = connection_count.load(std::sync::atomic::Ordering::SeqCst);
-    assert!(
-        observed >= 2,
-        "scanner must reconnect via the close-detection path \
-         (ping-send-error OR read-error) — observed only {} connections \
-         in the budget window, well inside the 30 s liveness watchdog",
-        observed,
-    );
+    for which in ["first (initial)", "second (close-detection reconnect)"] {
+        match tokio::time::timeout(Duration::from_secs(5), accepted_rx.recv()).await {
+            Ok(Some(())) => {}
+            Ok(None) => panic!(
+                "accept-notify channel closed before {which} connection; \
+                 server accept loop died"
+            ),
+            Err(_) => panic!(
+                "timed out waiting for {which} connection — scanner must reconnect \
+                 via close-detection (ping-send-error OR read-error) well inside \
+                 the 30 s liveness watchdog (hang-detector=5s)"
+            ),
+        }
+    }
 
     // The server never sent any block frames, only the implicit
     // subscribe-then-drop. The channel must therefore be empty —
@@ -612,9 +625,9 @@ async fn run_scanner_ws_reconnects_when_ping_send_errors() {
 
 /// Peer-stops-reading reconnect: covers the failure mode where the
 /// peer accepts the TCP socket and completes the WS upgrade but
-/// then stops reading entirely. The
-/// `tokio::time::timeout(liveness_timeout, out_tx.send(...))` wrap
-/// in `scanner_ws.rs` is in place to defuse the deadlock shape:
+/// then stops reading entirely. The production select keeps the
+/// liveness watchdog concurrent with a pending `out_tx.send(Ping)`
+/// so a wedged writer cannot mute the deadline:
 ///
 /// 1. Peer accepts and never reads again; OS-level TCP send window
 ///    on the scanner side fills up.
@@ -622,37 +635,23 @@ async fn run_scanner_ws_reconnects_when_ping_send_errors() {
 ///    waiting for the kernel to drain that buffer.
 /// 3. The 1-slot `out_tx` channel fills with the first un-flushed
 ///    ping (writer holds it, can't progress).
-/// 4. The next `ping_ticker.tick()` body calls
-///    `out_tx.send(...).await`, which now blocks (queue full).
-/// 5. WITHOUT the timeout wrap, this `.await` sits forever — the
-///    enclosing `select!` has already exited (the ping arm won),
-///    so the watchdog arm can't fire to break the deadlock.
-/// 6. WITH the timeout wrap, the wedge surfaces as a stream error
-///    inside `liveness_timeout`, the outer reconnect loop kicks
-///    in, and a fresh TCP connection lands at the server.
+/// 4. The next ping tick arms a concurrent `out_tx.send` select arm
+///    that stays pending (queue full).
+/// 5. Because send is a select arm (not a nested await), the
+///    watchdog arm still fires at `deadline` and reconnects.
 ///
 /// Setup: `SO_RCVBUF = 1 KiB` on each ACCEPTED socket (NOT on the
 /// listener — macOS does not propagate the listener-level recv
 /// buffer to accepted children). `socket2::SockRef` provides a
 /// safe wrapper around `setsockopt`, no unsafe block needed.
 ///
-/// Honesty note (reviewer round 3): isolating the wrap path from
-/// the watchdog path in this fixture is not achievable in a few-
-/// second budget on the m3-ultra CI runner pool (macOS). The macOS
-/// TCP loopback implementation buffers up to ~150 KiB on the
-/// sender side and dynamically drains/grows in ways that prevent
-/// the scanner's writer-task `flush()` from blocking reliably
-/// inside a 30 s window at any practical ping cadence. As a
-/// result, the path that drives the reconnect observed below is
-/// the liveness watchdog (`liveness_timeout = 300 ms` here), not
-/// the wrap. The wrap remains production-correct code — on links
-/// where the kernel actually wedges the writer (smaller buffers,
-/// non-loopback peer, paths with real RTT) the wrap is the path
-/// that fires — but a "wrap-only" isolation test would need a
-/// custom Sink fixture that sidesteps TCP, which is out of scope
-/// for this PR. The assertion pins the OBSERVABLE invariant
-/// (reconnect within the budget) rather than the specific path,
-/// matching the production guarantee.
+/// Honesty note: forcing the writer-wedge path (vs pure watchdog)
+/// on macOS loopback is unreliable — the kernel buffers enough that
+/// `flush` often never blocks in a short budget. The path observed
+/// below is therefore the liveness watchdog at 300 ms. The concurrent
+/// send arm is still the production guarantee for links that do
+/// wedge the writer. Pass condition is order-based (second accept),
+/// not a fixed wall-clock sleep.
 #[cfg(unix)]
 #[tokio::test]
 async fn run_scanner_ws_reconnects_when_writer_send_times_out() {
@@ -668,8 +667,7 @@ async fn run_scanner_ws_reconnects_when_writer_send_times_out() {
     let addr = listener.local_addr().unwrap();
     let url = format!("ws://{}", addr);
 
-    let connection_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let cc_for_server = std::sync::Arc::clone(&connection_count);
+    let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel::<()>();
 
     tokio::spawn(async move {
         // Per-connection handler: complete the WS handshake, read the
@@ -678,7 +676,7 @@ async fn run_scanner_ws_reconnects_when_writer_send_times_out() {
         // anything else.
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            cc_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = accepted_tx.send(());
             // Shrink the accepted socket's recv buffer BEFORE the WS
             // upgrade handshake completes, so the tiny window is in
             // effect for every byte the client sends after subscribe.
@@ -704,12 +702,10 @@ async fn run_scanner_ws_reconnects_when_writer_send_times_out() {
     });
 
     let (tx, mut rx) = mpsc::channel::<BlockHash>(8);
-    // `liveness_timeout = 300 ms`: the test's reconnect path (see the
-    // honesty note in the doc-comment above). `ping_interval = 50 ms`:
-    // fast enough that several ping ticks land inside one watchdog
-    // window so any "ping itself accidentally resets the deadline"
-    // regression would surface as a hung connection rather than a
-    // false positive.
+    // `liveness_timeout = 300 ms`: reconnect driver for this fixture
+    // (see honesty note). `ping_interval = 50 ms`: several ticks per
+    // window so a regression that reset the deadline on outbound
+    // activity would hang rather than false-pass.
     let config = ScannerWsConfig {
         url,
         http_url: "http://127.0.0.1:1/api".to_string(),
@@ -720,23 +716,20 @@ async fn run_scanner_ws_reconnects_when_writer_send_times_out() {
     };
     let handle = tokio::spawn(run_scanner_ws(config, tx));
 
-    // Budget: ≫ liveness_timeout + reconnect_max so at least one
-    // reconnect cycle is observable, ≪ any realistic CI flake budget.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    let observed = connection_count.load(std::sync::atomic::Ordering::SeqCst);
-    assert!(
-        observed >= 2,
-        "scanner must reconnect when the peer accepts the WS upgrade \
-         then stops reading entirely; observed only {} connections in \
-         the 3 s budget. On the m3-ultra CI runner pool (macOS) the \
-         path that drives this reconnect is the watchdog at \
-         liveness_timeout (300 ms); on links where the writer wedge \
-         actually develops, the timeout-wrap fires first. Both are \
-         production-correct reconnect drivers — the assertion only \
-         pins the observable invariant",
-        observed,
-    );
+    for which in ["first (initial)", "second (reconnect after peer stops reading)"] {
+        match tokio::time::timeout(Duration::from_secs(5), accepted_rx.recv()).await {
+            Ok(Some(())) => {}
+            Ok(None) => panic!(
+                "accept-notify channel closed before {which} connection; \
+                 server accept loop died"
+            ),
+            Err(_) => panic!(
+                "timed out waiting for {which} connection — scanner must reconnect \
+                 when the peer accepts the WS upgrade then stops reading \
+                 (liveness_timeout=300ms; hang-detector=5s)"
+            ),
+        }
+    }
 
     // No block frames were ever sent, so the channel must be empty.
     assert!(

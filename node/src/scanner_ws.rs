@@ -99,10 +99,10 @@ pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
 ///   us nothing the next live ping wouldn't.
 /// - No unbounded queue. If the peer accepts TCP but never reads
 ///   (a stalled writer), the producer's `out_tx.send(...).await`
-///   is the natural choke-point; combined with the
-///   `liveness_timeout`-bounded `tokio::time::timeout` wrapper
-///   around that send, a wedged writer becomes a reconnect rather
-///   than a deadlocked task.
+///   is the natural choke-point; that send is a concurrent `select!`
+///   arm alongside the liveness watchdog, so a wedged writer cannot
+///   mute the deadline and becomes a reconnect rather than a
+///   deadlocked task.
 const WRITER_QUEUE_CAPACITY: usize = 1;
 
 /// Compile-time assertion that the ping cadence leaves enough margin
@@ -427,6 +427,17 @@ async fn connect_and_drain(
     // the invariant we want.
     let mut deadline = tokio::time::Instant::now() + config.liveness_timeout;
 
+    // When true, the select below holds an `out_tx.send(Ping)` future
+    // as a concurrent arm rather than awaiting it inside the tick arm.
+    // That keeps the liveness watchdog polled while a send is blocked
+    // on a full writer queue (wedged flush / peer not reading). A nested
+    // `timeout(...).await` inside the tick arm used to suppress the
+    // watchdog for up to a full `liveness_timeout` per blocked send —
+    // under load that delayed reconnect past wall-clock test budgets
+    // and, in production with 30 s pings / 90 s liveness, stretched the
+    // half-open detection window toward ~2× liveness.
+    let mut ping_send_pending = false;
+
     loop {
         tokio::select! {
             biased;
@@ -434,7 +445,8 @@ async fn connect_and_drain(
             // Liveness watchdog. Fires only if no inbound frame has
             // arrived for `liveness_timeout`. A live peer answers our
             // pings, so this should only fire on a genuinely dead
-            // socket.
+            // socket. Always concurrent with the ping-send arm below
+            // so a blocked `out_tx.send` cannot mute it.
             _ = tokio::time::sleep_until(deadline) => { // scanner-polling-ok: liveness watchdog deadline, not a chain-tip poll
                 return Err(WsError::Stream(format!(
                     "no frame in {:?} (liveness watchdog)",
@@ -442,45 +454,42 @@ async fn connect_and_drain(
                 )));
             }
 
-            // Outbound ping. RFC 6455 §5.5 requires the peer to reply
-            // with a Pong carrying the same payload; that Pong arrives
-            // on `stream.next()` and resets the deadline.
+            // Outbound ping send. Armed only after a ticker tick sets
+            // `ping_send_pending`. RFC 6455 §5.5 requires the peer to
+            // reply with a Pong; that Pong arrives on `stream.next()`
+            // and resets the deadline.
             //
             // Cancel-safety: `tokio::sync::mpsc::Sender::send().await`
-            // is documented as cancel-safe, so if the read arm wins
-            // this race the half-completed send-future can be dropped
-            // without corrupting the channel or the underlying sink.
-            // The actual wire-level write happens inside the dedicated
-            // writer task above, never inside this `select!`. A send
-            // error here means the writer task has exited (e.g. the
-            // peer closed mid-write) — surface as a stream error so
+            // is documented as cancel-safe, so if the read or watchdog
+            // arm wins this race the half-completed send-future can be
+            // dropped without corrupting the channel or the underlying
+            // sink. The actual wire-level write happens inside the
+            // dedicated writer task above, never inside this `select!`.
+            // A send error here means the writer task has exited (e.g.
+            // the peer closed mid-write) — surface as a stream error so
             // the reconnect loop kicks in.
             //
-            // Backpressure-deadlock guard: if the peer accepts TCP but
-            // never reads, the writer task wedges in `sink.flush()`
-            // forever. The 1-slot `out_tx` then fills with the first
-            // unflushed ping, and a subsequent `out_tx.send(...).await`
-            // would block this arm indefinitely — preventing the
-            // `select!` from advancing to the watchdog arm too. We wrap
-            // the send in `tokio::time::timeout(liveness_timeout, ...)`
-            // so a wedged writer surfaces as a reconnect-triggering
-            // error within the same upper bound the watchdog uses for
-            // "this connection is dead", keeping the two failure modes
-            // semantically aligned.
-            _ = ping_ticker.tick() => {
-                let send_fut = out_tx.send(WsMessage::Ping(PING_PAYLOAD.to_vec()));
-                match tokio::time::timeout(config.liveness_timeout, send_fut).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        return Err(WsError::Stream(format!("ping send failed: {}", e)));
-                    }
-                    Err(_) => {
-                        return Err(WsError::Stream(format!(
-                            "ping send stalled for {:?} (writer wedged, peer not reading)",
-                            config.liveness_timeout
-                        )));
-                    }
+            // Backpressure / wedged writer: if the peer accepts TCP but
+            // never reads, the writer wedges in `sink.flush()`, the
+            // 1-slot `out_tx` fills, and this send stays pending. Because
+            // it is a select arm (not a nested await), the watchdog arm
+            // above still fires at `deadline` and reconnects — the same
+            // upper bound the half-open detector always promised. No
+            // separate send-timeout is required.
+            result = out_tx.send(WsMessage::Ping(PING_PAYLOAD.to_vec())), if ping_send_pending => {
+                ping_send_pending = false;
+                if let Err(e) = result {
+                    return Err(WsError::Stream(format!("ping send failed: {}", e)));
                 }
+            }
+
+            // Ticker only arms a send; the send itself is the arm above
+            // so it never holds the select exclusively. `if !pending`
+            // prevents stacking a second ping while one is still waiting
+            // on the 1-slot writer queue (latest-ping-wins is pointless
+            // for keepalive; one outstanding ping is enough).
+            _ = ping_ticker.tick(), if !ping_send_pending => {
+                ping_send_pending = true;
             }
 
             // Inbound frame. Any frame — Text, Binary, Ping, Pong,
