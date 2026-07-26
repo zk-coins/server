@@ -5,18 +5,9 @@ edition.workspace = true
 description = "Guarded Esplora HTTP wrappers — sole workspace owner of the esplora-client dependency"
 publish = false
 
-[features]
-default = []
-# Enables [`LegacyBroadcastWitness::issue`]. Only the `node` package enables
-# this feature; it is the sole workspace issuer after the process claim check.
-issue-legacy-broadcast-witness = []
-
 [dependencies]
 bitcoin = { workspace = true }
 esplora-client = { git = "https://github.com/BitVM/rust-esplora-client", branch = "master" }
-
-[dev-dependencies]
-# Compile-fail evidence that `EsploraBroadcastClient::connect` requires a
-# witness (no un-witnessed constructor). Runs against this crate without
-# `issue-legacy-broadcast-witness`, i.e. from a non-`node` consumer.
-trybuild = "1.0"
+# Process-stack policy runs inside the broadcast-client constructor so every
+# construction — including from `node` itself — executes the same check.
+stack-policy = { path = "../stack-policy" }
