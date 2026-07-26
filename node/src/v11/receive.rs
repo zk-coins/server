@@ -33,14 +33,18 @@
 //! `v11_pending_publishes` (migration 0021). Status machine:
 //! `members_ready → constructed → commit_broadcast → reveal_broadcast`.
 //!
+//! Engine snapshot and `members_ready` land in **one transaction**, so the
+//! previously unrecoverable "account advanced, no `s`" window no longer exists.
+//!
 //! | Window | Durable belief | Chain | Recovery |
 //! |--------|----------------|-------|----------|
-//! | During prove/apply (pre-persist) | pre-receive | none | clean retry |
-//! | After engine persist + `members_ready` | account + `s` + BatchMember; no txs | none | re-construct txs, continue |
+//! | During prove (pre-apply) | pre-receive | none | clean retry |
+//! | After in-memory apply, before atomic persist | memory only | none | clean retry (DB unchanged) |
+//! | After atomic engine + `members_ready` | account + `s` + BatchMember; no txs | none | re-construct txs, continue |
 //! | After `constructed` (txs persisted) | full pair; nothing broadcast | none | broadcast commit then reveal |
-//! | After `commit_broadcast` | full pair; commit accepted | commit present | broadcast reveal only |
-//! | After `reveal_broadcast` | full pair; both legs sent | nullifier pending inclusion | scanner folds NfLog |
-//! | Publish fails after `members_ready` | durable pending remains | maybe partial | **no** memory restore; resume from status |
+//! | After `commit_broadcast` | full pair; commit accepted | commit present | broadcast reveal only (idempotent) |
+//! | After `reveal_broadcast` | full pair; both legs sent | nullifier pending inclusion | boot resumer rebroadcasts pair idempotently if evicted; scanner folds NfLog |
+//! | Publish fails after atomic persist | durable pending remains | maybe partial | **no** memory restore; resume from status |
 //!
 //! Never restore the pre-receive snapshot after a successful engine persist
 //! that accompanies a publish intent: Bitcoin cannot be rolled back, and
@@ -51,7 +55,10 @@
 //!
 //! The snapshot→mutate→persist→restore window holds
 //! [`EngineAdapter::lock_writes`] so a concurrent scanner restore cannot
-//! discard a receive that already committed (and vice versa).
+//! discard a receive that already committed (and vice versa). **Proving is
+//! outside the gate** (pure witness→proof). Apply re-validates the pending
+//! envelope against the live engine, so a concurrent scan fold during prove
+//! fails loud on collision rather than corrupting state.
 //!
 //! ## Clause 10 is unskippable
 //!
@@ -323,12 +330,11 @@ pub fn verify_and_begin_receive(
 /// broadcast.
 ///
 /// Ordering (crash-consistent; see module docs):
-/// 1. Acquire [`EngineAdapter::lock_writes`] (serialises vs scanner restore).
-/// 2. `finalise_pending_chain_nullifier` — prove + apply account; **NfLog
-///    untouched** (own nullifier is pending, not accumulator state).
-/// 3. Engine `persist` + `v11_pending_publishes` `members_ready` (s + member).
-/// 4. Construct txs when possible → `constructed`; broadcast commit →
-///    `commit_broadcast`; broadcast reveal → `reveal_broadcast`.
+/// 1. **Prove outside the write gate** (multi-minute; pure witness→proof).
+/// 2. Acquire [`EngineAdapter::lock_writes`] (serialises vs scanner restore).
+/// 3. Apply account (NfLog untouched); re-validates envelope after prove.
+/// 4. **Atomic** engine persist + `v11_pending_publishes` `members_ready`.
+/// 5. Release write gate; construct/broadcast outside the gate.
 ///
 /// The own nullifier enters the canonical NfLog only when the scanner folds
 /// the confirmed on-chain survivor at its real §3.6 position.
@@ -343,45 +349,106 @@ pub async fn finalise_publish_persist(
         .context("v1.1 receive finalise: exclusive stack claim required")?;
 
     let owner = pending.owner;
-    // Serialise snapshot→mutate→persist→restore against the scanner.
-    let _write_gate = adapter.lock_writes().await;
-    let pre = adapter.snapshot_live();
     let nflog_size_before = adapter.with_engine(|engine| engine.nflog().nav().size);
 
-    // 1. Prove + apply account only — chain decides the log, not this process.
-    let applied = adapter
-        .with_engine_mut(|engine| {
-            engine.finalise_pending_chain_nullifier(pending, signature.clone())
-        })?
+    // 1. Prove outside the write gate — does not mutate the engine.
+    // Concurrent scanner folds during this multi-minute window are fine:
+    // apply re-validates the pending envelope against the live engine.
+    let proved_pending = adapter
+        .with_engine(|engine| engine.prove_pending_transition(pending, signature.clone()))
         .context(
-            "v1.1 receive: finalise_pending_chain_nullifier (prove + apply) failed — \
-             state unchanged",
+            "v1.1 receive: prove_pending_transition failed — state unchanged, nothing persisted",
         )?;
 
-    let nflog_size_after_apply = adapter.with_engine(|engine| engine.nflog().nav().size);
-    ensure!(
-        nflog_size_after_apply == nflog_size_before,
-        "v1.1 receive BUG: finalise_pending_chain_nullifier mutated the canonical NfLog \
-         (size {nflog_size_before} → {nflog_size_after_apply}); refusing to publish a \
-         locally invented accumulator state"
-    );
-    // Pending (not accumulator): last_nullifier_pos must be None until scan.
-    adapter.with_engine(|engine| {
-        let rec = engine
-            .account(&owner)
-            .context("v1.1 receive: account missing after apply")?;
-        ensure!(
-            rec.last_nullifier.is_some(),
-            "v1.1 receive: last_nullifier missing after apply"
-        );
-        ensure!(
-            rec.last_nullifier_pos.is_none(),
-            "v1.1 receive: last_nullifier_pos must stay None until scan-fold \
-             (got {:?})",
-            rec.last_nullifier_pos
-        );
-        Ok(())
-    })?;
+    // 2. Write gate covers only snapshot→mutate→persist→restore.
+    let applied = {
+        let _write_gate = adapter.lock_writes().await;
+        let pre = adapter.snapshot_live();
+        let applied = match adapter.with_engine_mut(|engine| {
+            engine.apply_proved_transition(proved_pending)
+        })? {
+            Ok(a) => a,
+            Err(err) => {
+                // Apply failed before the account insert; restore for safety.
+                let _ = adapter.restore_live(pre);
+                return Err(err).context(
+                    "v1.1 receive: apply_proved_transition failed — state restored",
+                );
+            }
+        };
+
+        // Post-apply invariant checks. Any failure restores the pre-apply
+        // snapshot so memory never stays advanced without a durable commit.
+        let post_apply_ok = (|| -> Result<()> {
+            let nflog_size_after_apply = adapter.with_engine(|engine| engine.nflog().nav().size);
+            ensure!(
+                nflog_size_after_apply == nflog_size_before,
+                "v1.1 receive BUG: apply_proved_transition mutated the canonical NfLog \
+                 (size {nflog_size_before} → {nflog_size_after_apply}); refusing to publish a \
+                 locally invented accumulator state"
+            );
+            adapter.with_engine(|engine| {
+                let rec = engine
+                    .account(&owner)
+                    .context("v1.1 receive: account missing after apply")?;
+                ensure!(
+                    rec.last_nullifier.is_some(),
+                    "v1.1 receive: last_nullifier missing after apply"
+                );
+                ensure!(
+                    rec.last_nullifier_pos.is_none(),
+                    "v1.1 receive: last_nullifier_pos must stay None until scan-fold \
+                     (got {:?})",
+                    rec.last_nullifier_pos
+                );
+                Ok(())
+            })
+        })();
+        if let Err(err) = post_apply_ok {
+            adapter
+                .restore_live(pre)
+                .context("v1.1 receive: restore after post-apply invariant failure")?;
+            return Err(err);
+        }
+
+        // 3. Atomic: engine snapshot + members_ready in one transaction.
+        // Closes the "account advanced, no s" unrecoverable window.
+        let member = match batch_member_from_applied(&applied, &signature, build_tip) {
+            Ok(m) => m,
+            Err(err) => {
+                adapter
+                    .restore_live(pre)
+                    .context("v1.1 receive: restore after batch member build failure")?;
+                return Err(err);
+            }
+        };
+        let snap = adapter.snapshot_live();
+        if let Err(err) = db_v11::persist_engine_with_pending_members_ready(
+            adapter.pool(),
+            &snap,
+            owner,
+            member.sig.pk,
+            member.sig.r,
+            member.sig.s,
+            signature.r_prime,
+            build_tip.height,
+            build_tip.block_hash,
+        )
+        .await
+        {
+            adapter
+                .restore_live(pre)
+                .context("v1.1 receive: restore engine after atomic persist failure")?;
+            return Err(err).context(
+                "v1.1 receive: atomic persist of engine + members_ready failed; \
+                 engine restored (no silent credit, nothing broadcast)",
+            );
+        }
+        // Intent is durable. Never restore_live after this point.
+        // Drop write gate before broadcast (liveness: scanner can proceed).
+        (applied, member)
+    };
+    let (applied, member) = applied;
 
     let admitted_coin_ids = adapter.with_engine(|engine| {
         engine
@@ -396,41 +463,7 @@ pub async fn finalise_publish_persist(
             .unwrap_or(0)
     });
 
-    // 2. Persist engine + rebroadcast intent (s + BatchMember) BEFORE any
-    // construct/broadcast. Crash here → durable pending, no chain.
-    if let Err(err) = adapter.persist().await {
-        adapter
-            .restore_live(pre)
-            .context("v1.1 receive: restore engine after pre-publish persist failure")?;
-        return Err(err).context(
-            "v1.1 receive: persist of pending receive failed before publish; \
-             engine restored (no silent credit, nothing broadcast)",
-        );
-    }
-
-    let member = batch_member_from_applied(&applied, &signature, build_tip)?;
-    if let Err(err) = db_v11::insert_pending_publish_members_ready(
-        adapter.pool(),
-        owner,
-        member.sig.pk,
-        member.sig.r,
-        member.sig.s,
-        signature.r_prime,
-        build_tip.height,
-        build_tip.block_hash,
-    )
-    .await
-    {
-        // Engine is durable; do not restore memory (would diverge from DB).
-        return Err(err).context(
-            "v1.1 receive: persist of rebroadcast intent (s + BatchMember) failed; \
-             account remains credited with last_nullifier_pos=None — operator must \
-             retry intent insert or abandon explicitly",
-        );
-    }
-    // Intent is durable. Never restore_live after this point.
-
-    // 3. Construct + broadcast with intermediate durability when possible.
+    // 4. Construct + broadcast outside the write gate.
     let published = durable_publish_nullifier(adapter, publisher, &member)
         .await
         .context(
@@ -439,7 +472,6 @@ pub async fn finalise_publish_persist(
              NfLog unchanged until scanner sees the on-chain nullifier",
         )?;
 
-    // Invariant: still no synthetic NfLog entry after publish.
     let nflog_size_after_publish = adapter.with_engine(|engine| engine.nflog().nav().size);
     ensure!(
         nflog_size_after_publish == nflog_size_before,
@@ -479,6 +511,66 @@ fn batch_member_from_applied(
     })
 }
 
+/// Classify a broadcast error as an **idempotent success** for rebroadcast.
+///
+/// Distinguishes specific Bitcoin Core / mempool "already done" signals from
+/// genuine failures. Generic errors are **not** treated as success.
+fn is_rebroadcast_already_done(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_lowercase();
+    // Bitcoin Core / bitcoind phrases observed on rebroadcast of a tx that
+    // already landed in mempool or chain. Keep the list explicit — never
+    // "any error ⇒ success".
+    const SIGNALS: &[&str] = &[
+        "txn-already-known",
+        "txn-already-in-mempool",
+        "already in mempool",
+        "already have",
+        "transaction already in block chain",
+        "txn-mempool-conflict",
+        "bad-txns-inputs-missingorspent",
+        "missing-inputs",
+        "already spent",
+    ];
+    SIGNALS.iter().any(|s| msg.contains(s))
+}
+
+/// Broadcast commit; treat "already known / already in mempool / already spent"
+/// as success and return the prepared commit txid.
+fn broadcast_commit_idempotent(
+    publisher: &impl NullifierBatchPublisher,
+    prepared: &PreparedBatch,
+) -> Result<bitcoin::Txid> {
+    match publisher.broadcast_commit(prepared) {
+        Ok(txid) => Ok(txid),
+        Err(err) if is_rebroadcast_already_done(&err) => {
+            let txid = prepared.commit_txid();
+            eprintln!(
+                "v11 publish: commit {txid} already known/mempool/spent — treating rebroadcast as success"
+            );
+            Ok(txid)
+        }
+        Err(err) => Err(err).context("broadcast commit (not an already-done signal)"),
+    }
+}
+
+/// Broadcast reveal with the same idempotent "already done" classification.
+fn broadcast_reveal_idempotent(
+    publisher: &impl NullifierBatchPublisher,
+    prepared: &PreparedBatch,
+) -> Result<bitcoin::Txid> {
+    match publisher.broadcast_reveal(prepared) {
+        Ok(txid) => Ok(txid),
+        Err(err) if is_rebroadcast_already_done(&err) => {
+            let txid = prepared.reveal_txid();
+            eprintln!(
+                "v11 publish: reveal {txid} already known/mempool/spent — treating rebroadcast as success"
+            );
+            Ok(txid)
+        }
+        Err(err) => Err(err).context("broadcast reveal (not an already-done signal)"),
+    }
+}
+
 /// Persist-aware publish: prefer prepare→persist-txs→commit→reveal when the
 /// publisher can construct; otherwise `publish_batch` after `members_ready`.
 async fn durable_publish_nullifier(
@@ -504,8 +596,7 @@ async fn durable_publish_nullifier(
             .await
             .context("persist constructed commit/reveal pair")?;
 
-            let commit_txid = publisher
-                .broadcast_commit(&prepared)
+            let commit_txid = broadcast_commit_idempotent(publisher, &prepared)
                 .context("broadcast commit after durable construct")?;
             db_v11::mark_pending_publish_status(
                 adapter.pool(),
@@ -516,7 +607,7 @@ async fn durable_publish_nullifier(
             .await
             .context("mark commit_broadcast")?;
 
-            let reveal_txid = publisher.broadcast_reveal(&prepared).with_context(|| {
+            let reveal_txid = broadcast_reveal_idempotent(publisher, &prepared).with_context(|| {
                 format!(
                     "broadcast reveal failed; commit already on chain as {commit_txid}; \
                      durable pair remains at commit_broadcast for resume"
@@ -546,8 +637,6 @@ async fn durable_publish_nullifier(
             let published = publisher
                 .publish_batch(&members)
                 .context("publish_batch after members_ready")?;
-            // Treat as fully broadcast from the durable-intent point of view.
-            // (No constructed row; resume re-publishes via members alone.)
             db_v11::mark_pending_publish_status(
                 adapter.pool(),
                 member.sig.pk,
@@ -564,8 +653,53 @@ async fn durable_publish_nullifier(
     }
 }
 
+fn prepared_batch_from_pending_row(
+    row: &db_v11::PendingPublishRow,
+    member: &BatchMember,
+) -> Result<PreparedBatch> {
+    let commit_tx_bytes = row
+        .commit_tx
+        .as_ref()
+        .context("resume: row missing commit_tx")?;
+    let reveal_tx_bytes = row
+        .reveal_tx
+        .as_ref()
+        .context("resume: row missing reveal_tx")?;
+    let signed_commit: Transaction =
+        deserialize(commit_tx_bytes).context("resume: deserialize commit_tx")?;
+    let reveal_tx: Transaction =
+        deserialize(reveal_tx_bytes).context("resume: deserialize reveal_tx")?;
+    let commit_output = signed_commit
+        .output
+        .first()
+        .cloned()
+        .context("resume: commit has no outputs")?;
+    Ok(PreparedBatch {
+        aggregate: zkcoins_prover::half_agg::AggregateStateNullifierV3 {
+            version: 3,
+            format: 0x01,
+            block_anchor: member.build_tip,
+            members: vec![(member.sig.pk, member.sig.r)],
+            raw_s: None,
+            s_agg: Some(member.sig.s),
+        },
+        payload: Vec::new(),
+        signed_commit,
+        reveal_tx,
+        commit_output,
+        block_anchor: member.build_tip,
+        commit_vsize: 0,
+        reveal_vsize: 0,
+        commit_fee: bitcoin::Amount::from_sat(0),
+        reveal_fee: bitcoin::Amount::from_sat(0),
+    })
+}
+
 /// Resume a durable pending publish after crash. Reconstructs from
 /// `v11_pending_publishes` and finishes or fails loud — never invents txs.
+///
+/// Rebroadcast is **idempotent**: chain replies that the tx is already known,
+/// already in the mempool, or already spent are success signals, not errors.
 pub async fn resume_pending_publish(
     adapter: &EngineAdapter,
     publisher: &impl NullifierBatchPublisher,
@@ -590,108 +724,71 @@ pub async fn resume_pending_publish(
     };
     match row.status.as_str() {
         "members_ready" => {
-            // Re-construct and continue from the live path.
             let published = durable_publish_nullifier(adapter, publisher, &member).await?;
             Ok(Some(published))
         }
-        "constructed" | "commit_broadcast" => {
-            let commit_tx_bytes = row
-                .commit_tx
-                .as_ref()
-                .context("resume: constructed row missing commit_tx")?;
-            let reveal_tx_bytes = row
-                .reveal_tx
-                .as_ref()
-                .context("resume: constructed row missing reveal_tx")?;
-            let signed_commit: Transaction = deserialize(commit_tx_bytes)
-                .context("resume: deserialize commit_tx")?;
-            let reveal_tx: Transaction = deserialize(reveal_tx_bytes)
-                .context("resume: deserialize reveal_tx")?;
-            // Rebuild a PreparedBatch shell for the publisher broadcast APIs.
-            // Aggregate/payload are not required for sendrawtransaction; fill
-            // minimal placeholders that broadcast_commit/reveal ignore except
-            // for the real Publisher path which re-checks the anchor via
-            // prepared.block_anchor.
-            let commit_output = signed_commit
-                .output
-                .first()
-                .cloned()
-                .context("resume: commit has no outputs")?;
-            let prepared = PreparedBatch {
-                aggregate: zkcoins_prover::half_agg::AggregateStateNullifierV3 {
-                    version: 3,
-                    format: 0x01,
-                    block_anchor: member.build_tip,
-                    members: vec![(member.sig.pk, member.sig.r)],
-                    raw_s: None,
-                    s_agg: Some(member.sig.s),
-                },
-                payload: Vec::new(),
-                signed_commit,
-                reveal_tx,
-                commit_output,
-                block_anchor: member.build_tip,
-                commit_vsize: 0,
-                reveal_vsize: 0,
-                commit_fee: bitcoin::Amount::from_sat(0),
-                reveal_fee: bitcoin::Amount::from_sat(0),
-            };
-
-            if row.status == "constructed" {
-                let commit_txid = publisher.broadcast_commit(&prepared)?;
-                db_v11::mark_pending_publish_status(
-                    adapter.pool(),
-                    pk,
-                    PENDING_PUBLISH_CONSTRUCTED,
-                    PENDING_PUBLISH_COMMIT_BROADCAST,
-                )
-                .await?;
-                let reveal_txid = publisher.broadcast_reveal(&prepared).with_context(|| {
-                    format!(
-                        "resume reveal failed; commit {commit_txid} already broadcast"
-                    )
-                })?;
-                db_v11::mark_pending_publish_status(
-                    adapter.pool(),
-                    pk,
-                    PENDING_PUBLISH_COMMIT_BROADCAST,
-                    PENDING_PUBLISH_REVEAL_BROADCAST,
-                )
-                .await?;
-                Ok(Some(PublishedBatch {
-                    aggregate: prepared.aggregate,
-                    payload: prepared.payload,
-                    commit_txid,
-                    reveal_txid,
-                    commit_output: prepared.commit_output,
-                    block_anchor: prepared.block_anchor,
-                }))
-            } else {
-                // commit_broadcast: reveal only.
-                let commit_txid = prepared.commit_txid();
-                let reveal_txid = publisher.broadcast_reveal(&prepared).with_context(|| {
-                    format!(
-                        "resume reveal-only failed; commit was {commit_txid}"
-                    )
-                })?;
-                db_v11::mark_pending_publish_status(
-                    adapter.pool(),
-                    pk,
-                    PENDING_PUBLISH_COMMIT_BROADCAST,
-                    PENDING_PUBLISH_REVEAL_BROADCAST,
-                )
-                .await?;
-                Ok(Some(PublishedBatch {
-                    aggregate: prepared.aggregate,
-                    payload: prepared.payload,
-                    commit_txid,
-                    reveal_txid,
-                    commit_output: prepared.commit_output,
-                    block_anchor: prepared.block_anchor,
-                }))
-            }
+        "constructed" => {
+            let prepared = prepared_batch_from_pending_row(&row, &member)?;
+            let commit_txid = broadcast_commit_idempotent(publisher, &prepared)?;
+            db_v11::mark_pending_publish_status(
+                adapter.pool(),
+                pk,
+                PENDING_PUBLISH_CONSTRUCTED,
+                PENDING_PUBLISH_COMMIT_BROADCAST,
+            )
+            .await?;
+            let reveal_txid = broadcast_reveal_idempotent(publisher, &prepared).with_context(|| {
+                format!("resume reveal failed; commit {commit_txid} already broadcast")
+            })?;
+            db_v11::mark_pending_publish_status(
+                adapter.pool(),
+                pk,
+                PENDING_PUBLISH_COMMIT_BROADCAST,
+                PENDING_PUBLISH_REVEAL_BROADCAST,
+            )
+            .await?;
+            Ok(Some(PublishedBatch {
+                aggregate: prepared.aggregate,
+                payload: prepared.payload,
+                commit_txid,
+                reveal_txid,
+                commit_output: prepared.commit_output,
+                block_anchor: prepared.block_anchor,
+            }))
         }
-        "reveal_broadcast" | "complete" => Ok(None),
+        "commit_broadcast" => {
+            let prepared = prepared_batch_from_pending_row(&row, &member)?;
+            let commit_txid = prepared.commit_txid();
+            let reveal_txid = broadcast_reveal_idempotent(publisher, &prepared).with_context(|| {
+                format!("resume reveal-only failed; commit was {commit_txid}")
+            })?;
+            db_v11::mark_pending_publish_status(
+                adapter.pool(),
+                pk,
+                PENDING_PUBLISH_COMMIT_BROADCAST,
+                PENDING_PUBLISH_REVEAL_BROADCAST,
+            )
+            .await?;
+            Ok(Some(PublishedBatch {
+                aggregate: prepared.aggregate,
+                payload: prepared.payload,
+                commit_txid,
+                reveal_txid,
+                commit_output: prepared.commit_output,
+                block_anchor: prepared.block_anchor,
+            }))
+        }
+        "reveal_broadcast" => {
+            // Pair retained: rebroadcast both legs idempotently so a mempool
+            // eviction before confirmation is recovered on boot.
+            if row.commit_tx.is_some() && row.reveal_tx.is_some() {
+                let prepared = prepared_batch_from_pending_row(&row, &member)?;
+                let _ = broadcast_commit_idempotent(publisher, &prepared)?;
+                let _ = broadcast_reveal_idempotent(publisher, &prepared)?;
+            }
+            Ok(None)
+        }
+        "complete" => Ok(None),
         "failed" => bail!(
             "resume_pending_publish: pk={} is marked failed; refusing silent retry",
             hex::encode(pk)
@@ -701,6 +798,36 @@ pub async fn resume_pending_publish(
             hex::encode(pk)
         ),
     }
+}
+
+/// Boot-time resumer: walk every non-terminal `v11_pending_publishes` row.
+///
+/// Called from the v1.1 scan-loop bootstrap so pending publishes are picked
+/// up automatically rather than only by hand. Per-row failures are returned
+/// (fail loud) — operators must not silently drop a half-broadcast nullifier.
+pub async fn resume_all_pending_publishes(
+    adapter: &EngineAdapter,
+    publisher: &impl NullifierBatchPublisher,
+) -> Result<usize> {
+    require_v11_process_for_nflog_write()
+        .context("resume_all_pending_publishes: exclusive stack claim required")?;
+    let rows = db_v11::list_resumable_pending_publishes(adapter.pool()).await?;
+    let mut completed = 0usize;
+    for row in rows {
+        resume_pending_publish(adapter, publisher, row.pk)
+            .await
+            .with_context(|| {
+                format!(
+                    "resume_all_pending_publishes: failed for pk={} status={}",
+                    hex::encode(row.pk),
+                    row.status
+                )
+            })?;
+        completed = completed
+            .checked_add(1)
+            .context("resume_all_pending_publishes: completed counter overflow")?;
+    }
+    Ok(completed)
 }
 
 /// Full production path: host clause-10 → begin → prove/apply (no NfLog) →
@@ -1074,7 +1201,6 @@ mod tests {
     use crate::v11::separation::{
         clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
     };
-    use bitcoin::hashes::Hash as _;
     use bitcoin::{Amount, ScriptBuf, TxOut, Txid};
     use sha2::{Digest, Sha256};
     use std::sync::Mutex;
@@ -1085,13 +1211,26 @@ mod tests {
 
     struct RecordingPublisher {
         batches: Mutex<Vec<Vec<BatchMember>>>,
+        /// When set, `broadcast_commit` / `broadcast_reveal` return this error
+        /// string (wrapped in anyhow) so idempotent rebroadcast can be tested.
+        broadcast_err: Mutex<Option<String>>,
+        commit_calls: Mutex<u32>,
+        reveal_calls: Mutex<u32>,
     }
 
     impl RecordingPublisher {
         fn new() -> Self {
             Self {
                 batches: Mutex::new(Vec::new()),
+                broadcast_err: Mutex::new(None),
+                commit_calls: Mutex::new(0),
+                reveal_calls: Mutex::new(0),
             }
+        }
+        fn with_broadcast_err(err: &str) -> Self {
+            let p = Self::new();
+            *p.broadcast_err.lock().expect("lock") = Some(err.to_string());
+            p
         }
         fn published_members(&self) -> Vec<BatchMember> {
             self.batches
@@ -1101,6 +1240,58 @@ mod tests {
                 .flatten()
                 .copied()
                 .collect()
+        }
+        fn dummy_prepared(member: &BatchMember) -> PreparedBatch {
+            // Distinct lock_time from pk/r so each member has unique txids
+            // (unique index on commit_txid in v11_pending_publishes).
+            let commit_lock = u32::from_le_bytes(member.sig.pk[0..4].try_into().unwrap());
+            let reveal_lock = u32::from_le_bytes(member.sig.r[0..4].try_into().unwrap());
+            let signed_commit = Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::from_consensus(commit_lock),
+                input: vec![],
+                output: vec![TxOut {
+                    value: Amount::from_sat(600),
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            };
+            let reveal_tx = Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::from_consensus(reveal_lock),
+                input: vec![],
+                output: vec![
+                    TxOut {
+                        value: Amount::from_sat(330),
+                        script_pubkey: ScriptBuf::new(),
+                    },
+                    TxOut {
+                        value: Amount::from_sat(600),
+                        script_pubkey: ScriptBuf::new(),
+                    },
+                ],
+            };
+            PreparedBatch {
+                aggregate: AggregateStateNullifierV3 {
+                    version: 3,
+                    format: 0x01,
+                    block_anchor: member.build_tip,
+                    members: vec![(member.sig.pk, member.sig.r)],
+                    raw_s: None,
+                    s_agg: Some(member.sig.s),
+                },
+                payload: vec![0x42],
+                signed_commit,
+                reveal_tx,
+                commit_output: TxOut {
+                    value: Amount::from_sat(600),
+                    script_pubkey: ScriptBuf::new(),
+                },
+                block_anchor: member.build_tip,
+                commit_vsize: 100,
+                reveal_vsize: 200,
+                commit_fee: Amount::from_sat(1000),
+                reveal_fee: Amount::from_sat(2000),
+            }
         }
     }
 
@@ -1128,6 +1319,27 @@ mod tests {
                 block_anchor: members[0].build_tip,
             })
         }
+
+        fn try_prepare(&self, members: &[BatchMember]) -> Result<Option<PreparedBatch>> {
+            ensure!(!members.is_empty(), "recording publisher: empty prepare");
+            Ok(Some(Self::dummy_prepared(&members[0])))
+        }
+
+        fn broadcast_commit(&self, prepared: &PreparedBatch) -> Result<bitcoin::Txid> {
+            *self.commit_calls.lock().expect("lock") += 1;
+            if let Some(err) = self.broadcast_err.lock().expect("lock").as_ref() {
+                bail!("{err}");
+            }
+            Ok(prepared.commit_txid())
+        }
+
+        fn broadcast_reveal(&self, prepared: &PreparedBatch) -> Result<bitcoin::Txid> {
+            *self.reveal_calls.lock().expect("lock") += 1;
+            if let Some(err) = self.broadcast_err.lock().expect("lock").as_ref() {
+                bail!("{err}");
+            }
+            Ok(prepared.reveal_txid())
+        }
     }
 
     fn digest_label(label: &[u8]) -> HashDigest {
@@ -1142,6 +1354,21 @@ mod tests {
             vin_index: 0,
             member_index: 0,
         }
+    }
+
+    fn scanned(
+        height: u64,
+        tx_index: u32,
+        pk: [u8; 32],
+        r: [u8; 32],
+    ) -> zkcoins_prover::state_engine::ScannedNullifier {
+        zkcoins_prover::state_engine::ScannedNullifier::from_survivor(
+            &shared::spec_v1::PublishedNullifier {
+                chain_pos: pos(height, tx_index),
+                pk,
+                r,
+            },
+        )
     }
 
     /// Two distinct valid x-only points (from real secrets). Used to build
@@ -1548,41 +1775,281 @@ mod tests {
         }
     }
 
-    /// Production-path receive through [`execute_v11_receive`] /
-    /// [`finalise_publish_persist`].
-    ///
-    /// ## Status: impossible as a real prove path in this worktree
-    ///
-    /// A receive that reaches `StateEngine::finalise` needs a **circuit-valid
-    /// creating compliance proof** (the bridge re-verifies each creating
-    /// proof in-circuit). Building that requires a prior mint (or mint+send)
-    /// Plonky2 prove plus the receive prove — multi-minute, multi-hop work
-    /// with a full Alice→Bob fixture, Postgres adapter seed, and wallet S2C
-    /// for Bob. Hollow PI shells pass host clause-10 but fail at prove.
-    ///
-    /// What *is* covered without faking that path:
-    /// - Engine invariant (public `finalise` never invents a synthetic NfLog
-    ///   position) — `public_finalise_api_is_deferred_only_*` and the ignored
-    ///   `state_engine_send_end_to_end` (mint/send success path).
-    /// - Host clause-10, multi-slot entry-point rejection, scan-order, deferred
-    ///   NfLog after publish — non-ignored tests in this module.
-    /// - Rebroadcast durability — `v11_pending_publishes` + `members_ready`
-    ///   insert inside `finalise_publish_persist`.
-    ///
-    /// A panicking `#[ignore]` placeholder would misrepresent coverage; this
-    /// test only asserts the production entry points remain reachable symbols.
+    /// Type-level: `append_nullifier` accepts only [`ScannedNullifier`], not a
+    /// bare [`host::ChainPosition`]. Possession of the capability is the proof
+    /// the position came through the scan path (`from_survivor`).
     #[test]
-    fn production_path_receive_status_is_documented_not_a_panicking_placeholder() {
-        // Keep the production entry points referenced so a rename fails here.
-        // (No panicking placeholder; see the long doc comment above.)
-        let _: fn(&StateEngine, V11ReceiveRequest) -> Result<PendingTransition> =
-            verify_and_begin_receive;
+    fn append_nullifier_requires_scanned_capability_not_bare_chain_position() {
+        use zkcoins_prover::state_engine::ScannedNullifier;
+        // Signature pin: if append_nullifier is ever re-opened to bare
+        // ChainPosition, this assignment fails to compile.
         let _: fn(
-            &RecordingPublisher,
-            &AppliedTransition,
-            &TransitionSignature,
-            BlockAnchor,
-        ) -> Result<PublishedBatch> = publish_applied_nullifier;
+            &mut StateEngine,
+            ScannedNullifier,
+        ) -> Result<u64> = StateEngine::append_nullifier;
+
+        let mut engine = StateEngine::new(Network::Regtest, 0);
+        engine.set_tip_height(50);
+        let pk = xonly_from_label(b"v11-rx/scan-auth/pk");
+        let r = xonly_from_label(b"v11-rx/scan-auth/r");
+        // Only via from_survivor (scan-path mint of the capability).
+        let scanned = ScannedNullifier::from_survivor(&shared::spec_v1::PublishedNullifier {
+            chain_pos: pos(20, 0),
+            pk,
+            r,
+        });
+        engine.append_nullifier(scanned).expect("scan-path append");
+        assert_eq!(engine.nflog().nav().size, 1);
+        assert_eq!(engine.nflog_mirror()[0].0.height, 20);
+    }
+
+    /// Crash window that was previously unrecoverable: account advanced on
+    /// disk without durable Schnorr `s`. Atomic
+    /// [`db_v11::persist_engine_with_pending_members_ready`] closes it —
+    /// after the transaction both account and `members_ready` are present,
+    /// and resume can reconstruct from the pending row alone.
+    #[tokio::test]
+    async fn crash_window_atomic_engine_and_members_ready_is_recoverable() {
+        use crate::test_db::setup_pool;
+        use crate::v11::db_v11::{self, EngineSnapshot};
+        use crate::v11::separation::claim_stack_scan_mode;
+        use crate::v11::EngineAdapter;
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim v11");
+
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("adapter");
+
+        let nk: [u8; 32] = Sha256::digest(b"v11-rx/crash/nk").into();
+        let current_pubkey = xonly_from_label(b"v11-rx/crash/sk0");
+        let next_pubkey = xonly_from_label(b"v11-rx/crash/sk1");
+        let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
+        let pk = current_pubkey;
+        let r = xonly_from_label(b"v11-rx/crash/r");
+        let s = [0x5Au8; 32];
+        let r_prime = xonly_from_label(b"v11-rx/crash/rp");
+
+        // Simulate post-apply account (last_nullifier set, pos None).
+        adapter
+            .with_engine_mut(|engine| {
+                let state = host::AccountState::new(
+                    owner,
+                    host::nk_commit(&nk),
+                    std::collections::BTreeMap::new(),
+                    next_pubkey,
+                    1,
+                    host::coinhist_empty_root(),
+                )
+                .expect("state");
+                let record = AccountRecord {
+                    state,
+                    coinhist: host::CoinHistTree::new(),
+                    nk,
+                    genesis_pubkey: current_pubkey,
+                    spendable: std::collections::BTreeMap::new(),
+                    spent_ids: std::collections::BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: Some(NullifierOpening {
+                        public_key: pk,
+                        signature_r: r,
+                        r_prime,
+                    }),
+                    last_nullifier_pos: None,
+                };
+                engine.insert_account(owner, record).expect("insert");
+            })
+            .expect("mutate");
+
+        let snap = adapter.snapshot_live();
+        db_v11::persist_engine_with_pending_members_ready(
+            &pool,
+            &snap,
+            owner,
+            pk,
+            r,
+            s,
+            r_prime,
+            100,
+            [0xBB; 32],
+        )
+        .await
+        .expect("atomic persist");
+
+        // Simulate crash: reload from DB only.
+        let reloaded = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("reload");
+        reloaded.with_engine(|engine| {
+            let rec = engine.account(&owner).expect("account survived");
+            assert!(rec.last_nullifier.is_some());
+            assert!(rec.last_nullifier_pos.is_none());
+        });
+        let pending = db_v11::load_pending_publish(&pool, pk)
+            .await
+            .expect("load")
+            .expect("members_ready row must exist — previously unrecoverable without s");
+        assert_eq!(pending.status, db_v11::PENDING_PUBLISH_MEMBERS_READY);
+        assert_eq!(pending.s, s);
+        assert_eq!(pending.r, r);
+
+        // Resume from members_ready with a construct-capable publisher.
+        let publisher = RecordingPublisher::new();
+        let published = resume_pending_publish(&reloaded, &publisher, pk)
+            .await
+            .expect("resume")
+            .expect("should produce a batch");
+        assert_eq!(published.aggregate.members.len(), 1);
+        let after = db_v11::load_pending_publish(&pool, pk)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(after.status, db_v11::PENDING_PUBLISH_REVEAL_BROADCAST);
+
+        clear_process_stack_mode_for_test();
+        let _ = EngineSnapshot::from_engine_with_tip_hash; // keep type reachable
+    }
+
+    /// Rebroadcast of an already-known transaction is success, not error.
+    #[tokio::test]
+    async fn rebroadcast_already_known_transaction_succeeds() {
+        use crate::test_db::setup_pool;
+        use crate::v11::db_v11;
+        use crate::v11::separation::claim_stack_scan_mode;
+        use crate::v11::EngineAdapter;
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim");
+        // Seed empty meta so stack checks pass on writes.
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("adapter");
+
+        let owner = Address(xonly_from_label(b"v11-rx/rebcast/owner"));
+        let pk = xonly_from_label(b"v11-rx/rebcast/pk");
+        let r = xonly_from_label(b"v11-rx/rebcast/r");
+        let s = [0x77u8; 32];
+        let r_prime = xonly_from_label(b"v11-rx/rebcast/rp");
+        let member = BatchMember {
+            sig: NullifierSig { pk, r, s },
+            build_tip: BlockAnchor {
+                block_hash: [0xCC; 32],
+                height: 42,
+            },
+        };
+        let prepared = RecordingPublisher::dummy_prepared(&member);
+        let commit_tx = serialize(&prepared.signed_commit);
+        let reveal_tx = serialize(&prepared.reveal_tx);
+
+        db_v11::insert_pending_publish_members_ready(
+            &pool,
+            owner,
+            pk,
+            r,
+            s,
+            r_prime,
+            42,
+            [0xCC; 32],
+        )
+        .await
+        .expect("members_ready");
+        db_v11::mark_pending_publish_constructed(
+            &pool,
+            pk,
+            &commit_tx,
+            &reveal_tx,
+            prepared.commit_txid().to_byte_array(),
+            prepared.reveal_txid().to_byte_array(),
+        )
+        .await
+        .expect("constructed");
+
+        // Publisher reports the exact chain "already known" signal.
+        let publisher = RecordingPublisher::with_broadcast_err(
+            "sendrawtransaction RPC error: txn-already-known",
+        );
+        let published = resume_pending_publish(&adapter, &publisher, pk)
+            .await
+            .expect("already-known must be success")
+            .expect("batch");
+        assert_eq!(published.commit_txid, prepared.commit_txid());
+        assert_eq!(published.reveal_txid, prepared.reveal_txid());
+        assert!(*publisher.commit_calls.lock().unwrap() >= 1);
+        assert!(*publisher.reveal_calls.lock().unwrap() >= 1);
+
+        let row = db_v11::load_pending_publish(&pool, pk)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(row.status, db_v11::PENDING_PUBLISH_REVEAL_BROADCAST);
+
+        // A genuine (non-already-done) error must still fail loud.
+        db_v11::mark_pending_publish_status(
+            &pool,
+            pk,
+            db_v11::PENDING_PUBLISH_REVEAL_BROADCAST,
+            db_v11::PENDING_PUBLISH_FAILED,
+        )
+        .await
+        .ok(); // may fail status machine; re-seed constructed path instead
+        // Fresh constructed row under a different pk for the negative case.
+        let pk2 = xonly_from_label(b"v11-rx/rebcast/pk2");
+        let member2 = BatchMember {
+            sig: NullifierSig {
+                pk: pk2,
+                r,
+                s,
+            },
+            build_tip: member.build_tip,
+        };
+        let prepared2 = RecordingPublisher::dummy_prepared(&member2);
+        db_v11::insert_pending_publish_members_ready(
+            &pool,
+            owner,
+            pk2,
+            r,
+            s,
+            r_prime,
+            42,
+            [0xCC; 32],
+        )
+        .await
+        .expect("m2");
+        db_v11::mark_pending_publish_constructed(
+            &pool,
+            pk2,
+            &serialize(&prepared2.signed_commit),
+            &serialize(&prepared2.reveal_tx),
+            prepared2.commit_txid().to_byte_array(),
+            prepared2.reveal_txid().to_byte_array(),
+        )
+        .await
+        .expect("c2");
+        let bad = RecordingPublisher::with_broadcast_err("connection refused");
+        let err = resume_pending_publish(&adapter, &bad, pk2)
+            .await
+            .expect_err("generic error must not be success");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("connection refused") || msg.contains("not an already-done"),
+            "got: {msg}"
+        );
+
+        clear_process_stack_mode_for_test();
     }
 
     /// Test 2: multi-slot host clause-10 through the real entry point
@@ -1613,7 +2080,12 @@ mod tests {
                     let create_pk = xonly_from_label(&[b'p', tag]);
                     let create_r = xonly_from_label(&[b'r', tag]);
                     engine
-                        .append_nullifier(pos(20 + i as u64, 0), create_pk, create_r)
+                        .append_nullifier(scanned(
+                            20 + i as u64,
+                            0,
+                            create_pk,
+                            create_r,
+                        ))
                         .expect("fold corrupt create");
                 } else {
                     // Fold only; slot body built after tip is final.
@@ -1651,7 +2123,7 @@ mod tests {
                     );
                     let r = sig.transition.signature_r();
                     engine
-                        .append_nullifier(pos(20 + i as u64, 0), create_pk, r)
+                        .append_nullifier(scanned(20 + i as u64, 0, create_pk, r))
                         .expect("fold good create");
                     let _ = (creating_prev_ash, amount, coin_id, empty_nav, nav_rand, sig);
                 }
@@ -1814,7 +2286,7 @@ mod tests {
         let create_pk = xonly_from_label(b"v11-rx/ord/create");
         let create_r = xonly_from_label(b"v11-rx/ord/create-r");
         engine
-            .append_nullifier(pos(20, 0), create_pk, create_r)
+            .append_nullifier(scanned(20, 0, create_pk, create_r))
             .expect("creating nf");
 
         let asset_id = host::asset_id_v1(host::GENESIS_TAG, &create_pk, &[0x31; 32], 2, 1);

@@ -93,6 +93,8 @@ async fn connect_and_migrate_creates_all_tables() {
     //     NfLog / CoinHist / multi-asset account tables; all `v11_*`).
     //   * After 0020 (stack_scan_mode):  32 tables + 1 view (exclusive
     //     legacy vs v1.1 scan-stack claim for Cutover Stage 2).
+    //   * After 0021 (v11_pending_publishes): 33 tables + 1 view
+    //     (durable AggregateStateNullifierV3 rebroadcast intent).
     assert_eq!(
         names,
         vec![
@@ -127,6 +129,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "v11_engine_meta".to_string(),
             "v11_nflog_entries".to_string(),
             "v11_nullifier_index".to_string(),
+            "v11_pending_publishes".to_string(),
             "v11_spendable_coins".to_string(),
             "v11_spent_coins".to_string(),
         ]

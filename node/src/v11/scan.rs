@@ -132,7 +132,9 @@ pub fn fold_survivors_into_engine(
             continue;
         }
 
-        match engine.append_nullifier(nf.chain_pos, nf.pk, nf.r) {
+        match engine.append_nullifier(zkcoins_prover::state_engine::ScannedNullifier::from_survivor(
+            &nf,
+        )) {
             Ok(_) => {
                 stats.appended = stats
                     .appended
