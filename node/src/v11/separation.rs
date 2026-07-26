@@ -157,13 +157,83 @@ pub async fn load_stack_scan_mode(pool: &PgPool) -> Result<Option<ScanStackMode>
     }
 }
 
-/// Persist the exclusive claim (idempotent when the same mode is already set).
+/// Test-only marker seed with the **same emptiness / data invariant** as
+/// [`enforce_stack_scan_mode`] (no auto-claim over existing stack data).
 ///
-/// Prefer [`enforce_stack_scan_mode`] for boot: that path checks emptiness
-/// and inserts the marker in **one** transaction. This helper remains for
-/// tests that seed a marker without the full boot gate.
+/// Compiled out of production: a "test helper" that ships is a production
+/// API. Production boot must use [`enforce_stack_scan_mode`] only.
+/// Does **not** set process mode (tests that need a process claim call
+/// [`set_process_stack_mode`] explicitly).
+#[cfg(test)]
 pub async fn claim_stack_scan_mode(pool: &PgPool, mode: ScanStackMode) -> Result<()> {
     let mut tx = pool.begin().await.context("begin claim_stack_scan_mode tx")?;
+
+    let marker_row: Option<(String,)> =
+        sqlx::query_as("SELECT mode FROM stack_scan_mode WHERE id = 1 FOR UPDATE")
+            .fetch_optional(&mut *tx)
+            .await
+            .context("lock stack_scan_mode for claim_stack_scan_mode")?;
+    let marker = match marker_row {
+        None => None,
+        Some((mode_s,)) => Some(ScanStackMode::parse(&mode_s)?),
+    };
+
+    let (legacy_n,): (i64,) = sqlx::query_as(LEGACY_SCAN_STATE_COUNT_SQL)
+        .fetch_one(&mut *tx)
+        .await
+        .context("count legacy scan tables inside claim_stack_scan_mode")?;
+    let (v11_n,): (i64,) = sqlx::query_as(V11_SCAN_STATE_COUNT_SQL)
+        .fetch_one(&mut *tx)
+        .await
+        .context("count v11 tables inside claim_stack_scan_mode")?;
+    let legacy_data = legacy_n > 0;
+    let v11_data = v11_n > 0;
+
+    if legacy_data && v11_data {
+        bail!(
+            "{STACK_SEPARATION_REFUSAL}: database carries BOTH legacy and v1.1 \
+             scan-stack rows — refusing claim_stack_scan_mode"
+        );
+    }
+    if marker.is_none() && (legacy_data || v11_data) {
+        bail!(
+            "{STACK_SEPARATION_REFUSAL} {}: stack_scan_mode marker is missing but \
+             stack data already exists — claim_stack_scan_mode refuses to \
+             auto-claim from data (same invariant as enforce_stack_scan_mode)",
+            mode.as_str(),
+        );
+    }
+    match mode {
+        ScanStackMode::Legacy => {
+            if v11_data {
+                bail!(
+                    "{STACK_SEPARATION_REFUSAL} legacy: v1.1 scan state is present; \
+                     claim_stack_scan_mode refuses"
+                );
+            }
+            if let Some(ScanStackMode::V11) = marker {
+                bail!(
+                    "{STACK_SEPARATION_REFUSAL} legacy: already claimed as v11; \
+                     claim_stack_scan_mode refuses"
+                );
+            }
+        }
+        ScanStackMode::V11 => {
+            if legacy_data {
+                bail!(
+                    "{STACK_SEPARATION_REFUSAL} v11: legacy scan state is present; \
+                     claim_stack_scan_mode refuses"
+                );
+            }
+            if let Some(ScanStackMode::Legacy) = marker {
+                bail!(
+                    "{STACK_SEPARATION_REFUSAL} v11: already claimed as legacy; \
+                     claim_stack_scan_mode refuses"
+                );
+            }
+        }
+    }
+
     claim_stack_scan_mode_in_tx(&mut tx, mode).await?;
     tx.commit()
         .await
@@ -367,6 +437,29 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
         .await
         .context("commit enforce_stack_scan_mode transaction")?;
     set_process_stack_mode(selected);
+    Ok(())
+}
+
+/// Establish the process stack claim the same way the node binary does
+/// for dual-stack selection — from an already-resolved
+/// [`super::mode::V11ShadowMode`].
+///
+/// Used by `bin/recover_inscription` so the recovery process claims
+/// under `ZKCOINS_V11_SHADOW=1` before any broadcast client is built.
+/// Tests call this with a pure mode value instead of hand-setting
+/// [`set_process_stack_mode`] directly (which would skip the binary path).
+pub fn claim_process_stack_from_shadow_mode(mode: super::mode::V11ShadowMode) {
+    match mode {
+        super::mode::V11ShadowMode::On => set_process_stack_mode(ScanStackMode::V11),
+        super::mode::V11ShadowMode::Off => set_process_stack_mode(ScanStackMode::Legacy),
+    }
+}
+
+/// Read `ZKCOINS_V11_SHADOW` and claim the process stack. Entry point for
+/// `bin/recover_inscription` (and any other out-of-band legacy tool).
+pub fn claim_process_stack_from_v11_shadow_env() -> Result<()> {
+    let mode = super::mode::v11_shadow_mode_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+    claim_process_stack_from_shadow_mode(mode);
     Ok(())
 }
 

@@ -47,9 +47,7 @@ const ACCOUNT_NODE_ADDR: &str = "0.0.0.0:4242";
 
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
-use esplora_client::{
-    r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
-};
+use node::esplora_bound::EsploraReadClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
@@ -328,10 +326,12 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
         None => {
             println!("No saved block hash found, fetching latest from Esplora...");
-            let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(EsploraBuilder::new(
-                &network_config.url,
-            ))?;
-            let tip_hash = client.get_tip_hash().await?;
+            let client = EsploraReadClient::connect(&network_config.url)
+                .map_err(|e| format!("EsploraReadClient::connect: {e}"))?;
+            let tip_hash = client
+                .get_tip_hash()
+                .await
+                .map_err(|e| format!("get_tip_hash: {e}"))?;
             println!("Fetched latest tip hash from Esplora: {}", tip_hash);
             tip_hash
         }
@@ -651,9 +651,11 @@ fn mark_pending_complete_from_sync_context(
 ///
 /// ## Reorg (restart while down)
 /// A fresh scanner has no checkpoint, so a reorg that happened offline is
-/// invisible to `report.reorg`. Before the first fold we reconcile the
-/// **persisted** tip hash against bitcoind; on divergence the first apply
-/// is a full NfLog replace from the rescan survivor stream.
+/// invisible to `report.reorg`. Reconciliation and the first scan are
+/// therefore **one observation**: scan first, reconcile the persisted tip
+/// against that scan's tip, re-verify the tip is unchanged, then apply
+/// from the same survivors. A reorg between a free-standing recon and a
+/// later scan cannot slip through — there is no free-standing recon.
 async fn run_v11_scan_loop(
     adapter: node::v11::EngineAdapter,
     scan_caught_up: Option<Arc<AtomicBool>>,
@@ -662,7 +664,9 @@ async fn run_v11_scan_loop(
     use std::collections::HashSet;
     use std::time::Duration;
     use v11::{
-        folded_keys_from_nflog_mirror, reconcile_persisted_tip, PersistedTipReconciliation,
+        first_boot_requires_full_replace, folded_keys_from_nflog_mirror,
+        observation_tip_still_live, reconcile_persisted_tip, PersistedTipReconciliation,
+        TipReconcileOutcome,
     };
 
     let pins = v11::mode::v11_boot_pins_from_env().map_err(|e| e.to_string())?;
@@ -697,144 +701,17 @@ async fn run_v11_scan_loop(
         )
     })?;
 
-    // Boot tip reconciliation (§3.9): resolve the persisted tip hash, walk
-    // to the last common ancestor, refuse deep / unresolvable offline reorgs.
-    // Uses a separate RPC client so we do not depend on scanner-private
-    // state (fresh scanner has scanned_through = None).
-    let persisted_height = adapter.with_engine(|e| e.tip_height());
-    let persisted_hash = adapter.tip_hash();
-    let activation_height = pins.activation_height;
-    let tip_recon = {
-        let rpc_url = rpc_url.clone();
-        let cookie_path = cookie_path.clone();
-        let height = persisted_height;
-        tokio::task::spawn_blocking(move || {
-            use bitcoincore_rpc::RpcApi;
-            use v11::scan::ResolvedBlock;
-
-            let open_client = || {
-                bitcoincore_rpc::Client::new(
-                    rpc_url.trim_end_matches('/'),
-                    bitcoincore_rpc::Auth::CookieFile(cookie_path.clone()),
-                )
-                .map_err(|e| anyhow::anyhow!("bitcoind RPC open for tip recon: {e}"))
-            };
-
-            reconcile_persisted_tip(
-                height,
-                persisted_hash,
-                activation_height,
-                |h| {
-                    let client = open_client()?;
-                    let tip = client
-                        .get_block_count()
-                        .map_err(|e| anyhow::anyhow!("getblockcount for tip recon: {e}"))?;
-                    if h > tip {
-                        return Ok(None);
-                    }
-                    let hash = client
-                        .get_block_hash(h)
-                        .map_err(|e| anyhow::anyhow!("getblockhash({h}) for tip recon: {e}"))?;
-                    Ok(Some(hash.to_byte_array()))
-                },
-                |block_hash| {
-                    let client = open_client()?;
-                    let bh = BlockHash::from_byte_array(block_hash);
-                    match client.get_block_header_info(&bh) {
-                        Ok(info) => {
-                            let height = u64::try_from(info.height).map_err(|_| {
-                                anyhow::anyhow!(
-                                    "getblockheader height {} does not fit u64",
-                                    info.height
-                                )
-                            })?;
-                            let prev_hash = info
-                                .previous_block_hash
-                                .map(|p| p.to_byte_array())
-                                .unwrap_or([0u8; 32]);
-                            Ok(Some(ResolvedBlock {
-                                height,
-                                prev_hash,
-                            }))
-                        }
-                        // Unknown / pruned block: not an RPC infrastructure
-                        // failure — surface as Ok(None) so recon can fail-stop
-                        // with an unresolvable-tip error (not silent recover).
-                        Err(e) => {
-                            let msg = e.to_string();
-                            let unknown = msg.contains("Block not found")
-                                || msg.contains("Block header not found")
-                                || msg.contains("not found")
-                                || msg.contains("-5");
-                            if unknown {
-                                Ok(None)
-                            } else {
-                                Err(anyhow::anyhow!("getblockheader for tip recon: {e}"))
-                            }
-                        }
-                    }
-                },
-            )
-        })
-        .await
-        .map_err(|e| format!("v1.1 tip reconciliation join: {e}"))?
-        .map_err(|e| {
-            // Deep / unresolvable offline reorg: fail readiness before any fold.
-            if let Some(flag) = &finality_ok {
-                flag.store(false, Ordering::SeqCst);
-            }
-            format!("v1.1 tip reconciliation failed: {e:#}")
-        })?
-    };
-
     // Track which survivor chain positions we have already folded so a
     // re-scan of the same tip does not re-append (append_nullifier is
     // strict). Reorg / full-replace clears this set and rebuilds.
     let mut folded_keys: HashSet<(u64, u32, u32, u32, [u8; 32])> = HashSet::new();
-    // When a shallow offline reorg was detected, the first successful scan
-    // must full-replace NfLog even if the fresh scanner reports no reorg.
-    let mut force_full_replace = matches!(
-        tip_recon,
-        PersistedTipReconciliation::ShallowReorg { .. }
-    );
-
-    match tip_recon {
-        PersistedTipReconciliation::Fresh => {
-            println!("v1.1 boot tip: fresh engine (no persisted tip); forward scan from activation");
-        }
-        PersistedTipReconciliation::StillCanonical {
-            tip_height,
-            tip_hash,
-        } => {
-            let mirror = adapter.with_engine(|e| e.nflog_mirror());
-            folded_keys = folded_keys_from_nflog_mirror(&mirror);
-            println!(
-                "v1.1 boot tip: still canonical at height={} hash={} (seeded {} folded keys)",
-                tip_height,
-                hex::encode(tip_hash),
-                folded_keys.len()
-            );
-        }
-        PersistedTipReconciliation::ShallowReorg {
-            ancestor_height,
-            ancestor_hash,
-            reorg_depth,
-            persisted_height,
-            persisted_hash,
-        } => {
-            println!(
-                "v1.1 boot tip: shallow offline reorg depth={} (persisted height={} \
-                 hash={} → common ancestor height={} hash={}); first apply will \
-                 full-replace NfLog from the rescan survivor stream (never \
-                 forward-fold into a stale accumulator; §3.9 ≤5-block window)",
-                reorg_depth,
-                persisted_height,
-                hex::encode(persisted_hash),
-                ancestor_height,
-                hex::encode(ancestor_hash)
-            );
-        }
-    }
+    // First observation unit not yet committed: recon + first scan share
+    // one tip. After commit, the scanner has a checkpoint and `report.reorg`
+    // is trustworthy.
+    let mut boot_observation_committed = false;
+    let activation_height = pins.activation_height;
+    // Transient incomplete-view backoff (RPC behind). Not a chain-tip poll.
+    const RECON_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
     loop {
         let scan_result = tokio::task::spawn_blocking(move || {
@@ -883,7 +760,205 @@ async fn run_v11_scan_loop(
         let tip_hash = tip.1.to_byte_array();
         let survivors = scanner.survivors().to_vec();
 
-        let do_full_replace = force_full_replace || report.reorg.is_some();
+        // —— Boot observation unit: bind recon to THIS scan's tip ——
+        // Window is closed, not narrowed: we never seed folded keys or
+        // choose forward vs full-replace from a recon that observed a
+        // different chain than the survivors we are about to apply.
+        let mut force_full_replace = report.reorg.is_some();
+        if !boot_observation_committed {
+            let persisted_height = adapter.with_engine(|e| e.tip_height());
+            let persisted_hash = adapter.tip_hash();
+            let scan_tip_height = tip_height;
+            let scan_tip_hash = tip_hash;
+            let rpc_url_b = rpc_url.clone();
+            let cookie_path_b = cookie_path.clone();
+
+            let recon_result = tokio::task::spawn_blocking(move || {
+                use bitcoincore_rpc::RpcApi;
+                use v11::scan::ResolvedBlock;
+
+                let open_client = || {
+                    bitcoincore_rpc::Client::new(
+                        rpc_url_b.trim_end_matches('/'),
+                        bitcoincore_rpc::Auth::CookieFile(cookie_path_b.clone()),
+                    )
+                    .map_err(|e| anyhow::anyhow!("bitcoind RPC open for tip recon: {e}"))
+                };
+
+                let query_live_hash = |h: u64| -> anyhow::Result<Option<[u8; 32]>> {
+                    let client = open_client()?;
+                    let tip = client
+                        .get_block_count()
+                        .map_err(|e| anyhow::anyhow!("getblockcount for tip recon: {e}"))?;
+                    if h > tip {
+                        return Ok(None);
+                    }
+                    let hash = client
+                        .get_block_hash(h)
+                        .map_err(|e| anyhow::anyhow!("getblockhash({h}) for tip recon: {e}"))?;
+                    Ok(Some(hash.to_byte_array()))
+                };
+
+                let resolve_hash = |block_hash: [u8; 32]| -> anyhow::Result<Option<ResolvedBlock>> {
+                    let client = open_client()?;
+                    let bh = BlockHash::from_byte_array(block_hash);
+                    match client.get_block_header_info(&bh) {
+                        Ok(info) => {
+                            let height = u64::try_from(info.height).map_err(|_| {
+                                anyhow::anyhow!(
+                                    "getblockheader height {} does not fit u64",
+                                    info.height
+                                )
+                            })?;
+                            let prev_hash = info
+                                .previous_block_hash
+                                .map(|p| p.to_byte_array())
+                                .unwrap_or([0u8; 32]);
+                            Ok(Some(ResolvedBlock {
+                                height,
+                                prev_hash,
+                            }))
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            let unknown = msg.contains("Block not found")
+                                || msg.contains("Block header not found")
+                                || msg.contains("not found")
+                                || msg.contains("-5");
+                            if unknown {
+                                Ok(None)
+                            } else {
+                                Err(anyhow::anyhow!("getblockheader for tip recon: {e}"))
+                            }
+                        }
+                    }
+                };
+
+                let outcome = reconcile_persisted_tip(
+                    persisted_height,
+                    persisted_hash,
+                    activation_height,
+                    query_live_hash,
+                    resolve_hash,
+                )?;
+
+                // Tip stability pin: recon and scan must still describe the
+                // same tip. If the live hash at the scan height moved, the
+                // whole observation is stale — caller retries. Fresh query
+                // (query_live_hash was moved into recon above).
+                let live_at_scan = {
+                    let client = open_client()?;
+                    let tip = client
+                        .get_block_count()
+                        .map_err(|e| anyhow::anyhow!("getblockcount for tip pin: {e}"))?;
+                    if scan_tip_height > tip {
+                        None
+                    } else {
+                        let hash = client.get_block_hash(scan_tip_height).map_err(|e| {
+                            anyhow::anyhow!("getblockhash({scan_tip_height}) for tip pin: {e}")
+                        })?;
+                        Some(hash.to_byte_array())
+                    }
+                };
+                let stable = observation_tip_still_live(scan_tip_hash, live_at_scan);
+                Ok::<_, anyhow::Error>((outcome, stable))
+            })
+            .await
+            .map_err(|e| format!("v1.1 tip reconciliation join: {e}"))?;
+
+            let (outcome, tip_stable) = match recon_result {
+                Ok(v) => v,
+                Err(e) => {
+                    // Fatal only (deep reorg / unresolvable / corruption).
+                    if let Some(flag) = &finality_ok {
+                        flag.store(false, Ordering::SeqCst);
+                    }
+                    return Err(format!("v1.1 tip reconciliation failed: {e:#}").into());
+                }
+            };
+
+            if !tip_stable {
+                println!(
+                    "v1.1 boot tip: scan tip height={} hash={} moved during \
+                     reconciliation — discarding observation and retrying \
+                     (bound recon+scan window closed, not narrowed)",
+                    tip_height,
+                    hex::encode(tip_hash)
+                );
+                // scanner-polling-ok: v11 bound-observation tip-stability retry
+                tokio::time::sleep(RECON_RETRY_BACKOFF).await;
+                continue;
+            }
+
+            match outcome {
+                TipReconcileOutcome::RetryableIncompleteView {
+                    queried_height,
+                    detail,
+                } => {
+                    // Transient: RPC behind. Stay unready, leave finality_ok
+                    // alone, never assume canonical or divergent.
+                    println!(
+                        "v1.1 boot tip: incomplete live view at height \
+                         {queried_height} — {detail}; staying unready and retrying"
+                    );
+                    // scanner-polling-ok: v11 incomplete-view RPC-behind backoff
+                    tokio::time::sleep(RECON_RETRY_BACKOFF).await;
+                    continue;
+                }
+                TipReconcileOutcome::Ready(PersistedTipReconciliation::Fresh) => {
+                    println!(
+                        "v1.1 boot tip: fresh engine (no persisted tip); applying \
+                         first scan observation (tip={tip_height})"
+                    );
+                }
+                TipReconcileOutcome::Ready(PersistedTipReconciliation::StillCanonical {
+                    tip_height: ph,
+                    tip_hash: p_hash,
+                }) => {
+                    let mirror = adapter.with_engine(|e| e.nflog_mirror());
+                    folded_keys = folded_keys_from_nflog_mirror(&mirror);
+                    println!(
+                        "v1.1 boot tip: still canonical at height={} hash={} \
+                         (seeded {} folded keys; bound to scan tip={tip_height})",
+                        ph,
+                        hex::encode(p_hash),
+                        folded_keys.len()
+                    );
+                }
+                TipReconcileOutcome::Ready(PersistedTipReconciliation::ShallowReorg {
+                    ancestor_height,
+                    ancestor_hash,
+                    reorg_depth,
+                    persisted_height,
+                    persisted_hash,
+                }) => {
+                    force_full_replace = true;
+                    println!(
+                        "v1.1 boot tip: shallow offline reorg depth={} (persisted \
+                         height={} hash={} → common ancestor height={} hash={}); \
+                         full-replace NfLog from this scan's survivors (bound \
+                         observation; §3.9 ≤5-block window)",
+                        reorg_depth,
+                        persisted_height,
+                        hex::encode(persisted_hash),
+                        ancestor_height,
+                        hex::encode(ancestor_hash)
+                    );
+                    debug_assert!(first_boot_requires_full_replace(
+                        &PersistedTipReconciliation::ShallowReorg {
+                            ancestor_height,
+                            ancestor_hash,
+                            reorg_depth,
+                            persisted_height,
+                            persisted_hash,
+                        }
+                    ));
+                }
+            }
+            boot_observation_committed = true;
+        }
+
+        let do_full_replace = force_full_replace;
         if do_full_replace {
             // Full replace: scanner survivors are the canonical stream.
             let stats = v11::apply_canonical_survivors(
@@ -894,7 +969,6 @@ async fn run_v11_scan_loop(
             )
             .await
             .map_err(|e| format!("v1.1 reorg/full-replace NfLog apply failed: {e:#}"))?;
-            force_full_replace = false;
             folded_keys.clear();
             for nf in &survivors {
                 folded_keys.insert((
@@ -948,8 +1022,10 @@ async fn run_v11_scan_loop(
             }
         }
 
-        // First successful catch-up: mark readiness so load balancers can
-        // send traffic once the NfLog view reflects the chain tip.
+        // First successful catch-up after a committed boot observation:
+        // mark readiness so load balancers can send traffic once the NfLog
+        // view reflects the chain tip. Incomplete-view retries never reach
+        // here (they `continue` before apply / before this flag).
         if let Some(flag) = &scan_caught_up {
             if !flag.load(Ordering::SeqCst) {
                 flag.store(true, Ordering::SeqCst);

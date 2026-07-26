@@ -29,21 +29,22 @@ pub use publish::{
     connect_v11_publisher, publish_v11_batch, v11_publisher_env_from_env, V11PublisherEnv,
 };
 pub use scan::{
-    apply_canonical_survivors, apply_forward_scan, fold_survivors_into_engine,
-    folded_keys_from_nflog_mirror, members_to_published, reconcile_persisted_tip,
-    replace_engine_nflog_from_survivors, sort_canonical, FoldStats, MAX_RECOVERABLE_REORG_DEPTH,
-    PersistedTipReconciliation, ResolvedBlock,
+    apply_canonical_survivors, apply_forward_scan, first_boot_requires_full_replace,
+    fold_survivors_into_engine, folded_keys_from_nflog_mirror, members_to_published,
+    observation_tip_still_live, reconcile_persisted_tip, replace_engine_nflog_from_survivors,
+    sort_canonical, FoldStats, MAX_RECOVERABLE_REORG_DEPTH, PersistedTipReconciliation,
+    ResolvedBlock, TipReconcileOutcome,
 };
 pub use separation::{
-    claim_stack_scan_mode, enforce_stack_scan_mode, ensure_legacy_publisher_allowed,
-    ensure_v11_publisher_allowed, legacy_scan_state_present, load_stack_scan_mode,
-    process_stack_mode, require_stack_mode_for_update, require_v11_process_for_nflog_write,
-    set_process_stack_mode, v11_scan_state_present, ScanStackMode, STACK_CAPABILITY_REFUSAL,
-    STACK_SEPARATION_REFUSAL,
+    claim_process_stack_from_shadow_mode, claim_process_stack_from_v11_shadow_env,
+    enforce_stack_scan_mode, ensure_legacy_publisher_allowed, ensure_v11_publisher_allowed,
+    legacy_scan_state_present, load_stack_scan_mode, process_stack_mode,
+    require_stack_mode_for_update, require_v11_process_for_nflog_write, set_process_stack_mode,
+    v11_scan_state_present, ScanStackMode, STACK_CAPABILITY_REFUSAL, STACK_SEPARATION_REFUSAL,
 };
 
 #[cfg(test)]
-pub use separation::clear_process_stack_mode_for_test;
+pub use separation::{claim_stack_scan_mode, clear_process_stack_mode_for_test};
 
 #[cfg(test)]
 mod tests;

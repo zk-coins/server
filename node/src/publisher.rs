@@ -14,73 +14,14 @@ use bitcoin::{
 };
 
 use std::str::FromStr;
-// Import specific Esplora client types
-use esplora_client::{
-    r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
-};
 use sqlx::PgPool;
 
 use crate::db;
-use crate::v11::ensure_legacy_publisher_allowed;
-
-/// Broadcast-capable Esplora client for **legacy** commitment inscriptions.
-///
-/// ## Structural choke point
-///
-/// Construction is the only public way to obtain this type, and construction
-/// always runs [`ensure_legacy_publisher_allowed`]. The inner
-/// `EsploraAsyncClient` is **private** and never returned — a caller
-/// (including `bin/recover_inscription`) cannot extract an unguarded
-/// broadcast handle after the fact. Possessing a value of this type already
-/// means the stack check passed at connect time.
-///
-/// What prevents a future caller from reaching the raw client through this
-/// crate: there is no `into_inner` / `as_raw` / public field. A binary that
-/// wants to broadcast legacy commitments must call [`Self::connect`] (or a
-/// helper that does); the old pattern of `EsploraBuilder` + `client.broadcast`
-/// is no longer used on any publisher / recovery path in this crate.
-pub struct LegacyBroadcastClient {
-    inner: EsploraAsyncClient<DefaultSleeper>,
-}
-
-impl std::fmt::Debug for LegacyBroadcastClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("LegacyBroadcastClient { /* inner private */ }")
-    }
-}
-
-impl LegacyBroadcastClient {
-    /// Build a broadcast-capable client after the legacy stack check.
-    ///
-    /// Fails loud under a v1.1 process claim (and under any future
-    /// strengthening of [`ensure_legacy_publisher_allowed`]) **before** any
-    /// Esplora I/O.
-    pub fn connect(url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        ensure_legacy_publisher_allowed().map_err(|e| {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                as Box<dyn std::error::Error + Send + Sync>
-        })?;
-        let builder = EsploraBuilder::new(url);
-        let inner = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
-        Ok(Self { inner })
-    }
-
-    /// Broadcast a raw transaction via Esplora REST `POST /tx`.
-    pub async fn broadcast(
-        &self,
-        tx: &Transaction,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.broadcast(tx).await.map_err(|e| e.into())
-    }
-
-    /// Fetch a transaction by txid (read path used by recovery confirmation).
-    pub async fn get_tx(
-        &self,
-        txid: &Txid,
-    ) -> Result<Option<Transaction>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.get_tx(txid).await.map_err(|e| e.into())
-    }
-}
+use crate::esplora_bound::EsploraReadClient;
+// Re-export the guarded broadcast client so existing call sites
+// (`publisher::LegacyBroadcastClient`, `bin/recover_inscription`) keep
+// working. Construction lives only in `esplora_bound` (raw type private).
+pub use crate::esplora_bound::LegacyBroadcastClient;
 
 // Define a configuration struct for Esplora
 #[derive(Clone, Debug)]
@@ -530,21 +471,17 @@ pub async fn get_publisher_utxo(
     config: &EsploraConfig,
     min_amount: Option<u64>,
 ) -> Result<Vec<(OutPoint, u64)>, Box<dyn std::error::Error + Send + Sync>> {
-    let builder = EsploraBuilder::new(&config.url);
-    let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
+    // Read path only — goes through the bound wrapper (no raw client).
+    let client = EsploraReadClient::connect(&config.url)?;
+    let utxos = client.get_address_utxos(publisher_address.clone()).await?;
 
-    // Get all UTXOs for the address
-    let utxos = client.get_address_utxo(publisher_address.clone()).await?;
-
-    // Find UTXOs with sufficient value
     let required_amount = min_amount.unwrap_or(0);
     let mut outpoints_with_sats = Vec::<(OutPoint, u64)>::new();
-    let mut sats_amount_sum = 0;
+    let mut sats_amount_sum = 0u64;
 
     for utxo in utxos {
-        let sats = utxo.value.to_sat();
-        outpoints_with_sats.push((OutPoint::new(utxo.txid, utxo.vout), sats));
-        sats_amount_sum += sats;
+        outpoints_with_sats.push((utxo.outpoint, utxo.value_sats));
+        sats_amount_sum += utxo.value_sats;
     }
 
     // Discard UTXOs if total amount is insufficient
@@ -897,7 +834,7 @@ async fn resume_single_row(
     let reveal_tx: Transaction = bitcoin::consensus::deserialize(&row.reveal_tx)
         .map_err(|e| format!("deserialize reveal_tx: {}", e))?;
 
-    // Connect is the choke point — no raw EsploraAsyncClient on this path.
+    // Connect is the choke point — no raw Esplora client on this path.
     let client = LegacyBroadcastClient::connect(&config.url)?;
 
     let commit_txid = commit_tx.compute_txid();

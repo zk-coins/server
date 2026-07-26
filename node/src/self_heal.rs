@@ -227,7 +227,23 @@ pub async fn heal_circuit_digest(
                  proof-dependent state to genesis (self-heal) so the node serves \
                  cleanly."
             );
-            db::reset_proof_dependent_state_tx(pool, live_digest).await?;
+            // Under exclusive v1.1 the legacy scan tables must already be empty
+            // (stack separation). The wipe is a legacy-stack writer and requires
+            // the legacy marker — do not call it under a v11 claim. Still record
+            // the live digest so the next boot takes the fast path.
+            match crate::v11::process_stack_mode() {
+                Some(crate::v11::ScanStackMode::V11) => {
+                    warn!(
+                        "Self-heal: process is claimed v1.1 — skipping legacy \
+                         proof-dependent wipe (tables must already be empty under \
+                         exclusive NfLog stack); storing circuit digest only"
+                    );
+                    db::store_circuit_digest(pool, live_digest).await?;
+                }
+                _ => {
+                    db::reset_proof_dependent_state_tx(pool, live_digest).await?;
+                }
+            }
             if let Err(e) = reset_proof_store_dir(proofs_dir) {
                 warn!(
                     "Self-heal: failed to drop proof-store dir {} (continuing — no \
