@@ -495,14 +495,26 @@ async fn resolve_username_returns_none_for_unknown() {
 
 #[tokio::test]
 async fn connect_and_migrate_propagates_connect_failure() {
-    // Bogus port → connect() fails fast (no Postgres listening) and
-    // the error propagates via `?`. Exercises the otherwise-unreached
-    // error branch in `connect_and_migrate`.
-    let err = connect_and_migrate("postgres://postgres:postgres@127.0.0.1:1/postgres")
-        .await
-        .expect_err("expected connect failure");
+    // Unresolvable host + explicit libpq `connect_timeout` so the error
+    // path fails in seconds rather than hanging on OS TCP blackholes
+    // (seen with low-numbered ports on some macOS/Docker setups where
+    // `127.0.0.1:1` never surfaces a refused connection to sqlx).
+    // Exercises the otherwise-unreached error branch in
+    // `connect_and_migrate`.
+    let err = connect_and_migrate(
+        "postgres://postgres:postgres@invalid.invalid:5432/postgres?connect_timeout=2",
+    )
+    .await
+    .expect_err("expected connect failure");
     assert!(
-        matches!(err, sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut),
+        matches!(
+            err,
+            sqlx::Error::Io(_)
+                | sqlx::Error::PoolTimedOut
+                | sqlx::Error::Tls(_)
+                | sqlx::Error::Protocol(_)
+                | sqlx::Error::Configuration(_)
+        ),
         "unexpected: {:?}",
         err
     );

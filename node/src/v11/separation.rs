@@ -34,10 +34,18 @@ use anyhow::{bail, Context, Result};
 use sqlx::{PgPool, Postgres, Transaction};
 
 // Process-wide claim registry + legacy-publisher policy (shared crate).
+// Production surface only — the test reset is re-exported under `cfg(test)`
+// below (and only compiles when `stack-policy` was built with
+// `test-support`, which `[dev-dependencies]` enables for this package).
 pub use stack_policy::{
-    clear_process_stack_mode_for_test, ensure_legacy_publisher_allowed, process_stack_mode,
-    set_process_stack_mode, ScanStackMode, STACK_SEPARATION_REFUSAL,
+    ensure_legacy_publisher_allowed, process_stack_mode, set_process_stack_mode, ScanStackMode,
+    STACK_SEPARATION_REFUSAL,
 };
+
+/// Test-only process-claim reset. Not part of the production `node` API
+/// (see `stack-policy` feature `test-support`).
+#[cfg(test)]
+pub use stack_policy::clear_process_stack_mode_for_test;
 
 /// Canonical error prefix when a writer finds no matching marker in-tx.
 pub const STACK_CAPABILITY_REFUSAL: &str = "stack separation: refusing write";

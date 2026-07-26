@@ -12,6 +12,15 @@
 //! This crate is deliberately tiny: only the in-process mode registry and the
 //! pure policy functions that consult it. Database marker enforcement stays in
 //! `node` (sqlx / pool types). Fail loud; never fall back to the other stack.
+//!
+//! ## Monotonic process claim
+//!
+//! Production builds export only [`set_process_stack_mode`],
+//! [`process_stack_mode`], and the policy check. Once a mode is claimed, no
+//! public production API can withdraw it or switch to a different mode
+//! (conflicting re-sets panic). The test-only reset lives behind
+//! `feature = "test-support"` (and `cfg(test)` for this crate's unit tests)
+//! so a production binary cannot observe an unclaimed window after boot.
 
 use std::fmt;
 use std::sync::Mutex;
@@ -79,8 +88,9 @@ impl std::error::Error for StackPolicyError {}
 /// Publish / scan entry points consult this so a v1.1 process cannot
 /// silently call the legacy commitment publisher (or the reverse).
 ///
-/// `Mutex` (not `OnceLock`) so unit tests in the same process can reset
-/// between cases; production boot still panics on conflicting re-set.
+/// Production claim is **monotonic**: [`set_process_stack_mode`] may only
+/// set `None → Some(mode)` or re-affirm the same mode; conflicting re-sets
+/// panic. The test-only clear is cfg-gated out of production builds.
 static PROCESS_STACK_MODE: Mutex<Option<ScanStackMode>> = Mutex::new(None);
 
 /// Record the mode this process claimed. Panics if called twice with
@@ -108,13 +118,25 @@ pub fn process_stack_mode() -> Option<ScanStackMode> {
 
 /// Drop the process claim so the next test case can re-enforce.
 ///
-/// Production boot never calls this. Always exported (not `cfg(test)`) so
-/// the `node` test suite can reset the registry while depending on this
-/// crate as a normal library target.
+/// **Not available in production builds.** Gated on
+/// `cfg(any(test, feature = "test-support"))` so:
+/// - this crate's unit tests can reset between cases (`cfg(test)`);
+/// - dependent test targets enable `features = ["test-support"]` via
+///   `[dev-dependencies]` feature unification;
+/// - a production `node` / `esplora-bound` binary never links the symbol.
+#[cfg(any(test, feature = "test-support"))]
 pub fn clear_process_stack_mode_for_test() {
-    *PROCESS_STACK_MODE
-        .lock()
-        .expect("PROCESS_STACK_MODE mutex poisoned") = None;
+    // Recover from poison so a `#[should_panic]` conflict test that panics
+    // while holding the mutex does not brick later tests in the same
+    // process (`cargo test` shares one process; nextest does not care).
+    let mut guard = match PROCESS_STACK_MODE.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            PROCESS_STACK_MODE.clear_poison();
+            poisoned.into_inner()
+        }
+    };
+    *guard = None;
 }
 
 /// Refuse a legacy publish / broadcast path that does not match the process
@@ -162,5 +184,64 @@ mod tests {
             "got: {err}"
         );
         clear_process_stack_mode_for_test();
+    }
+
+    /// Once a mode is claimed, no sequence of **production** public APIs
+    /// (`set_process_stack_mode`, `process_stack_mode`,
+    /// `ensure_legacy_publisher_allowed`) can withdraw the claim or yield a
+    /// successful legacy-broadcast allowance under a different/absent mode.
+    /// (The test-only clear is used only for fixture isolation here.)
+    ///
+    /// Conflicting re-set is covered by
+    /// [`conflicting_set_process_stack_mode_panics`] — not catch_unwind'd
+    /// here, because a panic while holding the registry mutex would poison
+    /// it for later tests in the same process.
+    #[test]
+    fn process_claim_is_monotonic_under_public_production_api() {
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        // Re-affirming the same mode is a no-op, not a reset.
+        set_process_stack_mode(ScanStackMode::V11);
+        assert_eq!(process_stack_mode(), Some(ScanStackMode::V11));
+
+        // Legacy broadcast path stays refused for the life of the claim.
+        let err = ensure_legacy_publisher_allowed().expect_err("still v11");
+        assert!(
+            err.to_string().contains(STACK_SEPARATION_REFUSAL),
+            "got: {err}"
+        );
+
+        // No production export returns the registry to unclaimed. The only
+        // withdraw path is clear_process_stack_mode_for_test, which is
+        // cfg-gated out of production (see feature = "test-support").
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Conflicting `set_process_stack_mode` panics — the claim cannot flip
+    /// from V11 to Legacy (or the reverse) via the production API.
+    #[test]
+    #[should_panic(expected = "conflicts with already-set")]
+    fn conflicting_set_process_stack_mode_panics() {
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::Legacy);
+    }
+
+    /// Inventory of this crate's public surface that can mutate the
+    /// process registry: only `set_process_stack_mode` (monotonic) and
+    /// `clear_process_stack_mode_for_test` (test-only). Nothing else can
+    /// move the registry out from under an existing client.
+    #[test]
+    fn only_test_clear_can_withdraw_process_claim() {
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::Legacy);
+        assert_eq!(process_stack_mode(), Some(ScanStackMode::Legacy));
+        // Production mutators cannot clear:
+        set_process_stack_mode(ScanStackMode::Legacy); // re-affirm only
+        assert_eq!(process_stack_mode(), Some(ScanStackMode::Legacy));
+        // Withdraw is exclusively the test helper:
+        clear_process_stack_mode_for_test();
+        assert_eq!(process_stack_mode(), None);
     }
 }

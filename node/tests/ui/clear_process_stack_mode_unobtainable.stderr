@@ -1,0 +1,22 @@
+error[E0425]: cannot find function `clear_process_stack_mode_for_test` in module `node::v11`
+  --> tests/ui/clear_process_stack_mode_unobtainable.rs:10:16
+   |
+10 |     node::v11::clear_process_stack_mode_for_test();
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `node::v11`
+   |
+note: found an item that was configured out
+  --> src/v11/mod.rs
+   |
+   | #[cfg(test)]
+   |       ---- the item is gated here
+   | pub use separation::{claim_stack_scan_mode, clear_process_stack_mode_for_test};
+   |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: consider importing this function
+   |
+ 7 + use stack_policy::clear_process_stack_mode_for_test;
+   |
+help: if you import `clear_process_stack_mode_for_test`, refer to it directly
+   |
+10 -     node::v11::clear_process_stack_mode_for_test();
+10 +     clear_process_stack_mode_for_test();
+   |
