@@ -63,7 +63,9 @@ bitcoincore-zmq = { version = "=1.5.4", optional = true }
 # Esplora I/O goes through the `esplora-bound` facade package, which
 # exports only guarded wrappers (private inner client). Naming
 # `esplora_client::…` in this package is a compile error.
-esplora-bound = { path = "../esplora-bound" }
+# `issue-legacy-broadcast-witness` lets this package mint the broadcast
+# typestate witness after the process claim check — sole workspace issuer.
+esplora-bound = { path = "../esplora-bound", features = ["issue-legacy-broadcast-witness"] }
 axum = { version = "0.7.9", features = ["json", "multipart"] }
 # `BodyExt::collect()` for the audit middleware's request/response
 # body buffering. Promoted from `[dev-dependencies]` because the
