@@ -58,10 +58,12 @@
 //! discard a receive that already committed (and vice versa). **Proving
 //! holds neither the write gate nor the live-engine mutex** (the pending
 //! witness carries everything the prover needs). Apply re-validates every
-//! live dependency the prove-time decision read (account, tip/`size_final`,
-//! receiver NAV canonicity, creating anchors, CoinHist, own-Pk absence) so
-//! a concurrent scan fold during prove fails loud on collision rather than
-//! committing against a moved world.
+//! **commit dependency** — live engine reads *and* caller-supplied values that
+//! reach durable state (account, tip/`size_final`, receiver NAV canonicity,
+//! creating anchors, CoinHist, own-Pk absence, plus `build_tip` against the
+//! snapshot tip identity and the full commit signature against the proved
+//! envelope) — so a concurrent scan fold or a stale caller tip fails loud
+//! rather than committing against a moved world.
 //!
 //! ## Clause 10 is unskippable
 //!
@@ -195,9 +197,11 @@ pub struct V11ReceiveOutcome {
     pub nullifier: ([u8; 32], [u8; 32]),
     /// Receiver account owner.
     pub owner: Address,
-    /// `send_counter` after the transition (monotone +1).
+    /// `send_counter` produced by **this** transition (from the proved
+    /// witness), not a post-gate re-read of live account state.
     pub new_send_counter: u64,
-    /// Coin identifiers admitted into the receiver's CoinHist (state-1).
+    /// Coin identifiers **this** transition admitted (received slots only),
+    /// not the account's full spendable set.
     pub admitted_coin_ids: Vec<[u8; 32]>,
     /// Publisher result (commit/reveal txids, member Pks).
     pub published: PublishedBatchSummary,
@@ -373,6 +377,20 @@ pub async fn finalise_publish_persist(
 /// State-critical section after unlocked prove: write-gate → revalidate/apply
 /// → atomic persist → publish. Split out so tests can inject a concurrent
 /// scanner append between prove and apply without a multi-minute circuit.
+///
+/// ## Commit-dependency revalidation (extended derivation)
+///
+/// Revalidation covers **everything the durable commit depends on**, not only
+/// values read from the live engine between snapshot and commit. Caller-
+/// supplied fields that land in durable state escape a pure "what did we
+/// read?" list and must be checked explicitly:
+///
+/// | Commit dependency | Source | Re-check |
+/// |-------------------|--------|----------|
+/// | account / tip→`size_final` / NAV / anchors / CoinHist / own-Pk | live engine | [`StateEngine::apply_proved_transition`] |
+/// | `build_tip` (→ `BatchMember` + `v11_pending_publishes`) | **caller** | equals pre-apply snapshot `(tip_height, tip_hash)` |
+/// | commit `signature` (→ member `s` + `r_prime`) | **caller** | byte-equal to the proved envelope signature |
+/// | outcome `admitted_coin_ids` / `new_send_counter` | this transition | taken from the proved witness, not a post-gate live re-read |
 pub async fn commit_proved_receive(
     adapter: &EngineAdapter,
     proved_pending: zkcoins_prover::state_engine::ProvedPendingTransition,
@@ -384,11 +402,38 @@ pub async fn commit_proved_receive(
         .context("v1.1 receive commit: exclusive stack claim required")?;
 
     let owner = proved_pending.pending().owner;
+    // Outcome fields describe *this* transition only — capture from the
+    // proved witness before apply consumes the envelope. Never re-read the
+    // live account's full spendable set or send_counter after the gate.
+    let admitted_coin_ids: Vec<[u8; 32]> = proved_pending
+        .pending()
+        .witness_wip
+        .received_coins
+        .iter()
+        .map(|c| host::digest_to_bytes(&c.identifier))
+        .collect();
+    let new_send_counter = proved_pending
+        .pending()
+        .witness_wip
+        .new_account_state
+        .send_counter;
+    let proved_signature = proved_pending.signature().clone();
 
     // 2. Write gate covers only snapshot→mutate→persist→restore.
     let applied = {
         let _write_gate = adapter.lock_writes().await;
         let pre = adapter.snapshot_live();
+
+        // Caller-supplied durable fields: revalidate before any mutation.
+        if let Err(err) = revalidate_caller_supplied_commit_deps(
+            &pre,
+            &build_tip,
+            &signature,
+            &proved_signature,
+        ) {
+            return Err(err);
+        }
+
         // Measure NfLog size *inside* the gate, immediately before apply —
         // never against a pre-prove snapshot a concurrent scan can move.
         let nflog_size_pre_apply = adapter.with_engine(|engine| engine.nflog().nav().size);
@@ -478,19 +523,6 @@ pub async fn commit_proved_receive(
     };
     let (applied, member) = applied;
 
-    let admitted_coin_ids = adapter.with_engine(|engine| {
-        engine
-            .account(&owner)
-            .map(|rec| rec.spendable.keys().copied().collect::<Vec<_>>())
-            .unwrap_or_default()
-    });
-    let new_send_counter = adapter.with_engine(|engine| {
-        engine
-            .account(&owner)
-            .map(|rec| rec.state.send_counter)
-            .unwrap_or(0)
-    });
-
     // 4. Construct + broadcast outside the write gate.
     let published = durable_publish_nullifier(adapter, publisher, &member)
         .await
@@ -510,6 +542,38 @@ pub async fn commit_proved_receive(
         admitted_coin_ids,
         published: summarize_published(&published),
     })
+}
+
+/// Revalidate caller-supplied values that reach durable commit state.
+///
+/// These never appear in a pure "engine read set" derivation because they
+/// arrive from outside; they still decide what is persisted.
+fn revalidate_caller_supplied_commit_deps(
+    pre: &db_v11::EngineSnapshot,
+    build_tip: &BlockAnchor,
+    signature: &TransitionSignature,
+    proved_signature: &TransitionSignature,
+) -> Result<()> {
+    ensure!(
+        u64::from(build_tip.height) == pre.tip_height,
+        "v1.1 receive: build_tip.height {} does not match live tip_height {} \
+         (caller-supplied tip identity stale or forged relative to pre-apply snapshot)",
+        build_tip.height,
+        pre.tip_height
+    );
+    ensure!(
+        build_tip.block_hash == pre.tip_hash,
+        "v1.1 receive: build_tip.block_hash does not match live tip_hash \
+         (caller-supplied tip identity stale or forged relative to pre-apply snapshot)"
+    );
+    ensure!(
+        signature.pk_i == proved_signature.pk_i
+            && signature.signature == proved_signature.signature
+            && signature.r_prime == proved_signature.r_prime,
+        "v1.1 receive: commit signature does not match the proved envelope \
+         (caller-supplied s/r_prime must not diverge from what was proved)"
+    );
+    Ok(())
 }
 
 fn batch_member_from_applied(
@@ -2600,6 +2664,10 @@ mod tests {
                 engine.set_tip_height(40);
             })
             .expect("seed creating nf");
+        // Tip identity the commit path revalidates `build_tip` against.
+        adapter
+            .set_tip_hash(SEEDED_RECEIVE_TIP_HASH)
+            .expect("set tip_hash");
 
         let slot = adapter
             .with_engine(|engine| slot_host_valid_from_folded(engine, owner, tag))
@@ -2620,6 +2688,16 @@ mod tests {
         })?;
         let signature = placeholder_rx_signature(current_pubkey);
         Ok((pending, signature, owner, current_pubkey))
+    }
+
+    /// Tip hash paired with `seeded_receive_pending` tip_height=40.
+    const SEEDED_RECEIVE_TIP_HASH: [u8; 32] = [0x40; 32];
+
+    fn seeded_receive_build_tip() -> BlockAnchor {
+        BlockAnchor {
+            block_hash: SEEDED_RECEIVE_TIP_HASH,
+            height: 40,
+        }
     }
 
     /// Concurrent scanner append lands **during** the prove window (after
@@ -2675,16 +2753,12 @@ mod tests {
         );
 
         let publisher = RecordingPublisher::new();
-        let build_tip = BlockAnchor {
-            block_hash: [0xBB; 32],
-            height: 40,
-        };
         let outcome = commit_proved_receive(
             &adapter,
             proved,
             signature,
             &publisher,
-            build_tip,
+            seeded_receive_build_tip(),
         )
         .await
         .expect("receive must commit despite concurrent append during prove");
@@ -2767,17 +2841,12 @@ mod tests {
                 })
                 .expect("concurrent post-broadcast append");
         });
-        let build_tip = BlockAnchor {
-            block_hash: [0xCC; 32],
-            height: 40,
-        };
-
         let outcome = commit_proved_receive(
             &adapter,
             proved,
             signature,
             &publisher,
-            build_tip,
+            seeded_receive_build_tip(),
         )
         .await
         .expect(
@@ -2804,14 +2873,361 @@ mod tests {
         clear_process_stack_mode_for_test();
     }
 
+    /// Stale / forged caller-supplied `build_tip` must fail at apply commit —
+    /// tip identity is a commit dependency even though it is never read from
+    /// the engine (it is handed in by the caller).
+    #[tokio::test]
+    async fn stale_build_tip_rejected_at_apply() {
+        use crate::test_db::setup_pool;
+        use crate::v11::separation::claim_stack_scan_mode;
+        use crate::v11::EngineAdapter;
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim");
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("adapter");
+
+        let (pending, signature, owner, _pk) = seeded_receive_pending(&adapter)
+            .await
+            .expect("seed pending");
+        let proved = hollow_proved_pending(pending, signature.clone()).expect("hollow prove");
+        let publisher = RecordingPublisher::new();
+
+        // Wrong hash at the correct height.
+        let stale_hash = BlockAnchor {
+            block_hash: [0xDE; 32],
+            height: 40,
+        };
+        let err = commit_proved_receive(
+            &adapter,
+            proved.clone(),
+            signature.clone(),
+            &publisher,
+            stale_hash,
+        )
+        .await
+        .expect_err("stale build_tip hash must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("build_tip") && msg.contains("tip_hash"),
+            "expected tip_hash mismatch, got: {msg}"
+        );
+
+        // Wrong height at the correct hash.
+        let stale_height = BlockAnchor {
+            block_hash: SEEDED_RECEIVE_TIP_HASH,
+            height: 39,
+        };
+        let err = commit_proved_receive(&adapter, proved, signature, &publisher, stale_height)
+            .await
+            .expect_err("stale build_tip height must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("build_tip") && msg.contains("tip_height"),
+            "expected tip_height mismatch, got: {msg}"
+        );
+
+        // Nothing durable should have been written.
+        adapter.with_engine(|engine| {
+            assert!(
+                engine.account(&owner).is_none(),
+                "failed apply must not credit the account"
+            );
+        });
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Outcome fields describe only this transition: an unrelated pre-existing
+    /// spendable coin must not appear in `admitted_coin_ids`, and
+    /// `new_send_counter` comes from the proved witness (not a global live
+    /// re-read of "all spendable").
+    #[tokio::test]
+    async fn outcome_fields_scoped_to_this_transition_with_unrelated_coin() {
+        use crate::test_db::setup_pool;
+        use crate::v11::separation::claim_stack_scan_mode;
+        use crate::v11::EngineAdapter;
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim");
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("adapter");
+
+        // First receive admits coin A.
+        let (pending_a, sig_a, owner, pk0) = seeded_receive_pending(&adapter)
+            .await
+            .expect("seed A");
+        let coin_a = pending_a.witness_wip.received_coins[0].clone();
+        let coin_a_id = host::digest_to_bytes(&coin_a.identifier);
+        let next_pk = pending_a.witness_wip.new_account_state.current_pubkey;
+        let nk = pending_a.witness_wip.nk;
+        let create_prev_a = pending_a.witness_wip.received_auth[0].creating_prev_ash;
+        let proved_a = hollow_proved_pending(pending_a, sig_a.clone()).expect("hollow A");
+        let outcome_a = commit_proved_receive(
+            &adapter,
+            proved_a,
+            sig_a,
+            &RecordingPublisher::new(),
+            seeded_receive_build_tip(),
+        )
+        .await
+        .expect("commit A");
+        assert_eq!(outcome_a.admitted_coin_ids, vec![coin_a_id]);
+        assert_eq!(outcome_a.new_send_counter, 1);
+
+        // Fold A's nullifier; inject unrelated spendable coin U.
+        let (recv_r, last_proof, last_nav) = adapter.with_engine(|engine| {
+            let rec = engine.account(&owner).expect("A credited");
+            let nf = rec.last_nullifier.clone().expect("A nullifier");
+            (
+                nf.signature_r,
+                rec.last_proof.clone().expect("last proof"),
+                rec.last_nav_opening.expect("last nav"),
+            )
+        });
+        adapter
+            .with_engine_mut(|engine| {
+                engine
+                    .append_nullifier(scanned(30, 0, pk0, recv_r))
+                    .expect("fold A nullifier");
+                engine.set_tip_height(40);
+            })
+            .expect("fold A");
+
+        let unrel_create_ash = digest_label(b"unrel-prev");
+        let unrel_asset = host::asset_id_v1(
+            host::GENESIS_TAG,
+            &xonly_from_label(b"v11-rx/unrel/pk"),
+            &[0x77; 32],
+            2,
+            1,
+        );
+        let unrel_amount = 3u128;
+        let unrel_coin_id =
+            host::coin_identifier(unrel_create_ash, &owner.0, unrel_asset, unrel_amount, 0);
+        let unrel_coin = Coin {
+            identifier: unrel_coin_id,
+            recipient: owner,
+            amount: unrel_amount,
+            asset_id: unrel_asset,
+        };
+        let unrel_id_bytes = host::digest_to_bytes(&unrel_coin_id);
+
+        adapter
+            .with_engine_mut(|engine| {
+                let mut hist = host::CoinHistTree::new();
+                hist.admit(coin_a_id).expect("admit A");
+                hist.admit(unrel_id_bytes).expect("admit U");
+                let ch_root = hist.root();
+                let mut balances = std::collections::BTreeMap::new();
+                balances.insert(host::digest_to_bytes(&coin_a.asset_id), coin_a.amount);
+                balances.insert(host::digest_to_bytes(&unrel_asset), unrel_amount);
+                let state = host::AccountState::new(
+                    owner,
+                    host::nk_commit(&nk),
+                    balances,
+                    next_pk,
+                    1,
+                    ch_root,
+                )
+                .expect("state with U");
+                let mut spendable = std::collections::BTreeMap::new();
+                spendable.insert(
+                    coin_a_id,
+                    TrackedCoin {
+                        coin: coin_a.clone(),
+                        creating_prev_ash: create_prev_a,
+                        coin_index: 0,
+                    },
+                );
+                spendable.insert(
+                    unrel_id_bytes,
+                    TrackedCoin {
+                        coin: unrel_coin,
+                        creating_prev_ash: unrel_create_ash,
+                        coin_index: 0,
+                    },
+                );
+                let last_nf = engine
+                    .account(&owner)
+                    .expect("A")
+                    .last_nullifier
+                    .clone();
+                let record = AccountRecord {
+                    state,
+                    coinhist: hist,
+                    nk,
+                    genesis_pubkey: pk0,
+                    spendable,
+                    spent_ids: std::collections::BTreeSet::new(),
+                    last_proof: Some(last_proof),
+                    last_nav_opening: Some(last_nav),
+                    last_nullifier: last_nf,
+                    last_nullifier_pos: None, // NfLog is authoritative after fold
+                };
+                let rebuilt = StateEngine::from_persisted(
+                    engine.network(),
+                    engine.activation_height(),
+                    engine.tip_height(),
+                    engine.fold_seq(),
+                    engine.nflog_mirror(),
+                    vec![(owner, record)],
+                )
+                .expect("rebuild with U");
+                *engine = rebuilt;
+            })
+            .expect("inject U");
+
+        let live_spendable_before = adapter.with_engine(|engine| {
+            engine
+                .account(&owner)
+                .expect("acc")
+                .spendable
+                .len()
+        });
+        assert_eq!(
+            live_spendable_before, 2,
+            "A + U must both be spendable before the second receive"
+        );
+
+        // Second receive: coin B (AccountUpdate). A global spendable read would
+        // list A, U, and B; outcome must list only B.
+        let tag_b = 2u8;
+        let (sk_b, pk_pt_b, create_pk_b) =
+            zkcoins_prover::prover_bridge::test_signing::normalized_key(
+                zkcoins_prover::prover_bridge::test_signing::deterministic_secret(&[
+                    b'K', tag_b, b's', b'k',
+                ]),
+            );
+        let creating_prev_b = digest_label(&[b'p', tag_b]);
+        let asset_b = host::asset_id_v1(host::GENESIS_TAG, &create_pk_b, &[tag_b; 32], 2, 1);
+        let amount_b = 10u128 + u128::from(tag_b);
+        let coin_b_id = host::coin_identifier(creating_prev_b, &owner.0, asset_b, amount_b, 0);
+        let coin_b_id_bytes = host::digest_to_bytes(&coin_b_id);
+        let empty_nav = Nav {
+            size: 0,
+            mth: host::nflog_empty(),
+        };
+        let nav_rand_b = [tag_b; 32];
+        let pd_b = ProofData {
+            new_account_state_hash: digest_label(&[b'a', tag_b]),
+            output_coins_root: host::merkle_root(TreeKind::CoinsRoot, &[coin_b_id]),
+            input_nullifiers_root: host::merkle_root(TreeKind::NullifiersRoot, &[]),
+            coin_history_root: host::coinhist_empty_root(),
+            nav_commitment: host::nav_commitment(empty_nav.root(), &nav_rand_b),
+            npk_commit: [tag_b; 32],
+        };
+        let create_sig_b = zkcoins_prover::prover_bridge::test_signing::sign_transition(
+            sk_b,
+            pk_pt_b,
+            &pd_b,
+            Network::Regtest,
+        );
+        let create_r_b = create_sig_b.transition.signature_r();
+        adapter
+            .with_engine_mut(|engine| {
+                // Strictly after prior folds (creating@20, A@30).
+                engine
+                    .append_nullifier(scanned(31, 0, create_pk_b, create_r_b))
+                    .expect("fold creating B");
+                engine.set_tip_height(40);
+            })
+            .expect("seed B creating");
+        adapter
+            .set_tip_hash(SEEDED_RECEIVE_TIP_HASH)
+            .expect("tip hash");
+
+        let slot_b = adapter
+            .with_engine(|engine| slot_host_valid_from_folded(engine, owner, tag_b))
+            .expect("slot B");
+        assert_eq!(
+            host::digest_to_bytes(&slot_b.coin.identifier),
+            coin_b_id_bytes
+        );
+        let next_pk2 = xonly_from_label(b"v11-rx/race/sk2");
+        let pending_b = adapter
+            .with_engine(|engine| {
+                verify_and_begin_receive(
+                    engine,
+                    V11ReceiveRequest {
+                        owner,
+                        nk,
+                        current_pubkey: next_pk,
+                        slots: vec![slot_b],
+                        next_pubkey: next_pk2,
+                        nav_rand: [0x51; 32],
+                        npk_rand: [0x52; 32],
+                    },
+                )
+            })
+            .expect("begin receive B");
+        assert_eq!(pending_b.witness_wip.new_account_state.send_counter, 2);
+        let sig_b = placeholder_rx_signature(next_pk);
+        let proved_b = hollow_proved_pending(pending_b, sig_b.clone()).expect("hollow B");
+        let outcome_b = commit_proved_receive(
+            &adapter,
+            proved_b,
+            sig_b,
+            &RecordingPublisher::new(),
+            seeded_receive_build_tip(),
+        )
+        .await
+        .expect("commit B");
+
+        assert_eq!(
+            outcome_b.admitted_coin_ids,
+            vec![coin_b_id_bytes],
+            "admitted_coin_ids must list only this transition's received coins"
+        );
+        assert_eq!(outcome_b.new_send_counter, 2);
+        adapter.with_engine(|engine| {
+            let rec = engine.account(&owner).expect("acc");
+            assert_eq!(
+                rec.spendable.len(),
+                3,
+                "live spendable still holds A + U + B"
+            );
+            assert!(rec.spendable.contains_key(&coin_a_id));
+            assert!(rec.spendable.contains_key(&unrel_id_bytes));
+            assert!(rec.spendable.contains_key(&coin_b_id_bytes));
+            assert_eq!(rec.state.send_counter, 2);
+        });
+
+        clear_process_stack_mode_for_test();
+    }
+
     /// Production entry: [`verify_and_begin_receive`] → hollow prove stand-in
     /// → [`commit_proved_receive`] (apply + atomic persist + publisher) →
-    /// boot reload. Real Plonky2 prove is covered by the ignored engine e2e;
-    /// this test covers the node orchestration surface without bitcoind.
+    /// boot reload.
     ///
-    /// **Stopping point:** `RecordingPublisher` fakes construct/broadcast —
-    /// no live bitcoind / chain inclusion. Scanner fold of the own nullifier
-    /// is a separate step (asserted Absent here).
+    /// ## Production-path boundary (default suite vs ignored genuine prove)
+    ///
+    /// | Stage | Default suite (this test) | Ignored genuine-prove variant |
+    /// |-------|---------------------------|-------------------------------|
+    /// | Host clause-10 + `begin_receive` | yes | yes |
+    /// | Plonky2 proof validity | **no** (hollow stand-in) | yes |
+    /// | Apply + live revalidation | yes | yes |
+    /// | Atomic engine + `members_ready` persist | yes | yes |
+    /// | Publisher construct/broadcast | **fake only** (`RecordingPublisher`) | **fake only** (`RecordingPublisher`) |
+    /// | Real publisher / live bitcoind | **no** | **no** |
+    /// | Chain inclusion + scanner fold of own nullifier | **no** (asserted Absent) | **no** (engine e2e elsewhere) |
+    ///
+    /// The default suite establishes neither proof validity nor real publisher
+    /// construction — only orchestration under the fake publisher double.
     #[tokio::test]
     async fn production_path_receive_begin_finalise_publish_persist_reload() {
         use crate::test_db::setup_pool;
@@ -2843,13 +3259,15 @@ mod tests {
 
         let proved = hollow_proved_pending(pending, signature.clone()).expect("prove stand-in");
         let publisher = RecordingPublisher::new();
-        let build_tip = BlockAnchor {
-            block_hash: [0xDD; 32],
-            height: 40,
-        };
-        let outcome = commit_proved_receive(&adapter, proved, signature, &publisher, build_tip)
-            .await
-            .expect("commit + persist + publish");
+        let outcome = commit_proved_receive(
+            &adapter,
+            proved,
+            signature,
+            &publisher,
+            seeded_receive_build_tip(),
+        )
+        .await
+        .expect("commit + persist + publish");
 
         assert_eq!(outcome.nullifier.0, current_pubkey);
         assert_eq!(outcome.new_send_counter, 1);
@@ -2883,9 +3301,11 @@ mod tests {
     /// Heavy production path with a **genuine** Plonky2 prove, entered through
     /// [`verify_and_begin_receive`] and [`finalise_publish_persist`].
     ///
-    /// **Stopping point:** `RecordingPublisher` substitutes for bitcoind —
-    /// construct/broadcast are faked; chain inclusion / scanner fold are not
-    /// exercised here (engine e2e covers scan-fold of the own nullifier).
+    /// Boundary: same table as
+    /// [`production_path_receive_begin_finalise_publish_persist_reload`] except
+    /// Plonky2 proof validity is yes. Publisher construct/broadcast remains the
+    /// fake `RecordingPublisher` only — neither this nor the default suite
+    /// establishes real publisher construction or chain inclusion.
     #[tokio::test]
     #[ignore = "heavy: real Plonky2 prove for mint+send+receive (minutes); run with --ignored --release"]
     async fn production_path_receive_with_genuine_prove_via_verify_and_begin() {
@@ -3143,11 +3563,14 @@ mod tests {
             &pending_rx.proof_data,
             Network::Testnet,
         );
-        let publisher = RecordingPublisher::new();
+        // Align caller-supplied build_tip with the live adapter tip identity.
+        let tip_hash = [0xEE; 32];
+        adapter.set_tip_hash(tip_hash).expect("set tip_hash for commit");
         let build_tip = BlockAnchor {
-            block_hash: [0xEE; 32],
+            block_hash: tip_hash,
             height: 120,
         };
+        let publisher = RecordingPublisher::new();
         let outcome = finalise_publish_persist(
             &adapter,
             pending_rx,

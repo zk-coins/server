@@ -1498,8 +1498,17 @@ impl StateEngine {
     }
 
     /// Re-check every live-engine input that `begin_*` / clause-10 / prove
-    /// decisions depend on. Derived by tracing engine reads from pending
-    /// construction through apply (not by extending an ad-hoc checklist):
+    /// decisions depend on. Derived by tracing what the **commit depends on**
+    /// (engine reads from pending construction through apply), not by
+    /// extending an ad-hoc checklist.
+    ///
+    /// **Scope of this method:** live engine state only. Caller-supplied
+    /// durable fields that never touch the engine (e.g. receive-path
+    /// `build_tip` vs adapter tip identity, commit signature vs proved
+    /// envelope) are revalidated at the node commit boundary — see
+    /// `node::v11::receive::commit_proved_receive`. A pure "what did we
+    /// read?" derivation misses those; the full method is "everything the
+    /// durable commit depends on".
     ///
     /// | Live read | Where baked | Re-check here |
     /// |-----------|-------------|---------------|
@@ -1512,10 +1521,11 @@ impl StateEngine {
     /// | own Pk absent (apply guard) | — | checked later in apply body |
     /// | CoinHist leaf collisions / root | apply body | sequential rebuild below |
     ///
-    /// Tip is not compared for equality: the only tip-dependent decision is
-    /// `size_final(tip)`, which is rechecked directly. A concurrent tip
-    /// advance that only grows `size_final` leaves a still-valid proved NAV
-    /// as a canonical prefix (`size ≤ size_final`).
+    /// Tip is not compared for equality here: the only tip-dependent *engine*
+    /// decision is `size_final(tip)`, which is rechecked directly. A concurrent
+    /// tip advance that only grows `size_final` leaves a still-valid proved NAV
+    /// as a canonical prefix (`size ≤ size_final`). (Caller-supplied
+    /// `build_tip` identity is a separate node-layer check.)
     fn revalidate_pending_against_live(&self, pending: &PendingTransition) -> Result<()> {
         self.validate_pending_envelope(pending)?;
 
