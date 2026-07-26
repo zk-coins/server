@@ -4,11 +4,25 @@
 //! snapshot / reload it. Stage 2 folds NfLog survivors through this
 //! adapter (`scan` / `main::run_v11_scan_loop`). Wallet signing and
 //! prove-path REST remain Stage 3.
+//!
+//! ## Write serialisation (receive ↔ scanner)
+//!
+//! Receive and scanner each take a pre-mutation snapshot, mutate memory,
+//! release the engine mutex, await durable persist, and may later restore
+//! their snapshot on persist failure. Without a shared gate those restores
+//! race: a scanner persist failure can roll back a receive that already
+//! committed (or vice versa).
+//!
+//! [`Self::lock_writes`] is an async mutex held for the full
+//! snapshot → mutate → persist → optional-restore critical section. Only
+//! one participant may occupy that window at a time; that is what enforces
+//! the ordering.
 
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use sqlx::PgPool;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use zkcoins_program::circuit::compliance::Network;
 use zkcoins_prover::prover_bridge::ProverBridge;
 use zkcoins_prover::state_engine::StateEngine;
@@ -28,6 +42,8 @@ struct LiveEngine {
 /// Flag-gated handle: node process ↔ v1.1 StateEngine + shadow persistence.
 pub struct EngineAdapter {
     live: Mutex<LiveEngine>,
+    /// Serialises snapshot→mutate→persist→restore across receive and scanner.
+    write_gate: AsyncMutex<()>,
     pool: PgPool,
     network: Network,
     activation_height: u64,
@@ -54,6 +70,7 @@ impl EngineAdapter {
                         engine,
                         tip_hash: [0u8; 32],
                     }),
+                    write_gate: AsyncMutex::new(()),
                     pool,
                     network,
                     activation_height,
@@ -86,6 +103,7 @@ impl EngineAdapter {
                     .context("EngineAdapter: reconstruct StateEngine from snapshot")?;
                 Ok(Self {
                     live: Mutex::new(LiveEngine { engine, tip_hash }),
+                    write_gate: AsyncMutex::new(()),
                     pool,
                     network,
                     activation_height,
@@ -116,11 +134,25 @@ impl EngineAdapter {
         self.activation_height
     }
 
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     pub fn tip_hash(&self) -> [u8; 32] {
         self.live
             .lock()
             .expect("EngineAdapter mutex poisoned")
             .tip_hash
+    }
+
+    /// Acquire the exclusive write gate that serialises receive and scanner
+    /// snapshot→mutate→persist→restore critical sections.
+    ///
+    /// Hold for the entire window that ends either with a durable commit or
+    /// with a restore of the pre-mutation snapshot. Releasing earlier re-opens
+    /// the cross-participant rollback race.
+    pub async fn lock_writes(&self) -> AsyncMutexGuard<'_, ()> {
+        self.write_gate.lock().await
     }
 
     /// Update the tip block hash (height remains on the engine via
@@ -163,7 +195,8 @@ impl EngineAdapter {
     ///
     /// Callers that also persist **must** restore via [`Self::restore_live`]
     /// if the durable write fails (see [`super::scan::apply_forward_scan`]);
-    /// this method alone does not open a DB transaction.
+    /// this method alone does not open a DB transaction. Hold
+    /// [`Self::lock_writes`] across the mutate+persist+restore window.
     pub fn with_engine_mut<R>(&self, f: impl FnOnce(&mut StateEngine) -> R) -> Result<R> {
         require_v11_process_for_nflog_write()
             .context("EngineAdapter::with_engine_mut: stack claim required")?;

@@ -253,6 +253,10 @@ pub fn replace_engine_nflog_from_survivors(
 /// Mutates memory only after a successful durable write would be wrong —
 /// this path snapshots the live engine, mutates, persists, and **restores**
 /// the snapshot if persist fails so the adapter never advances past Postgres.
+///
+/// Holds [`EngineAdapter::lock_writes`] for the full snapshot→mutate→persist
+/// →restore window so a concurrent receive cannot have its committed work
+/// rolled back by this path's restore (and vice versa).
 pub async fn apply_forward_scan(
     adapter: &EngineAdapter,
     tip_height: u64,
@@ -260,6 +264,7 @@ pub async fn apply_forward_scan(
     new_survivors: &[PublishedNullifier],
 ) -> Result<FoldStats> {
     require_v11_process_for_nflog_write()?;
+    let _write_gate = adapter.lock_writes().await;
     let backup = adapter.snapshot_live();
 
     let stats = match adapter.with_engine_mut(|engine| -> Result<FoldStats> {
@@ -304,7 +309,8 @@ pub async fn apply_forward_scan(
 /// (or post-rescan) survivor stream.
 ///
 /// Same memory-before-persist safety as [`apply_forward_scan`]: restore
-/// the pre-mutation snapshot if durable write fails.
+/// the pre-mutation snapshot if durable write fails. Same write-gate
+/// serialisation against receive.
 pub async fn apply_canonical_survivors(
     adapter: &EngineAdapter,
     tip_height: u64,
@@ -312,6 +318,7 @@ pub async fn apply_canonical_survivors(
     survivors: &[PublishedNullifier],
 ) -> Result<FoldStats> {
     require_v11_process_for_nflog_write()?;
+    let _write_gate = adapter.lock_writes().await;
     let backup = adapter.snapshot_live();
 
     let stats = match adapter.with_engine_mut(|engine| {
