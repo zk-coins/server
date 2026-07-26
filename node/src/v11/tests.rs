@@ -18,7 +18,8 @@ use super::mode::{
 };
 use super::separation::{
     claim_stack_scan_mode, clear_process_stack_mode_for_test, enforce_stack_scan_mode,
-    ScanStackMode, STACK_CAPABILITY_REFUSAL, STACK_SEPARATION_REFUSAL,
+    load_stack_scan_mode, set_process_stack_mode, ScanStackMode, STACK_CAPABILITY_REFUSAL,
+    STACK_SEPARATION_REFUSAL,
 };
 use super::EngineAdapter;
 use crate::test_db::setup_pool;
@@ -304,10 +305,14 @@ async fn restart_identity_nflog_and_coinhist_roots() {
     assert_eq!(adapter_ch, before_coinhist);
 
     // Mutate in memory, persist, reload — identity tracks the new state.
-    adapter.with_engine_mut(|eng| {
-        eng.append_nullifier(pos(30, 0), pk(9), r_val(99))
-            .expect("append fourth nullifier");
-    });
+    // with_engine_mut requires a v1.1 process claim.
+    set_process_stack_mode(ScanStackMode::V11);
+    adapter
+        .with_engine_mut(|eng| {
+            eng.append_nullifier(pos(30, 0), pk(9), r_val(99))
+                .expect("append fourth nullifier");
+        })
+        .expect("with_engine_mut under v11 claim");
     let (mid_nflog, mid_ch) = adapter.identity_roots();
     assert_ne!(mid_nflog, before_nflog_root);
     assert_eq!(mid_ch, before_coinhist); // accounts unchanged
@@ -317,6 +322,7 @@ async fn restart_identity_nflog_and_coinhist_roots() {
     assert_eq!(final_nflog, mid_nflog);
     assert_eq!(final_ch, mid_ch);
     assert_eq!(adapter.tip_hash(), tip_hash);
+    clear_process_stack_mode_for_test();
 }
 
 #[tokio::test]
@@ -439,7 +445,10 @@ async fn tip_hash_survives_persist_reload() {
     let fork_b = [0xBB; 32];
     assert_ne!(fork_a, fork_b);
 
-    adapter.with_engine_mut(|eng| eng.set_tip_height(42));
+    set_process_stack_mode(ScanStackMode::V11);
+    adapter
+        .with_engine_mut(|eng| eng.set_tip_height(42))
+        .expect("with_engine_mut under v11 claim");
     adapter.set_tip_hash(fork_a);
     adapter.persist().await.expect("persist fork A");
 
@@ -460,6 +469,7 @@ async fn tip_hash_survives_persist_reload() {
         42,
         "height alone cannot distinguish the fork"
     );
+    clear_process_stack_mode_for_test();
 }
 
 // ---------------------------------------------------------------------------
@@ -468,10 +478,56 @@ async fn tip_hash_survives_persist_reload() {
 
 use super::scan::{
     apply_canonical_survivors, fold_survivors_into_engine, members_to_published,
-    reconcile_persisted_tip, sort_canonical, PersistedTipReconciliation,
+    reconcile_persisted_tip, sort_canonical, MAX_RECOVERABLE_REORG_DEPTH,
+    PersistedTipReconciliation, ResolvedBlock,
 };
 use super::separation::{ensure_legacy_publisher_allowed, ensure_v11_publisher_allowed};
 use shared::spec_v1::{LookupResult, PublishedNullifier};
+
+/// Test double: a linear "old" chain of block hashes for offline recon.
+/// `chain[h]` is the hash at height h; parents link via prev = chain[h-1].
+fn mock_chain(len: usize, seed: u8) -> Vec<[u8; 32]> {
+    (0..len)
+        .map(|h| {
+            let mut hash = [0u8; 32];
+            hash[0] = seed;
+            hash[1] = (h & 0xff) as u8;
+            hash[2] = ((h >> 8) & 0xff) as u8;
+            hash
+        })
+        .collect()
+}
+
+fn resolve_from_chain(
+    chain: &[[u8; 32]],
+    hash: [u8; 32],
+) -> anyhow::Result<Option<ResolvedBlock>> {
+    match chain.iter().position(|h| *h == hash) {
+        None => Ok(None),
+        Some(height) => {
+            let prev_hash = if height == 0 {
+                [0u8; 32]
+            } else {
+                chain[height - 1]
+            };
+            Ok(Some(ResolvedBlock {
+                height: height as u64,
+                prev_hash,
+            }))
+        }
+    }
+}
+
+fn live_from_chain(
+    chain: &[[u8; 32]],
+    height: u64,
+) -> anyhow::Result<Option<[u8; 32]>> {
+    let tip = chain.len().saturating_sub(1) as u64;
+    if height > tip {
+        return Ok(None);
+    }
+    Ok(Some(chain[height as usize]))
+}
 
 /// Seed one `mmr_root_index` row — the durable signal of legacy scan activity.
 async fn seed_legacy_scan_state(pool: &sqlx::PgPool) {
@@ -725,9 +781,9 @@ async fn resume_pending_inscriptions_refuses_under_v11_claim() {
     clear_process_stack_mode_for_test();
 }
 
-/// Defect 3: persist state, simulate a reorg that invalidates the tip,
-/// restart apply path, assert accumulator equals a continuously-running
-/// full-replace from the new canonical stream.
+/// Offline reorg of depth ≤ 5: restart rebuilds NfLog to match an
+/// **independent** continuous-node oracle (sequential fold, never the
+/// restart/replace path under test).
 #[tokio::test]
 async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     clear_process_stack_mode_for_test();
@@ -737,11 +793,39 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
         .await
         .expect("claim v11");
 
+    // Shared prefix heights 0..=10; height 11 diverges (depth-1 shallow reorg).
+    let mut old_chain = mock_chain(12, 0xAA);
+    let mut new_chain = mock_chain(12, 0xBB);
+    for h in 0..=10 {
+        let shared = {
+            let mut hash = [0u8; 32];
+            hash[0] = 0x11;
+            hash[1] = h as u8;
+            hash
+        };
+        old_chain[h] = shared;
+        new_chain[h] = shared;
+    }
+    old_chain[11] = {
+        let mut h = [0u8; 32];
+        h[0] = 0xAA;
+        h[1] = 11;
+        h
+    };
+    new_chain[11] = {
+        let mut h = [0u8; 32];
+        h[0] = 0xBB;
+        h[1] = 11;
+        h
+    };
+    let old_tip_hash = old_chain[11];
+    let new_tip_hash = new_chain[11];
+    assert_ne!(old_tip_hash, new_tip_hash);
+
     // --- Persist old-fork state (what a node would hold before crash) ---
     let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
         .await
         .expect("adapter");
-    let old_tip_hash = [0xAA; 32];
     let fork_survivors = members_to_published(
         10,
         0,
@@ -749,7 +833,6 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
         &[(pk(1), r_val(1)), (pk(2), r_val(2))],
     )
     .expect("old fork members");
-    // Height 11 has a third nullifier that will be orphaned by the reorg.
     let mut orphaned = members_to_published(11, 0, 0, &[(pk(3), r_val(3))]).expect("orphan");
     let mut old_stream = fork_survivors.clone();
     old_stream.append(&mut orphaned);
@@ -761,22 +844,19 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     assert_eq!(adapter.with_engine(|e| e.nflog().nav().size), 3);
 
     // --- New canonical stream after reorg (pk3 orphaned, pk4 wins at 11) ---
-    let new_tip_hash = [0xBB; 32];
-    assert_ne!(old_tip_hash, new_tip_hash);
     let mut new_stream = fork_survivors;
     let mut replacement =
         members_to_published(11, 0, 0, &[(pk(4), r_val(4))]).expect("replacement");
     new_stream.append(&mut replacement);
 
-    // Continuous-node oracle: pure in-memory full-replace (no DB write yet).
+    // Independent continuous-node oracle: sequential first-occurrence fold
+    // the way a node that never restarted would accumulate — never calls
+    // replace_engine_nflog_from_survivors (the path under test).
     let mut continuous_engine = StateEngine::new(Network::Regtest, 0);
-    super::scan::replace_engine_nflog_from_survivors(
-        &mut continuous_engine,
-        11,
-        new_tip_hash,
-        &new_stream,
-    )
-    .expect("continuous replace");
+    continuous_engine.set_tip_height(11);
+    let cont_stats = fold_survivors_into_engine(&mut continuous_engine, &new_stream)
+        .expect("continuous sequential fold");
+    assert_eq!(cont_stats.appended, 3);
     let continuous_root =
         host::digest_to_bytes(&continuous_engine.nflog().nav().root());
     assert_eq!(continuous_engine.nflog().nav().size, 3);
@@ -790,13 +870,26 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     ));
     assert_ne!(continuous_root, old_root, "reorg must change the NfLog root");
 
-    // --- Restart path: reconciling the persisted tip sees divergence ---
-    let recon = reconcile_persisted_tip(11, old_tip_hash, |_h| Ok(Some(new_tip_hash)))
-        .expect("recon");
-    assert!(
-        matches!(recon, PersistedTipReconciliation::MustFullReplace { .. }),
-        "diverged tip must force full replace; got {recon:?}"
-    );
+    // --- Restart path: reconciling the persisted tip sees a shallow reorg ---
+    let recon = reconcile_persisted_tip(
+        11,
+        old_tip_hash,
+        0,
+        |h| live_from_chain(&new_chain, h),
+        |hash| resolve_from_chain(&old_chain, hash),
+    )
+    .expect("shallow recon");
+    match recon {
+        PersistedTipReconciliation::ShallowReorg {
+            reorg_depth,
+            ancestor_height,
+            ..
+        } => {
+            assert_eq!(reorg_depth, 1, "single-block tip reorg");
+            assert_eq!(ancestor_height, 10);
+        }
+        other => panic!("expected ShallowReorg, got {other:?}"),
+    }
 
     // Fresh adapter load (simulates process restart) still holds old tip.
     let restarted = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
@@ -805,18 +898,7 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     assert_eq!(restarted.tip_hash(), old_tip_hash);
     assert_eq!(restarted.identity_roots().0, old_root);
 
-    let recon2 = reconcile_persisted_tip(
-        restarted.with_engine(|e| e.tip_height()),
-        restarted.tip_hash(),
-        |_h| Ok(Some(new_tip_hash)),
-    )
-    .expect("recon2");
-    assert!(matches!(
-        recon2,
-        PersistedTipReconciliation::MustFullReplace { .. }
-    ));
-
-    // MustFullReplace apply — same as a continuous node after live reorg.
+    // Shallow apply — must match the independent sequential oracle.
     apply_canonical_survivors(&restarted, 11, new_tip_hash, &new_stream)
         .await
         .expect("restart full replace");
@@ -824,7 +906,7 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     let (restarted_root, _) = restarted.identity_roots();
     assert_eq!(
         restarted_root, continuous_root,
-        "restarted node must match continuous-node NfLog after reorg"
+        "restarted node must match independent continuous-node NfLog after reorg"
     );
     assert_eq!(restarted.tip_hash(), new_tip_hash);
     restarted.with_engine(|e| {
@@ -836,21 +918,244 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     });
 
     // Still-canonical tip: forward path is selected (no full replace).
-    let recon_ok = reconcile_persisted_tip(11, new_tip_hash, |_h| Ok(Some(new_tip_hash)))
-        .expect("still canonical");
+    let recon_ok = reconcile_persisted_tip(
+        11,
+        new_tip_hash,
+        0,
+        |h| live_from_chain(&new_chain, h),
+        |hash| resolve_from_chain(&new_chain, hash),
+    )
+    .expect("still canonical");
     assert!(matches!(
         recon_ok,
         PersistedTipReconciliation::StillCanonical { .. }
     ));
 
     // Ambiguous tip (height>0, zero hash) refuses.
-    let err = reconcile_persisted_tip(5, [0u8; 32], |_| Ok(Some([1u8; 32])))
-        .expect_err("zero hash with height must refuse");
+    let err = reconcile_persisted_tip(
+        5,
+        [0u8; 32],
+        0,
+        |_| Ok(Some([1u8; 32])),
+        |_| Ok(None),
+    )
+    .expect_err("zero hash with height must refuse");
     assert!(
         format!("{err:#}").contains("all-zero"),
         "got: {err:#}"
     );
 
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 1: offline reorg deeper than the recoverable limit (§3.9 ≥6)
+/// refuses — no fold, explicit error (fail-stop, not silent recovery).
+#[test]
+fn offline_reorg_deeper_than_recoverable_limit_refuses() {
+    // Old tip at height 20; live chain diverged from height 14 upward
+    // → common ancestor at 14 → depth = 6 > MAX_RECOVERABLE_REORG_DEPTH (5).
+    let mut old_chain = mock_chain(21, 0xAA);
+    let mut live_chain = mock_chain(21, 0xBB);
+    for h in 0..=14 {
+        let shared = {
+            let mut hash = [0u8; 32];
+            hash[0] = 0x11;
+            hash[1] = h as u8;
+            hash
+        };
+        old_chain[h] = shared;
+        live_chain[h] = shared;
+    }
+    // Heights 15..=20 diverge.
+    for h in 15..=20 {
+        old_chain[h] = {
+            let mut hash = [0u8; 32];
+            hash[0] = 0xAA;
+            hash[1] = h as u8;
+            hash
+        };
+        live_chain[h] = {
+            let mut hash = [0u8; 32];
+            hash[0] = 0xBB;
+            hash[1] = h as u8;
+            hash
+        };
+    }
+    let old_tip = old_chain[20];
+    let err = reconcile_persisted_tip(
+        20,
+        old_tip,
+        0,
+        |h| live_from_chain(&live_chain, h),
+        |hash| resolve_from_chain(&old_chain, hash),
+    )
+    .expect_err("depth-6 offline reorg must refuse");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("exceeds recoverable limit")
+            || msg.contains("deep_reorg")
+            || msg.contains("≥6")
+            || msg.contains("no recovery"),
+        "must name §3.9 fail-stop; got: {msg}"
+    );
+    assert!(
+        msg.contains(&MAX_RECOVERABLE_REORG_DEPTH.to_string()) || msg.contains("depth 6"),
+        "must mention depth/limit; got: {msg}"
+    );
+}
+
+/// Unresolvable persisted tip (unknown / pruned hash) refuses — not a
+/// silent shallow-reorg assumption.
+#[test]
+fn unresolvable_persisted_tip_refuses() {
+    let err = reconcile_persisted_tip(
+        10,
+        [0xDE; 32],
+        0,
+        |_| Ok(Some([0xAD; 32])),
+        |_| Ok(None), // hash unknown
+    )
+    .expect_err("unknown tip hash must refuse");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("unknown") || msg.contains("pruned") || msg.contains("unresolvable"),
+        "got: {msg}"
+    );
+}
+
+/// Defect 2: legacy DB with only smt_state / mmr_state / latest_block
+/// (no mmr_root_index) cannot be claimed by v1.1.
+#[tokio::test]
+async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v11_claim() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+
+    // Seed durable legacy state the way persist_state_tx does when the
+    // optional root-index argument is None — no mmr_root_index row.
+    sqlx::query(
+        "INSERT INTO smt_state (id, data, updated_at) VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+    )
+    .bind([0x51u8; 16].as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed smt_state");
+    sqlx::query(
+        "INSERT INTO mmr_state (id, data, updated_at) VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+    )
+    .bind([0x52u8; 16].as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed mmr_state");
+    sqlx::query(
+        "INSERT INTO latest_block (id, block_hash, updated_at) VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE SET block_hash = EXCLUDED.block_hash",
+    )
+    .bind([0x53u8; 32].as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed latest_block");
+
+    // Sanity: mmr_root_index is still empty (the hole the old guard missed).
+    let (root_n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mmr_root_index")
+        .fetch_one(&pool)
+        .await
+        .expect("count root index");
+    assert_eq!(root_n, 0, "test requires no mmr_root_index rows");
+
+    let err = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+        .await
+        .expect_err("v1.1 must refuse legacy smt/mmr/latest_block without root index");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(STACK_SEPARATION_REFUSAL),
+        "must refuse with stack separation; got: {msg}"
+    );
+    assert!(
+        msg.contains("smt_state")
+            || msg.contains("mmr_state")
+            || msg.contains("latest_block")
+            || msg.contains("legacy"),
+        "must name legacy durable tables; got: {msg}"
+    );
+
+    // Marker must not have been claimed.
+    let marker = load_stack_scan_mode(&pool).await.expect("load marker");
+    assert!(marker.is_none(), "failed claim must leave marker unset");
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 3: both unguarded-looking broadcast entry points refuse under a
+/// v1.1 process claim (structural guard at the Esplora choke point).
+#[tokio::test]
+async fn broadcast_inscription_paths_refuse_under_v11_claim() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    enforce_stack_scan_mode(&scope.pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11");
+
+    // Minimal valid-looking txs (broadcast is refused before Esplora I/O).
+    let commit_tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![],
+    };
+    let reveal_tx = commit_tx.clone();
+    let config = crate::publisher::EsploraConfig {
+        url: "http://127.0.0.1:1/api".to_string(),
+        is_mainnet: false,
+        network_name: "regtest".to_string(),
+        ws_url: None,
+    };
+
+    let err1 = crate::publisher::broadcast_inscription_txs(&config, &commit_tx, &reveal_tx)
+        .await
+        .expect_err("broadcast_inscription_txs must refuse under v11");
+    let msg1 = err1.to_string();
+    assert!(
+        msg1.contains(STACK_SEPARATION_REFUSAL) || msg1.contains("v1.1"),
+        "got: {msg1}"
+    );
+
+    let err2 = crate::publisher::broadcast_inscription_txs_with_persistence(
+        &config,
+        &commit_tx,
+        &reveal_tx,
+        None,
+    )
+    .await
+    .expect_err("broadcast_inscription_txs_with_persistence must refuse under v11");
+    let msg2 = err2.to_string();
+    assert!(
+        msg2.contains(STACK_SEPARATION_REFUSAL) || msg2.contains("v1.1"),
+        "got: {msg2}"
+    );
+
+    clear_process_stack_mode_for_test();
+}
+
+/// Public `with_engine_mut` refuses without a v1.1 process claim.
+#[tokio::test]
+async fn with_engine_mut_refuses_without_v11_claim() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    claim_v11_marker(&pool).await;
+
+    let adapter = EngineAdapter::load_or_create(pool, Network::Regtest, 0)
+        .await
+        .expect("adapter");
+    let err = adapter
+        .with_engine_mut(|eng| eng.set_tip_height(1))
+        .expect_err("unguarded mut must refuse");
+    assert!(
+        format!("{err:#}").contains("refusing") || format!("{err:#}").contains("claim"),
+        "got: {err:#}"
+    );
     clear_process_stack_mode_for_test();
 }
 

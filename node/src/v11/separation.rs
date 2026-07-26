@@ -101,13 +101,33 @@ pub const STACK_SEPARATION_REFUSAL: &str = "stack separation: refusing to start"
 /// Canonical error prefix when a writer finds no matching marker in-tx.
 pub const STACK_CAPABILITY_REFUSAL: &str = "stack separation: refusing write";
 
-/// True when the legacy scanner has folded at least one commitment into
-/// the global MMR index (the durable signal of SMT-first-write activity).
+/// SQL: any durable legacy scan-stack row across **all** legacy tables.
+///
+/// `persist_state_tx` writes `smt_state` / `mmr_state` / `latest_block` even
+/// when no `mmr_root_index` entry is present, so emptiness must not be
+/// decided on the root-index alone.
+const LEGACY_SCAN_STATE_COUNT_SQL: &str = "SELECT \
+    (SELECT COUNT(*) FROM mmr_root_index) \
+  + (SELECT COUNT(*) FROM smt_state) \
+  + (SELECT COUNT(*) FROM mmr_state) \
+  + (SELECT COUNT(*) FROM latest_block)";
+
+/// SQL: any durable v1.1 scan-stack row across the six engine tables.
+const V11_SCAN_STATE_COUNT_SQL: &str = "SELECT \
+    (SELECT COUNT(*) FROM v11_engine_meta) \
+  + (SELECT COUNT(*) FROM v11_nflog_entries) \
+  + (SELECT COUNT(*) FROM v11_nullifier_index) \
+  + (SELECT COUNT(*) FROM v11_accounts) \
+  + (SELECT COUNT(*) FROM v11_spendable_coins) \
+  + (SELECT COUNT(*) FROM v11_spent_coins)";
+
+/// True when any durable legacy scan-stack table has rows
+/// (`mmr_root_index`, `smt_state`, `mmr_state`, `latest_block`).
 pub async fn legacy_scan_state_present(pool: &PgPool) -> Result<bool> {
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mmr_root_index")
+    let (n,): (i64,) = sqlx::query_as(LEGACY_SCAN_STATE_COUNT_SQL)
         .fetch_one(pool)
         .await
-        .context("count mmr_root_index for stack separation")?;
+        .context("count legacy scan tables for stack separation")?;
     Ok(n > 0)
 }
 
@@ -117,18 +137,10 @@ pub async fn legacy_scan_state_present(pool: &PgPool) -> Result<bool> {
 /// `v11_engine_meta`, and that must bind the database to v1.1 just as
 /// strongly as a non-empty NfLog.
 pub async fn v11_scan_state_present(pool: &PgPool) -> Result<bool> {
-    let (n,): (i64,) = sqlx::query_as(
-        "SELECT \
-            (SELECT COUNT(*) FROM v11_engine_meta) \
-          + (SELECT COUNT(*) FROM v11_nflog_entries) \
-          + (SELECT COUNT(*) FROM v11_nullifier_index) \
-          + (SELECT COUNT(*) FROM v11_accounts) \
-          + (SELECT COUNT(*) FROM v11_spendable_coins) \
-          + (SELECT COUNT(*) FROM v11_spent_coins)",
-    )
-    .fetch_one(pool)
-    .await
-    .context("count v11 tables for stack separation")?;
+    let (n,): (i64,) = sqlx::query_as(V11_SCAN_STATE_COUNT_SQL)
+        .fetch_one(pool)
+        .await
+        .context("count v11 tables for stack separation")?;
     Ok(n > 0)
 }
 
@@ -146,21 +158,43 @@ pub async fn load_stack_scan_mode(pool: &PgPool) -> Result<Option<ScanStackMode>
 }
 
 /// Persist the exclusive claim (idempotent when the same mode is already set).
+///
+/// Prefer [`enforce_stack_scan_mode`] for boot: that path checks emptiness
+/// and inserts the marker in **one** transaction. This helper remains for
+/// tests that seed a marker without the full boot gate.
 pub async fn claim_stack_scan_mode(pool: &PgPool, mode: ScanStackMode) -> Result<()> {
+    let mut tx = pool.begin().await.context("begin claim_stack_scan_mode tx")?;
+    claim_stack_scan_mode_in_tx(&mut tx, mode).await?;
+    tx.commit()
+        .await
+        .context("commit claim_stack_scan_mode tx")?;
+    Ok(())
+}
+
+async fn claim_stack_scan_mode_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    mode: ScanStackMode,
+) -> Result<()> {
     let result = sqlx::query(
         "INSERT INTO stack_scan_mode (id, mode, claimed_at) \
          VALUES (1, $1, NOW()) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(mode.as_str())
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("claim stack_scan_mode")?;
 
     if result.rows_affected() == 0 {
-        // Row already present — must match.
-        let existing = load_stack_scan_mode(pool)
-            .await?
+        // Row already present — must match. Re-read under the same tx.
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT mode FROM stack_scan_mode WHERE id = 1 FOR UPDATE")
+                .fetch_optional(&mut **tx)
+                .await
+                .context("load stack_scan_mode after claim conflict")?;
+        let existing = row
+            .map(|(m,)| ScanStackMode::parse(&m))
+            .transpose()?
             .context("stack_scan_mode row missing after conflict")?;
         if existing != mode {
             bail!(
@@ -222,6 +256,10 @@ pub async fn require_stack_mode_for_update(
 /// this database. Claims the marker **only** when the DB is still empty
 /// (no marker, no either-side scan data).
 ///
+/// Emptiness check (every durable table of **both** stacks) and marker
+/// insertion run in **one** transaction so a concurrent writer cannot
+/// insert stack data between the check and the claim.
+///
 /// # Failures (all loud, no fall-back)
 ///
 /// - Marker claims the opposite mode
@@ -229,16 +267,39 @@ pub async fn require_stack_mode_for_update(
 /// - Both sides have scan data (corrupt dual write)
 /// - **Any** stack data exists while the marker is missing (no auto-claim)
 pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> Result<()> {
-    let marker = load_stack_scan_mode(pool).await?;
-    let legacy_data = legacy_scan_state_present(pool).await?;
-    let v11_data = v11_scan_state_present(pool).await?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin enforce_stack_scan_mode transaction")?;
+
+    // Lock the marker row if present so concurrent enforcers serialise.
+    let marker_row: Option<(String,)> =
+        sqlx::query_as("SELECT mode FROM stack_scan_mode WHERE id = 1 FOR UPDATE")
+            .fetch_optional(&mut *tx)
+            .await
+            .context("lock stack_scan_mode for enforce")?;
+    let marker = match marker_row {
+        None => None,
+        Some((mode_s,)) => Some(ScanStackMode::parse(&mode_s)?),
+    };
+
+    let (legacy_n,): (i64,) = sqlx::query_as(LEGACY_SCAN_STATE_COUNT_SQL)
+        .fetch_one(&mut *tx)
+        .await
+        .context("count legacy scan tables inside enforce tx")?;
+    let (v11_n,): (i64,) = sqlx::query_as(V11_SCAN_STATE_COUNT_SQL)
+        .fetch_one(&mut *tx)
+        .await
+        .context("count v11 tables inside enforce tx")?;
+    let legacy_data = legacy_n > 0;
+    let v11_data = v11_n > 0;
 
     if legacy_data && v11_data {
         bail!(
             "{STACK_SEPARATION_REFUSAL}: database carries BOTH legacy \
-             mmr_root_index rows and v1.1 tables — mixed Commitment \
-             and AggregateStateNullifierV3 accumulators. Manual recovery \
-             required; refusing to start either path"
+             scan-stack rows (mmr_root_index/smt_state/mmr_state/latest_block) \
+             and v1.1 tables — mixed Commitment and AggregateStateNullifierV3 \
+             accumulators. Manual recovery required; refusing to start either path"
         );
     }
 
@@ -247,7 +308,9 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
     // leave v11_engine_meta under a later legacy claim).
     if marker.is_none() && (legacy_data || v11_data) {
         let which = match (legacy_data, v11_data) {
-            (true, false) => "legacy mmr_root_index",
+            (true, false) => {
+                "legacy scan-stack rows (mmr_root_index/smt_state/mmr_state/latest_block)"
+            }
             (false, true) => "v1.1 tables (meta/NfLog/accounts/coins)",
             _ => "stack data",
         };
@@ -282,7 +345,8 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
             if legacy_data {
                 bail!(
                     "{STACK_SEPARATION_REFUSAL} v1.1 scan stack: \
-                     legacy SMT/MMR scan state is present (mmr_root_index). \
+                     legacy SMT/MMR scan state is present \
+                     (mmr_root_index/smt_state/mmr_state/latest_block). \
                      An NfLog scanner must never fold into a database that \
                      already enforces Commitment first-write"
                 );
@@ -297,7 +361,11 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
         }
     }
 
-    claim_stack_scan_mode(pool, selected).await?;
+    // Claim inside the same transaction as the emptiness / marker checks.
+    claim_stack_scan_mode_in_tx(&mut tx, selected).await?;
+    tx.commit()
+        .await
+        .context("commit enforce_stack_scan_mode transaction")?;
     set_process_stack_mode(selected);
     Ok(())
 }
@@ -333,6 +401,25 @@ pub fn ensure_v11_publisher_allowed() -> Result<()> {
             "{STACK_SEPARATION_REFUSAL}: v1.1 publisher requires a process that \
              claimed ScanStackMode::V11 at boot (ZKCOINS_V11_SHADOW=1). \
              Refusing to publish without an exclusive stack claim"
+        ),
+    }
+}
+
+/// Require an exclusive v1.1 process claim before mutating NfLog state.
+///
+/// Unset process mode is **not** permitted: an unset mode previously
+/// allowed writes that later left v1.1 data under a legacy marker.
+/// Shared by scan apply paths and [`super::adapter::EngineAdapter::with_engine_mut`].
+pub fn require_v11_process_for_nflog_write() -> Result<()> {
+    match process_stack_mode() {
+        Some(ScanStackMode::V11) => Ok(()),
+        Some(ScanStackMode::Legacy) => bail!(
+            "stack separation: refusing to fold NfLog while process \
+             is claimed as legacy (no silent cross-stack write)"
+        ),
+        None => bail!(
+            "stack separation: refusing to fold NfLog without a process \
+             claim of ScanStackMode::V11 (no silent write under unset mode)"
         ),
     }
 }

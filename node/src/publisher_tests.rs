@@ -19,6 +19,16 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::test_db::{setup_pool, SchemaScope};
+use crate::v11::clear_process_stack_mode_for_test;
+
+/// Drop any process stack claim left by a concurrent test binary path.
+///
+/// The stack-mode static is process-wide; with `--test-threads>1` a v1.1
+/// claim from another test would otherwise trip the structural broadcast
+/// guard even for pure legacy publisher unit tests.
+fn ensure_legacy_process_for_publisher_test() {
+    clear_process_stack_mode_for_test();
+}
 
 /// Test publisher key used to produce deterministic Taproot addresses
 /// and signatures. The production `PUBLISHER_KEY` is now a required env
@@ -369,6 +379,7 @@ async fn get_publisher_utxo_returns_empty_when_total_below_minimum() {
 
 #[tokio::test]
 async fn broadcast_inscription_txs_returns_both_txids_on_success() {
+    ensure_legacy_process_for_publisher_test();
     let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
@@ -402,6 +413,7 @@ async fn broadcast_inscription_txs_returns_both_txids_on_success() {
 
 #[tokio::test]
 async fn broadcast_inscription_txs_propagates_esplora_error() {
+    ensure_legacy_process_for_publisher_test();
     let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
     let outpoints = vec![(fake_outpoint(0), 100_000u64)];
@@ -437,6 +449,7 @@ async fn broadcast_inscription_txs_propagates_esplora_error() {
 
 #[tokio::test]
 async fn create_and_broadcast_inscription_fails_when_no_utxos() {
+    ensure_legacy_process_for_publisher_test();
     let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
 
@@ -464,6 +477,7 @@ async fn create_and_broadcast_inscription_fails_when_no_utxos() {
 
 #[tokio::test]
 async fn create_and_broadcast_inscription_succeeds_end_to_end_with_mocked_esplora() {
+    ensure_legacy_process_for_publisher_test();
     let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
 
@@ -623,6 +637,7 @@ async fn seed_pending_row(
 
 #[tokio::test]
 async fn broadcast_persists_constructed_row_before_commit_broadcast() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
@@ -678,6 +693,7 @@ async fn broadcast_persists_constructed_row_before_commit_broadcast() {
 
 #[tokio::test]
 async fn broadcast_advances_to_commit_broadcast_after_commit_success() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
@@ -743,6 +759,7 @@ async fn broadcast_advances_to_commit_broadcast_after_commit_success() {
 
 #[tokio::test]
 async fn broadcast_advances_to_reveal_broadcast_after_reveal_success() {
+    ensure_legacy_process_for_publisher_test();
     // Phase E: `complete` now means "SMT/MMR contain this inscription's
     // entry", not "reveal landed on chain". The broadcast leg stops at
     // `reveal_broadcast`; the caller (`mint_handler`) advances the row
@@ -791,6 +808,7 @@ async fn broadcast_advances_to_reveal_broadcast_after_reveal_success() {
 
 #[tokio::test]
 async fn resume_from_commit_broadcast_rebroadcasts_reveal_only() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
 
@@ -840,6 +858,7 @@ async fn resume_from_commit_broadcast_rebroadcasts_reveal_only() {
 
 #[tokio::test]
 async fn resume_from_constructed_rebroadcasts_both() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
 
@@ -886,6 +905,7 @@ async fn resume_from_constructed_rebroadcasts_both() {
 
 #[tokio::test]
 async fn resume_skips_complete_rows() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
 
@@ -924,6 +944,7 @@ async fn resume_skips_complete_rows() {
 
 #[tokio::test]
 async fn resume_is_idempotent_when_called_twice() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
 
@@ -1000,6 +1021,7 @@ async fn resume_is_idempotent_when_called_twice() {
 
 #[tokio::test]
 async fn resume_tolerates_bad_inputs_error_on_double_spend() {
+    ensure_legacy_process_for_publisher_test();
     // The `constructed` retry case: a previous attempt's commit
     // landed on chain (so the input UTXO is already spent) but we
     // crashed before recording the success. The resumer re-tries
@@ -1097,6 +1119,7 @@ async fn resume_tolerates_bad_inputs_error_on_double_spend() {
 /// it out of the publisher).
 #[tokio::test]
 async fn mint_handler_advances_state_synchronously_with_broadcast() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());

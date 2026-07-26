@@ -31,13 +31,15 @@ pub use publish::{
 pub use scan::{
     apply_canonical_survivors, apply_forward_scan, fold_survivors_into_engine,
     folded_keys_from_nflog_mirror, members_to_published, reconcile_persisted_tip,
-    replace_engine_nflog_from_survivors, sort_canonical, FoldStats, PersistedTipReconciliation,
+    replace_engine_nflog_from_survivors, sort_canonical, FoldStats, MAX_RECOVERABLE_REORG_DEPTH,
+    PersistedTipReconciliation, ResolvedBlock,
 };
 pub use separation::{
     claim_stack_scan_mode, enforce_stack_scan_mode, ensure_legacy_publisher_allowed,
     ensure_v11_publisher_allowed, legacy_scan_state_present, load_stack_scan_mode,
-    process_stack_mode, require_stack_mode_for_update, set_process_stack_mode,
-    v11_scan_state_present, ScanStackMode, STACK_CAPABILITY_REFUSAL, STACK_SEPARATION_REFUSAL,
+    process_stack_mode, require_stack_mode_for_update, require_v11_process_for_nflog_write,
+    set_process_stack_mode, v11_scan_state_present, ScanStackMode, STACK_CAPABILITY_REFUSAL,
+    STACK_SEPARATION_REFUSAL,
 };
 
 #[cfg(test)]
