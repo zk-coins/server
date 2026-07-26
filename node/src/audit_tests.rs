@@ -155,6 +155,7 @@ async fn build_state_with_pool() -> (AppState, SchemaScope) {
         v11_scan_caught_up: None,
         v11_finality_ok: None,
         pending_sign_map: Arc::new(dashmap::DashMap::new()),
+        v11_finalise: None,
     };
     // tempdir lives until the test ends (Drop on test exit).
     std::mem::forget(tmp);

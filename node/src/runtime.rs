@@ -45,6 +45,9 @@ pub async fn start_rest_node(
     pool: Arc<PgPool>,
     proofs_dir: &str,
     v11_readiness: V11Readiness,
+    // Shared v1.1 engine (when `ZKCOINS_V11_SHADOW=1`). Used to drive
+    // `StateEngine::finalise` after an accepted `/v1/jobs/{id}/sign`.
+    v11_engine: Option<Arc<crate::v11::EngineAdapter>>,
 ) -> anyhow::Result<()> {
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -106,6 +109,19 @@ pub async fn start_rest_node(
         v11_scan_caught_up: v11_readiness.scan_caught_up,
         v11_finality_ok: v11_readiness.finality_ok,
         pending_sign_map: Arc::new(DashMap::new()),
+        // Production finalise: install the accepted signature and call
+        // StateEngine::finalise on the shared engine. Under the v1.1 claim
+        // a missing driver fails the job loud rather than short-circuiting
+        // to "signature_accepted" alone.
+        v11_finalise: v11_engine.map(|adapter| {
+            let hook: crate::router::V11FinaliseHook = Arc::new(move |pending, signature| {
+                adapter.with_engine_mut(|engine| {
+                    crate::v11::finalise_with_accepted_signature(engine, pending, signature)
+                })
+                .map_err(|e| e.to_string())?
+            });
+            hook
+        }),
     };
 
     // No minting-account bootstrap: the neutral model has no

@@ -133,6 +133,7 @@ async fn start_rest_node_binds_and_serves_health() {
             pool,
             &proofs_dir,
             crate::runtime::V11Readiness::default(),
+            None,
         )
         .await
     });

@@ -73,12 +73,14 @@
 //!   (`commit_flow` / `mint_commit_flow` / jobs commit). Under
 //!   `ScanStackMode::V11` a legacy commitment is refused loud.
 //! - [`crate::router::jobs_sign_handler`] is the production REST caller:
-//!   flag-gated `POST /api/jobs/{id}/sign` decodes [`WalletSignSubmission`]
-//!   at the boundary (strict hex) and verifies via
+//!   flag-gated `POST /v1/jobs/{id}/sign` (§7.5) decodes
+//!   [`WalletSignSubmission`] at the boundary (strict hex →
+//!   `malformed_request` on violation) and verifies via
 //!   [`accept_wallet_transition_signature`] against the staged
-//!   [`PendingSignEntry`] before the job may finalise. With the flag off
-//!   the route refuses at [`SignatureCheck::ShadowFlag`]; the legacy
-//!   `/commit` path is untouched.
+//!   [`PendingSignEntry`]. An accepted signature is driven into
+//!   [`finalise_with_accepted_signature`] / `StateEngine::finalise`.
+//!   With the flag off the route refuses at [`SignatureCheck::ShadowFlag`];
+//!   the legacy `/api/jobs/{id}/commit` path is untouched.
 
 use std::fmt;
 use std::sync::Arc;
@@ -153,20 +155,21 @@ impl TransitionSignatureError {
     }
 }
 
-/// JSON request body of `POST /api/jobs/{job_id}/sign` (§7.5) **before**
+/// JSON request body of `POST /v1/jobs/{job_id}/sign` (§7.5) **before**
 /// strict hex decode.
 ///
 /// Field names match the normative wire: `signature`, `s2c_nonce`. Values
 /// are raw strings; the boundary converts them via
 /// [`WalletSignSubmission::try_from`] so encoding failures surface as
-/// [`SignatureCheck::Encoding`], never as a generic JSON-shape error.
+/// [`SignatureCheck::Encoding`] → outward `malformed_request`, never as a
+/// generic JSON-shape error or an invented machine code.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct WalletSignSubmissionWire {
     pub signature: String,
     pub s2c_nonce: String,
 }
 
-/// Decoded binary body of `POST /api/jobs/{job_id}/sign` after strict hex
+/// Decoded binary body of `POST /v1/jobs/{job_id}/sign` after strict hex
 /// decode (§7.5). This is the request type the route verifies against —
 /// the documented encoding is what the boundary enforces.
 ///
@@ -234,18 +237,277 @@ impl TryFrom<WalletSignSubmissionWire> for WalletSignSubmission {
 /// [`accept_wallet_transition_signature`]); the job's advertised
 /// `awaiting_signature` JSON is derived from the same pending object so
 /// a wallet never signs a different surface than the node verifies.
+///
+/// **`send_counter` is not a free field.** It is always
+/// `pending.witness_wip.prev_account_state.send_counter` — the entry
+/// counter of the transition being authorised. Callers cannot set a
+/// counter that disagrees with the pending transition.
 #[derive(Clone, Debug)]
 pub struct PendingSignEntry {
     pub pending: PendingTransition,
     pub network: Network,
-    pub send_counter: u64,
+}
+
+impl PendingSignEntry {
+    /// Stage a pending transition for the given network. `send_counter`
+    /// is derived from the pending envelope — never accepted as input.
+    pub fn new(pending: PendingTransition, network: Network) -> Self {
+        Self { pending, network }
+    }
+
+    /// Entry counter `i` of this transition (`skᵢ = A/0'/i'`, §1.2 / §7.5).
+    /// Derived from the pending account state — not stored separately.
+    pub fn send_counter(&self) -> u64 {
+        self.pending.witness_wip.prev_account_state.send_counter
+    }
 }
 
 /// Per-job map of staged v1.1 sign material. Keyed by job `public_id`.
 pub type PendingSignMap = Arc<DashMap<Uuid, PendingSignEntry>>;
 
-/// Build the §7.5 `awaiting_signature` result object from staged pending
-/// material. All digests are lowercase hex; `send_counter` is a JSON number.
+/// JSON key under `jobs.request_body` where the restart-safe staging
+/// envelope is persisted when a job enters `awaiting_signature`.
+pub const PENDING_SIGN_BODY_KEY: &str = "pending_sign";
+
+/// Restart-safe staging envelope for `/sign` after a process restart.
+///
+/// **Choice (Defect 4): persist**, do not re-derive. Re-deriving via
+/// `begin_*` after a restart can produce a different `H(ProofData)` if
+/// the engine tip or account head moved, so the wallet's already-shown
+/// surface would no longer verify. This envelope captures exactly the
+/// host-side material [`accept_wallet_transition_signature`] needs, plus
+/// the account-state / mode fields required to rebuild a
+/// verification-grade [`PendingTransition`].
+///
+/// Full coin-history proofs / `prev_proof` are **not** in this envelope
+/// (they are not Serialize on the host types used for clause-8 paths).
+/// After a restart:
+/// - `/sign` verifies successfully against the rebuilt pending;
+/// - `StateEngine::finalise` is driven with that pending; if the
+///   original transition needed material not in the envelope the prove
+///   fails loud (job → `failed`) rather than inventing a fallback.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct StagedSignPersist {
+    pub network: String,
+    pub proof_data: shared::spec_v1::ProofData,
+    pub proof_data_hash: [u8; 32],
+    pub prev_account_state: shared::spec_v1::AccountState,
+    pub new_account_state: shared::spec_v1::AccountState,
+    pub owner: [u8; 32],
+    /// `"initial"` | `"account_update"`.
+    pub mode: String,
+    pub nav: shared::spec_v1::Nav,
+    pub nav_rand: [u8; 32],
+    pub next_pubkey: [u8; 32],
+    pub npk_rand: [u8; 32],
+    pub nk: [u8; 32],
+}
+
+impl StagedSignPersist {
+    pub fn from_entry(entry: &PendingSignEntry) -> Self {
+        let w = &entry.pending.witness_wip;
+        let mode = match entry.pending.mode {
+            zkcoins_prover::prover_bridge::TransitionMode::InitialProof => "initial",
+            zkcoins_prover::prover_bridge::TransitionMode::AccountUpdateProof => "account_update",
+        };
+        Self {
+            network: network_label(entry.network).to_string(),
+            proof_data: entry.pending.proof_data.clone(),
+            proof_data_hash: entry.pending.proof_data_hash,
+            prev_account_state: w.prev_account_state.clone(),
+            new_account_state: w.new_account_state.clone(),
+            owner: entry.pending.owner.0,
+            mode: mode.to_string(),
+            nav: w.nav,
+            nav_rand: w.nav_rand,
+            next_pubkey: w.next_pubkey,
+            npk_rand: w.npk_rand,
+            nk: w.nk,
+        }
+    }
+
+    /// Rebuild a verification-grade pending from the persisted envelope.
+    pub fn into_entry(self) -> Result<PendingSignEntry, TransitionSignatureError> {
+        let network = parse_network_label(&self.network).ok_or_else(|| {
+            TransitionSignatureError::new(
+                SignatureCheck::PendingEnvelope,
+                format!("persisted pending_sign network {:?} is not a known label", self.network),
+            )
+        })?;
+        let mode = match self.mode.as_str() {
+            "initial" => zkcoins_prover::prover_bridge::TransitionMode::InitialProof,
+            "account_update" => zkcoins_prover::prover_bridge::TransitionMode::AccountUpdateProof,
+            other => {
+                return Err(TransitionSignatureError::new(
+                    SignatureCheck::PendingEnvelope,
+                    format!("persisted pending_sign mode {other:?} is unknown"),
+                ));
+            }
+        };
+        let owner = shared::spec_v1::Address(self.owner);
+        let pk = self.prev_account_state.current_pubkey;
+        let nav_opening = zkcoins_prover::prover_bridge::NavOpening {
+            nav: self.nav,
+            nav_rand: self.nav_rand,
+        };
+        let witness = zkcoins_prover::prover_bridge::TransitionWitness {
+            mode,
+            prev_account_state: self.prev_account_state.clone(),
+            new_account_state: self.new_account_state.clone(),
+            input_coins: Vec::new(),
+            input_auth: Vec::new(),
+            output_templates: Vec::new(),
+            output_coins: Vec::new(),
+            output_history_proofs: Vec::new(),
+            received_coins: Vec::new(),
+            received_auth: Vec::new(),
+            asset_issuance: None,
+            nk: self.nk,
+            nav: self.nav,
+            nav_rand: self.nav_rand,
+            prev_nav_opening: None,
+            nav_consistency: Vec::new(),
+            next_pubkey: self.next_pubkey,
+            npk_rand: self.npk_rand,
+            transition_signature: TransitionSignature {
+                pk_i: pk,
+                signature: [0u8; 64],
+                r_prime: [0u8; 32],
+            },
+            prev_proof: None,
+            predecessor_nullifier: None,
+        };
+        let pending = PendingTransition {
+            witness_wip: witness,
+            proof_data: self.proof_data,
+            proof_data_hash: self.proof_data_hash,
+            mode,
+            owner,
+            nav_opening,
+        };
+        Ok(PendingSignEntry::new(pending, network))
+    }
+}
+
+fn network_label(network: Network) -> &'static str {
+    match network {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+        Network::Regtest => "regtest",
+    }
+}
+
+fn parse_network_label(s: &str) -> Option<Network> {
+    match s {
+        "mainnet" => Some(Network::Mainnet),
+        "testnet" => Some(Network::Testnet),
+        "regtest" => Some(Network::Regtest),
+        _ => None,
+    }
+}
+
+/// Stage a pending entry in the in-memory map **and** return the JSON
+/// blob to merge into `jobs.request_body` under [`PENDING_SIGN_BODY_KEY`]
+/// so a restart can rehydrate the map.
+pub fn stage_pending_sign(
+    map: &PendingSignMap,
+    job_id: Uuid,
+    entry: PendingSignEntry,
+) -> serde_json::Value {
+    let persist = StagedSignPersist::from_entry(&entry);
+    map.insert(job_id, entry);
+    serde_json::to_value(persist).expect("StagedSignPersist always encodes")
+}
+
+/// Rehydrate a staged entry from a job's persisted `request_body`.
+pub fn rehydrate_pending_sign(
+    request_body: &serde_json::Value,
+) -> Result<Option<PendingSignEntry>, TransitionSignatureError> {
+    let Some(raw) = request_body.get(PENDING_SIGN_BODY_KEY) else {
+        return Ok(None);
+    };
+    let persist: StagedSignPersist = serde_json::from_value(raw.clone()).map_err(|e| {
+        TransitionSignatureError::new(
+            SignatureCheck::PendingEnvelope,
+            format!("persisted pending_sign is not a valid envelope: {e}"),
+        )
+    })?;
+    Ok(Some(persist.into_entry()?))
+}
+
+/// §7.5 completed `result` object after a successful finalise.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinaliseOutcome {
+    pub new_account_state_hash: [u8; 32],
+    pub output_coins_root: [u8; 32],
+    pub input_nullifiers_root: [u8; 32],
+    pub output_coin_ids: Vec<[u8; 32]>,
+}
+
+impl FinaliseOutcome {
+    pub fn from_applied(
+        applied: &zkcoins_prover::state_engine::AppliedTransition,
+    ) -> Self {
+        let pd = &applied.proved.proof_data;
+        Self {
+            new_account_state_hash: digest_to_bytes(&pd.new_account_state_hash),
+            output_coins_root: digest_to_bytes(&pd.output_coins_root),
+            input_nullifiers_root: digest_to_bytes(&pd.input_nullifiers_root),
+            // AppliedTransition does not currently surface output coin ids
+            // on the host type; the §7.5 field is present as an empty list
+            // until the prove path exposes them. Fail-closed empty, never
+            // invented.
+            output_coin_ids: Vec::new(),
+        }
+    }
+
+    /// Build an outcome from the pending's ProofData (used by test drivers
+    /// that do not run the full prove, and as the response skeleton when
+    /// the engine reports the same ProofData it was given).
+    pub fn from_pending_proof_data(pending: &PendingTransition) -> Self {
+        let pd = &pending.proof_data;
+        Self {
+            new_account_state_hash: digest_to_bytes(&pd.new_account_state_hash),
+            output_coins_root: digest_to_bytes(&pd.output_coins_root),
+            input_nullifiers_root: digest_to_bytes(&pd.input_nullifiers_root),
+            output_coin_ids: Vec::new(),
+        }
+    }
+
+    pub fn to_result_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "new_account_state_hash": hex_lower(&self.new_account_state_hash),
+            "output_coins_root": hex_lower(&self.output_coins_root),
+            "input_nullifiers_root": hex_lower(&self.input_nullifiers_root),
+            "output_coin_ids": self
+                .output_coin_ids
+                .iter()
+                .map(|id| hex_lower(id))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Drive an accepted wallet signature into [`StateEngine::finalise`].
+///
+/// Installs the signature on the pending witness and calls `finalise`.
+/// This is the **only** production path from a verified `/sign` body to
+/// a completed job under a v1.1 claim — the dispatcher must not mark the
+/// job completed with the signature material alone.
+pub fn finalise_with_accepted_signature(
+    engine: &mut zkcoins_prover::state_engine::StateEngine,
+    pending: PendingTransition,
+    signature: TransitionSignature,
+) -> Result<FinaliseOutcome, String> {
+    let applied = engine
+        .finalise(pending, signature)
+        .map_err(|e| format!("StateEngine::finalise failed: {e:#}"))?;
+    Ok(FinaliseOutcome::from_applied(&applied))
+}
+
+/// Build the §7.5 `awaiting_signature` object from staged pending
+/// material. All digests are lowercase hex; `send_counter` is a JSON number
+/// **derived** from the pending account state.
 ///
 /// This is what a v1.1 wallet must recompute and sign — **not** legacy
 /// `account_state_hash` / `output_coins_root`.
@@ -261,7 +523,7 @@ pub fn awaiting_signature_result_json(entry: &PendingSignEntry) -> serde_json::V
         "npk_commit": hex_lower(&pd.npk_commit),
         "proof_data_hash": hex_lower(&entry.pending.proof_data_hash),
         "txn_pubkey": hex_lower(&txn_pubkey),
-        "send_counter": entry.send_counter,
+        "send_counter": entry.send_counter(),
     })
 }
 
@@ -303,18 +565,19 @@ pub fn select_awaiting_signature_result(
     }
 }
 
-/// Machine-code + HTTP status for a rejected `/sign` submission (§7.5 jobs-family).
+/// Machine-code + HTTP status for a rejected `/sign` submission (§7.5 closed
+/// enumeration — **no invented codes**).
 ///
 /// | check | HTTP | `error` |
 /// |---|---|---|
-/// | Encoding | 400 | `encoding` |
+/// | Encoding | 400 | `malformed_request` (non-canonical hex / wrong width — §7.1 / §7.5) |
 /// | ShadowFlag | 409 | `wrong_phase` (route inactive under flag-off) |
 /// | S2cOpening | 409 | `stale_message` |
 /// | Bip340 / PkMatch / PendingEnvelope | 409 | `invalid_signature` |
 /// | LegacyCommitment | 409 | `wrong_phase` |
 pub fn sign_rejection(err: &TransitionSignatureError) -> (u16, &'static str) {
     match err.check {
-        SignatureCheck::Encoding => (400, "encoding"),
+        SignatureCheck::Encoding => (400, "malformed_request"),
         SignatureCheck::S2cOpening => (409, "stale_message"),
         SignatureCheck::Bip340
         | SignatureCheck::PkMatch
@@ -673,11 +936,7 @@ pub mod test_fixtures {
         };
         let pending = pending_for(pk, proof_data_at_0());
         (
-            PendingSignEntry {
-                pending,
-                network: Network::Mainnet,
-                send_counter: 0,
-            },
+            PendingSignEntry::new(pending, Network::Mainnet),
             submission,
         )
     }
@@ -1241,11 +1500,7 @@ mod tests {
         let pd = proof_data_at_0();
         let (_, pk) = v5_case(Network::Mainnet);
         let pending = pending_for(pk, pd);
-        let entry = PendingSignEntry {
-            pending,
-            network: Network::Mainnet,
-            send_counter: 0,
-        };
+        let entry = PendingSignEntry::new(pending, Network::Mainnet);
         let result = select_awaiting_signature_result("aa".repeat(32).as_str(), "bb".repeat(32).as_str(), Some(&entry))
             .expect("v11 with staged pending must advertise");
         assert!(
@@ -1315,6 +1570,70 @@ mod tests {
         assert_eq!(err.check, SignatureCheck::Encoding);
         let (status, code) = sign_rejection(&err);
         assert_eq!(status, 400);
-        assert_eq!(code, "encoding");
+        // §7.5 closed enumeration: non-canonical hex is malformed_request,
+        // never an invented "encoding" code.
+        assert_eq!(code, "malformed_request");
+    }
+
+    #[test]
+    fn send_counter_is_derived_from_pending_not_free() {
+        let pd = proof_data_at_0();
+        let (_, pk) = v5_case(Network::Mainnet);
+        // Build a pending whose prev_account_state.send_counter is 7.
+        let mut pending = pending_for(pk, pd);
+        pending.witness_wip.prev_account_state = AccountState::new(
+            pending.owner,
+            ZERO_HASH,
+            BTreeMap::new(),
+            pk,
+            7,
+            ZERO_HASH,
+        )
+        .expect("account with send_counter=7");
+        let entry = PendingSignEntry::new(pending, Network::Mainnet);
+        assert_eq!(entry.send_counter(), 7);
+        let advertised = awaiting_signature_result_json(&entry);
+        assert_eq!(advertised["send_counter"], 7);
+        // There is no constructor / field that would let a caller set 99
+        // while the pending carries 7 — send_counter is a method only.
+    }
+
+    #[test]
+    fn staged_sign_persist_round_trips_for_restart() {
+        let (entry, submission) = test_fixtures::v5_mainnet_entry_and_submission();
+        let persist = StagedSignPersist::from_entry(&entry);
+        let json = serde_json::to_value(&persist).expect("encode");
+        let body = serde_json::json!({ PENDING_SIGN_BODY_KEY: json });
+        let rehydrated = rehydrate_pending_sign(&body)
+            .expect("rehydrate ok")
+            .expect("Some");
+        assert_eq!(rehydrated.send_counter(), entry.send_counter());
+        assert_eq!(
+            rehydrated.pending.proof_data_hash,
+            entry.pending.proof_data_hash
+        );
+        // After a simulated restart the rebuilt pending still accepts
+        // the reference signature — this is what /sign needs.
+        accept_wallet_transition_signature(
+            V11ShadowMode::On,
+            rehydrated.network,
+            &rehydrated.pending,
+            &submission,
+        )
+        .expect("rehydrated pending must still verify the wallet signature");
+    }
+
+    #[test]
+    fn finalise_outcome_from_pending_carries_proof_data_surface() {
+        let (entry, _) = test_fixtures::v5_mainnet_entry_and_submission();
+        let outcome = FinaliseOutcome::from_pending_proof_data(&entry.pending);
+        let result = outcome.to_result_json();
+        assert!(result.get("new_account_state_hash").is_some());
+        assert!(result.get("output_coins_root").is_some());
+        assert!(result.get("input_nullifiers_root").is_some());
+        assert!(result.get("output_coin_ids").is_some());
+        // Must not look like the old short-circuit body.
+        assert!(result.get("signature_accepted").is_none());
+        assert!(result.get("sign").is_none());
     }
 }

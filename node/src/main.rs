@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let shadow_mode = v11::mode::v11_shadow_mode_from_env().unwrap_or_else(|e| {
         panic!("{e}");
     });
-    let v11_adapter: Option<node::v11::EngineAdapter> = match shadow_mode {
+    let v11_adapter: Option<Arc<node::v11::EngineAdapter>> = match shadow_mode {
         V11ShadowMode::Off => {
             // Exclusive claim: this DB is the legacy scan stack.
             v11::enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
@@ -146,7 +146,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 adapter.network(),
                 adapter.activation_height()
             );
-            Some(adapter)
+            Some(Arc::new(adapter))
         }
     };
 
@@ -289,6 +289,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // runtime tests can each pass their own `tempfile::tempdir()` path
     // instead of racing on the process-wide env var under
     // `--test-threads=8` (issue #181 Opt A).
+    let v11_engine_for_rest = v11_adapter.clone();
     tokio::spawn(async move {
         if let Err(e) = start_rest_node(
             account_node,
@@ -297,6 +298,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             pool_for_rest,
             &proofs_dir,
             v11_readiness,
+            v11_engine_for_rest,
         )
         .await
         {
@@ -657,7 +659,7 @@ fn mark_pending_complete_from_sync_context(
 /// from the same survivors. A reorg between a free-standing recon and a
 /// later scan cannot slip through — there is no free-standing recon.
 async fn run_v11_scan_loop(
-    adapter: node::v11::EngineAdapter,
+    adapter: Arc<node::v11::EngineAdapter>,
     scan_caught_up: Option<Arc<AtomicBool>>,
     finality_ok: Option<Arc<AtomicBool>>,
 ) -> Result<(), Box<dyn StdError>> {
