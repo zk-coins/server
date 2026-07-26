@@ -1557,12 +1557,13 @@ fn bytes_from_u32_le_limbs(limbs: &[F]) -> Result<[u8; 32]> {
     Ok(bytes)
 }
 
-/// Crate-internal test helpers for BIP-340 + sign-to-contract transition signing.
+/// Deterministic BIP-340 + sign-to-contract helpers for host integration
+/// tests and ignored multi-minute prove fixtures.
 ///
-/// Used by `state_engine` tests and the bridge's own fixtures so both share one
-/// S2C+BIP-340 implementation rather than reimplementing the wallet signer.
-#[cfg(test)]
-pub(crate) mod test_signing {
+/// **Not a production wallet API.** Exposed (not `cfg(test)`) so dependent
+/// crates such as `node` can build host-valid clause-10 fixtures without
+/// reimplementing S2C. Production signing remains Gap G4 (wallet-side).
+pub mod test_signing {
     use num::BigUint;
     use plonky2::field::types::Field;
     use sha2::{Digest, Sha256};
@@ -1579,19 +1580,19 @@ pub(crate) mod test_signing {
     use shared::spec_v1 as host;
 
     #[derive(Clone)]
-    pub(crate) struct TestSignature {
-        pub(crate) transition: TransitionSignature,
-        pub(crate) r_prime_point: AffinePoint<Secp256K1>,
+    pub struct TestSignature {
+        pub transition: TransitionSignature,
+        pub r_prime_point: AffinePoint<Secp256K1>,
     }
 
-    pub(crate) fn deterministic_secret(label: &[u8]) -> Secp256K1Scalar {
+    pub fn deterministic_secret(label: &[u8]) -> Secp256K1Scalar {
         let digest = Sha256::digest(label);
         let scalar = Secp256K1Scalar::from_noncanonical_biguint(BigUint::from_bytes_be(&digest));
         assert!(scalar.is_nonzero());
         scalar
     }
 
-    pub(crate) fn normalized_key(
+    pub fn normalized_key(
         secret: Secp256K1Scalar,
     ) -> (Secp256K1Scalar, AffinePoint<Secp256K1>, [u8; 32]) {
         let mut normalized_secret = secret;
@@ -1605,7 +1606,7 @@ pub(crate) mod test_signing {
     }
 
     /// Sign `H(ProofData)` with BIP-340 + S2C for the given network's `m_state`.
-    pub(crate) fn sign_transition(
+    pub fn sign_transition(
         secret: Secp256K1Scalar,
         public: AffinePoint<Secp256K1>,
         proof_data: &ProofData,

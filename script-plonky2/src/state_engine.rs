@@ -175,29 +175,6 @@ pub struct StateEngine {
     fold_seq: u32,
 }
 
-struct StagedNfLog {
-    accumulator: NfLogAccumulator,
-    entries: Vec<NfLogEntry>,
-    positions: Vec<ChainPosition>,
-    fold_seq: u32,
-    nullifier_pos: u64,
-}
-
-/// How the transition's own nullifier is recorded relative to the
-/// **canonical** NfLog (§3.6: fold of what Bitcoin actually contains).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OwnNullifierCommit {
-    /// Fold immediately at a synthetic local `(tip_height, fold_seq)` —
-    /// used by mint/send until those paths are also deferred to the
-    /// scanner. The synthetic position is **not** chain-canonical.
-    SyntheticLocal,
-    /// Do **not** touch the canonical NfLog. Account holds
-    /// `last_nullifier = Some` / `last_nullifier_pos = None` until the
-    /// scanner folds the confirmed on-chain survivor at its real
-    /// `(height, tx_index, vin_index, member_index)`.
-    DeferredToScanner,
-}
-
 impl StateEngine {
     /// Construct an empty engine for `network` with NfLog activation height.
     pub fn new(network: Network, activation_height: u64) -> Self {
@@ -1015,41 +992,47 @@ impl StateEngine {
     // -----------------------------------------------------------------------
 
     /// Phase 2: install the wallet signature, prove via the bridge, then
-    /// **atomically** apply the new account state / CoinHist / NfLog fold.
+    /// **atomically** apply the new account state / CoinHist.
     /// On proving failure the engine state is left unchanged.
     ///
-    /// Folds the own nullifier at a synthetic local position (mint/send path).
-    /// Prefer [`Self::finalise_pending_chain_nullifier`] for receives so the
-    /// canonical NfLog stays a pure function of Bitcoin.
+    /// ## Engine invariant — no synthetic NfLog positions
+    ///
+    /// The canonical NfLog is a pure function of Bitcoin (§3.6). This method
+    /// **never** folds the transition's own nullifier into the accumulator
+    /// and never invents a local `(tip_height, fold_seq)` position. The
+    /// account records `last_nullifier = Some` / `last_nullifier_pos = None`
+    /// until the scanner folds the confirmed on-chain survivor at its real
+    /// `(height, tx_index, vin_index, member_index)`.
+    ///
+    /// Applies equally to mint, send, and receive: a public finalise path
+    /// that could invent a position would also fool the absent-lookup guard
+    /// and permanently desync after a later canonical scan-fold.
     pub fn finalise(
         &mut self,
         pending: PendingTransition,
         signature: TransitionSignature,
     ) -> Result<AppliedTransition> {
-        self.finalise_with_own_nullifier(pending, signature, OwnNullifierCommit::SyntheticLocal)
+        self.finalise_deferred_own_nullifier(pending, signature)
     }
 
     /// Prove + apply account/CoinHist **without** folding the own nullifier
     /// into the canonical NfLog.
     ///
-    /// The receive path must use this: a published-but-unconfirmed nullifier
-    /// is not part of the log defined by §3.6. The scanner folds it at the
-    /// real chain position when it appears on Bitcoin. Until then the
-    /// account records the nullifier opening with `last_nullifier_pos = None`
-    /// (explicitly pending inclusion — not an accumulator entry).
+    /// Identical to [`Self::finalise`]: retained as a named alias so receive
+    /// call sites document that the chain (via the scanner) places the
+    /// nullifier. There is no alternate "synthetic local" outcome.
     pub fn finalise_pending_chain_nullifier(
         &mut self,
         pending: PendingTransition,
         signature: TransitionSignature,
     ) -> Result<AppliedTransition> {
-        self.finalise_with_own_nullifier(pending, signature, OwnNullifierCommit::DeferredToScanner)
+        self.finalise_deferred_own_nullifier(pending, signature)
     }
 
-    fn finalise_with_own_nullifier(
+    fn finalise_deferred_own_nullifier(
         &mut self,
         mut pending: PendingTransition,
         signature: TransitionSignature,
-        own_nullifier: OwnNullifierCommit,
     ) -> Result<AppliedTransition> {
         // Bind the mutable phase-1 envelope back to the witness before any
         // expensive proving or state staging.
@@ -1228,31 +1211,17 @@ impl StateEngine {
             "apply: coinhist root diverges from new_account_state"
         );
 
-        // Own-nullifier commit: either stage a synthetic local fold (mint/send)
-        // or leave the canonical NfLog untouched (receive → scanner).
-        let (nullifier_pos, staged_fold) = match own_nullifier {
-            OwnNullifierCommit::SyntheticLocal => {
-                // Stage the complete accumulator and all of its engine-owned
-                // mirrors. NfLogAccumulator::fold advances its private ordering
-                // cursor even for DuplicateIgnored, so the live accumulator
-                // must never be the object used for a fallible candidate fold.
-                let staged = self.stage_nflog_append(pk_i, r)?;
-                (Some(staged.nullifier_pos), Some(staged))
-            }
-            OwnNullifierCommit::DeferredToScanner => {
-                // Refuse to invent a position. Caller must not observe this
-                // nullifier in the accumulator until scan-fold.
-                ensure!(
-                    matches!(self.nflog.lookup(pk_i), LookupResult::Absent),
-                    "apply: deferred nullifier Pk already present on canonical NfLog \
-                     (double-spend / republish)"
-                );
-                (None, None)
-            }
-        };
+        // Engine invariant: never invent a local NfLog position. Refuse if
+        // the own Pk is already present (double-spend / republish). The
+        // scanner alone may fold this nullifier at a real chain position.
+        ensure!(
+            matches!(self.nflog.lookup(pk_i), LookupResult::Absent),
+            "apply: deferred nullifier Pk already present on canonical NfLog \
+             (double-spend / republish)"
+        );
 
-        // All fallible checks are complete. Commit the account record and,
-        // when synthetic, the staged NfLog state as one non-fallible section.
+        // All fallible checks are complete. Commit the account record only —
+        // the canonical NfLog is untouched.
         let record = AccountRecord {
             state: witness.new_account_state.clone(),
             coinhist: next_hist,
@@ -1263,14 +1232,8 @@ impl StateEngine {
             last_proof: Some(proved.proof.clone()),
             last_nav_opening: Some(pending.nav_opening),
             last_nullifier: Some(nullifier_opening),
-            last_nullifier_pos: nullifier_pos,
+            last_nullifier_pos: None,
         };
-        if let Some(staged) = staged_fold {
-            self.nflog = staged.accumulator;
-            self.nflog_entries = staged.entries;
-            self.nflog_positions = staged.positions;
-            self.fold_seq = staged.fold_seq;
-        }
         self.accounts.insert(pending.owner, record);
 
         Ok(AppliedTransition {
@@ -1371,101 +1334,6 @@ impl StateEngine {
             }
         }
         Ok(())
-    }
-
-    /// Rebuild the live accumulator from its exact canonical-position mirror,
-    /// apply the candidate to the rebuilt value, and return a complete staged
-    /// replacement. No field on `self` is mutated on any error.
-    fn stage_nflog_append(&self, pk: [u8; 32], r: [u8; 32]) -> Result<StagedNfLog> {
-        ensure!(
-            self.nflog_entries.len() == self.nflog_positions.len(),
-            "apply: NfLog entry/position mirrors have different lengths"
-        );
-        ensure!(
-            self.nflog.nav().size == self.nflog_entries.len() as u64,
-            "apply: NfLog entry mirror length drifted from accumulator"
-        );
-        ensure!(
-            self.nflog.nav().mth == host::nflog_mth(&self.nflog_entries),
-            "apply: NfLog entry mirror root drifted from accumulator"
-        );
-
-        let mut accumulator = NfLogAccumulator::new(self.activation_height);
-        for (expected_pos, (chain_pos, entry)) in self
-            .nflog_positions
-            .iter()
-            .copied()
-            .zip(self.nflog_entries.iter().copied())
-            .enumerate()
-        {
-            match accumulator
-                .fold(chain_pos, entry.pk, entry.r)
-                .context("apply: replay NfLog mirror")?
-            {
-                FoldOutcome::Appended(pos) => ensure!(
-                    pos == expected_pos as u64,
-                    "apply: replayed NfLog position mismatch"
-                ),
-                FoldOutcome::DuplicateIgnored => {
-                    bail!("apply: replayed NfLog mirror contains a duplicate key")
-                }
-                FoldOutcome::BelowActivationHeight => {
-                    bail!("apply: replayed NfLog mirror contains a pre-activation entry")
-                }
-            }
-        }
-        ensure!(
-            accumulator.nav() == self.nflog.nav(),
-            "apply: replayed NfLog differs from live accumulator"
-        );
-        ensure!(
-            accumulator.size_final(self.tip_height) == self.nflog.size_final(self.tip_height),
-            "apply: replayed NfLog final prefix differs from live accumulator"
-        );
-
-        let next_fold_seq = self
-            .fold_seq
-            .checked_add(1)
-            .context("apply: fold_seq overflow")?;
-        let chain_pos = ChainPosition {
-            height: self.tip_height,
-            tx_index: self.fold_seq,
-            vin_index: 0,
-            member_index: 0,
-        };
-        let nullifier_pos = match accumulator
-            .fold(chain_pos, pk, r)
-            .context("apply: staged NfLog fold failed")?
-        {
-            FoldOutcome::Appended(pos) => pos,
-            FoldOutcome::DuplicateIgnored => {
-                bail!("apply: nullifier Pk already present (double-spend / republish)")
-            }
-            FoldOutcome::BelowActivationHeight => {
-                bail!("apply: fold height is below NfLog activation height")
-            }
-        };
-
-        let mut entries = self.nflog_entries.clone();
-        entries.push(NfLogEntry { pk, r });
-        let mut positions = self.nflog_positions.clone();
-        positions.push(chain_pos);
-        ensure!(
-            entries.len() as u64 == nullifier_pos + 1 && positions.len() == entries.len(),
-            "apply: staged NfLog mirrors drifted from accumulator"
-        );
-        ensure!(
-            accumulator.nav().mth == host::nflog_mth(&entries),
-            "apply: staged NfLog mirror root mismatch"
-        );
-
-        Ok(StagedNfLog {
-            accumulator,
-            entries,
-            positions,
-            fold_seq: next_fold_seq,
-            nullifier_pos,
-        })
     }
 
     /// Shared setup for begin_*: mode, prev state, recursion material, and a
@@ -2348,50 +2216,43 @@ mod tests {
         assert!(format!("{err:#}").contains("envelope nav_opening"));
     }
 
+    /// Public finalise and the receive-named alias are the same deferred-only
+    /// path: neither can invent a synthetic NfLog position.
+    ///
+    /// Uses a cheap envelope-mismatch rejection (before prove) so the default
+    /// suite does not build the compliance circuit. Success-path proof that
+    /// mint/send leave the log untouched lives in the ignored send e2e.
     #[test]
-    fn transactional_nflog_stage_leaves_engine_unchanged_on_duplicate() {
-        let mut engine = StateEngine::new(Network::Testnet, 0);
-        engine.set_tip_height(50);
-        let position = ChainPosition {
-            height: 50,
-            tx_index: 0,
-            vin_index: 0,
-            member_index: 0,
-        };
-        let entry = NfLogEntry {
-            pk: [0xa1; 32],
-            r: [0xa2; 32],
-        };
-        assert_eq!(
-            engine.nflog.fold(position, entry.pk, entry.r).unwrap(),
-            FoldOutcome::Appended(0)
-        );
-        engine.nflog_entries.push(entry);
-        engine.nflog_positions.push(position);
-        engine.fold_seq = 1;
+    fn public_finalise_api_is_deferred_only_and_leaves_nflog_untouched_on_prove_fail() {
+        let mut via_finalise = StateEngine::new(Network::Testnet, 0);
+        let mut via_alias = StateEngine::new(Network::Testnet, 0);
+        let req = test_mint_request(1);
+        let pending_a = via_finalise
+            .begin_mint(req.clone())
+            .expect("begin mint A");
+        let pending_b = via_alias.begin_mint(req).expect("begin mint B");
+        let signature =
+            placeholder_signature(pending_a.witness_wip.prev_account_state.current_pubkey);
 
-        let nav_before = engine.nflog.nav();
-        let entries_before = engine.nflog_entries.clone();
-        let positions_before = engine.nflog_positions.clone();
-        let fold_seq_before = engine.fold_seq;
-        let account_count_before = engine.accounts.len();
+        assert_eq!(via_finalise.nflog.nav().size, 0);
+        assert_eq!(via_alias.nflog.nav().size, 0);
 
-        let err = engine
-            .stage_nflog_append(entry.pk, [0xff; 32])
-            .err()
-            .expect("duplicate staged fold must fail");
-        assert!(format!("{err:#}").contains("already present"));
-        assert_eq!(engine.nflog.nav(), nav_before);
-        assert_eq!(engine.nflog_entries, entries_before);
-        assert_eq!(engine.nflog_positions, positions_before);
-        assert_eq!(engine.fold_seq, fold_seq_before);
-        assert_eq!(engine.accounts.len(), account_count_before);
-
-        let fresh = engine
-            .stage_nflog_append([0xb1; 32], [0xb2; 32])
-            .expect("a fresh fold at the same next position still stages");
-        assert_eq!(fresh.nullifier_pos, 1);
-        assert_eq!(engine.nflog.nav(), nav_before);
+        // Envelope mismatch fails before prove — both public entry points
+        // must leave the canonical NfLog untouched (no SyntheticLocal fold).
+        let mut wrong_a = pending_a;
+        wrong_a.owner = Address([0x91u8; 32]);
+        let mut wrong_b = pending_b;
+        wrong_b.owner = Address([0x92u8; 32]);
+        via_finalise
+            .finalise(wrong_a, signature.clone())
+            .expect_err("finalise must reject envelope mismatch");
+        via_alias
+            .finalise_pending_chain_nullifier(wrong_b, signature)
+            .expect_err("alias must reject envelope mismatch");
+        assert_eq!(via_finalise.nflog.nav().size, 0);
+        assert_eq!(via_alias.nflog.nav().size, 0);
+        assert!(via_finalise.accounts.is_empty());
+        assert!(via_alias.accounts.is_empty());
     }
 
     #[test]
@@ -2568,6 +2429,9 @@ mod tests {
             &pending.proof_data,
             Network::Testnet,
         );
+        let nflog_size_before = engine.nflog.nav().size;
+        assert_eq!(nflog_size_before, 1, "only the funded genesis nullifier");
+
         let applied = engine
             .finalise(pending, sig.transition)
             .expect("finalise send");
@@ -2592,16 +2456,42 @@ mod tests {
         assert_eq!(change.coin.amount, 70);
         assert_eq!(change.coin.recipient, fixture.owner);
 
-        // Nullifier folded.
+        // Engine invariant: send finalise must not invent a synthetic NfLog
+        // entry. Own nullifier is pending until a real chain position is folded.
         assert_eq!(applied.nullifier.0, applied.proved.consumed_pubkey);
+        assert_eq!(
+            engine.nflog.nav().size,
+            nflog_size_before,
+            "finalise must not grow the canonical NfLog"
+        );
+        assert!(
+            matches!(engine.nflog.lookup(applied.nullifier.0), LookupResult::Absent),
+            "send own nullifier must stay absent until scan-fold"
+        );
+        assert!(
+            rec.last_nullifier_pos.is_none(),
+            "last_nullifier_pos must stay None until scan-fold"
+        );
+        assert!(rec.last_nullifier.is_some());
+
+        // Scanner places the nullifier at a real chain position (not tip/fold_seq).
+        // Must be strictly after the genesis fold at height 100.
+        let chain_pos = ChainPosition {
+            height: 110,
+            tx_index: 3,
+            vin_index: 0,
+            member_index: 0,
+        };
+        let pos = engine
+            .append_nullifier(chain_pos, applied.nullifier.0, applied.nullifier.1)
+            .expect("scan-fold send nullifier");
+        assert_eq!(pos, 1);
         assert_eq!(engine.nflog.nav().size, 2);
-        assert_eq!(engine.nflog_entries.len(), 2);
         assert_eq!(engine.nflog_entries[1].pk, applied.nullifier.0);
         assert_eq!(engine.nflog_entries[1].r, applied.nullifier.1);
 
-        // Host acceptance against the engine's own NfLog: the send's nav was
-        // size_final=1 at prove time; after folding size grows, but the proved
-        // nav remains a canonical prefix.
+        // Host acceptance: the send's nav was size_final=1 at prove time; after
+        // scan-fold size grows, but the proved nav remains a canonical prefix.
         engine
             .verify_incoming_transition(
                 &applied.proved,
