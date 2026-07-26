@@ -3,13 +3,15 @@
 //! Fills the two long-form `<REGEN>` slots that no earlier generator produces:
 //! - **V.5** transition signature — BIP-340 + S2C over `H(ProofData@0)` with
 //!   the V.2-ext keys (curve-valid). Emitted for **all three** networks
-//!   (the fixture does not pin a single `m_state`).
+//!   (the fixture does not pin a single `m_state`). Values are the **reference
+//!   implementation's output** (this generator), proposed for specification
+//!   appendix V.5 in PR #124 — an unmerged draft, not a published-spec pin.
 //! - **V.6** aggregate scalar `s_agg` — Σⱼ aⱼ·sⱼ mod n over the **V.8**
 //!   two-signer member set (`m = 2` layout in V.6; V.8 is the only fully
 //!   pinned two-member signing/aggregation fixture).
 //!
-//! Nonce rule: the V.8 fixture rule (spec V.8 "Fixture nonce rule") so the
-//! vectors are deterministic. Production nonces remain signer-private.
+//! Nonce rule: the V.8 fixture rule (deterministic test-vector nonce rule)
+//! so the vectors are reproducible. Production nonces remain signer-private.
 //!
 //! Values are **computed**, never hand-copied. Self-checks:
 //! - each V.5 signature verifies under BIP-340 (`verify_single`) and opens
@@ -384,7 +386,10 @@ fn generate_sig_agg_vectors() {
     lines.push("# generated_sig_agg_vectors.txt — V.5 signature + V.6 s_agg".into());
     lines.push("# Computed by script-plonky2 generate_sig_agg_vectors; never hand-edit.".into());
     lines.push("#".into());
-    lines.push("# V.5 inputs (pinned by the spec / earlier generators):".into());
+    lines.push(
+        "# V.5 inputs (reference-implementation output; proposed for V.5 in PR #124 draft):"
+            .into(),
+    );
     lines.push("#   sk/Pk = V.2-ext sk₀/Pk₀ (BIP-340-normalised d used for signing)".into());
     lines.push("#   H(ProofData@0) = V.4 pin from generated_poseidon_vectors.txt".into());
     lines

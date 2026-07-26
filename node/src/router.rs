@@ -228,6 +228,11 @@ pub struct AppState {
     /// `ReorgOutcome::finality_broken`. Readiness then fails with
     /// `"deep_reorg"` and callers must stop crediting. `None` = legacy.
     pub(crate) v11_finality_ok: Option<Arc<AtomicBool>>,
+    /// Staged v1.1 [`PendingSignEntry`](crate::v11::PendingSignEntry)
+    /// material keyed by job id. Populated when a job reaches
+    /// `awaiting_signature` under a v1.1 claim; consumed by
+    /// [`jobs_sign_handler`]. Empty / unused under the legacy stack.
+    pub(crate) pending_sign_map: crate::v11::PendingSignMap,
 }
 
 // Response types for our API
@@ -2261,6 +2266,216 @@ pub(crate) async fn jobs_commit_handler(
     }
 }
 
+/// `POST /api/jobs/:id/sign` — flag-gated §7.5 wallet transition signature.
+///
+/// Active only under a v1.1 process claim (`ScanStackMode::V11`). The body is
+/// decoded as [`crate::v11::WalletSignSubmissionWire`] then strictly converted
+/// to [`crate::v11::WalletSignSubmission`] so encoding failures surface as the
+/// distinct `encoding` machine code (HTTP 400), not a generic JSON error.
+/// Verification uses [`crate::v11::accept_wallet_transition_signature`] against
+/// the staged [`crate::v11::PendingSignEntry`] for this job — provenance is the
+/// pending transition alone.
+///
+/// With the flag off this route refuses at `wrong_phase` / ShadowFlag; the
+/// legacy [`jobs_commit_handler`] path is untouched.
+#[utoipa::path(
+    post,
+    path = "/api/jobs/{job_id}/sign",
+    tag = "Jobs",
+    params(
+        ("job_id" = String, Path, description = "Job UUID returned by the matching admit handler."),
+    ),
+    responses(
+        (status = 200, description = "Signature verified and accepted; dispatcher woken."),
+        (status = 400, description = "Wire encoding violation on `signature` / `s2c_nonce`.",
+            body = JobErrorResponse),
+        (status = 404, description = "No job exists for this id.",
+            body = JobErrorResponse),
+        (status = 409, description = "Flag off, wrong phase, or crypto rejection \
+            (`stale_message` / `invalid_signature` / `wrong_phase`).",
+            body = JobErrorResponse),
+        (status = 500, description = "Database error while attaching the signature payload.",
+            body = JobErrorResponse),
+    ),
+)]
+pub(crate) async fn jobs_sign_handler(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(wire): Json<crate::v11::WalletSignSubmissionWire>,
+) -> axum::response::Response {
+    // Flag gate: refuse the v1.1 path when the process is not on the v1.1 claim.
+    // Legacy `/commit` remains the only active authorisation surface.
+    if !crate::v11::v11_sign_route_active() {
+        let err = crate::v11::TransitionSignatureError {
+            check: crate::v11::SignatureCheck::ShadowFlag,
+            message: "POST /api/jobs/{id}/sign requires ZKCOINS_V11_SHADOW=1 / \
+                      ScanStackMode::V11; legacy ash‖ocr uses POST /api/jobs/{id}/commit"
+                .to_string(),
+        };
+        let (status, code) = crate::v11::sign_rejection(&err);
+        return (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT),
+            Json(serde_json::json!({
+                "error": code,
+                "message": err.message,
+                "check": format!("{:?}", err.check),
+            })),
+        )
+            .into_response();
+    }
+
+    // Boundary: documented encoding is what we enforce. Distinct machine code.
+    let submission = match crate::v11::WalletSignSubmission::try_from(&wire) {
+        Ok(s) => s,
+        Err(err) => {
+            let (status, code) = crate::v11::sign_rejection(&err);
+            return (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                Json(serde_json::json!({
+                    "error": code,
+                    "message": err.message,
+                    "check": format!("{:?}", err.check),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let job = match state.job_store.load(id).await {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(JobErrorResponse {
+                    error: "Job not found".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!("JobStore::load failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(JobErrorResponse {
+                    error: "Failed to load job".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    if job.status != JobStatus::AwaitingSignature {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "wrong_phase",
+                "message": format!(
+                    "Job is in status `{}`, not `awaiting_signature`",
+                    job.status.as_str()
+                ),
+            })),
+        )
+            .into_response();
+    }
+
+    let entry = match state.pending_sign_map.get(&id) {
+        Some(e) => e.clone(),
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "wrong_phase",
+                    "message": "no PendingTransition staged for this job \
+                                (awaiting_signature under v1.1 requires a staged entry)",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let accepted = match crate::v11::accept_wallet_transition_signature(
+        crate::v11::V11ShadowMode::On,
+        entry.network,
+        &entry.pending,
+        &submission,
+    ) {
+        Ok(sig) => sig,
+        Err(err) => {
+            let (status, code) = crate::v11::sign_rejection(&err);
+            return (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT),
+                Json(serde_json::json!({
+                    "error": code,
+                    "message": err.message,
+                    "check": format!("{:?}", err.check),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Persist the verified TransitionSignature on the job row under `sign`
+    // so the dispatcher can finalise without re-accepting untrusted bytes.
+    let mut merged = job.request_body.clone();
+    let sign_value = serde_json::json!({
+        "pk_i": hex::encode(accepted.pk_i),
+        "signature": hex::encode(accepted.signature),
+        "r_prime": hex::encode(accepted.r_prime),
+    });
+    let obj = merged
+        .as_object_mut()
+        .expect("jobs.request_body is always a JSON object (admit handlers enforce)");
+    obj.insert("sign".to_string(), sign_value);
+
+    if let Err(e) =
+        sqlx::query("UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2")
+            .bind(&merged)
+            .bind(id)
+            .execute(state.job_store.pool())
+            .await
+    {
+        tracing::error!("Failed to merge sign payload into job row: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(JobErrorResponse {
+                error: "Failed to persist sign payload".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Drop staged material so a second /sign cannot reuse it against a
+    // different body after the first acceptance.
+    state.pending_sign_map.remove(&id);
+
+    let notifier = state.job_notify_map.get(&id).map(|e| e.value().clone());
+    match notifier {
+        Some(n) => {
+            n.commit_wake.notify_one();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "signature_accepted",
+                    "job_id": id,
+                })),
+            )
+                .into_response()
+        }
+        None => (
+            // Signature verified and persisted; the dispatcher is not
+            // parked (timeout/cleanup race). Still 200 — verification
+            // succeeded; the wallet can poll for terminal status.
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "signature_accepted",
+                "job_id": id,
+                "dispatcher": "not_waiting",
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /api/jobs/:id/cancel` — cancel a still-queued job. Only
 /// succeeds while `status = queued`; once the prove leg starts the
 /// dispatcher has paid sunk cost and the row is no longer
@@ -3054,6 +3269,7 @@ pub struct RootEndpoints {
     get_job: &'static str,
     stream_job: &'static str,
     commit: &'static str,
+    sign: &'static str,
     cancel: &'static str,
     proof: &'static str,
     inscription: &'static str,
@@ -3095,6 +3311,7 @@ pub(crate) async fn root_handler() -> impl IntoResponse {
             get_job: "GET  /api/jobs/{job_id}",
             stream_job: "GET  /api/jobs/{job_id}/stream",
             commit: "POST /api/jobs/{job_id}/commit",
+            sign: "POST /api/jobs/{job_id}/sign",
             cancel: "POST /api/jobs/{job_id}/cancel",
             proof: "GET  /api/proof/{id}",
             inscription: "GET  /api/inscriptions/{txid}",
@@ -3553,6 +3770,7 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/jobs/:id", get(get_job_handler))
         .route("/api/jobs/:id/stream", get(stream_job_handler))
         .route("/api/jobs/:id/commit", post(jobs_commit_handler))
+        .route("/api/jobs/:id/sign", post(jobs_sign_handler))
         .route("/api/jobs/:id/cancel", post(jobs_cancel_handler))
         .route("/api/inscriptions/:txid", get(get_inscription_handler))
         .route(

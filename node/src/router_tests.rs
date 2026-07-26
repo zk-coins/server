@@ -97,6 +97,7 @@ fn test_state() -> AppState {
         // Legacy-stack tests: no v1.1 readiness gates.
         v11_scan_caught_up: None,
         v11_finality_ok: None,
+        pending_sign_map: Arc::new(dashmap::DashMap::new()),
     }
 }
 
@@ -2410,6 +2411,7 @@ fn mint_test_state() -> AppState {
         job_notify_map: Arc::new(dashmap::DashMap::new()),
         v11_scan_caught_up: None,
         v11_finality_ok: None,
+        pending_sign_map: Arc::new(dashmap::DashMap::new()),
     }
 }
 
@@ -3167,6 +3169,263 @@ mod jobs_endpoint_tests {
             .unwrap();
         let (status, _h, _b) = run(state, req).await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    // ---- POST /api/jobs/:id/sign (Gap G4 wire boundary) ----
+
+    #[tokio::test]
+    async fn jobs_sign_valid_v11_signature_accepted_through_route() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, SignatureCheck,
+            ScanStackMode,
+        };
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xABu8; 32],
+                Some("k-sign-ok"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (entry, submission) =
+            crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v11::awaiting_signature_result_json(&entry);
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        state.pending_sign_map.insert(job_id, entry);
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier);
+
+        let body = serde_json::json!({
+            "signature": hex::encode(submission.signature),
+            "s2c_nonce": hex::encode(submission.s2c_nonce),
+        });
+        let req = Request::post(format!("/api/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["status"], "signature_accepted");
+
+        // Staged material consumed after accept.
+        assert!(state.pending_sign_map.get(&job_id).is_none());
+
+        // Encoding path must report SignatureCheck::Encoding distinctly.
+        let _ = SignatureCheck::Encoding;
+
+        clear_process_stack_mode_for_test();
+    }
+
+    #[tokio::test]
+    async fn jobs_sign_malformed_encoding_rejected_at_boundary() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        };
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xACu8; 32],
+                Some("k-sign-enc"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+            .await
+            .expect("awaiting_signature");
+
+        // Uppercase hex is encoding failure — not a generic JSON deserialisation
+        // error (the JSON shape is valid; the hex contract is not).
+        let body = serde_json::json!({
+            "signature": "AA".repeat(64),
+            "s2c_nonce": "bb".repeat(32),
+        });
+        let req = Request::post(format!("/api/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "encoding");
+        assert_eq!(v["check"], "Encoding");
+        assert!(
+            v["message"].as_str().unwrap_or("").contains("lowercase")
+                || v["message"].as_str().unwrap_or("").contains("hex"),
+            "message should describe the encoding rule: {resp}"
+        );
+
+        clear_process_stack_mode_for_test();
+    }
+
+    #[tokio::test]
+    async fn jobs_sign_flag_off_refuses_and_legacy_commit_still_works() {
+        use crate::v11::clear_process_stack_mode_for_test;
+
+        // Flag / claim off (default).
+        clear_process_stack_mode_for_test();
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xADu8; 32],
+                Some("k-sign-flag-off"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        // Legacy awaiting_signature shape (ash/ocr).
+        let ash = "aa".repeat(32);
+        let ocr = "bb".repeat(32);
+        state
+            .job_store
+            .set_awaiting_signature(
+                job_id,
+                7,
+                serde_json::json!({
+                    "account_state_hash": ash,
+                    "output_coins_root": ocr,
+                }),
+            )
+            .await
+            .expect("awaiting_signature");
+
+        // /sign refuses under flag-off.
+        let sign_body = serde_json::json!({
+            "signature": "00".repeat(64),
+            "s2c_nonce": "11".repeat(32),
+        });
+        let req = Request::post(format!("/api/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(sign_body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "wrong_phase");
+        assert_eq!(v["check"], "ShadowFlag");
+
+        // Job poll still surfaces legacy ash/ocr unchanged.
+        let req = Request::get(format!("/api/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["result"]["account_state_hash"], ash);
+        assert_eq!(v["result"]["output_coins_root"], ocr);
+        assert!(v["result"].get("proof_data_hash").is_none());
+
+        // Legacy /commit still accepts the request (wakes notifier) under flag-off.
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        let commit_wake = notifier.commit_wake.clone();
+        state.job_notify_map.insert(job_id, notifier);
+        let commit_body = serde_json::json!({
+            "proof_id": 7u64,
+            "public_key": "020000000000000000000000000000000000000000000000000000000000000001",
+            "signature": "00".repeat(64),
+            "message": "ff".repeat(32),
+        });
+        let req = Request::post(format!("/api/jobs/{}/commit", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(commit_body.to_string()))
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "legacy commit body: {body}");
+        tokio::time::timeout(std::time::Duration::from_secs(1), commit_wake.notified())
+            .await
+            .expect("legacy commit must still wake the dispatcher");
+    }
+
+    #[tokio::test]
+    async fn v11_job_poll_advertises_v11_fields_not_ash_ocr() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        };
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Mint,
+                &[0xAEu8; 32],
+                Some("k-v11-ad"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (entry, _) =
+            crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v11::select_awaiting_signature_result(
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            Some(&entry),
+        )
+        .expect("v11 ad");
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 3, advertised)
+            .await
+            .expect("awaiting_signature");
+
+        let req = Request::get(format!("/api/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "awaiting_signature");
+        assert!(v["result"].get("account_state_hash").is_none());
+        assert!(v["result"].get("new_account_state_hash").is_some());
+        assert!(v["result"].get("proof_data_hash").is_some());
+        assert!(v["result"].get("txn_pubkey").is_some());
+        assert!(v["result"].get("send_counter").is_some());
+        assert!(v["result"].get("npk_commit").is_some());
+
+        clear_process_stack_mode_for_test();
     }
 
     // ---- DB-error 500 arms ----

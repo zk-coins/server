@@ -41,6 +41,12 @@
 //! Residual ash‖ocr [`shared::commitment::Commitment`] is refused under a
 //! v1.1 process claim ([`refuse_legacy_commitment_under_v11`]); with the
 //! flag off the legacy path is untouched.
+//!
+//! Production caller: flag-gated `POST /api/jobs/{id}/sign` decodes
+//! [`WalletSignSubmission`] at the boundary and verifies via
+//! [`accept_wallet_transition_signature`] against a staged
+//! [`PendingSignEntry`]. Under a v1.1 claim, `awaiting_signature` advertises
+//! the §7.5 ProofData surface (not legacy ash/ocr).
 
 mod adapter;
 pub mod db_v11;
@@ -77,9 +83,12 @@ pub use separation::{
     v11_scan_state_present, ScanStackMode, STACK_CAPABILITY_REFUSAL, STACK_SEPARATION_REFUSAL,
 };
 pub use signature::{
-    accept_wallet_transition_signature, ensure_v11_signature_path,
-    refuse_legacy_commitment_under_v11, verify_transition_signature_material, SignatureCheck,
-    TransitionSignatureError, WalletSignSubmission, LEGACY_COMMITMENT_REFUSED_UNDER_V11,
+    accept_wallet_transition_signature, awaiting_signature_result_json, ensure_v11_signature_path,
+    legacy_awaiting_signature_result_json, refuse_legacy_commitment_under_v11,
+    select_awaiting_signature_result, sign_rejection, v11_sign_route_active,
+    verify_transition_signature_material, PendingSignEntry, PendingSignMap, SignatureCheck,
+    TransitionSignatureError, WalletSignSubmission, WalletSignSubmissionWire,
+    LEGACY_COMMITMENT_REFUSED_UNDER_V11,
 };
 
 #[cfg(test)]

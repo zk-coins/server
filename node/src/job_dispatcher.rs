@@ -454,10 +454,39 @@ async fn process_mint(
         .or_insert_with(|| Arc::new(JobNotifier::new()))
         .clone();
 
-    let result = serde_json::json!({
-        "account_state_hash": commit_hashes.account_state_hash,
-        "output_coins_root": commit_hashes.output_coins_root,
-    });
+    let pending = app_state
+        .pending_sign_map
+        .get(&public_id)
+        .map(|e| e.clone());
+    let result = match crate::v11::select_awaiting_signature_result(
+        &commit_hashes.account_state_hash,
+        &commit_hashes.output_coins_root,
+        pending.as_ref(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e.to_string();
+            tracing::warn!(
+                "Job dispatcher: mint job {} refused awaiting_signature advertisement: {}",
+                public_id,
+                msg
+            );
+            job_store.fail(public_id, &msg).await?;
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(msg),
+                },
+            );
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    };
     job_store
         .set_awaiting_signature(public_id, proof_id as i64, result.clone())
         .await?;
@@ -624,13 +653,43 @@ async fn process_send_initial(
         .or_insert_with(|| Arc::new(JobNotifier::new()))
         .clone();
 
-    // ash/ocr hex the wallet signs. Persisted on the row + pushed on
-    // the phase event so a thin pure-TS wallet never has to decode the
-    // binary `CoinProof` from `GET /api/proof/{id}`.
-    let result = serde_json::json!({
-        "account_state_hash": commit_hashes.account_state_hash,
-        "output_coins_root": commit_hashes.output_coins_root,
-    });
+    // Under a v1.1 claim the job advertises the §7.5 ProofData surface
+    // (from a staged PendingSignEntry), not legacy ash/ocr — a wallet
+    // that signed ash/ocr would be rejected at `/sign`. Flag-off keeps
+    // the legacy ash/ocr fields unchanged.
+    let pending = app_state
+        .pending_sign_map
+        .get(&public_id)
+        .map(|e| e.clone());
+    let result = match crate::v11::select_awaiting_signature_result(
+        &commit_hashes.account_state_hash,
+        &commit_hashes.output_coins_root,
+        pending.as_ref(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e.to_string();
+            tracing::warn!(
+                "Job dispatcher: send job {} refused awaiting_signature advertisement: {}",
+                public_id,
+                msg
+            );
+            job_store.fail(public_id, &msg).await?;
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(msg),
+                },
+            );
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    };
     job_store
         .set_awaiting_signature(public_id, proof_id as i64, result.clone())
         .await?;
@@ -773,7 +832,41 @@ async fn wait_for_commit(
         }
     };
 
-    // The commit-route persists the wallet-provided
+    // v1.1 path: `/sign` already verified via accept_wallet_transition_signature
+    // and persisted the TransitionSignature under `sign`. Stage 3 will own the
+    // prove+publish finalise; until then a verified signature is a successful
+    // authorisation gate and the job completes with that material.
+    if crate::v11::v11_sign_route_active() {
+        if let Some(sign_val) = job.request_body.get("sign").cloned() {
+            let response_body = serde_json::json!({
+                "success": true,
+                "signature_accepted": true,
+                "sign": sign_val,
+            });
+            job_store
+                .complete(public_id, response_body.clone(), 200)
+                .await?;
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Completed,
+                    phase: "completed".to_string(),
+                    proof_id: None,
+                    result: Some(response_body),
+                    error: None,
+                },
+            );
+            tracing::info!(
+                "Job dispatcher: job {} completed after verified v1.1 /sign",
+                public_id
+            );
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
+
+    // Legacy path: the commit-route persists the wallet-provided
     // `CommitRequest` into the job's `request_body` under a
     // `commit` key alongside the original send body. Pull it out
     // and feed it to `commit_flow`.
