@@ -36,8 +36,8 @@
 pub mod account_node;
 pub mod audit;
 pub mod db;
-/// Sole production owner of the `esplora-client` dependency (read +
-/// guarded broadcast wrappers). Other modules must not import the raw crate.
+/// Node-side Esplora boundary: re-exports the `esplora-bound` facade
+/// (sole owner of `esplora-client`) and stack-gates legacy broadcast.
 pub mod esplora_bound;
 pub mod flow;
 pub mod job_dispatcher;

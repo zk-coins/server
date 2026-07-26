@@ -227,18 +227,22 @@ pub async fn heal_circuit_digest(
                  proof-dependent state to genesis (self-heal) so the node serves \
                  cleanly."
             );
-            // Under exclusive v1.1 the legacy scan tables must already be empty
-            // (stack separation). The wipe is a legacy-stack writer and requires
-            // the legacy marker — do not call it under a v11 claim. Still record
-            // the live digest so the next boot takes the fast path.
+            // Under exclusive v1.1:
+            //   * Do NOT wipe SMT/MMR/root-index/latest_block — structures the
+            //     v1.1 stack does not use (and that the full legacy wipe would
+            //     require a legacy marker to touch).
+            //   * DO clear legacy proof-bearing `accounts` rows and store the
+            //     new digest. A digest-only update left stale proofs in place;
+            //     main reloads them into AccountNode and the next prove fails.
+            // Legacy (or unclaimed) path keeps the full proof-dependent wipe.
             match crate::v11::process_stack_mode() {
                 Some(crate::v11::ScanStackMode::V11) => {
                     warn!(
-                        "Self-heal: process is claimed v1.1 — skipping legacy \
-                         proof-dependent wipe (tables must already be empty under \
-                         exclusive NfLog stack); storing circuit digest only"
+                        "Self-heal: process is claimed v1.1 — clearing legacy \
+                         proof-bearing accounts + storing circuit digest; leaving \
+                         SMT/MMR/latest_block structures untouched (v1.1 does not use them)"
                     );
-                    db::store_circuit_digest(pool, live_digest).await?;
+                    db::reset_legacy_accounts_for_v11_self_heal(pool, live_digest).await?;
                 }
                 _ => {
                     db::reset_proof_dependent_state_tx(pool, live_digest).await?;
