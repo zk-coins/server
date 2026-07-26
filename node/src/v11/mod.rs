@@ -1,14 +1,20 @@
-//! v1.1 cutover Stages 1–2: flag-gated **shadow** path.
+//! v1.1 cutover Stages 1–2 (+ G3 receive): flag-gated **shadow** path.
 //!
 //! ## Stage 1
 //! [`StateEngine`] persistence behind `ZKCOINS_V11_SHADOW=1`. Proving remains
 //! legacy until Stage 3.
 //!
-//! ## Stage 2 (this block)
+//! ## Stage 2
 //! Exclusive dual stack for **publisher + scanner**:
 //! - Flag off → legacy Commitment publisher + Esplora SMT scanner (default).
 //! - Flag on → script-plonky2 `AggregateStateNullifierV3` publisher + NfLog
 //!   scan-fold (§3.6). Missing bitcoind pins fail loud — never fall back.
+//!
+//! ## G3 — Receive as a real transition
+//! [`receive`] wires `begin_receive` → compliance proof → nullifier publish →
+//! v1.1 persistence. Clause-10 creating-proof bindings are mandatory per
+//! slot. The legacy `receive_coin_into` bookkeeping path is refused under
+//! the v1.1 process claim (no silent fall-back).
 //!
 //! A commitment and an `AggregateStateNullifierV3` must never share one
 //! accumulator or one database; see [`separation`].
@@ -17,6 +23,7 @@ mod adapter;
 mod db_v11;
 pub mod mode;
 pub mod publish;
+pub mod receive;
 pub mod scan;
 pub mod separation;
 
@@ -27,6 +34,12 @@ pub use mode::{
 };
 pub use publish::{
     connect_v11_publisher, publish_v11_batch, v11_publisher_env_from_env, V11PublisherEnv,
+};
+pub use receive::{
+    execute_v11_receive, finalise_publish_persist, publish_applied_nullifier,
+    refuse_legacy_receive_under_v11, verify_and_begin_receive, verify_clause10_slot,
+    verify_creating_nullifier_binding, NullifierBatchPublisher, ReceivedCoinSlot,
+    V11ReceiveOutcome, V11ReceiveRequest, LEGACY_RECEIVE_REFUSED_UNDER_V11,
 };
 pub use scan::{
     apply_canonical_survivors, apply_forward_scan, first_boot_requires_full_replace,
