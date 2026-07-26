@@ -5,6 +5,7 @@ members = [
     "node",
     "shared",
     "esplora-bound",
+    "stack-policy",
 ]
 resolver = "2"
 

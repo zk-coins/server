@@ -20,83 +20,24 @@
 //!    in depth after a partial backup restore).
 //!
 //! Fail loud. Never fall back to the other stack.
-
-use std::sync::Mutex;
+//!
+//! ## Process claim lives in `stack-policy`
+//!
+//! The in-process mode registry and
+//! [`ensure_legacy_publisher_allowed`](stack_policy::ensure_legacy_publisher_allowed)
+//! live in the shared `stack-policy` crate so `esplora-bound` can run the
+//! same check inside its broadcast-client constructor. This module owns
+//! the **database** marker / data checks and re-exports the process-mode
+//! surface for existing `node::v11` call sites.
 
 use anyhow::{bail, Context, Result};
 use sqlx::{PgPool, Postgres, Transaction};
 
-/// Which exclusive scan stack this process / database is running.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScanStackMode {
-    /// Commitment inscriptions → global SMT + MMR (node default).
-    Legacy,
-    /// `AggregateStateNullifierV3` → NfLog first-occurrence (§3.6).
-    V11,
-}
-
-impl ScanStackMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Legacy => "legacy",
-            Self::V11 => "v11",
-        }
-    }
-
-    pub fn parse(s: &str) -> Result<Self> {
-        match s {
-            "legacy" => Ok(Self::Legacy),
-            "v11" => Ok(Self::V11),
-            other => bail!(
-                "stack_scan_mode={other:?} is not a known mode \
-                 (expected exactly \"legacy\" or \"v11\")"
-            ),
-        }
-    }
-}
-
-/// Process-wide mode set at boot after [`enforce_stack_scan_mode`].
-///
-/// Publish / scan entry points consult this so a v1.1 process cannot
-/// silently call the legacy commitment publisher (or the reverse).
-///
-/// `Mutex` (not `OnceLock`) so unit tests in the same process can reset
-/// between cases; production boot still panics on conflicting re-set.
-static PROCESS_STACK_MODE: Mutex<Option<ScanStackMode>> = Mutex::new(None);
-
-/// Record the mode this process claimed. Panics if called twice with
-/// conflicting values (a single process must not dual-boot).
-pub fn set_process_stack_mode(mode: ScanStackMode) {
-    let mut guard = PROCESS_STACK_MODE
-        .lock()
-        .expect("PROCESS_STACK_MODE mutex poisoned");
-    match *guard {
-        None => *guard = Some(mode),
-        Some(existing) if existing == mode => {}
-        Some(existing) => panic!(
-            "set_process_stack_mode({:?}) conflicts with already-set {:?}",
-            mode, existing
-        ),
-    }
-}
-
-/// Mode claimed by this process, if boot has run [`set_process_stack_mode`].
-pub fn process_stack_mode() -> Option<ScanStackMode> {
-    *PROCESS_STACK_MODE
-        .lock()
-        .expect("PROCESS_STACK_MODE mutex poisoned")
-}
-
-/// Test-only: drop the process claim so the next case can re-enforce.
-#[cfg(test)]
-pub fn clear_process_stack_mode_for_test() {
-    *PROCESS_STACK_MODE
-        .lock()
-        .expect("PROCESS_STACK_MODE mutex poisoned") = None;
-}
-
-/// Canonical error prefix for hard-separation refusals (asserted in tests).
-pub const STACK_SEPARATION_REFUSAL: &str = "stack separation: refusing to start";
+// Process-wide claim registry + legacy-publisher policy (shared crate).
+pub use stack_policy::{
+    clear_process_stack_mode_for_test, ensure_legacy_publisher_allowed, process_stack_mode,
+    set_process_stack_mode, ScanStackMode, STACK_SEPARATION_REFUSAL,
+};
 
 /// Canonical error prefix when a writer finds no matching marker in-tx.
 pub const STACK_CAPABILITY_REFUSAL: &str = "stack separation: refusing write";
@@ -153,7 +94,9 @@ pub async fn load_stack_scan_mode(pool: &PgPool) -> Result<Option<ScanStackMode>
             .context("load stack_scan_mode")?;
     match row {
         None => Ok(None),
-        Some((mode,)) => Ok(Some(ScanStackMode::parse(&mode)?)),
+        Some((mode,)) => Ok(Some(
+            ScanStackMode::parse(&mode).map_err(|e| anyhow::anyhow!("{e}"))?,
+        )),
     }
 }
 
@@ -175,7 +118,9 @@ pub async fn claim_stack_scan_mode(pool: &PgPool, mode: ScanStackMode) -> Result
             .context("lock stack_scan_mode for claim_stack_scan_mode")?;
     let marker = match marker_row {
         None => None,
-        Some((mode_s,)) => Some(ScanStackMode::parse(&mode_s)?),
+        Some((mode_s,)) => Some(
+            ScanStackMode::parse(&mode_s).map_err(|e| anyhow::anyhow!("{e}"))?,
+        ),
     };
 
     let (legacy_n,): (i64,) = sqlx::query_as(LEGACY_SCAN_STATE_COUNT_SQL)
@@ -263,7 +208,7 @@ async fn claim_stack_scan_mode_in_tx(
                 .await
                 .context("load stack_scan_mode after claim conflict")?;
         let existing = row
-            .map(|(m,)| ScanStackMode::parse(&m))
+            .map(|(m,)| ScanStackMode::parse(&m).map_err(|e| anyhow::anyhow!("{e}")))
             .transpose()?
             .context("stack_scan_mode row missing after conflict")?;
         if existing != mode {
@@ -307,7 +252,7 @@ pub async fn require_stack_mode_for_update(
             want = required.as_str(),
         ),
         Some((mode_s,)) => {
-            let mode = ScanStackMode::parse(&mode_s)?;
+            let mode = ScanStackMode::parse(&mode_s).map_err(|e| anyhow::anyhow!("{e}"))?;
             if mode != required {
                 bail!(
                     "{STACK_CAPABILITY_REFUSAL}: stack_scan_mode is claimed as \
@@ -350,7 +295,9 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
             .context("lock stack_scan_mode for enforce")?;
     let marker = match marker_row {
         None => None,
-        Some((mode_s,)) => Some(ScanStackMode::parse(&mode_s)?),
+        Some((mode_s,)) => Some(
+            ScanStackMode::parse(&mode_s).map_err(|e| anyhow::anyhow!("{e}"))?,
+        ),
     };
 
     let (legacy_n,): (i64,) = sqlx::query_as(LEGACY_SCAN_STATE_COUNT_SQL)
@@ -461,34 +408,6 @@ pub fn claim_process_stack_from_v11_shadow_env() -> Result<()> {
     let mode = super::mode::v11_shadow_mode_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
     claim_process_stack_from_shadow_mode(mode);
     Ok(())
-}
-
-/// Refuse a publish path that does not match the process stack mode.
-///
-/// When the process has not claimed a mode yet (unit tests that never
-/// boot dual-stack), only the **explicit** `required` check against a
-/// known `Some(process)` mismatch fails. Unset process mode allows the
-/// legacy publisher so existing tests stay green without a silent
-/// cross-stack fall-back: the v1.1 publisher still requires an explicit
-/// `ScanStackMode::V11` claim (see [`ensure_v11_publisher_allowed`]).
-///
-/// On success returns a [`esplora_bound::LegacyBroadcastWitness`]. This
-/// function is the **sole production issuer** of that witness: the facade
-/// constructor [`esplora_bound::EsploraBroadcastClient::connect`] requires
-/// one, so a broadcast-capable client cannot exist without this check
-/// having succeeded (or an explicit out-of-band mint under the
-/// `issue-legacy-broadcast-witness` feature, which only `node` enables).
-pub fn ensure_legacy_publisher_allowed() -> Result<esplora_bound::LegacyBroadcastWitness> {
-    match process_stack_mode() {
-        None | Some(ScanStackMode::Legacy) => {
-            Ok(esplora_bound::LegacyBroadcastWitness::issue())
-        }
-        Some(ScanStackMode::V11) => bail!(
-            "{STACK_SEPARATION_REFUSAL}: process is running the v1.1 scan stack; \
-             legacy Commitment publish is forbidden (no silent fall-back to \
-             commitment_data inscriptions)"
-        ),
-    }
 }
 
 /// Refuse the v1.1 publisher unless this process claimed v1.1.

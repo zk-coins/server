@@ -62,10 +62,14 @@ bitcoincore-zmq = { version = "=1.5.4", optional = true }
 # Raw `esplora-client` is **not** a direct dependency of `node`. All
 # Esplora I/O goes through the `esplora-bound` facade package, which
 # exports only guarded wrappers (private inner client). Naming
-# `esplora_client::…` in this package is a compile error.
-# `issue-legacy-broadcast-witness` lets this package mint the broadcast
-# typestate witness after the process claim check — sole workspace issuer.
-esplora-bound = { path = "../esplora-bound", features = ["issue-legacy-broadcast-witness"] }
+# `esplora_client::…` in this package is a compile error. Broadcast
+# construction runs process-stack policy inside the facade constructor
+# (shared `stack-policy` crate) — no witness feature.
+esplora-bound = { path = "../esplora-bound" }
+# Process-wide scan-stack claim registry + legacy-publisher policy.
+# Shared with `esplora-bound` so the broadcast facade constructor and
+# node boot / publisher guards consult the same process claim.
+stack-policy = { path = "../stack-policy" }
 axum = { version = "0.7.9", features = ["json", "multipart"] }
 # `BodyExt::collect()` for the audit middleware's request/response
 # body buffering. Promoted from `[dev-dependencies]` because the

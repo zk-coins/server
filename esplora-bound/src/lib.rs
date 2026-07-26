@@ -12,17 +12,15 @@
 //! Callers only see [`EsploraReadClient`] (reads) and
 //! [`EsploraBroadcastClient`] (broadcast + get_tx).
 //!
-//! ## Broadcast capability = witness typestate
+//! ## Broadcast capability = co-located process-stack policy
 //!
-//! [`EsploraBroadcastClient::connect`] requires a [`LegacyBroadcastWitness`].
-//! The witness has a private field, so it cannot be forged outside this
-//! crate. Minting is available only under the
-//! `issue-legacy-broadcast-witness` feature (enabled solely by the `node`
-//! package). The sole production issuer is
-//! `node::v11::ensure_legacy_publisher_allowed`, which mints only after the
-//! process claim check succeeds. Possession of a broadcast-capable client
-//! is therefore evidence that a witness was supplied at construction; in
-//! the workspace, that witness is issued only on the claim-check path.
+//! [`EsploraBroadcastClient::connect`] runs
+//! [`stack_policy::ensure_legacy_publisher_allowed`] **inside** this
+//! constructor before any Esplora I/O. There is no witness typestate and
+//! no feature-gated mint path: every construction of a broadcast-capable
+//! facade, from any crate including `node`, executes the same check.
+//! Possession of a returned client is therefore evidence that the process
+//! claim allowed legacy publish at construction time.
 
 use bitcoin::{Address, BlockHash, OutPoint, Transaction, Txid};
 use esplora_client::{
@@ -30,32 +28,6 @@ use esplora_client::{
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-/// Proof that the legacy-publisher process claim was checked.
-///
-/// Private field: values cannot be constructed with struct-literal syntax
-/// from any other crate. The only mint path is [`LegacyBroadcastWitness::issue`],
-/// gated behind the `issue-legacy-broadcast-witness` feature so workspace
-/// crates other than `node` cannot obtain a witness at all.
-///
-/// `node::v11::ensure_legacy_publisher_allowed` is the sole caller of
-/// [`issue`](LegacyBroadcastWitness::issue) after the claim check passes.
-#[derive(Clone, Copy, Debug)]
-pub struct LegacyBroadcastWitness {
-    _private: (),
-}
-
-#[cfg(feature = "issue-legacy-broadcast-witness")]
-impl LegacyBroadcastWitness {
-    /// Mint a witness after the process claim check has succeeded.
-    ///
-    /// Available only when the `issue-legacy-broadcast-witness` feature is
-    /// enabled. The `node` package is the sole workspace consumer of that
-    /// feature; its claim-check function is the sole production caller.
-    pub const fn issue() -> Self {
-        Self { _private: () }
-    }
-}
 
 /// Read-only Esplora HTTP surface used by the legacy scanner, readiness
 /// probe, and UTXO fetch.
@@ -129,11 +101,11 @@ impl EsploraReadClient {
 
 /// Broadcast-capable Esplora client (raw I/O only).
 ///
-/// Construction requires a [`LegacyBroadcastWitness`]. Stack policy (legacy
-/// publisher under a v1.1 process claim) is enforced by the `node` package,
-/// which is the sole issuer of that witness after the claim check. This
-/// type hides the raw `esplora-client` handle and refuses un-witnessed
-/// construction at compile time.
+/// Construction always runs the process-stack legacy-publisher policy
+/// ([`stack_policy::ensure_legacy_publisher_allowed`]) before building the
+/// inner client. Stack policy is co-located with construction so a caller
+/// inside `node` cannot obtain a broadcast-capable client without the check.
+/// This type hides the raw `esplora-client` handle.
 pub struct EsploraBroadcastClient {
     inner: RawAsyncClient<DefaultSleeper>,
 }
@@ -147,12 +119,11 @@ impl std::fmt::Debug for EsploraBroadcastClient {
 impl EsploraBroadcastClient {
     /// Build a broadcast-capable client from an Esplora base URL.
     ///
-    /// Requires a [`LegacyBroadcastWitness`]. There is no un-witnessed
-    /// constructor: `connect(url)` without a witness is a compile error.
-    /// Possession of a returned client therefore implies a witness was
-    /// supplied; the `node` package issues witnesses only from the
-    /// claim-check path.
-    pub fn connect(url: &str, _witness: LegacyBroadcastWitness) -> Result<Self, BoxError> {
+    /// Runs [`stack_policy::ensure_legacy_publisher_allowed`] first. Fails
+    /// loud under a v1.1 process claim **before** any Esplora I/O. There is
+    /// no un-checked constructor and no witness to forge or forget.
+    pub fn connect(url: &str) -> Result<Self, BoxError> {
+        stack_policy::ensure_legacy_publisher_allowed()?;
         let builder = RawBuilder::new(url);
         let inner = RawAsyncClient::<DefaultSleeper>::from_builder(builder)?;
         Ok(Self { inner })
@@ -164,5 +135,54 @@ impl EsploraBroadcastClient {
 
     pub async fn get_tx(&self, txid: &Txid) -> Result<Option<Transaction>, BoxError> {
         self.inner.get_tx(txid).await.map_err(|e| e.into())
+    }
+}
+
+#[cfg(test)]
+mod policy_construction_tests {
+    use super::*;
+    use stack_policy::{
+        clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        STACK_SEPARATION_REFUSAL,
+    };
+
+    /// A broadcast-capable client cannot be obtained under a v1.1 process
+    /// claim — the policy check is inside `connect`, not a caller-side
+    /// witness.
+    #[test]
+    fn broadcast_connect_refuses_under_v11_process_claim() {
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+        let err = EsploraBroadcastClient::connect("http://127.0.0.1:1")
+            .expect_err("v11 claim must block broadcast construction");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(STACK_SEPARATION_REFUSAL) || msg.contains("v1.1"),
+            "got: {msg}"
+        );
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Policy pass (legacy claim) allows construction; no stack-separation
+    /// error is returned. Client build itself only needs a parseable URL.
+    #[test]
+    fn broadcast_connect_succeeds_under_legacy_process_claim() {
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::Legacy);
+        let client = EsploraBroadcastClient::connect("http://127.0.0.1:1")
+            .expect("legacy claim must allow broadcast construction");
+        // Touch Debug so the private-inner formatting path is covered.
+        let _ = format!("{client:?}");
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Unclaimed process (pre-boot / unit-test default) still allows legacy
+    /// broadcast construction — same rule as the policy function.
+    #[test]
+    fn broadcast_connect_allowed_when_process_unclaimed() {
+        clear_process_stack_mode_for_test();
+        EsploraBroadcastClient::connect("http://127.0.0.1:1")
+            .expect("unclaimed process allows legacy broadcast construction");
+        clear_process_stack_mode_for_test();
     }
 }
