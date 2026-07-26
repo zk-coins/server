@@ -24,7 +24,9 @@
 //! module's logic needs to cover.
 
 use super::*;
-use crate::v11::{claim_stack_scan_mode, ScanStackMode};
+use crate::v11::{
+    claim_stack_scan_mode, clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+};
 use crate::account_node::CanaryOutcome;
 use crate::test_db::setup_pool;
 
@@ -295,6 +297,7 @@ async fn heal_keep_leaves_everything_untouched_and_skips_canary() {
 async fn heal_reset_on_digest_mismatch_wipes_state_and_skips_canary() {
     // Detector 1: a persisted digest differs from the live one. Wipe,
     // and the canary must NOT run (detector 1 is authoritative).
+    clear_process_stack_mode_for_test();
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     let proofs = tempfile::tempdir().expect("tempdir");
@@ -324,6 +327,100 @@ async fn heal_reset_on_digest_mismatch_wipes_state_and_skips_canary() {
         Some(&b"NEW"[..])
     );
     assert!(!proofs_subdir.exists(), "proof-store dir wiped");
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 2 (round 6): under a v1.1 process claim, Reset must clear
+/// legacy proof-bearing `accounts` (what the reset exists to drop) while
+/// leaving structures v1.1 does not use (SMT/MMR/latest_block) intact.
+#[tokio::test]
+async fn heal_reset_under_v11_clears_accounts_preserves_unused_legacy_structures() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let proofs = tempfile::tempdir().expect("tempdir");
+    let proofs_subdir = proofs.path().join("proofs");
+    std::fs::create_dir_all(&proofs_subdir).expect("mkdir");
+    std::fs::write(proofs_subdir.join("0.bin"), b"stale").expect("write");
+    let proofs_dir = proofs_subdir.to_str().unwrap();
+
+    // Claim v1.1 (empty DB). Seed proof-bearing accounts + orphan SMT/MMR
+    // rows via raw SQL (structures v1.1 does not use — must survive reset).
+    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11");
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let owner = zkcoins_program::hash::digest_from_bytes(&[7u8; 32]);
+    let asset_id = zkcoins_program::hash::digest_from_bytes(&[8u8; 32]);
+    let key = crate::account_node::account_key_bytes(&owner, &asset_id);
+    db::upsert_account(&pool, &key, b"stale-v11-account-blob")
+        .await
+        .expect("seed account under v11");
+    // Bypass stack writers: raw insert of structures v1.1 never reads.
+    sqlx::query(
+        "INSERT INTO smt_state (id, data, updated_at) VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+    )
+    .bind([0x51u8; 8].as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed smt_state");
+    sqlx::query(
+        "INSERT INTO mmr_state (id, data, updated_at) VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+    )
+    .bind([0x52u8; 8].as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed mmr_state");
+    sqlx::query(
+        "INSERT INTO latest_block (id, block_hash, updated_at) VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE SET block_hash = EXCLUDED.block_hash",
+    )
+    .bind([0x53u8; 32].as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed latest_block");
+
+    db::store_circuit_digest(&pool, b"OLD-V11")
+        .await
+        .expect("store old digest");
+    assert_eq!(count_accounts(&pool).await, 1);
+
+    let decision = heal_circuit_digest(&pool, b"NEW-V11", proofs_dir, &canary_must_not_run)
+        .await
+        .expect("heal ok under v11");
+
+    assert_eq!(decision, ResetDecision::Reset);
+    assert_eq!(
+        count_accounts(&pool).await,
+        0,
+        "v1.1 reset must clear legacy proof-bearing accounts"
+    );
+    assert_eq!(
+        db::load_circuit_digest(&pool).await.unwrap().as_deref(),
+        Some(&b"NEW-V11"[..]),
+        "digest must update"
+    );
+    // Structures v1.1 does not use must remain (not a full legacy wipe).
+    assert_eq!(
+        db::load_smt(&pool).await.unwrap().as_deref(),
+        Some([0x51u8; 8].as_slice()),
+        "smt_state must be preserved under v1.1 reset"
+    );
+    assert_eq!(
+        db::load_mmr(&pool).await.unwrap().as_deref(),
+        Some([0x52u8; 8].as_slice()),
+        "mmr_state must be preserved under v1.1 reset"
+    );
+    assert_eq!(
+        db::load_latest_block(&pool).await.unwrap(),
+        Some([0x53u8; 32]),
+        "latest_block must be preserved under v1.1 reset"
+    );
+    assert!(!proofs_subdir.exists(), "proof-store dir wiped");
+    clear_process_stack_mode_for_test();
 }
 
 #[tokio::test]

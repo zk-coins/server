@@ -785,20 +785,10 @@ async fn run_v11_scan_loop(
                     .map_err(|e| anyhow::anyhow!("bitcoind RPC open for tip recon: {e}"))
                 };
 
-                let query_live_hash = |h: u64| -> anyhow::Result<Option<[u8; 32]>> {
-                    let client = open_client()?;
-                    let tip = client
-                        .get_block_count()
-                        .map_err(|e| anyhow::anyhow!("getblockcount for tip recon: {e}"))?;
-                    if h > tip {
-                        return Ok(None);
-                    }
-                    let hash = client
-                        .get_block_hash(h)
-                        .map_err(|e| anyhow::anyhow!("getblockhash({h}) for tip recon: {e}"))?;
-                    Ok(Some(hash.to_byte_array()))
-                };
-
+                // Recon classifies against the **immutable ancestry of the
+                // captured scan-tip hash** (resolve by hash / prev links) —
+                // never against mutable getblockhash(height) of the live tip.
+                // A→B→A cannot flip StillCanonical under a fixed observation.
                 let resolve_hash = |block_hash: [u8; 32]| -> anyhow::Result<Option<ResolvedBlock>> {
                     let client = open_client()?;
                     let bh = BlockHash::from_byte_array(block_hash);
@@ -834,18 +824,26 @@ async fn run_v11_scan_loop(
                     }
                 };
 
+                let live_node_height = {
+                    let client = open_client()?;
+                    client
+                        .get_block_count()
+                        .map_err(|e| anyhow::anyhow!("getblockcount for tip recon: {e}"))?
+                };
+
                 let outcome = reconcile_persisted_tip(
                     persisted_height,
                     persisted_hash,
                     activation_height,
-                    query_live_hash,
+                    scan_tip_height,
+                    scan_tip_hash,
+                    live_node_height,
                     resolve_hash,
                 )?;
 
-                // Tip stability pin: recon and scan must still describe the
-                // same tip. If the live hash at the scan height moved, the
-                // whole observation is stale — caller retries. Fresh query
-                // (query_live_hash was moved into recon above).
+                // Secondary pin: if the live tip at the scan height moved
+                // away from the captured scan hash, re-observe. Not the
+                // A→B→A defence (that is ancestry-based recon above).
                 let live_at_scan = {
                     let client = open_client()?;
                     let tip = client

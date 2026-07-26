@@ -1,0 +1,10 @@
+[package]
+name = "esplora-bound"
+version.workspace = true
+edition.workspace = true
+description = "Guarded Esplora HTTP wrappers — sole workspace owner of the esplora-client dependency"
+publish = false
+
+[dependencies]
+bitcoin = { workspace = true }
+esplora-client = { git = "https://github.com/BitVM/rust-esplora-client", branch = "master" }

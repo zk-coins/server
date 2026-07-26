@@ -22,30 +22,37 @@
 //! Every boot creates a fresh scanner with an empty checkpoint. If Bitcoin
 //! reorganised while the node was down, that scanner cannot report a reorg
 //! (no previous tip). The node therefore reconciles the **persisted** tip
-//! against the **same chain observation** as the first scan — never
-//! recon-then-scan as two independent observations (§3.9):
+//! against the **immutable ancestry of the captured scan-tip hash** — never
+//! against mutable `getblockhash(height)` observations of the live tip
+//! (same design as §3.5 `block_anchor` ancestry in the script-plonky2
+//! scanner: A→B→A leaves no detectable reorg if you only sample the live
+//! tip twice):
 //!
-//! 1. Run `scan_to_tip` to obtain `(tip, survivors)`.
-//! 2. **Resolve the persisted tip hash itself** (by hash, not only by
-//!    height) against that live view. An unknown / pruned tip is **not**
-//!    treated as a shallow reorg — fail-stop.
-//! 3. Walk the old chain via `previousblockhash` to the **last common
-//!    ancestor** with the live main chain; reorg depth =
-//!    `persisted_height − ancestor_height`.
-//! 4. Re-verify `live_hash_at(scan_tip) == scan_tip_hash`. If the tip
-//!    moved, discard recon + scan and re-observe. The window is **closed**,
-//!    not narrowed: there is no path that commits a recon decision from
-//!    a different observation than the survivors applied.
+//! 1. Run `scan_to_tip` to obtain `(tip_height, tip_hash, survivors)`.
+//! 2. **Behind-node gate first**: if the connected node's tip height is
+//!    still below the persisted height, return
+//!    [`TipReconcileOutcome::RetryableIncompleteView`] **before** resolving
+//!    the persisted hash. A restored bitcoind that does not know later
+//!    blocks must retry, not fail-stop.
+//! 3. Resolve the persisted tip hash (by hash). Unknown / pruned is fatal
+//!    **only** once the live node is already at or beyond that height.
+//! 4. Classify against the **scan tip's immutable ancestry** (walk
+//!    `previousblockhash` from the fixed scan-tip hash — never
+//!    `getblockhash(height)` on the live tip):
+//!    - hash at `persisted_height` on that ancestry equals `tip_hash` →
+//!      StillCanonical;
+//!    - otherwise walk the old chain to the last common ancestor with the
+//!      scan-tip ancestry; reorg depth = `persisted_height − ancestor_height`.
 //! 5. **Taxonomy of outcomes**:
 //!    - **Ready** ([`PersistedTipReconciliation`]): Fresh / StillCanonical
 //!      / ShallowReorg — apply from **this** scan's survivors.
-//!    - **Retryable incomplete view** (`live_hash_at` → `None`, or tip
-//!      pin failed): RPC behind / lag. Stay unready, leave `finality_ok`
-//!      untouched, back off, full re-verify. Never assume canonical,
-//!      never assume reorg, never conflate lag with deep_reorg.
-//!    - **Fatal** (`Err`): unresolvable tip, no common ancestor, depth
-//!      beyond §3.9, RPC infrastructure failure, ambiguous cursor.
-//!      Fail-stop; deep reorg trips readiness `deep_reorg`.
+//!    - **Retryable incomplete view**: RPC behind / observation incomplete.
+//!      Stay unready, leave `finality_ok` untouched, back off, full
+//!      re-verify. Never assume canonical, never assume reorg, never
+//!      conflate lag with deep_reorg.
+//!    - **Fatal** (`Err`): unresolvable tip (with live already at height),
+//!      no common ancestor, depth beyond §3.9, RPC infrastructure failure,
+//!      ambiguous cursor. Fail-stop; deep reorg trips readiness `deep_reorg`.
 //! 6. Only a **shallow** (depth ≤ 5), non-final reorg may full-replace
 //!    NfLog from the rescan survivor stream. A one-block reorg of the
 //!    **activation block** has common ancestor `activation_height − 1`
@@ -400,14 +407,13 @@ pub enum TipReconcileOutcome {
 
 /// Whether a scan tip is still the live main-chain hash at that height.
 ///
-/// Used to pin reconciliation and the first boot scan to **one**
-/// observation: after reconciling against the scan tip, re-read
-/// `live_hash_at(scan_tip_height)`. If it no longer equals
-/// `scan_tip_hash`, discard both recon and scan and re-observe.
+/// Secondary pin after ancestry-based recon: if the live tip at the scan
+/// height has moved away from the captured `scan_tip_hash`, the whole
+/// observation (scan + recon) is stale and the caller must re-observe.
 ///
-/// This closes (does not merely narrow) the recon/scan race: there is
-/// no path that applies a recon decision from a different chain tip
-/// than the survivors being folded.
+/// **Not** the defence against A→B→A: equality of a mutable live-tip
+/// sample observed twice proves nothing. Classification is a pure
+/// function of the fixed scan-tip ancestry (see [`reconcile_persisted_tip`]).
 pub fn observation_tip_still_live(
     scan_tip_hash: [u8; 32],
     live_at_scan_height: Option<[u8; 32]>,
@@ -421,32 +427,106 @@ pub fn first_boot_requires_full_replace(recon: &PersistedTipReconciliation) -> b
     matches!(recon, PersistedTipReconciliation::ShallowReorg { .. })
 }
 
-/// Reconcile `(tip_height, tip_hash)` from the persisted engine against
-/// the live chain under §3.9 finality rules.
+/// Hash of the block at `target_height` on the **immutable ancestry** of a
+/// fixed tip `(tip_height, tip_hash)`.
 ///
-/// `live_hash_at(height)` returns:
-/// - `Ok(Some(hash))` when the height is on the live main chain
-/// - `Ok(None)` when the height is above the live tip (RPC node behind /
-///   height not yet known) — **not** evidence of a reorg; yields
-///   [`TipReconcileOutcome::RetryableIncompleteView`]
-/// - `Err(_)` on RPC / infrastructure failure — this function propagates
-///   the error and **refuses** to classify the tip (never fold blind)
+/// Walks `prev_hash` from the tip via `resolve_hash` — never
+/// `getblockhash(height)` against the mutable live tip. Same principle as
+/// script-plonky2 scanner anchor resolution from the inclusion block.
 ///
-/// `resolve_hash(hash)` returns:
-/// - `Ok(Some(ResolvedBlock))` when bitcoind knows the block (main or orphan)
-/// - `Ok(None)` when the hash is unknown / pruned
-/// - `Err(_)` on RPC failure — refused, never treated as a shallow reorg
+/// Returns `Ok(None)` when `target_height > tip_height` (target is not on
+/// this tip's ancestry). Returns `Err` on resolve failure / inconsistency.
+fn hash_at_height_on_ancestry(
+    tip_height: u64,
+    tip_hash: [u8; 32],
+    target_height: u64,
+    resolve_hash: &mut impl FnMut([u8; 32]) -> Result<Option<ResolvedBlock>>,
+) -> Result<Option<[u8; 32]>> {
+    if target_height > tip_height {
+        return Ok(None);
+    }
+    if target_height == tip_height {
+        return Ok(Some(tip_hash));
+    }
+
+    let mut walk_height = tip_height;
+    let mut walk_hash = tip_hash;
+    while walk_height > target_height {
+        let block = resolve_hash(walk_hash).with_context(|| {
+            format!(
+                "v1.1 boot tip reconciliation: resolve during observation-ancestry \
+                 walk for height {target_height} (from tip height={tip_height} \
+                 hash={}) failed",
+                hex::encode(tip_hash)
+            )
+        })?;
+        let Some(block) = block else {
+            bail!(
+                "v1.1 boot tip reconciliation: observation-ancestry block {} at \
+                 height {walk_height} became unresolvable while walking to height \
+                 {target_height} — refusing to fold",
+                hex::encode(walk_hash)
+            );
+        };
+        if block.height != walk_height {
+            bail!(
+                "v1.1 boot tip reconciliation: resolved height {} != walk height {} \
+                 for hash {} during observation-ancestry walk; refusing",
+                block.height,
+                walk_height,
+                hex::encode(walk_hash)
+            );
+        }
+        walk_hash = block.prev_hash;
+        walk_height = walk_height
+            .checked_sub(1)
+            .context("v1.1 boot tip reconciliation: height underflow on observation ancestry")?;
+    }
+    Ok(Some(walk_hash))
+}
+
+/// Reconcile `(tip_height, tip_hash)` from the persisted engine against the
+/// **immutable ancestry of a fixed observation tip** (the captured scan tip)
+/// under §3.9 finality rules.
+///
+/// # Why the observation tip, not the live tip
+///
+/// Sampling `getblockhash(height)` on the live chain is mutable: an
+/// A→B→A sequence can make recon see chain B (StillCanonical for a B
+/// persisted tip) while the scan survivors and the post-recon pin both
+/// belong to A — permanently mixing accumulators. Equality of a mutable
+/// value observed twice proves nothing. Classification is therefore a
+/// pure function of the **fixed** `(observation_tip_height,
+/// observation_tip_hash)` ancestry (walk `prev_hash` via `resolve_hash`),
+/// mirroring how the scanner decides anchor admissibility from the
+/// inclusion block's ancestry rather than the live tip.
+///
+/// # Arguments
+///
+/// * `live_node_height` — highest height the connected node currently
+///   reports (`getblockcount`). Checked **before** resolving the
+///   persisted hash: a restored/syncing node that has not reached the
+///   persisted height returns [`TipReconcileOutcome::RetryableIncompleteView`]
+///   instead of treating an unknown hash as fatal.
+/// * `observation_tip_height` / `observation_tip_hash` — the scan tip this
+///   recon is bound to (same observation as the survivors to apply).
+/// * `resolve_hash(hash)` returns:
+///   - `Ok(Some(ResolvedBlock))` when bitcoind knows the block (main or orphan)
+///   - `Ok(None)` when the hash is unknown / pruned
+///   - `Err(_)` on RPC failure — refused, never treated as a shallow reorg
 ///
 /// # Failures (`Err` — fatal only, no silent recovery)
 ///
 /// - `tip_height > 0` with all-zero `tip_hash` (ambiguous cursor)
-/// - persisted tip hash unknown / pruned (depth indeterminate)
-/// - no common ancestor with the live main chain (walked to genesis)
+/// - persisted tip hash unknown / pruned **while** `live_node_height >= tip_height`
+/// - no common ancestor with the observation tip's ancestry (walked to genesis)
 /// - reorg depth > [`MAX_RECOVERABLE_REORG_DEPTH`] (§3.9 ≥6-block fail-stop)
-/// - live-chain or resolve RPC **infrastructure** failure
+/// - resolve RPC **infrastructure** failure
+/// - observation tip unresolvable / height mismatch
 ///
-/// Incomplete live views (`live_hash_at` → `None`) are **not** failures;
-/// they return [`TipReconcileOutcome::RetryableIncompleteView`].
+/// Incomplete views (live node behind persisted height, or observation tip
+/// below persisted height) are **not** failures; they return
+/// [`TipReconcileOutcome::RetryableIncompleteView`].
 ///
 /// # Activation boundary
 ///
@@ -459,7 +539,9 @@ pub fn reconcile_persisted_tip(
     tip_height: u64,
     tip_hash: [u8; 32],
     activation_height: u64,
-    mut live_hash_at: impl FnMut(u64) -> Result<Option<[u8; 32]>>,
+    observation_tip_height: u64,
+    observation_tip_hash: [u8; 32],
+    live_node_height: u64,
     mut resolve_hash: impl FnMut([u8; 32]) -> Result<Option<ResolvedBlock>>,
 ) -> Result<TipReconcileOutcome> {
     let zero = [0u8; 32];
@@ -476,9 +558,39 @@ pub fn reconcile_persisted_tip(
         );
     }
 
-    // 1. Resolve the persisted tip hash **itself** (not merely height→hash).
-    //    An unknown/pruned tip is indistinguishable from a shallow reorg if
-    //    we only compare getblockhash(height) — refuse rather than assume.
+    // 1. Behind-node gate FIRST (Defect 3). A restored bitcoind that has not
+    //    reached the persisted height does not know the tip hash yet;
+    //    resolving before this check misclassifies lag as fatal unknown.
+    if live_node_height < tip_height {
+        return Ok(TipReconcileOutcome::RetryableIncompleteView {
+            queried_height: tip_height,
+            detail: format!(
+                "connected bitcoind tip height {live_node_height} is behind \
+                 persisted tip height {tip_height} (hash={}). Incomplete view \
+                 — not a confirmed reorg and not an unresolvable tip. Staying \
+                 unready and retrying (no silent assume-canonical, no silent \
+                 assume-reorg).",
+                hex::encode(tip_hash)
+            ),
+        });
+    }
+
+    // 2. Observation must cover the persisted height (bound scan window).
+    if observation_tip_height < tip_height {
+        return Ok(TipReconcileOutcome::RetryableIncompleteView {
+            queried_height: tip_height,
+            detail: format!(
+                "observation (scan) tip height {observation_tip_height} is below \
+                 persisted tip height {tip_height} (hash={}). Incomplete \
+                 observation relative to the engine cursor — staying unready \
+                 and retrying (no silent assume-canonical).",
+                hex::encode(tip_hash)
+            ),
+        });
+    }
+
+    // 3. Resolve the persisted tip hash **itself** (not merely height→hash).
+    //    Live node is already at/beyond tip_height, so unknown/pruned is fatal.
     let tip_block = resolve_hash(tip_hash).context(
         "v1.1 boot tip reconciliation: resolve of persisted tip hash failed; \
          refusing to fold onto an unverified persisted tip",
@@ -486,9 +598,10 @@ pub fn reconcile_persisted_tip(
     let Some(tip_block) = tip_block else {
         bail!(
             "v1.1 boot tip reconciliation: persisted tip hash {} at height {} \
-             is unknown or pruned on the connected bitcoind — reorg depth and \
-             common ancestor cannot be determined. Refusing to fold (fail-stop; \
-             no silent recovery of an unresolvable tip). Manual recovery required.",
+             is unknown or pruned on the connected bitcoind (live tip height \
+             {live_node_height} ≥ persisted height) — reorg depth and common \
+             ancestor cannot be determined. Refusing to fold (fail-stop; no \
+             silent recovery of an unresolvable tip). Manual recovery required.",
             hex::encode(tip_hash),
             tip_height
         );
@@ -503,54 +616,68 @@ pub fn reconcile_persisted_tip(
         );
     }
 
-    // 2. Still on the live main chain at that height?
-    //    Distinguish: Some(same) = canonical; Some(different) = reorg;
-    //    None = RPC behind / height not known yet — retryable, not reorg.
-    let live_at_tip = live_hash_at(tip_height).context(
-        "v1.1 boot tip reconciliation: live-chain query failed; \
-         refusing to fold onto an unverified persisted tip",
+    // 4. Resolve the fixed observation tip (scan tip) — ancestry root.
+    let obs_block = resolve_hash(observation_tip_hash).context(
+        "v1.1 boot tip reconciliation: resolve of observation (scan) tip hash failed; \
+         refusing to fold onto an unverified observation",
     )?;
-    match live_at_tip {
-        Some(hash) if hash == tip_hash => {
-            return Ok(TipReconcileOutcome::Ready(
-                PersistedTipReconciliation::StillCanonical {
-                    tip_height,
-                    tip_hash,
-                },
-            ));
-        }
-        Some(_) => {
-            // Diverged at the tip — walk for common ancestor below.
-        }
-        None => {
-            return Ok(TipReconcileOutcome::RetryableIncompleteView {
-                queried_height: tip_height,
-                detail: format!(
-                    "live chain has no block at persisted tip height {tip_height} \
-                     (hash={}). The RPC node's tip is behind the persisted cursor \
-                     — incomplete view, not a confirmed reorg. Staying unready and \
-                     retrying (no silent assume-canonical, no silent assume-reorg).",
-                    hex::encode(tip_hash)
-                ),
-            });
-        }
+    let Some(obs_block) = obs_block else {
+        bail!(
+            "v1.1 boot tip reconciliation: observation tip hash {} at height {} \
+             is unknown or pruned — cannot build immutable ancestry; refusing \
+             to fold",
+            hex::encode(observation_tip_hash),
+            observation_tip_height
+        );
+    };
+    if obs_block.height != observation_tip_height {
+        bail!(
+            "v1.1 boot tip reconciliation: observation_tip_height={observation_tip_height} \
+             but resolved hash {} is at height {} — observation inconsistency; \
+             refusing to fold",
+            hex::encode(observation_tip_hash),
+            obs_block.height
+        );
     }
 
-    // 3. Walk back the old chain via previousblockhash to the last common
-    //    ancestor with the live main chain. Depth = persisted − ancestor.
+    // 5. Hash at persisted height on the **observation tip's immutable ancestry**.
+    //    Never getblockhash(height) on the live tip.
+    let hash_on_obs = hash_at_height_on_ancestry(
+        observation_tip_height,
+        observation_tip_hash,
+        tip_height,
+        &mut resolve_hash,
+    )?
+    .context(
+        "v1.1 boot tip reconciliation: internal — observation tip height covers \
+         persisted height but ancestry walk returned None",
+    )?;
+
+    if hash_on_obs == tip_hash {
+        return Ok(TipReconcileOutcome::Ready(
+            PersistedTipReconciliation::StillCanonical {
+                tip_height,
+                tip_hash,
+            },
+        ));
+    }
+
+    // 6. Diverged: walk the old (persisted) chain via previousblockhash to
+    //    the last common ancestor with the observation ancestry.
     let mut walk_hash = tip_hash;
     let mut walk_height = tip_height;
-    // Cache the already-resolved tip block so the first step needs no re-fetch.
     let mut cached: Option<ResolvedBlock> = Some(tip_block);
 
     loop {
         if walk_height == 0 {
             bail!(
                 "v1.1 boot tip reconciliation: no common ancestor between \
-                 persisted tip (height={tip_height}, hash={}) and the live \
-                 chain — walked to genesis. Refusing to fold (fail-stop; \
-                 §3.9 provides no recovery for an unrooted offline reorg).",
-                hex::encode(tip_hash)
+                 persisted tip (height={tip_height}, hash={}) and the observation \
+                 tip ancestry (height={observation_tip_height}, hash={}) — walked \
+                 to genesis. Refusing to fold (fail-stop; §3.9 provides no \
+                 recovery for an unrooted offline reorg).",
+                hex::encode(tip_hash),
+                hex::encode(observation_tip_hash)
             );
         }
 
@@ -605,23 +732,24 @@ pub fn reconcile_persisted_tip(
             );
         }
 
-        let live_parent = live_hash_at(parent_height).context(
-            "v1.1 boot tip reconciliation: live-chain query during ancestor walk failed; \
-             refusing to fold",
+        // Membership of parent on observation ancestry — immutable walk,
+        // not live getblockhash(parent_height).
+        let parent_on_obs = hash_at_height_on_ancestry(
+            observation_tip_height,
+            observation_tip_hash,
+            parent_height,
+            &mut resolve_hash,
         )?;
-        match live_parent {
+        match parent_on_obs {
             Some(h) if h == parent_hash => {
-                // Found last common ancestor on the live chain.
+                // Found last common ancestor on the observation ancestry.
                 //
                 // Ancestor may sit below `activation_height` (e.g. one-block
                 // reorg of the activation block → parent = activation − 1).
                 // NfLog has no entries below activation (§3.6), so a full
                 // replace from the rescan stream is exactly "replay from
                 // activation". Depth is already gated above — do not refuse
-                // solely because `parent_height < activation_height`
-                // (one-block reorg of the activation block: parent =
-                // activation − 1). `activation_height` remains a parameter
-                // for callers and for this contract.
+                // solely because `parent_height < activation_height`.
                 let _: bool = parent_height < activation_height;
                 return Ok(TipReconcileOutcome::Ready(
                     PersistedTipReconciliation::ShallowReorg {
@@ -634,20 +762,21 @@ pub fn reconcile_persisted_tip(
                 ));
             }
             Some(_) => {
-                // Parent still diverged from the live main chain — keep walking.
+                // Parent still diverged from the observation ancestry — keep walking.
                 walk_hash = parent_hash;
                 walk_height = parent_height;
             }
             None => {
-                // Incomplete live view at this height: RPC tip is behind the
-                // walk. That is not evidence the parent is orphaned.
+                // parent_height > observation_tip_height is impossible here
+                // (we gated observation_tip_height >= tip_height >= walk).
+                // Treat as incomplete rather than silent reorg.
                 return Ok(TipReconcileOutcome::RetryableIncompleteView {
                     queried_height: parent_height,
                     detail: format!(
-                        "live chain has no block at height {parent_height} during \
-                         ancestor walk (persisted tip height={tip_height}). The RPC \
-                         node is behind — incomplete view, not confirmed divergence. \
-                         Staying unready and retrying (no silent reorg classification)."
+                        "observation ancestry has no block at height {parent_height} \
+                         during ancestor walk (persisted tip height={tip_height}). \
+                         Incomplete view — staying unready and retrying (no silent \
+                         reorg classification)."
                     ),
                 });
             }

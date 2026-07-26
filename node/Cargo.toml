@@ -59,7 +59,11 @@ serde_json = "1.0"
 # so any version drift should be a deliberate code change with
 # review, not a silent `cargo update` side-effect.
 bitcoincore-zmq = { version = "=1.5.4", optional = true }
-esplora-client = { git = "https://github.com/BitVM/rust-esplora-client", branch = "master" }
+# Raw `esplora-client` is **not** a direct dependency of `node`. All
+# Esplora I/O goes through the `esplora-bound` facade package, which
+# exports only guarded wrappers (private inner client). Naming
+# `esplora_client::…` in this package is a compile error.
+esplora-bound = { path = "../esplora-bound" }
 axum = { version = "0.7.9", features = ["json", "multipart"] }
 # `BodyExt::collect()` for the audit middleware's request/response
 # body buffering. Promoted from `[dev-dependencies]` because the
@@ -243,6 +247,9 @@ fs2 = "0.4"
 # (`t_<uuid_simple>`); the workspace pulls it from the main
 # `[dependencies]` block above (where the `v4` + `serde` features
 # are already enabled), so no separate dev-dep entry is needed.
+# Compile-fail evidence that `esplora_client` is unobtainable from `node`
+# (Defect 4 / facade package boundary).
+trybuild = "1.0"
 
 [features]
 # All non-MVP features are off by default. When a feature is not enabled, the

@@ -1039,6 +1039,40 @@ pub async fn reset_proof_dependent_state_tx(
     tx.commit().await
 }
 
+/// v1.1 self-heal reset: clear **legacy proof-bearing account state** and
+/// store the live circuit digest, without touching structures the v1.1
+/// stack does not use (SMT / MMR / root index / latest_block).
+///
+/// Under exclusive v1.1 the full [`reset_proof_dependent_state_tx`] is a
+/// legacy-stack writer and must not run (it requires the legacy marker and
+/// would wipe scan tables that stack separation already keeps empty). But
+/// a circuit-digest reset still exists to drop stale `accounts` rows that
+/// carry recursive proofs — those survive a digest-only update and would
+/// be reloaded by `main` into an incompatible AccountNode.
+///
+/// Does **not** require a legacy stack marker (v1.1 process owns this path).
+/// Does **not** DELETE from `smt_state` / `mmr_state` / `mmr_root_index` /
+/// `latest_block` (v1.1 does not use them; leave them intact).
+pub async fn reset_legacy_accounts_for_v11_self_heal(
+    pool: &PgPool,
+    new_digest: &[u8],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM accounts")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO circuit_digest_meta (id, digest, updated_at) \
+         VALUES (1, $1, NOW()) \
+         ON CONFLICT (id) DO UPDATE \
+         SET digest = EXCLUDED.digest, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(new_digest)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
 // ---- Username persistence (PR-A3) -----------------------------------------
 
 /// Load every `(name, address)` pair from the `usernames` table.

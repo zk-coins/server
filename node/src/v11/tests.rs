@@ -535,15 +535,40 @@ fn resolve_from_chain(
     }
 }
 
-fn live_from_chain(
-    chain: &[[u8; 32]],
-    height: u64,
-) -> anyhow::Result<Option<[u8; 32]>> {
-    let tip = chain.len().saturating_sub(1) as u64;
-    if height > tip {
-        return Ok(None);
+/// Resolve across several chains (e.g. old fork + new tip for reorg tests).
+fn resolve_from_chains(
+    chains: &[&[[u8; 32]]],
+    hash: [u8; 32],
+) -> anyhow::Result<Option<ResolvedBlock>> {
+    for chain in chains {
+        if let Some(b) = resolve_from_chain(chain, hash)? {
+            return Ok(Some(b));
+        }
     }
-    Ok(Some(chain[height as usize]))
+    Ok(None)
+}
+
+/// Restored/syncing node: only headers up to `max_known_height` exist.
+fn resolve_up_to(
+    chain: &[[u8; 32]],
+    max_known_height: u64,
+    hash: [u8; 32],
+) -> anyhow::Result<Option<ResolvedBlock>> {
+    match chain.iter().position(|h| *h == hash) {
+        None => Ok(None),
+        Some(height) if (height as u64) > max_known_height => Ok(None),
+        Some(height) => {
+            let prev_hash = if height == 0 {
+                [0u8; 32]
+            } else {
+                chain[height - 1]
+            };
+            Ok(Some(ResolvedBlock {
+                height: height as u64,
+                prev_hash,
+            }))
+        }
+    }
 }
 
 /// Seed one `mmr_root_index` row — the durable signal of legacy scan activity.
@@ -888,13 +913,16 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     assert_ne!(continuous_root, old_root, "reorg must change the NfLog root");
 
     // --- Restart path: reconciling the persisted tip sees a shallow reorg ---
+    // Observation = new (scan) tip; classify against its immutable ancestry.
     let recon = expect_ready(
         reconcile_persisted_tip(
             11,
             old_tip_hash,
             0,
-            |h| live_from_chain(&new_chain, h),
-            |hash| resolve_from_chain(&old_chain, hash),
+            11,
+            new_tip_hash,
+            11,
+            |hash| resolve_from_chains(&[&old_chain, &new_chain], hash),
         )
         .expect("shallow recon"),
     );
@@ -942,7 +970,9 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
             11,
             new_tip_hash,
             0,
-            |h| live_from_chain(&new_chain, h),
+            11,
+            new_tip_hash,
+            11,
             |hash| resolve_from_chain(&new_chain, hash),
         )
         .expect("still canonical"),
@@ -958,7 +988,9 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
         5,
         [0u8; 32],
         0,
-        |_| Ok(Some([1u8; 32])),
+        5,
+        [1u8; 32],
+        5,
         |_| Ok(None),
     )
     .expect_err("zero hash with height must refuse");
@@ -1004,12 +1036,15 @@ fn offline_reorg_deeper_than_recoverable_limit_refuses() {
         };
     }
     let old_tip = old_chain[20];
+    let live_tip = live_chain[20];
     let err = reconcile_persisted_tip(
         20,
         old_tip,
         0,
-        |h| live_from_chain(&live_chain, h),
-        |hash| resolve_from_chain(&old_chain, hash),
+        20,
+        live_tip,
+        20,
+        |hash| resolve_from_chains(&[&old_chain, &live_chain], hash),
     )
     .expect_err("depth-6 offline reorg must refuse");
     let msg = format!("{err:#}");
@@ -1027,17 +1062,30 @@ fn offline_reorg_deeper_than_recoverable_limit_refuses() {
 }
 
 /// Unresolvable persisted tip (unknown / pruned hash) refuses — not a
-/// silent shallow-reorg assumption.
+/// silent shallow-reorg assumption — **when** the live node is already at
+/// or beyond the persisted height.
 #[test]
 fn unresolvable_persisted_tip_refuses() {
+    let obs = [0xADu8; 32];
     let err = reconcile_persisted_tip(
         10,
         [0xDE; 32],
         0,
-        |_| Ok(Some([0xAD; 32])),
-        |_| Ok(None), // hash unknown
+        10,
+        obs,
+        10, // live already at height → unknown is fatal
+        |hash| {
+            if hash == obs {
+                Ok(Some(ResolvedBlock {
+                    height: 10,
+                    prev_hash: [0u8; 32],
+                }))
+            } else {
+                Ok(None) // persisted hash unknown
+            }
+        },
     )
-    .expect_err("unknown tip hash must refuse");
+    .expect_err("unknown tip hash must refuse when live is at height");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("unknown") || msg.contains("pruned") || msg.contains("unresolvable"),
@@ -1285,15 +1333,22 @@ fn recover_inscription_binary_path_refuses_under_v11_shadow() {
     clear_process_stack_mode_for_test();
 }
 
-/// Defect 1 (round 5): a reorg between a free-standing recon and a later
-/// first scan is the race that StillCanonical + force_full_replace=false
-/// used to miss. Binding recon to the **scan's** live chain closes it:
-/// recon against chain A says StillCanonical; recon against the scan's
-/// chain B says ShallowReorg (full-replace). Tip stability also rejects
-/// applying recon(A) onto scan tip B.
+/// Defect 1 (round 5 + 6): A→B→A defeats any pin based on mutable
+/// `getblockhash(height)`. Recon must classify against the **immutable
+/// ancestry of the captured scan-tip hash**, never against live tip samples.
+///
+/// Sequence that used to pass incorrectly:
+/// 1. persisted state belongs to B,
+/// 2. first scan captures A,
+/// 3. mutable recon observes B → StillCanonical,
+/// 4. chain returns to A; pin sees A and passes,
+/// 5. stale B fold keys + A survivors → permanent mixed accumulator.
+///
+/// With observation ancestry of A, step 3 is ShallowReorg (full-replace)
+/// regardless of what the live tip is doing during recon.
 #[test]
-fn reorg_between_recon_and_first_scan_caught_by_bound_observation() {
-    // Shared prefix 0..=9; old tip at 10 (chain A); live/scan tip at 10 (chain B).
+fn aba_race_caught_by_immutable_scan_tip_ancestry() {
+    // Shared prefix 0..=9; tips at height 10 diverge (A vs B).
     let mut chain_a = mock_chain(11, 0xAA);
     let mut chain_b = mock_chain(11, 0xBB);
     for h in 0..=9 {
@@ -1306,58 +1361,66 @@ fn reorg_between_recon_and_first_scan_caught_by_bound_observation() {
         chain_a[h] = shared;
         chain_b[h] = shared;
     }
-    let persisted_hash = chain_a[10];
-    let scan_tip_hash = chain_b[10];
+    let persisted_b = chain_b[10];
+    let scan_tip_a = chain_a[10];
 
-    // Free-standing recon against chain A (the race window's first half):
-    // would seed folded keys and skip full-replace.
-    let free_standing = expect_ready(
+    // Boot binds recon to the **scan tip A** ancestry. Persisted B is not
+    // on that ancestry → ShallowReorg. Mutable live tip may be B or A
+    // mid-recon; classification does not consult it.
+    let bound_to_scan_a = expect_ready(
         reconcile_persisted_tip(
             10,
-            persisted_hash,
+            persisted_b,
             0,
-            |h| live_from_chain(&chain_a, h),
-            |hash| resolve_from_chain(&chain_a, hash),
+            10,
+            scan_tip_a,
+            10,
+            |hash| resolve_from_chains(&[&chain_a, &chain_b], hash),
         )
-        .expect("recon on A"),
+        .expect("recon bound to scan tip A"),
     );
     assert!(
         matches!(
-            free_standing,
-            PersistedTipReconciliation::StillCanonical { .. }
+            bound_to_scan_a,
+            PersistedTipReconciliation::ShallowReorg { .. }
         ),
-        "recon alone on A is StillCanonical — the dangerous half of the race"
+        "persisted B vs scan-tip A ancestry must be ShallowReorg; got {bound_to_scan_a:?}"
     );
-    assert!(!first_boot_requires_full_replace(&free_standing));
+    assert!(
+        first_boot_requires_full_replace(&bound_to_scan_a),
+        "first boot must full-replace — never seed B fold keys onto A survivors"
+    );
 
-    // Bound recon: live view is the **scan's** chain B.
-    let bound = expect_ready(
+    // Same recon with observation = B would be StillCanonical (dangerous
+    // if the scan had actually captured A). Boot never does this: it always
+    // passes the scan tip as the observation.
+    let free_standing_b = expect_ready(
         reconcile_persisted_tip(
             10,
-            persisted_hash,
+            persisted_b,
             0,
-            |h| live_from_chain(&chain_b, h),
-            |hash| resolve_from_chain(&chain_a, hash),
+            10,
+            persisted_b,
+            10,
+            |hash| resolve_from_chain(&chain_b, hash),
         )
-        .expect("bound recon on B"),
+        .expect("recon observation=B"),
     );
     assert!(
-        matches!(bound, PersistedTipReconciliation::ShallowReorg { .. }),
-        "bound to scan chain B must see the offline reorg; got {bound:?}"
-    );
-    assert!(
-        first_boot_requires_full_replace(&bound),
-        "first boot must full-replace after ShallowReorg"
+        matches!(
+            free_standing_b,
+            PersistedTipReconciliation::StillCanonical { .. }
+        ),
+        "observation=B + persisted=B is StillCanonical (why binding to scan tip matters)"
     );
 
-    // Tip-stability pin: free-standing recon tip A must not be applied
-    // onto a scan that observed tip B.
+    // Secondary pin still rejects applying when live hash ≠ scan tip.
     assert!(
-        !observation_tip_still_live(persisted_hash, Some(scan_tip_hash)),
-        "scan tip B != recon tip A → discard observation"
+        !observation_tip_still_live(scan_tip_a, Some(persisted_b)),
+        "live at B while scan was A → discard"
     );
     assert!(
-        observation_tip_still_live(scan_tip_hash, Some(scan_tip_hash)),
+        observation_tip_still_live(scan_tip_a, Some(scan_tip_a)),
         "matching pin allows apply"
     );
 }
@@ -1457,13 +1520,16 @@ fn one_block_reorg_at_activation_boundary_replays() {
         h
     };
     let old_tip = old_chain[activation as usize];
+    let live_tip = live_chain[activation as usize];
     let recon = expect_ready(
         reconcile_persisted_tip(
             activation,
             old_tip,
             activation,
-            |h| live_from_chain(&live_chain, h),
-            |hash| resolve_from_chain(&old_chain, hash),
+            activation,
+            live_tip,
+            activation,
+            |hash| resolve_from_chains(&[&old_chain, &live_chain], hash),
         )
         .expect("activation-boundary one-block reorg must replay"),
     );
@@ -1481,28 +1547,28 @@ fn one_block_reorg_at_activation_boundary_replays() {
     }
 }
 
-/// Defect 3B (round 4) + Defect 4 (round 5): `live_hash_at` returning `None`
-/// means the RPC view is behind — a **retryable** incomplete view, not a
-/// reorg / divergence / crash.
+/// Defect 3 (round 6): a restored bitcoind that is legitimately behind
+/// must be **retryable**, not fatal. The resolver itself does not know
+/// the later blocks (unlike an older test that only stubbed `live_hash_at`
+/// while the resolver still knew height 10).
 #[test]
-fn rpc_view_behind_persisted_height_is_not_divergence() {
+fn restored_node_behind_persisted_height_is_retryable_not_fatal() {
     let chain = mock_chain(11, 0xAA); // tip height 10
     let tip_hash = chain[10];
-    // RPC only knows up to height 8 (behind persisted tip 10).
+    let max_known = 8u64;
+    // Observation tip is whatever the restored node could scan (height 8).
+    let obs_hash = chain[max_known as usize];
+
     let outcome = reconcile_persisted_tip(
         10,
         tip_hash,
         0,
-        |h| {
-            if h > 8 {
-                Ok(None) // incomplete view
-            } else {
-                live_from_chain(&chain, h)
-            }
-        },
-        |hash| resolve_from_chain(&chain, hash),
+        max_known,
+        obs_hash,
+        max_known, // live_node_height behind persisted
+        |hash| resolve_up_to(&chain, max_known, hash),
     )
-    .expect("behind RPC must not be a fatal Err");
+    .expect("behind restored node must not be a fatal Err");
     match outcome {
         TipReconcileOutcome::RetryableIncompleteView {
             queried_height,
@@ -1512,49 +1578,26 @@ fn rpc_view_behind_persisted_height_is_not_divergence() {
             assert!(
                 detail.contains("behind")
                     || detail.contains("incomplete")
-                    || detail.contains("no block at")
                     || detail.contains("retry"),
                 "must name incomplete/behind view; got: {detail}"
             );
         }
         TipReconcileOutcome::Ready(r) => {
-            panic!("behind RPC must not classify as Ready({r:?})")
+            panic!("behind restored node must not classify as Ready({r:?})")
         }
     }
-}
 
-/// Defect 4 (round 5): once the RPC catches up, the same persisted tip
-/// becomes Ready/StillCanonical — the retry path can proceed without
-/// having ever set deep_reorg.
-#[test]
-fn rpc_behind_then_catchup_becomes_ready_still_canonical() {
-    let chain = mock_chain(11, 0xAA);
-    let tip_hash = chain[10];
-    let behind = reconcile_persisted_tip(
-        10,
-        tip_hash,
-        0,
-        |h| {
-            if h > 8 {
-                Ok(None)
-            } else {
-                live_from_chain(&chain, h)
-            }
-        },
-        |hash| resolve_from_chain(&chain, hash),
-    )
-    .expect("behind is Ok(Retryable)");
-    assert!(matches!(
-        behind,
-        TipReconcileOutcome::RetryableIncompleteView { .. }
-    ));
-
+    // Even if a buggy caller claimed live_node_height >= tip while the
+    // resolver still lacked the headers, unknown would be fatal — the
+    // height gate is what makes restored nodes safe. Catch-up works:
     let caught_up = expect_ready(
         reconcile_persisted_tip(
             10,
             tip_hash,
             0,
-            |h| live_from_chain(&chain, h),
+            10,
+            tip_hash,
+            10,
             |hash| resolve_from_chain(&chain, hash),
         )
         .expect("catch-up recon"),

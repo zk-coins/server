@@ -4,6 +4,7 @@ members = [
     "script-plonky2",
     "node",
     "shared",
+    "esplora-bound",
 ]
 resolver = "2"
 
