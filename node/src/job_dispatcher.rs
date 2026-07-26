@@ -487,6 +487,14 @@ async fn process_mint(
             return Ok(());
         }
     };
+    if let Some(entry) = pending.as_ref() {
+        if let Err(e) = persist_pending_sign_on_job(job_store, public_id, entry).await {
+            let msg = format!("failed to persist pending_sign for restart safety: {e}");
+            job_store.fail(public_id, &msg).await?;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
     job_store
         .set_awaiting_signature(public_id, proof_id as i64, result.clone())
         .await?;
@@ -534,6 +542,7 @@ async fn process_mint_resume(
     job: Job,
 ) -> anyhow::Result<()> {
     let public_id = job.public_id;
+    rehydrate_pending_sign_into_map(app_state, public_id, &job);
     let notifier = notify_map
         .entry(public_id)
         .or_insert_with(|| Arc::new(JobNotifier::new()))
@@ -563,6 +572,65 @@ async fn process_mint_resume(
         notifier,
     )
     .await
+}
+
+/// Merge the restart-safe staging envelope into `jobs.request_body`.
+async fn persist_pending_sign_on_job(
+    job_store: &JobStore,
+    public_id: Uuid,
+    entry: &crate::v11::PendingSignEntry,
+) -> anyhow::Result<()> {
+    let job = job_store
+        .load(public_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("job {public_id} missing while staging pending_sign"))?;
+    let mut body = job.request_body;
+    let persist = crate::v11::StagedSignPersist::from_entry(entry);
+    let value = serde_json::to_value(persist)?;
+    let obj = body
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("jobs.request_body is not an object"))?;
+    obj.insert(crate::v11::PENDING_SIGN_BODY_KEY.to_string(), value);
+    sqlx::query("UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2")
+        .bind(&body)
+        .bind(public_id)
+        .execute(job_store.pool())
+        .await?;
+    Ok(())
+}
+
+/// Rehydrate `pending_sign_map` from the job row after a process restart.
+fn rehydrate_pending_sign_into_map(app_state: &AppState, public_id: Uuid, job: &Job) {
+    if app_state.pending_sign_map.contains_key(&public_id) {
+        return;
+    }
+    match crate::v11::rehydrate_pending_sign(&job.request_body) {
+        Ok(Some(entry)) => {
+            tracing::info!(
+                "Job dispatcher: rehydrated pending_sign for job {} after restart \
+                 (send_counter={})",
+                public_id,
+                entry.send_counter()
+            );
+            app_state.pending_sign_map.insert(public_id, entry);
+        }
+        Ok(None) => {
+            if crate::v11::v11_sign_route_active() {
+                tracing::warn!(
+                    "Job dispatcher: job {} resumed awaiting_signature under v1.1 \
+                     but request_body has no pending_sign envelope — /sign will fail",
+                    public_id
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                "Job dispatcher: failed to rehydrate pending_sign for job {}: {}",
+                public_id,
+                e
+            );
+        }
+    }
 }
 
 /// Drive a send job from `queued` through the prove leg to
@@ -656,7 +724,9 @@ async fn process_send_initial(
     // Under a v1.1 claim the job advertises the §7.5 ProofData surface
     // (from a staged PendingSignEntry), not legacy ash/ocr — a wallet
     // that signed ash/ocr would be rejected at `/sign`. Flag-off keeps
-    // the legacy ash/ocr fields unchanged.
+    // the legacy ash/ocr fields unchanged. When a staged entry is
+    // present, also persist its restart-safe envelope under
+    // request_body.pending_sign.
     let pending = app_state
         .pending_sign_map
         .get(&public_id)
@@ -690,6 +760,14 @@ async fn process_send_initial(
             return Ok(());
         }
     };
+    if let Some(entry) = pending.as_ref() {
+        if let Err(e) = persist_pending_sign_on_job(job_store, public_id, entry).await {
+            let msg = format!("failed to persist pending_sign for restart safety: {e}");
+            job_store.fail(public_id, &msg).await?;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
     job_store
         .set_awaiting_signature(public_id, proof_id as i64, result.clone())
         .await?;
@@ -734,6 +812,8 @@ async fn process_send_resume(
     job: Job,
 ) -> anyhow::Result<()> {
     let public_id = job.public_id;
+    // Defect 4: rehydrate staged pending so /sign works after a restart.
+    rehydrate_pending_sign_into_map(app_state, public_id, &job);
     let notifier = notify_map
         .entry(public_id)
         .or_insert_with(|| Arc::new(JobNotifier::new()))
@@ -745,7 +825,7 @@ async fn process_send_resume(
     // Re-publish the awaiting_signature event so a freshly-connected
     // SSE stream sees the current phase even if its initial-state
     // push fired before the dispatcher reached this function. The
-    // ash/ocr result persisted on the row at the original
+    // surface persisted on the row at the original
     // `set_awaiting_signature` is carried through so a wallet that
     // reconnects after a node restart still gets the hex to sign
     // without an extra round-trip.
@@ -832,37 +912,21 @@ async fn wait_for_commit(
         }
     };
 
-    // v1.1 path: `/sign` already verified via accept_wallet_transition_signature
-    // and persisted the TransitionSignature under `sign`. Stage 3 will own the
-    // prove+publish finalise; until then a verified signature is a successful
-    // authorisation gate and the job completes with that material.
+    // v1.1 path: `/v1/jobs/{id}/sign` already verified via
+    // accept_wallet_transition_signature and persisted the TransitionSignature
+    // under `sign`. Drive StateEngine::finalise (or the injected hook) — never
+    // complete the job with the signature material alone.
     if crate::v11::v11_sign_route_active() {
         if let Some(sign_val) = job.request_body.get("sign").cloned() {
-            let response_body = serde_json::json!({
-                "success": true,
-                "signature_accepted": true,
-                "sign": sign_val,
-            });
-            job_store
-                .complete(public_id, response_body.clone(), 200)
-                .await?;
-            publish_phase(
+            return drive_v11_finalise(
+                job_store,
+                app_state,
                 notify_map,
                 public_id,
-                JobPhaseEvent {
-                    status: JobStatus::Completed,
-                    phase: "completed".to_string(),
-                    proof_id: None,
-                    result: Some(response_body),
-                    error: None,
-                },
-            );
-            tracing::info!(
-                "Job dispatcher: job {} completed after verified v1.1 /sign",
-                public_id
-            );
-            notify_map.remove(&public_id);
-            return Ok(());
+                &job,
+                sign_val,
+            )
+            .await;
         }
     }
 
@@ -970,4 +1034,202 @@ async fn wait_for_commit(
 enum SignalOutcome {
     Signaled,
     TimedOut,
+}
+
+/// Drive an accepted v1.1 signature into finalise (Defect 2).
+///
+/// Loads the staged [`PendingSignEntry`] (in-memory or rehydrated from
+/// `request_body.pending_sign`), reconstructs the verified
+/// `TransitionSignature` from the persisted `sign` blob, invokes the
+/// `v11_finalise` hook (production: `StateEngine::finalise`; tests: spy),
+/// and completes the job with the §7.5 `result` shape — never with the
+/// raw signature material alone.
+async fn drive_v11_finalise(
+    job_store: &JobStore,
+    app_state: &AppState,
+    notify_map: &JobNotifyMap,
+    public_id: Uuid,
+    job: &Job,
+    sign_val: serde_json::Value,
+) -> anyhow::Result<()> {
+    // Resolve staged pending: memory first, then persisted envelope.
+    let entry = match app_state.pending_sign_map.get(&public_id).map(|e| e.clone()) {
+        Some(e) => e,
+        None => match crate::v11::rehydrate_pending_sign(&job.request_body) {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                let msg = "v1.1 finalise: no staged PendingTransition for job \
+                           (pending_sign_map empty and no request_body.pending_sign)"
+                    .to_string();
+                job_store.fail(public_id, &msg).await?;
+                publish_phase(
+                    notify_map,
+                    public_id,
+                    JobPhaseEvent {
+                        status: JobStatus::Failed,
+                        phase: "failed".to_string(),
+                        proof_id: None,
+                        result: None,
+                        error: Some(msg),
+                    },
+                );
+                notify_map.remove(&public_id);
+                app_state.pending_sign_map.remove(&public_id);
+                return Ok(());
+            }
+            Err(e) => {
+                let msg = format!("v1.1 finalise: rehydrate pending_sign failed: {e}");
+                job_store.fail(public_id, &msg).await?;
+                publish_phase(
+                    notify_map,
+                    public_id,
+                    JobPhaseEvent {
+                        status: JobStatus::Failed,
+                        phase: "failed".to_string(),
+                        proof_id: None,
+                        result: None,
+                        error: Some(msg),
+                    },
+                );
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
+        },
+    };
+
+    let signature = match parse_persisted_transition_signature(&sign_val) {
+        Ok(s) => s,
+        Err(msg) => {
+            job_store.fail(public_id, &msg).await?;
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(msg),
+                },
+            );
+            notify_map.remove(&public_id);
+            app_state.pending_sign_map.remove(&public_id);
+            return Ok(());
+        }
+    };
+
+    let Some(hook) = app_state.v11_finalise.as_ref() else {
+        let msg = "v1.1 finalise: no finalise driver configured on AppState \
+                   (wire EngineAdapter::finalise or a test hook; refusing to \
+                   complete with signature material alone)"
+            .to_string();
+        job_store.fail(public_id, &msg).await?;
+        publish_phase(
+            notify_map,
+            public_id,
+            JobPhaseEvent {
+                status: JobStatus::Failed,
+                phase: "failed".to_string(),
+                proof_id: None,
+                result: None,
+                error: Some(msg),
+            },
+        );
+        notify_map.remove(&public_id);
+        app_state.pending_sign_map.remove(&public_id);
+        return Ok(());
+    };
+
+    job_store
+        .set_status(public_id, JobStatus::Broadcasting, "publishing")
+        .await?;
+    publish_phase(
+        notify_map,
+        public_id,
+        JobPhaseEvent {
+            status: JobStatus::Broadcasting,
+            phase: "publishing".to_string(),
+            proof_id: None,
+            result: None,
+            error: None,
+        },
+    );
+
+    match hook(entry.pending, signature) {
+        Ok(outcome) => {
+            let response_body = outcome.to_result_json();
+            job_store
+                .complete(public_id, response_body.clone(), 200)
+                .await?;
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Completed,
+                    phase: "completed".to_string(),
+                    proof_id: None,
+                    result: Some(response_body),
+                    error: None,
+                },
+            );
+            tracing::info!(
+                "Job dispatcher: job {} completed after v1.1 finalise",
+                public_id
+            );
+        }
+        Err(e) => {
+            let msg = format!("v1.1 finalise failed: {e}");
+            tracing::warn!("Job dispatcher: job {} {}", public_id, msg);
+            job_store.fail(public_id, &msg).await?;
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(msg),
+                },
+            );
+        }
+    }
+
+    app_state.pending_sign_map.remove(&public_id);
+    notify_map.remove(&public_id);
+    Ok(())
+}
+
+fn parse_persisted_transition_signature(
+    sign_val: &serde_json::Value,
+) -> Result<zkcoins_prover::prover_bridge::TransitionSignature, String> {
+    let pk_hex = sign_val
+        .get("pk_i")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "persisted sign.pk_i missing".to_string())?;
+    let sig_hex = sign_val
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "persisted sign.signature missing".to_string())?;
+    let r_hex = sign_val
+        .get("r_prime")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "persisted sign.r_prime missing".to_string())?;
+    let pk_i: [u8; 32] = hex::decode(pk_hex)
+        .map_err(|e| format!("sign.pk_i hex: {e}"))?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("sign.pk_i length {}", v.len()))?;
+    let signature: [u8; 64] = hex::decode(sig_hex)
+        .map_err(|e| format!("sign.signature hex: {e}"))?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("sign.signature length {}", v.len()))?;
+    let r_prime: [u8; 32] = hex::decode(r_hex)
+        .map_err(|e| format!("sign.r_prime hex: {e}"))?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("sign.r_prime length {}", v.len()))?;
+    Ok(zkcoins_prover::prover_bridge::TransitionSignature {
+        pk_i,
+        signature,
+        r_prime,
+    })
 }

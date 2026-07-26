@@ -42,11 +42,13 @@
 //! v1.1 process claim ([`refuse_legacy_commitment_under_v11`]); with the
 //! flag off the legacy path is untouched.
 //!
-//! Production caller: flag-gated `POST /api/jobs/{id}/sign` decodes
+//! Production caller: flag-gated `POST /v1/jobs/{id}/sign` (§7.5) decodes
 //! [`WalletSignSubmission`] at the boundary and verifies via
 //! [`accept_wallet_transition_signature`] against a staged
 //! [`PendingSignEntry`]. Under a v1.1 claim, `awaiting_signature` advertises
-//! the §7.5 ProofData surface (not legacy ash/ocr).
+//! the §7.5 ProofData surface (not legacy ash/ocr). An accepted signature
+//! is driven into [`StateEngine::finalise`](zkcoins_prover::state_engine::StateEngine::finalise)
+//! rather than short-circuited to a status change.
 
 mod adapter;
 pub mod db_v11;
@@ -84,11 +86,12 @@ pub use separation::{
 };
 pub use signature::{
     accept_wallet_transition_signature, awaiting_signature_result_json, ensure_v11_signature_path,
-    legacy_awaiting_signature_result_json, refuse_legacy_commitment_under_v11,
-    select_awaiting_signature_result, sign_rejection, v11_sign_route_active,
-    verify_transition_signature_material, PendingSignEntry, PendingSignMap, SignatureCheck,
+    finalise_with_accepted_signature, legacy_awaiting_signature_result_json,
+    refuse_legacy_commitment_under_v11, rehydrate_pending_sign, select_awaiting_signature_result,
+    sign_rejection, stage_pending_sign, v11_sign_route_active, verify_transition_signature_material,
+    FinaliseOutcome, PendingSignEntry, PendingSignMap, SignatureCheck, StagedSignPersist,
     TransitionSignatureError, WalletSignSubmission, WalletSignSubmissionWire,
-    LEGACY_COMMITMENT_REFUSED_UNDER_V11,
+    LEGACY_COMMITMENT_REFUSED_UNDER_V11, PENDING_SIGN_BODY_KEY,
 };
 
 #[cfg(test)]
