@@ -115,8 +115,12 @@ pub async fn start_rest_node(
         // to "signature_accepted" alone.
         v11_finalise: v11_engine.map(|adapter| {
             let hook: crate::router::V11FinaliseHook = Arc::new(move |pending, signature| {
+                // publisher_pubkey is filled by the dispatcher from the job
+                // request_body after the hook returns (hook has no job ctx).
                 adapter.with_engine_mut(|engine| {
-                    crate::v11::finalise_with_accepted_signature(engine, pending, signature)
+                    crate::v11::finalise_with_accepted_signature(
+                        engine, pending, signature, None,
+                    )
                 })
                 .map_err(|e| e.to_string())?
             });

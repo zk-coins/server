@@ -1,14 +1,19 @@
 use axum::{
+    async_trait,
     body::Bytes,
-    extract::{Json, Path, State},
-    http::{header, HeaderMap, Method, StatusCode},
+    extract::{
+        rejection::{JsonRejection, PathRejection},
+        FromRequest, FromRequestParts, Json, Path, State,
+    },
+    http::{header, request::Parts, HeaderMap, Method, Request, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{get, post},
     Router,
 };
+use serde::de::DeserializeOwned;
 use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, Message};
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
@@ -2297,6 +2302,82 @@ fn v11_error_body(code: &str, message: impl Into<String>) -> serde_json::Value {
     })
 }
 
+/// §7.5 path extractor for job UUIDs: malformed ids → `400 malformed_request`
+/// (Axum's default `Path<Uuid>` rejection is a framework 400/422 without the
+/// closed machine code).
+pub(crate) struct V1JobId(pub Uuid);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for V1JobId
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Path::<Uuid>::from_request_parts(parts, state).await {
+            Ok(Path(id)) => Ok(V1JobId(id)),
+            Err(PathRejection::FailedToDeserializePathParams(err)) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(v11_error_body(
+                    "malformed_request",
+                    format!("job_id is not a valid UUID: {err}"),
+                )),
+            )
+                .into_response()),
+            Err(err) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(v11_error_body(
+                    "malformed_request",
+                    format!("malformed job_id path parameter: {err}"),
+                )),
+            )
+                .into_response()),
+        }
+    }
+}
+
+/// §7.5 JSON body extractor: missing / malformed / wrong-type JSON →
+/// `400 malformed_request` (Axum's default is 422 with a framework body).
+pub(crate) struct V1Json<T>(pub T);
+
+#[async_trait]
+impl<S, T> FromRequest<S> for V1Json<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request<axum::body::Body>, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(V1Json(value)),
+            Err(err) => {
+                let message = match &err {
+                    JsonRejection::MissingJsonContentType(_) => {
+                        "Content-Type must be application/json".to_string()
+                    }
+                    JsonRejection::JsonDataError(e) => {
+                        format!("request body is not a well-formed JSON value of the expected type: {e}")
+                    }
+                    JsonRejection::JsonSyntaxError(e) => {
+                        format!("request body is not valid JSON: {e}")
+                    }
+                    JsonRejection::BytesRejection(e) => {
+                        format!("failed to read request body: {e}")
+                    }
+                    _ => format!("malformed request body: {err}"),
+                };
+                Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(v11_error_body("malformed_request", message)),
+                )
+                    .into_response())
+            }
+        }
+    }
+}
+
 /// `POST /v1/jobs/:id/sign` — §7.5 wallet transition signature (normative path).
 ///
 /// Active only under a v1.1 process claim (`ScanStackMode::V11`). The body is
@@ -2311,8 +2392,8 @@ fn v11_error_body(code: &str, message: impl Into<String>) -> serde_json::Value {
 /// the dispatcher is woken to drive `StateEngine::finalise` (not a bare
 /// status flip).
 ///
-/// With the flag off this route refuses at `wrong_phase` / ShadowFlag; the
-/// legacy [`jobs_commit_handler`] path is untouched.
+/// With the flag off this route refuses at `feature_disabled` / ShadowFlag;
+/// the legacy [`jobs_commit_handler`] path is untouched.
 #[utoipa::path(
     post,
     path = "/v1/jobs/{job_id}/sign",
@@ -2334,11 +2415,13 @@ fn v11_error_body(code: &str, message: impl Into<String>) -> serde_json::Value {
 )]
 pub(crate) async fn jobs_sign_handler(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(wire): Json<crate::v11::WalletSignSubmissionWire>,
+    V1JobId(id): V1JobId,
+    V1Json(wire): V1Json<crate::v11::WalletSignSubmissionWire>,
 ) -> axum::response::Response {
     // Flag gate: refuse the v1.1 path when the process is not on the v1.1 claim.
     // Legacy `/commit` remains the only active authorisation surface.
+    // §7.5: this is a disabled surface (`feature_disabled`), not a job
+    // phase mismatch (`wrong_phase`).
     if !crate::v11::v11_sign_route_active() {
         let err = crate::v11::TransitionSignatureError {
             check: crate::v11::SignatureCheck::ShadowFlag,
@@ -2348,7 +2431,7 @@ pub(crate) async fn jobs_sign_handler(
         };
         let (status, code) = crate::v11::sign_rejection(&err);
         return (
-            StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT),
+            StatusCode::from_u16(status).unwrap_or(StatusCode::NOT_FOUND),
             Json(v11_error_body(code, err.message)),
         )
             .into_response();
@@ -2386,6 +2469,9 @@ pub(crate) async fn jobs_sign_handler(
         }
     };
 
+    // §7.5 wrong_phase: only when the job is not in the status that accepts
+    // /sign. Missing staging while status is correct is an internal
+    // lifecycle failure, not a phase mismatch.
     if job.status != JobStatus::AwaitingSignature {
         return (
             StatusCode::CONFLICT,
@@ -2411,9 +2497,9 @@ pub(crate) async fn jobs_sign_handler(
             }
             Ok(None) => {
                 return (
-                    StatusCode::CONFLICT,
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     Json(v11_error_body(
-                        "wrong_phase",
+                        "internal_error",
                         "no PendingTransition staged for this job \
                          (awaiting_signature under v1.1 requires a staged entry)",
                     )),
@@ -2447,6 +2533,22 @@ pub(crate) async fn jobs_sign_handler(
         }
     };
 
+    // Acceptance requires a parked dispatcher that will process the
+    // signature. Reporting signature_accepted when nothing will finalise
+    // is worse than failing — the wallet would believe the work is done.
+    // §7.5 has no dedicated "dispatcher down" code → internal_error.
+    let Some(notifier) = state.job_notify_map.get(&id).map(|e| e.value().clone()) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(v11_error_body(
+                "internal_error",
+                "signature verified but no dispatcher is waiting to finalise this job; \
+                 refusing acceptance so the wallet does not treat the work as done",
+            )),
+        )
+            .into_response();
+    };
+
     // Persist the verified TransitionSignature on the job row under `sign`
     // so the dispatcher can finalise without re-accepting untrusted bytes.
     // Keep the staged pending in the map until finalise consumes it — a
@@ -2478,32 +2580,18 @@ pub(crate) async fn jobs_sign_handler(
             .into_response();
     }
 
-    let notifier = state.job_notify_map.get(&id).map(|e| e.value().clone());
-    match notifier {
-        Some(n) => {
-            n.commit_wake.notify_one();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "signature_accepted",
-                    "job_id": id,
-                })),
-            )
-                .into_response()
-        }
-        None => (
-            // Signature verified and persisted; the dispatcher is not
-            // parked (timeout/cleanup race). Still 200 — verification
-            // succeeded; the wallet can poll for terminal status.
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "signature_accepted",
-                "job_id": id,
-                "dispatcher": "not_waiting",
-            })),
-        )
-            .into_response(),
-    }
+    // Wake only after durable persist — acceptance and processing are
+    // coupled: 200 signature_accepted means the dispatcher has been
+    // notified to drive finalise.
+    notifier.commit_wake.notify_one();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "signature_accepted",
+            "job_id": id,
+        })),
+    )
+        .into_response()
 }
 
 /// Map legacy job-store status to the §7.5 closed status set.
@@ -2548,7 +2636,7 @@ fn v11_progress_wire(progress: i16) -> f64 {
 )]
 pub(crate) async fn get_job_v1_handler(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    V1JobId(id): V1JobId,
 ) -> axum::response::Response {
     let job = match state.job_store.load(id).await {
         Ok(Some(j)) => j,
@@ -2603,15 +2691,12 @@ pub(crate) async fn get_job_v1_handler(
             }
         }
         JobStatus::Failed | JobStatus::Cancelled => {
-            if let Some(err) = job.error.clone() {
-                obj.insert(
-                    "error".to_string(),
-                    serde_json::json!({
-                        "error": "proving_failed",
-                        "message": err,
-                    }),
-                );
-            }
+            // §7.5: always present on failed/cancelled; machine codes from
+            // the closed enumeration (never invent, never omit).
+            obj.insert(
+                "error".to_string(),
+                crate::v11::decode_job_error(job.error.as_deref(), job.status),
+            );
         }
         _ => {}
     }

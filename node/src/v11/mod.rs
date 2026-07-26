@@ -85,10 +85,12 @@ pub use separation::{
     v11_scan_state_present, ScanStackMode, STACK_CAPABILITY_REFUSAL, STACK_SEPARATION_REFUSAL,
 };
 pub use signature::{
-    accept_wallet_transition_signature, awaiting_signature_result_json, ensure_v11_signature_path,
+    accept_wallet_transition_signature, awaiting_signature_result_json, decode_job_error,
+    encode_job_error, ensure_finalise_ready, ensure_v11_signature_path,
     finalise_with_accepted_signature, legacy_awaiting_signature_result_json,
-    refuse_legacy_commitment_under_v11, rehydrate_pending_sign, select_awaiting_signature_result,
-    sign_rejection, stage_pending_sign, v11_sign_route_active, verify_transition_signature_material,
+    publisher_pubkey_from_request_body, refuse_legacy_commitment_under_v11,
+    rehydrate_pending_sign, select_awaiting_signature_result, sign_rejection, stage_pending_sign,
+    strip_pending_sign_from_body, v11_sign_route_active, verify_transition_signature_material,
     FinaliseOutcome, PendingSignEntry, PendingSignMap, SignatureCheck, StagedSignPersist,
     TransitionSignatureError, WalletSignSubmission, WalletSignSubmissionWire,
     LEGACY_COMMITMENT_REFUSED_UNDER_V11, PENDING_SIGN_BODY_KEY,
