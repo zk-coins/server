@@ -205,10 +205,11 @@ pub struct PendingTransition {
 /// [`StateEngine::apply_proved_transition`] (and node
 /// `commit_proved_receive`) cannot fabricate a hollow envelope.
 ///
-/// A test-only hollow mint exists under `cfg(test)` / `feature = "test-utils"`
-/// so race tests can inject concurrent scan work between prove and apply
-/// without a multi-minute circuit. That constructor is unavailable in
-/// production builds.
+/// A test-only hollow mint exists under **`#[cfg(test)]` in this crate only**
+/// so unit tests here can inject concurrent scan work between prove and apply
+/// without a multi-minute circuit. `cfg(test)` is never true for a dependency
+/// library build — external crates (including `node` integration tests) cannot
+/// enable it via features, transitive activation, or any Cargo flag.
 #[derive(Clone, Debug)]
 pub struct ProvedPendingTransition {
     pending: PendingTransition,
@@ -252,12 +253,15 @@ impl ProvedPendingTransition {
         })
     }
 
-    /// Test-only hollow mint for race / orchestration tests.
+    /// Test-only hollow mint for unit tests **in this crate**.
     ///
-    /// Unavailable outside test builds: gated on this crate's `cfg(test)`
-    /// or the `test-utils` Cargo feature (dependents enable that feature
-    /// only via `[dev-dependencies]`, so production binaries never see it).
-    #[cfg(any(test, feature = "test-utils"))]
+    /// Gated solely on `#[cfg(test)]` of the defining crate. That cfg is
+    /// never set when this library is compiled as a dependency — no Cargo
+    /// feature, no transitive activation, and no external test target can
+    /// open this door. External tests that need a proved envelope must use
+    /// a real prove ([`StateEngine::prove_pending_transition`] /
+    /// [`StateEngine::prove_pending_transition_detached`]).
+    #[cfg(test)]
     pub fn from_parts_for_test(
         pending: PendingTransition,
         proved: ProvedTransition,
@@ -280,11 +284,29 @@ impl ProvedPendingTransition {
 }
 
 /// Phase-2 output after a successful prove + atomic state apply.
+///
+/// **Capability token.** Fields are private. The sole production constructors
+/// are [`StateEngine::apply_proved_transition`], [`StateEngine::finalise`],
+/// and [`StateEngine::finalise_pending_chain_nullifier`] (the latter two go
+/// through prove → apply). Possession means a real apply ran against a
+/// [`ProvedPendingTransition`]; external crates cannot fabricate a hollow
+/// applied transition to drive publish / durable-state helpers.
 #[derive(Clone, Debug)]
 pub struct AppliedTransition {
-    pub proved: ProvedTransition,
+    proved: ProvedTransition,
     /// On-chain nullifier `(Pkᵢ, R)` extracted from the transition signature.
-    pub nullifier: ([u8; 32], [u8; 32]),
+    nullifier: ([u8; 32], [u8; 32]),
+}
+
+impl AppliedTransition {
+    pub fn proved(&self) -> &ProvedTransition {
+        &self.proved
+    }
+
+    /// On-chain nullifier `(Pkᵢ, R)`.
+    pub fn nullifier(&self) -> ([u8; 32], [u8; 32]) {
+        self.nullifier
+    }
 }
 
 /// In-memory state-transition engine.

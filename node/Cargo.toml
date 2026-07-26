@@ -77,11 +77,10 @@ axum = { version = "0.7.9", features = ["json", "multipart"] }
 http-body-util = "0.1"
 anyhow = "1.0"
 zkcoins-prover = { path = "../script-plonky2/", package = "zkcoins-prover-plonky2" }
-# NOTE: hollow `ProvedPendingTransition` mint is feature-gated on
-# `zkcoins-prover/test-utils`. Production builds leave it off (this line).
-# Unit/integration tests enable it via the matching `[dev-dependencies]`
-# entry so race tests can stand in for a multi-minute prove without making
-# a hollow envelope constructible in production binaries.
+# Hollow `ProvedPendingTransition` mint is `#[cfg(test)]` only inside
+# `zkcoins-prover-plonky2` — never a Cargo feature. Dependency builds of
+# this crate cannot open that seam; tests here use a real prove (or pure
+# host-path checks that do not need the capability).
 zkcoins-program = { path = "../program-plonky2/", package = "zkcoins-program-plonky2" }
 shared = { path = "../shared/" }
 # Direct dep for v1.1 receive host PI extraction (`PrimeField64`) and
@@ -263,14 +262,9 @@ fs2 = "0.4"
 # `[dependencies]` block above (where the `v4` + `serde` features
 # are already enabled), so no separate dev-dep entry is needed.
 # Compile-fail evidence that `esplora_client` is unobtainable from `node`
-# (Defect 4 / facade package boundary).
+# (Defect 4 / facade package boundary) and that a hollow proved envelope
+# / fabricated `AppliedTransition` cannot drive publish from outside.
 trybuild = "1.0"
-# Hollow proved-envelope mint for v1.1 receive race tests. Feature is
-# **not** enabled on the production `[dependencies]` line above — only
-# test builds of `node` unify this feature in (Cargo feature union for
-# deps listed under both sections). Production binaries never see
-# `ProvedPendingTransition::from_parts_for_test`.
-zkcoins-prover = { path = "../script-plonky2/", package = "zkcoins-prover-plonky2", features = ["test-utils"] }
 
 [features]
 # All non-MVP features are off by default. When a feature is not enabled, the
