@@ -11,10 +11,12 @@
 //!   scan-fold (§3.6). Missing bitcoind pins fail loud — never fall back.
 //!
 //! ## G3 — Receive as a real transition
-//! [`receive`] wires `begin_receive` → compliance proof → nullifier publish →
-//! v1.1 persistence. Clause-10 creating-proof bindings are mandatory per
-//! slot. The legacy `receive_coin_into` bookkeeping path is refused under
-//! the v1.1 process claim (no silent fall-back).
+//! [`receive`] wires `begin_receive` → compliance proof → account apply
+//! (NfLog **not** mutated) → persist intent → nullifier publish. The
+//! scanner folds the own nullifier into the canonical NfLog at its real
+//! §3.6 position on inclusion. Clause-10 creating-proof bindings are
+//! mandatory per slot. The legacy `receive_coin_into` bookkeeping path is
+//! refused under the v1.1 process claim (no silent fall-back).
 //!
 //! A commitment and an `AggregateStateNullifierV3` must never share one
 //! accumulator or one database; see [`separation`].
