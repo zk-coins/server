@@ -35,8 +35,12 @@
 //! Behind the same flag, wallet authorisation is a §3.2
 //! [`TransitionSignature`](zkcoins_prover::prover_bridge::TransitionSignature)
 //! (BIP-340 + sign-to-contract over the full canonical `serialize(ProofData)`),
-//! verified by [`signature`]. Legacy ash‖ocr [`shared::commitment::Commitment`]
-//! stays the default when the flag is off.
+//! verified by [`signature`]. The finalise-path entry takes a
+//! [`PendingTransition`](zkcoins_prover::state_engine::PendingTransition) and
+//! derives `pk_i` / `ProofData` from it so provenance cannot be decorative.
+//! Residual ash‖ocr [`shared::commitment::Commitment`] is refused under a
+//! v1.1 process claim ([`refuse_legacy_commitment_under_v11`]); with the
+//! flag off the legacy path is untouched.
 
 mod adapter;
 pub mod db_v11;
@@ -73,8 +77,9 @@ pub use separation::{
     v11_scan_state_present, ScanStackMode, STACK_CAPABILITY_REFUSAL, STACK_SEPARATION_REFUSAL,
 };
 pub use signature::{
-    accept_wallet_transition_signature, ensure_v11_signature_path, verify_transition_signature,
-    SignatureCheck, TransitionSignatureError, WalletSignSubmission,
+    accept_wallet_transition_signature, ensure_v11_signature_path,
+    refuse_legacy_commitment_under_v11, verify_transition_signature_material, SignatureCheck,
+    TransitionSignatureError, WalletSignSubmission, LEGACY_COMMITMENT_REFUSED_UNDER_V11,
 };
 
 #[cfg(test)]

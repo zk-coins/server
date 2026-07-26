@@ -14,8 +14,14 @@
 //!
 //! | Field        | Encoding                                              | Wire size |
 //! |--------------|-------------------------------------------------------|-----------|
-//! | `signature`  | lowercase hex of `bytes(R) ‖ bytes(s)` (§3.2 step 6) | 128 hex chars → 64 bytes |
-//! | `s2c_nonce`  | lowercase hex of x-only even-y `R'` (§3.2 step 1b)  | 64 hex chars → 32 bytes  |
+//! | `signature`  | lowercase hex of `bytes(R) ‖ bytes(s)` (§3.2 step 6) | **exactly** 128 hex chars → 64 bytes |
+//! | `s2c_nonce`  | lowercase hex of x-only even-y `R'` (§3.2 step 1b)  | **exactly** 64 hex chars → 32 bytes  |
+//!
+//! **Strict encoding (no silent variants):**
+//! - Alphabet: only ASCII `0-9` and `a-f` (lowercase). Uppercase rejects.
+//! - Length: exact character counts above. No pad, no truncate.
+//! - **No** `0x` / `0X` prefix. A prefixed string is encoding failure.
+//! - No whitespace, no mixed case.
 //!
 //! JSON field order is irrelevant (named fields). Binary order inside
 //! `signature` is fixed: `R` (32 bytes) then `s` (32 bytes).
@@ -35,15 +41,17 @@
 //!
 //! ## Where `ProofData` comes from (binding is not decorative)
 //!
-//! On this path `ProofData` is exactly `PendingTransition.proof_data`, which
-//! the state engine computed from the full transition witness before any
-//! wallet bytes arrive. This module always re-serialises that structure with
-//! [`shared::spec_v1::serialize_proof_data`] (192 bytes, six digests in §1.4
-//! order) and hashes with [`shared::spec_v1::hash_proof_data`]. A caller
-//! **cannot** hand in a free-standing digest or a partial re-assembly: the
-//! only input is the typed `ProofData` value the engine owns. Signing one
-//! payload and submitting another therefore fails the S2C opening against
-//! the pending payload, full stop.
+//! The finalise-path entry [`accept_wallet_transition_signature`] takes a
+//! [`PendingTransition`] and derives both `pk_i` and the canonical
+//! `serialize(ProofData)` **from that pending object alone**. A caller
+//! therefore cannot verify a signature against one payload while the
+//! transition it authorises carries another: there is no independent
+//! `proof_data` / `expected_pk_i` parameter on the finalise path.
+//!
+//! Free-standing material verification exists as
+//! [`verify_transition_signature_material`] for preflight/tooling when no
+//! pending transition exists yet. That function is **not** called from the
+//! finalise path.
 //!
 //! ## Checks (both mandatory — no silent partial accept)
 //!
@@ -57,6 +65,17 @@
 //!
 //! Either failure rejects the submission. "BIP-340 alone verified" is never
 //! enough.
+//!
+//! ## Live path under a v1.1 claim
+//!
+//! - [`refuse_legacy_commitment_under_v11`] gates residual ash‖ocr
+//!   [`CommitRequest`](crate::router::CommitRequest) entry points
+//!   (`commit_flow` / `mint_commit_flow` / jobs commit). Under
+//!   `ScanStackMode::V11` a legacy commitment is refused loud.
+//! - Send / receive finalise must call
+//!   [`accept_wallet_transition_signature`] with the engine's pending
+//!   transition before installing the signature. REST `/sign` remains
+//!   Stage 3; this module is the internal verification those paths use.
 
 use std::fmt;
 
@@ -64,8 +83,16 @@ use shared::spec_v1::{hash_proof_data, serialize_proof_data, ProofData};
 use zkcoins_program::circuit::compliance::Network;
 use zkcoins_prover::half_agg::{comm_verify, verify_single};
 use zkcoins_prover::prover_bridge::TransitionSignature;
+use zkcoins_prover::state_engine::PendingTransition;
 
 use super::mode::V11ShadowMode;
+use super::separation::{process_stack_mode, ScanStackMode};
+
+/// Canonical message when a legacy ash‖ocr Commitment hits a v1.1 process.
+pub const LEGACY_COMMITMENT_REFUSED_UNDER_V11: &str =
+    "legacy ash‖ocr Commitment refused under v1.1 process claim; \
+     submit a §3.2 TransitionSignature bound to the pending transition \
+     (ZKCOINS_V11_SHADOW=1 / ScanStackMode::V11 — no dual-accept)";
 
 /// Which verification step rejected a wallet signature.
 ///
@@ -75,10 +102,14 @@ use super::mode::V11ShadowMode;
 pub enum SignatureCheck {
     /// `ZKCOINS_V11_SHADOW` is not on — legacy ash‖ocr path only.
     ShadowFlag,
+    /// Process claimed v1.1; residual legacy Commitment entry is refused.
+    LegacyCommitment,
     /// Hex / length / alphabet failure on the wire fields.
     Encoding,
     /// `sig.pk_i` does not equal the pending account's `current_pubkey`.
     PkMatch,
+    /// Pending envelope's `proof_data_hash` does not match its `proof_data`.
+    PendingEnvelope,
     /// S2C opening `R == R' + H(R' ‖ H(ProofData))·G` failed.
     S2cOpening,
     /// BIP-340 verify over the node network's `m_state` failed.
@@ -127,8 +158,13 @@ pub struct WalletSignSubmission {
 impl WalletSignSubmission {
     /// Decode the hex fields the wallet POSTs.
     ///
-    /// Accepts optional `0x` prefix. Requires lowercase hex digits only
-    /// (no silent case-fold) and exact lengths (128 / 64 hex chars).
+    /// **Strict contract (SDK-facing):**
+    /// - `signature`: exactly 128 lowercase hex characters (no `0x` prefix)
+    /// - `s2c_nonce`: exactly 64 lowercase hex characters (no `0x` prefix)
+    ///
+    /// Uppercase, wrong length, whitespace, or a `0x`/`0X` prefix all fail
+    /// at [`SignatureCheck::Encoding`]. There is no silent case-fold or
+    /// prefix strip.
     pub fn from_hex(
         signature_hex: &str,
         s2c_nonce_hex: &str,
@@ -167,16 +203,80 @@ pub fn ensure_v11_signature_path(mode: V11ShadowMode) -> Result<(), TransitionSi
     }
 }
 
-/// Verify a fully assembled [`TransitionSignature`] against node-owned inputs.
+/// Refuse a residual legacy ash‖ocr Commitment under a v1.1 process claim.
 ///
-/// - `network` — boot pin (`ZKCOINS_NETWORK`), selects `m_state`.
-/// - `expected_pk_i` — `pending.witness_wip.prev_account_state.current_pubkey`.
-/// - `proof_data` — `pending.proof_data` (engine-computed; re-serialised here).
-/// - `sig` — wallet-produced BIP-340 + S2C object.
+/// Returns `Ok(())` when the process is **not** on the v1.1 claim (legacy
+/// or unclaimed). Fail-loud under `ScanStackMode::V11` — never a silent
+/// allow of the wrong signing protocol.
 ///
-/// Both the S2C opening and BIP-340 checks must pass. Failure of either
-/// rejects; there is no "BIP-340 was enough" branch.
-pub fn verify_transition_signature(
+/// Wired into `commit_flow` / `mint_commit_flow` and the jobs commit
+/// handler so a v1.1 boot cannot finalise via `CommitRequest`.
+pub fn refuse_legacy_commitment_under_v11() -> Result<(), TransitionSignatureError> {
+    match process_stack_mode() {
+        Some(ScanStackMode::V11) => Err(TransitionSignatureError::new(
+            SignatureCheck::LegacyCommitment,
+            LEGACY_COMMITMENT_REFUSED_UNDER_V11,
+        )),
+        Some(ScanStackMode::Legacy) | None => Ok(()),
+    }
+}
+
+/// Finalise-path entry: decode already done; derive `pk_i` and
+/// `serialize(ProofData)` **from the pending transition**, verify BIP-340
+/// + S2C, and return a [`TransitionSignature`] ready for engine finalise.
+///
+/// `mode` must be [`V11ShadowMode::On`]; under Off this fails at
+/// [`SignatureCheck::ShadowFlag`] so the legacy Commitment path cannot be
+/// bypassed by feeding a TransitionSignature into a half-migrated caller.
+///
+/// **Provenance is enforced by the type signature:** there is no
+/// independent `expected_pk_i` or `proof_data` parameter. Substituting a
+/// foreign `ProofData` while finalising a different pending transition is
+/// not expressible — the only material used is `pending.proof_data` and
+/// `pending.witness_wip.prev_account_state.current_pubkey`.
+pub fn accept_wallet_transition_signature(
+    mode: V11ShadowMode,
+    network: Network,
+    pending: &PendingTransition,
+    submission: &WalletSignSubmission,
+) -> Result<TransitionSignature, TransitionSignatureError> {
+    ensure_v11_signature_path(mode)?;
+
+    let expected_pk_i = &pending.witness_wip.prev_account_state.current_pubkey;
+    let proof_data = &pending.proof_data;
+
+    // Fail closed if the pending envelope is self-inconsistent.
+    let serialized = serialize_proof_data(proof_data);
+    let h_proof_data = hash_proof_data(&serialized);
+    if h_proof_data != pending.proof_data_hash {
+        return Err(TransitionSignatureError::new(
+            SignatureCheck::PendingEnvelope,
+            format!(
+                "pending.proof_data_hash {} does not match hash(serialize(pending.proof_data)) {}",
+                hex_lower(&pending.proof_data_hash),
+                hex_lower(&h_proof_data)
+            ),
+        ));
+    }
+
+    let sig = TransitionSignature {
+        pk_i: *expected_pk_i,
+        signature: submission.signature,
+        r_prime: submission.s2c_nonce,
+    };
+    verify_transition_signature_material(network, expected_pk_i, proof_data, &sig)?;
+    Ok(sig)
+}
+
+/// Host-side BIP-340 + S2C check against **explicit** material.
+///
+/// Prefer [`accept_wallet_transition_signature`] on the finalise path —
+/// that API takes a [`PendingTransition`] and derives `pk_i` / `ProofData`
+/// so a caller cannot verify against substituted bytes. This function
+/// exists for preflight/tooling when no pending transition exists yet; it
+/// is **not** reachable from the finalise path (nothing on that path
+/// calls it with caller-supplied pairs).
+pub fn verify_transition_signature_material(
     network: Network,
     expected_pk_i: &[u8; 32],
     proof_data: &ProofData,
@@ -227,31 +327,6 @@ pub fn verify_transition_signature(
     Ok(())
 }
 
-/// Decode a wallet `/sign` body, bind `pk_i` from the pending account, verify
-/// BIP-340 + S2C against the node-owned `ProofData`, and return a
-/// [`TransitionSignature`] ready for engine finalise.
-///
-/// `mode` must be [`V11ShadowMode::On`]; under Off this fails at
-/// [`SignatureCheck::ShadowFlag`] so the legacy Commitment path cannot be
-/// bypassed by feeding a TransitionSignature into a half-migrated caller.
-pub fn accept_wallet_transition_signature(
-    mode: V11ShadowMode,
-    network: Network,
-    expected_pk_i: &[u8; 32],
-    proof_data: &ProofData,
-    submission: &WalletSignSubmission,
-) -> Result<TransitionSignature, TransitionSignatureError> {
-    ensure_v11_signature_path(mode)?;
-
-    let sig = TransitionSignature {
-        pk_i: *expected_pk_i,
-        signature: submission.signature,
-        r_prime: submission.s2c_nonce,
-    };
-    verify_transition_signature(network, expected_pk_i, proof_data, &sig)?;
-    Ok(sig)
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -260,18 +335,28 @@ fn parse_hex_exact<const N: usize>(
     raw: &str,
     field: &str,
 ) -> Result<[u8; N], TransitionSignatureError> {
-    let hex = raw.strip_prefix("0x").unwrap_or(raw);
+    // Strict: reject optional 0x/0X that the earlier parser silently stripped.
+    if raw.len() >= 2 && (raw.starts_with("0x") || raw.starts_with("0X")) {
+        return Err(TransitionSignatureError::new(
+            SignatureCheck::Encoding,
+            format!(
+                "{field} must be bare lowercase hex (exactly {} chars); \
+                 0x/0X prefix is not accepted",
+                N * 2
+            ),
+        ));
+    }
     let expected_chars = N * 2;
-    if hex.len() != expected_chars {
+    if raw.len() != expected_chars {
         return Err(TransitionSignatureError::new(
             SignatureCheck::Encoding,
             format!(
                 "{field} hex length {} != {expected_chars} (no silent pad/truncate)",
-                hex.len()
+                raw.len()
             ),
         ));
     }
-    if hex
+    if raw
         .bytes()
         .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
     {
@@ -280,7 +365,7 @@ fn parse_hex_exact<const N: usize>(
             format!("{field} is not lowercase hex (no silent case-fold)"),
         ));
     }
-    let bytes = hex::decode(hex).map_err(|e| {
+    let bytes = hex::decode(raw).map_err(|e| {
         TransitionSignatureError::new(
             SignatureCheck::Encoding,
             format!("{field} hex decode failed: {e}"),
@@ -303,14 +388,24 @@ mod tests {
     use super::*;
     use shared::spec_v1::{
         account_state_hash, address, asset_id_v1, coin_identifier, coinhist_empty_root,
-        coinhist_root_after_first_insert, digest_to_bytes, merkle_root, name_hash, nav_commitment,
-        nflog_empty, nflog_root, nk_commit, npk_commit, serialize_proof_data, AccountState, Address,
-        CoinHistState, ProofData, TreeKind, GENESIS_TAG, ZERO_HASH,
+        coinhist_root_after_first_insert, digest_to_bytes, hash_proof_data, merkle_root, name_hash,
+        nav_commitment, nflog_empty, nflog_root, nk_commit, npk_commit, serialize_proof_data,
+        AccountState, Address, CoinHistState, Nav, ProofData, TreeKind, GENESIS_TAG, ZERO_HASH,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
+    use zkcoins_prover::prover_bridge::{NavOpening, TransitionMode, TransitionWitness};
+    use zkcoins_prover::state_engine::PendingTransition;
 
-    // ── V.5 pins from script-plonky2/tests/generated_sig_agg_vectors.txt ────
+    use crate::v11::separation::{
+        clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+    };
+
+    // ── V.5 pins from the reference implementation fixture ─────────────────
+    // Source: script-plonky2/tests/generated_sig_agg_vectors.txt
+    // (output of generate_sig_agg_vectors). Proposed for specification
+    // appendix V.5 in PR #124 (unmerged draft at the time of this wiring).
+    // Not claimed as already normative in the published spec tree.
     // Read-only conformance anchors. Do not regenerate here.
 
     const V2EXT_PK0: &str =
@@ -344,7 +439,8 @@ mod tests {
         Sha256::digest(label.as_bytes()).into()
     }
 
-    /// Rebuild the V.4 `ProofData@0` that pins `H(ProofData@0)` for V.5.
+    /// Rebuild the V.4 `ProofData@0` that pins `H(ProofData@0)` for the
+    /// reference V.5 signature fixture.
     ///
     /// Same recipe as `shared/tests/generated_poseidon_vectors_test.rs`.
     /// The node verifies by serialising *this* structure — never by trusting
@@ -436,14 +532,69 @@ mod tests {
         }
     }
 
+    /// Skeleton pending whose only signature-relevant fields are
+    /// `current_pubkey` and `proof_data` / `proof_data_hash`.
+    /// Other witness fields are placeholders (finalise would reject them;
+    /// this helper is only for the host-side signature gate).
+    fn pending_for(pk: [u8; 32], pd: ProofData) -> PendingTransition {
+        let owner = Address([0u8; 32]);
+        let account = AccountState::new(owner, ZERO_HASH, BTreeMap::new(), pk, 0, ZERO_HASH)
+            .expect("skeleton account");
+        let nav = Nav {
+            size: 0,
+            mth: nflog_empty(),
+        };
+        let nav_opening = NavOpening {
+            nav,
+            nav_rand: [0u8; 32],
+        };
+        let proof_data_hash = hash_proof_data(&serialize_proof_data(&pd));
+        let witness = TransitionWitness {
+            mode: TransitionMode::InitialProof,
+            prev_account_state: account.clone(),
+            new_account_state: account,
+            input_coins: Vec::new(),
+            input_auth: Vec::new(),
+            output_templates: Vec::new(),
+            output_coins: Vec::new(),
+            output_history_proofs: Vec::new(),
+            received_coins: Vec::new(),
+            received_auth: Vec::new(),
+            asset_issuance: None,
+            nk: [0u8; 32],
+            nav: nav_opening.nav,
+            nav_rand: nav_opening.nav_rand,
+            prev_nav_opening: None,
+            nav_consistency: Vec::new(),
+            next_pubkey: [0u8; 32],
+            npk_rand: [0u8; 32],
+            transition_signature: TransitionSignature {
+                pk_i: pk,
+                signature: [0u8; 64],
+                r_prime: [0u8; 32],
+            },
+            prev_proof: None,
+            predecessor_nullifier: None,
+        };
+        PendingTransition {
+            witness_wip: witness,
+            proof_data: pd,
+            proof_data_hash,
+            mode: TransitionMode::InitialProof,
+            owner,
+            nav_opening,
+        }
+    }
+
     #[test]
-    fn proof_data_at_0_matches_v4_h_proof_data_pin() {
+    fn proof_data_at_0_matches_reference_h_proof_data_pin() {
         let pd = proof_data_at_0();
         let h = hash_proof_data(&serialize_proof_data(&pd));
         assert_eq!(
             hex::encode(h),
             H_PROOF_DATA_0,
-            "reconstructed ProofData@0 must hash to the V.4/V.5 pin"
+            "reconstructed ProofData@0 must hash to the reference-implementation pin \
+             (generated_sig_agg_vectors.txt / proposed V.5)"
         );
     }
 
@@ -452,15 +603,17 @@ mod tests {
         let pd = proof_data_at_0();
         for network in [Network::Mainnet, Network::Testnet, Network::Regtest] {
             let (submission, pk) = v5_case(network);
+            let pending = pending_for(pk, pd.clone());
             let sig = accept_wallet_transition_signature(
                 V11ShadowMode::On,
                 network,
-                &pk,
-                &pd,
+                &pending,
                 &submission,
             )
             .unwrap_or_else(|e| {
-                panic!("V.5 signature must verify under {network:?}: {e}");
+                panic!(
+                    "reference V.5 signature fixture must verify under {network:?}: {e}"
+                );
             });
             assert_eq!(sig.pk_i, pk);
             assert_eq!(sig.signature, submission.signature);
@@ -475,11 +628,11 @@ mod tests {
         // check that fails (cross-network replay).
         let pd = proof_data_at_0();
         let (submission, pk) = v5_case(Network::Mainnet);
+        let pending = pending_for(pk, pd);
         let err = accept_wallet_transition_signature(
             V11ShadowMode::On,
             Network::Testnet,
-            &pk,
-            &pd,
+            &pending,
             &submission,
         )
         .expect_err("cross-network signature must be rejected");
@@ -497,11 +650,11 @@ mod tests {
         let pd = proof_data_at_0();
         let (mut submission, pk) = v5_case(Network::Regtest);
         submission.s2c_nonce[0] ^= 0x01;
+        let pending = pending_for(pk, pd);
         let err = accept_wallet_transition_signature(
             V11ShadowMode::On,
             Network::Regtest,
-            &pk,
-            &pd,
+            &pending,
             &submission,
         )
         .expect_err("tampered R' must be rejected");
@@ -512,62 +665,187 @@ mod tests {
         );
     }
 
+    /// Defect 2: a signature S2C-bound to ProofData@0 must not authorise a
+    /// *different* pending transition. The finalise API takes the pending
+    /// itself — there is no independent `proof_data` parameter to
+    /// substitute — so the only attack is presenting the right signature
+    /// against the wrong pending. That fails at S2C with a distinct check.
     #[test]
-    fn rejects_signature_bound_to_different_proof_data() {
-        // V.5 signature S2C-commits H(ProofData@0). Verifying against a
-        // different ProofData must fail the S2C opening — this is the
-        // "sign one payload, submit another" attack.
+    fn substituted_proof_data_cannot_authorise_a_different_pending() {
+        let correct_pd = proof_data_at_0();
         let wrong_pd = other_proof_data();
         assert_ne!(
             hash_proof_data(&serialize_proof_data(&wrong_pd)),
             hex32(H_PROOF_DATA_0),
-            "fixture guard: alternate ProofData must not hash to the V.5 pin"
+            "fixture guard: alternate ProofData must not hash to the reference pin"
         );
         let (submission, pk) = v5_case(Network::Mainnet);
+
+        // Pending that carries the *wrong* ProofData (would be the
+        // transition being finalised) while the wallet signature was
+        // produced over ProofData@0.
+        let pending_wrong = pending_for(pk, wrong_pd);
         let err = accept_wallet_transition_signature(
             V11ShadowMode::On,
             Network::Mainnet,
-            &pk,
-            &wrong_pd,
+            &pending_wrong,
             &submission,
         )
-        .expect_err("signature over a different ProofData must be rejected");
+        .expect_err("signature over a different ProofData must not finalise this pending");
         assert_eq!(
             err.check,
             SignatureCheck::S2cOpening,
-            "wrong ProofData must fail at S2cOpening; got: {err}"
+            "substituted proof_data on the pending must fail at S2cOpening; got: {err}"
+        );
+
+        // Sanity: the same submission against the *matching* pending works.
+        let pending_ok = pending_for(pk, correct_pd);
+        accept_wallet_transition_signature(
+            V11ShadowMode::On,
+            Network::Mainnet,
+            &pending_ok,
+            &submission,
+        )
+        .expect("matching pending must accept the reference signature");
+    }
+
+    #[test]
+    fn accept_api_derives_pk_and_proof_data_from_pending_only() {
+        // Type-level lock: accept_wallet_transition_signature takes
+        // &PendingTransition, not (pk, proof_data). A caller that only
+        // has a free-standing ProofData cannot reach the finalise path
+        // without wrapping it in a pending — and then S2C binds that
+        // pending's own proof_data.
+        let pd = proof_data_at_0();
+        let (submission, pk) = v5_case(Network::Regtest);
+        let pending = pending_for(pk, pd);
+        let sig = accept_wallet_transition_signature(
+            V11ShadowMode::On,
+            Network::Regtest,
+            &pending,
+            &submission,
+        )
+        .expect("canonical path");
+        assert_eq!(
+            sig.pk_i,
+            pending.witness_wip.prev_account_state.current_pubkey
         );
     }
 
     #[test]
-    fn rejects_pk_mismatch() {
+    fn rejects_pk_mismatch_on_material_preflight() {
         let pd = proof_data_at_0();
         let (submission, real_pk) = v5_case(Network::Testnet);
         let wrong_pk = [0x11u8; 32];
-        // Explicit TransitionSignature with a foreign pk_i.
         let sig = TransitionSignature {
             pk_i: wrong_pk,
             signature: submission.signature,
             r_prime: submission.s2c_nonce,
         };
-        let err = verify_transition_signature(Network::Testnet, &real_pk, &pd, &sig)
+        // Material preflight (not finalise path) — explicit pair for tooling.
+        let err = verify_transition_signature_material(Network::Testnet, &real_pk, &pd, &sig)
             .expect_err("explicit pk mismatch");
         assert_eq!(err.check, SignatureCheck::PkMatch, "got: {err}");
+    }
+
+    #[test]
+    fn inconsistent_pending_envelope_hash_is_rejected() {
+        let pd = proof_data_at_0();
+        let (submission, pk) = v5_case(Network::Mainnet);
+        let mut pending = pending_for(pk, pd);
+        // Corrupt the cached hash so the envelope disagrees with proof_data.
+        pending.proof_data_hash[0] ^= 0xff;
+        let err = accept_wallet_transition_signature(
+            V11ShadowMode::On,
+            Network::Mainnet,
+            &pending,
+            &submission,
+        )
+        .expect_err("inconsistent pending envelope must fail closed");
+        assert_eq!(err.check, SignatureCheck::PendingEnvelope, "got: {err}");
     }
 
     #[test]
     fn flag_off_refuses_transition_signature_path() {
         let pd = proof_data_at_0();
         let (submission, pk) = v5_case(Network::Regtest);
+        let pending = pending_for(pk, pd);
         let err = accept_wallet_transition_signature(
             V11ShadowMode::Off,
             Network::Regtest,
-            &pk,
-            &pd,
+            &pending,
             &submission,
         )
         .expect_err("flag off must refuse TransitionSignature");
         assert_eq!(err.check, SignatureCheck::ShadowFlag, "got: {err}");
+    }
+
+    /// Defect 1: under a v1.1 process claim the wired path refuses a legacy
+    /// ash‖ocr Commitment, and accepts a v1.1 TransitionSignature against
+    /// the pending transition.
+    #[test]
+    fn wired_path_rejects_legacy_commitment_under_v11_and_accepts_v11_signature() {
+        clear_process_stack_mode_for_test();
+
+        // Flag / claim off: legacy commitment gate stays open; v1.1 accept
+        // path is still gated by the shadow mode parameter.
+        assert!(
+            refuse_legacy_commitment_under_v11().is_ok(),
+            "unclaimed process must allow residual legacy commit path"
+        );
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::Legacy);
+        assert!(
+            refuse_legacy_commitment_under_v11().is_ok(),
+            "legacy claim must allow ash‖ocr Commitment"
+        );
+        // Legacy commitment verify itself is untouched.
+        {
+            use bitcoin::secp256k1::SecretKey;
+            use shared::commitment::Commitment;
+            let sk = SecretKey::from_slice(&[0x42u8; 32]).expect("secret");
+            let mut message = vec![0u8; 64];
+            message[..32].fill(0xA1);
+            message[32..].fill(0xB2);
+            let commitment = Commitment::new(&sk, message).expect("sign legacy commitment");
+            assert!(
+                commitment.verify(),
+                "legacy Commitment::verify must still accept ash‖ocr under flag-off"
+            );
+        }
+        clear_process_stack_mode_for_test();
+
+        // v1.1 claim: refuse legacy commitment loud.
+        set_process_stack_mode(ScanStackMode::V11);
+        let legacy_err =
+            refuse_legacy_commitment_under_v11().expect_err("v1.1 claim must refuse legacy");
+        assert_eq!(
+            legacy_err.check,
+            SignatureCheck::LegacyCommitment,
+            "got: {legacy_err}"
+        );
+        assert!(
+            legacy_err
+                .message
+                .contains("legacy ash‖ocr Commitment refused"),
+            "got: {legacy_err}"
+        );
+
+        // Same claim: accept a real v1.1 signature against the pending.
+        let pd = proof_data_at_0();
+        let (submission, pk) = v5_case(Network::Mainnet);
+        let pending = pending_for(pk, pd);
+        let sig = accept_wallet_transition_signature(
+            V11ShadowMode::On,
+            Network::Mainnet,
+            &pending,
+            &submission,
+        )
+        .expect("v1.1 signature must be accepted under the v1.1 claim");
+        assert_eq!(sig.pk_i, pk);
+
+        clear_process_stack_mode_for_test();
     }
 
     #[test]
@@ -578,6 +856,7 @@ mod tests {
         use bitcoin::secp256k1::SecretKey;
         use shared::commitment::Commitment;
 
+        clear_process_stack_mode_for_test();
         let sk = SecretKey::from_slice(&[0x42u8; 32]).expect("secret");
         let mut message = vec![0u8; 64];
         message[..32].fill(0xA1);
@@ -589,39 +868,66 @@ mod tests {
         );
         assert!(ensure_v11_signature_path(V11ShadowMode::Off).is_err());
         assert!(ensure_v11_signature_path(V11ShadowMode::On).is_ok());
+        assert!(refuse_legacy_commitment_under_v11().is_ok());
     }
 
+    /// Defect 4: parser matches the documented SDK wire contract exactly.
     #[test]
-    fn wallet_hex_parse_roundtrip_and_rejects_bad_encoding() {
+    fn parser_matches_documented_wire_contract_exactly() {
         let (submission, _) = v5_case(Network::Mainnet);
         let sig_hex = hex::encode(submission.signature);
         let r_hex = hex::encode(submission.s2c_nonce);
-        let parsed = WalletSignSubmission::from_hex(&sig_hex, &r_hex).expect("parse");
+        assert_eq!(sig_hex.len(), 128);
+        assert_eq!(r_hex.len(), 64);
+
+        let parsed = WalletSignSubmission::from_hex(&sig_hex, &r_hex).expect("canonical parse");
         assert_eq!(parsed, submission);
 
+        // Uppercase rejected (no silent case-fold).
         let err = WalletSignSubmission::from_hex(&sig_hex.to_uppercase(), &r_hex)
             .expect_err("uppercase");
         assert_eq!(err.check, SignatureCheck::Encoding);
 
+        // Wrong length rejected.
         let err = WalletSignSubmission::from_hex(&sig_hex[..10], &r_hex).expect_err("short");
+        assert_eq!(err.check, SignatureCheck::Encoding);
+
+        // Optional 0x prefix was previously accepted — contract now rejects it.
+        let err = WalletSignSubmission::from_hex(&format!("0x{sig_hex}"), &r_hex)
+            .expect_err("0x prefix on signature");
+        assert_eq!(err.check, SignatureCheck::Encoding, "got: {err}");
+        assert!(
+            err.message.contains("0x") || err.message.contains("prefix"),
+            "error should name the prefix rule: {err}"
+        );
+
+        let err = WalletSignSubmission::from_hex(&sig_hex, &format!("0x{r_hex}"))
+            .expect_err("0x prefix on s2c_nonce");
+        assert_eq!(err.check, SignatureCheck::Encoding, "got: {err}");
+
+        let err = WalletSignSubmission::from_hex(&format!("0X{sig_hex}"), &r_hex)
+            .expect_err("0X prefix");
+        assert_eq!(err.check, SignatureCheck::Encoding, "got: {err}");
+
+        // Whitespace / mixed content rejected.
+        let err = WalletSignSubmission::from_hex(&format!(" {sig_hex}"), &r_hex)
+            .expect_err("leading space");
         assert_eq!(err.check, SignatureCheck::Encoding);
     }
 
     #[test]
     fn never_accepts_caller_supplied_digest_in_place_of_proof_data() {
-        // The public API has no parameter for H(ProofData). Binding is only
-        // through serialize(ProofData). This locks the surface: the only way
-        // to influence the S2C message is to pass a different ProofData,
-        // which the engine — not the wallet — owns.
+        // The finalise API has no parameter for H(ProofData). Binding is only
+        // through serialize(pending.proof_data). This locks the surface.
         let pd = proof_data_at_0();
         let h = hash_proof_data(&serialize_proof_data(&pd));
         assert_eq!(hex::encode(h), H_PROOF_DATA_0);
         let (submission, pk) = v5_case(Network::Regtest);
+        let pending = pending_for(pk, pd);
         accept_wallet_transition_signature(
             V11ShadowMode::On,
             Network::Regtest,
-            &pk,
-            &pd,
+            &pending,
             &submission,
         )
         .expect("canonical path");
