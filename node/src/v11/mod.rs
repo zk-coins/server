@@ -38,11 +38,11 @@ pub use publish::{
     connect_v11_publisher, publish_v11_batch, v11_publisher_env_from_env, V11PublisherEnv,
 };
 pub use receive::{
-    execute_v11_receive, finalise_publish_persist, publish_applied_nullifier,
-    refuse_legacy_receive_under_v11, resume_all_pending_publishes, resume_pending_publish,
-    verify_and_begin_receive, verify_clause10_slot, verify_creating_nullifier_binding,
-    NullifierBatchPublisher, ReceivedCoinSlot, V11ReceiveOutcome, V11ReceiveRequest,
-    LEGACY_RECEIVE_REFUSED_UNDER_V11,
+    commit_proved_receive, execute_v11_receive, finalise_publish_persist,
+    publish_applied_nullifier, refuse_legacy_receive_under_v11, resume_all_pending_publishes,
+    resume_pending_publish, verify_and_begin_receive, verify_clause10_slot,
+    verify_creating_nullifier_binding, NullifierBatchPublisher, ReceivedCoinSlot,
+    V11ReceiveOutcome, V11ReceiveRequest, LEGACY_RECEIVE_REFUSED_UNDER_V11,
 };
 pub use scan::{
     apply_canonical_survivors, apply_forward_scan, first_boot_requires_full_replace,

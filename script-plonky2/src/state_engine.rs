@@ -206,6 +206,55 @@ pub struct ProvedPendingTransition {
     signature: TransitionSignature,
 }
 
+impl ProvedPendingTransition {
+    /// Assemble a proved envelope from parts that already match each other.
+    ///
+    /// Performs only self-consistency checks (signature ↔ prev pubkey,
+    /// proved `ProofData` ↔ pending). **Does not** consult live engine state
+    /// — that is [`StateEngine::apply_proved_transition`]'s job after any
+    /// concurrent scan work.
+    ///
+    /// Used by unlocked prove and by tests that inject a concurrent fold
+    /// between prove and apply without running the multi-minute circuit.
+    pub fn from_parts(
+        mut pending: PendingTransition,
+        proved: ProvedTransition,
+        signature: TransitionSignature,
+    ) -> Result<Self> {
+        ensure!(
+            signature.pk_i == pending.witness_wip.prev_account_state.current_pubkey,
+            "signature pk_i does not equal prev_account_state.current_pubkey"
+        );
+        ensure!(
+            pending.proof_data_hash
+                == host::hash_proof_data(&host::serialize_proof_data(&pending.proof_data)),
+            "pending proof_data_hash does not match proof_data"
+        );
+        ensure!(
+            proved.proof_data == pending.proof_data,
+            "proved ProofData differs from pending ProofData"
+        );
+        pending.witness_wip.transition_signature = signature.clone();
+        Ok(Self {
+            pending,
+            proved,
+            signature,
+        })
+    }
+
+    pub fn pending(&self) -> &PendingTransition {
+        &self.pending
+    }
+
+    pub fn proved(&self) -> &ProvedTransition {
+        &self.proved
+    }
+
+    pub fn signature(&self) -> &TransitionSignature {
+        &self.signature
+    }
+}
+
 /// Phase-2 output after a successful prove + atomic state apply.
 #[derive(Clone, Debug)]
 pub struct AppliedTransition {
@@ -1092,16 +1141,32 @@ impl StateEngine {
 
     /// Phase 2a: prove only. **Does not mutate** the engine.
     ///
-    /// Callers that must not hold a write gate across multi-minute proving
-    /// use this, then [`Self::apply_proved_transition`] under the gate.
-    /// Apply re-validates the envelope against current engine state so a
-    /// concurrent scanner fold during prove fails loud if it collides.
+    /// Validates the envelope against **this** engine, then proves via the
+    /// bridge. Callers that must not hold any engine lock across proving
+    /// should use [`Self::prove_pending_transition_detached`] instead and
+    /// re-validate on [`Self::apply_proved_transition`].
     pub fn prove_pending_transition(
         &self,
-        mut pending: PendingTransition,
+        pending: PendingTransition,
         signature: TransitionSignature,
     ) -> Result<ProvedPendingTransition> {
         self.validate_pending_envelope(&pending)?;
+        Self::prove_pending_transition_detached(&self.bridge, pending, signature)
+    }
+
+    /// Prove a pending transition **without reading engine state**.
+    ///
+    /// The pending witness already carries everything the prover needs.
+    /// Live-state re-validation (account, tip/`size_final`, receiver NAV
+    /// canonicity, creating anchors, own-Pk absence) happens only in
+    /// [`Self::apply_proved_transition`] after the caller re-acquires the
+    /// engine mutex. This is the production receive path: prove holds
+    /// neither `write_gate` nor the live-engine mutex.
+    pub fn prove_pending_transition_detached(
+        bridge: &ProverBridge,
+        mut pending: PendingTransition,
+        signature: TransitionSignature,
+    ) -> Result<ProvedPendingTransition> {
         ensure!(
             signature.pk_i == pending.witness_wip.prev_account_state.current_pubkey,
             "signature pk_i does not equal prev_account_state.current_pubkey"
@@ -1113,25 +1178,22 @@ impl StateEngine {
         );
 
         pending.witness_wip.transition_signature = signature.clone();
-        let proved = self
-            .bridge
+        let proved = bridge
             .prove_transition(&pending.witness_wip)
             .context("prove_pending_transition: prove_transition failed (state unchanged)")?;
         ensure!(
             proved.proof_data == pending.proof_data,
             "proved ProofData differs from pending ProofData"
         );
-        Ok(ProvedPendingTransition {
-            pending,
-            proved,
-            signature,
-        })
+        ProvedPendingTransition::from_parts(pending, proved, signature)
     }
 
     /// Phase 2b: apply a previously proved pending transition.
     ///
     /// Mutates account/CoinHist only — never the canonical NfLog.
-    /// Re-validates the envelope so prove-outside-gate remains safe.
+    /// Re-validates **every live dependency** the prove-time decision read
+    /// so a concurrent scanner fold during unlocked prove fails loud
+    /// rather than committing against a moved tip / size_final / anchor.
     pub fn apply_proved_transition(
         &mut self,
         proved_pending: ProvedPendingTransition,
@@ -1141,8 +1203,8 @@ impl StateEngine {
             proved,
             signature,
         } = proved_pending;
-        // Re-check after any concurrent scan work that ran during prove.
-        self.validate_pending_envelope(&pending)?;
+        // Full live re-validation after any concurrent scan work during prove.
+        self.revalidate_pending_against_live(&pending)?;
         ensure!(
             signature.pk_i == pending.witness_wip.prev_account_state.current_pubkey,
             "apply: signature pk_i does not equal prev_account_state.current_pubkey"
@@ -1432,6 +1494,162 @@ impl StateEngine {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Re-check every live-engine input that `begin_*` / clause-10 / prove
+    /// decisions depend on. Derived by tracing engine reads from pending
+    /// construction through apply (not by extending an ad-hoc checklist):
+    ///
+    /// | Live read | Where baked | Re-check here |
+    /// |-----------|-------------|---------------|
+    /// | account `state` / presence / mode | envelope + coinhist | `validate_pending_envelope` |
+    /// | `tip_height` → `size_final` | `pending.nav` | `nav.size ≤ size_final(tip)` |
+    /// | canonical receiver NAV (size, mth) | `pending.nav` | `is_canonical` |
+    /// | predecessor nullifier pos/R | witness (AccountUpdate) | still Present at pos |
+    /// | creating nullifier anchors | `received_auth` | still Present at `pos_create` + inclusion |
+    /// | creating NAV canonicity / prefix | `received_auth` | `is_canonical` + consistency |
+    /// | own Pk absent (apply guard) | — | checked later in apply body |
+    /// | CoinHist leaf collisions / root | apply body | sequential rebuild below |
+    ///
+    /// Tip is not compared for equality: the only tip-dependent decision is
+    /// `size_final(tip)`, which is rechecked directly. A concurrent tip
+    /// advance that only grows `size_final` leaves a still-valid proved NAV
+    /// as a canonical prefix (`size ≤ size_final`).
+    fn revalidate_pending_against_live(&self, pending: &PendingTransition) -> Result<()> {
+        self.validate_pending_envelope(pending)?;
+
+        let receiver_nav = pending.nav_opening.nav;
+        let size_final = self.nflog.size_final(self.tip_height);
+        ensure!(
+            receiver_nav.size <= size_final,
+            "apply: pending receiver nav.size {} exceeds live size_final {} at tip {} \
+             (tip/`size_final` moved under the proved NAV)",
+            receiver_nav.size,
+            size_final,
+            self.tip_height
+        );
+        ensure!(
+            self.nflog
+                .is_canonical(receiver_nav.size, receiver_nav.mth),
+            "apply: pending receiver nav is no longer canonical on the live NfLog \
+             (tip={}, size_final={})",
+            self.tip_height,
+            size_final
+        );
+
+        if let Some(pred) = &pending.witness_wip.predecessor_nullifier {
+            match self.nflog.lookup(pred.nullifier.public_key) {
+                LookupResult::Present { pos, r, .. } => {
+                    ensure!(
+                        r == pred.nullifier.signature_r,
+                        "apply: predecessor nullifier R on live NfLog does not match witness"
+                    );
+                    ensure!(
+                        pos == pred.position,
+                        "apply: predecessor nullifier position moved \
+                         (witness {witness_pos} → live {pos})",
+                        witness_pos = pred.position
+                    );
+                    ensure!(
+                        pos < receiver_nav.size,
+                        "apply: predecessor position {pos} is not covered by \
+                         pending receiver nav.size {}",
+                        receiver_nav.size
+                    );
+                    let leaf = host::nflog_leaf_hash(
+                        pos,
+                        &NfLogEntry {
+                            pk: pred.nullifier.public_key,
+                            r: pred.nullifier.signature_r,
+                        },
+                    );
+                    ensure!(
+                        host::verify_inclusion(
+                            leaf,
+                            pos,
+                            &pred.nav_inclusion,
+                            receiver_nav.size,
+                            receiver_nav.mth,
+                        ),
+                        "apply: predecessor inclusion path no longer opens pending receiver nav"
+                    );
+                }
+                LookupResult::Absent => {
+                    bail!(
+                        "apply: predecessor nullifier is no longer on the live NfLog \
+                         (reorg / un-fold during prove)"
+                    );
+                }
+            }
+        }
+
+        for (index, auth) in pending.witness_wip.received_auth.iter().enumerate() {
+            match self.nflog.lookup(auth.creating_nullifier.public_key) {
+                LookupResult::Present { pos, r, .. } => {
+                    ensure!(
+                        r == auth.creating_nullifier.signature_r,
+                        "apply: creating nullifier R mismatch for received slot {index}"
+                    );
+                    ensure!(
+                        pos == auth.pos_create,
+                        "apply: creating nullifier position moved for received slot {index} \
+                         (witness {} → live {pos})",
+                        auth.pos_create
+                    );
+                    ensure!(
+                        pos < receiver_nav.size,
+                        "apply: creating nullifier position {pos} for slot {index} is not \
+                         covered by pending receiver nav.size {}",
+                        receiver_nav.size
+                    );
+                }
+                LookupResult::Absent => {
+                    bail!(
+                        "apply: creating nullifier for received slot {index} is no longer \
+                         on the live NfLog (reorg / un-fold during prove)"
+                    );
+                }
+            }
+
+            ensure!(
+                self.nflog.is_canonical(
+                    auth.creating_nav_opening.nav.size,
+                    auth.creating_nav_opening.nav.mth
+                ),
+                "apply: creating nav for received slot {index} is no longer canonical"
+            );
+
+            let leaf = host::nflog_leaf_hash(
+                auth.pos_create,
+                &NfLogEntry {
+                    pk: auth.creating_nullifier.public_key,
+                    r: auth.creating_nullifier.signature_r,
+                },
+            );
+            ensure!(
+                host::verify_inclusion(
+                    leaf,
+                    auth.pos_create,
+                    &auth.creating_nav_inclusion,
+                    receiver_nav.size,
+                    receiver_nav.mth,
+                ),
+                "apply: creating nullifier inclusion path no longer opens pending receiver \
+                 nav for slot {index}"
+            );
+            ensure!(
+                host::verify_consistency(
+                    auth.creating_nav_opening.nav.size,
+                    auth.creating_nav_opening.nav.mth,
+                    receiver_nav.size,
+                    receiver_nav.mth,
+                    &auth.creating_nav_consistency,
+                ),
+                "apply: creating nav is no longer a prefix of pending receiver nav for slot {index}"
+            );
+        }
+
         Ok(())
     }
 
