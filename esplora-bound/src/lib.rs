@@ -185,4 +185,35 @@ mod policy_construction_tests {
             .expect("unclaimed process allows legacy broadcast construction");
         clear_process_stack_mode_for_test();
     }
+
+    /// Once V11 is claimed, no production public call sequence can obtain a
+    /// broadcast-capable client under a different or absent claim. The
+    /// test-only clear is used solely for fixture isolation.
+    ///
+    /// Conflicting `set_process_stack_mode` panic is covered in
+    /// `stack-policy` (`conflicting_set_process_stack_mode_panics`); we
+    /// do not catch_unwind it here because poisoning the registry mutex
+    /// would break later tests in the same process.
+    #[test]
+    fn broadcast_client_claim_is_monotonic() {
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        EsploraBroadcastClient::connect("http://127.0.0.1:1")
+            .expect_err("v11 claim blocks broadcast construction");
+
+        // Re-affirm does not open an unclaimed window.
+        set_process_stack_mode(ScanStackMode::V11);
+        EsploraBroadcastClient::connect("http://127.0.0.1:1")
+            .expect_err("re-affirm still blocks");
+
+        // process_stack_mode still reports V11 — no public production path
+        // withdrew the claim.
+        assert_eq!(
+            stack_policy::process_stack_mode(),
+            Some(ScanStackMode::V11)
+        );
+
+        clear_process_stack_mode_for_test();
+    }
 }

@@ -10,4 +10,9 @@ bitcoin = { workspace = true }
 esplora-client = { git = "https://github.com/BitVM/rust-esplora-client", branch = "master" }
 # Process-stack policy runs inside the broadcast-client constructor so every
 # construction — including from `node` itself — executes the same check.
+# Production omits `test-support` (monotonic claim; no public reset).
 stack-policy = { path = "../stack-policy" }
+
+[dev-dependencies]
+# Unit tests in this crate reset the process claim between cases.
+stack-policy = { path = "../stack-policy", features = ["test-support"] }

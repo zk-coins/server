@@ -69,6 +69,8 @@ esplora-bound = { path = "../esplora-bound" }
 # Process-wide scan-stack claim registry + legacy-publisher policy.
 # Shared with `esplora-bound` so the broadcast facade constructor and
 # node boot / publisher guards consult the same process claim.
+# Production builds intentionally omit `test-support` so
+# `clear_process_stack_mode_for_test` is not linked (monotonic claim).
 stack-policy = { path = "../stack-policy" }
 axum = { version = "0.7.9", features = ["json", "multipart"] }
 # `BodyExt::collect()` for the audit middleware's request/response
@@ -254,8 +256,14 @@ fs2 = "0.4"
 # `[dependencies]` block above (where the `v4` + `serde` features
 # are already enabled), so no separate dev-dep entry is needed.
 # Compile-fail evidence that `esplora_client` is unobtainable from `node`
-# (Defect 4 / facade package boundary).
+# (Defect 4 / facade package boundary) and that the process-claim reset
+# is unreachable from a production `node` build.
 trybuild = "1.0"
+# Re-declare `stack-policy` with `test-support` so unit / integration
+# tests of this package get `clear_process_stack_mode_for_test` via
+# Cargo feature unification. Production `[dependencies]` above leave
+# the feature off — the clear symbol is absent from release binaries.
+stack-policy = { path = "../stack-policy", features = ["test-support"] }
 
 [features]
 # All non-MVP features are off by default. When a feature is not enabled, the
