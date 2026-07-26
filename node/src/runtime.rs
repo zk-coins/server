@@ -105,6 +105,7 @@ pub async fn start_rest_node(
         job_notify_map: Arc::clone(&job_notify_map),
         v11_scan_caught_up: v11_readiness.scan_caught_up,
         v11_finality_ok: v11_readiness.finality_ok,
+        pending_sign_map: Arc::new(DashMap::new()),
     };
 
     // No minting-account bootstrap: the neutral model has no

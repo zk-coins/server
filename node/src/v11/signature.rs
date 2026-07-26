@@ -72,14 +72,23 @@
 //!   [`CommitRequest`](crate::router::CommitRequest) entry points
 //!   (`commit_flow` / `mint_commit_flow` / jobs commit). Under
 //!   `ScanStackMode::V11` a legacy commitment is refused loud.
-//! - Send / receive finalise must call
-//!   [`accept_wallet_transition_signature`] with the engine's pending
-//!   transition before installing the signature. REST `/sign` remains
-//!   Stage 3; this module is the internal verification those paths use.
+//! - [`crate::router::jobs_sign_handler`] is the production REST caller:
+//!   flag-gated `POST /api/jobs/{id}/sign` decodes [`WalletSignSubmission`]
+//!   at the boundary (strict hex) and verifies via
+//!   [`accept_wallet_transition_signature`] against the staged
+//!   [`PendingSignEntry`] before the job may finalise. With the flag off
+//!   the route refuses at [`SignatureCheck::ShadowFlag`]; the legacy
+//!   `/commit` path is untouched.
 
 use std::fmt;
+use std::sync::Arc;
 
-use shared::spec_v1::{hash_proof_data, serialize_proof_data, ProofData};
+use dashmap::DashMap;
+use serde::Deserialize;
+use shared::spec_v1::{
+    digest_to_bytes, hash_proof_data, serialize_proof_data, ProofData,
+};
+use uuid::Uuid;
 use zkcoins_program::circuit::compliance::Network;
 use zkcoins_prover::half_agg::{comm_verify, verify_single};
 use zkcoins_prover::prover_bridge::TransitionSignature;
@@ -144,7 +153,22 @@ impl TransitionSignatureError {
     }
 }
 
-/// Binary body of `POST /v1/jobs/<job_id>/sign` after hex decode (§7.5).
+/// JSON request body of `POST /api/jobs/{job_id}/sign` (§7.5) **before**
+/// strict hex decode.
+///
+/// Field names match the normative wire: `signature`, `s2c_nonce`. Values
+/// are raw strings; the boundary converts them via
+/// [`WalletSignSubmission::try_from`] so encoding failures surface as
+/// [`SignatureCheck::Encoding`], never as a generic JSON-shape error.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct WalletSignSubmissionWire {
+    pub signature: String,
+    pub s2c_nonce: String,
+}
+
+/// Decoded binary body of `POST /api/jobs/{job_id}/sign` after strict hex
+/// decode (§7.5). This is the request type the route verifies against —
+/// the documented encoding is what the boundary enforces.
 ///
 /// Field meanings:
 /// - `signature` = `bytes(R) ‖ bytes(s)` (64 bytes, §3.2 step 6)
@@ -186,6 +210,122 @@ impl WalletSignSubmission {
             .try_into()
             .expect("64-byte signature has a 32-byte s")
     }
+}
+
+impl TryFrom<&WalletSignSubmissionWire> for WalletSignSubmission {
+    type Error = TransitionSignatureError;
+
+    fn try_from(wire: &WalletSignSubmissionWire) -> Result<Self, Self::Error> {
+        Self::from_hex(&wire.signature, &wire.s2c_nonce)
+    }
+}
+
+impl TryFrom<WalletSignSubmissionWire> for WalletSignSubmission {
+    type Error = TransitionSignatureError;
+
+    fn try_from(wire: WalletSignSubmissionWire) -> Result<Self, Self::Error> {
+        Self::try_from(&wire)
+    }
+}
+
+/// Staged material for a job in `awaiting_signature` under a v1.1 claim.
+///
+/// The REST `/sign` route takes provenance from this entry alone (via
+/// [`accept_wallet_transition_signature`]); the job's advertised
+/// `awaiting_signature` JSON is derived from the same pending object so
+/// a wallet never signs a different surface than the node verifies.
+#[derive(Clone, Debug)]
+pub struct PendingSignEntry {
+    pub pending: PendingTransition,
+    pub network: Network,
+    pub send_counter: u64,
+}
+
+/// Per-job map of staged v1.1 sign material. Keyed by job `public_id`.
+pub type PendingSignMap = Arc<DashMap<Uuid, PendingSignEntry>>;
+
+/// Build the §7.5 `awaiting_signature` result object from staged pending
+/// material. All digests are lowercase hex; `send_counter` is a JSON number.
+///
+/// This is what a v1.1 wallet must recompute and sign — **not** legacy
+/// `account_state_hash` / `output_coins_root`.
+pub fn awaiting_signature_result_json(entry: &PendingSignEntry) -> serde_json::Value {
+    let pd = &entry.pending.proof_data;
+    let txn_pubkey = entry.pending.witness_wip.prev_account_state.current_pubkey;
+    serde_json::json!({
+        "new_account_state_hash": hex_lower(&digest_to_bytes(&pd.new_account_state_hash)),
+        "output_coins_root": hex_lower(&digest_to_bytes(&pd.output_coins_root)),
+        "input_nullifiers_root": hex_lower(&digest_to_bytes(&pd.input_nullifiers_root)),
+        "coin_history_root": hex_lower(&digest_to_bytes(&pd.coin_history_root)),
+        "nav_commitment": hex_lower(&digest_to_bytes(&pd.nav_commitment)),
+        "npk_commit": hex_lower(&pd.npk_commit),
+        "proof_data_hash": hex_lower(&entry.pending.proof_data_hash),
+        "txn_pubkey": hex_lower(&txn_pubkey),
+        "send_counter": entry.send_counter,
+    })
+}
+
+/// Legacy ash‖ocr surface (flag off only).
+pub fn legacy_awaiting_signature_result_json(
+    account_state_hash: &str,
+    output_coins_root: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "account_state_hash": account_state_hash,
+        "output_coins_root": output_coins_root,
+    })
+}
+
+/// Choose the `awaiting_signature` job result under the current process claim.
+///
+/// - **Legacy / unclaimed** → ash‖ocr (unchanged).
+/// - **v1.1 claim** → §7.5 surface from staged pending. If no pending is
+///   staged, returns `Err` — never silently falls back to ash‖ocr (a
+///   wallet that signed those would then be rejected at `/sign`).
+pub fn select_awaiting_signature_result(
+    legacy_ash: &str,
+    legacy_ocr: &str,
+    pending: Option<&PendingSignEntry>,
+) -> Result<serde_json::Value, TransitionSignatureError> {
+    match process_stack_mode() {
+        Some(ScanStackMode::V11) => match pending {
+            Some(entry) => Ok(awaiting_signature_result_json(entry)),
+            None => Err(TransitionSignatureError::new(
+                SignatureCheck::LegacyCommitment,
+                "v1.1 process claim: refusing to advertise legacy ash‖ocr on \
+                 awaiting_signature; stage a PendingTransition (PendingSignEntry) \
+                 so the job surfaces the §7.5 ProofData identity the wallet must sign",
+            )),
+        },
+        Some(ScanStackMode::Legacy) | None => {
+            Ok(legacy_awaiting_signature_result_json(legacy_ash, legacy_ocr))
+        }
+    }
+}
+
+/// Machine-code + HTTP status for a rejected `/sign` submission (§7.5 jobs-family).
+///
+/// | check | HTTP | `error` |
+/// |---|---|---|
+/// | Encoding | 400 | `encoding` |
+/// | ShadowFlag | 409 | `wrong_phase` (route inactive under flag-off) |
+/// | S2cOpening | 409 | `stale_message` |
+/// | Bip340 / PkMatch / PendingEnvelope | 409 | `invalid_signature` |
+/// | LegacyCommitment | 409 | `wrong_phase` |
+pub fn sign_rejection(err: &TransitionSignatureError) -> (u16, &'static str) {
+    match err.check {
+        SignatureCheck::Encoding => (400, "encoding"),
+        SignatureCheck::S2cOpening => (409, "stale_message"),
+        SignatureCheck::Bip340
+        | SignatureCheck::PkMatch
+        | SignatureCheck::PendingEnvelope => (409, "invalid_signature"),
+        SignatureCheck::ShadowFlag | SignatureCheck::LegacyCommitment => (409, "wrong_phase"),
+    }
+}
+
+/// True when the process claim is v1.1 (flag on and stack claimed).
+pub fn v11_sign_route_active() -> bool {
+    matches!(process_stack_mode(), Some(ScanStackMode::V11))
 }
 
 /// Refuse the v1.1 signature path when the shadow flag is off.
@@ -381,6 +521,166 @@ fn parse_hex_exact<const N: usize>(
 
 fn hex_lower(bytes: &[u8]) -> String {
     hex::encode(bytes)
+}
+
+/// Test-only V.5 fixture helpers used by the `/sign` route tests.
+/// Production code must not call these.
+#[cfg(test)]
+pub mod test_fixtures {
+    use super::*;
+    use shared::spec_v1::{
+        account_state_hash, address, asset_id_v1, coin_identifier, coinhist_empty_root,
+        coinhist_root_after_first_insert, digest_to_bytes, hash_proof_data, merkle_root, name_hash,
+        nav_commitment, nflog_empty, nflog_root, nk_commit, npk_commit, serialize_proof_data,
+        AccountState, Address, CoinHistState, Nav, ProofData, TreeKind, GENESIS_TAG, ZERO_HASH,
+    };
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use zkcoins_prover::prover_bridge::{NavOpening, TransitionMode, TransitionWitness};
+
+    const V2EXT_PK0: &str =
+        "7c9cdde9b8cb1e33a48a5c2b6ab1fa6fd753fa1762f56c0b3e8169e4f2d54630";
+    const V5_R_PRIME_MAINNET: &str =
+        "fafd5229e657311d934989a4bc8bdfc8f033b4d640d2eb27b9fdda316f5c9601";
+    const V5_SIG_MAINNET: &str = "7db327f8ff4bb148f051a038d370c4213149fe3affeff5b7fb7e9f8e3cc4438532168b5fca622ba2fad6d72ed201e71cef1003df880d345ddbe2b89f1ce3d4e5";
+
+    fn hex32(s: &str) -> [u8; 32] {
+        hex::decode(s).expect("fixture hex").try_into().expect("32")
+    }
+    fn hex64(s: &str) -> [u8; 64] {
+        hex::decode(s).expect("fixture hex").try_into().expect("64")
+    }
+    fn sha256_label(label: &str) -> [u8; 32] {
+        Sha256::digest(label.as_bytes()).into()
+    }
+
+    fn proof_data_at_0() -> ProofData {
+        let pk0 = sha256_label("zkCoins/v1/test-vector/Pk0");
+        let pk1 = sha256_label("zkCoins/v1/test-vector/Pk1");
+        let nk = sha256_label("zkCoins/v1/test-vector/nk");
+        let npk_rand = sha256_label("zkCoins/v1/test-vector/npk_rand");
+        let nav_rand = sha256_label("zkCoins/v1/test-vector/nav_rand");
+        let name_hash_usd = name_hash(b"USD-Demo").expect("USD-Demo");
+        let npk_commit_0 = npk_commit(&pk1, &npk_rand);
+        let nflog_empty_v = nflog_empty();
+        let coinhist_empty = coinhist_empty_root();
+        let nk_commit_sample = nk_commit(&nk);
+        let asset_id = asset_id_v1(GENESIS_TAG, &pk0, &name_hash_usd, 2, 1);
+        let addr_bytes = address(&pk0, nk_commit_sample);
+        let addr = Address(addr_bytes);
+        let ash_empty = account_state_hash(
+            &AccountState::new(
+                addr,
+                nk_commit_sample,
+                BTreeMap::new(),
+                pk0,
+                0,
+                coinhist_empty,
+            )
+            .expect("empty account"),
+        )
+        .expect("hash empty");
+        let coin_identifier_0 =
+            coin_identifier(ash_empty, &addr_bytes, asset_id, 1_000_000_000u128, 0u32);
+        let coin_history_root_0 = coinhist_root_after_first_insert(
+            &digest_to_bytes(&coin_identifier_0),
+            CoinHistState::Admitted,
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(digest_to_bytes(&asset_id), 1_000_000_000u128);
+        let ash_0 = account_state_hash(
+            &AccountState::new(
+                addr,
+                nk_commit_sample,
+                balances,
+                pk1,
+                1,
+                coin_history_root_0,
+            )
+            .expect("ash_0 account"),
+        )
+        .expect("hash ash_0");
+        let ocr_0 = merkle_root(TreeKind::CoinsRoot, &[coin_identifier_0]);
+        let inr_0 = merkle_root(TreeKind::NullifiersRoot, &[]);
+        let nav_root_empty = nflog_root(0, nflog_empty_v);
+        let nav_commitment_0 = nav_commitment(nav_root_empty, &nav_rand);
+        ProofData {
+            new_account_state_hash: ash_0,
+            output_coins_root: ocr_0,
+            input_nullifiers_root: inr_0,
+            coin_history_root: coin_history_root_0,
+            nav_commitment: nav_commitment_0,
+            npk_commit: npk_commit_0,
+        }
+    }
+
+    fn pending_for(pk: [u8; 32], pd: ProofData) -> PendingTransition {
+        let owner = Address([0u8; 32]);
+        let account = AccountState::new(owner, ZERO_HASH, BTreeMap::new(), pk, 0, ZERO_HASH)
+            .expect("skeleton account");
+        let nav = Nav {
+            size: 0,
+            mth: nflog_empty(),
+        };
+        let nav_opening = NavOpening {
+            nav,
+            nav_rand: [0u8; 32],
+        };
+        let proof_data_hash = hash_proof_data(&serialize_proof_data(&pd));
+        let witness = TransitionWitness {
+            mode: TransitionMode::InitialProof,
+            prev_account_state: account.clone(),
+            new_account_state: account,
+            input_coins: Vec::new(),
+            input_auth: Vec::new(),
+            output_templates: Vec::new(),
+            output_coins: Vec::new(),
+            output_history_proofs: Vec::new(),
+            received_coins: Vec::new(),
+            received_auth: Vec::new(),
+            asset_issuance: None,
+            nk: [0u8; 32],
+            nav: nav_opening.nav,
+            nav_rand: nav_opening.nav_rand,
+            prev_nav_opening: None,
+            nav_consistency: Vec::new(),
+            next_pubkey: [0u8; 32],
+            npk_rand: [0u8; 32],
+            transition_signature: TransitionSignature {
+                pk_i: pk,
+                signature: [0u8; 64],
+                r_prime: [0u8; 32],
+            },
+            prev_proof: None,
+            predecessor_nullifier: None,
+        };
+        PendingTransition {
+            witness_wip: witness,
+            proof_data: pd,
+            proof_data_hash,
+            mode: TransitionMode::InitialProof,
+            owner,
+            nav_opening,
+        }
+    }
+
+    /// V.5 mainnet fixture: staged pending + the matching wire submission.
+    pub fn v5_mainnet_entry_and_submission() -> (PendingSignEntry, WalletSignSubmission) {
+        let pk = hex32(V2EXT_PK0);
+        let submission = WalletSignSubmission {
+            signature: hex64(V5_SIG_MAINNET),
+            s2c_nonce: hex32(V5_R_PRIME_MAINNET),
+        };
+        let pending = pending_for(pk, proof_data_at_0());
+        (
+            PendingSignEntry {
+                pending,
+                network: Network::Mainnet,
+                send_counter: 0,
+            },
+            submission,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -931,5 +1231,90 @@ mod tests {
             &submission,
         )
         .expect("canonical path");
+    }
+
+    #[test]
+    fn v11_job_advertises_proof_data_fields_not_ash_ocr() {
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let pd = proof_data_at_0();
+        let (_, pk) = v5_case(Network::Mainnet);
+        let pending = pending_for(pk, pd);
+        let entry = PendingSignEntry {
+            pending,
+            network: Network::Mainnet,
+            send_counter: 0,
+        };
+        let result = select_awaiting_signature_result("aa".repeat(32).as_str(), "bb".repeat(32).as_str(), Some(&entry))
+            .expect("v11 with staged pending must advertise");
+        assert!(
+            result.get("account_state_hash").is_none(),
+            "v1.1 job must not advertise legacy ash; got {result}"
+        );
+        assert!(
+            result.get("output_coins_root").is_some(),
+            "ocr is a ProofData field name under §7.5; got {result}"
+        );
+        for key in [
+            "new_account_state_hash",
+            "output_coins_root",
+            "input_nullifiers_root",
+            "coin_history_root",
+            "nav_commitment",
+            "npk_commit",
+            "proof_data_hash",
+            "txn_pubkey",
+            "send_counter",
+        ] {
+            assert!(
+                result.get(key).is_some(),
+                "v1.1 awaiting_signature missing {key}; got {result}"
+            );
+        }
+        assert_eq!(result["txn_pubkey"], hex::encode(pk));
+        assert_eq!(result["send_counter"], 0);
+        assert_eq!(result["proof_data_hash"], H_PROOF_DATA_0);
+
+        // Without staged pending: refuse ash/ocr fallback.
+        let err = select_awaiting_signature_result("aa", "bb", None)
+            .expect_err("must not fall back to ash/ocr under v1.1");
+        assert_eq!(err.check, SignatureCheck::LegacyCommitment);
+
+        clear_process_stack_mode_for_test();
+    }
+
+    #[test]
+    fn flag_off_job_still_advertises_legacy_ash_ocr() {
+        clear_process_stack_mode_for_test();
+        let ash = "aa".repeat(32);
+        let ocr = "bb".repeat(32);
+        let result = select_awaiting_signature_result(&ash, &ocr, None)
+            .expect("legacy/unclaimed must keep ash/ocr");
+        assert_eq!(result["account_state_hash"], ash);
+        assert_eq!(result["output_coins_root"], ocr);
+        assert!(result.get("proof_data_hash").is_none());
+        assert!(result.get("txn_pubkey").is_none());
+    }
+
+    #[test]
+    fn wire_body_try_from_enforces_encoding_at_boundary() {
+        let (submission, _) = v5_case(Network::Mainnet);
+        let wire = WalletSignSubmissionWire {
+            signature: hex::encode(submission.signature),
+            s2c_nonce: hex::encode(submission.s2c_nonce),
+        };
+        let decoded = WalletSignSubmission::try_from(&wire).expect("canonical wire");
+        assert_eq!(decoded, submission);
+
+        let bad = WalletSignSubmissionWire {
+            signature: wire.signature.to_uppercase(),
+            s2c_nonce: wire.s2c_nonce.clone(),
+        };
+        let err = WalletSignSubmission::try_from(&bad).expect_err("uppercase");
+        assert_eq!(err.check, SignatureCheck::Encoding);
+        let (status, code) = sign_rejection(&err);
+        assert_eq!(status, 400);
+        assert_eq!(code, "encoding");
     }
 }
