@@ -10,10 +10,19 @@
 //! not because of a string-search convention.
 //!
 //! Callers only see [`EsploraReadClient`] (reads) and
-//! [`EsploraBroadcastClient`] (broadcast + get_tx). Stack policy for the
-//! legacy publisher (v1.1 exclusive claim) is enforced by the `node`
-//! wrapper around [`EsploraBroadcastClient`] — this crate stays free of
-//! process-global stack state.
+//! [`EsploraBroadcastClient`] (broadcast + get_tx).
+//!
+//! ## Broadcast capability = witness typestate
+//!
+//! [`EsploraBroadcastClient::connect`] requires a [`LegacyBroadcastWitness`].
+//! The witness has a private field, so it cannot be forged outside this
+//! crate. Minting is available only under the
+//! `issue-legacy-broadcast-witness` feature (enabled solely by the `node`
+//! package). The sole production issuer is
+//! `node::v11::ensure_legacy_publisher_allowed`, which mints only after the
+//! process claim check succeeds. Possession of a broadcast-capable client
+//! is therefore evidence that a witness was supplied at construction; in
+//! the workspace, that witness is issued only on the claim-check path.
 
 use bitcoin::{Address, BlockHash, OutPoint, Transaction, Txid};
 use esplora_client::{
@@ -21,6 +30,32 @@ use esplora_client::{
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Proof that the legacy-publisher process claim was checked.
+///
+/// Private field: values cannot be constructed with struct-literal syntax
+/// from any other crate. The only mint path is [`LegacyBroadcastWitness::issue`],
+/// gated behind the `issue-legacy-broadcast-witness` feature so workspace
+/// crates other than `node` cannot obtain a witness at all.
+///
+/// `node::v11::ensure_legacy_publisher_allowed` is the sole caller of
+/// [`issue`](LegacyBroadcastWitness::issue) after the claim check passes.
+#[derive(Clone, Copy, Debug)]
+pub struct LegacyBroadcastWitness {
+    _private: (),
+}
+
+#[cfg(feature = "issue-legacy-broadcast-witness")]
+impl LegacyBroadcastWitness {
+    /// Mint a witness after the process claim check has succeeded.
+    ///
+    /// Available only when the `issue-legacy-broadcast-witness` feature is
+    /// enabled. The `node` package is the sole workspace consumer of that
+    /// feature; its claim-check function is the sole production caller.
+    pub const fn issue() -> Self {
+        Self { _private: () }
+    }
+}
 
 /// Read-only Esplora HTTP surface used by the legacy scanner, readiness
 /// probe, and UTXO fetch.
@@ -94,9 +129,11 @@ impl EsploraReadClient {
 
 /// Broadcast-capable Esplora client (raw I/O only).
 ///
-/// Stack policy (legacy publisher under a v1.1 process claim) is enforced
-/// by the `node` package's [`LegacyBroadcastClient`](../node) wrapper —
-/// this type only hides the raw `esplora-client` handle.
+/// Construction requires a [`LegacyBroadcastWitness`]. Stack policy (legacy
+/// publisher under a v1.1 process claim) is enforced by the `node` package,
+/// which is the sole issuer of that witness after the claim check. This
+/// type hides the raw `esplora-client` handle and refuses un-witnessed
+/// construction at compile time.
 pub struct EsploraBroadcastClient {
     inner: RawAsyncClient<DefaultSleeper>,
 }
@@ -109,7 +146,13 @@ impl std::fmt::Debug for EsploraBroadcastClient {
 
 impl EsploraBroadcastClient {
     /// Build a broadcast-capable client from an Esplora base URL.
-    pub fn connect(url: &str) -> Result<Self, BoxError> {
+    ///
+    /// Requires a [`LegacyBroadcastWitness`]. There is no un-witnessed
+    /// constructor: `connect(url)` without a witness is a compile error.
+    /// Possession of a returned client therefore implies a witness was
+    /// supplied; the `node` package issues witnesses only from the
+    /// claim-check path.
+    pub fn connect(url: &str, _witness: LegacyBroadcastWitness) -> Result<Self, BoxError> {
         let builder = RawBuilder::new(url);
         let inner = RawAsyncClient::<DefaultSleeper>::from_builder(builder)?;
         Ok(Self { inner })

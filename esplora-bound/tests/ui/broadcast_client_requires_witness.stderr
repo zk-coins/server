@@ -1,0 +1,15 @@
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+  --> tests/ui/broadcast_client_requires_witness.rs:10:13
+   |
+10 |     let _ = esplora_bound::EsploraBroadcastClient::connect("http://127.0.0.1");
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-------------------- argument #2 of type `LegacyBroadcastWitness` is missing
+   |
+note: associated function defined here
+  --> src/lib.rs
+   |
+   |     pub fn connect(url: &str, _witness: LegacyBroadcastWitness) -> Result<Self, BoxError> {
+   |            ^^^^^^^
+help: provide the argument
+   |
+10 |     let _ = esplora_bound::EsploraBroadcastClient::connect("http://127.0.0.1", /* LegacyBroadcastWitness */);
+   |                                                                              ++++++++++++++++++++++++++++++

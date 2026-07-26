@@ -10,21 +10,26 @@
 //!
 //! The `esplora-bound` package owns the raw crate and exports only
 //! [`EsploraReadClient`] and [`EsploraBroadcastClient`] with private
-//! inner fields. This module wraps broadcast construction with
-//! [`ensure_legacy_publisher_allowed`] so a v1.1 process claim still
-//! refuses legacy commitment broadcast before any Esplora I/O.
+//! inner fields. Broadcast construction on the facade requires a
+//! [`LegacyBroadcastWitness`]; this module is the sole issuer of that
+//! witness via [`ensure_legacy_publisher_allowed`], so a v1.1 process
+//! claim still refuses legacy commitment broadcast before any Esplora I/O.
 
 use crate::v11::ensure_legacy_publisher_allowed;
 
 // Read path: no stack gate (reads are not a publish path).
 pub use esplora_bound::{AddressUtxo, BlockStatusView, EsploraReadClient};
 
+/// Re-export the broadcast typestate witness (issued only by the claim check).
+pub use esplora_bound::LegacyBroadcastWitness;
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Broadcast-capable Esplora client for **legacy** commitment inscriptions.
 ///
-/// Construction always runs [`ensure_legacy_publisher_allowed`]. Possessing
-/// a value of this type means the stack check passed at connect time.
+/// Construction always runs [`ensure_legacy_publisher_allowed`] and passes
+/// the resulting witness into the facade. Possessing a value of this type
+/// means the stack check passed at connect time.
 pub struct LegacyBroadcastClient {
     inner: esplora_bound::EsploraBroadcastClient,
 }
@@ -39,11 +44,13 @@ impl LegacyBroadcastClient {
     /// Build a broadcast-capable client after the legacy stack check.
     ///
     /// Fails loud under a v1.1 process claim **before** any Esplora I/O.
+    /// The claim check is also the sole issuer of the facade witness, so
+    /// the inner client cannot be built without a successful check.
     pub fn connect(url: &str) -> Result<Self, BoxError> {
-        ensure_legacy_publisher_allowed().map_err(|e| {
+        let witness = ensure_legacy_publisher_allowed().map_err(|e| {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as BoxError
         })?;
-        let inner = esplora_bound::EsploraBroadcastClient::connect(url)?;
+        let inner = esplora_bound::EsploraBroadcastClient::connect(url, witness)?;
         Ok(Self { inner })
     }
 

@@ -471,9 +471,18 @@ pub fn claim_process_stack_from_v11_shadow_env() -> Result<()> {
 /// legacy publisher so existing tests stay green without a silent
 /// cross-stack fall-back: the v1.1 publisher still requires an explicit
 /// `ScanStackMode::V11` claim (see [`ensure_v11_publisher_allowed`]).
-pub fn ensure_legacy_publisher_allowed() -> Result<()> {
+///
+/// On success returns a [`esplora_bound::LegacyBroadcastWitness`]. This
+/// function is the **sole production issuer** of that witness: the facade
+/// constructor [`esplora_bound::EsploraBroadcastClient::connect`] requires
+/// one, so a broadcast-capable client cannot exist without this check
+/// having succeeded (or an explicit out-of-band mint under the
+/// `issue-legacy-broadcast-witness` feature, which only `node` enables).
+pub fn ensure_legacy_publisher_allowed() -> Result<esplora_bound::LegacyBroadcastWitness> {
     match process_stack_mode() {
-        None | Some(ScanStackMode::Legacy) => Ok(()),
+        None | Some(ScanStackMode::Legacy) => {
+            Ok(esplora_bound::LegacyBroadcastWitness::issue())
+        }
         Some(ScanStackMode::V11) => bail!(
             "{STACK_SEPARATION_REFUSAL}: process is running the v1.1 scan stack; \
              legacy Commitment publish is forbidden (no silent fall-back to \
