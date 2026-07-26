@@ -30,6 +30,13 @@
 //! never leaves the package; assembling a durable effect from raw parts is
 //! a compile error — see the `downstream-boundary` package
 //! (`sealed_plumbing_compile_fail_matrix`).
+//!
+//! ## Gap G4 — transition signature
+//! Behind the same flag, wallet authorisation is a §3.2
+//! [`TransitionSignature`](zkcoins_prover::prover_bridge::TransitionSignature)
+//! (BIP-340 + sign-to-contract over the full canonical `serialize(ProofData)`),
+//! verified by [`signature`]. Legacy ash‖ocr [`shared::commitment::Commitment`]
+//! stays the default when the flag is off.
 
 mod adapter;
 pub mod db_v11;
@@ -38,6 +45,7 @@ pub mod publish;
 pub mod receive;
 pub mod scan;
 pub mod separation;
+pub mod signature;
 
 pub use adapter::EngineAdapter;
 pub use mode::{
@@ -63,6 +71,10 @@ pub use separation::{
     legacy_scan_state_present, load_stack_scan_mode, process_stack_mode,
     require_stack_mode_for_update, require_v11_process_for_nflog_write, set_process_stack_mode,
     v11_scan_state_present, ScanStackMode, STACK_CAPABILITY_REFUSAL, STACK_SEPARATION_REFUSAL,
+};
+pub use signature::{
+    accept_wallet_transition_signature, ensure_v11_signature_path, verify_transition_signature,
+    SignatureCheck, TransitionSignatureError, WalletSignSubmission,
 };
 
 #[cfg(test)]
