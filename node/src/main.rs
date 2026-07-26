@@ -697,49 +697,105 @@ async fn run_v11_scan_loop(
         )
     })?;
 
-    // Boot tip reconciliation: compare the persisted tip against the live
-    // chain before any fold. Uses a separate RPC client so we do not depend
-    // on scanner-private state (fresh scanner has scanned_through = None).
+    // Boot tip reconciliation (§3.9): resolve the persisted tip hash, walk
+    // to the last common ancestor, refuse deep / unresolvable offline reorgs.
+    // Uses a separate RPC client so we do not depend on scanner-private
+    // state (fresh scanner has scanned_through = None).
     let persisted_height = adapter.with_engine(|e| e.tip_height());
     let persisted_hash = adapter.tip_hash();
+    let activation_height = pins.activation_height;
     let tip_recon = {
         let rpc_url = rpc_url.clone();
         let cookie_path = cookie_path.clone();
         let height = persisted_height;
         tokio::task::spawn_blocking(move || {
             use bitcoincore_rpc::RpcApi;
-            reconcile_persisted_tip(height, persisted_hash, |h| {
-                let client = bitcoincore_rpc::Client::new(
+            use v11::scan::ResolvedBlock;
+
+            let open_client = || {
+                bitcoincore_rpc::Client::new(
                     rpc_url.trim_end_matches('/'),
                     bitcoincore_rpc::Auth::CookieFile(cookie_path.clone()),
                 )
-                .map_err(|e| anyhow::anyhow!("bitcoind RPC open for tip recon: {e}"))?;
-                let tip = client
-                    .get_block_count()
-                    .map_err(|e| anyhow::anyhow!("getblockcount for tip recon: {e}"))?;
-                if h > tip {
-                    return Ok(None);
-                }
-                let hash = client
-                    .get_block_hash(h)
-                    .map_err(|e| anyhow::anyhow!("getblockhash({h}) for tip recon: {e}"))?;
-                Ok(Some(hash.to_byte_array()))
-            })
+                .map_err(|e| anyhow::anyhow!("bitcoind RPC open for tip recon: {e}"))
+            };
+
+            reconcile_persisted_tip(
+                height,
+                persisted_hash,
+                activation_height,
+                |h| {
+                    let client = open_client()?;
+                    let tip = client
+                        .get_block_count()
+                        .map_err(|e| anyhow::anyhow!("getblockcount for tip recon: {e}"))?;
+                    if h > tip {
+                        return Ok(None);
+                    }
+                    let hash = client
+                        .get_block_hash(h)
+                        .map_err(|e| anyhow::anyhow!("getblockhash({h}) for tip recon: {e}"))?;
+                    Ok(Some(hash.to_byte_array()))
+                },
+                |block_hash| {
+                    let client = open_client()?;
+                    let bh = BlockHash::from_byte_array(block_hash);
+                    match client.get_block_header_info(&bh) {
+                        Ok(info) => {
+                            let height = u64::try_from(info.height).map_err(|_| {
+                                anyhow::anyhow!(
+                                    "getblockheader height {} does not fit u64",
+                                    info.height
+                                )
+                            })?;
+                            let prev_hash = info
+                                .previous_block_hash
+                                .map(|p| p.to_byte_array())
+                                .unwrap_or([0u8; 32]);
+                            Ok(Some(ResolvedBlock {
+                                height,
+                                prev_hash,
+                            }))
+                        }
+                        // Unknown / pruned block: not an RPC infrastructure
+                        // failure — surface as Ok(None) so recon can fail-stop
+                        // with an unresolvable-tip error (not silent recover).
+                        Err(e) => {
+                            let msg = e.to_string();
+                            let unknown = msg.contains("Block not found")
+                                || msg.contains("Block header not found")
+                                || msg.contains("not found")
+                                || msg.contains("-5");
+                            if unknown {
+                                Ok(None)
+                            } else {
+                                Err(anyhow::anyhow!("getblockheader for tip recon: {e}"))
+                            }
+                        }
+                    }
+                },
+            )
         })
         .await
         .map_err(|e| format!("v1.1 tip reconciliation join: {e}"))?
-        .map_err(|e| format!("v1.1 tip reconciliation failed: {e:#}"))?
+        .map_err(|e| {
+            // Deep / unresolvable offline reorg: fail readiness before any fold.
+            if let Some(flag) = &finality_ok {
+                flag.store(false, Ordering::SeqCst);
+            }
+            format!("v1.1 tip reconciliation failed: {e:#}")
+        })?
     };
 
     // Track which survivor chain positions we have already folded so a
     // re-scan of the same tip does not re-append (append_nullifier is
     // strict). Reorg / full-replace clears this set and rebuilds.
     let mut folded_keys: HashSet<(u64, u32, u32, u32, [u8; 32])> = HashSet::new();
-    // When the persisted tip diverged, the first successful scan must
-    // full-replace NfLog even if the fresh scanner reports no reorg.
+    // When a shallow offline reorg was detected, the first successful scan
+    // must full-replace NfLog even if the fresh scanner reports no reorg.
     let mut force_full_replace = matches!(
         tip_recon,
-        PersistedTipReconciliation::MustFullReplace { .. }
+        PersistedTipReconciliation::ShallowReorg { .. }
     );
 
     match tip_recon {
@@ -759,16 +815,23 @@ async fn run_v11_scan_loop(
                 folded_keys.len()
             );
         }
-        PersistedTipReconciliation::MustFullReplace {
+        PersistedTipReconciliation::ShallowReorg {
+            ancestor_height,
+            ancestor_hash,
+            reorg_depth,
             persisted_height,
             persisted_hash,
         } => {
             println!(
-                "v1.1 boot tip: persisted tip height={} hash={} is no longer canonical; \
-                 first apply will full-replace NfLog from the rescan survivor stream \
-                 (never forward-fold into a stale accumulator)",
+                "v1.1 boot tip: shallow offline reorg depth={} (persisted height={} \
+                 hash={} → common ancestor height={} hash={}); first apply will \
+                 full-replace NfLog from the rescan survivor stream (never \
+                 forward-fold into a stale accumulator; §3.9 ≤5-block window)",
+                reorg_depth,
                 persisted_height,
-                hex::encode(persisted_hash)
+                hex::encode(persisted_hash),
+                ancestor_height,
+                hex::encode(ancestor_hash)
             );
         }
     }

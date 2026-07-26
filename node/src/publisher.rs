@@ -446,15 +446,30 @@ pub async fn broadcast_inscription_txs(
     let builder = EsploraBuilder::new(&config.url);
     let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
 
-    client.broadcast(commit_tx).await?;
-    let commit_txid = commit_tx.compute_txid();
-    println!("Commit transaction broadcast successfully: {}", commit_txid);
-
-    client.broadcast(reveal_tx).await?;
-    let reveal_txid = reveal_tx.compute_txid();
-    println!("Reveal transaction broadcast successfully: {}", reveal_txid);
+    let commit_txid = broadcast_raw_tx(&client, commit_tx, "Commit").await?;
+    let reveal_txid = broadcast_raw_tx(&client, reveal_tx, "Reveal").await?;
 
     Ok((commit_txid, reveal_txid))
+}
+
+/// Structural choke point for every legacy commitment broadcast.
+///
+/// Stack separation is enforced **here** (not only at public entry points)
+/// so a new caller cannot forget the guard: under a v1.1 process claim the
+/// Esplora `broadcast` never runs.
+async fn broadcast_raw_tx(
+    client: &EsploraAsyncClient<DefaultSleeper>,
+    tx: &Transaction,
+    label: &str,
+) -> Result<Txid, Box<dyn std::error::Error + Send + Sync>> {
+    crate::v11::ensure_legacy_publisher_allowed().map_err(|e| {
+        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            as Box<dyn std::error::Error + Send + Sync>
+    })?;
+    client.broadcast(tx).await?;
+    let txid = tx.compute_txid();
+    println!("{label} transaction broadcast successfully: {txid}");
+    Ok(txid)
 }
 
 /// Fetches available UTXOs for the publisher address
@@ -715,11 +730,9 @@ pub async fn broadcast_inscription_txs_with_persistence(
     let builder = EsploraBuilder::new(&config.url);
     let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
 
-    let commit_txid = commit_tx.compute_txid();
+    // Guard lives inside `broadcast_raw_tx` — structural, not per-entry-point.
+    let commit_txid = broadcast_raw_tx(&client, commit_tx, "Commit").await?;
     let commit_txid_bytes = *commit_txid.as_byte_array();
-
-    client.broadcast(commit_tx).await?;
-    println!("Commit transaction broadcast successfully: {}", commit_txid);
     advance_pending_status(
         pool,
         &commit_txid_bytes,
@@ -727,9 +740,7 @@ pub async fn broadcast_inscription_txs_with_persistence(
     )
     .await;
 
-    client.broadcast(reveal_tx).await?;
-    let reveal_txid = reveal_tx.compute_txid();
-    println!("Reveal transaction broadcast successfully: {}", reveal_txid);
+    let reveal_txid = broadcast_raw_tx(&client, reveal_tx, "Reveal").await?;
     advance_pending_status(
         pool,
         &commit_txid_bytes,

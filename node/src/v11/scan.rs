@@ -22,28 +22,45 @@
 //! Every boot creates a fresh scanner with an empty checkpoint. If Bitcoin
 //! reorganised while the node was down, that scanner cannot report a reorg
 //! (no previous tip). The node therefore reconciles the **persisted** tip
-//! hash against the live chain **before** any fold:
+//! against the live chain **before** any fold (§3.9 finality directive):
 //!
-//! - tip still canonical → seed folded keys; forward-append only
-//! - tip diverged / missing → full NfLog replace from the rescan survivor
-//!   stream (equivalent to replaying from activation; NfLog is a pure
-//!   function of the confirmed chain's first-occurrence winners)
-//! - tip height > 0 with all-zero hash → refuse (ambiguous cursor)
-//! - live-chain query failure → refuse (never fold onto an unverified tip)
+//! 1. **Resolve the persisted tip hash itself** (by hash, not only by
+//!    height). An unknown / pruned tip is **not** treated as a shallow
+//!    reorg — fail-stop.
+//! 2. Walk the old chain via `previousblockhash` to the **last common
+//!    ancestor** with the live main chain; reorg depth =
+//!    `persisted_height − ancestor_height`.
+//! 3. **Refuse** when:
+//!    - the ancestor is below `activation_height`, or
+//!    - depth exceeds [`MAX_RECOVERABLE_REORG_DEPTH`] (5; §3.9 ≤5-block
+//!      window), or
+//!    - the tip hash cannot be resolved / mid-walk is unresolvable.
+//!    A ≥6-block reorg MAY displace final positions; v1 has **no**
+//!    recovery path — readiness must not report ready (`deep_reorg`).
+//! 4. Only a **shallow** (depth ≤ 5), non-final reorg may full-replace
+//!    NfLog from the rescan survivor stream (equivalent to
+//!    truncate-and-extend from the ancestor).
+//! 5. Tip still canonical → seed folded keys; forward-append only.
+//! 6. Tip height > 0 with all-zero hash → refuse (ambiguous cursor).
+//! 7. Live-chain / resolve RPC failure → refuse (never fold blind).
 //!
-//! Property: after any crash or reorg, a restarted node reaches the same
-//! accumulator a continuously running node would hold.
+//! Property: after any crash or *tolerated* reorg, a restarted node
+//! reaches the same accumulator a continuously running node would hold.
+//! A finality-breaking offline reorg fails the process; it does **not**
+//! silently rebuild.
 //!
 //! A mid-apply crash leaves the previous snapshot (persist is
 //! all-or-nothing via [`crate::v11::db_v11::persist_engine_snapshot`]);
-//! retry reloads and re-applies from the scanner checkpoint.
+//! apply paths restore the in-memory engine from a pre-mutation snapshot
+//! when persist fails so the live adapter never advances past durable
+//! state.
 
 use anyhow::{bail, Context, Result};
 use shared::spec_v1::{ChainPosition, FoldOutcome, PublishedNullifier};
 use zkcoins_prover::state_engine::StateEngine;
 
 use super::adapter::EngineAdapter;
-use super::separation::{ensure_v11_publisher_allowed, process_stack_mode, ScanStackMode};
+use super::separation::{ensure_v11_publisher_allowed, require_v11_process_for_nflog_write};
 
 /// Outcome counters for one fold pass (forward scan or reorg apply).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -215,25 +232,11 @@ pub fn replace_engine_nflog_from_survivors(
     Ok(stats)
 }
 
-/// Require an exclusive v1.1 process claim before mutating NfLog state.
-///
-/// Unset process mode is **not** permitted: an unset mode previously
-/// allowed writes that later left v1.1 data under a legacy marker.
-fn require_v11_process_for_nflog_write() -> Result<()> {
-    match process_stack_mode() {
-        Some(ScanStackMode::V11) => Ok(()),
-        Some(ScanStackMode::Legacy) => bail!(
-            "stack separation: refusing to fold NfLog while process \
-             is claimed as legacy (no silent cross-stack write)"
-        ),
-        None => bail!(
-            "stack separation: refusing to fold NfLog without a process \
-             claim of ScanStackMode::V11 (no silent write under unset mode)"
-        ),
-    }
-}
-
 /// Forward-scan apply on the live adapter: fold new survivors, set tip, persist.
+///
+/// Mutates memory only after a successful durable write would be wrong —
+/// this path snapshots the live engine, mutates, persists, and **restores**
+/// the snapshot if persist fails so the adapter never advances past Postgres.
 pub async fn apply_forward_scan(
     adapter: &EngineAdapter,
     tip_height: u64,
@@ -241,8 +244,9 @@ pub async fn apply_forward_scan(
     new_survivors: &[PublishedNullifier],
 ) -> Result<FoldStats> {
     require_v11_process_for_nflog_write()?;
+    let backup = adapter.snapshot_live();
 
-    let stats = adapter.with_engine_mut(|engine| {
+    let stats = match adapter.with_engine_mut(|engine| -> Result<FoldStats> {
         if tip_height < engine.tip_height() {
             bail!(
                 "apply_forward_scan: tip_height {tip_height} is behind engine tip {}; \
@@ -255,17 +259,34 @@ pub async fn apply_forward_scan(
             engine.set_tip_height(tip_height);
         }
         fold_survivors_into_engine(engine, new_survivors)
-    })?;
+    }) {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) | Err(e) => {
+            adapter
+                .restore_live(backup)
+                .context("apply_forward_scan: restore after mutate error")?;
+            return Err(e);
+        }
+    };
     adapter.set_tip_hash(tip_hash);
-    adapter
+    if let Err(e) = adapter
         .persist()
         .await
-        .context("apply_forward_scan: persist")?;
+        .context("apply_forward_scan: persist")
+    {
+        adapter
+            .restore_live(backup)
+            .context("apply_forward_scan: restore after persist failure")?;
+        return Err(e);
+    }
     Ok(stats)
 }
 
 /// Reorg / full-rebuild apply: replace NfLog from the full post-reorg
 /// (or post-rescan) survivor stream.
+///
+/// Same memory-before-persist safety as [`apply_forward_scan`]: restore
+/// the pre-mutation snapshot if durable write fails.
 pub async fn apply_canonical_survivors(
     adapter: &EngineAdapter,
     tip_height: u64,
@@ -273,21 +294,49 @@ pub async fn apply_canonical_survivors(
     survivors: &[PublishedNullifier],
 ) -> Result<FoldStats> {
     require_v11_process_for_nflog_write()?;
-    let stats = adapter.with_engine_mut(|engine| {
+    let backup = adapter.snapshot_live();
+
+    let stats = match adapter.with_engine_mut(|engine| {
         replace_engine_nflog_from_survivors(engine, tip_height, tip_hash, survivors)
-    })?;
+    }) {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) | Err(e) => {
+            adapter
+                .restore_live(backup)
+                .context("apply_canonical_survivors: restore after mutate error")?;
+            return Err(e);
+        }
+    };
     adapter.set_tip_hash(tip_hash);
-    adapter
+    if let Err(e) = adapter
         .persist()
         .await
-        .context("apply_canonical_survivors: persist")?;
+        .context("apply_canonical_survivors: persist")
+    {
+        adapter
+            .restore_live(backup)
+            .context("apply_canonical_survivors: restore after persist failure")?;
+        return Err(e);
+    }
     Ok(stats)
+}
+
+/// §3.9: reorgs of **up to 5 blocks** are tolerated (non-final only).
+/// Depth ≥ 6 is outside v1's recovery guarantee (finality = 6 confirmations).
+pub const MAX_RECOVERABLE_REORG_DEPTH: u64 = 5;
+
+/// A block resolved by hash from bitcoind (or a test double).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedBlock {
+    pub height: u64,
+    /// Previous-block hash; all-zero for the genesis block.
+    pub prev_hash: [u8; 32],
 }
 
 /// Outcome of reconciling a persisted tip against the live Bitcoin chain.
 ///
-/// Decides whether a restarted node may forward-append or must rebuild
-/// the NfLog from the full canonical survivor stream.
+/// Decides whether a restarted node may forward-append, may rebuild from
+/// a shallow offline reorg, or must **fail-stop** (returned as `Err`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistedTipReconciliation {
     /// Engine has no tip yet (height 0, all-zero hash). Scan forward from
@@ -299,33 +348,47 @@ pub enum PersistedTipReconciliation {
         tip_height: u64,
         tip_hash: [u8; 32],
     },
-    /// Persisted tip is no longer on the canonical chain (hash mismatch,
-    /// height above live tip, or height missing). First apply after the
-    /// rescan **must** full-replace the NfLog — never forward-fold into
-    /// the stale accumulator.
-    MustFullReplace {
+    /// Offline reorg within the ≤5-block recoverable window. First apply
+    /// after the rescan **must** full-replace the NfLog from the survivor
+    /// stream (equivalent to truncate-and-extend from the ancestor) —
+    /// never forward-fold into the stale accumulator.
+    ShallowReorg {
+        ancestor_height: u64,
+        ancestor_hash: [u8; 32],
+        /// `persisted_height − ancestor_height` (1..=[`MAX_RECOVERABLE_REORG_DEPTH`]).
+        reorg_depth: u64,
         persisted_height: u64,
         persisted_hash: [u8; 32],
     },
 }
 
 /// Reconcile `(tip_height, tip_hash)` from the persisted engine against
-/// the live chain.
+/// the live chain under §3.9 finality rules.
 ///
 /// `live_hash_at(height)` returns:
-/// - `Ok(Some(hash))` when the height is on the live chain
+/// - `Ok(Some(hash))` when the height is on the live main chain
 /// - `Ok(None)` when the height is above the live tip (or otherwise absent)
 /// - `Err(_)` on RPC / infrastructure failure — this function propagates
 ///   the error and **refuses** to classify the tip (never fold blind)
 ///
-/// # Failures
+/// `resolve_hash(hash)` returns:
+/// - `Ok(Some(ResolvedBlock))` when bitcoind knows the block (main or orphan)
+/// - `Ok(None)` when the hash is unknown / pruned
+/// - `Err(_)` on RPC failure — refused, never treated as a shallow reorg
+///
+/// # Failures (all loud, no silent recovery)
 ///
 /// - `tip_height > 0` with all-zero `tip_hash` (ambiguous cursor)
-/// - live-chain query failure
+/// - persisted tip hash unknown / pruned (depth indeterminate)
+/// - no common ancestor at or above `activation_height`
+/// - reorg depth > [`MAX_RECOVERABLE_REORG_DEPTH`] (§3.9 ≥6-block fail-stop)
+/// - live-chain or resolve RPC failure
 pub fn reconcile_persisted_tip(
     tip_height: u64,
     tip_hash: [u8; 32],
-    live_hash_at: impl FnOnce(u64) -> Result<Option<[u8; 32]>>,
+    activation_height: u64,
+    mut live_hash_at: impl FnMut(u64) -> Result<Option<[u8; 32]>>,
+    mut resolve_hash: impl FnMut([u8; 32]) -> Result<Option<ResolvedBlock>>,
 ) -> Result<PersistedTipReconciliation> {
     let zero = [0u8; 32];
     if tip_height == 0 && tip_hash == zero {
@@ -339,20 +402,147 @@ pub fn reconcile_persisted_tip(
         );
     }
 
-    let live = live_hash_at(tip_height).context(
+    // 1. Resolve the persisted tip hash **itself** (not merely height→hash).
+    //    An unknown/pruned tip is indistinguishable from a shallow reorg if
+    //    we only compare getblockhash(height) — refuse rather than assume.
+    let tip_block = resolve_hash(tip_hash).context(
+        "v1.1 boot tip reconciliation: resolve of persisted tip hash failed; \
+         refusing to fold onto an unverified persisted tip",
+    )?;
+    let Some(tip_block) = tip_block else {
+        bail!(
+            "v1.1 boot tip reconciliation: persisted tip hash {} at height {} \
+             is unknown or pruned on the connected bitcoind — reorg depth and \
+             common ancestor cannot be determined. Refusing to fold (fail-stop; \
+             no silent recovery of an unresolvable tip). Manual recovery required.",
+            hex::encode(tip_hash),
+            tip_height
+        );
+    };
+    if tip_block.height != tip_height {
+        bail!(
+            "v1.1 boot tip reconciliation: persisted tip_height={tip_height} but \
+             resolved hash {} is at height {} — cursor inconsistency; refusing \
+             to fold",
+            hex::encode(tip_hash),
+            tip_block.height
+        );
+    }
+
+    // 2. Still on the live main chain at that height?
+    let live_at_tip = live_hash_at(tip_height).context(
         "v1.1 boot tip reconciliation: live-chain query failed; \
          refusing to fold onto an unverified persisted tip",
     )?;
+    if let Some(hash) = live_at_tip {
+        if hash == tip_hash {
+            return Ok(PersistedTipReconciliation::StillCanonical {
+                tip_height,
+                tip_hash,
+            });
+        }
+    }
 
-    match live {
-        Some(hash) if hash == tip_hash => Ok(PersistedTipReconciliation::StillCanonical {
-            tip_height,
-            tip_hash,
-        }),
-        Some(_) | None => Ok(PersistedTipReconciliation::MustFullReplace {
-            persisted_height: tip_height,
-            persisted_hash: tip_hash,
-        }),
+    // 3. Walk back the old chain via previousblockhash to the last common
+    //    ancestor with the live main chain. Depth = persisted − ancestor.
+    let mut walk_hash = tip_hash;
+    let mut walk_height = tip_height;
+    // Cache the already-resolved tip block so the first step needs no re-fetch.
+    let mut cached: Option<ResolvedBlock> = Some(tip_block);
+
+    loop {
+        if walk_height == 0 {
+            bail!(
+                "v1.1 boot tip reconciliation: no common ancestor between \
+                 persisted tip (height={tip_height}, hash={}) and the live \
+                 chain — walked to genesis. Refusing to fold (fail-stop; \
+                 §3.9 provides no recovery for an unrooted offline reorg).",
+                hex::encode(tip_hash)
+            );
+        }
+
+        let block = match cached.take() {
+            Some(b) => b,
+            None => {
+                let resolved = resolve_hash(walk_hash).context(
+                    "v1.1 boot tip reconciliation: resolve during ancestor walk failed; \
+                     refusing to fold",
+                )?;
+                match resolved {
+                    Some(b) => b,
+                    None => bail!(
+                        "v1.1 boot tip reconciliation: block hash {} at height {} \
+                         became unresolvable during ancestor walk — refusing to \
+                         fold (no silent assumption of a shallow reorg)",
+                        hex::encode(walk_hash),
+                        walk_height
+                    ),
+                }
+            }
+        };
+        if block.height != walk_height {
+            bail!(
+                "v1.1 boot tip reconciliation: resolved height {} != walk height {} \
+                 for hash {}; refusing",
+                block.height,
+                walk_height,
+                hex::encode(walk_hash)
+            );
+        }
+
+        let parent_hash = block.prev_hash;
+        let parent_height = walk_height
+            .checked_sub(1)
+            .context("v1.1 boot tip reconciliation: height underflow during ancestor walk")?;
+        let reorg_depth = tip_height
+            .checked_sub(parent_height)
+            .context("v1.1 boot tip reconciliation: reorg_depth underflow")?;
+
+        // Fail-stop as soon as depth exceeds the recoverable window — do not
+        // keep walking and silently recover a ≥6-block offline reorg.
+        if reorg_depth > MAX_RECOVERABLE_REORG_DEPTH {
+            bail!(
+                "v1.1 boot tip reconciliation: offline reorg depth {reorg_depth} \
+                 exceeds recoverable limit {MAX_RECOVERABLE_REORG_DEPTH} \
+                 (persisted tip height={tip_height} hash={}). §3.9: reorgs of \
+                 ≥6 blocks MAY displace final nullifier positions and v1 \
+                 provides no recovery path — refusing to fold; readiness must \
+                 not report ready (deep_reorg). Manual recovery required.",
+                hex::encode(tip_hash)
+            );
+        }
+
+        let live_parent = live_hash_at(parent_height).context(
+            "v1.1 boot tip reconciliation: live-chain query during ancestor walk failed; \
+             refusing to fold",
+        )?;
+        match live_parent {
+            Some(h) if h == parent_hash => {
+                // Found last common ancestor.
+                if parent_height < activation_height {
+                    bail!(
+                        "v1.1 boot tip reconciliation: last common ancestor at \
+                         height {parent_height} is below activation_height \
+                         {activation_height} (persisted tip height={tip_height}). \
+                         Refusing to fold — scan origin is consensus-critical \
+                         (§3.6); no recovery that rescan-from-activation would \
+                         silently rewrite final positions."
+                    );
+                }
+                return Ok(PersistedTipReconciliation::ShallowReorg {
+                    ancestor_height: parent_height,
+                    ancestor_hash: parent_hash,
+                    reorg_depth,
+                    persisted_height: tip_height,
+                    persisted_hash: tip_hash,
+                });
+            }
+            Some(_) | None => {
+                // Parent still diverged (or above live tip) — continue walking.
+                walk_hash = parent_hash;
+                walk_height = parent_height;
+            }
+        }
     }
 }
 

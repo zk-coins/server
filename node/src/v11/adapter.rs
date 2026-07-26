@@ -15,6 +15,7 @@ use zkcoins_prover::state_engine::StateEngine;
 
 use super::db_v11::{self, EngineSnapshot};
 use super::mode::{network_label, v11_boot_pins_from_env, V11_BOOT_CONFIG_ERROR};
+use super::separation::require_v11_process_for_nflog_write;
 
 /// In-memory engine plus the tip block hash the StateEngine does not yet
 /// carry (Stage 1: hash lives on the adapter / snapshot so equal-height
@@ -150,9 +151,50 @@ impl EngineAdapter {
         f(&guard.engine)
     }
 
-    pub fn with_engine_mut<R>(&self, f: impl FnOnce(&mut StateEngine) -> R) -> R {
+    /// Mutate the in-memory engine. Requires an exclusive v1.1 process claim
+    /// ([`require_v11_process_for_nflog_write`]) — the public surface must not
+    /// allow unguarded NfLog mutation under a legacy / unset claim.
+    ///
+    /// Callers that also persist **must** restore via [`Self::restore_live`]
+    /// if the durable write fails (see [`super::scan::apply_forward_scan`]);
+    /// this method alone does not open a DB transaction.
+    pub fn with_engine_mut<R>(&self, f: impl FnOnce(&mut StateEngine) -> R) -> Result<R> {
+        require_v11_process_for_nflog_write()
+            .context("EngineAdapter::with_engine_mut: stack claim required")?;
         let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");
-        f(&mut guard.engine)
+        Ok(f(&mut guard.engine))
+    }
+
+    /// Snapshot the live engine + tip hash (for rollback if a later persist fails).
+    pub fn snapshot_live(&self) -> EngineSnapshot {
+        let guard = self.live.lock().expect("EngineAdapter mutex poisoned");
+        EngineSnapshot::from_engine_with_tip_hash(&guard.engine, guard.tip_hash)
+    }
+
+    /// Replace the live engine from a previously taken [`Self::snapshot_live`].
+    pub fn restore_live(&self, snap: EngineSnapshot) -> Result<()> {
+        if snap.network != self.network {
+            bail!(
+                "EngineAdapter::restore_live: network pin mismatch ({} vs {})",
+                network_label(snap.network),
+                network_label(self.network)
+            );
+        }
+        if snap.activation_height != self.activation_height {
+            bail!(
+                "EngineAdapter::restore_live: activation_height pin mismatch ({} vs {})",
+                snap.activation_height,
+                self.activation_height
+            );
+        }
+        let tip_hash = snap.tip_hash;
+        let engine = snap
+            .into_engine()
+            .context("EngineAdapter::restore_live reconstruct")?;
+        let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");
+        guard.engine = engine;
+        guard.tip_hash = tip_hash;
+        Ok(())
     }
 
     /// Snapshot the live engine and write it atomically to Postgres.
