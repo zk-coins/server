@@ -242,17 +242,41 @@ impl TryFrom<WalletSignSubmissionWire> for WalletSignSubmission {
 /// `pending.witness_wip.prev_account_state.send_counter` — the entry
 /// counter of the transition being authorised. Callers cannot set a
 /// counter that disagrees with the pending transition.
+///
+/// ## Finalise readiness
+///
+/// [`StateEngine::finalise`](zkcoins_prover::state_engine::StateEngine::finalise)
+/// needs the **full** host `TransitionWitness` produced by `begin_*`:
+/// `input_coins` / `input_auth`, `output_templates` / `output_coins` /
+/// `output_history_proofs`, `received_coins` / `received_auth`,
+/// `asset_issuance`, `prev_nav_opening`, `nav_consistency`, `prev_proof`
+/// (AccountUpdate), and `predecessor_nullifier`. A restart envelope
+/// ([`StagedSignPersist`]) deliberately carries only the material
+/// `/sign` needs to recompute `H(ProofData)` and verify BIP-340+S2C —
+/// rehydrated entries therefore set [`Self::finalise_safe`] = `false`
+/// and [`ensure_finalise_ready`] refuses them. Live-staged entries
+/// (kept in the process map from `begin_*`) set it `true`.
 #[derive(Clone, Debug)]
 pub struct PendingSignEntry {
     pub pending: PendingTransition,
     pub network: Network,
+    /// `true` only for a live-staged entry whose witness is complete for
+    /// `StateEngine::finalise`. Rehydrated verification-grade entries
+    /// are `false` — finalise must refuse them rather than prove from a
+    /// partial reconstruction.
+    pub finalise_safe: bool,
 }
 
 impl PendingSignEntry {
-    /// Stage a pending transition for the given network. `send_counter`
-    /// is derived from the pending envelope — never accepted as input.
+    /// Stage a **live** pending transition (complete witness from
+    /// `begin_*`). `send_counter` is derived from the pending envelope
+    /// — never accepted as input. Marked finalise-safe.
     pub fn new(pending: PendingTransition, network: Network) -> Self {
-        Self { pending, network }
+        Self {
+            pending,
+            network,
+            finalise_safe: true,
+        }
     }
 
     /// Entry counter `i` of this transition (`skᵢ = A/0'/i'`, §1.2 / §7.5).
@@ -260,6 +284,26 @@ impl PendingSignEntry {
     pub fn send_counter(&self) -> u64 {
         self.pending.witness_wip.prev_account_state.send_counter
     }
+}
+
+/// Refuse finalise when the staged entry is not fully reconstructible.
+///
+/// Live-staged entries (`finalise_safe = true`) pass. Rehydrated
+/// envelopes pass `/sign` but fail here — never finalise a partial
+/// witness. Outward mapping for the job poll is `proving_failed`
+/// (§7.5: witness assembly / proof generation failed).
+pub fn ensure_finalise_ready(entry: &PendingSignEntry) -> Result<(), String> {
+    if entry.finalise_safe {
+        return Ok(());
+    }
+    Err(
+        "rehydrated pending_sign is verification-grade only: the restart \
+         envelope does not carry the full TransitionWitness finalise \
+         requires (input/output coins and auth, history proofs, prev_proof, \
+         predecessor_nullifier). Refuse finalise rather than prove from a \
+         partial reconstruction; resubmit the transition on this process"
+            .to_string(),
+    )
 }
 
 /// Per-job map of staged v1.1 sign material. Keyed by job `public_id`.
@@ -271,21 +315,34 @@ pub const PENDING_SIGN_BODY_KEY: &str = "pending_sign";
 
 /// Restart-safe staging envelope for `/sign` after a process restart.
 ///
-/// **Choice (Defect 4): persist**, do not re-derive. Re-deriving via
-/// `begin_*` after a restart can produce a different `H(ProofData)` if
+/// **Choice: persist verification material**, do not re-derive. Re-deriving
+/// via `begin_*` after a restart can produce a different `H(ProofData)` if
 /// the engine tip or account head moved, so the wallet's already-shown
 /// surface would no longer verify. This envelope captures exactly the
 /// host-side material [`accept_wallet_transition_signature`] needs, plus
 /// the account-state / mode fields required to rebuild a
-/// verification-grade [`PendingTransition`].
+/// **verification-grade** [`PendingTransition`].
 ///
-/// Full coin-history proofs / `prev_proof` are **not** in this envelope
-/// (they are not Serialize on the host types used for clause-8 paths).
-/// After a restart:
+/// ## What finalise requires (and this envelope does NOT carry)
+///
+/// `StateEngine::finalise` / `prove_transition` need the full host
+/// `TransitionWitness` from `begin_*` (input coins + auth, outputs +
+/// history proofs, received coins + auth, asset issuance, prev_nav /
+/// nav_consistency, prev_proof, predecessor_nullifier). Those types are
+/// not all Serialize on the host path (notably `ComplianceProof` /
+/// `CoinHistProof`), so this envelope **does not** claim to reconstruct
+/// them. After a restart:
 /// - `/sign` verifies successfully against the rebuilt pending;
-/// - `StateEngine::finalise` is driven with that pending; if the
-///   original transition needed material not in the envelope the prove
-///   fails loud (job → `failed`) rather than inventing a fallback.
+/// - finalise is **refused** via [`ensure_finalise_ready`] (entry is
+///   marked `finalise_safe = false`) — never prove from a partial
+///   reconstruction.
+///
+/// ## Stale-envelope cleanup
+///
+/// `pending_sign` is stripped from `jobs.request_body` when the job
+/// reaches a terminal status (completed / failed / cancelled / awaiting
+/// timeout) — see [`cleanup_pending_sign_envelope`]. The in-memory map
+/// entry is removed at the same points.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StagedSignPersist {
     pub network: String,
@@ -385,8 +442,24 @@ impl StagedSignPersist {
             owner,
             nav_opening,
         };
-        Ok(PendingSignEntry::new(pending, network))
+        // Verification-grade only — empty coins/auth/prev_proof means
+        // this entry must never drive StateEngine::finalise.
+        Ok(PendingSignEntry {
+            pending,
+            network,
+            finalise_safe: false,
+        })
     }
+}
+
+/// Remove the restart envelope from a job's `request_body` (in-memory
+/// JSON). Callers persist the result. Used by
+/// [`cleanup_pending_sign_envelope`] and tests.
+pub fn strip_pending_sign_from_body(request_body: &mut serde_json::Value) -> bool {
+    request_body
+        .as_object_mut()
+        .map(|obj| obj.remove(PENDING_SIGN_BODY_KEY).is_some())
+        .unwrap_or(false)
 }
 
 fn network_label(network: Network) -> &'static str {
@@ -441,41 +514,65 @@ pub struct FinaliseOutcome {
     pub new_account_state_hash: [u8; 32],
     pub output_coins_root: [u8; 32],
     pub input_nullifiers_root: [u8; 32],
+    /// `coin.identifier` of every output coin the transition produced
+    /// (empty for pure receive — §7.5 / §2.3.3).
     pub output_coin_ids: Vec<[u8; 32]>,
+    /// Present for externally published kinds (publisher presence matrix
+    /// case (b)/(c)); absent on self-publish (case a) and attest jobs.
+    pub publisher_pubkey: Option<[u8; 32]>,
 }
 
 impl FinaliseOutcome {
+    /// Coin identifiers from the pending witness (the transition that
+    /// finalise proved). `AppliedTransition` only carries `ProofData` +
+    /// nullifier; ids live on the witness.
+    fn output_coin_ids_from_pending(pending: &PendingTransition) -> Vec<[u8; 32]> {
+        pending
+            .witness_wip
+            .output_coins
+            .iter()
+            .map(|c| digest_to_bytes(&c.identifier))
+            .collect()
+    }
+
     pub fn from_applied(
         applied: &zkcoins_prover::state_engine::AppliedTransition,
+        pending: &PendingTransition,
+        publisher_pubkey: Option<[u8; 32]>,
     ) -> Self {
         let pd = &applied.proved.proof_data;
         Self {
             new_account_state_hash: digest_to_bytes(&pd.new_account_state_hash),
             output_coins_root: digest_to_bytes(&pd.output_coins_root),
             input_nullifiers_root: digest_to_bytes(&pd.input_nullifiers_root),
-            // AppliedTransition does not currently surface output coin ids
-            // on the host type; the §7.5 field is present as an empty list
-            // until the prove path exposes them. Fail-closed empty, never
-            // invented.
-            output_coin_ids: Vec::new(),
+            output_coin_ids: Self::output_coin_ids_from_pending(pending),
+            publisher_pubkey,
         }
     }
 
-    /// Build an outcome from the pending's ProofData (used by test drivers
-    /// that do not run the full prove, and as the response skeleton when
-    /// the engine reports the same ProofData it was given).
+    /// Build an outcome from the pending's ProofData + output coins
+    /// (test drivers that do not run the full prove; production hook
+    /// doubles that return the pending surface).
     pub fn from_pending_proof_data(pending: &PendingTransition) -> Self {
+        Self::from_pending_proof_data_with_publisher(pending, None)
+    }
+
+    pub fn from_pending_proof_data_with_publisher(
+        pending: &PendingTransition,
+        publisher_pubkey: Option<[u8; 32]>,
+    ) -> Self {
         let pd = &pending.proof_data;
         Self {
             new_account_state_hash: digest_to_bytes(&pd.new_account_state_hash),
             output_coins_root: digest_to_bytes(&pd.output_coins_root),
             input_nullifiers_root: digest_to_bytes(&pd.input_nullifiers_root),
-            output_coin_ids: Vec::new(),
+            output_coin_ids: Self::output_coin_ids_from_pending(pending),
+            publisher_pubkey,
         }
     }
 
     pub fn to_result_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "new_account_state_hash": hex_lower(&self.new_account_state_hash),
             "output_coins_root": hex_lower(&self.output_coins_root),
             "input_nullifiers_root": hex_lower(&self.input_nullifiers_root),
@@ -484,7 +581,16 @@ impl FinaliseOutcome {
                 .iter()
                 .map(|id| hex_lower(id))
                 .collect::<Vec<_>>(),
-        })
+        });
+        if let Some(pk) = &self.publisher_pubkey {
+            obj.as_object_mut()
+                .expect("object")
+                .insert(
+                    "publisher_pubkey".to_string(),
+                    serde_json::Value::String(hex_lower(pk)),
+                );
+        }
+        obj
     }
 }
 
@@ -494,15 +600,44 @@ impl FinaliseOutcome {
 /// This is the **only** production path from a verified `/sign` body to
 /// a completed job under a v1.1 claim — the dispatcher must not mark the
 /// job completed with the signature material alone.
+///
+/// `publisher_pubkey` is the §7.5 optional result field (echo of the
+/// transition's external publisher target, when present).
 pub fn finalise_with_accepted_signature(
     engine: &mut zkcoins_prover::state_engine::StateEngine,
     pending: PendingTransition,
     signature: TransitionSignature,
+    publisher_pubkey: Option<[u8; 32]>,
 ) -> Result<FinaliseOutcome, String> {
+    // Capture output ids before finalise moves the pending.
+    let output_coin_ids = FinaliseOutcome::output_coin_ids_from_pending(&pending);
     let applied = engine
         .finalise(pending, signature)
         .map_err(|e| format!("StateEngine::finalise failed: {e:#}"))?;
-    Ok(FinaliseOutcome::from_applied(&applied))
+    let pd = &applied.proved.proof_data;
+    Ok(FinaliseOutcome {
+        new_account_state_hash: digest_to_bytes(&pd.new_account_state_hash),
+        output_coins_root: digest_to_bytes(&pd.output_coins_root),
+        input_nullifiers_root: digest_to_bytes(&pd.input_nullifiers_root),
+        output_coin_ids,
+        publisher_pubkey,
+    })
+}
+
+/// Optional `publisher_pubkey` from a job's original transition request
+/// body (§7.5 presence matrix). Hex-32, lowercase; malformed → absent
+/// (fail-closed: never invent a publisher).
+pub fn publisher_pubkey_from_request_body(request_body: &serde_json::Value) -> Option<[u8; 32]> {
+    let raw = request_body.get("publisher_pubkey")?.as_str()?;
+    if raw.len() != 64
+        || raw
+            .bytes()
+            .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let bytes = hex::decode(raw).ok()?;
+    <[u8; 32]>::try_from(bytes).ok()
 }
 
 /// Build the §7.5 `awaiting_signature` object from staged pending
@@ -568,13 +703,18 @@ pub fn select_awaiting_signature_result(
 /// Machine-code + HTTP status for a rejected `/sign` submission (§7.5 closed
 /// enumeration — **no invented codes**).
 ///
-/// | check | HTTP | `error` |
-/// |---|---|---|
-/// | Encoding | 400 | `malformed_request` (non-canonical hex / wrong width — §7.1 / §7.5) |
-/// | ShadowFlag | 409 | `wrong_phase` (route inactive under flag-off) |
-/// | S2cOpening | 409 | `stale_message` |
-/// | Bip340 / PkMatch / PendingEnvelope | 409 | `invalid_signature` |
-/// | LegacyCommitment | 409 | `wrong_phase` |
+/// | check | HTTP | `error` | §7.5 meaning |
+/// |---|---|---|---|
+/// | Encoding | 400 | `malformed_request` | body violates §7.1 hex/width |
+/// | ShadowFlag | 404 | `feature_disabled` | v1.1 sign surface inactive under flag-off |
+/// | S2cOpening | 409 | `stale_message` | S2C nonce does not open this job's H(ProofData) |
+/// | Bip340 / PkMatch / PendingEnvelope | 409 | `invalid_signature` | BIP-340 / envelope fail |
+/// | LegacyCommitment | 409 | `wrong_phase` | residual ash‖ocr on a v1.1 claim |
+///
+/// Not covered by `SignatureCheck` (handled at the route):
+/// - job status ≠ `awaiting_signature` → `wrong_phase` (409)
+/// - missing staged pending while status is correct → `internal_error` (500)
+/// - dispatcher notifier absent after accept → `internal_error` (500)
 pub fn sign_rejection(err: &TransitionSignatureError) -> (u16, &'static str) {
     match err.check {
         SignatureCheck::Encoding => (400, "malformed_request"),
@@ -582,8 +722,98 @@ pub fn sign_rejection(err: &TransitionSignatureError) -> (u16, &'static str) {
         SignatureCheck::Bip340
         | SignatureCheck::PkMatch
         | SignatureCheck::PendingEnvelope => (409, "invalid_signature"),
-        SignatureCheck::ShadowFlag | SignatureCheck::LegacyCommitment => (409, "wrong_phase"),
+        // Route inactive under this process claim — not a phase mismatch.
+        SignatureCheck::ShadowFlag => (404, "feature_disabled"),
+        // Residual legacy Commitment under a v1.1 claim: the job is on the
+        // wrong authorisation surface for this process (phase/protocol).
+        SignatureCheck::LegacyCommitment => (409, "wrong_phase"),
     }
+}
+
+/// Encode a terminal job `error` column as the §7.5 `{error, message}`
+/// object (JSON text). Prefer this over free-form strings so poll can
+/// surface the closed machine code without inventing one.
+pub fn encode_job_error(code: &str, message: impl Into<String>) -> String {
+    serde_json::json!({
+        "error": code,
+        "message": message.into(),
+    })
+    .to_string()
+}
+
+/// Decode a stored job error into the §7.5 poll `error` object.
+///
+/// Accepts the structured JSON produced by [`encode_job_error`]. Free-form
+/// legacy strings are mapped into the closed enumeration (never invented
+/// codes): default `proving_failed` for failed jobs, `internal_error` for
+/// cancelled / unclassifiable. Empty stored error still yields a body so
+/// the poll envelope never omits `error` on failed/cancelled.
+pub fn decode_job_error(raw: Option<&str>, status: crate::job_store::JobStatus) -> serde_json::Value {
+    if let Some(s) = raw {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+            if v.get("error").and_then(|e| e.as_str()).is_some() {
+                // Ensure message is present.
+                if v.get("message").is_none() {
+                    let mut obj = v;
+                    obj.as_object_mut()
+                        .expect("object")
+                        .insert(
+                            "message".to_string(),
+                            serde_json::Value::String(String::new()),
+                        );
+                    return obj;
+                }
+                return v;
+            }
+        }
+        let code = classify_stored_failure(s, status);
+        return serde_json::json!({ "error": code, "message": s });
+    }
+    let (code, message) = match status {
+        crate::job_store::JobStatus::Cancelled => ("internal_error", "cancelled"),
+        _ => ("proving_failed", "job failed"),
+    };
+    serde_json::json!({ "error": code, "message": message })
+}
+
+fn classify_stored_failure(msg: &str, status: crate::job_store::JobStatus) -> &'static str {
+    if matches!(status, crate::job_store::JobStatus::Cancelled) {
+        return "internal_error";
+    }
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("publish_rejected") || lower.contains("publisher rejected") {
+        return "publish_rejected";
+    }
+    if lower.contains("unknown_publisher") {
+        return "unknown_publisher";
+    }
+    if lower.contains("invalid_input_coin") {
+        return "invalid_input_coin";
+    }
+    if lower.contains("insufficient_balance") {
+        return "insufficient_balance";
+    }
+    if lower.contains("bounds_exceeded") {
+        return "bounds_exceeded";
+    }
+    if lower.contains("dependency_not_final") {
+        return "dependency_not_final";
+    }
+    if lower.contains("circuit_digest") {
+        return "circuit_digest_mismatch";
+    }
+    // awaiting_signature timeout, missing dispatcher, rehydrate refuse,
+    // and generic prove failures — §7.5 has no dedicated timeout code;
+    // witness/prove failures are proving_failed; pure lifecycle bugs
+    // that never reached prove use internal_error when so labelled.
+    if lower.contains("internal_error")
+        || lower.contains("no finalise driver")
+        || lower.contains("dispatcher")
+        || lower.contains("not_waiting")
+    {
+        return "internal_error";
+    }
+    "proving_failed"
 }
 
 /// True when the process claim is v1.1 (flag on and stack claimed).
@@ -1601,6 +1831,7 @@ mod tests {
     #[test]
     fn staged_sign_persist_round_trips_for_restart() {
         let (entry, submission) = test_fixtures::v5_mainnet_entry_and_submission();
+        assert!(entry.finalise_safe, "live-staged entry is finalise-safe");
         let persist = StagedSignPersist::from_entry(&entry);
         let json = serde_json::to_value(&persist).expect("encode");
         let body = serde_json::json!({ PENDING_SIGN_BODY_KEY: json });
@@ -1621,19 +1852,66 @@ mod tests {
             &submission,
         )
         .expect("rehydrated pending must still verify the wallet signature");
+        // But it is NOT finalise-safe: refuse rather than prove partial.
+        assert!(!rehydrated.finalise_safe);
+        ensure_finalise_ready(&rehydrated).expect_err("rehydrated must refuse finalise");
+    }
+
+    #[test]
+    fn rehydrated_transition_missing_finalise_material_is_refused() {
+        let (entry, _) = test_fixtures::v5_mainnet_entry_and_submission();
+        let persist = StagedSignPersist::from_entry(&entry);
+        let rehydrated = persist.into_entry().expect("into_entry");
+        // Empty witness vectors — not a full reconstruction.
+        assert!(rehydrated.pending.witness_wip.input_coins.is_empty());
+        assert!(rehydrated.pending.witness_wip.output_coins.is_empty());
+        assert!(rehydrated.pending.witness_wip.prev_proof.is_none());
+        let err = ensure_finalise_ready(&rehydrated).expect_err("must refuse");
+        assert!(
+            err.contains("verification-grade") || err.contains("partial"),
+            "err={err}"
+        );
+        // Live entry still passes.
+        ensure_finalise_ready(&entry).expect("live-staged must be finalise-ready");
     }
 
     #[test]
     fn finalise_outcome_from_pending_carries_proof_data_surface() {
         let (entry, _) = test_fixtures::v5_mainnet_entry_and_submission();
-        let outcome = FinaliseOutcome::from_pending_proof_data(&entry.pending);
+        let publisher = [0xABu8; 32];
+        let outcome = FinaliseOutcome::from_pending_proof_data_with_publisher(
+            &entry.pending,
+            Some(publisher),
+        );
         let result = outcome.to_result_json();
         assert!(result.get("new_account_state_hash").is_some());
         assert!(result.get("output_coins_root").is_some());
         assert!(result.get("input_nullifiers_root").is_some());
         assert!(result.get("output_coin_ids").is_some());
+        assert!(result["output_coin_ids"].is_array());
+        assert_eq!(
+            result["publisher_pubkey"].as_str().unwrap(),
+            hex::encode(publisher)
+        );
         // Must not look like the old short-circuit body.
         assert!(result.get("signature_accepted").is_none());
         assert!(result.get("sign").is_none());
+    }
+
+    #[test]
+    fn decode_job_error_never_omits_and_never_invents() {
+        use crate::job_store::JobStatus;
+        let structured = encode_job_error("publish_rejected", "publisher said no");
+        let v = decode_job_error(Some(&structured), JobStatus::Failed);
+        assert_eq!(v["error"], "publish_rejected");
+        assert_eq!(v["message"], "publisher said no");
+
+        let free = decode_job_error(Some("prove blew up"), JobStatus::Failed);
+        assert_eq!(free["error"], "proving_failed");
+        assert_eq!(free["message"], "prove blew up");
+
+        let cancelled = decode_job_error(None, JobStatus::Cancelled);
+        assert_eq!(cancelled["error"], "internal_error");
+        assert!(cancelled.get("message").is_some());
     }
 }

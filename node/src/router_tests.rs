@@ -3350,7 +3350,8 @@ mod jobs_endpoint_tests {
             .await
             .expect("awaiting_signature");
 
-        // /v1/.../sign refuses under flag-off.
+        // /v1/.../sign refuses under flag-off as feature_disabled (not
+        // wrong_phase — the job phase is fine; the surface is off).
         let sign_body = serde_json::json!({
             "signature": "00".repeat(64),
             "s2c_nonce": "11".repeat(32),
@@ -3360,9 +3361,9 @@ mod jobs_endpoint_tests {
             .body(Body::from(sign_body.to_string()))
             .unwrap();
         let (status, _h, resp) = run(state.clone(), req).await;
-        assert_eq!(status, StatusCode::CONFLICT, "body: {resp}");
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
-        assert_eq!(v["error"], "wrong_phase");
+        assert_eq!(v["error"], "feature_disabled");
         assert!(v.get("check").is_none());
 
         // Legacy GET /api/jobs still surfaces ash/ocr under `result`.
@@ -3631,6 +3632,235 @@ mod jobs_endpoint_tests {
         assert!(v.get("phase").is_none(), "phase absent when terminal: {body}");
         assert!(v["result"].get("new_account_state_hash").is_some());
         assert!(v["result"].get("signature_accepted").is_none());
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Defect 1: acceptance without a parked dispatcher is failure, not
+    /// success — no invented `dispatcher: "not_waiting"`.
+    #[tokio::test]
+    async fn jobs_sign_without_dispatcher_reports_failure_not_acceptance() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        };
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xC1u8; 32],
+                Some("k-no-disp"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (entry, submission) =
+            crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v11::awaiting_signature_result_json(&entry);
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        state.pending_sign_map.insert(job_id, entry);
+        // Deliberately NO job_notify_map entry — dispatcher not parked.
+
+        let body = serde_json::json!({
+            "signature": hex::encode(submission.signature),
+            "s2c_nonce": hex::encode(submission.s2c_nonce),
+        });
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "internal_error");
+        assert_ne!(v["status"], "signature_accepted");
+        assert!(v.get("dispatcher").is_none(), "no invented dispatcher field: {resp}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no dispatcher"),
+            "message should describe the lifecycle failure: {resp}"
+        );
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Defect 2: rehydrated (verification-grade) pending must not finalise.
+    #[tokio::test]
+    async fn rehydrated_pending_refuses_finalise() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, ensure_finalise_ready, set_process_stack_mode,
+            ScanStackMode, StagedSignPersist,
+        };
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let (entry, _) =
+            crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let rehydrated = StagedSignPersist::from_entry(&entry)
+            .into_entry()
+            .expect("rehydrate");
+        assert!(!rehydrated.finalise_safe);
+        ensure_finalise_ready(&rehydrated).expect_err("must refuse partial reconstruction");
+
+        // Live-staged still OK.
+        ensure_finalise_ready(&entry).expect("live-staged finalise-safe");
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Defect 4/5: success result carries output_coin_ids + publisher_pubkey.
+    #[tokio::test]
+    async fn completed_result_carries_output_coin_ids_and_publisher_pubkey() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, FinaliseOutcome,
+            ScanStackMode,
+        };
+        use shared::spec_v1::{digest_from_bytes, digest_to_bytes, Coin, ZERO_HASH};
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let (mut entry, _) =
+            crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        // Attach one synthetic output coin so the result is non-empty.
+        let coin_id = [0x42u8; 32];
+        entry.pending.witness_wip.output_coins.push(Coin {
+            identifier: digest_from_bytes(&coin_id).expect("digest"),
+            recipient: entry.pending.owner,
+            amount: 1,
+            asset_id: ZERO_HASH,
+        });
+
+        let publisher = [0xCCu8; 32];
+        let outcome = FinaliseOutcome::from_pending_proof_data_with_publisher(
+            &entry.pending,
+            Some(publisher),
+        );
+        let result_json = outcome.to_result_json();
+        assert_eq!(
+            result_json["output_coin_ids"].as_array().map(|a| a.len()),
+            Some(1),
+            "output_coin_ids: {result_json}"
+        );
+        assert_eq!(
+            result_json["output_coin_ids"][0].as_str().unwrap(),
+            hex::encode(digest_to_bytes(
+                &entry.pending.witness_wip.output_coins[0].identifier
+            ))
+        );
+        assert_eq!(
+            result_json["publisher_pubkey"].as_str().unwrap(),
+            hex::encode(publisher)
+        );
+
+        // Also surface via GET /v1/jobs poll envelope.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Mint,
+                &[0xC2u8; 32],
+                Some("k-result-fields"),
+                serde_json::json!({
+                    "publisher_pubkey": hex::encode(publisher),
+                }),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .complete(job_id, result_json, 200)
+            .await
+            .expect("complete");
+        let req = Request::get(format!("/v1/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "completed");
+        assert!(v["result"]["output_coin_ids"].is_array());
+        assert_eq!(
+            v["result"]["publisher_pubkey"].as_str().unwrap(),
+            hex::encode(publisher)
+        );
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Defect 5: malformed JSON and malformed UUID → 400 malformed_request.
+    #[tokio::test]
+    async fn v1_extractors_map_malformed_json_and_uuid_to_malformed_request() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        };
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+
+        // Malformed UUID in path.
+        let req = Request::post("/v1/jobs/not-a-uuid/sign")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "signature": "00".repeat(64),
+                    "s2c_nonce": "11".repeat(32),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "uuid body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+        assert!(v.get("message").is_some());
+
+        // Malformed JSON body on a well-formed UUID.
+        let id = uuid::Uuid::new_v4();
+        let req = Request::post(format!("/v1/jobs/{}/sign", id))
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "json body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+
+        // Wrong-type JSON (missing required fields / wrong types).
+        let req = Request::post(format!("/v1/jobs/{}/sign", id))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"signature": 123, "s2c_nonce": true}"#))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "type body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
 
         clear_process_stack_mode_for_test();
     }

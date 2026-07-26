@@ -599,6 +599,42 @@ async fn persist_pending_sign_on_job(
     Ok(())
 }
 
+/// Stale-envelope cleanup (Defect 3).
+///
+/// Runs when a job leaves `awaiting_signature` for a terminal (or
+/// post-sign) status: successful finalise, finalise failure, awaiting
+/// timeout, or legacy commit completion/failure. Strips
+/// `request_body.pending_sign` and drops the in-memory map entry so
+/// completed/failed rows do not accumulate restart envelopes.
+async fn cleanup_pending_sign(
+    job_store: &JobStore,
+    app_state: &AppState,
+    public_id: Uuid,
+) {
+    app_state.pending_sign_map.remove(&public_id);
+    let Ok(Some(job)) = job_store.load(public_id).await else {
+        return;
+    };
+    let mut body = job.request_body;
+    if !crate::v11::strip_pending_sign_from_body(&mut body) {
+        return;
+    }
+    if let Err(e) = sqlx::query(
+        "UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2",
+    )
+    .bind(&body)
+    .bind(public_id)
+    .execute(job_store.pool())
+    .await
+    {
+        tracing::warn!(
+            "Job dispatcher: failed to strip pending_sign for job {}: {}",
+            public_id,
+            e
+        );
+    }
+}
+
 /// Rehydrate `pending_sign_map` from the job row after a process restart.
 fn rehydrate_pending_sign_into_map(app_state: &AppState, public_id: Uuid, job: &Job) {
     if app_state.pending_sign_map.contains_key(&public_id) {
@@ -878,9 +914,12 @@ async fn wait_for_commit(
                 "Job dispatcher: send job {} timed out in awaiting_signature",
                 public_id
             );
-            job_store
-                .fail(public_id, "awaiting_signature timeout")
-                .await?;
+            // §7.5 has no dedicated timeout code → internal_error.
+            let err = crate::v11::encode_job_error(
+                "internal_error",
+                "awaiting_signature timeout",
+            );
+            job_store.fail(public_id, &err).await?;
             // Publish the terminal `failed` event BEFORE removing the
             // notify-map entry so an attached SSE stream receives the
             // final phase frame. The remove() runs after — once every
@@ -894,9 +933,10 @@ async fn wait_for_commit(
                     phase: "failed".to_string(),
                     proof_id: None,
                     result: None,
-                    error: Some("awaiting_signature timeout".to_string()),
+                    error: Some(err),
                 },
             );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
             notify_map.remove(&public_id);
             return Ok(());
         }
@@ -1026,6 +1066,7 @@ async fn wait_for_commit(
     // but no new SSE subscriber can attach after this point — the
     // `stream_job_handler` would see the terminal row on its
     // initial-state push and close immediately.
+    cleanup_pending_sign(job_store, app_state, public_id).await;
     notify_map.remove(&public_id);
 
     Ok(())
@@ -1036,10 +1077,11 @@ enum SignalOutcome {
     TimedOut,
 }
 
-/// Drive an accepted v1.1 signature into finalise (Defect 2).
+/// Drive an accepted v1.1 signature into finalise.
 ///
-/// Loads the staged [`PendingSignEntry`] (in-memory or rehydrated from
-/// `request_body.pending_sign`), reconstructs the verified
+/// Loads the staged [`PendingSignEntry`] (in-memory live entry preferred;
+/// rehydrated envelope only for diagnostics — finalise refuses unless
+/// [`crate::v11::ensure_finalise_ready`] passes), reconstructs the verified
 /// `TransitionSignature` from the persisted `sign` blob, invokes the
 /// `v11_finalise` hook (production: `StateEngine::finalise`; tests: spy),
 /// and completes the job with the §7.5 `result` shape — never with the
@@ -1052,78 +1094,17 @@ async fn drive_v11_finalise(
     job: &Job,
     sign_val: serde_json::Value,
 ) -> anyhow::Result<()> {
-    // Resolve staged pending: memory first, then persisted envelope.
-    let entry = match app_state.pending_sign_map.get(&public_id).map(|e| e.clone()) {
-        Some(e) => e,
-        None => match crate::v11::rehydrate_pending_sign(&job.request_body) {
-            Ok(Some(e)) => e,
-            Ok(None) => {
-                let msg = "v1.1 finalise: no staged PendingTransition for job \
-                           (pending_sign_map empty and no request_body.pending_sign)"
-                    .to_string();
-                job_store.fail(public_id, &msg).await?;
-                publish_phase(
-                    notify_map,
-                    public_id,
-                    JobPhaseEvent {
-                        status: JobStatus::Failed,
-                        phase: "failed".to_string(),
-                        proof_id: None,
-                        result: None,
-                        error: Some(msg),
-                    },
-                );
-                notify_map.remove(&public_id);
-                app_state.pending_sign_map.remove(&public_id);
-                return Ok(());
-            }
-            Err(e) => {
-                let msg = format!("v1.1 finalise: rehydrate pending_sign failed: {e}");
-                job_store.fail(public_id, &msg).await?;
-                publish_phase(
-                    notify_map,
-                    public_id,
-                    JobPhaseEvent {
-                        status: JobStatus::Failed,
-                        phase: "failed".to_string(),
-                        proof_id: None,
-                        result: None,
-                        error: Some(msg),
-                    },
-                );
-                notify_map.remove(&public_id);
-                return Ok(());
-            }
-        },
-    };
-
-    let signature = match parse_persisted_transition_signature(&sign_val) {
-        Ok(s) => s,
-        Err(msg) => {
-            job_store.fail(public_id, &msg).await?;
-            publish_phase(
-                notify_map,
-                public_id,
-                JobPhaseEvent {
-                    status: JobStatus::Failed,
-                    phase: "failed".to_string(),
-                    proof_id: None,
-                    result: None,
-                    error: Some(msg),
-                },
-            );
-            notify_map.remove(&public_id);
-            app_state.pending_sign_map.remove(&public_id);
-            return Ok(());
-        }
-    };
-
-    let Some(hook) = app_state.v11_finalise.as_ref() else {
-        let msg = "v1.1 finalise: no finalise driver configured on AppState \
-                   (wire EngineAdapter::finalise or a test hook; refusing to \
-                   complete with signature material alone)"
-            .to_string();
-        job_store.fail(public_id, &msg).await?;
+    // Helper: fail with a §7.5 machine code, clean envelopes, drop notify.
+    async fn fail_v11(
+        job_store: &JobStore,
+        app_state: &AppState,
+        notify_map: &JobNotifyMap,
+        public_id: Uuid,
+        code: &str,
+        message: String,
+    ) -> anyhow::Result<()> {
+        let err = crate::v11::encode_job_error(code, message.clone());
+        job_store.fail(public_id, &err).await?;
         publish_phase(
             notify_map,
             public_id,
@@ -1132,12 +1113,88 @@ async fn drive_v11_finalise(
                 phase: "failed".to_string(),
                 proof_id: None,
                 result: None,
-                error: Some(msg),
+                error: Some(err),
             },
         );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
         notify_map.remove(&public_id);
-        app_state.pending_sign_map.remove(&public_id);
-        return Ok(());
+        Ok(())
+    }
+
+    // Resolve staged pending: memory first, then persisted envelope.
+    let entry = match app_state.pending_sign_map.get(&public_id).map(|e| e.clone()) {
+        Some(e) => e,
+        None => match crate::v11::rehydrate_pending_sign(&job.request_body) {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                return fail_v11(
+                    job_store,
+                    app_state,
+                    notify_map,
+                    public_id,
+                    "internal_error",
+                    "v1.1 finalise: no staged PendingTransition for job \
+                     (pending_sign_map empty and no request_body.pending_sign)"
+                        .to_string(),
+                )
+                .await;
+            }
+            Err(e) => {
+                return fail_v11(
+                    job_store,
+                    app_state,
+                    notify_map,
+                    public_id,
+                    "internal_error",
+                    format!("v1.1 finalise: rehydrate pending_sign failed: {e}"),
+                )
+                .await;
+            }
+        },
+    };
+
+    // Defect 2: refuse finalise on a partial rehydration. Never prove
+    // from a verification-grade-only witness.
+    if let Err(msg) = crate::v11::ensure_finalise_ready(&entry) {
+        return fail_v11(
+            job_store,
+            app_state,
+            notify_map,
+            public_id,
+            "proving_failed",
+            msg,
+        )
+        .await;
+    }
+
+    let signature = match parse_persisted_transition_signature(&sign_val) {
+        Ok(s) => s,
+        Err(msg) => {
+            return fail_v11(
+                job_store,
+                app_state,
+                notify_map,
+                public_id,
+                "internal_error",
+                msg,
+            )
+            .await;
+        }
+    };
+
+    let Some(hook) = app_state.v11_finalise.as_ref() else {
+        return fail_v11(
+            job_store,
+            app_state,
+            notify_map,
+            public_id,
+            "internal_error",
+            "v1.1 finalise: no finalise driver configured on AppState \
+             (wire EngineAdapter::finalise or a test hook; refusing to \
+             complete with signature material alone)"
+                .to_string(),
+        )
+        .await;
     };
 
     job_store
@@ -1155,8 +1212,16 @@ async fn drive_v11_finalise(
         },
     );
 
+    let publisher_pubkey =
+        crate::v11::publisher_pubkey_from_request_body(&job.request_body);
+
     match hook(entry.pending, signature) {
-        Ok(outcome) => {
+        Ok(mut outcome) => {
+            // Hook may not have job context; fill §7.5 publisher_pubkey
+            // from the original transition request when present.
+            if outcome.publisher_pubkey.is_none() {
+                outcome.publisher_pubkey = publisher_pubkey;
+            }
             let response_body = outcome.to_result_json();
             job_store
                 .complete(public_id, response_body.clone(), 200)
@@ -1180,7 +1245,8 @@ async fn drive_v11_finalise(
         Err(e) => {
             let msg = format!("v1.1 finalise failed: {e}");
             tracing::warn!("Job dispatcher: job {} {}", public_id, msg);
-            job_store.fail(public_id, &msg).await?;
+            let err = crate::v11::encode_job_error("proving_failed", msg);
+            job_store.fail(public_id, &err).await?;
             publish_phase(
                 notify_map,
                 public_id,
@@ -1189,13 +1255,13 @@ async fn drive_v11_finalise(
                     phase: "failed".to_string(),
                     proof_id: None,
                     result: None,
-                    error: Some(msg),
+                    error: Some(err),
                 },
             );
         }
     }
 
-    app_state.pending_sign_map.remove(&public_id);
+    cleanup_pending_sign(job_store, app_state, public_id).await;
     notify_map.remove(&public_id);
     Ok(())
 }
