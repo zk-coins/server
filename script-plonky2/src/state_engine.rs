@@ -196,9 +196,19 @@ pub struct PendingTransition {
     pub nav_opening: NavOpening,
 }
 
-/// Result of [`StateEngine::prove_pending_transition`]: a proved witness
-/// ready for [`StateEngine::apply_proved_transition`]. Proving is pure
-/// (no engine mutation); apply is the state-critical section.
+/// Capability token: a pending transition that has been **proved**.
+///
+/// Fields are private. The sole production constructors are
+/// [`StateEngine::prove_pending_transition`] and
+/// [`StateEngine::prove_pending_transition_detached`]. Possession of this
+/// type is the proof a real prove ran — callers of
+/// [`StateEngine::apply_proved_transition`] (and node
+/// `commit_proved_receive`) cannot fabricate a hollow envelope.
+///
+/// A test-only hollow mint exists under `cfg(test)` / `feature = "test-utils"`
+/// so race tests can inject concurrent scan work between prove and apply
+/// without a multi-minute circuit. That constructor is unavailable in
+/// production builds.
 #[derive(Clone, Debug)]
 pub struct ProvedPendingTransition {
     pending: PendingTransition,
@@ -214,9 +224,9 @@ impl ProvedPendingTransition {
     /// — that is [`StateEngine::apply_proved_transition`]'s job after any
     /// concurrent scan work.
     ///
-    /// Used by unlocked prove and by tests that inject a concurrent fold
-    /// between prove and apply without running the multi-minute circuit.
-    pub fn from_parts(
+    /// **Private:** only the prove path in this module may mint the
+    /// capability. External crates cannot construct a hollow envelope.
+    fn from_parts(
         mut pending: PendingTransition,
         proved: ProvedTransition,
         signature: TransitionSignature,
@@ -240,6 +250,20 @@ impl ProvedPendingTransition {
             proved,
             signature,
         })
+    }
+
+    /// Test-only hollow mint for race / orchestration tests.
+    ///
+    /// Unavailable outside test builds: gated on this crate's `cfg(test)`
+    /// or the `test-utils` Cargo feature (dependents enable that feature
+    /// only via `[dev-dependencies]`, so production binaries never see it).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn from_parts_for_test(
+        pending: PendingTransition,
+        proved: ProvedTransition,
+        signature: TransitionSignature,
+    ) -> Result<Self> {
+        Self::from_parts(pending, proved, signature)
     }
 
     pub fn pending(&self) -> &PendingTransition {

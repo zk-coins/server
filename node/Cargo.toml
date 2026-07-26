@@ -69,8 +69,6 @@ esplora-bound = { path = "../esplora-bound" }
 # Process-wide scan-stack claim registry + legacy-publisher policy.
 # Shared with `esplora-bound` so the broadcast facade constructor and
 # node boot / publisher guards consult the same process claim.
-# Production builds intentionally omit `test-support` so
-# `clear_process_stack_mode_for_test` is not linked (monotonic claim).
 stack-policy = { path = "../stack-policy" }
 axum = { version = "0.7.9", features = ["json", "multipart"] }
 # `BodyExt::collect()` for the audit middleware's request/response
@@ -79,6 +77,11 @@ axum = { version = "0.7.9", features = ["json", "multipart"] }
 http-body-util = "0.1"
 anyhow = "1.0"
 zkcoins-prover = { path = "../script-plonky2/", package = "zkcoins-prover-plonky2" }
+# NOTE: hollow `ProvedPendingTransition` mint is feature-gated on
+# `zkcoins-prover/test-utils`. Production builds leave it off (this line).
+# Unit/integration tests enable it via the matching `[dev-dependencies]`
+# entry so race tests can stand in for a multi-minute prove without making
+# a hollow envelope constructible in production binaries.
 zkcoins-program = { path = "../program-plonky2/", package = "zkcoins-program-plonky2" }
 shared = { path = "../shared/" }
 # Direct dep for v1.1 receive host PI extraction (`PrimeField64`) and
@@ -260,14 +263,14 @@ fs2 = "0.4"
 # `[dependencies]` block above (where the `v4` + `serde` features
 # are already enabled), so no separate dev-dep entry is needed.
 # Compile-fail evidence that `esplora_client` is unobtainable from `node`
-# (Defect 4 / facade package boundary) and that the process-claim reset
-# is unreachable from a production `node` build.
+# (Defect 4 / facade package boundary).
 trybuild = "1.0"
-# Re-declare `stack-policy` with `test-support` so unit / integration
-# tests of this package get `clear_process_stack_mode_for_test` via
-# Cargo feature unification. Production `[dependencies]` above leave
-# the feature off — the clear symbol is absent from release binaries.
-stack-policy = { path = "../stack-policy", features = ["test-support"] }
+# Hollow proved-envelope mint for v1.1 receive race tests. Feature is
+# **not** enabled on the production `[dependencies]` line above — only
+# test builds of `node` unify this feature in (Cargo feature union for
+# deps listed under both sections). Production binaries never see
+# `ProvedPendingTransition::from_parts_for_test`.
+zkcoins-prover = { path = "../script-plonky2/", package = "zkcoins-prover-plonky2", features = ["test-utils"] }
 
 [features]
 # All non-MVP features are off by default. When a feature is not enabled, the

@@ -57,7 +57,8 @@
 //! [`EngineAdapter::lock_writes`] so a concurrent scanner restore cannot
 //! discard a receive that already committed (and vice versa). **Proving
 //! holds neither the write gate nor the live-engine mutex** (the pending
-//! witness carries everything the prover needs). Apply re-validates every
+//! witness carries everything the prover needs). The proved envelope is a
+//! **capability** (only the prove path mints it). Apply re-validates every
 //! **commit dependency** — live engine reads *and* caller-supplied values that
 //! reach durable state (account, tip/`size_final`, receiver NAV canonicity,
 //! creating anchors, CoinHist, own-Pk absence, plus `build_tip` against the
@@ -378,6 +379,14 @@ pub async fn finalise_publish_persist(
 /// → atomic persist → publish. Split out so tests can inject a concurrent
 /// scanner append between prove and apply without a multi-minute circuit.
 ///
+/// ## Proved envelope is a capability
+///
+/// `proved_pending` is a [`zkcoins_prover::state_engine::ProvedPendingTransition`]:
+/// fields private, sole production constructors are the prove path. Possession
+/// of the type is the proof a real prove ran — a hollow envelope cannot be
+/// assembled in production builds (test-only mint is feature-gated). The
+/// signature of this function stays open for race tests; safety is in the type.
+///
 /// ## Commit-dependency revalidation (extended derivation)
 ///
 /// Revalidation covers **everything the durable commit depends on**, not only
@@ -388,6 +397,7 @@ pub async fn finalise_publish_persist(
 /// | Commit dependency | Source | Re-check |
 /// |-------------------|--------|----------|
 /// | account / tip→`size_final` / NAV / anchors / CoinHist / own-Pk | live engine | [`StateEngine::apply_proved_transition`] |
+/// | proved envelope (proof + witness) | **capability** (prove path only) | possession is the proof |
 /// | `build_tip` (→ `BatchMember` + `v11_pending_publishes`) | **caller** | equals pre-apply snapshot `(tip_height, tip_hash)` |
 /// | commit `signature` (→ member `s` + `r_prime`) | **caller** | byte-equal to the proved envelope signature |
 /// | outcome `admitted_coin_ids` / `new_send_counter` | this transition | taken from the proved witness, not a post-gate live re-read |
@@ -2584,6 +2594,10 @@ mod tests {
     /// Hollow proved envelope: apply re-validates live state but does not
     /// Plonky2-verify. Lets race tests inject scanner work between prove and
     /// apply without a multi-minute circuit build.
+    ///
+    /// Uses the test-only mint (`from_parts_for_test`, feature `test-utils`).
+    /// Production code cannot call that constructor — possession of
+    /// [`ProvedPendingTransition`] outside tests requires a real prove.
     fn hollow_proved_pending(
         pending: PendingTransition,
         signature: TransitionSignature,
@@ -2594,7 +2608,7 @@ mod tests {
             consumed_pubkey: signature.pk_i,
             network_id: host::network_id_regtest(),
         };
-        zkcoins_prover::state_engine::ProvedPendingTransition::from_parts(
+        zkcoins_prover::state_engine::ProvedPendingTransition::from_parts_for_test(
             pending, proved, signature,
         )
     }
@@ -2869,6 +2883,102 @@ mod tests {
             // Receive still credited.
             assert!(engine.account(&owner).is_some());
         });
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Type-level: durable commit takes a [`ProvedPendingTransition`]
+    /// capability (not bare pending + proof parts). Hollow mint is
+    /// test-gated; production mint is the prove path (compile-fail UI).
+    #[test]
+    fn commit_proved_receive_takes_proved_envelope_capability_not_parts() {
+        use zkcoins_prover::state_engine::ProvedPendingTransition;
+        // Name the capability type that commit_proved_receive accepts.
+        // If the API is ever re-opened to free-floating parts, callers and
+        // this pin diverge; the trybuild UI test then still rejects from_parts.
+        fn _accepts_capability(_: ProvedPendingTransition) {}
+        let _ = _accepts_capability as fn(ProvedPendingTransition);
+    }
+
+    /// Altered commit `s` / `r_prime` must fail the byte-equality check
+    /// against the proved envelope **before** any durable write.
+    #[tokio::test]
+    async fn altered_commit_signature_rejected_without_durable_write() {
+        use crate::test_db::setup_pool;
+        use crate::v11::db_v11;
+        use crate::v11::separation::claim_stack_scan_mode;
+        use crate::v11::EngineAdapter;
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim");
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("adapter");
+
+        let (pending, signature, owner, current_pubkey) = seeded_receive_pending(&adapter)
+            .await
+            .expect("seed pending");
+        let proved = hollow_proved_pending(pending, signature.clone()).expect("hollow prove");
+        let publisher = RecordingPublisher::new();
+
+        // Flip the Schnorr `s` half of the 64-byte signature (bytes 32..64).
+        let mut bad_s = signature.clone();
+        bad_s.signature[32] ^= 0xFF;
+        let err = commit_proved_receive(
+            &adapter,
+            proved.clone(),
+            bad_s,
+            &publisher,
+            seeded_receive_build_tip(),
+        )
+        .await
+        .expect_err("altered s must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("commit signature") && msg.contains("proved envelope"),
+            "expected signature mismatch, got: {msg}"
+        );
+
+        // Flip r_prime while keeping s intact.
+        let mut bad_rp = signature.clone();
+        bad_rp.r_prime[0] ^= 0xFF;
+        let err = commit_proved_receive(
+            &adapter,
+            proved,
+            bad_rp,
+            &publisher,
+            seeded_receive_build_tip(),
+        )
+        .await
+        .expect_err("altered r_prime must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("commit signature") && msg.contains("proved envelope"),
+            "expected signature mismatch, got: {msg}"
+        );
+
+        // Nothing durable: no account credit, no pending publish, no broadcast.
+        adapter.with_engine(|engine| {
+            assert!(
+                engine.account(&owner).is_none(),
+                "failed signature check must not credit the account"
+            );
+        });
+        let pending_row = db_v11::load_pending_publish(&pool, current_pubkey)
+            .await
+            .expect("load pending");
+        assert!(
+            pending_row.is_none(),
+            "failed signature check must not write v11_pending_publishes"
+        );
+        assert_eq!(*publisher.commit_calls.lock().expect("lock"), 0);
+        assert_eq!(*publisher.reveal_calls.lock().expect("lock"), 0);
 
         clear_process_stack_mode_for_test();
     }
