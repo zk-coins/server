@@ -79,6 +79,10 @@ anyhow = "1.0"
 zkcoins-prover = { path = "../script-plonky2/", package = "zkcoins-prover-plonky2" }
 zkcoins-program = { path = "../program-plonky2/", package = "zkcoins-program-plonky2" }
 shared = { path = "../shared/" }
+# Direct dep for v1.1 receive host PI extraction (`PrimeField64`) and
+# hollow-proof test shells. Already transitive via program/shared; declared
+# so `node` does not rely on an undeclared transitive path.
+plonky2 = "1.1.0"
 # Bitcoind JSON-RPC (cookie auth). Used by the v1.1 exclusive scan loop
 # for boot tip reconciliation (persisted tip_hash vs live getblockhash)
 # so a restart across a reorg never forward-folds into a stale NfLog.
