@@ -26,14 +26,11 @@ plonky2 = "1.1.0"
 num = "0.4"
 sha2 = { workspace = true }
 # Compile-fail evidence that a hollow `ProvedPendingTransition` cannot be
-# minted outside the prove path / `test-utils` feature.
+# minted outside the prove path (no Cargo feature seam — only `cfg(test)`
+# in this crate, which dependency builds never set).
 trybuild = "1.0"
 
 [features]
-# Test-only APIs (hollow proved-envelope mint for race tests in dependents).
-# Dependents must enable this only via `[dev-dependencies]` so production
-# builds never see `ProvedPendingTransition::from_parts_for_test`.
-test-utils = []
 default = []
 
 [lints.rust]
