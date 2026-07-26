@@ -22,7 +22,7 @@
 //! accumulator or one database; see [`separation`].
 
 mod adapter;
-mod db_v11;
+pub mod db_v11;
 pub mod mode;
 pub mod publish;
 pub mod receive;
@@ -39,9 +39,10 @@ pub use publish::{
 };
 pub use receive::{
     execute_v11_receive, finalise_publish_persist, publish_applied_nullifier,
-    refuse_legacy_receive_under_v11, resume_pending_publish, verify_and_begin_receive,
-    verify_clause10_slot, verify_creating_nullifier_binding, NullifierBatchPublisher,
-    ReceivedCoinSlot, V11ReceiveOutcome, V11ReceiveRequest, LEGACY_RECEIVE_REFUSED_UNDER_V11,
+    refuse_legacy_receive_under_v11, resume_all_pending_publishes, resume_pending_publish,
+    verify_and_begin_receive, verify_clause10_slot, verify_creating_nullifier_binding,
+    NullifierBatchPublisher, ReceivedCoinSlot, V11ReceiveOutcome, V11ReceiveRequest,
+    LEGACY_RECEIVE_REFUSED_UNDER_V11,
 };
 pub use scan::{
     apply_canonical_survivors, apply_forward_scan, first_boot_requires_full_replace,

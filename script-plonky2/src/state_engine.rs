@@ -25,7 +25,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use anyhow::{bail, ensure, Context, Result};
 use shared::spec_v1::{
     self as host, AccountState, Address, ChainPosition, Coin, CoinHistTree, CoinTemplate,
-    FoldOutcome, HashDigest, LookupResult, Nav, NfLogAccumulator, NfLogEntry, ProofData, TreeKind,
+    FoldOutcome, HashDigest, LookupResult, Nav, NfLogAccumulator, NfLogEntry, ProofData,
+    PublishedNullifier, TreeKind,
 };
 use zkcoins_program_plonky2::circuit::compliance::{
     Network, MAX_ACCOUNT_ASSETS, MAX_RX_COINS, MAX_TX_INPUTS, MAX_TX_OUTPUTS,
@@ -36,6 +37,52 @@ use crate::prover_bridge::{
     PredecessorNullifier, ProvedTransition, ProverBridge, ReceivedAuthorization, TransitionMode,
     TransitionSignature, TransitionWitness,
 };
+
+// ---------------------------------------------------------------------------
+// Scanner-only NfLog append capability
+// ---------------------------------------------------------------------------
+
+/// Capability token proving a nullifier was observed on the scan path.
+///
+/// Fields are private. The sole production constructor is
+/// [`ScannedNullifier::from_survivor`], which takes a
+/// [`PublishedNullifier`] emitted by the scanner (or by the node-side
+/// fold of scanner survivors). A free-floating [`ChainPosition`] cannot
+/// reach [`StateEngine::append_nullifier`] — possession of this type is
+/// the proof the position came through the scan path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScannedNullifier {
+    chain_pos: ChainPosition,
+    pk: [u8; 32],
+    r: [u8; 32],
+}
+
+impl ScannedNullifier {
+    /// Mint a scan-path capability from a survivor observed on chain.
+    ///
+    /// This is the only production constructor. Callers outside the scan
+    /// fold must not invent positions; they hold a survivor the scanner
+    /// (or `members_to_published` of a scanned inscription) produced.
+    pub fn from_survivor(nf: &PublishedNullifier) -> Self {
+        Self {
+            chain_pos: nf.chain_pos,
+            pk: nf.pk,
+            r: nf.r,
+        }
+    }
+
+    pub fn chain_pos(self) -> ChainPosition {
+        self.chain_pos
+    }
+
+    pub fn pk(self) -> [u8; 32] {
+        self.pk
+    }
+
+    pub fn r(self) -> [u8; 32] {
+        self.r
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Request types (wallet → engine)
@@ -147,6 +194,16 @@ pub struct PendingTransition {
     pub owner: Address,
     /// NAV opening used for this transition (stored on apply).
     pub nav_opening: NavOpening,
+}
+
+/// Result of [`StateEngine::prove_pending_transition`]: a proved witness
+/// ready for [`StateEngine::apply_proved_transition`]. Proving is pure
+/// (no engine mutation); apply is the state-critical section.
+#[derive(Clone, Debug)]
+pub struct ProvedPendingTransition {
+    pending: PendingTransition,
+    proved: ProvedTransition,
+    signature: TransitionSignature,
 }
 
 /// Phase-2 output after a successful prove + atomic state apply.
@@ -303,18 +360,20 @@ impl StateEngine {
         Ok(engine)
     }
 
-    /// Append a published nullifier at a known chain position (scanner / tests).
+    /// Append a nullifier that was **observed by the scan path**.
     ///
-    /// Updates the live accumulator and its entry/position mirrors together.
-    /// Fails loud on out-of-order positions, pre-activation folds, and
-    /// first-occurrence duplicates (does not silently ignore duplicates —
-    /// the scanner is expected to classify those before calling this).
-    pub fn append_nullifier(
-        &mut self,
-        chain_pos: ChainPosition,
-        pk: [u8; 32],
-        r: [u8; 32],
-    ) -> Result<u64> {
+    /// Requires a [`ScannedNullifier`] capability token — a bare
+    /// [`ChainPosition`] is not accepted. Possession of the token is proof
+    /// the position came from a scanner-emitted survivor (or an explicit
+    /// test mint of that survivor type). Updates the live accumulator and
+    /// its entry/position mirrors together. Fails loud on out-of-order
+    /// positions, pre-activation folds, and first-occurrence duplicates
+    /// (does not silently ignore duplicates — the scanner is expected to
+    /// classify those before calling this).
+    pub fn append_nullifier(&mut self, scanned: ScannedNullifier) -> Result<u64> {
+        let chain_pos = scanned.chain_pos;
+        let pk = scanned.pk;
+        let r = scanned.r;
         let expected_pos = self.nflog_entries.len() as u64;
         match self
             .nflog
@@ -1012,7 +1071,8 @@ impl StateEngine {
         pending: PendingTransition,
         signature: TransitionSignature,
     ) -> Result<AppliedTransition> {
-        self.finalise_deferred_own_nullifier(pending, signature)
+        let proved = self.prove_pending_transition(pending, signature)?;
+        self.apply_proved_transition(proved)
     }
 
     /// Prove + apply account/CoinHist **without** folding the own nullifier
@@ -1026,16 +1086,21 @@ impl StateEngine {
         pending: PendingTransition,
         signature: TransitionSignature,
     ) -> Result<AppliedTransition> {
-        self.finalise_deferred_own_nullifier(pending, signature)
+        let proved = self.prove_pending_transition(pending, signature)?;
+        self.apply_proved_transition(proved)
     }
 
-    fn finalise_deferred_own_nullifier(
-        &mut self,
+    /// Phase 2a: prove only. **Does not mutate** the engine.
+    ///
+    /// Callers that must not hold a write gate across multi-minute proving
+    /// use this, then [`Self::apply_proved_transition`] under the gate.
+    /// Apply re-validates the envelope against current engine state so a
+    /// concurrent scanner fold during prove fails loud if it collides.
+    pub fn prove_pending_transition(
+        &self,
         mut pending: PendingTransition,
         signature: TransitionSignature,
-    ) -> Result<AppliedTransition> {
-        // Bind the mutable phase-1 envelope back to the witness before any
-        // expensive proving or state staging.
+    ) -> Result<ProvedPendingTransition> {
         self.validate_pending_envelope(&pending)?;
         ensure!(
             signature.pk_i == pending.witness_wip.prev_account_state.current_pubkey,
@@ -1047,25 +1112,59 @@ impl StateEngine {
             "pending proof_data_hash does not match proof_data"
         );
 
-        pending.witness_wip.transition_signature = signature;
-        let witness = pending.witness_wip;
-
-        // Prove first — no state mutation yet.
+        pending.witness_wip.transition_signature = signature.clone();
         let proved = self
             .bridge
-            .prove_transition(&witness)
-            .context("finalise: prove_transition failed (state unchanged)")?;
+            .prove_transition(&pending.witness_wip)
+            .context("prove_pending_transition: prove_transition failed (state unchanged)")?;
         ensure!(
             proved.proof_data == pending.proof_data,
             "proved ProofData differs from pending ProofData"
         );
+        Ok(ProvedPendingTransition {
+            pending,
+            proved,
+            signature,
+        })
+    }
 
-        let pk_i = witness.transition_signature.pk_i;
-        let r = witness.transition_signature.signature_r();
+    /// Phase 2b: apply a previously proved pending transition.
+    ///
+    /// Mutates account/CoinHist only — never the canonical NfLog.
+    /// Re-validates the envelope so prove-outside-gate remains safe.
+    pub fn apply_proved_transition(
+        &mut self,
+        proved_pending: ProvedPendingTransition,
+    ) -> Result<AppliedTransition> {
+        let ProvedPendingTransition {
+            pending,
+            proved,
+            signature,
+        } = proved_pending;
+        // Re-check after any concurrent scan work that ran during prove.
+        self.validate_pending_envelope(&pending)?;
+        ensure!(
+            signature.pk_i == pending.witness_wip.prev_account_state.current_pubkey,
+            "apply: signature pk_i does not equal prev_account_state.current_pubkey"
+        );
+        ensure!(
+            proved.proof_data == pending.proof_data,
+            "apply: proved ProofData differs from pending ProofData"
+        );
+        ensure!(
+            pending.witness_wip.transition_signature.pk_i == signature.pk_i
+                && pending.witness_wip.transition_signature.signature == signature.signature
+                && pending.witness_wip.transition_signature.r_prime == signature.r_prime,
+            "apply: pending witness signature does not match proved envelope"
+        );
+
+        let witness = &pending.witness_wip;
+        let pk_i = signature.pk_i;
+        let r = signature.signature_r();
         let nullifier_opening = NullifierOpening {
             public_key: pk_i,
             signature_r: r,
-            r_prime: witness.transition_signature.r_prime,
+            r_prime: signature.r_prime,
         };
 
         // Apply atomically: if anything below fails after prove, we still
@@ -1611,6 +1710,7 @@ mod tests {
     use crate::prover_bridge::test_signing::{
         base_proved_transition, deterministic_secret, normalized_key, sign_transition,
     };
+    use crate::prover_bridge::{OutputInclusionProof, ReceivedAuthorization};
     use plonky2::field::secp256k1_scalar::Secp256K1Scalar;
     use sha2::{Digest, Sha256};
     use zkcoins_program_plonky2::circuit::gadgets::curve_types::{AffinePoint, Secp256K1};
@@ -2476,14 +2576,18 @@ mod tests {
 
         // Scanner places the nullifier at a real chain position (not tip/fold_seq).
         // Must be strictly after the genesis fold at height 100.
-        let chain_pos = ChainPosition {
-            height: 110,
-            tx_index: 3,
-            vin_index: 0,
-            member_index: 0,
-        };
+        let scanned = ScannedNullifier::from_survivor(&PublishedNullifier {
+            chain_pos: ChainPosition {
+                height: 110,
+                tx_index: 3,
+                vin_index: 0,
+                member_index: 0,
+            },
+            pk: applied.nullifier.0,
+            r: applied.nullifier.1,
+        });
         let pos = engine
-            .append_nullifier(chain_pos, applied.nullifier.0, applied.nullifier.1)
+            .append_nullifier(scanned)
             .expect("scan-fold send nullifier");
         assert_eq!(pos, 1);
         assert_eq!(engine.nflog.nav().size, 2);
@@ -2505,5 +2609,212 @@ mod tests {
                 },
             )
             .expect("verify_incoming_transition on applied send");
+    }
+
+    /// End-to-end RECEIVE through the engine with a **genuine creating proof**.
+    ///
+    /// Reuses [`build_funded_fixture`] (real genesis/mint prove) + a real send
+    /// prove to Bob, then Bob's receive prove via `begin_receive` + `finalise`.
+    /// Asserts:
+    /// - receive finalise credits Bob's CoinHist / balance;
+    /// - the canonical NfLog is **not** grown by receive finalise;
+    /// - `last_nullifier_pos` stays `None` until a scan-path
+    ///   [`ScannedNullifier`] append.
+    ///
+    /// Marked `#[ignore]`: three real Plonky2 proves (mint + send + receive).
+    #[test]
+    #[ignore = "heavy: real Plonky2 prove for mint+send+receive (minutes); run with --ignored --release"]
+    fn state_engine_receive_end_to_end_with_genuine_creating_proof() {
+        let bridge = ProverBridge::new(Network::Testnet);
+        let fixture = build_funded_fixture(&bridge);
+        let mut engine = engine_with_funded_account(&fixture);
+
+        // Bob's keys (distinct from Alice).
+        let bob_nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/receive-e2e/bob-nk").into();
+        let (bob_secret0, bob_public0, bob_pk0) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/receive-e2e/bob-sk0",
+        ));
+        let (_, _, bob_pk1) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/receive-e2e/bob-sk1",
+        ));
+        let bob_owner = Address(host::address(&bob_pk0, host::nk_commit(&bob_nk)));
+
+        // Alice sends 30 to Bob (genuine recursive prove).
+        let pending_send = engine
+            .begin_send(SendRequest {
+                owner: fixture.owner,
+                input_coin_ids: vec![fixture.input_coin.identifier],
+                output_templates: vec![CoinTemplate {
+                    recipient: bob_owner,
+                    amount: 30,
+                    asset_id: fixture.asset_id,
+                }],
+                next_pubkey: fixture.next_pubkey,
+                nav_rand: [0x3cu8; 32],
+                npk_rand: [0xa5u8; 32],
+            })
+            .expect("begin_send to Bob");
+        let bob_coin = pending_send
+            .witness_wip
+            .output_coins
+            .iter()
+            .find(|c| c.recipient == bob_owner)
+            .cloned()
+            .expect("Bob's coin in send outputs");
+        let bob_coin_index = pending_send
+            .witness_wip
+            .output_coins
+            .iter()
+            .position(|c| c.recipient == bob_owner)
+            .expect("index") as u32;
+        let send_creating_prev_ash =
+            host::account_state_hash(&pending_send.witness_wip.prev_account_state).unwrap();
+        let send_nav_opening = pending_send.nav_opening;
+        let send_sig = sign_transition(
+            fixture.spend_secret,
+            fixture.spend_public,
+            &pending_send.proof_data,
+            Network::Testnet,
+        );
+        let nflog_before_send = engine.nflog.nav().size;
+        let applied_send = engine
+            .finalise(pending_send, send_sig.transition.clone())
+            .expect("finalise send to Bob");
+        assert_eq!(
+            engine.nflog.nav().size,
+            nflog_before_send,
+            "send finalise must not grow NfLog"
+        );
+
+        // Scanner folds Alice's send nullifier so Bob's clause-10 can open it.
+        let send_scanned = ScannedNullifier::from_survivor(&PublishedNullifier {
+            chain_pos: ChainPosition {
+                height: 110,
+                tx_index: 1,
+                vin_index: 0,
+                member_index: 0,
+            },
+            pk: applied_send.nullifier.0,
+            r: applied_send.nullifier.1,
+        });
+        let send_pos = engine
+            .append_nullifier(send_scanned)
+            .expect("scan-fold send nullifier");
+        engine.set_tip_height(120); // past finality for send height 110
+
+        // Output inclusion of Bob's coin in the send's output tree (2 leaves).
+        let alice_change_id = {
+            let rec = engine.account(&fixture.owner).expect("alice");
+            rec.spendable
+                .values()
+                .next()
+                .expect("change")
+                .coin
+                .identifier
+        };
+        // Order matches begin_send: recipient templates first, then change.
+        let all_output_ids = vec![bob_coin.identifier, alice_change_id];
+        let ocr = host::merkle_root(TreeKind::CoinsRoot, &all_output_ids);
+        assert_eq!(ocr, applied_send.proved.proof_data.output_coins_root);
+        let sibling = host::leaf_hash(TreeKind::CoinsRoot, all_output_ids[1]);
+        let output_inclusion = OutputInclusionProof {
+            leaf_index: bob_coin_index,
+            depth: 1,
+            siblings: vec![sibling],
+        };
+
+        // Receiver nav = size_final covering genesis + send.
+        let size_final = engine.nflog.size_final(engine.tip_height());
+        assert!(size_final >= 2);
+        let creating_nav_inclusion =
+            host::inclusion_path(send_pos, &engine.nflog_entries).expect("inclusion");
+        let creating_nav_consistency =
+            host::consistency_proof(send_nav_opening.nav.size, &engine.nflog_entries)
+                .expect("consistency");
+
+        let received_auth = ReceivedAuthorization {
+            creating_proof: applied_send.proved.proof.clone(),
+            output_inclusion,
+            creating_prev_ash: send_creating_prev_ash,
+            creating_nullifier: NullifierOpening {
+                public_key: applied_send.nullifier.0,
+                signature_r: applied_send.nullifier.1,
+                r_prime: send_sig.transition.r_prime,
+            },
+            creating_nav_inclusion,
+            pos_create: send_pos,
+            creating_nav_opening: send_nav_opening,
+            creating_nav_consistency,
+            history_proof: host::CoinHistTree::new().prove([0u8; 32]),
+        };
+
+        let pending_rx = engine
+            .begin_receive(ReceiveRequest {
+                owner: bob_owner,
+                nk: bob_nk,
+                current_pubkey: bob_pk0,
+                received_coins: vec![bob_coin.clone()],
+                received_auth: vec![received_auth],
+                next_pubkey: bob_pk1,
+                nav_rand: [0x41u8; 32],
+                npk_rand: [0x42u8; 32],
+            })
+            .expect("begin_receive Bob");
+        assert_eq!(pending_rx.mode, TransitionMode::InitialProof);
+        assert_eq!(pending_rx.nav_opening.nav.size, size_final);
+
+        let bob_sig = sign_transition(
+            bob_secret0,
+            bob_public0,
+            &pending_rx.proof_data,
+            Network::Testnet,
+        );
+        let nflog_before_rx = engine.nflog.nav().size;
+        let applied_rx = engine
+            .finalise(pending_rx, bob_sig.transition)
+            .expect("finalise receive with genuine creating proof");
+
+        // Assertions requested by the fix brief.
+        assert_eq!(
+            engine.nflog.nav().size,
+            nflog_before_rx,
+            "receive finalise must not grow the canonical NfLog"
+        );
+        let bob = engine.account(&bob_owner).expect("Bob account");
+        assert_eq!(bob.state.send_counter, 1);
+        assert_eq!(bob.state.current_pubkey, bob_pk1);
+        assert_eq!(
+            bob.state
+                .balances
+                .get(&host::digest_to_bytes(&fixture.asset_id)),
+            Some(&30)
+        );
+        assert!(bob.last_nullifier.is_some());
+        assert!(
+            bob.last_nullifier_pos.is_none(),
+            "last_nullifier_pos stays None until scan-fold"
+        );
+        assert_eq!(applied_rx.nullifier.0, bob_pk0);
+        assert!(matches!(
+            engine.nflog.lookup(bob_pk0),
+            LookupResult::Absent
+        ));
+
+        // Scanner places Bob's receive nullifier at a real chain position.
+        let rx_scanned = ScannedNullifier::from_survivor(&PublishedNullifier {
+            chain_pos: ChainPosition {
+                height: 115,
+                tx_index: 0,
+                vin_index: 0,
+                member_index: 0,
+            },
+            pk: applied_rx.nullifier.0,
+            r: applied_rx.nullifier.1,
+        });
+        let rx_pos = engine
+            .append_nullifier(rx_scanned)
+            .expect("scan-fold receive nullifier");
+        assert_eq!(rx_pos, nflog_before_rx);
+        assert_eq!(engine.nflog.nav().size, nflog_before_rx + 1);
     }
 }

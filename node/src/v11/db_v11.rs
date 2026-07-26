@@ -525,6 +525,60 @@ pub async fn persist_engine_snapshot(pool: &PgPool, snap: &EngineSnapshot) -> Re
     Ok(())
 }
 
+/// Atomically persist the engine snapshot **and** a `members_ready` rebroadcast
+/// intent in one transaction.
+///
+/// Closes the crash window where the account is advanced on disk but the
+/// Schnorr `s` / BatchMember fields are not yet durable — that row was
+/// previously unrecoverable. Either both land or neither does.
+pub async fn persist_engine_with_pending_members_ready(
+    pool: &PgPool,
+    snap: &EngineSnapshot,
+    owner: Address,
+    pk: [u8; 32],
+    r: [u8; 32],
+    s: [u8; 32],
+    r_prime: [u8; 32],
+    build_tip_height: u32,
+    build_tip_hash: [u8; 32],
+) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin engine+members_ready persist tx")?;
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+        .await
+        .context("engine+members_ready persist: stack_scan_mode capability check")?;
+    clear_all(&mut tx).await?;
+    write_all(&mut tx, snap).await?;
+    sqlx::query(
+        "INSERT INTO v11_pending_publishes \
+         (pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
+          commit_tx, reveal_tx, commit_txid, reveal_txid, status, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, NULL, $8, NOW(), NOW())",
+    )
+    .bind(pk.as_slice())
+    .bind(owner.0.as_slice())
+    .bind(r.as_slice())
+    .bind(s.as_slice())
+    .bind(r_prime.as_slice())
+    .bind(i64::from(build_tip_height))
+    .bind(build_tip_hash.as_slice())
+    .bind(PENDING_PUBLISH_MEMBERS_READY)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| {
+        format!(
+            "insert v11_pending_publishes members_ready (atomic with engine) pk={}",
+            hex::encode(pk)
+        )
+    })?;
+    tx.commit()
+        .await
+        .context("commit engine+members_ready persist tx")?;
+    Ok(())
+}
+
 async fn clear_all(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     // Children first (FK), then parents, then meta.
     sqlx::query("DELETE FROM v11_spendable_coins")
@@ -886,7 +940,6 @@ pub async fn load_pending_publish(pool: &PgPool, pk: [u8; 32]) -> Result<Option<
 }
 
 /// Rows that still need rebroadcast work on boot (`status` not terminal).
-#[allow(dead_code)] // used by boot-time resumer wiring (Stage-3 entry)
 pub async fn list_resumable_pending_publishes(pool: &PgPool) -> Result<Vec<PendingPublishRow>> {
     let rows = sqlx::query(
         "SELECT pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
