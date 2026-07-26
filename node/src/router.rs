@@ -2145,6 +2145,20 @@ pub(crate) async fn jobs_commit_handler(
     Path(id): Path<Uuid>,
     Json(commit_request): Json<CommitRequest>,
 ) -> axum::response::Response {
+    // Gap G4: under a v1.1 process claim the residual ash‖ocr
+    // CommitRequest is the wrong signing protocol. Refuse before
+    // persisting or waking the dispatcher so a v1.1 boot cannot
+    // finalise via the legacy commit route.
+    if let Err(e) = crate::v11::refuse_legacy_commitment_under_v11() {
+        return (
+            StatusCode::CONFLICT,
+            Json(JobErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
+
     let job = match state.job_store.load(id).await {
         Ok(Some(j)) => j,
         Ok(None) => {
