@@ -19,3 +19,9 @@ fn applied_transition_struct_literal_is_unobtainable_by_compilation() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/applied_transition_unobtainable.rs");
 }
+
+#[test]
+fn receive_request_nav_rand_is_unobtainable_by_compilation() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/receive_request_nav_rand_unobtainable.rs");
+}

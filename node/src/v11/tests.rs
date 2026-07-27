@@ -147,6 +147,7 @@ fn seeded_engine() -> StateEngine {
         state,
         coinhist: hist,
         nk: pk(0xD1),
+        op_secret: Some(zkcoins_prover::state_engine::OpSecret(pk(0xD2))),
         genesis_pubkey: pk(0xB0),
         spendable,
         spent_ids,

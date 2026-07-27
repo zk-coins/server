@@ -2,7 +2,9 @@
 //!
 //! Poseidon (`Hc`) call sites follow the §1.7.3 encoding classification table
 //! exactly. SHA-256 sites use plain byte concatenation — no `E(·)`.
+//! HKDF sites use the §1.1 mapping (salt = 0x00×32, info = tag, L = 32).
 
+use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 
 use super::datastructures::AccountState;
@@ -11,7 +13,7 @@ use super::error::SpecError;
 use super::tags::{
     NETWORK_TAG_MAINNET, NETWORK_TAG_REGTEST, NETWORK_TAG_TESTNET, TAG_ACCOUNT_STATE, TAG_ASSET_ID,
     TAG_ASSET_ID_V2, TAG_COIN, TAG_DETECT_TAG, TAG_ISSUANCE_TERMS, TAG_ISSUANCE_TERMS_V2,
-    TAG_NAV_COMMIT, TAG_NETWORK, TAG_NK_COMMIT, TAG_NPK_COMMIT, TAG_NULLIFIER,
+    TAG_NAV_COMMIT, TAG_NAV_RAND, TAG_NETWORK, TAG_NK_COMMIT, TAG_NPK_COMMIT, TAG_NULLIFIER,
 };
 use zkcoins_program::hash::HashDigest;
 
@@ -176,6 +178,30 @@ pub fn nav_commitment(nav_root: HashDigest, nav_rand: &[u8; 32]) -> HashDigest {
     .expect("fixed-size inputs")
 }
 
+/// §1.1 / §1.4 HKDF-SHA-256 mapping:
+/// `HKDF(tag, material) = HKDF-Expand(HKDF-Extract(salt = 0x00×32, IKM = material), info = tag, L = 32)`.
+pub fn hkdf_sha256(tag: &str, material: &[u8]) -> [u8; 32] {
+    let salt = [0u8; 32];
+    let hk = Hkdf::<Sha256>::new(Some(&salt), material);
+    let mut okm = [0u8; 32];
+    hk.expand(tag.as_bytes(), &mut okm)
+        .expect("HKDF-Expand L=32 is always valid for SHA-256");
+    okm
+}
+
+/// `nav_rand = HKDF("zkCoins/v1/NavRand", op_secret ‖ u64-be(send_counter))` (§1.4).
+///
+/// Deterministic per operational bundle and entry `send_counter`. **MUST NOT**
+/// be derived from `nav`. Callers supply neither the output nor an independent
+/// counter — both come from the account's `op_secret` and the transition being
+/// built.
+pub fn derive_nav_rand(op_secret: &[u8; 32], send_counter: u64) -> [u8; 32] {
+    let mut material = [0u8; 40];
+    material[..32].copy_from_slice(op_secret);
+    material[32..].copy_from_slice(&send_counter.to_be_bytes());
+    hkdf_sha256(TAG_NAV_RAND, &material)
+}
+
 /// `detect_tag = Hc("DetectTag", ByteString(ss), ByteString(epk))` (§1.3).
 ///
 /// Per §1.7.2, `‖` inside an `Hc` call site separates the input list — each of
@@ -300,6 +326,23 @@ mod tests {
             hex::encode(sha256_label("zkCoins/v1/test-vector/nav_rand")),
             "e3b0e624bff8dbe486dd0761c14dcb84b4ccaf026fc60c58b69d653e6f656560"
         );
+    }
+
+    #[test]
+    fn derive_nav_rand_is_deterministic_and_counter_sensitive() {
+        let op_secret = sha256_label("zkCoins/v1/test-vector/op_secret");
+        let a = derive_nav_rand(&op_secret, 0);
+        let b = derive_nav_rand(&op_secret, 0);
+        let c = derive_nav_rand(&op_secret, 1);
+        assert_eq!(a, b, "same (op_secret, send_counter) must reproduce nav_rand");
+        assert_ne!(a, c, "different send_counter must yield different nav_rand");
+        // Wrong counter material (little-endian) must not match for a
+        // multi-byte counter where BE ≠ LE (counter 0 is identical in both).
+        let be = derive_nav_rand(&op_secret, 1);
+        let mut le_material = [0u8; 40];
+        le_material[..32].copy_from_slice(&op_secret);
+        le_material[32..].copy_from_slice(&1u64.to_le_bytes());
+        assert_ne!(be, hkdf_sha256(TAG_NAV_RAND, &le_material));
     }
 
     #[test]

@@ -1,0 +1,11 @@
+error[E0560]: struct `ReceiveRequest` has no field named `nav_rand`
+  --> tests/ui/receive_request_nav_rand_unobtainable.rs:18:9
+   |
+18 |         nav_rand: [0u8; 32],
+   |         ^^^^^^^^ `ReceiveRequest` does not have this field
+   |
+   = note: available fields are: `owner`, `nk`, `op_secret`, `current_pubkey`, `received_coins` ... and 3 others
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0560`.

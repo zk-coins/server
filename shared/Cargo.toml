@@ -16,6 +16,7 @@ zkcoins-program = { path = "../program-plonky2/", package = "zkcoins-program-plo
 lazy_static = { workspace = true }
 bitcoin = { workspace = true }
 sha2 = { workspace = true }
+hkdf = "0.12"
 serde = { workspace = true }
 bincode = { workspace = true }
 hex = "0.4.3"

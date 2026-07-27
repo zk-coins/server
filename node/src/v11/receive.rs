@@ -180,14 +180,19 @@ impl ReceivedCoinSlot {
 ///
 /// `slots` must be non-empty and at most [`MAX_RX_COINS`]. Each slot carries
 /// its own clause-10 binding; there is no way to pass a bare `Coin`.
+///
+/// `nav_rand` is **not** a request field: the engine derives it from
+/// `op_secret` and the entry `send_counter` of the pending transition (§1.4).
+/// A caller-supplied value is unrepresentable on this type.
 #[derive(Clone, Debug)]
 pub struct V11ReceiveRequest {
     pub owner: Address,
     pub nk: [u8; 32],
+    /// Nav-rand secret (A/4'; operational bundle). Debug-redacted.
+    pub op_secret: zkcoins_prover::state_engine::OpSecret,
     pub current_pubkey: [u8; 32],
     pub slots: Vec<ReceivedCoinSlot>,
     pub next_pubkey: [u8; 32],
-    pub nav_rand: [u8; 32],
     pub npk_rand: [u8; 32],
 }
 
@@ -327,11 +332,11 @@ pub fn verify_and_begin_receive(
         .begin_receive(ReceiveRequest {
             owner: req.owner,
             nk: req.nk,
+            op_secret: req.op_secret,
             current_pubkey: req.current_pubkey,
             received_coins: coins,
             received_auth: auth,
             next_pubkey: req.next_pubkey,
-            nav_rand: req.nav_rand,
             npk_rand: req.npk_rand,
         })
         .context("StateEngine::begin_receive failed")
@@ -1339,7 +1344,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::sync::Mutex;
     use zkcoins_prover::half_agg::AggregateStateNullifierV3;
-    use zkcoins_prover::state_engine::{AccountRecord, TrackedCoin};
+    use zkcoins_prover::state_engine::{AccountRecord, OpSecret, TrackedCoin};
 
     // ---- recording publisher ------------------------------------------------
 
@@ -1671,10 +1676,10 @@ mod tests {
             V11ReceiveRequest {
                 owner: Address([0; 32]),
                 nk: [1; 32],
+                op_secret: OpSecret([4; 32]),
                 current_pubkey: [2; 32],
                 slots: vec![],
                 next_pubkey: [3; 32],
-                nav_rand: [4; 32],
                 npk_rand: [5; 32],
             },
         )
@@ -1999,6 +2004,7 @@ mod tests {
                     state,
                     coinhist: host::CoinHistTree::new(),
                     nk,
+                    op_secret: Some(OpSecret([0xA1; 32])),
                     genesis_pubkey: current_pubkey,
                     spendable: std::collections::BTreeMap::new(),
                     spent_ids: std::collections::BTreeSet::new(),
@@ -2297,10 +2303,10 @@ mod tests {
                 V11ReceiveRequest {
                     owner,
                     nk,
+                    op_secret: OpSecret([0x41; 32]),
                     current_pubkey,
                     slots,
                     next_pubkey: xonly_from_label(b"v11-rx/multi/sk1"),
-                    nav_rand: [0x41; 32],
                     npk_rand: [0x42; 32],
                 },
             )
@@ -2483,6 +2489,7 @@ mod tests {
                 state,
                 coinhist: hist,
                 nk,
+                op_secret: Some(OpSecret([0xA1; 32])),
                 genesis_pubkey: current_pubkey,
                 spendable,
                 spent_ids: std::collections::BTreeSet::new(),
@@ -2775,6 +2782,7 @@ mod tests {
                 engine.begin_mint(MintRequest {
                     owner: alice_owner,
                     nk: alice_nk,
+                    op_secret: OpSecret(Sha256::digest(b"v11-rx/alice-op_secret").into()),
                     current_pubkey: alice_pk0,
                     next_pubkey: alice_pk1,
                     name: b"G3 sealed e2e asset".to_vec(),
@@ -2783,7 +2791,6 @@ mod tests {
                     issuance_version: 1,
                     cap_total: 0,
                     terms_salt: [0u8; 32],
-                    nav_rand: [0x21; 32],
                     npk_rand: [0x22; 32],
                 })
             })
@@ -2870,7 +2877,6 @@ mod tests {
                         asset_id: mint_asset,
                     }],
                     next_pubkey: alice_pk2,
-                    nav_rand: [0x3cu8; 32],
                     npk_rand: [0xa5u8; 32],
                 })
             })
@@ -2975,10 +2981,10 @@ mod tests {
                     V11ReceiveRequest {
                         owner: bob_owner,
                         nk: bob_nk,
+                        op_secret: OpSecret([0x41; 32]),
                         current_pubkey: bob_pk0,
                         slots: vec![slot],
                         next_pubkey: bob_pk1,
-                        nav_rand: [0x41u8; 32],
                         npk_rand: [0x42u8; 32],
                     },
                 )

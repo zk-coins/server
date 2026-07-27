@@ -46,9 +46,10 @@ pub use encoding::{
 };
 pub use error::SpecError;
 pub use hashes::{
-    account_state_hash, address, asset_id_v1, asset_id_v2, coin_identifier, detect_tag,
-    hash_proof_data, name_hash, nav_commitment, network_id, network_id_mainnet, network_id_regtest,
-    network_id_testnet, nk_commit, npk_commit, nullifier, terms_hash_v1, terms_hash_v2,
+    account_state_hash, address, asset_id_v1, asset_id_v2, coin_identifier, derive_nav_rand,
+    detect_tag, hash_proof_data, hkdf_sha256, name_hash, nav_commitment, network_id,
+    network_id_mainnet, network_id_regtest, network_id_testnet, nk_commit, npk_commit, nullifier,
+    terms_hash_v1, terms_hash_v2,
 };
 pub use network_params::NetworkParams;
 pub use nflog::{

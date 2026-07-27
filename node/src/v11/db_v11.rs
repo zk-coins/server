@@ -12,17 +12,22 @@ use shared::spec_v1::{
 use sqlx::{PgPool, Postgres, Transaction};
 use zkcoins_program::circuit::compliance::Network;
 use zkcoins_prover::prover_bridge::{ComplianceProof, NavOpening, NullifierOpening};
-use zkcoins_prover::state_engine::{AccountRecord, StateEngine, TrackedCoin};
+use zkcoins_prover::state_engine::{AccountRecord, OpSecret, StateEngine, TrackedCoin};
 
 use super::mode::{network_label, parse_network_label};
 use super::separation::{require_stack_mode_for_update, ScanStackMode};
 
 /// Serializable snapshot of one account for the DB layer.
+///
+/// `op_secret` is redacted in Debug (via [`OpSecret`]); it must never appear
+/// in logs or response bodies.
 #[derive(Clone, Debug)]
 pub struct AccountSnapshot {
     pub owner: Address,
     pub state: AccountState,
     pub nk: [u8; 32],
+    /// Operational nav-rand secret. `None` only for pre-0023 rows; use refuses.
+    pub op_secret: Option<OpSecret>,
     pub genesis_pubkey: [u8; 32],
     pub spendable: Vec<([u8; 32], TrackedCoin)>,
     pub spent_ids: Vec<[u8; 32]>,
@@ -59,6 +64,7 @@ impl EngineSnapshot {
                 owner: *owner,
                 state: record.state.clone(),
                 nk: record.nk,
+                op_secret: record.op_secret,
                 genesis_pubkey: record.genesis_pubkey,
                 spendable: record
                     .spendable
@@ -136,6 +142,7 @@ impl AccountSnapshot {
             state: self.state,
             coinhist,
             nk: self.nk,
+            op_secret: self.op_secret,
             genesis_pubkey: self.genesis_pubkey,
             spendable,
             spent_ids,
@@ -365,6 +372,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
         Vec<u8>,
         Vec<u8>,
         Vec<u8>,
+        Option<Vec<u8>>,
         Vec<u8>,
         Option<Vec<u8>>,
         Option<Vec<u8>>,
@@ -372,7 +380,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
         Option<i64>,
         Vec<u8>,
     )> = sqlx::query_as(
-        "SELECT owner, account_state, nk, genesis_pubkey, last_proof, \
+        "SELECT owner, account_state, nk, op_secret, genesis_pubkey, last_proof, \
                 last_nav_opening, last_nullifier, last_nullifier_pos, coin_history_root \
          FROM v11_accounts ORDER BY owner",
     )
@@ -385,6 +393,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
         owner_b,
         state_b,
         nk_b,
+        op_secret_b,
         genesis_b,
         last_proof_b,
         last_nav_b,
@@ -475,10 +484,16 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
             Some(p) => Some(u64_from_i64(p, "last_nullifier_pos")?),
         };
 
+        let op_secret = match op_secret_b {
+            None => None,
+            Some(b) => Some(OpSecret(fixed_32(&b, "account.op_secret")?)),
+        };
+
         accounts.push(AccountSnapshot {
             owner,
             state,
             nk: fixed_32(&nk_b, "account.nk")?,
+            op_secret,
             genesis_pubkey: fixed_32(&genesis_b, "account.genesis_pubkey")?,
             spendable,
             spent_ids,
@@ -789,15 +804,17 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
             Some(p) => Some(as_i64_u64(p, "last_nullifier_pos")?),
         };
 
+        let op_secret_bytes = account.op_secret.map(|s| s.0);
         sqlx::query(
             "INSERT INTO v11_accounts \
-             (owner, account_state, nk, genesis_pubkey, last_proof, last_nav_opening, \
+             (owner, account_state, nk, op_secret, genesis_pubkey, last_proof, last_nav_opening, \
               last_nullifier, last_nullifier_pos, coin_history_root, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())",
         )
         .bind(account.owner.0.as_slice())
         .bind(&state_bytes)
         .bind(account.nk.as_slice())
+        .bind(op_secret_bytes.as_ref().map(|b| b.as_slice()))
         .bind(account.genesis_pubkey.as_slice())
         .bind(last_proof.as_deref())
         .bind(last_nav.as_deref())

@@ -17,6 +17,8 @@ pub const TAG_NK_COMMIT: &str = "zkCoins/v1/NkCommit";
 pub const TAG_NULLIFIER: &str = "zkCoins/v1/Nullifier";
 pub const TAG_NETWORK: &str = "zkCoins/v1/Network";
 pub const TAG_NAV_COMMIT: &str = "zkCoins/v1/NavCommit";
+/// HKDF info for `nav_rand = HKDF("zkCoins/v1/NavRand", op_secret ‖ u64-be(send_counter))` (§1.4).
+pub const TAG_NAV_RAND: &str = "zkCoins/v1/NavRand";
 pub const TAG_DETECT_TAG: &str = "zkCoins/v1/DetectTag";
 
 pub const TAG_COINS_ROOT_LEAF: &str = "zkCoins/v1/CoinsRoot/Leaf";

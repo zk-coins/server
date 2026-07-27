@@ -94,6 +94,9 @@ pub struct MintRequest {
     pub owner: Address,
     /// Operational nullifier key (node operational bundle).
     pub nk: [u8; 32],
+    /// Nav-rand secret (A/4'; operational bundle). Keys deterministic `nav_rand`.
+    /// Debug-redacted via [`OpSecret`]; never caller-supplied as `nav_rand`.
+    pub op_secret: OpSecret,
     /// Consumed spend key `Pkᵢ` (`Pk₀` for a genesis mint).
     pub current_pubkey: [u8; 32],
     /// Rotated spend key `Pkᵢ₊₁` folded into `new_account_state`.
@@ -108,11 +111,14 @@ pub struct MintRequest {
     pub cap_total: u128,
     /// Token-standard-2 terms salt; all-zero for standard 1.
     pub terms_salt: [u8; 32],
-    pub nav_rand: [u8; 32],
     pub npk_rand: [u8; 32],
 }
 
 /// §2.3.2 send intent. Change outputs are computed by the engine.
+///
+/// `nav_rand` is **not** a request field: the engine derives it from the
+/// account's stored `op_secret` and the entry `send_counter` of the pending
+/// transition (§1.4 / Requirement 10).
 #[derive(Clone, Debug)]
 pub struct SendRequest {
     pub owner: Address,
@@ -121,7 +127,6 @@ pub struct SendRequest {
     /// Recipient output templates (before per-asset change).
     pub output_templates: Vec<CoinTemplate>,
     pub next_pubkey: [u8; 32],
-    pub nav_rand: [u8; 32],
     pub npk_rand: [u8; 32],
 }
 
@@ -132,19 +137,43 @@ pub struct SendRequest {
 /// re-verified (creating proof + clause-10 host material). Bundle decrypt and
 /// the Bitcoin first-occurrence scan are P1-G responsibilities — this engine
 /// only folds the verified receipt into the account state.
+///
+/// `nav_rand` is derived inside the engine from `op_secret` and the entry
+/// `send_counter` — it is not representable on this type.
 #[derive(Clone, Debug)]
 pub struct ReceiveRequest {
     pub owner: Address,
     /// Operational nullifier key. Required so a first receive can construct
     /// the canonical empty account for the `InitialProof` path.
     pub nk: [u8; 32],
+    /// Nav-rand secret (A/4'; operational bundle). Required on every receive
+    /// so a first-transition account can be created and so a registered
+    /// account can refuse a mismatched bundle.
+    pub op_secret: OpSecret,
     /// Consumed spend key `Pkᵢ` (`Pk₀` for a first-transition receive).
     pub current_pubkey: [u8; 32],
     pub received_coins: Vec<Coin>,
     pub received_auth: Vec<ReceivedAuthorization>,
     pub next_pubkey: [u8; 32],
-    pub nav_rand: [u8; 32],
     pub npk_rand: [u8; 32],
+}
+
+/// Operational nav-rand secret (`A/4'`, §1.2). Part of the operational bundle
+/// entrusted to the account's **own** node — never sent to a foreign node,
+/// never logged, and never Debug-printed as raw bytes.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpSecret(pub [u8; 32]);
+
+impl OpSecret {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for OpSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpSecret([REDACTED])")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +196,10 @@ pub struct AccountRecord {
     pub coinhist: CoinHistTree,
     /// Account nullifier key (operational bundle).
     pub nk: [u8; 32],
+    /// Nav-rand secret (A/4'; operational bundle). `None` only for pre-migration
+    /// rows that never received a bundle write — any transition that needs
+    /// `nav_rand` **refuses** rather than inventing a value.
+    pub op_secret: Option<OpSecret>,
     /// Address-bound genesis spend key `Pk₀`.
     pub genesis_pubkey: [u8; 32],
     /// Spendable (state-`1`) coins keyed by `digest_to_bytes(identifier)`.
@@ -194,6 +227,9 @@ pub struct PendingTransition {
     pub owner: Address,
     /// NAV opening used for this transition (stored on apply).
     pub nav_opening: NavOpening,
+    /// Operational nav-rand secret resolved for this transition (bundle).
+    /// Persisted onto the account on apply; Debug-redacted.
+    pub op_secret: OpSecret,
 }
 
 /// Durable, engine-owned finalisation capability for **prove + apply**.
@@ -650,6 +686,19 @@ impl StateEngine {
                 existing.nk == req.nk,
                 "nk does not match the registered account"
             );
+            match existing.op_secret {
+                None => {
+                    bail!(
+                        "mint: op_secret missing for account — refusing (no silent default)"
+                    );
+                }
+                Some(stored) => {
+                    ensure!(
+                        req.op_secret == stored,
+                        "op_secret does not match the registered account"
+                    );
+                }
+            }
             ensure!(
                 existing.state.current_pubkey == req.current_pubkey,
                 "current_pubkey does not match the registered account"
@@ -728,8 +777,8 @@ impl StateEngine {
 
         let mut new_balances = prev_account_state.balances.clone();
         credit_balance(&mut new_balances, asset_id, req.amount)?;
-        let new_send = prev_account_state
-            .send_counter
+        let entry_send_counter = prev_account_state.send_counter;
+        let new_send = entry_send_counter
             .checked_add(1)
             .context("send_counter overflow")?;
         let new_account_state = AccountState::new(
@@ -742,10 +791,11 @@ impl StateEngine {
         )
         .context("construct new AccountState after mint")?;
 
+        let nav_rand = host::derive_nav_rand(req.op_secret.as_bytes(), entry_send_counter);
         let nav = self.size_final_nav()?;
         let nav_opening = NavOpening {
             nav,
-            nav_rand: req.nav_rand,
+            nav_rand,
         };
         let proof_data = compute_proof_data(
             &new_account_state,
@@ -753,7 +803,7 @@ impl StateEngine {
             &[],
             &req.nk,
             nav,
-            &req.nav_rand,
+            &nav_rand,
             &req.next_pubkey,
             &req.npk_rand,
         )?;
@@ -773,7 +823,7 @@ impl StateEngine {
             asset_issuance: Some(issuance),
             nk: req.nk,
             nav,
-            nav_rand: req.nav_rand,
+            nav_rand,
             prev_nav_opening,
             nav_consistency,
             next_pubkey: req.next_pubkey,
@@ -790,6 +840,7 @@ impl StateEngine {
             mode,
             owner: req.owner,
             nav_opening,
+            op_secret: req.op_secret,
         })
     }
 
@@ -805,6 +856,9 @@ impl StateEngine {
             .get(&req.owner)
             .context("send: account not found")?;
         ensure!(record.state.owner == req.owner, "account owner mismatch");
+        let op_secret = record.op_secret.context(
+            "send: op_secret missing for account — refusing (no silent default)",
+        )?;
         ensure!(
             !req.input_coin_ids.is_empty(),
             "send requires at least one input coin"
@@ -1007,8 +1061,8 @@ impl StateEngine {
                 credit_balance(&mut new_balances, coin.asset_id, coin.amount)?;
             }
         }
-        let new_send = prev_account_state
-            .send_counter
+        let entry_send_counter = prev_account_state.send_counter;
+        let new_send = entry_send_counter
             .checked_add(1)
             .context("send_counter overflow")?;
         let new_account_state = AccountState::new(
@@ -1021,10 +1075,11 @@ impl StateEngine {
         )
         .context("construct new AccountState after send")?;
 
+        let nav_rand = host::derive_nav_rand(op_secret.as_bytes(), entry_send_counter);
         let nav = self.size_final_nav()?;
         let nav_opening = NavOpening {
             nav,
-            nav_rand: req.nav_rand,
+            nav_rand,
         };
         let proof_data = compute_proof_data(
             &new_account_state,
@@ -1032,7 +1087,7 @@ impl StateEngine {
             &input_coins,
             &record.nk,
             nav,
-            &req.nav_rand,
+            &nav_rand,
             &req.next_pubkey,
             &req.npk_rand,
         )?;
@@ -1052,7 +1107,7 @@ impl StateEngine {
             asset_issuance: None,
             nk: record.nk,
             nav,
-            nav_rand: req.nav_rand,
+            nav_rand,
             prev_nav_opening,
             nav_consistency,
             next_pubkey: req.next_pubkey,
@@ -1069,6 +1124,7 @@ impl StateEngine {
             mode,
             owner: req.owner,
             nav_opening,
+            op_secret,
         })
     }
 
@@ -1101,6 +1157,19 @@ impl StateEngine {
                 req.nk == record.nk,
                 "receive: nk does not match the registered account"
             );
+            match record.op_secret {
+                None => {
+                    bail!(
+                        "receive: op_secret missing for account — refusing (no silent default)"
+                    );
+                }
+                Some(stored) => {
+                    ensure!(
+                        req.op_secret == stored,
+                        "receive: op_secret does not match the registered account"
+                    );
+                }
+            }
             ensure!(
                 req.current_pubkey == record.state.current_pubkey,
                 "receive: current_pubkey does not match the registered account"
@@ -1164,8 +1233,8 @@ impl StateEngine {
         for coin in &req.received_coins {
             credit_balance(&mut new_balances, coin.asset_id, coin.amount)?;
         }
-        let new_send = prev_account_state
-            .send_counter
+        let entry_send_counter = prev_account_state.send_counter;
+        let new_send = entry_send_counter
             .checked_add(1)
             .context("send_counter overflow")?;
         let new_account_state = AccountState::new(
@@ -1178,10 +1247,11 @@ impl StateEngine {
         )
         .context("construct new AccountState after receive")?;
 
+        let nav_rand = host::derive_nav_rand(req.op_secret.as_bytes(), entry_send_counter);
         let nav = self.size_final_nav()?;
         let nav_opening = NavOpening {
             nav,
-            nav_rand: req.nav_rand,
+            nav_rand,
         };
         let proof_data = compute_proof_data(
             &new_account_state,
@@ -1189,7 +1259,7 @@ impl StateEngine {
             &[],
             &req.nk,
             nav,
-            &req.nav_rand,
+            &nav_rand,
             &req.next_pubkey,
             &req.npk_rand,
         )?;
@@ -1209,7 +1279,7 @@ impl StateEngine {
             asset_issuance: None,
             nk: req.nk,
             nav,
-            nav_rand: req.nav_rand,
+            nav_rand,
             prev_nav_opening,
             nav_consistency,
             next_pubkey: req.next_pubkey,
@@ -1226,6 +1296,7 @@ impl StateEngine {
             mode,
             owner: req.owner,
             nav_opening,
+            op_secret: req.op_secret,
         })
     }
 
@@ -1517,10 +1588,15 @@ impl StateEngine {
 
         // All fallible checks are complete. Commit the account record only —
         // the canonical NfLog is untouched.
+        //
+        // `op_secret` is engine-local operational material: never invent a
+        // value here. Carry the secret resolved at begin_* (request or prior
+        // record); a fresh node rebuilds openings from the restored bundle.
         let record = AccountRecord {
             state: witness.new_account_state.clone(),
             coinhist: next_hist,
             nk,
+            op_secret: Some(pending.op_secret),
             genesis_pubkey,
             spendable: next_spendable,
             spent_ids: next_spent,
@@ -2081,6 +2157,7 @@ mod tests {
     struct FundedFixture {
         owner: Address,
         nk: [u8; 32],
+        op_secret: OpSecret,
         asset_id: HashDigest,
         input_coin: Coin,
         /// Secret for the account's *current* spend key (post-mint = spend-key-1).
@@ -2090,6 +2167,10 @@ mod tests {
         genesis_proof: ProvedTransition,
         genesis_nav_opening: NavOpening,
         genesis_nullifier: NullifierOpening,
+    }
+
+    fn label_op_secret(label: &[u8]) -> OpSecret {
+        OpSecret(Sha256::digest(label).into())
     }
 
     fn build_funded_fixture(bridge: &ProverBridge) -> FundedFixture {
@@ -2202,6 +2283,7 @@ mod tests {
         FundedFixture {
             owner,
             nk,
+            op_secret: label_op_secret(b"zkCoins/v1/compliance-chain/op_secret"),
             asset_id,
             input_coin: output_coin,
             spend_secret,
@@ -2296,6 +2378,7 @@ mod tests {
             state,
             coinhist,
             nk: fixture.nk,
+            op_secret: Some(fixture.op_secret),
             genesis_pubkey: {
                 let (_s, _p, pk0) = normalized_key(deterministic_secret(
                     b"zkCoins/v1/compliance-chain/spend-key-0",
@@ -2325,6 +2408,7 @@ mod tests {
         MintRequest {
             owner: Address(host::address(&current_pubkey, host::nk_commit(&nk))),
             nk,
+            op_secret: label_op_secret(b"zkCoins/v1/state-engine/test-mint/op_secret"),
             current_pubkey,
             next_pubkey,
             name: b"State Engine Test Asset".to_vec(),
@@ -2337,7 +2421,6 @@ mod tests {
             } else {
                 [0; 32]
             },
-            nav_rand: [0x11; 32],
             npk_rand: [0x22; 32],
         }
     }
@@ -2435,11 +2518,11 @@ mod tests {
             .begin_receive(ReceiveRequest {
                 owner,
                 nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/initial-receive/op_secret"),
                 current_pubkey,
                 received_coins: coins.clone(),
                 received_auth: auth,
                 next_pubkey,
-                nav_rand: [0x41; 32],
                 npk_rand: [0x42; 32],
             })
             .expect("first-transition batched receive");
@@ -2559,6 +2642,9 @@ mod tests {
                     state: state.clone(),
                     coinhist,
                     nk,
+                    op_secret: Some(label_op_secret(
+                        b"zkCoins/v1/state-engine/multi-send/op_secret",
+                    )),
                     genesis_pubkey,
                     spendable,
                     spent_ids: BTreeSet::new(),
@@ -2590,7 +2676,6 @@ mod tests {
                     asset_id,
                 }],
                 next_pubkey,
-                nav_rand: [0x72; 32],
                 npk_rand: [0x73; 32],
             })
             .expect("multi-input begin_send");
@@ -2654,6 +2739,7 @@ mod tests {
                     state: stale_state,
                     coinhist: CoinHistTree::new(),
                     nk: stale_pending.witness_wip.nk,
+                    op_secret: Some(stale_pending.op_secret),
                     genesis_pubkey: stale_pending.witness_wip.prev_account_state.current_pubkey,
                     spendable: BTreeMap::new(),
                     spent_ids: BTreeSet::new(),
@@ -2789,6 +2875,7 @@ mod tests {
             state,
             coinhist,
             nk,
+            op_secret: Some(label_op_secret(b"zkCoins/v1/state-engine/overspend/op_secret")),
             genesis_pubkey: pk,
             spendable,
             spent_ids: BTreeSet::new(),
@@ -2811,7 +2898,6 @@ mod tests {
                     asset_id,
                 }],
                 next_pubkey: [0x55u8; 32],
-                nav_rand: [0x11u8; 32],
                 npk_rand: [0x22u8; 32],
             })
             .expect_err("overspend must fail");
@@ -2844,7 +2930,6 @@ mod tests {
                     asset_id: fixture.asset_id,
                 }],
                 next_pubkey: fixture.next_pubkey,
-                nav_rand: [0x3cu8; 32],
                 npk_rand: [0xa5u8; 32],
             })
             .expect("begin_send");
@@ -2958,6 +3043,8 @@ mod tests {
 
         // Host acceptance: the send's nav was size_final=1 at prove time; after
         // scan-fold size grows, but the proved nav remains a canonical prefix.
+        // send_counter at entry is 1 (post-mint); nav_rand is derived, not caller-set.
+        let expected_send_nav_rand = host::derive_nav_rand(fixture.op_secret.as_bytes(), 1);
         engine
             .verify_incoming_transition(
                 &applied.proved,
@@ -2966,8 +3053,7 @@ mod tests {
                         size: 1,
                         mth: host::nflog_mth(&engine.nflog_entries[..1]),
                     },
-                    // nav_rand from the send
-                    nav_rand: [0x3cu8; 32],
+                    nav_rand: expected_send_nav_rand,
                 },
             )
             .expect("verify_incoming_transition on applied send");
@@ -3012,7 +3098,6 @@ mod tests {
                     asset_id: fixture.asset_id,
                 }],
                 next_pubkey: fixture.next_pubkey,
-                nav_rand: [0x3cu8; 32],
                 npk_rand: [0xa5u8; 32],
             })
             .expect("begin_send to Bob");
@@ -3114,11 +3199,11 @@ mod tests {
             .begin_receive(ReceiveRequest {
                 owner: bob_owner,
                 nk: bob_nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/receive-e2e/bob-op_secret"),
                 current_pubkey: bob_pk0,
                 received_coins: vec![bob_coin.clone()],
                 received_auth: vec![received_auth],
                 next_pubkey: bob_pk1,
-                nav_rand: [0x41u8; 32],
                 npk_rand: [0x42u8; 32],
             })
             .expect("begin_receive Bob");
@@ -3178,5 +3263,155 @@ mod tests {
             .expect("scan-fold receive nullifier");
         assert_eq!(rx_pos, nflog_before_rx);
         assert_eq!(engine.nflog.nav().size, nflog_before_rx + 1);
+    }
+
+    /// Same account + same entry `send_counter` reproduce identical `nav_rand`;
+    /// a different counter yields a different one. Red if derivation ignored
+    /// the counter or accepted a caller-supplied constant.
+    #[test]
+    fn nav_rand_derived_deterministically_from_op_secret_and_send_counter() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let req = test_mint_request(1);
+        let pending_a = engine.begin_mint(req.clone()).expect("mint a");
+        let pending_b = engine.begin_mint(req.clone()).expect("mint b");
+        assert_eq!(
+            pending_a.nav_opening.nav_rand, pending_b.nav_opening.nav_rand,
+            "identical (op_secret, entry send_counter=0) must match"
+        );
+        let expected = host::derive_nav_rand(req.op_secret.as_bytes(), 0);
+        assert_eq!(pending_a.nav_opening.nav_rand, expected);
+        assert_ne!(
+            pending_a.nav_opening.nav_rand,
+            host::derive_nav_rand(req.op_secret.as_bytes(), 1),
+            "different send_counter must change nav_rand"
+        );
+        // OpSecret must never Debug-print raw bytes.
+        let dbg = format!("{:?}", req.op_secret);
+        assert_eq!(dbg, "OpSecret([REDACTED])");
+        let raw = format!("{:?}", req.op_secret.as_bytes());
+        assert!(
+            !dbg.contains(&raw),
+            "Debug must not embed the raw secret bytes"
+        );
+    }
+
+    /// Missing `op_secret` on a registered account refuses a send — no zero
+    /// default, no generated secret. Red if begin_send invents a value.
+    #[test]
+    fn begin_send_refuses_when_op_secret_missing() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/missing-op/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/missing-op/pk0",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x11; 32], 2, 1);
+        let coin = Coin {
+            identifier: host::coin_identifier(
+                host::account_state_hash(
+                    &AccountState::new(
+                        owner,
+                        host::nk_commit(&nk),
+                        BTreeMap::new(),
+                        pk,
+                        0,
+                        host::coinhist_empty_root(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                &owner.0,
+                asset_id,
+                50,
+                0,
+            ),
+            recipient: owner,
+            amount: 50,
+            asset_id,
+        };
+        let mut coinhist = CoinHistTree::new();
+        let id = host::digest_to_bytes(&coin.identifier);
+        coinhist.admit(id).unwrap();
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: coin.clone(),
+                creating_prev_ash: host::ZERO_HASH,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 50);
+        let state =
+            AccountState::new(owner, host::nk_commit(&nk), balances, pk, 1, coinhist.root())
+                .unwrap();
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk,
+                    op_secret: None, // the defect under test
+                    genesis_pubkey: pk,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    // last_proof deliberately None: op_secret is checked first
+                    // (must not reach AccountUpdateProof wiring / circuit).
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+
+        let err = engine
+            .begin_send(SendRequest {
+                owner,
+                input_coin_ids: vec![coin.identifier],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 10,
+                    asset_id,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("missing op_secret must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("op_secret missing"),
+            "expected missing-op_secret refusal, got: {msg}"
+        );
+    }
+
+    /// Requirement 10: a fresh node that restores the operational bundle
+    /// (here: `op_secret` + account `send_counter` history) reproduces a prior
+    /// opening's `nav_rand`. Red if nav_rand were caller-supplied ephemera.
+    #[test]
+    fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let req = test_mint_request(1);
+        let pending = engine.begin_mint(req.clone()).expect("mint");
+        let issued_nav_rand = pending.nav_opening.nav_rand;
+        let entry_counter = pending.witness_wip.prev_account_state.send_counter;
+        assert_eq!(entry_counter, 0);
+
+        // "Fresh node": only the operational secret and the counter that
+        // described the transition — no local pending state.
+        let restored_op_secret = req.op_secret;
+        let rebuilt = host::derive_nav_rand(restored_op_secret.as_bytes(), entry_counter);
+        assert_eq!(
+            rebuilt, issued_nav_rand,
+            "restored bundle must rebuild the opening's nav_rand"
+        );
+
+        // A second transition at counter 1 is a different opening.
+        assert_ne!(
+            host::derive_nav_rand(restored_op_secret.as_bytes(), 1),
+            issued_nav_rand
+        );
     }
 }

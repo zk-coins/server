@@ -1613,6 +1613,7 @@ pub mod test_fixtures {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use zkcoins_prover::prover_bridge::{NavOpening, TransitionMode, TransitionWitness};
+    use zkcoins_prover::state_engine::OpSecret;
 
     const V2EXT_PK0: &str =
         "7c9cdde9b8cb1e33a48a5c2b6ab1fa6fd753fa1762f56c0b3e8169e4f2d54630";
@@ -1737,6 +1738,9 @@ pub mod test_fixtures {
             mode: TransitionMode::InitialProof,
             owner,
             nav_opening,
+            // Signature-gate fixtures never exercise nav_rand derivation; a
+            // constant stands in so the skeleton type is constructible.
+            op_secret: OpSecret([0u8; 32]),
         }
     }
 
@@ -1767,7 +1771,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use zkcoins_prover::prover_bridge::{NavOpening, TransitionMode, TransitionWitness};
-    use zkcoins_prover::state_engine::PendingTransition;
+    use zkcoins_prover::state_engine::{OpSecret, PendingTransition};
 
     use crate::v11::separation::{
         clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
@@ -1955,6 +1959,9 @@ mod tests {
             mode: TransitionMode::InitialProof,
             owner,
             nav_opening,
+            // Signature-gate fixtures never exercise nav_rand derivation; a
+            // constant stands in so the skeleton type is constructible.
+            op_secret: OpSecret([0u8; 32]),
         }
     }
 

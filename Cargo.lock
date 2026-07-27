@@ -3376,6 +3376,7 @@ dependencies = [
  "bincode",
  "bitcoin",
  "hex",
+ "hkdf",
  "lazy_static",
  "plonky2",
  "serde",
