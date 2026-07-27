@@ -323,12 +323,15 @@ async fn plant_edge_job_with_claim(
         .await
         .expect("plant finalisation");
 
-    assert_eq!(
-        store
-            .claim_finalise_exclusive_as(job_id, claim_owner, lease)
-            .await
-            .expect("claim"),
-        FinaliseClaim::Won
+    assert!(
+        matches!(
+            store
+                .claim_finalise_exclusive_as(job_id, claim_owner, lease)
+                .await
+                .expect("claim"),
+            FinaliseClaim::Won { .. }
+        ),
+        "plant claim must win"
     );
     job_id
 }
@@ -384,12 +387,15 @@ async fn immediate_restart_drives_abandoned_edge_job_forward() {
     assert_eq!(env.public_id, job_id, "boot must re-arm the edge job");
 
     // Claim is free for the new process.
-    assert_eq!(
-        boot_store
-            .claim_finalise_exclusive(job_id)
-            .await
-            .expect("claim after boot"),
-        FinaliseClaim::Won
+    assert!(
+        matches!(
+            boot_store
+                .claim_finalise_exclusive(job_id)
+                .await
+                .expect("claim after boot"),
+            FinaliseClaim::Won { .. }
+        ),
+        "claim after boot must win"
     );
 
     clear_process_stack_mode_for_test();
@@ -455,12 +461,15 @@ async fn live_claim_not_enqueued_then_deferred_reclaim_after_expiry() {
         .expect("channel open");
     assert_eq!(env.public_id, job_id);
 
-    assert_eq!(
-        boot_store
-            .claim_finalise_exclusive(job_id)
-            .await
-            .expect("claim after deferred reclaim"),
-        FinaliseClaim::Won
+    assert!(
+        matches!(
+            boot_store
+                .claim_finalise_exclusive(job_id)
+                .await
+                .expect("claim after deferred reclaim"),
+            FinaliseClaim::Won { .. }
+        ),
+        "claim after deferred reclaim must win"
     );
 
     clear_process_stack_mode_for_test();
