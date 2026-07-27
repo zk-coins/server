@@ -540,7 +540,7 @@ impl FinaliseOutcome {
         pending: &PendingTransition,
         publisher_pubkey: Option<[u8; 32]>,
     ) -> Self {
-        let pd = &applied.proved.proof_data;
+        let pd = &applied.proved().proof_data;
         Self {
             new_account_state_hash: digest_to_bytes(&pd.new_account_state_hash),
             output_coins_root: digest_to_bytes(&pd.output_coins_root),
@@ -614,7 +614,7 @@ pub fn finalise_with_accepted_signature(
     let applied = engine
         .finalise(pending, signature)
         .map_err(|e| format!("StateEngine::finalise failed: {e:#}"))?;
-    let pd = &applied.proved.proof_data;
+    let pd = &applied.proved().proof_data;
     Ok(FinaliseOutcome {
         new_account_state_hash: digest_to_bytes(&pd.new_account_state_hash),
         output_coins_root: digest_to_bytes(&pd.output_coins_root),
