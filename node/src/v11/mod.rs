@@ -20,6 +20,14 @@
 //!
 //! A commitment and an `AggregateStateNullifierV3` must never share one
 //! accumulator or one database; see [`separation`].
+//!
+//! ## Public surface is orchestration, not raw sinks
+//!
+//! Raw publish / DB-write / adapter-mutation / scan-apply sinks are
+//! `pub(crate)` (crate-private). Downstream crates see only capability-
+//! carrying entry points: receive facade, scan apply orchestration, and
+//! publisher connect/env. Assembling a durable effect from raw parts is a
+//! compile error — see `tests/sealed_plumbing_compile_fail_matrix.rs`.
 
 mod adapter;
 pub mod db_v11;
@@ -34,9 +42,7 @@ pub use mode::{
     parse_network_label, resolve_v11_shadow_mode, v11_shadow_mode_from_env, validate_v11_boot_pins,
     V11BootPins, V11ShadowMode, V11_BOOT_CONFIG_ERROR,
 };
-pub use publish::{
-    connect_v11_publisher, publish_v11_batch, v11_publisher_env_from_env, V11PublisherEnv,
-};
+pub use publish::{connect_v11_publisher, v11_publisher_env_from_env, V11PublisherEnv};
 pub use receive::{
     commit_proved_receive, execute_v11_receive, finalise_publish_persist,
     refuse_legacy_receive_under_v11, resume_all_pending_publishes, resume_pending_publish,
@@ -46,10 +52,9 @@ pub use receive::{
 };
 pub use scan::{
     apply_canonical_survivors, apply_forward_scan, first_boot_requires_full_replace,
-    fold_survivors_into_engine, folded_keys_from_nflog_mirror, members_to_published,
-    observation_tip_still_live, reconcile_persisted_tip, replace_engine_nflog_from_survivors,
-    sort_canonical, FoldStats, MAX_RECOVERABLE_REORG_DEPTH, PersistedTipReconciliation,
-    ResolvedBlock, TipReconcileOutcome,
+    folded_keys_from_nflog_mirror, members_to_published, observation_tip_still_live,
+    reconcile_persisted_tip, sort_canonical, FoldStats, MAX_RECOVERABLE_REORG_DEPTH,
+    PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome,
 };
 pub use separation::{
     claim_process_stack_from_shadow_mode, claim_process_stack_from_v11_shadow_env,

@@ -100,8 +100,10 @@ pub fn sort_canonical(survivors: &mut [PublishedNullifier]) {
 /// * Pre-activation heights are skipped (counted, not fatal).
 /// * Out-of-order after sort is impossible; a fold error is fatal.
 ///
-/// This is the pure core used by tests and by [`EngineAdapter`] apply.
-pub fn fold_survivors_into_engine(
+/// Pure core used by crate-internal tests and by the sealed adapter apply
+/// path. **Crate-private scan-apply sink** — downstream must use
+/// [`apply_forward_scan`] / [`apply_canonical_survivors`].
+pub(crate) fn fold_survivors_into_engine(
     engine: &mut StateEngine,
     survivors: &[PublishedNullifier],
 ) -> Result<FoldStats> {
@@ -226,7 +228,10 @@ pub fn first_occurrence_nflog_pairs(
 ///
 /// Used after the script-plonky2 scanner reports a reorg outcome so the
 /// persisted NfLog matches the new canonical chain exactly.
-pub fn replace_engine_nflog_from_survivors(
+///
+/// **Crate-private scan-apply sink.** Downstream reorg apply goes through
+/// [`apply_canonical_survivors`] only.
+pub(crate) fn replace_engine_nflog_from_survivors(
     engine: &mut StateEngine,
     tip_height: u64,
     tip_hash: [u8; 32],

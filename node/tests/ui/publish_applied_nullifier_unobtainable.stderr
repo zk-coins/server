@@ -1,5 +1,0 @@
-error[E0425]: cannot find value `publish_applied_nullifier` in module `node::v11`
- --> tests/ui/publish_applied_nullifier_unobtainable.rs:9:24
-  |
-9 |     let _ = node::v11::publish_applied_nullifier;
-  |                        ^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `node::v11`

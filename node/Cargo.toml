@@ -261,9 +261,10 @@ fs2 = "0.4"
 # (`t_<uuid_simple>`); the workspace pulls it from the main
 # `[dependencies]` block above (where the `v4` + `serde` features
 # are already enabled), so no separate dev-dep entry is needed.
-# Compile-fail evidence that `esplora_client` is unobtainable from `node`
-# (Defect 4 / facade package boundary) and that a hollow proved envelope
-# / fabricated `AppliedTransition` cannot drive publish from outside.
+# Compile-fail evidence: raw `esplora_client` unobtainable from `node`
+# (Defect 4), and the sealed v1.1 plumbing matrix (`sealed_plumbing_*`)
+# proving raw publish/DB/adapter/scan-apply sinks are unobtainable from
+# outside the crate.
 trybuild = "1.0"
 
 [features]
