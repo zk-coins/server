@@ -387,6 +387,13 @@ async fn process_envelope(
             )
             .await
         }
+        // Mid-finalise crash: durable signed capability + broadcasting.
+        // Resume finalise without re-parking on /sign.
+        (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting)
+            if crate::v11::v11_sign_route_active() =>
+        {
+            drive_v11_finalise(job_store, app_state, notify_map, env.public_id, &job).await
+        }
         _ => {
             tracing::debug!(
                 "Job dispatcher: envelope for {} in unexpected state {:?}; skipping",
@@ -686,7 +693,12 @@ async fn process_mint_resume(
     .await
 }
 
-/// Merge the restart-safe staging envelope into `jobs.request_body`.
+/// Merge the durable finalisation capability into `jobs.request_body`.
+///
+/// Status-qualified: only writes while the job is still `queued` or
+/// `proving` (the statuses from which we enter `awaiting_signature`). If
+/// cancel won the race, the write fails loud rather than stamping a
+/// finalisation envelope onto a terminal row.
 async fn persist_pending_sign_on_job(
     job_store: &JobStore,
     public_id: Uuid,
@@ -695,19 +707,37 @@ async fn persist_pending_sign_on_job(
     let job = job_store
         .load(public_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("job {public_id} missing while staging pending_sign"))?;
+        .ok_or_else(|| anyhow::anyhow!("job {public_id} missing while staging finalisation"))?;
     let mut body = job.request_body;
-    let persist = crate::v11::StagedSignPersist::from_entry(entry);
+    let persist = crate::v11::DurableFinalisationPersist::from_entry(entry)
+        .map_err(|e| anyhow::anyhow!("encode durable finalisation: {e}"))?;
     let value = serde_json::to_value(persist)?;
     let obj = body
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("jobs.request_body is not an object"))?;
-    obj.insert(crate::v11::PENDING_SIGN_BODY_KEY.to_string(), value);
-    sqlx::query("UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2")
-        .bind(&body)
-        .bind(public_id)
-        .execute(job_store.pool())
-        .await?;
+    obj.insert(crate::v11::FINALISATION_BODY_KEY.to_string(), value);
+    // Drop legacy split keys if a previous build left them.
+    obj.remove(crate::v11::PENDING_SIGN_BODY_KEY);
+    obj.remove("sign");
+    // Prefer proving; fall back to queued (create leaves queued).
+    let applied = if job.status == JobStatus::Proving {
+        job_store
+            .replace_request_body_if_status(public_id, JobStatus::Proving, &body)
+            .await?
+    } else if job.status == JobStatus::Queued {
+        job_store
+            .replace_request_body_if_status(public_id, JobStatus::Queued, &body)
+            .await?
+    } else {
+        false
+    };
+    if !applied {
+        anyhow::bail!(
+            "refusing to persist finalisation capability: job {public_id} status \
+             moved off {:?} before write (status-qualified update)",
+            job.status
+        );
+    }
     Ok(())
 }
 
@@ -774,7 +804,19 @@ pub(crate) async fn stage_and_select_awaiting_signature(
     legacy_ocr: &str,
     pending: Option<crate::v11::PendingSignEntry>,
 ) -> Result<serde_json::Value, String> {
-    let staged_ref = if let Some(entry) = pending {
+    let staged_ref = if let Some(mut entry) = pending {
+        // Capture caller-supplied publisher_pubkey from the job row so the
+        // durable capability carries everything job completion needs.
+        if let Ok(Some(job)) = job_store.load(public_id).await {
+            match crate::v11::publisher_pubkey_from_request_body(&job.request_body) {
+                Ok(pk) => entry = entry.with_publisher_pubkey(pk),
+                Err(msg) => {
+                    return Err(format!(
+                        "publisher_pubkey on transition request is malformed: {msg}"
+                    ));
+                }
+            }
+        }
         // Canonical production writer — tests must not insert into the
         // map by hand if they want to exercise this path.
         let _persist_json =
@@ -790,7 +832,7 @@ pub(crate) async fn stage_and_select_awaiting_signature(
         if let Err(e) = persist_pending_sign_on_job(job_store, public_id, &entry_clone).await {
             app_state.pending_sign_map.remove(&public_id);
             return Err(format!(
-                "failed to persist pending_sign for restart safety: {e}"
+                "failed to persist durable finalisation for restart safety: {e}"
             ));
         }
         Some(entry_clone)
@@ -1184,24 +1226,17 @@ async fn process_send_resume(
 /// for a `Mint` job (which runs the soundness gate), [`commit_flow`]
 /// for a `Send`. On timeout, fail the job.
 ///
-/// ## Crash recovery (Defect 2)
+/// ## Crash recovery — durable finalisation capability
 ///
-/// `/sign` persists the verified signature **before** CAS/notify. If the
-/// process dies after that persist, boot resume re-enqueues the job and
-/// this function sees a durable `request_body.sign` **before** parking:
-/// it drives finalise immediately so a job the wallet already saw as
-/// `signature_accepted` is not left waiting for a second `/sign`.
+/// `/sign` installs the verified signature into the durable
+/// [`FinalisationCapability`] **before** CAS/notify. If the process dies
+/// after that persist, boot resume re-enqueues the job and this function
+/// sees a **signed** capability **before** parking: it drives finalise
+/// immediately so a job the wallet already saw as `signature_accepted` is
+/// not left waiting for a second `/sign`.
 ///
-/// Crash windows after the fix:
-/// | Window | Durable | Handoff | Resume yields |
-/// | after verify, before persist | none | WAITING | wallet retries `/sign` |
-/// | after persist, before CAS | `sign` | WAITING | wallet may retry `/sign` (re-persist idempotent); process death → boot auto-finalise |
-/// | after CAS, before notify | `sign` | SIGNALED | process death → boot re-arms + auto-finalise from durable `sign` |
-/// | after notify, before finalise completes | `sign` | SIGNALED | same: boot auto-finalise |
-///
-/// Auto-finalise still requires a live (`finalise_safe`) staged pending
-/// in `pending_sign_map`. A rehydrated verification-grade envelope alone
-/// refuses finalise (wallet must resubmit the transition on this process).
+/// Resume reads the capability alone — no in-memory map required (true cold
+/// boot). Each step is status-guarded so a second attempt is harmless.
 async fn wait_for_commit(
     job_store: &JobStore,
     app_state: &AppState,
@@ -1211,26 +1246,31 @@ async fn wait_for_commit(
     kind: JobKind,
     notifier: Arc<JobNotifier>,
 ) -> anyhow::Result<()> {
-    // Defect 2: durable signature already on the row (crash after
-    // persist / CAS / notify, or boot resume of a signed job). Drive
-    // finalise without waiting for another wallet round-trip.
+    // Signed durable capability already on the row (crash after persist /
+    // CAS / notify, or boot resume of a signed job). Drive finalise without
+    // waiting for another wallet round-trip.
     if crate::v11::v11_sign_route_active() {
         if let Ok(Some(job)) = job_store.load(public_id).await {
-            if job.status == JobStatus::AwaitingSignature {
-                if let Some(sign_val) = job.request_body.get("sign").cloned() {
-                    tracing::info!(
-                        "Job dispatcher: job {} has durable sign on resume — driving finalise",
-                        public_id
-                    );
-                    return drive_v11_finalise(
-                        job_store,
-                        app_state,
-                        notify_map,
-                        public_id,
-                        &job,
-                        sign_val,
-                    )
-                    .await;
+            if matches!(
+                job.status,
+                JobStatus::AwaitingSignature | JobStatus::Broadcasting
+            ) {
+                if let Ok(Some(entry)) = crate::v11::rehydrate_pending_sign(&job.request_body) {
+                    if entry.signature.is_some() {
+                        tracing::info!(
+                            "Job dispatcher: job {} has signed durable finalisation on resume \
+                             — driving finalise",
+                            public_id
+                        );
+                        return drive_v11_finalise(
+                            job_store,
+                            app_state,
+                            notify_map,
+                            public_id,
+                            &job,
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -1315,21 +1355,22 @@ async fn wait_for_commit(
         return Ok(());
     }
 
-    // v1.1 path: `/v1/jobs/{id}/sign` already verified via
-    // accept_wallet_transition_signature and persisted the TransitionSignature
-    // under `sign`. Drive StateEngine::finalise (or the injected hook) — never
-    // complete the job with the signature material alone.
+    // v1.1 path: `/v1/jobs/{id}/sign` already verified and installed the
+    // signature into the durable FinalisationCapability. Drive finalise —
+    // never complete the job with the signature material alone.
     if crate::v11::v11_sign_route_active() {
-        if let Some(sign_val) = job.request_body.get("sign").cloned() {
-            return drive_v11_finalise(
-                job_store,
-                app_state,
-                notify_map,
-                public_id,
-                &job,
-                sign_val,
-            )
-            .await;
+        if let Ok(Some(entry)) = crate::v11::rehydrate_pending_sign(&job.request_body) {
+            if entry.signature.is_some() {
+                return drive_v11_finalise(job_store, app_state, notify_map, public_id, &job)
+                    .await;
+            }
+        }
+        // In-memory map may hold the signature if persist rehydrate raced.
+        if let Some(entry) = app_state.pending_sign_map.get(&public_id) {
+            if entry.signature.is_some() {
+                return drive_v11_finalise(job_store, app_state, notify_map, public_id, &job)
+                    .await;
+            }
         }
     }
 
@@ -1441,22 +1482,24 @@ enum SignalOutcome {
     TimedOut,
 }
 
-/// Drive an accepted v1.1 signature into finalise.
+/// Drive an accepted v1.1 signature into finalise from the durable capability.
 ///
-/// Loads the staged [`PendingSignEntry`] (in-memory live entry preferred;
-/// rehydrated envelope only for diagnostics — finalise refuses unless
-/// [`crate::v11::ensure_finalise_ready`] passes), reconstructs the verified
-/// `TransitionSignature` from the persisted `sign` blob, invokes the
-/// `v11_finalise` hook (production: `StateEngine::finalise`; tests: spy),
-/// and completes the job with the §7.5 `result` shape — never with the
-/// raw signature material alone.
+/// ## Idempotency of each step
+///
+/// | Step | Guard |
+/// |------|-------|
+/// | Terminal job | status already completed/failed/cancelled → no-op return |
+/// | Load capability | rehydrate full [`FinalisationCapability`]; refuse if unsigned |
+/// | Enter publishing | `set_status_if(awaiting_signature → broadcasting)`; if already broadcasting, continue |
+/// | Prove + apply | engine re-validates live deps; job status prevents double-complete |
+/// | Complete | `complete_if_status([broadcasting])` — second resume after complete is no-op |
+/// | Fail | `fail_if_status` from non-terminal only |
 async fn drive_v11_finalise(
     job_store: &JobStore,
     app_state: &AppState,
     notify_map: &JobNotifyMap,
     public_id: Uuid,
     job: &Job,
-    sign_val: serde_json::Value,
 ) -> anyhow::Result<()> {
     // Helper: fail with a §7.5 machine code, clean envelopes, drop notify.
     async fn fail_v11(
@@ -1468,7 +1511,14 @@ async fn drive_v11_finalise(
         message: String,
     ) -> anyhow::Result<()> {
         let err = crate::v11::encode_job_error(code, message.clone());
-        job_store.fail(public_id, &err).await?;
+        // Status-qualified: do not overwrite a concurrent complete/cancel.
+        let _ = job_store
+            .fail_if_status(
+                public_id,
+                &[JobStatus::AwaitingSignature, JobStatus::Broadcasting],
+                &err,
+            )
+            .await?;
         publish_phase(
             notify_map,
             public_id,
@@ -1485,62 +1535,60 @@ async fn drive_v11_finalise(
         Ok(())
     }
 
-    // Resolve staged pending: memory first, then persisted envelope.
-    let entry = match app_state.pending_sign_map.get(&public_id).map(|e| e.clone()) {
-        Some(e) => e,
-        None => match crate::v11::rehydrate_pending_sign(&job.request_body) {
-            Ok(Some(e)) => e,
-            Ok(None) => {
+    // Idempotent resume: terminal jobs are done.
+    if job.status.is_terminal() {
+        tracing::info!(
+            "Job dispatcher: job {} already terminal ({:?}); finalise resume is a no-op",
+            public_id,
+            job.status
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        return Ok(());
+    }
+
+    // Prefer durable capability (cold boot); fall back to in-memory map.
+    let entry = match crate::v11::rehydrate_pending_sign(&job.request_body) {
+        Ok(Some(e)) => e,
+        Ok(None) => match app_state.pending_sign_map.get(&public_id).map(|e| e.clone()) {
+            Some(e) => e,
+            None => {
                 return fail_v11(
                     job_store,
                     app_state,
                     notify_map,
                     public_id,
                     "internal_error",
-                    "v1.1 finalise: no staged PendingTransition for job \
-                     (pending_sign_map empty and no request_body.pending_sign)"
+                    "v1.1 finalise: no durable FinalisationCapability on job \
+                     (and pending_sign_map empty)"
                         .to_string(),
                 )
                 .await;
             }
-            Err(e) => {
-                return fail_v11(
-                    job_store,
-                    app_state,
-                    notify_map,
-                    public_id,
-                    "internal_error",
-                    format!("v1.1 finalise: rehydrate pending_sign failed: {e}"),
-                )
-                .await;
-            }
         },
-    };
-
-    // Defect 2: refuse finalise on a partial rehydration. Never prove
-    // from a verification-grade-only witness.
-    if let Err(msg) = crate::v11::ensure_finalise_ready(&entry) {
-        return fail_v11(
-            job_store,
-            app_state,
-            notify_map,
-            public_id,
-            "proving_failed",
-            msg,
-        )
-        .await;
-    }
-
-    let signature = match parse_persisted_transition_signature(&sign_val) {
-        Ok(s) => s,
-        Err(msg) => {
+        Err(e) => {
             return fail_v11(
                 job_store,
                 app_state,
                 notify_map,
                 public_id,
                 "internal_error",
-                msg,
+                format!("v1.1 finalise: rehydrate finalisation failed: {e}"),
+            )
+            .await;
+        }
+    };
+
+    let signature = match entry.signature.clone() {
+        Some(s) => s,
+        None => {
+            return fail_v11(
+                job_store,
+                app_state,
+                notify_map,
+                public_id,
+                "internal_error",
+                "v1.1 finalise: durable capability has no installed signature".to_string(),
             )
             .await;
         }
@@ -1561,9 +1609,59 @@ async fn drive_v11_finalise(
         .await;
     };
 
-    job_store
-        .set_status(public_id, JobStatus::Broadcasting, "publishing")
-        .await?;
+    // Status-qualified enter publishing. Already broadcasting (mid-finalise
+    // crash) continues; any other status aborts without clobbering.
+    if job.status == JobStatus::AwaitingSignature {
+        let advanced = job_store
+            .set_status_if(
+                public_id,
+                JobStatus::AwaitingSignature,
+                JobStatus::Broadcasting,
+                "publishing",
+            )
+            .await?;
+        if !advanced {
+            // Cancel/timeout won, or concurrent finalise already moved us.
+            let latest = job_store.load(public_id).await?;
+            if let Some(j) = latest {
+                if j.status.is_terminal() {
+                    cleanup_pending_sign(job_store, app_state, public_id).await;
+                    notify_map.remove(&public_id);
+                    return Ok(());
+                }
+                if j.status != JobStatus::Broadcasting {
+                    return fail_v11(
+                        job_store,
+                        app_state,
+                        notify_map,
+                        public_id,
+                        "internal_error",
+                        format!(
+                            "v1.1 finalise: status-qualified enter publishing failed; \
+                             job is now {:?}",
+                            j.status
+                        ),
+                    )
+                    .await;
+                }
+            }
+        }
+    } else if job.status != JobStatus::Broadcasting {
+        return fail_v11(
+            job_store,
+            app_state,
+            notify_map,
+            public_id,
+            "internal_error",
+            format!(
+                "v1.1 finalise: refusing from status {:?} (expected awaiting_signature \
+                 or broadcasting)",
+                job.status
+            ),
+        )
+        .await;
+    }
+
     publish_phase(
         notify_map,
         public_id,
@@ -1576,55 +1674,75 @@ async fn drive_v11_finalise(
         },
     );
 
-    // Malformed publisher_pubkey is fail-closed (no silent drop).
-    let publisher_pubkey = match crate::v11::publisher_pubkey_from_request_body(&job.request_body)
-    {
-        Ok(pk) => pk,
-        Err(msg) => {
-            return fail_v11(
-                job_store,
-                app_state,
-                notify_map,
-                public_id,
-                "malformed_request",
-                msg,
-            )
-            .await;
-        }
+    // Publisher from the durable capability (captured at stage); fall back
+    // to request_body scan for older rows that only stored it at the root.
+    let publisher_pubkey = match entry.publisher_pubkey {
+        Some(pk) => Some(pk),
+        None => match crate::v11::publisher_pubkey_from_request_body(&job.request_body) {
+            Ok(pk) => pk,
+            Err(msg) => {
+                return fail_v11(
+                    job_store,
+                    app_state,
+                    notify_map,
+                    public_id,
+                    "malformed_request",
+                    msg,
+                )
+                .await;
+            }
+        },
     };
 
     match hook(entry.pending, signature) {
         Ok(mut outcome) => {
-            // Hook may not have job context; fill §7.5 publisher_pubkey
-            // from the original transition request when present.
             if outcome.publisher_pubkey.is_none() {
                 outcome.publisher_pubkey = publisher_pubkey;
             }
             let response_body = outcome.to_result_json();
-            job_store
-                .complete(public_id, response_body.clone(), 200)
+            let completed = job_store
+                .complete_if_status(
+                    public_id,
+                    &[JobStatus::Broadcasting],
+                    response_body.clone(),
+                    200,
+                )
                 .await?;
-            publish_phase(
-                notify_map,
-                public_id,
-                JobPhaseEvent {
-                    status: JobStatus::Completed,
-                    phase: "completed".to_string(),
-                    proof_id: None,
-                    result: Some(response_body),
-                    error: None,
-                },
-            );
-            tracing::info!(
-                "Job dispatcher: job {} completed after v1.1 finalise",
-                public_id
-            );
+            if completed {
+                publish_phase(
+                    notify_map,
+                    public_id,
+                    JobPhaseEvent {
+                        status: JobStatus::Completed,
+                        phase: "completed".to_string(),
+                        proof_id: None,
+                        result: Some(response_body),
+                        error: None,
+                    },
+                );
+                tracing::info!(
+                    "Job dispatcher: job {} completed after v1.1 finalise",
+                    public_id
+                );
+            } else {
+                // Concurrent complete already landed — resume is harmless.
+                tracing::info!(
+                    "Job dispatcher: job {} complete_if_status was a no-op (already terminal)",
+                    public_id
+                );
+            }
         }
         Err(e) => {
             let msg = format!("v1.1 finalise failed: {e}");
             tracing::warn!("Job dispatcher: job {} {}", public_id, msg);
             let err = crate::v11::encode_job_error("proving_failed", msg);
-            job_store.fail(public_id, &err).await?;
+            let _ = job_store
+                .fail_if_status(
+                    public_id,
+                    &[JobStatus::AwaitingSignature, JobStatus::Broadcasting],
+                    &err,
+                )
+                .await?;
             publish_phase(
                 notify_map,
                 public_id,
@@ -1644,6 +1762,8 @@ async fn drive_v11_finalise(
     Ok(())
 }
 
+// Retained for any residual call sites; production path uses the capability.
+#[allow(dead_code)]
 fn parse_persisted_transition_signature(
     sign_val: &serde_json::Value,
 ) -> Result<zkcoins_prover::prover_bridge::TransitionSignature, String> {

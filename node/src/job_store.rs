@@ -360,9 +360,14 @@ impl JobStore {
     /// cached response body + status code so an idempotent replay
     /// returns byte-identical JSON.
     ///
-    /// Atomically strips `pending_sign` / `sign` keys from
-    /// `request_body` (Defect 3): a terminal row must not retain a
-    /// restart envelope that boot recovery could treat as live work.
+    /// Atomically strips durable finalisation keys from `request_body`
+    /// (`finalisation`, legacy `pending_sign` / `sign`): a terminal row
+    /// must not retain a restart envelope that boot recovery could treat
+    /// as live work.
+    ///
+    /// **Legacy behaviour:** applies regardless of current status (same
+    /// SQL shape as pre-v1.1). Status-qualified completion for the v1.1
+    /// path lives on [`Self::complete_if_status`].
     pub async fn complete(
         &self,
         public_id: Uuid,
@@ -373,7 +378,7 @@ impl JobStore {
             "UPDATE jobs SET status = 'completed', phase = 'completed', \
                               response_body = $1, response_status = $2, \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
-                                  - 'pending_sign' - 'sign'), \
+                                  - 'finalisation' - 'pending_sign' - 'sign'), \
                               progress = 100, updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $3",
         )
@@ -385,19 +390,55 @@ impl JobStore {
         Ok(())
     }
 
+    /// Status-qualified complete: only applies when the row is still in
+    /// one of `expected`. Returns `true` if the row was updated.
+    ///
+    /// Used by the v1.1 finalise path so a second resume after a terminal
+    /// flip is a no-op (idempotent) rather than rewriting `completed`.
+    pub async fn complete_if_status(
+        &self,
+        public_id: Uuid,
+        expected: &[JobStatus],
+        response_body: serde_json::Value,
+        response_status: i16,
+    ) -> sqlx::Result<bool> {
+        if expected.is_empty() {
+            return Ok(false);
+        }
+        let statuses: Vec<String> = expected.iter().map(|s| s.as_str().to_string()).collect();
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'completed', phase = 'completed', \
+                              response_body = $1, response_status = $2, \
+                              request_body = (COALESCE(request_body, '{}'::jsonb) \
+                                  - 'finalisation' - 'pending_sign' - 'sign'), \
+                              progress = 100, updated_at = NOW(), completed_at = NOW() \
+             WHERE public_id = $3 AND status = ANY($4::text[])",
+        )
+        .bind(&response_body)
+        .bind(response_status)
+        .bind(public_id)
+        .bind(&statuses)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Move a job to the `failed` terminal state with an error
     /// message. The wallet surfaces `error` verbatim in the
     /// `KNOWN_SERVER_ERRORS` mapping table.
     ///
-    /// Atomically strips `pending_sign` / `sign` from `request_body`
-    /// with the status flip (Defect 3) so a failed cleanup path cannot
-    /// leave a restart envelope on a terminal row.
+    /// Atomically strips durable finalisation keys from `request_body`
+    /// with the status flip so a failed cleanup path cannot leave a
+    /// restart envelope on a terminal row.
+    ///
+    /// **Legacy behaviour:** applies regardless of current status.
+    /// Status-qualified fail for the v1.1 path lives on [`Self::fail_if_status`].
     pub async fn fail(&self, public_id: Uuid, error: &str) -> sqlx::Result<()> {
         sqlx::query(
             "UPDATE jobs SET status = 'failed', phase = 'failed', \
                               error = $1, \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
-                                  - 'pending_sign' - 'sign'), \
+                                  - 'finalisation' - 'pending_sign' - 'sign'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $2",
         )
@@ -406,6 +447,83 @@ impl JobStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Status-qualified fail: only applies when the row is still in one
+    /// of `expected`. Returns `true` if the row was updated.
+    pub async fn fail_if_status(
+        &self,
+        public_id: Uuid,
+        expected: &[JobStatus],
+        error: &str,
+    ) -> sqlx::Result<bool> {
+        if expected.is_empty() {
+            return Ok(false);
+        }
+        let statuses: Vec<String> = expected.iter().map(|s| s.as_str().to_string()).collect();
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'failed', phase = 'failed', \
+                              error = $1, \
+                              request_body = (COALESCE(request_body, '{}'::jsonb) \
+                                  - 'finalisation' - 'pending_sign' - 'sign'), \
+                              updated_at = NOW(), completed_at = NOW() \
+             WHERE public_id = $2 AND status = ANY($3::text[])",
+        )
+        .bind(error)
+        .bind(public_id)
+        .bind(&statuses)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Status-qualified status/phase advance. Returns `true` if applied.
+    ///
+    /// An update that assumes `from` fails (returns `false`) when the job
+    /// has moved on — never silently overwrites a later status.
+    pub async fn set_status_if(
+        &self,
+        public_id: Uuid,
+        from: JobStatus,
+        to: JobStatus,
+        phase: &str,
+    ) -> sqlx::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = $1, phase = $2, updated_at = NOW() \
+             WHERE public_id = $3 AND status = $4",
+        )
+        .bind(to.as_str())
+        .bind(phase)
+        .bind(public_id)
+        .bind(from.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Status-qualified JSON merge into `request_body`. Returns `true` if
+    /// the row was updated.
+    ///
+    /// The whole `request_body` value is replaced with `new_body` only when
+    /// the row's status still equals `expected`. Callers load, mutate, and
+    /// write back under this CAS so a concurrent status flip (cancel /
+    /// timeout) cannot accept a stale body write.
+    pub async fn replace_request_body_if_status(
+        &self,
+        public_id: Uuid,
+        expected: JobStatus,
+        new_body: &serde_json::Value,
+    ) -> sqlx::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET request_body = $1, updated_at = NOW() \
+             WHERE public_id = $2 AND status = $3",
+        )
+        .bind(new_body)
+        .bind(public_id)
+        .bind(expected.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Legacy cancel: only succeeds while the job is still `queued`.
@@ -420,10 +538,12 @@ impl JobStore {
     /// job was already past `queued` (or not found). The admit handler
     /// maps `false` to `409 Conflict`.
     pub async fn cancel(&self, public_id: Uuid) -> sqlx::Result<bool> {
+        // Legacy cancel stays queued-only. Strip keys for rows that never
+        // held a finalisation envelope too (no-op on missing keys).
         let result = sqlx::query(
             "UPDATE jobs SET status = 'cancelled', phase = 'cancelled', \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
-                                  - 'pending_sign' - 'sign'), \
+                                  - 'finalisation' - 'pending_sign' - 'sign'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $1 AND status = 'queued'",
         )
@@ -440,9 +560,9 @@ impl JobStore {
     /// `broadcasting` (or terminal), cancel is refused so a published
     /// nullifier cannot be rolled back by a status flip.
     ///
-    /// Atomically strips `pending_sign` / `sign` from `request_body` so a
+    /// Atomically strips durable finalisation keys from `request_body` so a
     /// cancelled `awaiting_signature` row cannot resurrect via boot
-    /// rehydrate (Defect 3).
+    /// rehydrate.
     ///
     /// Returns `Ok(true)` if cancellation applied, `Ok(false)` if the
     /// job was already past the cancellable set (or not found). The
@@ -451,7 +571,7 @@ impl JobStore {
         let result = sqlx::query(
             "UPDATE jobs SET status = 'cancelled', phase = 'cancelled', \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
-                                  - 'pending_sign' - 'sign'), \
+                                  - 'finalisation' - 'pending_sign' - 'sign'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $1 \
                AND status IN ('queued', 'proving', 'awaiting_signature')",

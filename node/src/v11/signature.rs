@@ -94,7 +94,7 @@ use uuid::Uuid;
 use zkcoins_program::circuit::compliance::Network;
 use zkcoins_prover::half_agg::{comm_verify, verify_single};
 use zkcoins_prover::prover_bridge::TransitionSignature;
-use zkcoins_prover::state_engine::PendingTransition;
+use zkcoins_prover::state_engine::{FinalisationCapability, PendingTransition};
 
 use super::mode::V11ShadowMode;
 use super::separation::{process_stack_mode, ScanStackMode};
@@ -243,40 +243,42 @@ impl TryFrom<WalletSignSubmissionWire> for WalletSignSubmission {
 /// counter of the transition being authorised. Callers cannot set a
 /// counter that disagrees with the pending transition.
 ///
-/// ## Finalise readiness
+/// ## Durable finalisation
 ///
-/// [`StateEngine::finalise`](zkcoins_prover::state_engine::StateEngine::finalise)
-/// needs the **full** host `TransitionWitness` produced by `begin_*`:
-/// `input_coins` / `input_auth`, `output_templates` / `output_coins` /
-/// `output_history_proofs`, `received_coins` / `received_auth`,
-/// `asset_issuance`, `prev_nav_opening`, `nav_consistency`, `prev_proof`
-/// (AccountUpdate), and `predecessor_nullifier`. A restart envelope
-/// ([`StagedSignPersist`]) deliberately carries only the material
-/// `/sign` needs to recompute `H(ProofData)` and verify BIP-340+S2C —
-/// rehydrated entries therefore set [`Self::finalise_safe`] = `false`
-/// and [`ensure_finalise_ready`] refuses them. Live-staged entries
-/// (kept in the process map from `begin_*`) set it `true`.
+/// The engine-owned [`FinalisationCapability`] inside this entry carries
+/// the **full** host witness. Persisting via [`DurableFinalisationPersist`]
+/// therefore makes resume "load and proceed" — including after a true cold
+/// boot with an empty in-memory map. There is no verification-only partial
+/// reconstruction and no `finalise_safe` gate.
 #[derive(Clone, Debug)]
 pub struct PendingSignEntry {
     pub pending: PendingTransition,
     pub network: Network,
-    /// `true` only for a live-staged entry whose witness is complete for
-    /// `StateEngine::finalise`. Rehydrated verification-grade entries
-    /// are `false` — finalise must refuse them rather than prove from a
-    /// partial reconstruction.
-    pub finalise_safe: bool,
+    /// Accepted wallet signature once `/sign` has verified it (also on the
+    /// durable capability). `None` while waiting for the wallet.
+    pub signature: Option<TransitionSignature>,
+    /// §7.5 optional result field captured at stage time from the original
+    /// transition request (caller-supplied; revalidated on complete).
+    pub publisher_pubkey: Option<[u8; 32]>,
 }
 
 impl PendingSignEntry {
-    /// Stage a **live** pending transition (complete witness from
-    /// `begin_*`). `send_counter` is derived from the pending envelope
-    /// — never accepted as input. Marked finalise-safe.
+    /// Stage a pending transition (complete witness from `begin_*`).
+    /// `send_counter` is derived from the pending envelope — never accepted
+    /// as input.
     pub fn new(pending: PendingTransition, network: Network) -> Self {
         Self {
             pending,
             network,
-            finalise_safe: true,
+            signature: None,
+            publisher_pubkey: None,
         }
+    }
+
+    /// Attach a caller-supplied publisher pubkey for the §7.5 result.
+    pub fn with_publisher_pubkey(mut self, pk: Option<[u8; 32]>) -> Self {
+        self.publisher_pubkey = pk;
+        self
     }
 
     /// Entry counter `i` of this transition (`skᵢ = A/0'/i'`, §1.2 / §7.5).
@@ -284,181 +286,181 @@ impl PendingSignEntry {
     pub fn send_counter(&self) -> u64 {
         self.pending.witness_wip.prev_account_state.send_counter
     }
+
+    /// Engine-owned capability for this entry (pending + optional signature).
+    pub fn capability(&self) -> FinalisationCapability {
+        let mut cap = FinalisationCapability::stage(self.pending.clone());
+        if let Some(sig) = self.signature.clone() {
+            // Already verified at install time; pk match is re-checked.
+            cap.install_signature(sig)
+                .expect("PendingSignEntry signature already pk-matched");
+        }
+        cap
+    }
+
+    /// Install an accepted wallet signature on the in-memory entry.
+    pub fn install_signature(
+        &mut self,
+        sig: TransitionSignature,
+    ) -> Result<(), TransitionSignatureError> {
+        if sig.pk_i != self.pending.witness_wip.prev_account_state.current_pubkey {
+            return Err(TransitionSignatureError::new(
+                SignatureCheck::PkMatch,
+                "install_signature: pk_i does not match pending current_pubkey",
+            ));
+        }
+        self.signature = Some(sig);
+        Ok(())
+    }
 }
 
-/// Refuse finalise when the staged entry is not fully reconstructible.
+/// Finalise readiness: a durable capability is always complete by construction.
 ///
-/// Live-staged entries (`finalise_safe = true`) pass. Rehydrated
-/// envelopes pass `/sign` but fail here — never finalise a partial
-/// witness. Outward mapping for the job poll is `proving_failed`
-/// (§7.5: witness assembly / proof generation failed).
-pub fn ensure_finalise_ready(entry: &PendingSignEntry) -> Result<(), String> {
-    if entry.finalise_safe {
-        return Ok(());
-    }
-    Err(
-        "rehydrated pending_sign is verification-grade only: the restart \
-         envelope does not carry the full TransitionWitness finalise \
-         requires (input/output coins and auth, history proofs, prev_proof, \
-         predecessor_nullifier). Refuse finalise rather than prove from a \
-         partial reconstruction; resubmit the transition on this process"
-            .to_string(),
-    )
+/// Kept as a named check so call sites stay explicit. Returns `Ok` for every
+/// well-formed entry; the previous verification-grade refuse path is gone.
+pub fn ensure_finalise_ready(_entry: &PendingSignEntry) -> Result<(), String> {
+    Ok(())
 }
 
 /// Per-job map of staged v1.1 sign material. Keyed by job `public_id`.
 pub type PendingSignMap = Arc<DashMap<Uuid, PendingSignEntry>>;
 
-/// JSON key under `jobs.request_body` where the restart-safe staging
-/// envelope is persisted when a job enters `awaiting_signature`.
+/// JSON key under `jobs.request_body` for the durable finalisation capability.
+///
+/// Replaces the old split (`pending_sign` + `sign`). Terminal status flips
+/// strip this key (and the legacy keys for rows written by older builds).
+pub const FINALISATION_BODY_KEY: &str = "finalisation";
+
+/// Legacy key kept only so terminal strip / cleanup still erase old rows.
 pub const PENDING_SIGN_BODY_KEY: &str = "pending_sign";
 
-/// Restart-safe staging envelope for `/sign` after a process restart.
+/// Durable job-row envelope: one record containing everything needed to
+/// resume finalise after a true process restart.
 ///
-/// **Choice: persist verification material**, do not re-derive. Re-deriving
-/// via `begin_*` after a restart can produce a different `H(ProofData)` if
-/// the engine tip or account head moved, so the wallet's already-shown
-/// surface would no longer verify. This envelope captures exactly the
-/// host-side material [`accept_wallet_transition_signature`] needs, plus
-/// the account-state / mode fields required to rebuild a
-/// **verification-grade** [`PendingTransition`].
+/// ## Contents (derived from what finalise + job completion depend on)
 ///
-/// ## What finalise requires (and this envelope does NOT carry)
+/// | Field | Source | Why |
+/// |-------|--------|-----|
+/// | `capability` ([`FinalisationCapability`]) | engine / `begin_*` + `/sign` | full pending witness + optional accepted signature — prove and apply |
+/// | `network` | process claim at stage | BIP-340 `m_state` for `/sign` re-verify after rehydrate |
+/// | `publisher_pubkey` | original transition request | §7.5 completed `result` field (caller-supplied) |
 ///
-/// `StateEngine::finalise` / `prove_transition` need the full host
-/// `TransitionWitness` from `begin_*` (input coins + auth, outputs +
-/// history proofs, received coins + auth, asset issuance, prev_nav /
-/// nav_consistency, prev_proof, predecessor_nullifier). Those types are
-/// not all Serialize on the host path (notably `ComplianceProof` /
-/// `CoinHistProof`), so this envelope **does not** claim to reconstruct
-/// them. After a restart:
-/// - `/sign` verifies successfully against the rebuilt pending;
-/// - finalise is **refused** via [`ensure_finalise_ready`] (entry is
-///   marked `finalise_safe = false`) — never prove from a partial
-///   reconstruction.
+/// Live engine tip / CoinHist / NfLog are **not** stored: apply re-validates
+/// them. Resume is therefore reading this record and proceeding.
 ///
-/// ## Stale-envelope cleanup
+/// ## Wire encoding
 ///
-/// `pending_sign` is stripped from `jobs.request_body` when the job
-/// reaches a terminal status (completed / failed / cancelled / awaiting
-/// timeout) — see [`cleanup_pending_sign_envelope`]. The in-memory map
-/// entry is removed at the same points.
+/// `capability` is **bincode → lowercase hex** so large `ComplianceProof`s
+/// stay off the JSON tree while remaining a single opaque blob. Network and
+/// publisher stay as plain JSON fields for operators reading the row.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct StagedSignPersist {
+pub struct DurableFinalisationPersist {
     pub network: String,
-    pub proof_data: shared::spec_v1::ProofData,
-    pub proof_data_hash: [u8; 32],
-    pub prev_account_state: shared::spec_v1::AccountState,
-    pub new_account_state: shared::spec_v1::AccountState,
-    pub owner: [u8; 32],
-    /// `"initial"` | `"account_update"`.
-    pub mode: String,
-    pub nav: shared::spec_v1::Nav,
-    pub nav_rand: [u8; 32],
-    pub next_pubkey: [u8; 32],
-    pub npk_rand: [u8; 32],
-    pub nk: [u8; 32],
+    /// Lowercase hex of bincode([`FinalisationCapability`]).
+    pub capability_bincode_hex: String,
+    /// Lowercase hex of the external publisher, when the request carried one.
+    pub publisher_pubkey: Option<String>,
 }
 
-impl StagedSignPersist {
-    pub fn from_entry(entry: &PendingSignEntry) -> Self {
-        let w = &entry.pending.witness_wip;
-        let mode = match entry.pending.mode {
-            zkcoins_prover::prover_bridge::TransitionMode::InitialProof => "initial",
-            zkcoins_prover::prover_bridge::TransitionMode::AccountUpdateProof => "account_update",
-        };
-        Self {
+impl DurableFinalisationPersist {
+    pub fn from_entry(entry: &PendingSignEntry) -> Result<Self, String> {
+        let capability = entry.capability();
+        let bytes = bincode::serialize(&capability)
+            .map_err(|e| format!("bincode serialize FinalisationCapability: {e}"))?;
+        Ok(Self {
             network: network_label(entry.network).to_string(),
-            proof_data: entry.pending.proof_data.clone(),
-            proof_data_hash: entry.pending.proof_data_hash,
-            prev_account_state: w.prev_account_state.clone(),
-            new_account_state: w.new_account_state.clone(),
-            owner: entry.pending.owner.0,
-            mode: mode.to_string(),
-            nav: w.nav,
-            nav_rand: w.nav_rand,
-            next_pubkey: w.next_pubkey,
-            npk_rand: w.npk_rand,
-            nk: w.nk,
-        }
+            capability_bincode_hex: hex_lower(&bytes),
+            publisher_pubkey: entry.publisher_pubkey.as_ref().map(|pk| hex_lower(pk)),
+        })
     }
 
-    /// Rebuild a verification-grade pending from the persisted envelope.
     pub fn into_entry(self) -> Result<PendingSignEntry, TransitionSignatureError> {
         let network = parse_network_label(&self.network).ok_or_else(|| {
             TransitionSignatureError::new(
                 SignatureCheck::PendingEnvelope,
-                format!("persisted pending_sign network {:?} is not a known label", self.network),
+                format!(
+                    "persisted finalisation network {:?} is not a known label",
+                    self.network
+                ),
             )
         })?;
-        let mode = match self.mode.as_str() {
-            "initial" => zkcoins_prover::prover_bridge::TransitionMode::InitialProof,
-            "account_update" => zkcoins_prover::prover_bridge::TransitionMode::AccountUpdateProof,
-            other => {
-                return Err(TransitionSignatureError::new(
-                    SignatureCheck::PendingEnvelope,
-                    format!("persisted pending_sign mode {other:?} is unknown"),
-                ));
+        if self
+            .capability_bincode_hex
+            .bytes()
+            .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
+            || self.capability_bincode_hex.len() % 2 != 0
+        {
+            return Err(TransitionSignatureError::new(
+                SignatureCheck::PendingEnvelope,
+                "persisted finalisation capability must be even-length lowercase hex",
+            ));
+        }
+        let bytes = hex::decode(&self.capability_bincode_hex).map_err(|e| {
+            TransitionSignatureError::new(
+                SignatureCheck::PendingEnvelope,
+                format!("persisted finalisation capability hex: {e}"),
+            )
+        })?;
+        let capability: FinalisationCapability = bincode::deserialize(&bytes).map_err(|e| {
+            TransitionSignatureError::new(
+                SignatureCheck::PendingEnvelope,
+                format!("persisted finalisation capability bincode: {e}"),
+            )
+        })?;
+        let publisher_pubkey = match self.publisher_pubkey {
+            None => None,
+            Some(hex) => {
+                if hex.len() != 64
+                    || hex
+                        .bytes()
+                        .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
+                {
+                    return Err(TransitionSignatureError::new(
+                        SignatureCheck::PendingEnvelope,
+                        format!(
+                            "persisted publisher_pubkey must be 64 lowercase hex chars; got len={}",
+                            hex.len()
+                        ),
+                    ));
+                }
+                let raw = hex::decode(&hex).map_err(|e| {
+                    TransitionSignatureError::new(
+                        SignatureCheck::PendingEnvelope,
+                        format!("persisted publisher_pubkey hex: {e}"),
+                    )
+                })?;
+                let arr: [u8; 32] = raw.try_into().map_err(|v: Vec<u8>| {
+                    TransitionSignatureError::new(
+                        SignatureCheck::PendingEnvelope,
+                        format!("persisted publisher_pubkey length {}", v.len()),
+                    )
+                })?;
+                Some(arr)
             }
         };
-        let owner = shared::spec_v1::Address(self.owner);
-        let pk = self.prev_account_state.current_pubkey;
-        let nav_opening = zkcoins_prover::prover_bridge::NavOpening {
-            nav: self.nav,
-            nav_rand: self.nav_rand,
-        };
-        let witness = zkcoins_prover::prover_bridge::TransitionWitness {
-            mode,
-            prev_account_state: self.prev_account_state.clone(),
-            new_account_state: self.new_account_state.clone(),
-            input_coins: Vec::new(),
-            input_auth: Vec::new(),
-            output_templates: Vec::new(),
-            output_coins: Vec::new(),
-            output_history_proofs: Vec::new(),
-            received_coins: Vec::new(),
-            received_auth: Vec::new(),
-            asset_issuance: None,
-            nk: self.nk,
-            nav: self.nav,
-            nav_rand: self.nav_rand,
-            prev_nav_opening: None,
-            nav_consistency: Vec::new(),
-            next_pubkey: self.next_pubkey,
-            npk_rand: self.npk_rand,
-            transition_signature: TransitionSignature {
-                pk_i: pk,
-                signature: [0u8; 64],
-                r_prime: [0u8; 32],
-            },
-            prev_proof: None,
-            predecessor_nullifier: None,
-        };
-        let pending = PendingTransition {
-            witness_wip: witness,
-            proof_data: self.proof_data,
-            proof_data_hash: self.proof_data_hash,
-            mode,
-            owner,
-            nav_opening,
-        };
-        // Verification-grade only — empty coins/auth/prev_proof means
-        // this entry must never drive StateEngine::finalise.
         Ok(PendingSignEntry {
-            pending,
+            pending: capability.pending().clone(),
             network,
-            finalise_safe: false,
+            signature: capability.signature().cloned(),
+            publisher_pubkey,
         })
     }
 }
 
-/// Remove the restart envelope from a job's `request_body` (in-memory
-/// JSON). Callers persist the result. Used by
-/// [`cleanup_pending_sign_envelope`] and tests.
+/// Backward-compatible alias used by older tests/docs.
+pub type StagedSignPersist = DurableFinalisationPersist;
+
+/// Remove durable finalisation material from a job's `request_body`
+/// (in-memory JSON). Also strips legacy `pending_sign` / `sign` keys.
 pub fn strip_pending_sign_from_body(request_body: &mut serde_json::Value) -> bool {
     request_body
         .as_object_mut()
-        .map(|obj| obj.remove(PENDING_SIGN_BODY_KEY).is_some())
+        .map(|obj| {
+            let a = obj.remove(FINALISATION_BODY_KEY).is_some();
+            let b = obj.remove(PENDING_SIGN_BODY_KEY).is_some();
+            let c = obj.remove("sign").is_some();
+            a || b || c
+        })
         .unwrap_or(false)
 }
 
@@ -480,32 +482,72 @@ fn parse_network_label(s: &str) -> Option<Network> {
 }
 
 /// Stage a pending entry in the in-memory map **and** return the JSON
-/// blob to merge into `jobs.request_body` under [`PENDING_SIGN_BODY_KEY`]
-/// so a restart can rehydrate the map.
+/// blob to merge into `jobs.request_body` under [`FINALISATION_BODY_KEY`]
+/// so a restart can rehydrate the map and finalise.
 pub fn stage_pending_sign(
     map: &PendingSignMap,
     job_id: Uuid,
     entry: PendingSignEntry,
 ) -> serde_json::Value {
-    let persist = StagedSignPersist::from_entry(&entry);
+    let persist = DurableFinalisationPersist::from_entry(&entry)
+        .expect("FinalisationCapability always bincode-encodes");
     map.insert(job_id, entry);
-    serde_json::to_value(persist).expect("StagedSignPersist always encodes")
+    serde_json::to_value(persist).expect("DurableFinalisationPersist always encodes")
 }
 
 /// Rehydrate a staged entry from a job's persisted `request_body`.
+///
+/// Prefers [`FINALISATION_BODY_KEY`]. A legacy `pending_sign` key alone is
+/// **not** rehydrated into a finalisable entry (old verification-grade
+/// shape) — fail closed rather than pretend a partial record is complete.
 pub fn rehydrate_pending_sign(
     request_body: &serde_json::Value,
 ) -> Result<Option<PendingSignEntry>, TransitionSignatureError> {
-    let Some(raw) = request_body.get(PENDING_SIGN_BODY_KEY) else {
-        return Ok(None);
-    };
-    let persist: StagedSignPersist = serde_json::from_value(raw.clone()).map_err(|e| {
+    if let Some(raw) = request_body.get(FINALISATION_BODY_KEY) {
+        let persist: DurableFinalisationPersist =
+            serde_json::from_value(raw.clone()).map_err(|e| {
+                TransitionSignatureError::new(
+                    SignatureCheck::PendingEnvelope,
+                    format!("persisted finalisation is not a valid envelope: {e}"),
+                )
+            })?;
+        return Ok(Some(persist.into_entry()?));
+    }
+    if request_body.get(PENDING_SIGN_BODY_KEY).is_some() {
+        return Err(TransitionSignatureError::new(
+            SignatureCheck::PendingEnvelope,
+            "legacy pending_sign envelope is verification-grade only and cannot \
+             resume finalise; resubmit the transition so a full FinalisationCapability \
+             is staged",
+        ));
+    }
+    Ok(None)
+}
+
+/// Attach an accepted signature to the durable finalisation record in
+/// `request_body`, returning the updated JSON object value for the
+/// `finalisation` key. Fails loud if no durable capability is present.
+pub fn durable_finalisation_with_signature(
+    request_body: &serde_json::Value,
+    signature: &TransitionSignature,
+) -> Result<serde_json::Value, TransitionSignatureError> {
+    let mut entry = rehydrate_pending_sign(request_body)?
+        .ok_or_else(|| {
+            TransitionSignatureError::new(
+                SignatureCheck::PendingEnvelope,
+                "no durable finalisation capability on job row to attach signature",
+            )
+        })?;
+    entry.install_signature(signature.clone())?;
+    let persist = DurableFinalisationPersist::from_entry(&entry).map_err(|e| {
+        TransitionSignatureError::new(SignatureCheck::PendingEnvelope, e)
+    })?;
+    serde_json::to_value(persist).map_err(|e| {
         TransitionSignatureError::new(
             SignatureCheck::PendingEnvelope,
-            format!("persisted pending_sign is not a valid envelope: {e}"),
+            format!("encode durable finalisation after signature: {e}"),
         )
-    })?;
-    Ok(Some(persist.into_entry()?))
+    })
 }
 
 /// §7.5 completed `result` object after a successful finalise.
@@ -1959,12 +2001,11 @@ mod tests {
     }
 
     #[test]
-    fn staged_sign_persist_round_trips_for_restart() {
+    fn durable_finalisation_round_trips_full_capability() {
         let (entry, submission) = test_fixtures::v5_mainnet_entry_and_submission();
-        assert!(entry.finalise_safe, "live-staged entry is finalise-safe");
-        let persist = StagedSignPersist::from_entry(&entry);
-        let json = serde_json::to_value(&persist).expect("encode");
-        let body = serde_json::json!({ PENDING_SIGN_BODY_KEY: json });
+        let persist = DurableFinalisationPersist::from_entry(&entry).expect("encode");
+        let json = serde_json::to_value(&persist).expect("json");
+        let body = serde_json::json!({ FINALISATION_BODY_KEY: json });
         let rehydrated = rehydrate_pending_sign(&body)
             .expect("rehydrate ok")
             .expect("Some");
@@ -1973,8 +2014,11 @@ mod tests {
             rehydrated.pending.proof_data_hash,
             entry.pending.proof_data_hash
         );
-        // After a simulated restart the rebuilt pending still accepts
-        // the reference signature — this is what /sign needs.
+        // Full witness survives — not a partial verification-grade rebuild.
+        assert_eq!(
+            rehydrated.pending.witness_wip.output_coins.len(),
+            entry.pending.witness_wip.output_coins.len()
+        );
         accept_wallet_transition_signature(
             V11ShadowMode::On,
             rehydrated.network,
@@ -1982,27 +2026,42 @@ mod tests {
             &submission,
         )
         .expect("rehydrated pending must still verify the wallet signature");
-        // But it is NOT finalise-safe: refuse rather than prove partial.
-        assert!(!rehydrated.finalise_safe);
-        ensure_finalise_ready(&rehydrated).expect_err("rehydrated must refuse finalise");
+        // Rehydrated capability is finalise-ready by construction.
+        ensure_finalise_ready(&rehydrated).expect("durable rehydrate is finalise-ready");
     }
 
     #[test]
-    fn rehydrated_transition_missing_finalise_material_is_refused() {
-        let (entry, _) = test_fixtures::v5_mainnet_entry_and_submission();
-        let persist = StagedSignPersist::from_entry(&entry);
+    fn signed_durable_capability_survives_round_trip() {
+        let (mut entry, submission) = test_fixtures::v5_mainnet_entry_and_submission();
+        let accepted = accept_wallet_transition_signature(
+            V11ShadowMode::On,
+            entry.network,
+            &entry.pending,
+            &submission,
+        )
+        .expect("accept");
+        entry.install_signature(accepted).expect("install");
+        let persist = DurableFinalisationPersist::from_entry(&entry).expect("encode");
         let rehydrated = persist.into_entry().expect("into_entry");
-        // Empty witness vectors — not a full reconstruction.
-        assert!(rehydrated.pending.witness_wip.input_coins.is_empty());
-        assert!(rehydrated.pending.witness_wip.output_coins.is_empty());
-        assert!(rehydrated.pending.witness_wip.prev_proof.is_none());
-        let err = ensure_finalise_ready(&rehydrated).expect_err("must refuse");
         assert!(
-            err.contains("verification-grade") || err.contains("partial"),
-            "err={err}"
+            rehydrated.signature.is_some(),
+            "signature must survive durable round-trip"
         );
-        // Live entry still passes.
-        ensure_finalise_ready(&entry).expect("live-staged must be finalise-ready");
+        ensure_finalise_ready(&rehydrated).expect("signed rehydrate is finalise-ready");
+    }
+
+    #[test]
+    fn legacy_pending_sign_key_alone_refuses_rehydrate() {
+        let body = serde_json::json!({
+            PENDING_SIGN_BODY_KEY: { "network": "mainnet" }
+        });
+        let err = rehydrate_pending_sign(&body).expect_err("legacy key must fail closed");
+        assert_eq!(err.check, SignatureCheck::PendingEnvelope);
+        assert!(
+            err.message.contains("legacy pending_sign") || err.message.contains("verification-grade"),
+            "err={}",
+            err.message
+        );
     }
 
     #[test]

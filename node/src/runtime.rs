@@ -362,10 +362,40 @@ async fn boot_resume_jobs(
     job_notify_map: &Arc<DashMap<uuid::Uuid, Arc<JobNotifier>>>,
     job_tx: &tokio::sync::mpsc::Sender<crate::job_dispatcher::JobEnvelope>,
 ) -> anyhow::Result<()> {
-    // Interrupted in-flight rows: mark each failed so the wallet
-    // observes a terminal status.
+    // Interrupted in-flight rows. Legacy / unsigned work cannot resume
+    // (prove output lived only in process memory) → mark failed.
+    // v1.1 jobs with a **signed durable FinalisationCapability** can
+    // resume finalise after a mid-prove crash (status broadcasting):
+    // re-arm and enqueue instead of failing.
     let interrupted = job_store.list_interrupted_for_resume().await?;
     for job in interrupted {
+        let resumable_v11 = crate::v11::v11_sign_route_active()
+            && job.status == JobStatus::Broadcasting
+            && matches!(
+                crate::v11::rehydrate_pending_sign(&job.request_body),
+                Ok(Some(e)) if e.signature.is_some()
+            );
+        if resumable_v11 {
+            let notifier = Arc::new(JobNotifier::new());
+            job_notify_map.insert(job.public_id, notifier);
+            if let Err(e) = job_tx
+                .send(crate::job_dispatcher::JobEnvelope {
+                    public_id: job.public_id,
+                })
+                .await
+            {
+                eprintln!(
+                    "boot_resume_jobs: enqueue signed broadcasting {} failed: {} (continuing)",
+                    job.public_id, e
+                );
+            } else {
+                tracing::info!(
+                    "boot_resume_jobs: re-armed signed broadcasting job {} for finalise resume",
+                    job.public_id
+                );
+            }
+            continue;
+        }
         if let Err(e) = job_store
             .fail(
                 job.public_id,

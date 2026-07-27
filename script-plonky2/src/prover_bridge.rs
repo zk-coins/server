@@ -50,7 +50,7 @@ pub type ComplianceProof = ProofWithPublicInputs<F, C, D>;
 pub type BalanceProof = ProofWithPublicInputs<F, C, D>;
 
 /// The recursive branch selected for a transition.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TransitionMode {
     InitialProof,
     AccountUpdateProof,
@@ -64,7 +64,7 @@ pub struct NavOpening {
 }
 
 /// Clause-2 authorization and clause-8 history evidence for one spent coin.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InputAuthorization {
     pub creating_prev_ash: HashDigest,
     pub coin_index: u32,
@@ -72,7 +72,7 @@ pub struct InputAuthorization {
 }
 
 /// Membership of an output coin in its creating proof's output tree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OutputInclusionProof {
     pub leaf_index: u32,
     pub depth: u8,
@@ -90,7 +90,7 @@ pub struct NullifierOpening {
 }
 
 /// Clause-10 provenance, accumulator, and history evidence for one receipt.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReceivedAuthorization {
     pub creating_proof: ComplianceProof,
     pub output_inclusion: OutputInclusionProof,
@@ -106,7 +106,7 @@ pub struct ReceivedAuthorization {
 }
 
 /// Optional token-standard-1/2 issuance witness.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AssetIssuance {
     pub asset_id: HashDigest,
     pub creator_pubkey: [u8; 32],
@@ -122,15 +122,56 @@ pub struct AssetIssuance {
 }
 
 /// Wallet-produced BIP-340+S2C authorization.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TransitionSignature {
     /// The x-only key `Pk_i`; it must equal
     /// `prev_account_state.current_pubkey`.
     pub pk_i: [u8; 32],
     /// Canonical BIP-340 signature `bytes(R) || bytes(s)`.
+    /// Serde's array limit is 32; use a tuple helper for the 64-byte field.
+    #[serde(with = "big_array_64")]
     pub signature: [u8; 64],
     /// X-only, even-y encoding of the S2C pre-tweak point `R'`.
     pub r_prime: [u8; 32],
+}
+
+/// Serde helper for `[u8; 64]` (serde only derives arrays up to 32 by default).
+mod big_array_64 {
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::ser::SerializeTuple;
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(v: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        let mut tup = s.serialize_tuple(64)?;
+        for b in v.iter() {
+            tup.serialize_element(b)?;
+        }
+        tup.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = [u8; 64];
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a 64-byte sequence")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<[u8; 64], A::Error> {
+                let mut out = [0u8; 64];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(i, &self))?;
+                }
+                if seq.next_element::<u8>()?.is_some() {
+                    return Err(de::Error::invalid_length(65, &self));
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_tuple(64, V)
+    }
 }
 
 impl TransitionSignature {
@@ -148,7 +189,7 @@ impl TransitionSignature {
 }
 
 /// Clause-1 predecessor anchoring for an account-update proof.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PredecessorNullifier {
     pub nullifier: NullifierOpening,
     /// Host-format RFC-6962 path (deepest/leaf-first).
@@ -161,7 +202,7 @@ pub struct PredecessorNullifier {
 /// Compact vectors represent active-prefix circuit slots. Inactive slots are
 /// filled canonically by the bridge. Coin-history proofs retain their semantic
 /// locations: inputs occupy slots 0..8, outputs 8..16, and receipts 16..20.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TransitionWitness {
     pub mode: TransitionMode,
     pub prev_account_state: AccountState,

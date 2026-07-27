@@ -3258,10 +3258,11 @@ mod jobs_endpoint_tests {
             crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
         let advertised = crate::v11::awaiting_signature_result_json(&entry);
         // Persist restart-safe envelope + stage in-memory.
-        let persist = crate::v11::StagedSignPersist::from_entry(&entry);
+        let persist = crate::v11::DurableFinalisationPersist::from_entry(&entry)
+            .expect("encode durable finalisation");
         let mut body = serde_json::json!({});
         body.as_object_mut().unwrap().insert(
-            crate::v11::PENDING_SIGN_BODY_KEY.to_string(),
+            crate::v11::FINALISATION_BODY_KEY.to_string(),
             serde_json::to_value(&persist).unwrap(),
         );
         sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
@@ -3581,10 +3582,11 @@ mod jobs_endpoint_tests {
         let (entry, submission) =
             crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
         let advertised = crate::v11::awaiting_signature_result_json(&entry);
-        let persist = crate::v11::StagedSignPersist::from_entry(&entry);
+        let persist = crate::v11::DurableFinalisationPersist::from_entry(&entry)
+            .expect("encode durable finalisation");
         let mut req_body = serde_json::json!({});
         req_body.as_object_mut().unwrap().insert(
-            crate::v11::PENDING_SIGN_BODY_KEY.to_string(),
+            crate::v11::FINALISATION_BODY_KEY.to_string(),
             serde_json::to_value(&persist).unwrap(),
         );
         sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
@@ -3618,35 +3620,14 @@ mod jobs_endpoint_tests {
         let (status, _h, resp) = run(state.clone(), req).await;
         assert_eq!(status, StatusCode::OK, "body: {resp}");
 
-        // Simulate the dispatcher waking on the commit_wake and driving
-        // finalise (the real dispatcher does this in wait_for_commit).
-        // We re-invoke the same internal path by loading the job and
-        // calling through the hook the same way drive_v11_finalise does.
-        let _ = commit_wake; // sign already notified; we drive finalise inline.
+        // Simulate the dispatcher waking and driving finalise from the
+        // durable capability (same path as wait_for_commit / drive_v11_finalise).
+        let _ = commit_wake;
         let job = state.job_store.load(job_id).await.expect("load").expect("row");
-        let sign_val = job.request_body.get("sign").cloned().expect("sign blob");
-        let entry = state
-            .pending_sign_map
-            .get(&job_id)
-            .expect("staged pending kept until finalise")
-            .clone();
-        let pk_i: [u8; 32] = hex::decode(sign_val["pk_i"].as_str().unwrap())
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let signature: [u8; 64] = hex::decode(sign_val["signature"].as_str().unwrap())
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let r_prime: [u8; 32] = hex::decode(sign_val["r_prime"].as_str().unwrap())
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let sig = zkcoins_prover::prover_bridge::TransitionSignature {
-            pk_i,
-            signature,
-            r_prime,
-        };
+        let entry = crate::v11::rehydrate_pending_sign(&job.request_body)
+            .expect("rehydrate")
+            .expect("signed durable finalisation on row after /sign");
+        let sig = entry.signature.clone().expect("signature installed");
         let hook = state.v11_finalise.as_ref().expect("hook");
         let outcome = hook(entry.pending, sig).expect("finalise");
         assert!(
@@ -3656,9 +3637,7 @@ mod jobs_endpoint_tests {
         let result_json = outcome.to_result_json();
         assert!(result_json.get("new_account_state_hash").is_some());
         assert!(result_json.get("signature_accepted").is_none());
-        assert!(result_json.get("sign").is_none());
 
-        // Persist the §7.5 completed result the way the dispatcher does.
         state
             .job_store
             .complete(job_id, result_json.clone(), 200)
@@ -3742,12 +3721,13 @@ mod jobs_endpoint_tests {
         clear_process_stack_mode_for_test();
     }
 
-    /// Defect 2: rehydrated (verification-grade) pending must not finalise.
+    /// Durable finalisation rehydrate carries a full capability (not a
+    /// verification-grade partial). Resume can finalise from the bytes alone.
     #[tokio::test]
-    async fn rehydrated_pending_refuses_finalise() {
+    async fn rehydrated_durable_finalisation_is_finalise_ready() {
         use crate::v11::{
             clear_process_stack_mode_for_test, ensure_finalise_ready, set_process_stack_mode,
-            ScanStackMode, StagedSignPersist,
+            DurableFinalisationPersist, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
@@ -3756,14 +3736,12 @@ mod jobs_endpoint_tests {
 
         let (entry, _) =
             crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
-        let rehydrated = StagedSignPersist::from_entry(&entry)
+        let rehydrated = DurableFinalisationPersist::from_entry(&entry)
+            .expect("encode")
             .into_entry()
             .expect("rehydrate");
-        assert!(!rehydrated.finalise_safe);
-        ensure_finalise_ready(&rehydrated).expect_err("must refuse partial reconstruction");
-
-        // Live-staged still OK.
-        ensure_finalise_ready(&entry).expect("live-staged finalise-safe");
+        ensure_finalise_ready(&rehydrated).expect("durable rehydrate is finalise-ready");
+        ensure_finalise_ready(&entry).expect("live-staged is finalise-ready");
 
         clear_process_stack_mode_for_test();
     }
@@ -3938,10 +3916,11 @@ mod jobs_endpoint_tests {
         let (entry, submission) =
             crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
         let advertised = crate::v11::awaiting_signature_result_json(&entry);
-        let persist = crate::v11::StagedSignPersist::from_entry(&entry);
+        let persist = crate::v11::DurableFinalisationPersist::from_entry(&entry)
+            .expect("encode durable finalisation");
         let mut req_body = serde_json::json!({});
         req_body.as_object_mut().unwrap().insert(
-            crate::v11::PENDING_SIGN_BODY_KEY.to_string(),
+            crate::v11::FINALISATION_BODY_KEY.to_string(),
             serde_json::to_value(&persist).unwrap(),
         );
         sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
@@ -4050,7 +4029,7 @@ mod jobs_endpoint_tests {
         // Restart envelope persisted.
         let row = state.job_store.load(job_id).await.expect("load").expect("row");
         assert!(
-            row.request_body.get(crate::v11::PENDING_SIGN_BODY_KEY).is_some(),
+            row.request_body.get(crate::v11::FINALISATION_BODY_KEY).is_some(),
             "pending_sign envelope must be on the job row"
         );
 
@@ -4149,17 +4128,20 @@ mod jobs_endpoint_tests {
                     .contains("timed out"),
             "message should describe the handoff race: {resp}"
         );
-        // Defect 2 (persist-before-signal): even on a refused handoff the
-        // signature must already be durable — never SIGNALED without it.
+        // Persist-before-signal: even on a refused handoff the signed
+        // durable capability must already be on the row.
         let row = state
             .job_store
             .load(job_id)
             .await
             .expect("load")
             .expect("row");
+        let entry = crate::v11::rehydrate_pending_sign(&row.request_body)
+            .expect("rehydrate")
+            .expect("durable finalisation present");
         assert!(
-            row.request_body.get("sign").is_some(),
-            "persist-before-signal: sign blob must be durable even when CAS refuses"
+            entry.signature.is_some(),
+            "persist-before-signal: signed capability must be durable even when CAS refuses"
         );
 
         clear_process_stack_mode_for_test();
@@ -4316,10 +4298,12 @@ mod jobs_endpoint_tests {
         clear_process_stack_mode_for_test();
     }
 
-    /// Defect 2: a job that crashed after durable sign persist (CAS/notify
-    /// window) is driven to completion on boot resume — no second `/sign`.
+    /// True fresh-state boot: drive a signed durable capability to completion
+    /// with **no** in-memory carry-over. After planting durable bytes on the
+    /// job row, every process map is cleared (pending, notify, live-begin)
+    /// before resume — the same empty-map shape a restarted node builds.
     #[tokio::test]
-    async fn boot_resume_drives_durable_sign_to_completion() {
+    async fn fresh_state_boot_drives_durable_finalisation_to_completion() {
         use crate::v11::{
             clear_process_stack_mode_for_test, set_process_stack_mode, FinaliseOutcome,
             ScanStackMode,
@@ -4333,19 +4317,14 @@ mod jobs_endpoint_tests {
 
         let finalise_called = Arc::new(AtomicBool::new(false));
         let finalise_called_hook = Arc::clone(&finalise_called);
-
-        let (mut state, _pool, _c) = jobs_test_state().await;
-        state.v11_finalise = Some(Arc::new(move |pending, _sig| {
-            finalise_called_hook.store(true, Ordering::SeqCst);
-            Ok(FinaliseOutcome::from_pending_proof_data(&pending))
-        }));
+        let (mut state, pool, _scope) = jobs_test_state().await;
 
         let result = state
             .job_store
             .create(
                 crate::job_store::JobKind::Send,
                 &[0xD5u8; 32],
-                Some("k-boot-resume-sign"),
+                Some("k-fresh-boot"),
                 serde_json::json!({}),
             )
             .await
@@ -4355,54 +4334,63 @@ mod jobs_endpoint_tests {
             _ => panic!(),
         };
 
-        let (entry, submission) =
+        let (mut entry, submission) =
             crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
         let advertised = crate::v11::awaiting_signature_result_json(&entry);
-        // Live pending (finalise_safe) — what boot recovery needs in-process.
-        state.pending_sign_map.insert(job_id, entry);
+        let accepted = crate::v11::accept_wallet_transition_signature(
+            crate::v11::V11ShadowMode::On,
+            entry.network,
+            &entry.pending,
+            &submission,
+        )
+        .expect("verify");
+        entry.install_signature(accepted).expect("install");
+        let persist = crate::v11::DurableFinalisationPersist::from_entry(&entry).expect("encode");
+        let mut body = serde_json::json!({});
+        body.as_object_mut().unwrap().insert(
+            crate::v11::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&body)
+            .bind(job_id)
+            .execute(pool.as_ref())
+            .await
+            .expect("persist durable finalisation");
         state
             .job_store
             .set_awaiting_signature(job_id, 1, advertised)
             .await
             .expect("awaiting_signature");
-
-        // Durable sign blob as `/sign` would leave after persist (crash
-        // after persist / CAS / notify — no live handoff notifier).
-        let accepted = {
-            let e = state.pending_sign_map.get(&job_id).unwrap().clone();
-            crate::v11::accept_wallet_transition_signature(
-                crate::v11::V11ShadowMode::On,
-                e.network,
-                &e.pending,
-                &submission,
-            )
-            .expect("verify")
-        };
-        let mut body = state
-            .job_store
-            .load(job_id)
-            .await
-            .expect("load")
-            .expect("row")
-            .request_body;
+        // set_awaiting_signature does not clear request_body; re-assert durable
+        // bytes so the row alone is sufficient for resume.
+        let row = state.job_store.load(job_id).await.expect("load").expect("row");
+        let mut body = row.request_body;
         body.as_object_mut().unwrap().insert(
-            "sign".to_string(),
-            serde_json::json!({
-                "pk_i": hex::encode(accepted.pk_i),
-                "signature": hex::encode(accepted.signature),
-                "r_prime": hex::encode(accepted.r_prime),
-            }),
+            crate::v11::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
         );
         sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
             .bind(&body)
             .bind(job_id)
-            .execute(state.job_store.pool())
+            .execute(pool.as_ref())
             .await
-            .expect("persist durable sign");
+            .expect("replant durable");
 
-        // Simulate boot: no notifier, re-enqueue via process_envelope
-        // (same path boot_resume_jobs → dispatcher takes).
+        // Genuinely fresh process state: empty maps + cold finalise hook.
+        // Production boot constructs empty DashMaps the same way.
+        state.pending_sign_map.clear();
         state.job_notify_map.clear();
+        state.v11_live_pending_after_begin.clear();
+        state.v11_finalise = Some(Arc::new(move |pending, _sig| {
+            finalise_called_hook.store(true, Ordering::SeqCst);
+            Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+        }));
+        assert!(
+            state.pending_sign_map.is_empty() && state.job_notify_map.is_empty(),
+            "fresh-state boot must start with empty process maps"
+        );
+
         crate::job_dispatcher::process_envelope_for_test(
             &state.job_store,
             &state,
@@ -4411,25 +4399,185 @@ mod jobs_endpoint_tests {
             crate::job_dispatcher::JobEnvelope { public_id: job_id },
         )
         .await
-        .expect("boot resume process");
+        .expect("fresh-state boot process");
 
         assert!(
             finalise_called.load(Ordering::SeqCst),
-            "boot resume must drive finalise from durable sign"
+            "fresh-state boot must drive finalise from durable capability alone"
         );
         let after = state.job_store.load(job_id).await.expect("load").expect("row");
         assert_eq!(
             after.status,
             crate::job_store::JobStatus::Completed,
-            "job must reach completed after boot resume; status={:?} err={:?}",
+            "job must reach completed; status={:?} err={:?}",
             after.status,
             after.error
         );
-        // Atomic complete strips sign + pending_sign.
+        assert!(after.request_body.get(crate::v11::FINALISATION_BODY_KEY).is_none());
         assert!(after.request_body.get("sign").is_none());
-        assert!(after.request_body.get(crate::v11::PENDING_SIGN_BODY_KEY).is_none());
 
         clear_process_stack_mode_for_test();
+    }
+
+    /// Resuming finalise twice is harmless: second attempt is a status-guarded
+    /// no-op (job already completed; no double-credit / double-complete).
+    #[tokio::test]
+    async fn resume_finalise_twice_is_harmless() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, FinaliseOutcome,
+            ScanStackMode,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let finalise_count = Arc::new(AtomicUsize::new(0));
+        let finalise_count_hook = Arc::clone(&finalise_count);
+
+        let (mut state, _pool, _c) = jobs_test_state().await;
+        state.v11_finalise = Some(Arc::new(move |pending, _sig| {
+            finalise_count_hook.fetch_add(1, Ordering::SeqCst);
+            Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+        }));
+
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xE1u8; 32],
+                Some("k-resume-twice"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (mut entry, submission) =
+            crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v11::awaiting_signature_result_json(&entry);
+        let accepted = crate::v11::accept_wallet_transition_signature(
+            crate::v11::V11ShadowMode::On,
+            entry.network,
+            &entry.pending,
+            &submission,
+        )
+        .expect("verify");
+        entry.install_signature(accepted).expect("install");
+        let persist = crate::v11::DurableFinalisationPersist::from_entry(&entry).expect("encode");
+        let mut body = serde_json::json!({});
+        body.as_object_mut().unwrap().insert(
+            crate::v11::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&body)
+            .bind(job_id)
+            .execute(state.job_store.pool())
+            .await
+            .expect("persist");
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        // Durable body after status flip.
+        let row = state.job_store.load(job_id).await.expect("load").expect("row");
+        let mut body = row.request_body;
+        body.as_object_mut().unwrap().insert(
+            crate::v11::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&body)
+            .bind(job_id)
+            .execute(state.job_store.pool())
+            .await
+            .expect("replant");
+
+        state.pending_sign_map.clear();
+        state.job_notify_map.clear();
+
+        for i in 0..2 {
+            crate::job_dispatcher::process_envelope_for_test(
+                &state.job_store,
+                &state,
+                &state.job_notify_map,
+                Duration::from_secs(30),
+                crate::job_dispatcher::JobEnvelope { public_id: job_id },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("resume #{i}: {e:#}"));
+        }
+
+        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(after.status, crate::job_store::JobStatus::Completed);
+        // First resume runs the hook; second is a terminal no-op (no second apply).
+        assert_eq!(
+            finalise_count.load(Ordering::SeqCst),
+            1,
+            "second resume must not re-run finalise after complete"
+        );
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Status-qualified request_body update fails when the job has moved on.
+    #[tokio::test]
+    async fn status_qualified_request_body_update_fails_when_status_moved() {
+        let (store, _c) = {
+            let (state, _pool, c) = jobs_test_state().await;
+            (state.job_store.clone(), c)
+        };
+        let result = store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xE2u8; 32],
+                Some("k-status-cas"),
+                serde_json::json!({ "seed": true }),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        store
+            .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+            .await
+            .expect("awaiting_signature");
+
+        // Concurrent cancel wins.
+        let applied = store
+            .cancel_not_yet_published(job_id)
+            .await
+            .expect("cancel");
+        assert!(applied);
+
+        let refused = store
+            .replace_request_body_if_status(
+                job_id,
+                crate::job_store::JobStatus::AwaitingSignature,
+                &serde_json::json!({ "finalisation": { "should": "not_apply" } }),
+            )
+            .await
+            .expect("cas");
+        assert!(
+            !refused,
+            "status-qualified update must fail when status moved off awaiting_signature"
+        );
+        let row = store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(row.status, crate::job_store::JobStatus::Cancelled);
+        assert!(
+            row.request_body.get("finalisation").is_none(),
+            "refused update must not apply: {:?}",
+            row.request_body
+        );
     }
 
     /// Defect 3: after a terminal fail, a leftover envelope (even if a
@@ -4465,10 +4613,11 @@ mod jobs_endpoint_tests {
 
         let (entry, _) =
             crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
-        let persist = crate::v11::StagedSignPersist::from_entry(&entry);
+        let persist = crate::v11::DurableFinalisationPersist::from_entry(&entry)
+            .expect("encode durable finalisation");
         let mut req_body = serde_json::json!({});
         req_body.as_object_mut().unwrap().insert(
-            crate::v11::PENDING_SIGN_BODY_KEY.to_string(),
+            crate::v11::FINALISATION_BODY_KEY.to_string(),
             serde_json::to_value(&persist).unwrap(),
         );
         sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
@@ -4501,7 +4650,7 @@ mod jobs_endpoint_tests {
         assert!(
             after_fail
                 .request_body
-                .get(crate::v11::PENDING_SIGN_BODY_KEY)
+                .get(crate::v11::FINALISATION_BODY_KEY)
                 .is_none(),
             "fail must strip envelope atomically: {:?}",
             after_fail.request_body
