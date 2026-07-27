@@ -6246,6 +6246,51 @@ mod jobs_endpoint_tests {
         assert_eq!(v["error"], "feature_disabled");
     }
 
+    /// Defect 4: flag check runs before V1Json. A malformed body to a
+    /// disabled endpoint must still be `feature_disabled`, not
+    /// `malformed_request`.
+    #[tokio::test]
+    async fn attest_balance_flag_off_malformed_body_is_feature_disabled() {
+        let _lock = lock_v11_stack_for_test();
+        use crate::v11::clear_process_stack_mode_for_test;
+        clear_process_stack_mode_for_test();
+
+        let state = test_state();
+
+        // Broken JSON syntax on challenge.
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from("{not-json"))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(
+            v["error"], "feature_disabled",
+            "flag-off must beat V1Json extraction; got: {resp}"
+        );
+
+        // Empty / missing body on admit.
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "feature_disabled");
+
+        // Wrong content-type.
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "text/plain")
+            .body(Body::from("x"))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "feature_disabled");
+    }
+
     /// §7.5 path + envelope + closed error codes under a v1.1 claim.
     #[tokio::test]
     async fn attest_balance_route_matches_section_7_5() {
@@ -6523,9 +6568,17 @@ mod jobs_endpoint_tests {
         clear_process_stack_mode_for_test();
     }
 
-    /// Root closed map advertises the §7.5 attest surface.
+    /// Root closed map advertises the §7.5 attest surface **only when the
+    /// flag is on**.
     #[tokio::test]
-    async fn root_advertises_attest_balance_endpoints() {
+    async fn root_advertises_attest_balance_endpoints_when_flag_on() {
+        let _lock = lock_v11_stack_for_test();
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        };
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
         let state = test_state();
         let req = Request::get("/").body(Body::empty()).unwrap();
         let (status, _h, resp) = run(state, req).await;
@@ -6538,6 +6591,74 @@ mod jobs_endpoint_tests {
         assert_eq!(
             v["endpoints"]["attest_balance"].as_str(),
             Some("POST /v1/attest/balance")
+        );
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Defect 3: flag-off `GET /` is byte-identical to the pre-G6 root map
+    /// — the attest keys are absent (not null), so the endpoints object
+    /// matches the closed always-on key set from before this branch.
+    #[tokio::test]
+    async fn root_flag_off_is_byte_identical_to_pre_attestation_map() {
+        let _lock = lock_v11_stack_for_test();
+        use crate::v11::clear_process_stack_mode_for_test;
+        clear_process_stack_mode_for_test();
+
+        let state = test_state();
+        let req = Request::get("/").body(Body::empty()).unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        let endpoints = v["endpoints"].as_object().expect("endpoints object");
+
+        // Keys must not appear at all (skip_serializing_if), not as null.
+        assert!(
+            !endpoints.contains_key("attest_balance_challenge"),
+            "flag-off root must omit attest_balance_challenge: {resp}"
+        );
+        assert!(
+            !endpoints.contains_key("attest_balance"),
+            "flag-off root must omit attest_balance: {resp}"
+        );
+        // Raw body must not contain the attest keys either (true byte identity
+        // of the wire form, not just Value key absence after reparse).
+        assert!(
+            !resp.contains("attest_balance"),
+            "flag-off raw body must not mention attest_balance*: {resp}"
+        );
+
+        // Full endpoints object must match the pre-G6 payload exactly
+        // (Value equality is key-order-independent; the raw-body check
+        // above pins that the keys are truly omitted, not null).
+        let expected_endpoints = serde_json::json!({
+            "info": "GET  /api/info",
+            "balance": "GET  /api/balance?address={hex}",
+            "history": "GET  /api/history?address={hex}&limit={n}&offset={n}",
+            "receive": "POST /api/receive",
+            "admit_mint": "POST /api/jobs/mint",
+            "admit_send": "POST /api/jobs/send",
+            "get_job": "GET  /api/jobs/{job_id}",
+            "stream_job": "GET  /api/jobs/{job_id}/stream",
+            "commit": "POST /api/jobs/{job_id}/commit",
+            "sign": "POST /v1/jobs/{job_id}/sign",
+            "cancel": "POST /api/jobs/{job_id}/cancel",
+            "proof": "GET  /api/proof/{id}",
+            "inscription": "GET  /api/inscriptions/{txid}",
+            "username_resolve": "GET  /api/username/resolve/{username}",
+            "health": "GET  /health",
+            "health_ready": "GET  /health/ready",
+            "health_publisher": "GET  /health/publisher",
+            "openapi": "GET  /openapi.json",
+            "docs": "GET  /docs",
+        });
+        assert_eq!(
+            v["endpoints"], expected_endpoints,
+            "flag-off endpoints payload must be byte-identical to pre-G6"
+        );
+        assert_eq!(
+            endpoints.len(),
+            expected_endpoints.as_object().unwrap().len(),
+            "flag-off must not add extra endpoint keys"
         );
     }
 

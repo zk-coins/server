@@ -54,7 +54,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use shared::spec_v1::{
     self as host, digest_to_bytes, network_id_mainnet, network_id_regtest, network_id_testnet,
-    Address, HashDigest, Nav,
+    Address, HashDigest, Nav, SpendClassification,
 };
 use zkcoins_program::circuit::compliance::Network;
 use zkcoins_prover::half_agg::verify_single;
@@ -599,6 +599,16 @@ pub fn authorise_attest_balance(
 // BalanceAttestationV1 serialization (§7.1)
 // ---------------------------------------------------------------------------
 
+/// §1.7.9 / §7.1 wire encoding of a `C_balance` proof.
+///
+/// Canonical form is Plonky2's native `ProofWithPublicInputs::to_bytes()`
+/// (public inputs as 8-byte-LE field elements + proof body). **Not**
+/// `bincode` / serde — that is an internal comparison encoding only and a
+/// verifier following the spec cannot read it.
+pub fn encode_c_balance_proof_bytes(proof: &BalanceProof) -> Vec<u8> {
+    proof.to_bytes()
+}
+
 /// Canonical `serialize(BalanceAttestation)` / `BalanceAttestationV1`.
 ///
 /// Layout (§7.1):  
@@ -610,9 +620,7 @@ pub fn serialize_balance_attestation(
     network: Network,
     proof: &BalanceProof,
 ) -> Result<Vec<u8>, AttestError> {
-    let proof_bytes = bincode::serialize(proof).map_err(|e| {
-        AttestError::Internal(format!("serialize C_balance proof: {e}"))
-    })?;
+    let proof_bytes = encode_c_balance_proof_bytes(proof);
     serialize_balance_attestation_v1(statement, network, &proof_bytes)
 }
 
@@ -673,6 +681,36 @@ pub fn require_resolved_anchor(
         AttestError::ProvingFailed(ATTEST_ANCHOR_LOCATOR_EDGE.to_string())
     })?;
     Ok((txid, block_hash))
+}
+
+/// §5.7 host-side completed-anchor gate (pure production body).
+///
+/// A `completed` anchor is the **first occurrence** of `(Pk, R)` on the
+/// node's NfLog at a position inside the ≥6-confirmation-final prefix
+/// `size_final` (`nullifier_pos < size_final`). Without this check a
+/// pending (not-yet-final) or double-spend-loser nullifier could be
+/// disclosed as the attestation anchor.
+///
+/// Called from [`collect_materials`]; tests **must** call this function
+/// — asserting locator non-zeros alone does not establish the property.
+pub fn require_completed_anchor(
+    nullifier_pos: u64,
+    size_final: u64,
+    classification: SpendClassification,
+) -> Result<(), AttestError> {
+    if classification != SpendClassification::ValidFirstSpend {
+        return Err(AttestError::ProvingFailed(format!(
+            "anchor nullifier at pos {nullifier_pos} is not the first occurrence of Pk \
+             on this node's NfLog (classification={classification:?}); state is not completed"
+        )));
+    }
+    if nullifier_pos >= size_final {
+        return Err(AttestError::ProvingFailed(format!(
+            "anchor nullifier position {nullifier_pos} is not inside size_final {size_final} \
+             (not ≥6-confirmation-final; state is not completed)"
+        )));
+    }
+    Ok(())
 }
 
 /// Extract the 32-byte `network_id` field from a serialized attestation.
@@ -834,6 +872,11 @@ fn collect_materials(
 
         // size_final ceiling (RECOMMENDED default §5.7).
         let size_final = engine.nflog().size_final(engine.tip_height());
+        // §5.7 host-side: completed = first occurrence inside size_final.
+        let classification = engine
+            .nflog()
+            .classify(nullifier.public_key, nullifier.signature_r);
+        require_completed_anchor(nullifier_pos, size_final, classification)?;
         let size_final_nav = if size_final == 0 {
             Nav {
                 size: 0,
@@ -1317,9 +1360,9 @@ mod tests {
     }
 
     /// Canonical §7.1 `BalanceAttestationV1` layout: every fixed field at
-    /// its offset, completed anchor fields present, network_id last PI.
+    /// its offset, network_id last PI, length-prefixed proof payload.
     #[test]
-    fn serialize_balance_attestation_canonical_layout_and_completed_anchor() {
+    fn serialize_balance_attestation_canonical_layout() {
         let subject = Address([0x01; 32]);
         let asset_bytes = [0x02u8; 32];
         let asset = host::digest_from_bytes(&asset_bytes).unwrap();
@@ -1352,7 +1395,6 @@ mod tests {
         assert_eq!(&bytes[64..80], &99u128.to_be_bytes());
         assert_eq!(&bytes[80..112], &nav_root);
         assert_eq!(&bytes[112..120], &7u64.to_be_bytes());
-        // Completed anchor fields (txid, block_hash, height, Pk, R).
         assert_eq!(&bytes[120..152], &[0x31; 32]);
         assert_eq!(&bytes[152..184], &[0x42; 32]);
         assert_eq!(&bytes[184..192], &100u64.to_be_bytes());
@@ -1369,6 +1411,145 @@ mod tests {
         let extracted = network_id_from_attestation_bytes(&bytes).unwrap();
         assert_eq!(extracted, nid);
         assert_ne!(extracted, digest_to_bytes(&network_id_mainnet()));
+    }
+
+    /// Hollow `BalanceProof` shell (never circuit-verified) so the wire
+    /// encoder can be bound to `to_bytes()` without a C_balance build.
+    fn hollow_balance_proof() -> BalanceProof {
+        use plonky2::field::polynomial::PolynomialCoeffs;
+        use plonky2::field::types::Field;
+        use plonky2::fri::proof::FriProof;
+        use plonky2::hash::merkle_tree::MerkleCap;
+        use plonky2::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
+        use zkcoins_program::F;
+
+        ProofWithPublicInputs {
+            proof: Proof {
+                wires_cap: MerkleCap(vec![]),
+                plonk_zs_partial_products_cap: MerkleCap(vec![]),
+                quotient_polys_cap: MerkleCap(vec![]),
+                openings: OpeningSet {
+                    constants: vec![],
+                    plonk_sigmas: vec![],
+                    wires: vec![],
+                    plonk_zs: vec![],
+                    plonk_zs_next: vec![],
+                    partial_products: vec![],
+                    quotient_polys: vec![],
+                    lookup_zs: vec![],
+                    lookup_zs_next: vec![],
+                },
+                opening_proof: FriProof {
+                    commit_phase_merkle_caps: vec![],
+                    query_round_proofs: vec![],
+                    final_poly: PolynomialCoeffs::new(vec![]),
+                    pow_witness: F::ZERO,
+                },
+            },
+            // Distinct public inputs so bincode and to_bytes diverge in body.
+            public_inputs: vec![F::from_canonical_u64(7), F::from_canonical_u64(42)],
+        }
+    }
+
+    /// Emitted proof bytes are the §1.7.9 / §7.1 canonical encoding
+    /// (`ProofWithPublicInputs::to_bytes()`), not bincode. Removing the
+    /// production encoder (or switching it to bincode) turns this red.
+    #[test]
+    fn emitted_proof_bytes_are_canonical_to_bytes_not_bincode() {
+        let proof = hollow_balance_proof();
+        let canonical = encode_c_balance_proof_bytes(&proof);
+        assert_eq!(
+            canonical,
+            proof.to_bytes(),
+            "production encoder must be ProofWithPublicInputs::to_bytes()"
+        );
+        let bincode_bytes = bincode::serialize(&proof).expect("bincode of hollow proof");
+        assert_ne!(
+            canonical, bincode_bytes,
+            "canonical wire form must differ from the internal bincode encoding"
+        );
+
+        let statement = BalanceAttestationStatement {
+            subject: Address([0x01; 32]),
+            asset_id: host::digest_from_bytes(&[0x02; 32]).unwrap(),
+            balance: 1,
+            nav_ceiling: Nav {
+                size: 0,
+                mth: host::nflog_empty(),
+            },
+            anchor: BalanceAnchor {
+                txid: [0x31; 32],
+                block_hash: [0x42; 32],
+                height: 1,
+                public_key: [0x11; 32],
+                signature_r: [0x22; 32],
+            },
+        };
+        let bytes =
+            serialize_balance_attestation(&statement, Network::Testnet, &proof).unwrap();
+        // Layout: 288-byte fixed header + u32-be len + proof payload.
+        let len = u32::from_be_bytes(bytes[288..292].try_into().unwrap()) as usize;
+        assert_eq!(len, canonical.len());
+        assert_eq!(
+            &bytes[292..],
+            &canonical[..],
+            "serialize_balance_attestation must embed encode_c_balance_proof_bytes, not bincode"
+        );
+        assert_ne!(&bytes[292..], &bincode_bytes[..]);
+    }
+
+    /// §5.7 completed anchor: first occurrence at a position inside
+    /// `size_final`. The production gate is [`require_completed_anchor`];
+    /// weakening it (accepting pending / double-spend / pos ≥ size_final)
+    /// must turn this red.
+    #[test]
+    fn completed_anchor_requires_first_occurrence_inside_size_final() {
+        // Happy path: first occurrence at pos 0 with size_final = 1.
+        require_completed_anchor(0, 1, SpendClassification::ValidFirstSpend)
+            .expect("first occurrence inside size_final must pass");
+        require_completed_anchor(2, 5, SpendClassification::ValidFirstSpend)
+            .expect("pos < size_final must pass");
+
+        // Not first occurrence → refuse (even when pos is inside size_final).
+        let err = require_completed_anchor(0, 5, SpendClassification::Pending).unwrap_err();
+        assert!(
+            matches!(err, AttestError::ProvingFailed(_)),
+            "pending must fail via production gate, got {err:?}"
+        );
+        assert!(
+            err.message().contains("first occurrence") || err.message().contains("completed"),
+            "message must name the completed/first-occurrence failure: {}",
+            err.message()
+        );
+        let err =
+            require_completed_anchor(0, 5, SpendClassification::RejectedDoubleSpend).unwrap_err();
+        assert!(matches!(err, AttestError::ProvingFailed(_)));
+        assert!(
+            err.message().contains("first occurrence") || err.message().contains("completed"),
+            "double-spend loser must fail completed-anchor gate: {}",
+            err.message()
+        );
+
+        // First occurrence but not yet final (pos ≥ size_final) → refuse.
+        let err =
+            require_completed_anchor(5, 5, SpendClassification::ValidFirstSpend).unwrap_err();
+        assert!(matches!(err, AttestError::ProvingFailed(_)));
+        assert!(
+            err.message().contains("size_final") || err.message().contains("completed"),
+            "pos ≥ size_final must fail: {}",
+            err.message()
+        );
+        let err =
+            require_completed_anchor(0, 0, SpendClassification::ValidFirstSpend).unwrap_err();
+        assert!(matches!(err, AttestError::ProvingFailed(_)));
+        assert!(
+            err.message().contains("size_final") || err.message().contains("completed"),
+            "empty size_final must refuse any pos: {}",
+            err.message()
+        );
+        let err =
+            require_completed_anchor(9, 3, SpendClassification::ValidFirstSpend).unwrap_err();
+        assert!(matches!(err, AttestError::ProvingFailed(_)));
     }
 
     /// Terminal success result carries only `attestation` (hex of V1 bytes).

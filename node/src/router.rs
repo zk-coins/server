@@ -2756,20 +2756,47 @@ fn attest_error_response(err: crate::v11::AttestError) -> axum::response::Respon
         .into_response()
 }
 
+/// FromRequestParts gate for the Gap-G6 attest surface.
+///
+/// Runs **before** any `FromRequest` body extractor ([`V1Json`]), so a
+/// malformed body against a disabled feature still yields
+/// `feature_disabled` rather than `malformed_request`.
+pub(crate) struct RequireAttestRoute;
+
+#[async_trait]
+impl<S> FromRequestParts<S> for RequireAttestRoute
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        _parts: &mut Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        if !crate::v11::v11_attest_route_active() {
+            return Err(attest_error_response(
+                crate::v11::AttestError::FeatureDisabled,
+            ));
+        }
+        Ok(RequireAttestRoute)
+    }
+}
+
 /// `POST /v1/attest/balance/challenge` — §7.5 action-bound challenge.
 ///
 /// Body: `{ subject: <zk-address> }`  
 /// Returns: `{ nonce: <hex32>, expiry: <decimal-string u64>, domain: "zkCoins/v1/AttestBalanceChallenge" }`
 ///
 /// `expiry` is a §7.1 decimal **string** (never a JSON number). Body
-/// decode uses [`V1Json`] so malformed JSON is `400 malformed_request`.
+/// decode uses [`V1Json`] so malformed JSON is `400 malformed_request`
+/// **only when the flag is on** — [`RequireAttestRoute`] checks the
+/// flag before body extraction.
 pub(crate) async fn attest_balance_challenge_handler(
     State(state): State<AppState>,
+    _active: RequireAttestRoute,
     V1Json(body): V1Json<crate::v11::AttestChallengeRequest>,
 ) -> axum::response::Response {
-    if !crate::v11::v11_attest_route_active() {
-        return attest_error_response(crate::v11::AttestError::FeatureDisabled);
-    }
     match crate::v11::issue_attest_challenge(
         &state.attest_challenges,
         &body.subject,
@@ -2793,15 +2820,13 @@ pub(crate) async fn attest_balance_challenge_handler(
 /// Returns `202 { job_id }` on success. Auth failures use the closed
 /// codes `unauthorized` / `challenge_expired` / `malformed_request`.
 /// Body decode uses [`V1Json`] so missing/malformed JSON is the closed
-/// `400 malformed_request` (not Axum's 422 rejection).
+/// `400 malformed_request` (not Axum's 422 rejection) **only when the
+/// flag is on** — [`RequireAttestRoute`] checks the flag first.
 pub(crate) async fn attest_balance_handler(
     State(state): State<AppState>,
+    _active: RequireAttestRoute,
     V1Json(body): V1Json<crate::v11::AttestBalanceRequest>,
 ) -> axum::response::Response {
-    if !crate::v11::v11_attest_route_active() {
-        return attest_error_response(crate::v11::AttestError::FeatureDisabled);
-    }
-
     let authorised = match crate::v11::authorise_attest_balance(
         &state.attest_challenges,
         state.public_hosts.as_slice(),
@@ -4082,6 +4107,10 @@ pub struct RootResponse {
 /// from the default build. Meta routes (`/openapi.json`, `/docs`,
 /// `/docs/{file}`) and admin endpoints (`/api/admin/*`) are also
 /// omitted — the OpenAPI spec is the canonical map for those.
+///
+/// Gap-G6 attestation keys are **flag-gated**: they appear only when
+/// the v1.1 stack claim is active so flag-off `GET /` stays
+/// byte-identical to the pre-attestation response.
 #[derive(Serialize, ToSchema)]
 pub struct RootEndpoints {
     info: &'static str,
@@ -4098,10 +4127,12 @@ pub struct RootEndpoints {
     proof: &'static str,
     inscription: &'static str,
     username_resolve: &'static str,
-    /// §7.5 closed key — Gap G6 balance-attestation challenge.
-    attest_balance_challenge: &'static str,
-    /// §7.5 closed key — Gap G6 balance-attestation admit.
-    attest_balance: &'static str,
+    /// §7.5 closed key — Gap G6 balance-attestation challenge (flag on only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attest_balance_challenge: Option<&'static str>,
+    /// §7.5 closed key — Gap G6 balance-attestation admit (flag on only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attest_balance: Option<&'static str>,
     health: &'static str,
     health_ready: &'static str,
     health_publisher: &'static str,
@@ -4125,6 +4156,9 @@ pub struct RootEndpoints {
 /// endpoints. Cheaper than serving a static landing page and still answers the
 /// "is this the right host?" question without surfacing a bare 404.
 pub(crate) async fn root_handler() -> impl IntoResponse {
+    // Advertise the §7.5 attest surface only when the flag is on so
+    // flag-off GET / is byte-identical to the pre-G6 root map.
+    let attest_on = crate::v11::v11_attest_route_active();
     Json(RootResponse {
         service: "zkcoins-node",
         version: env!("CARGO_PKG_VERSION"),
@@ -4144,8 +4178,9 @@ pub(crate) async fn root_handler() -> impl IntoResponse {
             proof: "GET  /api/proof/{id}",
             inscription: "GET  /api/inscriptions/{txid}",
             username_resolve: "GET  /api/username/resolve/{username}",
-            attest_balance_challenge: "POST /v1/attest/balance/challenge",
-            attest_balance: "POST /v1/attest/balance",
+            attest_balance_challenge: attest_on
+                .then_some("POST /v1/attest/balance/challenge"),
+            attest_balance: attest_on.then_some("POST /v1/attest/balance"),
             health: "GET  /health",
             health_ready: "GET  /health/ready",
             health_publisher: "GET  /health/publisher",

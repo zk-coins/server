@@ -64,13 +64,13 @@ pub mod signature;
 pub use adapter::EngineAdapter;
 pub use attest::{
     accept_attestation_for_network, accept_c_balance_network_binding, authorise_attest_balance,
-    completed_attest_result, ensure_v11_attest_path, issue_attest_challenge,
-    networks_have_distinct_c_balance_pins, parse_u64_decimal, pinned_c_balance_digest,
-    prove_attestation_for_job, public_hosts_from_env, require_resolved_anchor,
-    serialize_balance_attestation, serialize_balance_attestation_v1, unix_now,
-    v11_attest_route_active, AttestBalanceRequest, AttestChallengeMap, AttestChallengeRequest,
-    AttestError, AttestJobBody, U64Decimal, ATTEST_ANCHOR_LOCATOR_EDGE,
-    ATTEST_BALANCE_CHALLENGE_DOMAIN, PINNED_C_BALANCE_DIGEST_MAINNET,
+    completed_attest_result, encode_c_balance_proof_bytes, ensure_v11_attest_path,
+    issue_attest_challenge, networks_have_distinct_c_balance_pins, parse_u64_decimal,
+    pinned_c_balance_digest, prove_attestation_for_job, public_hosts_from_env,
+    require_completed_anchor, require_resolved_anchor, serialize_balance_attestation,
+    serialize_balance_attestation_v1, unix_now, v11_attest_route_active, AttestBalanceRequest,
+    AttestChallengeMap, AttestChallengeRequest, AttestError, AttestJobBody, U64Decimal,
+    ATTEST_ANCHOR_LOCATOR_EDGE, ATTEST_BALANCE_CHALLENGE_DOMAIN, PINNED_C_BALANCE_DIGEST_MAINNET,
     PINNED_C_BALANCE_DIGEST_REGTEST, PINNED_C_BALANCE_DIGEST_TESTNET,
 };
 pub use mode::{
