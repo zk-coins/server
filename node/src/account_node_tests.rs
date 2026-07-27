@@ -221,12 +221,18 @@ fn mint_funded_asset(
 }
 
 /// A second issuer mint into the SAME `(owner, asset_id)` account is
-/// explicitly rejected: `prepare_mint`'s AccountUpdate branch does not
-/// thread a `MintWitness` through the current circuit API, so it
-/// refuses rather than silently proving a non-mint update the issuer
-/// gate would not authorise. Covers the `Some(account_proof)` arm of
-/// `prepare_mint` (the happy `None` arm is covered by every
-/// [`mint_funded_asset`] caller).
+/// explicitly rejected on the **legacy** path: `prepare_mint`'s
+/// AccountUpdate branch does not thread a `MintWitness` through the
+/// current circuit API, so it refuses rather than silently proving a
+/// non-mint update the issuer gate would not authorise.
+///
+/// **G7 / flag-off contract:** this refusal is the default and must stay
+/// byte-identical while `ZKCOINS_V11_SHADOW` is off. Spec-conformant
+/// re-mint lives on the v1.1 engine path (`v11::mint::begin_v11_mint`)
+/// behind the shadow flag — never dual-accepted here.
+///
+/// Covers the `Some(account_proof)` arm of `prepare_mint` (the happy
+/// `None` arm is covered by every [`mint_funded_asset`] caller).
 #[test]
 fn prepare_mint_rejects_remint_into_existing_asset_account() {
     let state_arc = Arc::new(Mutex::new(State::new()));

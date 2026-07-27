@@ -1922,6 +1922,10 @@ pub mod test_signing {
     /// A correctly shaped dummy recursion-base proof and wrapper. It is not a
     /// real transition proof, but is sufficient for host-only tests that must
     /// reject wrapper/public-input mismatches before cryptographic verify.
+    ///
+    /// Builds the compliance circuit (expensive). Prefer a host-only empty
+    /// `ProofWithPublicInputs` for begin_* host tests that only need
+    /// `last_proof: Some(_)` and never prove.
     pub(crate) fn base_proved_transition(network: Network) -> ProvedTransition {
         let proof = super::compliance_circuit(network)
             .expect("compliance circuit")

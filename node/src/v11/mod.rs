@@ -49,30 +49,26 @@
 //! the §7.5 ProofData surface (not legacy ash/ocr). An accepted signature
 //! is driven into [`StateEngine::finalise`](zkcoins_prover::state_engine::StateEngine::finalise)
 //! rather than short-circuited to a status change.
+//!
+//! ## Gap G7 — re-mint into existing asset accounts
+//! [`mint`] exposes the flag-gated entry for token-standard-1 re-issuance
+//! via [`StateEngine::begin_mint`](zkcoins_prover::state_engine::StateEngine::begin_mint)
+//! (AccountUpdateProof + `asset_issuance`). Token-standard-2 re-mint and
+//! over-cap mints are refused naming §6.5 clauses (f)/(e). Legacy
+//! `prepare_mint` remint refusal is unchanged with the flag off.
 
 mod adapter;
-pub mod attest;
 pub mod db_v11;
+pub mod mint;
 pub mod mode;
 pub mod publish;
 pub mod receive;
 pub mod scan;
-pub mod self_heal;
 pub mod separation;
 pub mod signature;
 
 pub use adapter::EngineAdapter;
-pub use attest::{
-    accept_attestation_for_network, accept_c_balance_network_binding, authorise_attest_balance,
-    completed_attest_result, encode_c_balance_proof_bytes, ensure_v11_attest_path,
-    issue_attest_challenge, networks_have_distinct_c_balance_pins, parse_u64_decimal,
-    pinned_c_balance_digest, prove_attestation_for_job, public_hosts_from_env,
-    require_completed_anchor, require_resolved_anchor, serialize_balance_attestation,
-    serialize_balance_attestation_v1, unix_now, v11_attest_route_active, AttestBalanceRequest,
-    AttestChallengeMap, AttestChallengeRequest, AttestError, AttestJobBody, U64Decimal,
-    ATTEST_ANCHOR_LOCATOR_EDGE, ATTEST_BALANCE_CHALLENGE_DOMAIN, PINNED_C_BALANCE_DIGEST_MAINNET,
-    PINNED_C_BALANCE_DIGEST_REGTEST, PINNED_C_BALANCE_DIGEST_TESTNET,
-};
+pub use mint::{begin_v11_mint, ensure_v11_mint_path, V11_MINT_SHADOW_OFF};
 pub use mode::{
     parse_network_label, resolve_v11_shadow_mode, v11_shadow_mode_from_env, validate_v11_boot_pins,
     V11BootPins, V11ShadowMode, V11_BOOT_CONFIG_ERROR,
@@ -89,12 +85,6 @@ pub use scan::{
     folded_keys_from_nflog_mirror, members_to_published, observation_tip_still_live,
     reconcile_persisted_tip, sort_canonical, FoldStats, MAX_RECOVERABLE_REORG_DEPTH,
     PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome,
-};
-pub use self_heal::{
-    boot_canary, decode_v11_live_digest, encode_v11_live_digest, evaluate_v11_slow_canary,
-    evaluate_v11_structural_canary, resolve_v11_live_digest,
-    slow_canary_env_enabled, slow_canary_verify_transition, v11_canary_for_heal,
-    V11CanaryNflogView, V11CanarySample, V11StructuralInputs, V11_DIGEST_TAG, V11_LIVE_DIGEST_LEN,
 };
 pub use separation::{
     claim_process_stack_from_shadow_mode, claim_process_stack_from_v11_shadow_env,

@@ -789,28 +789,62 @@ impl StateEngine {
     // §2.3.1 Mint
     // -----------------------------------------------------------------------
 
-    /// Phase 1 of token-standard-1 mint / issuance (§2.3.1): empty inputs,
-    /// one self-output, `asset_issuance`, `nav = size_final`, six
-    /// `ProofData` fields.
+    /// Phase 1 of mint / issuance (§2.3.1 + §6.5).
     ///
-    /// Token-standard 2 is rejected until the request can name its mandatory
-    /// explicit non-owner emission recipient. Producing the current self
-    /// output would violate the frozen v2 constraints (no self-credit and no
-    /// same-transition CoinHist admission), so this path fails loudly rather
-    /// than constructing an unprovable witness.
+    /// **Token standard 1** (`issuance_version == 1`): empty inputs, one
+    /// self-output, `asset_issuance`, `nav = size_final`. Works as an
+    /// `InitialProof` (fresh account) **or** as an `AccountUpdateProof`
+    /// re-mint into an existing multi-asset account — §6.5 and §2.3.1 step 4
+    /// explicitly admit follow-up mints carrying `asset_issuance`; the
+    /// circuit's clause-3 mint checks apply identically on both modes.
+    ///
+    /// **Token standard 2** (`issuance_version == 2`): the host enforces the
+    /// unsatisfiable cases by name before any witness is built:
+    /// - amount `> cap_total` → §6.5 clause (e) / §2.1 clause 3
+    /// - non-genesis account (re-issuance) → §6.5 clause (f) genesis binding
+    /// - otherwise emission-recipient missing → §6.5 clause (g) (MintRequest
+    ///   does not yet carry a non-owner recipient; self-credit would be
+    ///   unprovable, so we refuse rather than attempt it)
+    ///
+    /// Circuit `C` still re-checks every mint clause in-circuit when a
+    /// witness is eventually proved; the host checks are fail-closed
+    /// preflight, not a substitute for `C`.
     pub fn begin_mint(&self, req: MintRequest) -> Result<PendingTransition> {
         ensure!(
             matches!(req.issuance_version, 1 | 2),
             "unsupported issuance_version {}",
             req.issuance_version
         );
+        ensure!(req.amount > 0, "mint amount must be non-zero");
+
+        // Token-standard-2 host preflight — refuse naming the clause, never
+        // construct an unprovable witness. Order: cap (e) then genesis (f)
+        // then emission (g), so each refusal is independently testable.
         if req.issuance_version == 2 {
+            ensure!(
+                req.amount <= req.cap_total,
+                "token-standard-2 mint refused: amount exceeds cap_total \
+                 (§6.5 clause (e) / §2.1 clause 3 cap enforcement)"
+            );
+            if let Some(existing) = self.accounts.get(&req.owner) {
+                // Clause (f): mint MUST be the issuing account's genesis
+                // transition (send_counter == 0 and current_pubkey == Pk₀).
+                let is_genesis = existing.state.send_counter == 0
+                    && existing.state.current_pubkey == existing.genesis_pubkey
+                    && req.current_pubkey == existing.genesis_pubkey;
+                ensure!(
+                    is_genesis,
+                    "token-standard-2 mint refused: re-issuance into a non-genesis account \
+                     (§6.5 clause (f) genesis binding / §2.1 clause 3)"
+                );
+            }
             bail!(
-                "token-standard-2 mint requires an explicit non-owner emission recipient; \
-                 P1-E.2 MintRequest does not yet carry one"
+                "token-standard-2 mint requires an explicit non-owner emission recipient \
+                 (§6.5 clause (g) emission); MintRequest does not yet carry one — \
+                 refusing rather than constructing an unprovable self-credit witness"
             );
         }
-        ensure!(req.amount > 0, "mint amount must be non-zero");
+
         ensure!(
             req.cap_total == 0,
             "token-standard-1 mint requires cap_total == 0"
@@ -850,6 +884,14 @@ impl StateEngine {
             ensure!(
                 host::nk_commit(&req.nk) == existing.state.nk_commit,
                 "nk does not open the registered nk_commit"
+            );
+            // §6.5 clause (b) / §2.1 clause 3: creator binding uses Pk₀
+            // (genesis_pubkey), not the rotated current key.
+            let expected_owner = Address(host::address(&existing.genesis_pubkey, nk_commit));
+            ensure!(
+                req.owner == expected_owner,
+                "token-standard-1 remint refused: H(creator_pubkey ‖ nk_commit) != owner \
+                 (§6.5 clause (b) / §2.1 clause 3 creator binding)"
             );
         } else {
             let expected_owner = Address(host::address(&req.current_pubkey, nk_commit));
@@ -2293,9 +2335,44 @@ mod tests {
         base_proved_transition, deterministic_secret, normalized_key, sign_transition,
     };
     use crate::prover_bridge::{OutputInclusionProof, ReceivedAuthorization};
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::polynomial::PolynomialCoeffs;
     use plonky2::field::secp256k1_scalar::Secp256K1Scalar;
+    use plonky2::field::types::Field;
+    use plonky2::fri::proof::FriProof;
+    use plonky2::hash::merkle_tree::MerkleCap;
+    use plonky2::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
     use sha2::{Digest, Sha256};
     use zkcoins_program_plonky2::circuit::gadgets::curve_types::{AffinePoint, Secp256K1};
+
+    /// Host-only dummy last_proof for begin_* host construction (no circuit).
+    fn host_dummy_last_proof() -> ComplianceProof {
+        ProofWithPublicInputs {
+            proof: Proof {
+                wires_cap: MerkleCap(vec![]),
+                plonk_zs_partial_products_cap: MerkleCap(vec![]),
+                quotient_polys_cap: MerkleCap(vec![]),
+                openings: OpeningSet {
+                    constants: vec![],
+                    plonk_sigmas: vec![],
+                    wires: vec![],
+                    plonk_zs: vec![],
+                    plonk_zs_next: vec![],
+                    partial_products: vec![],
+                    quotient_polys: vec![],
+                    lookup_zs: vec![],
+                    lookup_zs_next: vec![],
+                },
+                opening_proof: FriProof {
+                    commit_phase_merkle_caps: vec![],
+                    query_round_proofs: vec![],
+                    final_poly: PolynomialCoeffs::new(vec![]),
+                    pow_witness: GoldilocksField::ZERO,
+                },
+            },
+            public_inputs: vec![],
+        }
+    }
 
     /// Deterministic keys / coin construction matching `prover_bridge` fixtures.
     struct FundedFixture {
@@ -2608,10 +2685,265 @@ mod tests {
         let err = engine
             .begin_mint(test_mint_request(2))
             .expect_err("v2 mint must fail loudly");
+        let msg = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("explicit non-owner emission recipient"),
-            "unexpected error: {err:#}"
+            msg.contains("explicit non-owner emission recipient")
+                && msg.contains("§6.5 clause (g)"),
+            "unexpected error: {msg}"
         );
+    }
+
+    /// §6.5 clause (e): amount > cap_total is refused by name before any
+    /// witness is built (including the emission-recipient gap).
+    #[test]
+    fn begin_mint_rejects_token_standard_2_amount_over_cap_naming_clause_e() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let mut req = test_mint_request(2);
+        req.amount = 101;
+        req.cap_total = 100;
+        let err = engine
+            .begin_mint(req)
+            .expect_err("over-cap v2 mint must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("amount exceeds cap_total") && msg.contains("§6.5 clause (e)"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// §6.5 clause (f): a re-mint of a capped asset into a non-genesis
+    /// account is refused by the genesis-binding clause (not silently
+    /// attempted, and not masked as the emission-recipient gap).
+    ///
+    /// Host preflight only — fires before `account_transition_context`, so
+    /// no `last_proof` / circuit build is required.
+    #[test]
+    fn begin_mint_rejects_token_standard_2_remint_naming_clause_f() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let base = test_mint_request(1);
+        let nk_commit = host::nk_commit(&base.nk);
+        // Install a post-genesis account (send_counter = 1) so clause (f)
+        // fires on a subsequent v2 mint request.
+        let state = AccountState::new(
+            base.owner,
+            nk_commit,
+            BTreeMap::new(),
+            base.next_pubkey, // rotated away from Pk₀
+            1,
+            host::coinhist_empty_root(),
+        )
+        .expect("post-genesis state");
+        engine
+            .insert_account(
+                base.owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk: base.nk,
+                    genesis_pubkey: base.current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .expect("insert");
+
+        let mut req = test_mint_request(2);
+        req.owner = base.owner;
+        req.nk = base.nk;
+        req.current_pubkey = base.next_pubkey; // matches installed state
+        req.amount = 50;
+        req.cap_total = 100;
+        let err = engine
+            .begin_mint(req)
+            .expect_err("v2 remint must fail at genesis binding");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("non-genesis account") && msg.contains("§6.5 clause (f)"),
+            "unexpected error: {msg}"
+        );
+        // Cap is not the reason (amount ≤ cap); refuse must not mask as (e).
+        assert!(
+            !msg.contains("clause (e)"),
+            "clause (f) refusal must not be reported as clause (e): {msg}"
+        );
+    }
+
+    /// Conformant token-standard-1 re-mint into an existing multi-asset
+    /// account: AccountUpdateProof mode, asset_issuance present, supply
+    /// (balance) = prior + minted amount. Host-only — no circuit prove.
+    #[test]
+    fn begin_mint_std1_remint_into_existing_account_updates_supply() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let first = test_mint_request(1);
+        let nk_commit = host::nk_commit(&first.nk);
+        let name_hash = host::name_hash(&first.name).expect("name_hash");
+        let asset_id = host::asset_id_v1(
+            host::GENESIS_TAG,
+            &first.current_pubkey,
+            &name_hash,
+            first.decimals,
+            1,
+        );
+        let prior_amount: u128 = 100;
+        let remint_amount: u128 = 40;
+
+        // Fold a predecessor nullifier so AccountUpdateProof can bind it.
+        let predecessor_position = ChainPosition {
+            height: 10,
+            tx_index: 0,
+            vin_index: 0,
+            member_index: 0,
+        };
+        let predecessor_entry = NfLogEntry {
+            pk: first.current_pubkey,
+            r: [0x61; 32],
+        };
+        engine.set_tip_height(10);
+        assert_eq!(
+            engine
+                .nflog
+                .fold(
+                    predecessor_position,
+                    predecessor_entry.pk,
+                    predecessor_entry.r,
+                )
+                .unwrap(),
+            FoldOutcome::Appended(0)
+        );
+        engine.nflog_entries.push(predecessor_entry);
+        engine.nflog_positions.push(predecessor_position);
+        engine.set_tip_height(15);
+
+        // Prior self-output from the first mint, already admitted.
+        let empty = AccountState::new(
+            first.owner,
+            nk_commit,
+            BTreeMap::new(),
+            first.current_pubkey,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let prior_coin = Coin {
+            identifier: host::coin_identifier(
+                empty_ash,
+                &first.owner.0,
+                asset_id,
+                prior_amount,
+                0,
+            ),
+            recipient: first.owner,
+            amount: prior_amount,
+            asset_id,
+        };
+        let mut coinhist = CoinHistTree::new();
+        let prior_id = host::digest_to_bytes(&prior_coin.identifier);
+        coinhist.admit(prior_id).expect("admit prior");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            prior_id,
+            TrackedCoin {
+                coin: prior_coin,
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), prior_amount);
+        // Post-first-mint: send_counter = 1, current key rotated to next.
+        let state = AccountState::new(
+            first.owner,
+            nk_commit,
+            balances,
+            first.next_pubkey,
+            1,
+            coinhist.root(),
+        )
+        .expect("post-mint state");
+        engine
+            .insert_account(
+                first.owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk: first.nk,
+                    genesis_pubkey: first.current_pubkey,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: Some(host_dummy_last_proof()),
+                    last_nav_opening: Some(NavOpening {
+                        nav: Nav {
+                            size: 0,
+                            mth: host::nflog_empty(),
+                        },
+                        nav_rand: [0; 32],
+                    }),
+                    last_nullifier: Some(NullifierOpening {
+                        public_key: predecessor_entry.pk,
+                        signature_r: predecessor_entry.r,
+                        r_prime: [0; 32],
+                    }),
+                    last_nullifier_pos: Some(0),
+                },
+            )
+            .expect("insert funded account");
+
+        let (_, _, remint_next) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/test-mint/pk2",
+        ));
+        let remint = MintRequest {
+            owner: first.owner,
+            nk: first.nk,
+            current_pubkey: first.next_pubkey,
+            next_pubkey: remint_next,
+            name: first.name.clone(),
+            decimals: first.decimals,
+            amount: remint_amount,
+            issuance_version: 1,
+            cap_total: 0,
+            terms_salt: [0u8; 32],
+            nav_rand: [0x33; 32],
+            npk_rand: [0x44; 32],
+        };
+        let pending = engine.begin_mint(remint).expect("std1 remint must succeed");
+
+        assert_eq!(pending.mode, TransitionMode::AccountUpdateProof);
+        assert!(
+            pending.witness_wip.asset_issuance.is_some(),
+            "remint must carry asset_issuance so Mint(a) flows into clause 3"
+        );
+        let issuance = pending.witness_wip.asset_issuance.as_ref().unwrap();
+        assert_eq!(issuance.amount, remint_amount);
+        assert_eq!(issuance.asset_id, asset_id);
+        assert_eq!(issuance.creator_pubkey, first.current_pubkey);
+        assert_eq!(issuance.issuance_version, 1);
+
+        let new_bal = pending
+            .witness_wip
+            .new_account_state
+            .balances
+            .get(&host::digest_to_bytes(&asset_id))
+            .copied();
+        assert_eq!(
+            new_bal,
+            Some(prior_amount + remint_amount),
+            "supply must equal prior balance + remint amount"
+        );
+        assert_eq!(pending.witness_wip.new_account_state.send_counter, 2);
+        assert_eq!(
+            pending.witness_wip.new_account_state.current_pubkey,
+            remint_next
+        );
+        // Self-output of the remint amount only (prior coin stays spendable
+        // until a later spend; clause 7 credits balances, not rewrites coins).
+        assert_eq!(pending.witness_wip.output_coins.len(), 1);
+        assert_eq!(pending.witness_wip.output_coins[0].amount, remint_amount);
+        assert_eq!(pending.witness_wip.output_coins[0].asset_id, asset_id);
     }
 
     #[test]
