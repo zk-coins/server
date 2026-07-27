@@ -30,6 +30,25 @@
 //! never leaves the package; assembling a durable effect from raw parts is
 //! a compile error — see the `downstream-boundary` package
 //! (`sealed_plumbing_compile_fail_matrix`).
+//!
+//! ## Gap G4 — transition signature
+//! Behind the same flag, wallet authorisation is a §3.2
+//! [`TransitionSignature`](zkcoins_prover::prover_bridge::TransitionSignature)
+//! (BIP-340 + sign-to-contract over the full canonical `serialize(ProofData)`),
+//! verified by [`signature`]. The finalise-path entry takes a
+//! [`PendingTransition`](zkcoins_prover::state_engine::PendingTransition) and
+//! derives `pk_i` / `ProofData` from it so provenance cannot be decorative.
+//! Residual ash‖ocr [`shared::commitment::Commitment`] is refused under a
+//! v1.1 process claim ([`refuse_legacy_commitment_under_v11`]); with the
+//! flag off the legacy path is untouched.
+//!
+//! Production caller: flag-gated `POST /v1/jobs/{id}/sign` (§7.5) decodes
+//! [`WalletSignSubmission`] at the boundary and verifies via
+//! [`accept_wallet_transition_signature`] against a staged
+//! [`PendingSignEntry`]. Under a v1.1 claim, `awaiting_signature` advertises
+//! the §7.5 ProofData surface (not legacy ash/ocr). An accepted signature
+//! is driven into [`StateEngine::finalise`](zkcoins_prover::state_engine::StateEngine::finalise)
+//! rather than short-circuited to a status change.
 
 mod adapter;
 pub mod db_v11;
@@ -38,6 +57,7 @@ pub mod publish;
 pub mod receive;
 pub mod scan;
 pub mod separation;
+pub mod signature;
 
 pub use adapter::EngineAdapter;
 pub use mode::{
@@ -63,6 +83,20 @@ pub use separation::{
     legacy_scan_state_present, load_stack_scan_mode, process_stack_mode,
     require_stack_mode_for_update, require_v11_process_for_nflog_write, set_process_stack_mode,
     v11_scan_state_present, ScanStackMode, STACK_CAPABILITY_REFUSAL, STACK_SEPARATION_REFUSAL,
+};
+pub use signature::{
+    accept_wallet_transition_signature, awaiting_signature_result_json, decode_job_error,
+    durable_finalisation_with_signature, encode_job_error, ensure_completion_ready,
+    ensure_finalise_ready, ensure_v11_signature_path, finalise_accepted_prove_outside_lock,
+    finalise_accepted_prove_persist_and_stage, finalise_with_accepted_signature,
+    legacy_awaiting_signature_result_json,
+    publisher_pubkey_from_request_body, refuse_legacy_commitment_under_v11,
+    register_live_pending_after_begin, rehydrate_pending_sign, select_awaiting_signature_result,
+    sign_rejection, stage_pending_sign, strip_pending_sign_from_body,
+    take_live_pending_after_begin, v11_sign_route_active, verify_transition_signature_material,
+    DurableFinalisationPersist, FinaliseOutcome, PendingSignEntry, PendingSignMap, SignatureCheck,
+    StagedSignPersist, TransitionSignatureError, WalletSignSubmission, WalletSignSubmissionWire,
+    FINALISATION_BODY_KEY, LEGACY_COMMITMENT_REFUSED_UNDER_V11, PENDING_SIGN_BODY_KEY,
 };
 
 #[cfg(test)]

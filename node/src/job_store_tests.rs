@@ -32,6 +32,14 @@ fn sample_mint_body() -> serde_json::Value {
     })
 }
 
+/// Assert [`FinaliseClaim::Won`] and return its fencing token.
+fn expect_won(claim: FinaliseClaim) -> i64 {
+    match claim {
+        FinaliseClaim::Won { fence } => fence,
+        other => panic!("expected FinaliseClaim::Won, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn create_fresh_returns_queued_row() {
     let (store, _c) = setup_store().await;
@@ -320,10 +328,55 @@ async fn cancel_from_queued_returns_true_and_marks_cancelled() {
 }
 
 #[tokio::test]
-async fn cancel_from_proving_returns_false_and_leaves_status_untouched() {
+async fn cancel_legacy_rejects_proving_and_awaiting_signature() {
+    // Defect 1: shared JobStore::cancel stays queued-only under flag-off /
+    // legacy `/api` path — proving and awaiting_signature must refuse.
+    let (store, _c) = setup_store().await;
+    let CreateResult::Fresh(proving) = store
+        .create(JobKind::Mint, &account_addr(15), None, sample_mint_body())
+        .await
+        .expect("create proving")
+    else {
+        panic!("expected Fresh");
+    };
+    store
+        .set_status(proving.public_id, JobStatus::Proving, "proving")
+        .await
+        .expect("set proving");
+    let applied = store.cancel(proving.public_id).await.expect("cancel");
+    assert!(
+        !applied,
+        "legacy cancel must reject proving (pre-v1.1 byte-identical)"
+    );
+    let after = store.load(proving.public_id).await.unwrap().unwrap();
+    assert_eq!(after.status, JobStatus::Proving);
+
+    let CreateResult::Fresh(asig) = store
+        .create(JobKind::Mint, &account_addr(16), None, sample_mint_body())
+        .await
+        .expect("create awaiting")
+    else {
+        panic!("expected Fresh");
+    };
+    store
+        .set_awaiting_signature(asig.public_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+    let applied = store.cancel(asig.public_id).await.expect("cancel");
+    assert!(
+        !applied,
+        "legacy cancel must reject awaiting_signature"
+    );
+    let after = store.load(asig.public_id).await.unwrap().unwrap();
+    assert_eq!(after.status, JobStatus::AwaitingSignature);
+}
+
+#[tokio::test]
+async fn cancel_not_yet_published_accepts_proving_and_awaiting_signature() {
+    // §7.5 / v1.1 path only: proving and awaiting_signature are cancellable.
     let (store, _c) = setup_store().await;
     let CreateResult::Fresh(job) = store
-        .create(JobKind::Mint, &account_addr(15), None, sample_mint_body())
+        .create(JobKind::Mint, &account_addr(17), None, sample_mint_body())
         .await
         .expect("create")
     else {
@@ -333,10 +386,1691 @@ async fn cancel_from_proving_returns_false_and_leaves_status_untouched() {
         .set_status(job.public_id, JobStatus::Proving, "proving")
         .await
         .expect("set proving");
-    let applied = store.cancel(job.public_id).await.expect("cancel");
-    assert!(!applied, "cancel from non-queued state must not apply");
+    let applied = store
+        .cancel_not_yet_published(job.public_id)
+        .await
+        .expect("cancel_not_yet_published");
+    assert!(
+        applied,
+        "v1.1 cancel from proving must apply (§7.5 not-yet-published)"
+    );
     let after = store.load(job.public_id).await.unwrap().unwrap();
-    assert_eq!(after.status, JobStatus::Proving);
+    assert_eq!(after.status, JobStatus::Cancelled);
+
+    let CreateResult::Fresh(asig) = store
+        .create(JobKind::Mint, &account_addr(18), None, sample_mint_body())
+        .await
+        .expect("create")
+    else {
+        panic!("expected Fresh");
+    };
+    // Plant a restart envelope so the atomic strip is observable.
+    sqlx::query(
+        "UPDATE jobs SET request_body = $1 WHERE public_id = $2",
+    )
+    .bind(serde_json::json!({
+        "pending_sign": {"mode": "initial"},
+        "sign": {"pk_i": "00"}
+    }))
+    .bind(asig.public_id)
+    .execute(store.pool())
+    .await
+    .expect("plant envelope");
+    store
+        .set_awaiting_signature(asig.public_id, 2, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+    // set_awaiting_signature does not clear request_body; re-plant after.
+    sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+        .bind(serde_json::json!({
+            "pending_sign": {"mode": "initial"},
+            "sign": {"pk_i": "00"}
+        }))
+        .bind(asig.public_id)
+        .execute(store.pool())
+        .await
+        .expect("replant");
+    let applied = store
+        .cancel_not_yet_published(asig.public_id)
+        .await
+        .expect("cancel awaiting");
+    assert!(applied);
+    let after = store.load(asig.public_id).await.unwrap().unwrap();
+    assert_eq!(after.status, JobStatus::Cancelled);
+    assert!(
+        after.request_body.get("pending_sign").is_none(),
+        "atomic cancel must strip pending_sign: {:?}",
+        after.request_body
+    );
+    assert!(
+        after.request_body.get("sign").is_none(),
+        "atomic cancel must strip sign: {:?}",
+        after.request_body
+    );
+}
+
+#[tokio::test]
+async fn fail_atomically_strips_pending_sign_envelope() {
+    // Defect 3: fail must not leave a restart envelope that boot could
+    // rehydrate. Strip is atomic with the status flip.
+    let (store, _c) = setup_store().await;
+    let CreateResult::Fresh(job) = store
+        .create(JobKind::Send, &account_addr(19), None, sample_mint_body())
+        .await
+        .expect("create")
+    else {
+        panic!("expected Fresh");
+    };
+    sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+        .bind(serde_json::json!({
+            "pending_sign": {"mode": "initial", "network": "mainnet"},
+            "other": "kept"
+        }))
+        .bind(job.public_id)
+        .execute(store.pool())
+        .await
+        .expect("plant");
+    store
+        .fail(job.public_id, "awaiting_signature timeout")
+        .await
+        .expect("fail");
+    let after = store.load(job.public_id).await.unwrap().unwrap();
+    assert_eq!(after.status, JobStatus::Failed);
+    assert!(
+        after.request_body.get("pending_sign").is_none(),
+        "fail must atomically strip pending_sign: {:?}",
+        after.request_body
+    );
+    assert_eq!(
+        after.request_body.get("other").and_then(|v| v.as_str()),
+        Some("kept"),
+        "unrelated keys must survive: {:?}",
+        after.request_body
+    );
+}
+
+#[tokio::test]
+async fn claim_finalise_exclusive_only_one_winner_from_awaiting_signature() {
+    let (store, _c) = setup_store().await;
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xCA),
+            Some("k-claim-exclusive"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let a = store.claim_finalise_exclusive(job_id).await.expect("claim a");
+    let b = store.claim_finalise_exclusive(job_id).await.expect("claim b");
+    let fence_a = expect_won(a);
+    assert!(
+        matches!(
+            b,
+            FinaliseClaim::Lost {
+                observed: JobStatus::Broadcasting
+            }
+        ),
+        "second claim must lose with observed broadcasting; got {b:?}"
+    );
+    let row = store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(row.status, JobStatus::Broadcasting);
+    assert_eq!(row.phase, FINALISE_CLAIM_PHASE);
+    let claim = row
+        .request_body
+        .get(FINALISE_CLAIM_BODY_KEY)
+        .expect("won claim must plant finalise_claim");
+    let owner_str = store.process_owner().to_string();
+    assert_eq!(
+        claim.get("owner").and_then(|v| v.as_str()),
+        Some(owner_str.as_str()),
+        "claim owner must be this store's process_owner"
+    );
+    assert_eq!(
+        claim.get("fence").and_then(|v| v.as_i64()),
+        Some(fence_a),
+        "claim fence must match Won token"
+    );
+    assert!(
+        claim.get("lease_expires_at").and_then(|v| v.as_str()).is_some(),
+        "claim must carry lease_expires_at"
+    );
+
+    // Live (unexpired) lease must survive a boot-style release sweep.
+    assert!(
+        !store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release live"),
+        "live owner lease must not be released by boot sweep"
+    );
+
+    // Expire the lease — evidence the owner abandoned.
+    expire_finalise_claim_lease(store.pool(), job_id).await;
+    assert!(
+        store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release expired"),
+        "expired lease is evidence of abandonment"
+    );
+    let c = store.claim_finalise_exclusive(job_id).await.expect("claim c");
+    let fence_c = expect_won(c);
+    assert!(
+        fence_c > fence_a,
+        "reclaim must mint a strictly newer fencing token; old={fence_a} new={fence_c}"
+    );
+    let d = store.claim_finalise_exclusive(job_id).await.expect("claim d");
+    assert!(
+        matches!(d, FinaliseClaim::Lost { .. }),
+        "second after re-claim must lose; got {d:?}"
+    );
+}
+
+/// Plant an expired lease on a `finalise_claimed` row (test helper).
+async fn expire_finalise_claim_lease(pool: &sqlx::PgPool, job_id: uuid::Uuid) {
+    sqlx::query(
+        "UPDATE jobs SET request_body = jsonb_set( \
+             COALESCE(request_body, '{}'::jsonb), \
+             '{finalise_claim,lease_expires_at}', \
+             to_jsonb('1970-01-01T00:00:00Z'::text), \
+             true \
+         ) WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .expect("expire lease");
+}
+
+/// Defect 2: a live owner's claim survives a boot release sweep; only an
+/// expired lease (abandonment evidence) is reclaimable.
+#[tokio::test]
+async fn live_owner_claim_survives_boot_release_sweep() {
+    let scope = setup_pool().await;
+    let owner_live = uuid::Uuid::new_v4();
+    let owner_boot = uuid::Uuid::new_v4();
+    let live_store = JobStore::with_process_owner(scope.pool.clone(), owner_live);
+    let boot_store = JobStore::with_process_owner(scope.pool.clone(), owner_boot);
+
+    let result = live_store
+        .create(
+            JobKind::Send,
+            &account_addr(0xCB),
+            Some("k-live-lease"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    live_store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let live_fence = expect_won(
+        live_store
+            .claim_finalise_exclusive(job_id)
+            .await
+            .expect("live claim"),
+    );
+
+    // Boot sweep in a *different* process must not free a live lease.
+    assert!(
+        !boot_store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("boot release"),
+        "boot must not release a live owner's unexpired claim"
+    );
+    assert!(
+        matches!(
+            boot_store
+                .claim_finalise_exclusive(job_id)
+                .await
+                .expect("boot re-claim"),
+            FinaliseClaim::Lost {
+                observed: JobStatus::Broadcasting
+            }
+        ),
+        "second process must lose while live lease holds"
+    );
+
+    // Live owner can renew under its fence.
+    assert!(
+        live_store
+            .renew_finalise_claim(job_id, owner_live, live_fence, FINALISE_CLAIM_LEASE)
+            .await
+            .expect("renew"),
+        "live owner must renew its own claim"
+    );
+    // Foreign owner cannot renew (wrong owner + wrong fence).
+    assert!(
+        !boot_store
+            .renew_finalise_claim(job_id, owner_boot, live_fence, FINALISE_CLAIM_LEASE)
+            .await
+            .expect("foreign renew"),
+        "non-owner must not renew"
+    );
+    // Stale fence cannot renew even with the right owner.
+    assert!(
+        !live_store
+            .renew_finalise_claim(job_id, owner_live, live_fence - 1, FINALISE_CLAIM_LEASE)
+            .await
+            .expect("stale fence renew"),
+        "stale fence must not renew"
+    );
+
+    // After lease expiry, boot may release with abandonment evidence.
+    expire_finalise_claim_lease(live_store.pool(), job_id).await;
+    assert!(
+        boot_store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release after expiry"),
+        "expired lease is abandonment evidence"
+    );
+    expect_won(
+        boot_store
+            .claim_finalise_exclusive(job_id)
+            .await
+            .expect("boot claim after release"),
+    );
+
+    drop(scope);
+}
+
+/// Defect 2 (P0): lease expiry is created with Postgres `NOW()`, not host
+/// `Utc::now()`. Host/DB clock skew cannot manufacture abandonment of a
+/// still-live owner because create and evaluate share one clock.
+#[tokio::test]
+async fn finalise_claim_lease_uses_database_clock_not_host() {
+    let (store, _c) = setup_store().await;
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xCC),
+            Some("k-db-clock"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let lease = std::time::Duration::from_secs(300);
+    expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, store.process_owner(), lease)
+            .await
+            .expect("claim"),
+    );
+
+    // Remaining lease lifetime measured against DB NOW() must be ≈ lease.
+    let remaining_secs: f64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM ( \
+             (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz \
+             - NOW() \
+         ))::float8 \
+         FROM jobs WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(store.pool())
+    .await
+    .expect("remaining lease");
+    assert!(
+        (remaining_secs - 300.0).abs() < 3.0,
+        "lease_expires_at must be NOW()+lease on the database clock; remaining={remaining_secs}s"
+    );
+
+    // Live under DB comparison — boot cannot free it.
+    assert!(
+        !store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release"),
+        "DB-live lease must not be released"
+    );
+}
+
+/// Defect 2 (P0): host clock cannot expire a lease that is still live on
+/// the database clock. Plant an expiry that is still `> NOW()` in Postgres;
+/// release_stale must refuse regardless of what the host wall clock says.
+#[tokio::test]
+async fn host_db_clock_skew_cannot_expire_live_lease() {
+    let (store, _c) = setup_store().await;
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xCD),
+            Some("k-clock-skew"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+    expect_won(store.claim_finalise_exclusive(job_id).await.expect("claim"));
+
+    // Force expiry to a value that is unambiguously live on the DB clock
+    // (NOW() + 1 hour). Even if the host clock were hours ahead, release
+    // only consults Postgres NOW().
+    sqlx::query(
+        "UPDATE jobs SET request_body = jsonb_set( \
+             COALESCE(request_body, '{}'::jsonb), \
+             '{finalise_claim,lease_expires_at}', \
+             to_jsonb((NOW() + interval '1 hour')::text), \
+             true \
+         ) WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .execute(store.pool())
+    .await
+    .expect("plant DB-future expiry");
+
+    assert!(
+        !store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release"),
+        "lease still live on database clock must survive release sweep"
+    );
+    // Second process still loses the exclusive claim.
+    let other = JobStore::with_process_owner(store.pool().clone(), uuid::Uuid::new_v4());
+    assert!(
+        matches!(
+            other.claim_finalise_exclusive(job_id).await.expect("other claim"),
+            FinaliseClaim::Lost {
+                observed: JobStatus::Broadcasting
+            }
+        ),
+        "second resumer must lose while DB-live lease holds"
+    );
+}
+
+/// Defect 2 (P0): a "prove" longer than the lease period does **not** let a
+/// second resumer in, because the owner renews during the long operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prove_longer_than_lease_period_blocks_second_resumer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+    let other = JobStore::with_process_owner(scope.pool.clone(), uuid::Uuid::new_v4());
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xCE),
+            Some("k-long-prove-lease"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    // Short lease so the test budget is seconds, not minutes.
+    let lease = Duration::from_secs(1);
+    let renew_every = Duration::from_millis(250);
+    let fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, lease)
+            .await
+            .expect("claim"),
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_probe = Arc::clone(&stop);
+    let other_store = other.clone();
+    // Probe: while the long operation runs, a second process must never
+    // free + win the claim.
+    let probe = tokio::spawn(async move {
+        let mut saw_live_block = false;
+        while !stop_probe.load(Ordering::SeqCst) {
+            let released = other_store
+                .release_stale_finalise_claim(job_id)
+                .await
+                .expect("release probe");
+            if released {
+                let claim = other_store
+                    .claim_finalise_exclusive_as(job_id, other_store.process_owner(), lease)
+                    .await
+                    .expect("claim probe");
+                if matches!(claim, FinaliseClaim::Won { .. }) {
+                    return Err("second resumer won claim during live long prove".to_string());
+                }
+            } else {
+                saw_live_block = true;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        if !saw_live_block {
+            return Err("probe never observed a live (unreleased) lease".to_string());
+        }
+        Ok(())
+    });
+
+    // Long operation > lease period, with heartbeat renewals (production shape).
+    let long_prove = Duration::from_secs(3);
+    assert!(
+        long_prove > lease,
+        "test requires prove longer than lease"
+    );
+    crate::job_dispatcher::with_finalise_lease_heartbeat(
+        &store,
+        job_id,
+        owner,
+        fence,
+        lease,
+        renew_every,
+        Duration::from_secs(5),
+        async {
+            tokio::time::sleep(long_prove).await;
+        },
+    )
+    .await
+    .expect("long prove must complete while lease is kept alive by heartbeat");
+
+    stop.store(true, Ordering::SeqCst);
+    probe.await.expect("join probe").expect("probe ok");
+
+    // After the owner stops renewing, the short lease expires and boot may free.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        other
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release after abandon"),
+        "expired lease after owner stopped renewing is abandonment evidence"
+    );
+    expect_won(
+        other
+            .claim_finalise_exclusive_as(job_id, other.process_owner(), lease)
+            .await
+            .expect("claim after abandon"),
+    );
+
+    drop(scope);
+}
+
+/// Defect 1 (P0): a renewal that returns `Ok(false)` mid-prove aborts the
+/// operation and discards the result — fail closed, not a logged warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_renew_false_aborts_work_and_discards_result() {
+    use crate::job_dispatcher::{
+        with_finalise_lease_heartbeat_renew, FinaliseLeaseLivenessLost,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let renew_calls = Arc::new(AtomicUsize::new(0));
+    let work_finished = Arc::new(AtomicBool::new(false));
+    let renew_calls_h = Arc::clone(&renew_calls);
+    let work_finished_h = Arc::clone(&work_finished);
+
+    let result = with_finalise_lease_heartbeat_renew(
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+        move || {
+            let renew_calls_h = Arc::clone(&renew_calls_h);
+            async move {
+                renew_calls_h.fetch_add(1, Ordering::SeqCst);
+                // Every renew loses ownership — fail closed on first tick.
+                Ok(false)
+            }
+        },
+        async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            work_finished_h.store(true, Ordering::SeqCst);
+            "should_not_be_returned"
+        },
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        Err(FinaliseLeaseLivenessLost::RenewReturnedFalse),
+        "Ok(false) renew must abort with RenewReturnedFalse"
+    );
+    assert!(
+        !work_finished.load(Ordering::SeqCst),
+        "work must be cancelled — result discarded, not completed"
+    );
+    assert!(
+        renew_calls.load(Ordering::SeqCst) >= 1,
+        "renew must have been attempted"
+    );
+}
+
+/// Defect 1 (P0): a renew database/storage error mid-prove aborts work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_renew_error_aborts_work_and_discards_result() {
+    use crate::job_dispatcher::{
+        with_finalise_lease_heartbeat_renew, FinaliseLeaseLivenessLost,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let work_finished = Arc::new(AtomicBool::new(false));
+    let work_finished_h = Arc::clone(&work_finished);
+
+    let result = with_finalise_lease_heartbeat_renew(
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+        || async { Err("simulated db error".to_string()) },
+        async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            work_finished_h.store(true, Ordering::SeqCst);
+            42
+        },
+    )
+    .await;
+
+    match result {
+        Err(FinaliseLeaseLivenessLost::RenewError(msg)) => {
+            assert!(
+                msg.contains("simulated db error"),
+                "error text must surface; got {msg}"
+            );
+        }
+        other => panic!("expected RenewError, got {other:?}"),
+    }
+    assert!(
+        !work_finished.load(Ordering::SeqCst),
+        "work must stop when renew errors"
+    );
+}
+
+/// Defect 1 (P0): if the heartbeat task dies silently, work must stop.
+/// A panic inside renew drops the loss channel without a value — the same
+/// signal as a task that disappears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_task_death_aborts_work_and_discards_result() {
+    use crate::job_dispatcher::{
+        with_finalise_lease_heartbeat_renew, FinaliseLeaseLivenessLost,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let work_finished = Arc::new(AtomicBool::new(false));
+    let work_finished_h = Arc::clone(&work_finished);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_h = Arc::clone(&calls);
+
+    let result = with_finalise_lease_heartbeat_renew(
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+        move || {
+            let calls_h = Arc::clone(&calls_h);
+            async move {
+                let n = calls_h.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // Panic on the first real renew: heartbeat task dies.
+                    panic!("simulated heartbeat task death");
+                }
+                Ok(true)
+            }
+        },
+        async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            work_finished_h.store(true, Ordering::SeqCst);
+            "should_not_complete"
+        },
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        Err(FinaliseLeaseLivenessLost::HeartbeatTaskEnded),
+        "heartbeat death must surface as HeartbeatTaskEnded"
+    );
+    assert!(
+        !work_finished.load(Ordering::SeqCst),
+        "work must stop when the heartbeat task disappears"
+    );
+}
+
+/// Defect 1 (P0): integration — steal the claim mid-operation so
+/// `renew_finalise_claim` returns `Ok(false)`; the heartbeat wrapper aborts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mid_prove_lease_loss_aborts_via_real_store_renew() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xCF),
+            Some("k-mid-prove-loss"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let lease = Duration::from_secs(30);
+    let renew_every = Duration::from_millis(80);
+    let fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, lease)
+            .await
+            .expect("claim"),
+    );
+
+    // After a short delay, strip the claim so the next renew returns false.
+    let pool = scope.pool.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        sqlx::query(
+            "UPDATE jobs SET phase = 'publishing', \
+                    request_body = COALESCE(request_body, '{}'::jsonb) - 'finalise_claim' \
+             WHERE public_id = $1",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("steal claim");
+    });
+
+    let work_finished = Arc::new(AtomicBool::new(false));
+    let work_finished_h = Arc::clone(&work_finished);
+    let outcome = crate::job_dispatcher::with_finalise_lease_heartbeat(
+        &store,
+        job_id,
+        owner,
+        fence,
+        lease,
+        renew_every,
+        Duration::from_secs(5),
+        async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            work_finished_h.store(true, Ordering::SeqCst);
+            "applied"
+        },
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        Err(crate::job_dispatcher::FinaliseLeaseLivenessLost::RenewReturnedFalse),
+        "stolen claim must abort the in-flight operation"
+    );
+    assert!(
+        !work_finished.load(Ordering::SeqCst),
+        "prove work must not complete after lease loss"
+    );
+
+    drop(scope);
+}
+
+/// Defect 1 (P0): a stalled `renew()` await is treated as ownership loss,
+/// not an unbounded pause while work keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_renew_is_treated_as_liveness_loss() {
+    use crate::job_dispatcher::{
+        with_finalise_lease_heartbeat_renew, FinaliseLeaseLivenessLost,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let work_finished = Arc::new(AtomicBool::new(false));
+    let work_finished_h = Arc::clone(&work_finished);
+
+    let result = with_finalise_lease_heartbeat_renew(
+        Duration::from_millis(30),
+        Duration::from_millis(80),
+        || async {
+            // Never completes — simulates a hung database round-trip.
+            std::future::pending::<Result<bool, String>>().await
+        },
+        async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            work_finished_h.store(true, Ordering::SeqCst);
+            "should_not_complete"
+        },
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        Err(FinaliseLeaseLivenessLost::RenewTimedOut),
+        "stalled renew must surface as RenewTimedOut"
+    );
+    assert!(
+        !work_finished.load(Ordering::SeqCst),
+        "work must abort when renew stalls past the bound"
+    );
+}
+
+/// Defect 1 (P0): a worker that lost its lease cannot commit completion
+/// (or terminal complete) even if it keeps running — the fence is the
+/// fencing token + lease, not cooperative cancellation.
+#[tokio::test]
+async fn lost_lease_worker_cannot_commit_completion_or_complete() {
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let loser = uuid::Uuid::new_v4();
+    let winner = uuid::Uuid::new_v4();
+    let loser_store = JobStore::with_process_owner(scope.pool.clone(), loser);
+    let winner_store = JobStore::with_process_owner(scope.pool.clone(), winner);
+
+    let result = loser_store
+        .create(
+            JobKind::Send,
+            &account_addr(0xD1),
+            Some("k-lost-cannot-commit"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    loser_store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let loser_fence = expect_won(
+        loser_store
+            .claim_finalise_exclusive_as(job_id, loser, Duration::from_secs(60))
+            .await
+            .expect("loser claim"),
+    );
+
+    // Steal the claim for another owner (lease expiry + release + re-claim).
+    sqlx::query(
+        "UPDATE jobs SET request_body = jsonb_set( \
+             COALESCE(request_body, '{}'::jsonb), \
+             '{finalise_claim,lease_expires_at}', \
+             to_jsonb('1970-01-01T00:00:00Z'::text), \
+             true \
+         ) WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .execute(loser_store.pool())
+    .await
+    .expect("expire loser lease");
+    assert!(
+        winner_store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release stale"),
+        "expired claim must release"
+    );
+    let winner_fence = expect_won(
+        winner_store
+            .claim_finalise_exclusive_as(job_id, winner, Duration::from_secs(60))
+            .await
+            .expect("winner claim"),
+    );
+    assert!(
+        winner_fence > loser_fence,
+        "winner fence must be newer than loser's; loser={loser_fence} winner={winner_fence}"
+    );
+
+    // Contrast: status alone is not the fence. Loser "kept running" and
+    // tries fence-qualified commits with its stale token — must not apply.
+    let completion = serde_json::json!({
+        "pending": {"fake": true},
+        "signature": null,
+        "completion_result": {"ok": true},
+        "completion_status": 200
+    });
+    assert!(
+        !loser_store
+            .merge_finalisation_if_finalise_owner(job_id, loser, loser_fence, &completion)
+            .await
+            .expect("merge attempt"),
+        "stale fence must not persist completion capability"
+    );
+    assert!(
+        !loser_store
+            .complete_if_finalise_owner(
+                job_id,
+                loser,
+                loser_fence,
+                serde_json::json!({"stolen": true}),
+                200
+            )
+            .await
+            .expect("complete attempt"),
+        "stale fence must not complete the job"
+    );
+    assert!(
+        !loser_store
+            .fail_if_finalise_owner(
+                job_id,
+                loser,
+                loser_fence,
+                "loser must not fail winner's job"
+            )
+            .await
+            .expect("fail attempt"),
+        "stale fence must not fail the job"
+    );
+
+    let row = winner_store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(row.status, JobStatus::Broadcasting);
+    assert_eq!(row.phase, FINALISE_CLAIM_PHASE);
+    let winner_s = winner.to_string();
+    let claim_owner = row
+        .request_body
+        .get("finalise_claim")
+        .and_then(|c| c.get("owner"))
+        .and_then(|o| o.as_str());
+    assert_eq!(claim_owner, Some(winner_s.as_str()));
+    assert_eq!(
+        row.request_body
+            .get("finalise_claim")
+            .and_then(|c| c.get("fence"))
+            .and_then(|f| f.as_i64()),
+        Some(winner_fence)
+    );
+    assert!(
+        row.request_body.get("finalisation").is_none(),
+        "loser must not have written finalisation"
+    );
+
+    // Winner can still commit under the current fence + live lease.
+    assert!(
+        winner_store
+            .merge_finalisation_if_finalise_owner(job_id, winner, winner_fence, &completion)
+            .await
+            .expect("winner merge"),
+        "current fence must persist completion"
+    );
+    assert!(
+        winner_store
+            .complete_if_finalise_owner(
+                job_id,
+                winner,
+                winner_fence,
+                serde_json::json!({"ok": true}),
+                200
+            )
+            .await
+            .expect("winner complete"),
+        "current fence must complete"
+    );
+    let done = winner_store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(done.status, JobStatus::Completed);
+
+    drop(scope);
+}
+
+/// Same process reclaims after lease expiry: old epoch fence must lose even
+/// though the owner UUID is unchanged. Identity is not the fence.
+#[tokio::test]
+async fn same_owner_reclaim_rejects_stale_fence_writes() {
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xD2),
+            Some("k-same-owner-reclaim"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let old_fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("first claim"),
+    );
+
+    // Lease lapses; same owner reclaims (new acquisition epoch).
+    expire_finalise_claim_lease(store.pool(), job_id).await;
+    assert!(
+        store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release"),
+        "expired lease must release"
+    );
+    let new_fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("same-owner reclaim"),
+    );
+    assert!(
+        new_fence > old_fence,
+        "reclaim must mint a newer fence; old={old_fence} new={new_fence}"
+    );
+
+    let completion = serde_json::json!({
+        "pending": {"fake": true},
+        "signature": null,
+        "completion_result": {"ok": true},
+        "completion_status": 200
+    });
+    // Stale epoch (old fence) — owner still matches, but fence must lose.
+    assert!(
+        !store
+            .merge_finalisation_if_finalise_owner(job_id, owner, old_fence, &completion)
+            .await
+            .expect("stale merge"),
+        "stale fence must not merge after same-owner reclaim"
+    );
+    assert!(
+        !store
+            .complete_if_finalise_owner(
+                job_id,
+                owner,
+                old_fence,
+                serde_json::json!({"stolen": true}),
+                200
+            )
+            .await
+            .expect("stale complete"),
+        "stale fence must not complete after same-owner reclaim"
+    );
+    assert!(
+        !store
+            .fail_if_finalise_owner(job_id, owner, old_fence, "stale fail")
+            .await
+            .expect("stale fail"),
+        "stale fence must not fail after same-owner reclaim"
+    );
+    assert!(
+        !store
+            .renew_finalise_claim(job_id, owner, old_fence, Duration::from_secs(60))
+            .await
+            .expect("stale renew"),
+        "stale fence must not renew the new epoch"
+    );
+
+    // Current epoch still works.
+    assert!(
+        store
+            .merge_finalisation_if_finalise_owner(job_id, owner, new_fence, &completion)
+            .await
+            .expect("new merge"),
+        "current fence must merge"
+    );
+    assert!(
+        store
+            .complete_if_finalise_owner(
+                job_id,
+                owner,
+                new_fence,
+                serde_json::json!({"ok": true}),
+                200
+            )
+            .await
+            .expect("new complete"),
+        "current fence must complete"
+    );
+    let done = store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(done.status, JobStatus::Completed);
+
+    drop(scope);
+}
+
+/// A current fencing token whose lease has expired cannot commit.
+#[tokio::test]
+async fn current_fence_with_expired_lease_cannot_commit() {
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xD3),
+            Some("k-expired-lease-fence"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("claim"),
+    );
+
+    // Lease expires while the fence is still the current token on the row
+    // (no release / reclaim yet).
+    expire_finalise_claim_lease(store.pool(), job_id).await;
+
+    let completion = serde_json::json!({
+        "pending": {"fake": true},
+        "signature": null,
+        "completion_result": {"ok": true},
+        "completion_status": 200
+    });
+    assert!(
+        !store
+            .merge_finalisation_if_finalise_owner(job_id, owner, fence, &completion)
+            .await
+            .expect("merge"),
+        "expired lease must block completion persist even with current fence"
+    );
+    assert!(
+        !store
+            .complete_if_finalise_owner(
+                job_id,
+                owner,
+                fence,
+                serde_json::json!({"ok": true}),
+                200
+            )
+            .await
+            .expect("complete"),
+        "expired lease must block terminal complete even with current fence"
+    );
+    assert!(
+        !store
+            .fail_if_finalise_owner(job_id, owner, fence, "expired fail")
+            .await
+            .expect("fail"),
+        "expired lease must block terminal fail even with current fence"
+    );
+
+    let row = store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(row.status, JobStatus::Broadcasting);
+    assert_eq!(row.phase, FINALISE_CLAIM_PHASE);
+    assert_eq!(
+        row.request_body
+            .get("finalise_claim")
+            .and_then(|c| c.get("fence"))
+            .and_then(|f| f.as_i64()),
+        Some(fence),
+        "row still holds the same fence; only lease validity blocks the write"
+    );
+
+    drop(scope);
+}
+
+/// Defect 1 (P0): a stale fence cannot commit the engine snapshot or stage
+/// `members_ready` — the durable write that matters most carries the same
+/// acquisition fence as the job-row host-edge writes.
+#[tokio::test]
+async fn stale_fence_cannot_commit_engine_snapshot_or_members_ready() {
+    use std::time::Duration;
+    use shared::spec_v1::Address;
+    use zkcoins_program::circuit::compliance::Network;
+    use crate::v11::db_v11::{
+        self, EngineSnapshot, PENDING_PUBLISH_MEMBERS_READY,
+    };
+    use crate::v11::separation::{
+        claim_stack_scan_mode, clear_process_stack_mode_for_test, set_process_stack_mode,
+        ScanStackMode,
+    };
+
+    let _ = clear_process_stack_mode_for_test();
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let scope = setup_pool().await;
+    claim_stack_scan_mode(&scope.pool, ScanStackMode::V11)
+        .await
+        .expect("claim stack_scan_mode v11");
+
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xE8),
+            Some("k-stale-fence-engine"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let old_fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("first claim"),
+    );
+
+    // Same-owner reclaim mints a newer fence.
+    expire_finalise_claim_lease(store.pool(), job_id).await;
+    assert!(
+        store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release"),
+        "expired lease must release"
+    );
+    let new_fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("reclaim"),
+    );
+    assert!(
+        new_fence > old_fence,
+        "reclaim must mint a newer fence; old={old_fence} new={new_fence}"
+    );
+
+    let snap = EngineSnapshot {
+        network: Network::Regtest,
+        activation_height: 0,
+        tip_height: 0,
+        tip_hash: [0u8; 32],
+        fold_seq: 0,
+        nflog: vec![],
+        accounts: vec![],
+    };
+    let account_owner = Address(account_addr(0xE8));
+    let pk = [0xAAu8; 32];
+    let r = [0xBBu8; 32];
+    let s = [0xCCu8; 32];
+    let r_prime = [0xDDu8; 32];
+
+    // Stale epoch must not write engine or members_ready.
+    let stale = FinaliseFence {
+        job_id,
+        owner,
+        fence: old_fence,
+    };
+    assert!(
+        !db_v11::persist_engine_with_pending_members_ready_if_finalise_fence(
+            store.pool(),
+            &snap,
+            account_owner,
+            pk,
+            r,
+            s,
+            r_prime,
+            0,
+            [0u8; 32],
+            stale,
+        )
+        .await
+        .expect("stale fenced persist"),
+        "stale fence must not commit engine+members_ready"
+    );
+    assert!(
+        db_v11::load_pending_publish(store.pool(), pk)
+            .await
+            .expect("load pending")
+            .is_none(),
+        "stale fence must leave no members_ready row"
+    );
+    assert!(
+        db_v11::load_engine_snapshot(store.pool())
+            .await
+            .expect("load engine")
+            .is_none(),
+        "stale fence must leave no engine snapshot"
+    );
+
+    // Current fence commits both.
+    let current = FinaliseFence {
+        job_id,
+        owner,
+        fence: new_fence,
+    };
+    assert!(
+        db_v11::persist_engine_with_pending_members_ready_if_finalise_fence(
+            store.pool(),
+            &snap,
+            account_owner,
+            pk,
+            r,
+            s,
+            r_prime,
+            0,
+            [0u8; 32],
+            current,
+        )
+        .await
+        .expect("current fenced persist"),
+        "current fence must commit engine+members_ready"
+    );
+    let pending = db_v11::load_pending_publish(store.pool(), pk)
+        .await
+        .expect("load pending")
+        .expect("current fence must stage members_ready");
+    assert_eq!(pending.status, PENDING_PUBLISH_MEMBERS_READY);
+    assert!(
+        db_v11::load_engine_snapshot(store.pool())
+            .await
+            .expect("load engine")
+            .is_some(),
+        "current fence must persist engine snapshot"
+    );
+
+    clear_process_stack_mode_for_test();
+    drop(scope);
+}
+
+/// Defect 2 (P0): the awaiting-signature timeout path terminates via
+/// `fail_if_status` (not bare `fail`). A job held under a finalise claim —
+/// including after same-owner reclaim with a newer fence — must not be
+/// killed by the timeout.
+#[tokio::test]
+async fn awaiting_signature_timeout_cannot_terminate_job_under_newer_fence() {
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xE9),
+            Some("k-timeout-newer-fence"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    // First claim (old fence), then reclaim with a strictly newer fence.
+    let old_fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("first claim"),
+    );
+    expire_finalise_claim_lease(store.pool(), job_id).await;
+    assert!(
+        store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release"),
+        "expired lease must release"
+    );
+    let new_fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("reclaim"),
+    );
+    assert!(
+        new_fence > old_fence,
+        "reclaim must mint a newer fence; old={old_fence} new={new_fence}"
+    );
+
+    // Exact predicate the timeout path uses after the fix.
+    let err = "awaiting_signature timeout";
+    assert!(
+        !store
+            .fail_if_status(job_id, &[JobStatus::AwaitingSignature], err)
+            .await
+            .expect("timeout fail_if_status"),
+        "awaiting_signature timeout must not terminate a job held under a claim fence"
+    );
+
+    let row = store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(
+        row.status,
+        JobStatus::Broadcasting,
+        "claimed job must remain broadcasting after timeout attempt"
+    );
+    assert_eq!(row.phase, FINALISE_CLAIM_PHASE);
+    assert!(row.error.is_none(), "timeout must not write an error on a claimed job");
+    assert_eq!(
+        row.request_body
+            .get("finalise_claim")
+            .and_then(|c| c.get("fence"))
+            .and_then(|f| f.as_i64()),
+        Some(new_fence),
+        "newer fence must still be current"
+    );
+
+    // Contrast: an unclaimed awaiting_signature row is still terminable.
+    let result2 = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xEA),
+            Some("k-timeout-unclaimed"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create2");
+    let job2 = match result2 {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job2, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature2");
+    assert!(
+        store
+            .fail_if_status(job2, &[JobStatus::AwaitingSignature], err)
+            .await
+            .expect("timeout on unclaimed"),
+        "timeout must still fail a true unclaimed awaiting_signature job"
+    );
+    let failed = store.load(job2).await.expect("load").expect("row");
+    assert_eq!(failed.status, JobStatus::Failed);
+
+    drop(scope);
+}
+
+/// Pre-claim status-only fail must not terminate a row under exclusive claim.
+#[tokio::test]
+async fn pre_claim_fail_if_status_cannot_terminate_owned_row() {
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xD4),
+            Some("k-preclaim-fail-owned"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("claim"),
+    );
+
+    // Mirrors the pre-claim helper's status set (includes Broadcasting).
+    assert!(
+        !store
+            .fail_if_status(
+                job_id,
+                &[JobStatus::AwaitingSignature, JobStatus::Broadcasting],
+                "pre-claim must not kill owned job",
+            )
+            .await
+            .expect("fail_if_status"),
+        "status-only fail must refuse a finalise_claimed row"
+    );
+    // Same shape for status-only complete.
+    assert!(
+        !store
+            .complete_if_status(
+                job_id,
+                &[JobStatus::Broadcasting],
+                serde_json::json!({"no": true}),
+                200,
+            )
+            .await
+            .expect("complete_if_status"),
+        "status-only complete must refuse a finalise_claimed row"
+    );
+
+    let row = store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(row.status, JobStatus::Broadcasting);
+    assert_eq!(row.phase, FINALISE_CLAIM_PHASE);
+    assert!(row.error.is_none(), "owned row must not be failed via status");
+    assert_eq!(
+        row.request_body
+            .get("finalise_claim")
+            .and_then(|c| c.get("fence"))
+            .and_then(|f| f.as_i64()),
+        Some(fence)
+    );
+
+    // Unclaimed broadcasting (phase free) remains fail-able for pre-claim recovery.
+    sqlx::query(
+        "UPDATE jobs SET phase = 'publishing', \
+                request_body = COALESCE(request_body, '{}'::jsonb) - 'finalise_claim' \
+         WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .execute(store.pool())
+    .await
+    .expect("free claim");
+    assert!(
+        store
+            .fail_if_status(
+                job_id,
+                &[JobStatus::AwaitingSignature, JobStatus::Broadcasting],
+                "unclaimed broadcasting may fail",
+            )
+            .await
+            .expect("fail unclaimed"),
+        "unclaimed broadcasting row must still be fail-able"
+    );
+    let failed = store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(failed.status, JobStatus::Failed);
+
+    drop(scope);
+}
+
+/// P0: the dispatcher cleanup rewrite after an unexpected status load
+/// (`replace_request_body_if_cleanup_safe`) must not clobber a claimed row.
+/// Race: `set_awaiting_signature` wins → concurrent sign+claim → origin
+/// worker takes the unexpected-status cleanup branch.
+#[tokio::test]
+async fn cleanup_body_rewrite_cannot_mutate_claimed_row() {
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xC1),
+            Some("k-cleanup-claimed"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    // Plant leftover envelope keys the cleanup path would strip.
+    let row = store.load(job_id).await.expect("load").expect("row");
+    let mut with_envelope = row.request_body;
+    with_envelope.as_object_mut().unwrap().insert(
+        "pending_sign".to_string(),
+        serde_json::json!({"mode": "initial"}),
+    );
+    with_envelope
+        .as_object_mut()
+        .unwrap()
+        .insert("sign".to_string(), serde_json::json!({"pk_i": "00"}));
+    sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+        .bind(&with_envelope)
+        .bind(job_id)
+        .execute(store.pool())
+        .await
+        .expect("plant envelope");
+
+    let fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("claim"),
+    );
+
+    // Stale cleanup body: what the losing worker would write (stripped
+    // keys, but from a pre-claim load — missing finalise_claim).
+    let stale_cleanup_body = serde_json::json!({
+        "account_address": with_envelope["account_address"],
+        "amount": with_envelope["amount"],
+    });
+
+    assert!(
+        !store
+            .replace_request_body_if_cleanup_safe(job_id, &stale_cleanup_body)
+            .await
+            .expect("cleanup rewrite"),
+        "cleanup rewrite must refuse a finalise_claimed row"
+    );
+
+    let after = store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(after.status, JobStatus::Broadcasting);
+    assert_eq!(after.phase, FINALISE_CLAIM_PHASE);
+    assert_eq!(
+        after
+            .request_body
+            .get("finalise_claim")
+            .and_then(|c| c.get("fence"))
+            .and_then(|f| f.as_i64()),
+        Some(fence),
+        "claim must survive the cleanup branch"
+    );
+    assert!(
+        after.request_body.get("pending_sign").is_some(),
+        "cleanup must not have rewritten the claimed body"
+    );
+
+    // Contrast: unclaimed non-awaiting row is still rewrite-able.
+    sqlx::query(
+        "UPDATE jobs SET phase = 'publishing', \
+                request_body = COALESCE(request_body, '{}'::jsonb) - 'finalise_claim' \
+         WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .execute(store.pool())
+    .await
+    .expect("free claim");
+    // Still broadcasting, not awaiting_signature — cleanup-eligible.
+    assert!(
+        store
+            .replace_request_body_if_cleanup_safe(job_id, &stale_cleanup_body)
+            .await
+            .expect("cleanup on unclaimed"),
+        "cleanup must still rewrite an unclaimed non-awaiting_signature row"
+    );
+    let cleaned = store.load(job_id).await.expect("load").expect("row");
+    assert!(cleaned.request_body.get("pending_sign").is_none());
+    assert!(cleaned.request_body.get("finalise_claim").is_none());
+
+    drop(scope);
+}
+
+#[tokio::test]
+async fn cancel_from_broadcasting_returns_false_and_leaves_status_untouched() {
+    // Nullifier is in flight / published — cancel must refuse.
+    let (store, _c) = setup_store().await;
+    let CreateResult::Fresh(job) = store
+        .create(JobKind::Mint, &account_addr(115), None, sample_mint_body())
+        .await
+        .expect("create")
+    else {
+        panic!("expected Fresh");
+    };
+    store
+        .set_status(job.public_id, JobStatus::Broadcasting, "broadcasting")
+        .await
+        .expect("set broadcasting");
+    let applied = store.cancel(job.public_id).await.expect("cancel");
+    assert!(!applied, "cancel from broadcasting must not apply");
+    let after = store.load(job.public_id).await.unwrap().unwrap();
+    assert_eq!(after.status, JobStatus::Broadcasting);
 }
 
 #[tokio::test]

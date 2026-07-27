@@ -182,7 +182,7 @@ pub struct AccountRecord {
 }
 
 /// Phase-1 output: witness ready for the wallet to sign (`awaiting_signature`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PendingTransition {
     /// Full `TransitionWitness` with a placeholder signature; `finalise`
     /// overwrites `transition_signature` before proving.
@@ -194,6 +194,94 @@ pub struct PendingTransition {
     pub owner: Address,
     /// NAV opening used for this transition (stored on apply).
     pub nav_opening: NavOpening,
+}
+
+/// Durable, engine-owned finalisation capability for **prove + apply**.
+///
+/// Contains **everything** [`StateEngine::finalise`] /
+/// [`StateEngine::prove_pending_transition_detached`] +
+/// [`StateEngine::apply_proved_transition`] need from the host side.
+///
+/// Host-side publication of the §7.5 job result and job completion carry
+/// additional durable fields on the node envelope (`completion_result` /
+/// `completion_status` / `publisher_pubkey`) — derived the same way, from
+/// what those steps depend on including handed-in values. This engine type
+/// deliberately stops at prove/apply; the node composes the full path.
+///
+/// ## Contents (derived from what prove/apply depends on)
+///
+/// | Field | Why it is here |
+/// |-------|----------------|
+/// | `pending` (full [`PendingTransition`]) | prove installs the signature on the full host witness; apply re-validates live deps against it |
+/// | `signature` (once accepted) | caller-supplied wallet authorisation; prove binds it into the witness |
+///
+/// Live engine state (account tip, NfLog size, CoinHist, own-Pk absence) is
+/// **not** snapshotted here: apply re-validates those against the live engine
+/// after prove (same invariant as the receive path).
+///
+/// ## Idempotency of consumers
+///
+/// This type is pure data. Callers make resume safe with an **exclusive
+/// status claim** (only one resumer may enter finalise) and by persisting
+/// the completion surface after apply so a second resume publishes and
+/// completes without re-applying. The engine itself fails loud on a second
+/// apply against a moved account head.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FinalisationCapability {
+    pending: PendingTransition,
+    signature: Option<TransitionSignature>,
+}
+
+impl FinalisationCapability {
+    /// Stage a pending transition produced by `begin_*` (unsigned).
+    pub fn stage(pending: PendingTransition) -> Self {
+        Self {
+            pending,
+            signature: None,
+        }
+    }
+
+    /// Install a wallet signature that already passed host verification.
+    ///
+    /// Fails loud if `sig.pk_i` does not match the pending account head —
+    /// never stores a signature that cannot authorise this transition.
+    pub fn install_signature(&mut self, sig: TransitionSignature) -> Result<()> {
+        ensure!(
+            sig.pk_i == self.pending.witness_wip.prev_account_state.current_pubkey,
+            "FinalisationCapability::install_signature: pk_i does not match \
+             pending prev_account_state.current_pubkey"
+        );
+        self.signature = Some(sig);
+        Ok(())
+    }
+
+    pub fn pending(&self) -> &PendingTransition {
+        &self.pending
+    }
+
+    pub fn pending_mut(&mut self) -> &mut PendingTransition {
+        &mut self.pending
+    }
+
+    pub fn signature(&self) -> Option<&TransitionSignature> {
+        self.signature.as_ref()
+    }
+
+    pub fn is_signed(&self) -> bool {
+        self.signature.is_some()
+    }
+
+    /// Split into the `(pending, signature)` pair finalise consumes.
+    ///
+    /// Fails if no signature has been installed — never invents a zero sig.
+    pub fn into_finalise_parts(self) -> Result<(PendingTransition, TransitionSignature)> {
+        let sig = self.signature.ok_or_else(|| {
+            anyhow::anyhow!(
+                "FinalisationCapability::into_finalise_parts: no signature installed"
+            )
+        })?;
+        Ok((self.pending, sig))
+    }
 }
 
 /// Capability token: a pending transition that has been **proved**.

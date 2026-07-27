@@ -51,6 +51,7 @@
 //! that the `/api/jobs/*` integration tests in `router_tests.rs`
 //! verify against a real testcontainer Postgres.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,6 +97,14 @@ pub(crate) const PHASE_CHANNEL_CAPACITY: usize = 32;
 ///   only gets `Lagged` back, the dispatcher's `.send().ok()` ignores
 ///   that arm).
 ///
+/// Handoff state between `/sign` (or legacy `/commit`) and a parked
+/// dispatcher. CAS closes the race where the handler clones a notifier,
+/// the dispatcher times out and leaves, and the handler still reports
+/// acceptance.
+pub const HANDOFF_WAITING: u8 = 0;
+pub const HANDOFF_SIGNALED: u8 = 1;
+pub const HANDOFF_TIMED_OUT: u8 = 2;
+
 /// Held inside `Arc<JobNotifier>` so cloning the map entry is cheap
 /// and the broadcast channel survives until every receiver drops.
 #[derive(Debug)]
@@ -111,6 +120,11 @@ pub struct JobNotifier {
     /// pressure — and the SSE stream's initial-state push covers any
     /// event the listener missed before subscribing.
     pub phase_tx: broadcast::Sender<JobPhaseEvent>,
+    /// Atomic handoff: only one of route-signal / dispatcher-timeout wins.
+    /// Acceptance requires a successful CAS from [`HANDOFF_WAITING`] to
+    /// [`HANDOFF_SIGNALED`] at the moment of the wake — not a clone that
+    /// was valid a moment earlier.
+    pub handoff: AtomicU8,
 }
 
 impl JobNotifier {
@@ -121,7 +135,37 @@ impl JobNotifier {
         Self {
             commit_wake: Arc::new(Notify::new()),
             phase_tx,
+            handoff: AtomicU8::new(HANDOFF_WAITING),
         }
+    }
+
+    /// Route-side claim: the verified signature (or legacy commit) is
+    /// about to wake the dispatcher. Returns `true` only when the
+    /// dispatcher is still waiting — a timed-out or already-signaled
+    /// handoff refuses so the caller cannot report acceptance for work
+    /// that will never run.
+    pub fn try_signal_accept(&self) -> bool {
+        self.handoff
+            .compare_exchange(
+                HANDOFF_WAITING,
+                HANDOFF_SIGNALED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Dispatcher-side claim: the awaiting-signature wait timed out.
+    /// Returns `true` only when no route has already claimed the handoff.
+    pub fn try_claim_timeout(&self) -> bool {
+        self.handoff
+            .compare_exchange(
+                HANDOFF_WAITING,
+                HANDOFF_TIMED_OUT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 }
 
@@ -254,6 +298,27 @@ pub fn spawn(
 
 /// Drive a single envelope through one state-machine step. The
 /// outer loop in [`spawn`] calls this for every received envelope.
+///
+/// Test-visible so boot-resume / crash-window recovery can be exercised
+/// without spinning the full dispatcher channel.
+#[cfg(test)]
+pub(crate) async fn process_envelope_for_test(
+    job_store: &JobStore,
+    app_state: &AppState,
+    notify_map: &JobNotifyMap,
+    awaiting_signature_timeout: Duration,
+    env: JobEnvelope,
+) -> anyhow::Result<()> {
+    process_envelope(
+        job_store,
+        app_state,
+        notify_map,
+        awaiting_signature_timeout,
+        env,
+    )
+    .await
+}
+
 async fn process_envelope(
     job_store: &JobStore,
     app_state: &AppState,
@@ -321,6 +386,13 @@ async fn process_envelope(
                 job,
             )
             .await
+        }
+        // Mid-finalise crash: durable signed capability + broadcasting.
+        // Resume finalise without re-parking on /sign.
+        (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting)
+            if crate::v11::v11_sign_route_active() =>
+        {
+            drive_v11_finalise(job_store, app_state, notify_map, env.public_id, &job).await
         }
         _ => {
             tracing::debug!(
@@ -433,6 +505,14 @@ async fn process_mint(
                 message
             );
             note_prove_outcome(app_state, Err(message.as_str())).await;
+            // Cancel may have won while proving; do not overwrite cancelled.
+            if let Ok(Some(j)) = job_store.load(public_id).await {
+                if j.status == JobStatus::Cancelled {
+                    cleanup_pending_sign(job_store, app_state, public_id).await;
+                    notify_map.remove(&public_id);
+                    return Ok(());
+                }
+            }
             job_store.fail(public_id, &message).await?;
             publish_phase(
                 notify_map,
@@ -449,18 +529,94 @@ async fn process_mint(
         }
     };
 
+    // Cancel may have won during the prove leg.
+    if let Ok(Some(j)) = job_store.load(public_id).await {
+        if j.status == JobStatus::Cancelled {
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
+
     let notifier = notify_map
         .entry(public_id)
         .or_insert_with(|| Arc::new(JobNotifier::new()))
         .clone();
 
-    let result = serde_json::json!({
-        "account_state_hash": commit_hashes.account_state_hash,
-        "output_coins_root": commit_hashes.output_coins_root,
-    });
-    job_store
+    // Production staging site: under v1.1 a live PendingTransition must be
+    // staged via stage_pending_sign before the job advertises. Source is the
+    // post-begin registry (begin_* → register_live_pending_after_begin) or
+    // the optional test hook.
+    let live_pending = resolve_live_pending_after_prove(app_state, public_id);
+    let result = match stage_and_select_awaiting_signature(
+        job_store,
+        app_state,
+        public_id,
+        &commit_hashes.account_state_hash,
+        &commit_hashes.output_coins_root,
+        live_pending,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(msg) => {
+            tracing::warn!(
+                "Job dispatcher: mint job {} refused awaiting_signature advertisement: {}",
+                public_id,
+                msg
+            );
+            let err = fail_error_string(&msg);
+            job_store.fail(public_id, &err).await?;
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(err),
+                },
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    };
+    if let Err(e) = job_store
         .set_awaiting_signature(public_id, proof_id as i64, result.clone())
-        .await?;
+        .await
+    {
+        // Defect 3: staged map + envelope + notifier must not survive a
+        // failed status transition.
+        tracing::error!(
+            "Job dispatcher: mint job {} set_awaiting_signature failed: {}",
+            public_id,
+            e
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        return Err(e.into());
+    }
+    // Cancel may have won between stage and status write (WHERE filters).
+    match job_store.load(public_id).await? {
+        Some(j) if j.status == JobStatus::AwaitingSignature => {}
+        Some(j) if j.status == JobStatus::Cancelled => {
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+        other => {
+            tracing::warn!(
+                "Job dispatcher: mint job {} not in awaiting_signature after set ({:?}); cleaning up",
+                public_id,
+                other.map(|j| j.status)
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
     publish_phase(
         notify_map,
         public_id,
@@ -505,6 +661,7 @@ async fn process_mint_resume(
     job: Job,
 ) -> anyhow::Result<()> {
     let public_id = job.public_id;
+    rehydrate_pending_sign_into_map(app_state, public_id, &job);
     let notifier = notify_map
         .entry(public_id)
         .or_insert_with(|| Arc::new(JobNotifier::new()))
@@ -534,6 +691,288 @@ async fn process_mint_resume(
         notifier,
     )
     .await
+}
+
+/// Merge the durable finalisation capability into `jobs.request_body`.
+///
+/// Status-qualified: only writes while the job is still `queued` or
+/// `proving` (the statuses from which we enter `awaiting_signature`). If
+/// cancel won the race, the write fails loud rather than stamping a
+/// finalisation envelope onto a terminal row.
+async fn persist_pending_sign_on_job(
+    job_store: &JobStore,
+    public_id: Uuid,
+    entry: &crate::v11::PendingSignEntry,
+) -> anyhow::Result<()> {
+    let job = job_store
+        .load(public_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("job {public_id} missing while staging finalisation"))?;
+    let mut body = job.request_body;
+    let persist = crate::v11::DurableFinalisationPersist::from_entry(entry)
+        .map_err(|e| anyhow::anyhow!("encode durable finalisation: {e}"))?;
+    let value = serde_json::to_value(persist)?;
+    let obj = body
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("jobs.request_body is not an object"))?;
+    obj.insert(crate::v11::FINALISATION_BODY_KEY.to_string(), value);
+    // Drop legacy split keys if a previous build left them.
+    obj.remove(crate::v11::PENDING_SIGN_BODY_KEY);
+    obj.remove("sign");
+    // Prefer proving; fall back to queued (create leaves queued).
+    let applied = if job.status == JobStatus::Proving {
+        job_store
+            .replace_request_body_if_status(public_id, JobStatus::Proving, &body)
+            .await?
+    } else if job.status == JobStatus::Queued {
+        job_store
+            .replace_request_body_if_status(public_id, JobStatus::Queued, &body)
+            .await?
+    } else {
+        false
+    };
+    if !applied {
+        anyhow::bail!(
+            "refusing to persist finalisation capability: job {public_id} status \
+             moved off {:?} before write (status-qualified update)",
+            job.status
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a live pending after the prove / begin leg under a v1.1 claim.
+///
+/// Production path: consume a [`PendingSignEntry`] that `StateEngine::begin_*`
+/// registered via [`crate::v11::register_live_pending_after_begin`] into
+/// [`crate::router::AppState::v11_live_pending_after_begin`]. The pending is
+/// self-contained (witness + ProofData); finalise re-validates live
+/// dependencies rather than re-reading a snapshot a concurrent scan can move.
+///
+/// Under `cfg(test)` an optional fixture hook may also supply an entry.
+/// Missing the production registry fails closed at
+/// [`stage_and_select_awaiting_signature`] (no silent ash‖ocr).
+fn resolve_live_pending_after_prove(
+    app_state: &AppState,
+    public_id: Uuid,
+) -> Option<crate::v11::PendingSignEntry> {
+    if !crate::v11::v11_sign_route_active() {
+        return None;
+    }
+    if let Some(entry) = crate::v11::take_live_pending_after_begin(
+        &app_state.v11_live_pending_after_begin,
+        public_id,
+    ) {
+        return Some(entry);
+    }
+    #[cfg(test)]
+    {
+        if let Some(entry) = app_state
+            .v11_pending_after_prove
+            .as_ref()
+            .and_then(|hook| hook(public_id))
+        {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+/// Test-visible alias of [`resolve_live_pending_after_prove`].
+#[cfg(test)]
+pub(crate) fn resolve_live_pending_after_prove_for_test(
+    app_state: &AppState,
+    public_id: Uuid,
+) -> Option<crate::v11::PendingSignEntry> {
+    resolve_live_pending_after_prove(app_state, public_id)
+}
+
+/// Production staging site for a job entering `awaiting_signature`.
+///
+/// Under a v1.1 claim this is the **only** path that writes
+/// `pending_sign_map` for a live job: it calls [`crate::v11::stage_pending_sign`],
+/// persists the restart envelope, and builds the §7.5 advertisement.
+/// Flag-off ignores `pending` and returns legacy ash‖ocr.
+///
+/// On any failure after `stage_pending_sign`, the map entry is cleaned
+/// up before returning `Err` (Defect 3 — no best-effort leftover).
+pub(crate) async fn stage_and_select_awaiting_signature(
+    job_store: &JobStore,
+    app_state: &AppState,
+    public_id: Uuid,
+    legacy_ash: &str,
+    legacy_ocr: &str,
+    pending: Option<crate::v11::PendingSignEntry>,
+) -> Result<serde_json::Value, String> {
+    let staged_ref = if let Some(mut entry) = pending {
+        // Capture caller-supplied publisher_pubkey from the job row so the
+        // durable capability carries everything job completion needs.
+        if let Ok(Some(job)) = job_store.load(public_id).await {
+            match crate::v11::publisher_pubkey_from_request_body(&job.request_body) {
+                Ok(pk) => entry = entry.with_publisher_pubkey(pk),
+                Err(msg) => {
+                    return Err(format!(
+                        "publisher_pubkey on transition request is malformed: {msg}"
+                    ));
+                }
+            }
+        }
+        // Canonical production writer — tests must not insert into the
+        // map by hand if they want to exercise this path.
+        let _persist_json =
+            crate::v11::stage_pending_sign(&app_state.pending_sign_map, public_id, entry);
+        let Some(guard) = app_state.pending_sign_map.get(&public_id) else {
+            return Err(
+                "stage_pending_sign did not leave a map entry (internal lifecycle bug)"
+                    .to_string(),
+            );
+        };
+        let entry_clone = guard.clone();
+        drop(guard);
+        if let Err(e) = persist_pending_sign_on_job(job_store, public_id, &entry_clone).await {
+            app_state.pending_sign_map.remove(&public_id);
+            return Err(format!(
+                "failed to persist durable finalisation for restart safety: {e}"
+            ));
+        }
+        Some(entry_clone)
+    } else {
+        None
+    };
+
+    match crate::v11::select_awaiting_signature_result(
+        legacy_ash,
+        legacy_ocr,
+        staged_ref.as_ref(),
+    ) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // v1.1 without a staged pending — clean any partial state.
+            app_state.pending_sign_map.remove(&public_id);
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Job `error` column for a failed transition into awaiting_signature.
+/// Structured JSON under v1.1; plain string under flag-off (legacy).
+fn fail_error_string(message: &str) -> String {
+    if crate::v11::v11_sign_route_active() {
+        crate::v11::encode_job_error("proving_failed", message)
+    } else {
+        message.to_string()
+    }
+}
+
+/// In-memory staging cleanup after a job leaves the sign handoff.
+///
+/// Terminal status transitions (`fail` / `complete` /
+/// `cancel` / `cancel_not_yet_published`) strip `pending_sign` and
+/// `sign` from `request_body` **atomically** with the status flip
+/// (Defect 3). This helper therefore only drops the in-memory map
+/// entry for those paths.
+///
+/// When the status did **not** transition (e.g. `set_awaiting_signature`
+/// failed after `stage_pending_sign`, or cancel won and left the row
+/// cancelled via a separate path), this also best-effort strips any
+/// leftover envelope — **but only while the row is not under an exclusive
+/// finalise claim**. After `set_awaiting_signature` another process can
+/// sign + claim before this worker's confirmation load; the unexpected-
+/// status branch must not rewrite that claimed row (see
+/// [`JobStore::replace_request_body_if_cleanup_safe`]).
+///
+/// A leftover on a non-`awaiting_signature`, unclaimed row is harmless:
+/// boot resume and `/sign` only rehydrate when status is
+/// `awaiting_signature`, so a stale envelope cannot resurrect a job.
+async fn cleanup_pending_sign(
+    job_store: &JobStore,
+    app_state: &AppState,
+    public_id: Uuid,
+) {
+    app_state.pending_sign_map.remove(&public_id);
+    let Ok(Some(job)) = job_store.load(public_id).await else {
+        return;
+    };
+    // Live sign handoff: leave the envelope for the wallet / /sign path.
+    if job.status == JobStatus::AwaitingSignature {
+        return;
+    }
+    // Exclusive finalise claim: never rewrite the claim holder's body
+    // (even if a concurrent claim raced past our confirmation load).
+    if job.phase == crate::job_store::FINALISE_CLAIM_PHASE {
+        return;
+    }
+    let mut body = job.request_body;
+    if !crate::v11::strip_pending_sign_from_body(&mut body) {
+        // Also drop a durable `sign` blob if present without pending_sign.
+        if body
+            .as_object_mut()
+            .map(|o| o.remove("sign").is_some())
+            .unwrap_or(false)
+        {
+            // fall through to persist
+        } else {
+            return;
+        }
+    } else {
+        let _ = body.as_object_mut().map(|o| o.remove("sign"));
+    }
+    // Fence is in the SQL: refuses awaiting_signature and FINALISE_CLAIM_PHASE.
+    match job_store
+        .replace_request_body_if_cleanup_safe(public_id, &body)
+        .await
+    {
+        Ok(false) => {
+            tracing::info!(
+                "Job dispatcher: cleanup body rewrite skipped for job {} \
+                 (awaiting_signature or claimed since load)",
+                public_id
+            );
+        }
+        Ok(true) => {}
+        Err(e) => {
+            tracing::warn!(
+                "Job dispatcher: best-effort strip of leftover pending_sign for job {} failed: {} \
+                 (harmless: rehydrate is gated on awaiting_signature)",
+                public_id,
+                e
+            );
+        }
+    }
+}
+
+/// Rehydrate `pending_sign_map` from the job row after a process restart.
+fn rehydrate_pending_sign_into_map(app_state: &AppState, public_id: Uuid, job: &Job) {
+    if app_state.pending_sign_map.contains_key(&public_id) {
+        return;
+    }
+    match crate::v11::rehydrate_pending_sign(&job.request_body) {
+        Ok(Some(entry)) => {
+            tracing::info!(
+                "Job dispatcher: rehydrated pending_sign for job {} after restart \
+                 (send_counter={})",
+                public_id,
+                entry.send_counter()
+            );
+            app_state.pending_sign_map.insert(public_id, entry);
+        }
+        Ok(None) => {
+            if crate::v11::v11_sign_route_active() {
+                tracing::warn!(
+                    "Job dispatcher: job {} resumed awaiting_signature under v1.1 \
+                     but request_body has no pending_sign envelope — /sign will fail",
+                    public_id
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                "Job dispatcher: failed to rehydrate pending_sign for job {}: {}",
+                public_id,
+                e
+            );
+        }
+    }
 }
 
 /// Drive a send job from `queued` through the prove leg to
@@ -597,6 +1036,13 @@ async fn process_send_initial(
                 message
             );
             note_prove_outcome(app_state, Err(message.as_str())).await;
+            if let Ok(Some(j)) = job_store.load(public_id).await {
+                if j.status == JobStatus::Cancelled {
+                    cleanup_pending_sign(job_store, app_state, public_id).await;
+                    notify_map.remove(&public_id);
+                    return Ok(());
+                }
+            }
             job_store.fail(public_id, &message).await?;
             publish_phase(
                 notify_map,
@@ -613,6 +1059,15 @@ async fn process_send_initial(
         }
     };
 
+    // Cancel may have won during the prove leg.
+    if let Ok(Some(j)) = job_store.load(public_id).await {
+        if j.status == JobStatus::Cancelled {
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
+
     // Register a JobNotifier *before* persisting `awaiting_signature`
     // so a fast wallet that polls and POSTs `/commit` immediately
     // observes a ready channel. `entry().or_insert_with()` is used so
@@ -624,16 +1079,80 @@ async fn process_send_initial(
         .or_insert_with(|| Arc::new(JobNotifier::new()))
         .clone();
 
-    // ash/ocr hex the wallet signs. Persisted on the row + pushed on
-    // the phase event so a thin pure-TS wallet never has to decode the
-    // binary `CoinProof` from `GET /api/proof/{id}`.
-    let result = serde_json::json!({
-        "account_state_hash": commit_hashes.account_state_hash,
-        "output_coins_root": commit_hashes.output_coins_root,
-    });
-    job_store
+    // Under a v1.1 claim the job advertises the §7.5 ProofData surface
+    // (from a staged PendingSignEntry), not legacy ash/ocr — a wallet
+    // that signed ash/ocr would be rejected at `/sign`. Flag-off keeps
+    // the legacy ash/ocr fields unchanged. Staging goes through
+    // stage_pending_sign (the only production writer of pending_sign_map).
+    let live_pending = resolve_live_pending_after_prove(app_state, public_id);
+    let result = match stage_and_select_awaiting_signature(
+        job_store,
+        app_state,
+        public_id,
+        &commit_hashes.account_state_hash,
+        &commit_hashes.output_coins_root,
+        live_pending,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(msg) => {
+            tracing::warn!(
+                "Job dispatcher: send job {} refused awaiting_signature advertisement: {}",
+                public_id,
+                msg
+            );
+            let err = fail_error_string(&msg);
+            job_store.fail(public_id, &err).await?;
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(err),
+                },
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    };
+    if let Err(e) = job_store
         .set_awaiting_signature(public_id, proof_id as i64, result.clone())
-        .await?;
+        .await
+    {
+        // Defect 3: staged map + envelope + notifier must not survive a
+        // failed status transition.
+        tracing::error!(
+            "Job dispatcher: send job {} set_awaiting_signature failed: {}",
+            public_id,
+            e
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        return Err(e.into());
+    }
+    match job_store.load(public_id).await? {
+        Some(j) if j.status == JobStatus::AwaitingSignature => {}
+        Some(j) if j.status == JobStatus::Cancelled => {
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+        other => {
+            tracing::warn!(
+                "Job dispatcher: send job {} not in awaiting_signature after set ({:?}); cleaning up",
+                public_id,
+                other.map(|j| j.status)
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
     publish_phase(
         notify_map,
         public_id,
@@ -675,6 +1194,8 @@ async fn process_send_resume(
     job: Job,
 ) -> anyhow::Result<()> {
     let public_id = job.public_id;
+    // Defect 4: rehydrate staged pending so /sign works after a restart.
+    rehydrate_pending_sign_into_map(app_state, public_id, &job);
     let notifier = notify_map
         .entry(public_id)
         .or_insert_with(|| Arc::new(JobNotifier::new()))
@@ -686,7 +1207,7 @@ async fn process_send_resume(
     // Re-publish the awaiting_signature event so a freshly-connected
     // SSE stream sees the current phase even if its initial-state
     // push fired before the dispatcher reached this function. The
-    // ash/ocr result persisted on the row at the original
+    // surface persisted on the row at the original
     // `set_awaiting_signature` is carried through so a wallet that
     // reconnects after a node restart still gets the hex to sign
     // without an extra round-trip.
@@ -719,6 +1240,18 @@ async fn process_send_resume(
 /// the broadcast leg via the kind-appropriate flow: [`mint_commit_flow`]
 /// for a `Mint` job (which runs the soundness gate), [`commit_flow`]
 /// for a `Send`. On timeout, fail the job.
+///
+/// ## Crash recovery — durable finalisation capability
+///
+/// `/sign` installs the verified signature into the durable
+/// [`FinalisationCapability`] **before** CAS/notify. If the process dies
+/// after that persist, boot resume re-enqueues the job and this function
+/// sees a **signed** capability **before** parking: it drives finalise
+/// immediately so a job the wallet already saw as `signature_accepted` is
+/// not left waiting for a second `/sign`.
+///
+/// Resume reads the capability alone — no in-memory map required (true cold
+/// boot). Each step is status-guarded so a second attempt is harmless.
 async fn wait_for_commit(
     job_store: &JobStore,
     app_state: &AppState,
@@ -728,9 +1261,51 @@ async fn wait_for_commit(
     kind: JobKind,
     notifier: Arc<JobNotifier>,
 ) -> anyhow::Result<()> {
+    // Signed durable capability already on the row (crash after persist /
+    // CAS / notify, or boot resume of a signed job). Drive finalise without
+    // waiting for another wallet round-trip.
+    if crate::v11::v11_sign_route_active() {
+        if let Ok(Some(job)) = job_store.load(public_id).await {
+            if matches!(
+                job.status,
+                JobStatus::AwaitingSignature | JobStatus::Broadcasting
+            ) {
+                if let Ok(Some(entry)) = crate::v11::rehydrate_pending_sign(&job.request_body) {
+                    if entry.signature.is_some() {
+                        tracing::info!(
+                            "Job dispatcher: job {} has signed durable finalisation on resume \
+                             — driving finalise",
+                            public_id
+                        );
+                        return drive_v11_finalise(
+                            job_store,
+                            app_state,
+                            notify_map,
+                            public_id,
+                            &job,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+    // Park until the route signals (CAS → notify) or the timeout claims
+    // the handoff. The CAS on JobNotifier::handoff closes the race where
+    // the route clones a live notifier, the dispatcher times out, and
+    // the route still reports acceptance.
     let outcome = tokio::select! {
         _ = notifier.commit_wake.notified() => SignalOutcome::Signaled,
-        _ = tokio::time::sleep(awaiting_signature_timeout) => SignalOutcome::TimedOut,
+        _ = tokio::time::sleep(awaiting_signature_timeout) => {
+            if notifier.try_claim_timeout() {
+                SignalOutcome::TimedOut
+            } else {
+                // Route already claimed SIGNALED (possibly mid-race with
+                // this timeout). Process the signature; do not fail.
+                SignalOutcome::Signaled
+            }
+        }
     };
 
     match outcome {
@@ -739,9 +1314,30 @@ async fn wait_for_commit(
                 "Job dispatcher: send job {} timed out in awaiting_signature",
                 public_id
             );
-            job_store
-                .fail(public_id, "awaiting_signature timeout")
+            // Defect 5: flag-off stores the plain legacy string byte-for-byte.
+            // v1.1 uses the structured §7.5 {error, message} JSON (no dedicated
+            // timeout code → internal_error).
+            let err = if crate::v11::v11_sign_route_active() {
+                crate::v11::encode_job_error("internal_error", "awaiting_signature timeout")
+            } else {
+                "awaiting_signature timeout".to_string()
+            };
+            // Fence-aware terminate: only unclaimed `awaiting_signature`.
+            // An exclusive finalise claim (any fence, including a newer epoch
+            // after reclaim) must not be killed by this timeout — bare
+            // `JobStore::fail` would ignore the claim and terminate the winner.
+            let failed = job_store
+                .fail_if_status(public_id, &[JobStatus::AwaitingSignature], &err)
                 .await?;
+            if !failed {
+                tracing::info!(
+                    "Job dispatcher: job {} awaiting_signature timeout was a no-op \
+                     (status moved or exclusive finalise claim holds); \
+                     leaving shared notify state intact",
+                    public_id
+                );
+                return Ok(());
+            }
             // Publish the terminal `failed` event BEFORE removing the
             // notify-map entry so an attached SSE stream receives the
             // final phase frame. The remove() runs after — once every
@@ -755,9 +1351,10 @@ async fn wait_for_commit(
                     phase: "failed".to_string(),
                     proof_id: None,
                     result: None,
-                    error: Some("awaiting_signature timeout".to_string()),
+                    error: Some(err),
                 },
             );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
             notify_map.remove(&public_id);
             return Ok(());
         }
@@ -768,12 +1365,46 @@ async fn wait_for_commit(
         Some(j) => j,
         None => {
             tracing::warn!("Job dispatcher: post-signal load missed job {}", public_id);
+            cleanup_pending_sign(job_store, app_state, public_id).await;
             notify_map.remove(&public_id);
             return Ok(());
         }
     };
 
-    // The commit-route persists the wallet-provided
+    // Cancel won the race (wallet cancelled while we were parked, or
+    // the cancel handler claimed the handoff and woke us). Do not
+    // overwrite a cancelled row with fail/complete.
+    if job.status == JobStatus::Cancelled || job.status.is_terminal() {
+        tracing::info!(
+            "Job dispatcher: job {} is terminal ({:?}) after handoff wake; exiting",
+            public_id,
+            job.status
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        return Ok(());
+    }
+
+    // v1.1 path: `/v1/jobs/{id}/sign` already verified and installed the
+    // signature into the durable FinalisationCapability. Drive finalise —
+    // never complete the job with the signature material alone.
+    if crate::v11::v11_sign_route_active() {
+        if let Ok(Some(entry)) = crate::v11::rehydrate_pending_sign(&job.request_body) {
+            if entry.signature.is_some() {
+                return drive_v11_finalise(job_store, app_state, notify_map, public_id, &job)
+                    .await;
+            }
+        }
+        // In-memory map may hold the signature if persist rehydrate raced.
+        if let Some(entry) = app_state.pending_sign_map.get(&public_id) {
+            if entry.signature.is_some() {
+                return drive_v11_finalise(job_store, app_state, notify_map, public_id, &job)
+                    .await;
+            }
+        }
+    }
+
+    // Legacy path: the commit-route persists the wallet-provided
     // `CommitRequest` into the job's `request_body` under a
     // `commit` key alongside the original send body. Pull it out
     // and feed it to `commit_flow`.
@@ -798,6 +1429,7 @@ async fn wait_for_commit(
                     error: Some(msg),
                 },
             );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
             notify_map.remove(&public_id);
             return Ok(());
         }
@@ -869,6 +1501,7 @@ async fn wait_for_commit(
     // but no new SSE subscriber can attach after this point — the
     // `stream_job_handler` would see the terminal row on its
     // initial-state push and close immediately.
+    cleanup_pending_sign(job_store, app_state, public_id).await;
     notify_map.remove(&public_id);
 
     Ok(())
@@ -877,4 +1510,813 @@ async fn wait_for_commit(
 enum SignalOutcome {
     Signaled,
     TimedOut,
+}
+
+/// Why finalise lost demonstrable lease liveness mid-operation.
+///
+/// Losing the lease is not a warning: the owner no longer has the right to
+/// apply results. Every variant is fail-closed — work aborts, the result is
+/// discarded, and the job is left for a later resumer once the claim is free.
+///
+/// Dropping the work future is only cooperative (Rust cancel at the next
+/// `.await`). Durable transition commits are fenced separately by
+/// **fencing-token + lease** writes ([`JobStore::merge_finalisation_if_finalise_owner`],
+/// [`JobStore::complete_if_finalise_owner`]) so a worker that keeps running
+/// after loss — even under the same owner UUID after reclaim — still cannot
+/// commit with a stale fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FinaliseLeaseLivenessLost {
+    /// `renew_finalise_claim` returned `Ok(false)` — ownership is gone.
+    RenewReturnedFalse,
+    /// Database / storage error while renewing; liveness cannot be proved.
+    RenewError(String),
+    /// A single renew await exceeded its deadline — stalled renew is loss.
+    RenewTimedOut,
+    /// The heartbeat task ended (panic or silent exit) while work was in flight.
+    HeartbeatTaskEnded,
+}
+
+impl std::fmt::Display for FinaliseLeaseLivenessLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RenewReturnedFalse => {
+                write!(f, "finalise lease renew returned false (ownership lost)")
+            }
+            Self::RenewError(e) => write!(f, "finalise lease renew failed: {e}"),
+            Self::RenewTimedOut => {
+                write!(f, "finalise lease renew timed out (stalled renew is loss)")
+            }
+            Self::HeartbeatTaskEnded => {
+                write!(f, "finalise lease heartbeat task ended while work in flight")
+            }
+        }
+    }
+}
+
+/// Run `work` while periodically renewing the exclusive finalise lease.
+///
+/// A lease that is only asserted once before a multi-minute prove expires
+/// while the owner is still alive; a boot sweep then frees it and a second
+/// resumer double-executes. This heartbeat proves liveness continuously.
+///
+/// **Fail closed:** if renewal returns `Ok(false)`, a renew error occurs, a
+/// renew await exceeds `renew_timeout`, or the heartbeat task disappears,
+/// this future resolves to [`Err`]`(`[`FinaliseLeaseLivenessLost`]`)` and
+/// drops `work` without yielding its result. Drop is cooperative — durable
+/// commits still require the claim fence (token + unexpired lease).
+///
+/// `renew_every` should be well under `lease` (production uses
+/// [`crate::job_store::FINALISE_CLAIM_RENEW_INTERVAL`]). `renew_timeout`
+/// bounds each renew await (production:
+/// [`crate::job_store::FINALISE_CLAIM_RENEW_TIMEOUT`]). Renewals write
+/// `NOW() + lease` in Postgres — same clock as claim create and stale release
+/// — and must match the acquisition `fence`.
+///
+/// `work` must yield to the async runtime (await points / `spawn_blocking`
+/// for CPU-bound prove) so the heartbeat task can run. Production covers
+/// prove **and** host-edge completion writes under this heartbeat.
+pub(crate) async fn with_finalise_lease_heartbeat<F, T>(
+    job_store: &JobStore,
+    public_id: Uuid,
+    owner: Uuid,
+    fence: i64,
+    lease: std::time::Duration,
+    renew_every: std::time::Duration,
+    renew_timeout: std::time::Duration,
+    work: F,
+) -> Result<T, FinaliseLeaseLivenessLost>
+where
+    F: std::future::Future<Output = T>,
+{
+    let store = job_store.clone();
+    with_finalise_lease_heartbeat_renew(
+        renew_every,
+        renew_timeout,
+        move || {
+            let store = store.clone();
+            async move {
+                store
+                    .renew_finalise_claim(public_id, owner, fence, lease)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+        work,
+    )
+    .await
+}
+
+/// Core fail-closed heartbeat loop. `renew` is called on each tick; production
+/// wires [`JobStore::renew_finalise_claim`], tests inject failures.
+///
+/// Each `renew()` await is bounded by `renew_timeout`. A stalled renew is
+/// treated as ownership loss — not an unbounded pause while work runs on.
+pub(crate) async fn with_finalise_lease_heartbeat_renew<R, Fut, F, T>(
+    renew_every: std::time::Duration,
+    renew_timeout: std::time::Duration,
+    mut renew: R,
+    work: F,
+) -> Result<T, FinaliseLeaseLivenessLost>
+where
+    R: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<bool, String>> + Send,
+    F: std::future::Future<Output = T>,
+{
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    // Heartbeat reports loss on this channel. Dropping the sender without a
+    // value (panic / silent exit) is itself a liveness failure.
+    let (lost_tx, mut lost_rx) = tokio::sync::oneshot::channel::<FinaliseLeaseLivenessLost>();
+
+    let heartbeat = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(renew_every);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First `tick` completes immediately; skip so we do not double-renew
+        // at t=0 (caller already renewed after claim).
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = &mut cancel_rx => {
+                    // Clean stop after work completed; do not signal loss.
+                    // Dropping lost_tx without send is fine — receiver is gone.
+                    return;
+                }
+                _ = ticker.tick() => {
+                    // Bound the renew await: a hung DB must not pause fail-closed
+                    // while work continues past lease expiry.
+                    match tokio::time::timeout(renew_timeout, renew()).await {
+                        Err(_) => {
+                            tracing::error!(
+                                timeout_secs = renew_timeout.as_secs(),
+                                "finalise lease renew timed out mid-operation — aborting work"
+                            );
+                            let _ = lost_tx.send(FinaliseLeaseLivenessLost::RenewTimedOut);
+                            return;
+                        }
+                        Ok(Ok(true)) => {
+                            tracing::debug!("finalise lease renewed during long operation");
+                        }
+                        Ok(Ok(false)) => {
+                            tracing::error!(
+                                "finalise lease renew lost ownership mid-operation — aborting work"
+                            );
+                            let _ = lost_tx.send(FinaliseLeaseLivenessLost::RenewReturnedFalse);
+                            return;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                error = %e,
+                                "finalise lease renew failed mid-operation — aborting work"
+                            );
+                            let _ = lost_tx.send(FinaliseLeaseLivenessLost::RenewError(e));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Pin work so we can cancel it by dropping when liveness is lost.
+    tokio::pin!(work);
+
+    // Two completion paths only:
+    // 1. `lost_rx` fires → ownership gone, renew error/timeout, or heartbeat died
+    //    (sender dropped without a value). Drop `work` and discard its result.
+    // 2. `work` finishes first → stop heartbeat cleanly, return Ok(result)
+    //    only if no loss raced in and the heartbeat task did not panic.
+    //
+    // Heartbeat panics drop `lost_tx` without send → `lost_rx` yields `Err`,
+    // which is the "task disappeared" signal. `biased` prefers the loss arm
+    // when both are ready so a just-lost lease never publishes a result.
+    //
+    // Dropping `work` is cooperative: CPU-bound segments between `.await`
+    // points may still run. Durable writes must themselves require ownership.
+    tokio::select! {
+        biased;
+        lost = &mut lost_rx => {
+            // Liveness can no longer be demonstrated: drop `work`, discard result.
+            drop(work);
+            let _ = heartbeat.await;
+            match lost {
+                Ok(reason) => Err(reason),
+                // Sender dropped without a value → heartbeat task disappeared.
+                Err(_) => Err(FinaliseLeaseLivenessLost::HeartbeatTaskEnded),
+            }
+        }
+        result = &mut work => {
+            // Check loss *before* cancelling the heartbeat: a clean cancel
+            // drops `lost_tx` and would otherwise look like "task disappeared".
+            match lost_rx.try_recv() {
+                Ok(reason) => {
+                    let _ = cancel_tx.send(());
+                    let _ = heartbeat.await;
+                    return Err(reason);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    let _ = cancel_tx.send(());
+                    let _ = heartbeat.await;
+                    return Err(FinaliseLeaseLivenessLost::HeartbeatTaskEnded);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+            let _ = cancel_tx.send(());
+            match heartbeat.await {
+                Ok(()) => Ok(result),
+                // Heartbeat panicked after work completed: still fail closed —
+                // we cannot assert the lease was live for the whole operation.
+                Err(join_err) => {
+                    tracing::error!(
+                        error = %join_err,
+                        "finalise lease heartbeat panicked after work completed — discarding result"
+                    );
+                    Err(FinaliseLeaseLivenessLost::HeartbeatTaskEnded)
+                }
+            }
+        }
+    }
+}
+
+/// Documented host edge of the job-path finalise resume.
+///
+/// ## Where completion ends (and why)
+///
+/// [`drive_v11_finalise`] drives a job through:
+///
+/// 1. exclusive claim (owner + lease, renewed during long prove)
+/// 2. prove + apply + **durable** engine snapshot + `v11_pending_publishes`
+///    (`members_ready`) via [`crate::router::V11FinaliseHook`] **or** skip
+///    when `completion_result` is already durable (crash after stage)
+/// 3. persist the §7.5 completion surface on the durable capability
+/// 4. [`JobStore::complete_if_finalise_owner`] — §7.5 result published onto the job row
+///
+/// That is the **host edge**. The production hook
+/// ([`crate::v11::finalise_accepted_prove_persist_and_stage`]) leaves the
+/// applied account and a `members_ready` rebroadcast intent on disk so a
+/// restarted node — or later publisher wiring — finds the job exactly at
+/// this edge. On-chain AggregateStateNullifierV3 **broadcast** still needs
+/// a live bitcoind wallet ([`crate::v11::V11Publisher`]); that is outside
+/// the host edge, not a silent skip of durability up to it.
+///
+/// Resume is covered durably up to this edge so a job can be driven to exactly
+/// the point where chain-publish takes over.
+pub const JOB_FINALISE_HOST_EDGE: &str =
+    "job_result_published_after_durable_engine_and_members_ready; on-chain AggregateStateNullifierV3 broadcast requires bitcoind (publisher not driven by this path)";
+
+/// Drive an accepted v1.1 signature through the durable host path up to
+/// [`JOB_FINALISE_HOST_EDGE`].
+///
+/// ## Sweep: every SQL write that mutates a job row
+///
+/// **Derivation method (do not compose from memory):** grep every
+/// `UPDATE jobs` / `INSERT INTO jobs` in production code, quote the
+/// actual `WHERE` clause, then state the fence from that clause alone.
+/// A table assembled from recollection is the same class of evidence as
+/// a test that checks its own logic.
+///
+/// | Write | Actual `WHERE` (ground truth) | Fences on |
+/// |-------|------------------------------|-----------|
+/// | [`JobStore::create`] (`INSERT`) | `ON CONFLICT (account_address, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING` | partial unique key (idempotency) |
+/// | [`JobStore::set_status`] | `WHERE public_id = $3` | **public_id only** — no status predicate |
+/// | [`JobStore::set_status_if`] | `WHERE public_id = $3 AND status = $4` | status CAS |
+/// | [`JobStore::set_awaiting_signature`] | `WHERE public_id = $3 AND status IN ('queued', 'proving')` | status CAS (pre-claim) |
+/// | [`JobStore::complete`] | `WHERE public_id = $3` | **public_id only** — legacy unqualified |
+/// | [`JobStore::complete_if_status`] | `WHERE public_id = $3 AND status = ANY($4::text[]) AND phase IS DISTINCT FROM $5` | status + **not** [`FINALISE_CLAIM_PHASE`] |
+/// | [`JobStore::complete_if_finalise_owner`] | `WHERE public_id = $3 AND status = 'broadcasting' AND phase = $4 AND owner = $5 AND fence = $6 AND lease_expires_at IS NOT NULL AND lease_expires_at > NOW()` | **status + phase + owner + fence + unexpired lease** |
+/// | [`JobStore::fail`] | `WHERE public_id = $2` | **public_id only** — legacy unqualified |
+/// | [`JobStore::fail_if_status`] | `WHERE public_id = $2 AND status = ANY($3::text[]) AND phase IS DISTINCT FROM $4` | status + **not** [`FINALISE_CLAIM_PHASE`] |
+/// | [`JobStore::fail_if_finalise_owner`] | `WHERE public_id = $2 AND status = 'broadcasting' AND phase = $3 AND owner = $4 AND fence = $5 AND lease_expires_at IS NOT NULL AND lease_expires_at > NOW()` | **status + phase + owner + fence + unexpired lease** |
+/// | [`JobStore::claim_finalise_exclusive`] path A | `WHERE public_id = $6 AND status = $7` (`awaiting_signature` → claim) | status CAS; **mints** fence |
+/// | [`JobStore::claim_finalise_exclusive`] path B | `WHERE public_id = $5 AND status = 'broadcasting' AND phase IN ('publishing', 'broadcasting')` | status + free phase; **mints** fence |
+/// | [`JobStore::renew_finalise_claim`] | `WHERE public_id = $5 AND status = 'broadcasting' AND phase = $6 AND owner = $2 AND fence = $3` | **status + phase + owner + fence** (lease rewrite) |
+/// | [`JobStore::release_stale_finalise_claim`] | `WHERE public_id = $1 AND status = 'broadcasting' AND phase = $2 AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())` | status + claimed phase + **expired/absent lease** |
+/// | [`JobStore::replace_request_body_if_status`] | `WHERE public_id = $2 AND status = $3` | status CAS (pre-claim capability / accepted signature) |
+/// | [`JobStore::replace_request_body_if_cleanup_safe`] | `WHERE public_id = $2 AND status <> 'awaiting_signature' AND phase IS DISTINCT FROM $3` | not live handoff + **not** [`FINALISE_CLAIM_PHASE`] |
+/// | [`JobStore::merge_finalisation_if_finalise_owner`] | `WHERE public_id = $3 AND status = 'broadcasting' AND phase = $4 AND owner = $5 AND fence = $6 AND lease_expires_at IS NOT NULL AND lease_expires_at > NOW()` | **status + phase + owner + fence + unexpired lease** |
+/// | [`JobStore::cancel`] | `WHERE public_id = $1 AND status = 'queued'` | status CAS (legacy queued-only) |
+/// | [`JobStore::cancel_not_yet_published`] | `WHERE public_id = $1 AND status IN ('queued', 'proving', 'awaiting_signature')` | status CAS (v1.1 pre-publish) |
+/// | Legacy commit-payload write (`router` commit route) | `WHERE public_id = $2` | **public_id only** — flag-off commit path |
+/// | Finalise hook → engine snapshot + `members_ready` | (not a `jobs` row write; account/engine + rebroadcast) | **fence + owner + lease** via [`crate::v11::finalise_accepted_prove_persist_and_stage`] |
+///
+/// After the claim is won, durable transition commits are fenced on the
+/// **acquisition fencing token** plus a still-valid lease — not on owner
+/// identity or status alone. Dropping a future after lease loss is only
+/// cooperative; the write predicates are the safety mechanism.
+///
+/// `broadcasting` is an **exclusive claim**, not a permission: exactly one
+/// resumer wins the CAS; the loser observes [`FinaliseClaim::Lost`] and must
+/// not continue into side effects **and must not mutate shared notify state**.
+async fn drive_v11_finalise(
+    job_store: &JobStore,
+    app_state: &AppState,
+    notify_map: &JobNotifyMap,
+    public_id: Uuid,
+    job: &Job,
+) -> anyhow::Result<()> {
+    use crate::job_store::FinaliseClaim;
+
+    // Helper: fail with a §7.5 machine code, clean envelopes, drop notify.
+    // Pre-claim only: status-qualified and **never** touches a claimed row
+    // (`fail_if_status` refuses [`FINALISE_CLAIM_PHASE`]). Terminal writes
+    // on an owned epoch must use the fence path below.
+    async fn fail_v11(
+        job_store: &JobStore,
+        app_state: &AppState,
+        notify_map: &JobNotifyMap,
+        public_id: Uuid,
+        code: &str,
+        message: String,
+    ) -> anyhow::Result<()> {
+        let err = crate::v11::encode_job_error(code, message.clone());
+        // Unclaimed only: do not terminate a row another epoch owns.
+        let failed = job_store
+            .fail_if_status(
+                public_id,
+                &[JobStatus::AwaitingSignature, JobStatus::Broadcasting],
+                &err,
+            )
+            .await?;
+        if !failed {
+            // Row is terminal, claimed, or already moved — do not strip
+            // notify that may belong to a live claim holder.
+            tracing::info!(
+                %public_id,
+                "Job dispatcher: pre-claim fail_if_status was a no-op \
+                 (owned, terminal, or moved); leaving shared notify intact"
+            );
+            return Ok(());
+        }
+        publish_phase(
+            notify_map,
+            public_id,
+            JobPhaseEvent {
+                status: JobStatus::Failed,
+                phase: "failed".to_string(),
+                proof_id: None,
+                result: None,
+                error: Some(err),
+            },
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        Ok(())
+    }
+
+    // Post-claim fail: fence-qualified so a lost/stale worker cannot fail a
+    // job another epoch holds (including same-owner reclaim). `Ok(false)` is
+    // quiet loss — leave notify.
+    async fn fail_v11_as_owner(
+        job_store: &JobStore,
+        app_state: &AppState,
+        notify_map: &JobNotifyMap,
+        public_id: Uuid,
+        owner: Uuid,
+        fence: i64,
+        code: &str,
+        message: String,
+    ) -> anyhow::Result<()> {
+        let err = crate::v11::encode_job_error(code, message.clone());
+        let failed = job_store
+            .fail_if_finalise_owner(public_id, owner, fence, &err)
+            .await?;
+        if !failed {
+            tracing::info!(
+                %public_id,
+                %owner,
+                fence,
+                "Job dispatcher: fail_if_finalise_owner was a no-op (fence/lease lost); \
+                 leaving shared notify state intact"
+            );
+            return Ok(());
+        }
+        publish_phase(
+            notify_map,
+            public_id,
+            JobPhaseEvent {
+                status: JobStatus::Failed,
+                phase: "failed".to_string(),
+                proof_id: None,
+                result: None,
+                error: Some(err),
+            },
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        Ok(())
+    }
+
+    // Idempotent resume: terminal jobs are done.
+    if job.status.is_terminal() {
+        tracing::info!(
+            "Job dispatcher: job {} already terminal ({:?}); finalise resume is a no-op",
+            public_id,
+            job.status
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        return Ok(());
+    }
+
+    // Prefer durable capability (cold boot). In-memory map is only a warm
+    // cache of the same envelope — never a substitute for missing fields.
+    let mut entry = match crate::v11::rehydrate_pending_sign(&job.request_body) {
+        Ok(Some(e)) => e,
+        Ok(None) => match app_state.pending_sign_map.get(&public_id).map(|e| e.clone()) {
+            Some(e) => e,
+            None => {
+                return fail_v11(
+                    job_store,
+                    app_state,
+                    notify_map,
+                    public_id,
+                    "internal_error",
+                    "v1.1 finalise: no durable FinalisationCapability on job \
+                     (and pending_sign_map empty)"
+                        .to_string(),
+                )
+                .await;
+            }
+        },
+        Err(e) => {
+            return fail_v11(
+                job_store,
+                app_state,
+                notify_map,
+                public_id,
+                "internal_error",
+                format!("v1.1 finalise: rehydrate finalisation failed: {e}"),
+            )
+            .await;
+        }
+    };
+
+    // Prove+apply readiness (signature). Completion surface may still be absent.
+    if let Err(msg) = crate::v11::ensure_finalise_ready(&entry) {
+        return fail_v11(
+            job_store,
+            app_state,
+            notify_map,
+            public_id,
+            "internal_error",
+            format!("v1.1 finalise: {msg}"),
+        )
+        .await;
+    }
+
+    // Exclusive claim — broadcasting is ownership, not permission. The fence
+    // token minted here is the only credential durable writes accept.
+    let claim_fence = match job_store.claim_finalise_exclusive(public_id).await? {
+        FinaliseClaim::Won { fence } => {
+            tracing::info!(
+                "Job dispatcher: job {} won exclusive finalise claim (owner={}, fence={})",
+                public_id,
+                job_store.process_owner(),
+                fence
+            );
+            // Full lease window from Postgres NOW() before the long path.
+            let renewed = job_store
+                .renew_finalise_claim(
+                    public_id,
+                    job_store.process_owner(),
+                    fence,
+                    crate::job_store::FINALISE_CLAIM_LEASE,
+                )
+                .await?;
+            if !renewed {
+                // Already claimed then lost before prove — fence if we still
+                // hold this epoch; otherwise quiet exit.
+                return fail_v11_as_owner(
+                    job_store,
+                    app_state,
+                    notify_map,
+                    public_id,
+                    job_store.process_owner(),
+                    fence,
+                    "internal_error",
+                    "v1.1 finalise: won claim but immediate lease renew failed \
+                     (lost ownership before prove)"
+                        .to_string(),
+                )
+                .await;
+            }
+            fence
+        }
+        FinaliseClaim::Lost { observed } => {
+            if observed.is_terminal() {
+                tracing::info!(
+                    "Job dispatcher: job {} finalise claim lost; already terminal ({:?})",
+                    public_id,
+                    observed
+                );
+                // Terminal: no winner is mid-flight. Safe to drop local maps.
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
+            // Another resumer owns this job — observe the loss and stop.
+            // Do **not** continue just because status is broadcasting.
+            // Do **not** remove notify_map: that entry now belongs to the
+            // winner (or the live dispatcher that still parks the wallet).
+            tracing::info!(
+                "Job dispatcher: job {} finalise claim lost (observed {:?}); \
+                 refusing side effects; leaving shared notify state intact",
+                public_id,
+                observed
+            );
+            return Ok(());
+        }
+    };
+
+    let claim_owner = job_store.process_owner();
+
+    publish_phase(
+        notify_map,
+        public_id,
+        JobPhaseEvent {
+            status: JobStatus::Broadcasting,
+            phase: crate::job_store::FINALISE_CLAIM_PHASE.to_string(),
+            proof_id: None,
+            result: None,
+            error: None,
+        },
+    );
+
+    // Heartbeat covers prove **and** host-edge completion writes. Dropping
+    // the work future on lease loss is cooperative only; fence + lease
+    // durable writes are the real barrier for anything that still runs.
+    //
+    // What a worker can still do with a stale fence / expired lease:
+    // pure in-process work (CPU prove segments between `.await`s, in-memory
+    // apply under a local write gate). It must not commit durable transitions
+    // — engine/`members_ready` stage, completion persist, terminal complete,
+    // and fence-scoped fail all require the current fence token and an
+    // unexpired lease.
+    let owned_drive = async {
+        // If prove+apply already recorded the §7.5 surface, skip the hook and
+        // only publish + complete (crash window after durable stage + completion
+        // persist, before terminal complete).
+        if !entry.has_completion() {
+            let signature = entry
+                .signature
+                .clone()
+                .expect("ensure_finalise_ready checked signature");
+            let Some(hook) = app_state.v11_finalise.as_ref() else {
+                return fail_v11_as_owner(
+                    job_store,
+                    app_state,
+                    notify_map,
+                    public_id,
+                    claim_owner,
+                    claim_fence,
+                    "internal_error",
+                    "v1.1 finalise: no finalise driver and no durable completion_result \
+                     — cannot prove/apply or complete (incomplete capability path; \
+                     refusing to half-finish)"
+                        .to_string(),
+                )
+                .await;
+            };
+
+            // publisher_pubkey is only the staged capability field — no silent
+            // fall-back to a root request_body key.
+            let publisher_pubkey = entry.publisher_pubkey;
+            let claim = crate::job_store::FinaliseFence {
+                job_id: public_id,
+                owner: claim_owner,
+                fence: claim_fence,
+            };
+            // Fence reaches the hook: production stages engine + members_ready
+            // only while this acquisition epoch still holds.
+            let hook_result = hook(entry.pending.clone(), signature, claim).await;
+            match hook_result {
+                Ok(mut outcome) => {
+                    if outcome.publisher_pubkey.is_none() {
+                        outcome.publisher_pubkey = publisher_pubkey;
+                    }
+                    let response_body = outcome.to_result_json();
+                    if let Err(e) = entry.install_completion(response_body, 200) {
+                        return fail_v11_as_owner(
+                            job_store,
+                            app_state,
+                            notify_map,
+                            public_id,
+                            claim_owner,
+                            claim_fence,
+                            "internal_error",
+                            format!("v1.1 finalise: install_completion failed: {e}"),
+                        )
+                        .await;
+                    }
+                    // Persist completion onto the durable capability **before**
+                    // the terminal complete flip so a crash here is resumable.
+                    // Fence-qualified jsonb_set: stale epochs cannot commit;
+                    // concurrent lease renew is not clobbered.
+                    let persist = match crate::v11::DurableFinalisationPersist::from_entry(&entry)
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return fail_v11_as_owner(
+                                job_store,
+                                app_state,
+                                notify_map,
+                                public_id,
+                                claim_owner,
+                                claim_fence,
+                                "internal_error",
+                                format!("v1.1 finalise: encode completion capability: {e}"),
+                            )
+                            .await;
+                        }
+                    };
+                    let persist_val = match serde_json::to_value(&persist) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return fail_v11_as_owner(
+                                job_store,
+                                app_state,
+                                notify_map,
+                                public_id,
+                                claim_owner,
+                                claim_fence,
+                                "internal_error",
+                                format!(
+                                    "v1.1 finalise: json-encode completion capability: {e}"
+                                ),
+                            )
+                            .await;
+                        }
+                    };
+                    let wrote = job_store
+                        .merge_finalisation_if_finalise_owner(
+                            public_id,
+                            claim_owner,
+                            claim_fence,
+                            &persist_val,
+                        )
+                        .await?;
+                    if !wrote {
+                        tracing::info!(
+                            "Job dispatcher: job {} completion persist was a no-op \
+                             (fence/lease lost or claim free); exiting without re-complete",
+                            public_id
+                        );
+                        // Do not strip notify — may belong to a new epoch.
+                        return Ok(());
+                    }
+                    app_state.pending_sign_map.insert(public_id, entry.clone());
+                }
+                Err(e) if e == crate::job_store::FINALISE_FENCE_LOST => {
+                    // Stale epoch lost the engine/members_ready commit (or the
+                    // resume shortcut). Quiet exit — do not terminal-fail a
+                    // job another fence may hold.
+                    tracing::info!(
+                        "Job dispatcher: job {} finalise hook refused durable stage \
+                         (fence/lease lost); leaving shared notify state intact",
+                        public_id
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    let msg = format!("v1.1 finalise failed: {e}");
+                    tracing::warn!("Job dispatcher: job {} {}", public_id, msg);
+                    return fail_v11_as_owner(
+                        job_store,
+                        app_state,
+                        notify_map,
+                        public_id,
+                        claim_owner,
+                        claim_fence,
+                        "proving_failed",
+                        msg,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        // Host §7.5 job-result publication + terminal complete.
+        // This is [`JOB_FINALISE_HOST_EDGE`] — not on-chain AggregateStateNullifierV3.
+        // Fence is claim token + unexpired lease, not status or owner alone.
+        if let Err(msg) = crate::v11::ensure_completion_ready(&entry) {
+            return fail_v11_as_owner(
+                job_store,
+                app_state,
+                notify_map,
+                public_id,
+                claim_owner,
+                claim_fence,
+                "internal_error",
+                format!("v1.1 finalise: incomplete capability for host complete: {msg}"),
+            )
+            .await;
+        }
+        let response_body = entry
+            .completion_result
+            .clone()
+            .expect("ensure_completion_ready checked");
+        let response_status = entry
+            .completion_status
+            .expect("ensure_completion_ready checked");
+        let completed = job_store
+            .complete_if_finalise_owner(
+                public_id,
+                claim_owner,
+                claim_fence,
+                response_body.clone(),
+                response_status,
+            )
+            .await?;
+        if completed {
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Completed,
+                    phase: "completed".to_string(),
+                    proof_id: None,
+                    result: Some(response_body),
+                    error: None,
+                },
+            );
+            tracing::info!(
+                "Job dispatcher: job {} reached host finalise edge ({}); \
+                 on-chain nullifier publish is not driven by this path",
+                public_id,
+                JOB_FINALISE_HOST_EDGE
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+        } else {
+            tracing::info!(
+                "Job dispatcher: job {} complete_if_finalise_owner was a no-op \
+                 (fence/lease lost or already terminal); leaving shared notify intact",
+                public_id
+            );
+        }
+        Ok(())
+    };
+
+    match with_finalise_lease_heartbeat(
+        job_store,
+        public_id,
+        claim_owner,
+        claim_fence,
+        crate::job_store::FINALISE_CLAIM_LEASE,
+        crate::job_store::FINALISE_CLAIM_RENEW_INTERVAL,
+        crate::job_store::FINALISE_CLAIM_RENEW_TIMEOUT,
+        owned_drive,
+    )
+    .await
+    {
+        Ok(inner) => inner,
+        Err(lost) => {
+            // Lease liveness failed: discard any in-flight prove result,
+            // do not fail the job (another resumer must be able to pick
+            // it up once the claim is free), leave shared notify intact.
+            // Even if work segments still run until the next `.await`,
+            // fence-qualified writes refuse commits from this epoch.
+            tracing::error!(
+                %public_id,
+                reason = %lost,
+                "Job dispatcher: finalise aborted — lease liveness lost mid-operation; \
+                 result discarded; job left for a later resumer"
+            );
+            Ok(())
+        }
+    }
+}
+
+// Retained for any residual call sites; production path uses the capability.
+#[allow(dead_code)]
+fn parse_persisted_transition_signature(
+    sign_val: &serde_json::Value,
+) -> Result<zkcoins_prover::prover_bridge::TransitionSignature, String> {
+    let pk_hex = sign_val
+        .get("pk_i")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "persisted sign.pk_i missing".to_string())?;
+    let sig_hex = sign_val
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "persisted sign.signature missing".to_string())?;
+    let r_hex = sign_val
+        .get("r_prime")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "persisted sign.r_prime missing".to_string())?;
+    let pk_i: [u8; 32] = hex::decode(pk_hex)
+        .map_err(|e| format!("sign.pk_i hex: {e}"))?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("sign.pk_i length {}", v.len()))?;
+    let signature: [u8; 64] = hex::decode(sig_hex)
+        .map_err(|e| format!("sign.signature hex: {e}"))?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("sign.signature length {}", v.len()))?;
+    let r_prime: [u8; 32] = hex::decode(r_hex)
+        .map_err(|e| format!("sign.r_prime hex: {e}"))?
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("sign.r_prime length {}", v.len()))?;
+    Ok(zkcoins_prover::prover_bridge::TransitionSignature {
+        pk_i,
+        signature,
+        r_prime,
+    })
 }

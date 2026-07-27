@@ -45,6 +45,9 @@ pub async fn start_rest_node(
     pool: Arc<PgPool>,
     proofs_dir: &str,
     v11_readiness: V11Readiness,
+    // Shared v1.1 engine (when `ZKCOINS_V11_SHADOW=1`). Used to drive
+    // `StateEngine::finalise` after an accepted `/v1/jobs/{id}/sign`.
+    v11_engine: Option<Arc<crate::v11::EngineAdapter>>,
 ) -> anyhow::Result<()> {
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -105,6 +108,37 @@ pub async fn start_rest_node(
         job_notify_map: Arc::clone(&job_notify_map),
         v11_scan_caught_up: v11_readiness.scan_caught_up,
         v11_finality_ok: v11_readiness.finality_ok,
+        pending_sign_map: Arc::new(DashMap::new()),
+        // Production finalise: prove outside the engine lock, then apply
+        // with live re-validation (receive-path invariant). Under the v1.1
+        // claim a missing driver fails the job loud rather than
+        // short-circuiting to "signature_accepted" alone.
+        v11_finalise: v11_engine.as_ref().map(|adapter| {
+            let adapter = Arc::clone(adapter);
+            let hook: crate::router::V11FinaliseHook =
+                Arc::new(move |pending, signature, fence| {
+                    let adapter = Arc::clone(&adapter);
+                    // publisher_pubkey is filled by the dispatcher from the job
+                    // request_body after the hook returns.
+                    // Durable + fenced: prove → apply → engine snapshot +
+                    // members_ready only while this claim epoch still holds.
+                    Box::pin(async move {
+                        crate::v11::finalise_accepted_prove_persist_and_stage(
+                            &adapter, pending, signature, None, fence,
+                        )
+                        .await
+                    })
+                });
+            hook
+        }),
+        // Production post-begin registry: `StateEngine::begin_*` writes a
+        // live PendingSignEntry here; the dispatcher takes it when the job
+        // enters awaiting_signature and stages via stage_pending_sign.
+        // Under the legacy stack the map stays empty and is unused.
+        v11_live_pending_after_begin: Arc::new(DashMap::new()),
+        // Test-only injection point (Defect 4): never installed in production.
+        #[cfg(test)]
+        v11_pending_after_prove: None,
     };
 
     // No minting-account bootstrap: the neutral model has no
@@ -314,6 +348,205 @@ pub async fn start_rest_node(
     Ok(())
 }
 
+async fn rearm_and_enqueue_v11_finalise(
+    public_id: uuid::Uuid,
+    job_notify_map: &DashMap<uuid::Uuid, Arc<JobNotifier>>,
+    job_tx: &tokio::sync::mpsc::Sender<crate::job_dispatcher::JobEnvelope>,
+) {
+    let notifier = Arc::new(JobNotifier::new());
+    job_notify_map.insert(public_id, notifier);
+    if let Err(e) = job_tx
+        .send(crate::job_dispatcher::JobEnvelope { public_id })
+        .await
+    {
+        eprintln!(
+            "boot_resume_jobs: enqueue signed broadcasting {public_id} failed: {e} (continuing)"
+        );
+    } else {
+        tracing::info!(
+            "boot_resume_jobs: re-armed signed broadcasting job {public_id} for finalise resume"
+        );
+    }
+}
+
+/// Poll until the exclusive finalise claim is abandoned (or the job leaves
+/// broadcasting), then release + enqueue. Prevents stranding after an
+/// immediate restart while a dead owner's lease has not yet expired.
+///
+/// **Durable:** no fixed deadline. A slow-dying owner (lease still renewing
+/// or wall-clock lag before abandonment) must not cause silent job loss.
+/// This task keeps trying until the claim is free, the job is terminal /
+/// non-broadcasting, or the process exits. A later boot re-lists interrupted
+/// `broadcasting` rows and schedules reclaim again if needed.
+fn spawn_deferred_finalise_reclaim(
+    job_store: Arc<JobStore>,
+    job_notify_map: Arc<DashMap<uuid::Uuid, Arc<JobNotifier>>>,
+    job_tx: tokio::sync::mpsc::Sender<crate::job_dispatcher::JobEnvelope>,
+    public_id: uuid::Uuid,
+) {
+    tokio::spawn(async move {
+        // Poll frequently enough that a short test lease is reclaimed promptly.
+        // No wall-clock deadline: abandoning after N minutes was silent loss.
+        let poll = std::time::Duration::from_millis(200);
+        loop {
+            tokio::time::sleep(poll).await;
+
+            let row = match job_store.load(public_id).await {
+                Ok(Some(j)) => j,
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!(
+                        %public_id,
+                        error = %e,
+                        "boot_resume_jobs: deferred reclaim load failed; retrying"
+                    );
+                    continue;
+                }
+            };
+            if row.status.is_terminal() {
+                return;
+            }
+            if row.status != JobStatus::Broadcasting {
+                return;
+            }
+
+            let released = match job_store.release_stale_finalise_claim(public_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        %public_id,
+                        error = %e,
+                        "boot_resume_jobs: deferred release_stale failed; retrying"
+                    );
+                    continue;
+                }
+            };
+            // When release succeeds the claim is free — enqueue without a
+            // second load (a DB error on re-load must not strand a freed row).
+            if released {
+                tracing::info!(
+                    %public_id,
+                    "boot_resume_jobs: deferred reclaim — claim free, enqueueing"
+                );
+                rearm_and_enqueue_v11_finalise(public_id, &job_notify_map, &job_tx).await;
+                return;
+            }
+            // Re-load phase after a no-op release (still need free-vs-owned).
+            let phase = match job_store.load(public_id).await {
+                Ok(Some(j)) => j.phase,
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!(
+                        %public_id,
+                        error = %e,
+                        "boot_resume_jobs: deferred reclaim phase reload failed; retrying"
+                    );
+                    continue;
+                }
+            };
+            match boot_finalise_action_after_release(false, JobStatus::Broadcasting, &phase) {
+                BootFinaliseAction::EnqueueNow => {
+                    tracing::info!(
+                        %public_id,
+                        "boot_resume_jobs: deferred reclaim — claim free, enqueueing"
+                    );
+                    rearm_and_enqueue_v11_finalise(public_id, &job_notify_map, &job_tx).await;
+                    return;
+                }
+                BootFinaliseAction::DeferUntilAbandoned => {
+                    // Still live — keep waiting for abandonment evidence.
+                }
+                BootFinaliseAction::Skip => return,
+            }
+        }
+    });
+}
+
+/// Boot decision after a `release_stale_finalise_claim` attempt on a
+/// resumable v1.1 broadcasting job.
+///
+/// | Prior phase | Release result | Action |
+/// |-------------|----------------|--------|
+/// | `finalise_claimed` | `Ok(true)` (abandoned) | [`BootFinaliseAction::EnqueueNow`] — claim freed |
+/// | `finalise_claimed` | `Ok(false)` (lease still live) | [`BootFinaliseAction::DeferUntilAbandoned`] — still owned; do **not** enqueue as free |
+/// | `publishing` / `broadcasting` | `Ok(false)` (nothing to release) | [`BootFinaliseAction::EnqueueNow`] — already free |
+/// | any free/terminal after error recovery | — | [`BootFinaliseAction::Skip`] |
+/// | any | `Err(_)` | caller must not enqueue (fail closed for that row) |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BootFinaliseAction {
+    /// Claim is free — boot may re-arm notify and enqueue for finalise.
+    EnqueueNow,
+    /// Exclusive claim still held under a live lease. Do not enqueue; a
+    /// deferred reclaim must wait for abandonment evidence.
+    DeferUntilAbandoned,
+    /// Job is no longer a broadcasting finalise candidate.
+    Skip,
+}
+
+/// Decide boot action from the release outcome and the job row **after**
+/// the release attempt. Pure decision table — no I/O.
+pub(crate) fn boot_finalise_action_after_release(
+    released: bool,
+    status: JobStatus,
+    phase: &str,
+) -> BootFinaliseAction {
+    if status != JobStatus::Broadcasting {
+        return BootFinaliseAction::Skip;
+    }
+    if released {
+        // Abandoned claim stripped; phase is `publishing`.
+        return BootFinaliseAction::EnqueueNow;
+    }
+    // Ok(false): either still exclusively claimed, or already free.
+    if phase == crate::job_store::FINALISE_CLAIM_PHASE {
+        BootFinaliseAction::DeferUntilAbandoned
+    } else if phase == "publishing" || phase == "broadcasting" {
+        BootFinaliseAction::EnqueueNow
+    } else {
+        // Unknown phase under broadcasting — do not pretend it is free.
+        BootFinaliseAction::Skip
+    }
+}
+
+/// Boot disposition for one interrupted v1.1 edge row, including DB-error
+/// paths. Pure — no I/O.
+///
+/// | `release` | `phase_reload` (only if `Ok(false)`) | Disposition |
+/// |-----------|--------------------------------------|-------------|
+/// | `Err` | — | [`BootRowDisposition::LeaveUntouchedForRetry`] — no mutation |
+/// | `Ok(true)` | ignored | [`BootRowDisposition::Act`]`(EnqueueNow)` — claim freed; enqueue without second load |
+/// | `Ok(false)` | `Err` | [`BootRowDisposition::LeaveUntouchedForRetry`] — row not mutated by release |
+/// | `Ok(false)` | `Ok(None)` | [`BootRowDisposition::Act`]`(Skip)` — row vanished |
+/// | `Ok(false)` | `Ok(Some(phase))` | [`BootRowDisposition::Act`]`(`[`boot_finalise_action_after_release`]`)` |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BootRowDisposition {
+    /// Database error before or without a successful mutation — leave the
+    /// row as-is for a later boot/retry. Never half-process.
+    LeaveUntouchedForRetry,
+    /// A defined action for this row.
+    Act(BootFinaliseAction),
+}
+
+/// Pure error-path + success-path decision for one resumable v1.1 edge row.
+pub(crate) fn boot_finalise_disposition(
+    release: Result<bool, ()>,
+    phase_reload: Result<Option<&str>, ()>,
+) -> BootRowDisposition {
+    match release {
+        Err(()) => BootRowDisposition::LeaveUntouchedForRetry,
+        Ok(true) => BootRowDisposition::Act(BootFinaliseAction::EnqueueNow),
+        Ok(false) => match phase_reload {
+            Err(()) => BootRowDisposition::LeaveUntouchedForRetry,
+            Ok(None) => BootRowDisposition::Act(BootFinaliseAction::Skip),
+            Ok(Some(phase)) => BootRowDisposition::Act(boot_finalise_action_after_release(
+                false,
+                JobStatus::Broadcasting,
+                phase,
+            )),
+        },
+    }
+}
+
 /// Job-API boot-time resumer. Walks every non-terminal row in the
 /// `jobs` table and applies the partition described in
 /// `JobStore::list_interrupted_for_resume` /
@@ -330,32 +563,156 @@ pub async fn start_rest_node(
 ///   the signature. Re-arm a fresh `Notify` entry and hand the
 ///   public_id back to the dispatcher so it parks on the channel
 ///   the same way it did pre-restart.
-async fn boot_resume_jobs(
+pub(crate) async fn boot_resume_jobs(
     job_store: &Arc<JobStore>,
     job_notify_map: &Arc<DashMap<uuid::Uuid, Arc<JobNotifier>>>,
     job_tx: &tokio::sync::mpsc::Sender<crate::job_dispatcher::JobEnvelope>,
 ) -> anyhow::Result<()> {
-    // Interrupted in-flight rows: mark each failed so the wallet
-    // observes a terminal status.
+    // Interrupted in-flight rows. Legacy / unsigned work cannot resume
+    // (prove output lived only in process memory) → mark failed.
+    // v1.1 jobs with a **signed durable FinalisationCapability** can
+    // resume finalise after a mid-prove crash (status broadcasting):
+    // re-arm and enqueue instead of failing.
     let interrupted = job_store.list_interrupted_for_resume().await?;
     for job in interrupted {
-        if let Err(e) = job_store
-            .fail(
+        let resumable_v11 = crate::v11::v11_sign_route_active()
+            && job.status == JobStatus::Broadcasting
+            && matches!(
+                crate::v11::rehydrate_pending_sign(&job.request_body),
+                Ok(Some(e)) if e.signature.is_some()
+            );
+        if resumable_v11 {
+            // Honour release_stale: only enqueue when the claim is free.
+            // Ignoring Ok(false) re-enqueued still-owned jobs; the loser
+            // then exited and the edge job was stranded forever.
+            //
+            // On a database error the row must stay **entirely untouched**
+            // and be retried (next boot) — never half-process (e.g. release
+            // then abort before enqueue via `?` on a subsequent load).
+            // Decision table: [`boot_finalise_disposition`].
+            let release_result = match job_store
+                .release_stale_finalise_claim(job.public_id)
+                .await
+            {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    eprintln!(
+                        "boot_resume_jobs: release_stale_finalise_claim({}) failed: {} \
+                         (row left untouched for retry; fail closed)",
+                        job.public_id, e
+                    );
+                    Err(())
+                }
+            };
+
+            // Phase reload only when release was Ok(false). On Ok(true) the
+            // disposition enqueues without a second load so a load error
+            // cannot strand a just-freed claim.
+            let phase_reload: Result<Option<String>, ()> = match release_result {
+                Ok(false) => match job_store.load(job.public_id).await {
+                    Ok(Some(j)) => Ok(Some(j.phase)),
+                    Ok(None) => {
+                        tracing::warn!(
+                            "boot_resume_jobs: job {} vanished after release attempt",
+                            job.public_id
+                        );
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "boot_resume_jobs: load({}) after release_stale failed: {} \
+                             (row left untouched for retry; fail closed)",
+                            job.public_id, e
+                        );
+                        Err(())
+                    }
+                },
+                // Not consulted when release is Err or Ok(true).
+                _ => Ok(None),
+            };
+
+            let disposition = boot_finalise_disposition(
+                release_result,
+                phase_reload
+                    .as_ref()
+                    .map(|o| o.as_deref())
+                    .map_err(|_| ()),
+            );
+            match disposition {
+                BootRowDisposition::LeaveUntouchedForRetry => {
+                    // Already logged; continue to next interrupted row.
+                }
+                BootRowDisposition::Act(BootFinaliseAction::EnqueueNow) => {
+                    rearm_and_enqueue_v11_finalise(
+                        job.public_id,
+                        job_notify_map,
+                        job_tx,
+                    )
+                    .await;
+                }
+                BootRowDisposition::Act(BootFinaliseAction::DeferUntilAbandoned) => {
+                    let phase = phase_reload
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| crate::job_store::FINALISE_CLAIM_PHASE.to_string());
+                    tracing::info!(
+                        "boot_resume_jobs: job {} still under a live finalise claim \
+                         (phase={}); not enqueueing as free — scheduling reclaim",
+                        job.public_id,
+                        phase
+                    );
+                    spawn_deferred_finalise_reclaim(
+                        Arc::clone(job_store),
+                        Arc::clone(job_notify_map),
+                        job_tx.clone(),
+                        job.public_id,
+                    );
+                }
+                BootRowDisposition::Act(BootFinaliseAction::Skip) => {
+                    tracing::info!(
+                        "boot_resume_jobs: job {} not enqueued after release \
+                         (disposition=Skip)",
+                        job.public_id
+                    );
+                }
+            }
+            continue;
+        }
+        // Status-qualified fail against the status observed in this
+        // snapshot — never bare `fail`. Between list and write another
+        // process can advance the row to `awaiting_signature` and win a
+        // finalise claim; bare fail would then terminate an owned epoch.
+        // `fail_if_status` refuses any held claim (`phase IS DISTINCT FROM
+        // FINALISE_CLAIM_PHASE`) and is a no-op when status has moved on.
+        match job_store
+            .fail_if_status(
                 job.public_id,
+                &[job.status],
                 "server restarted before processing — please retry",
             )
             .await
         {
-            eprintln!(
-                "boot_resume_jobs: fail({}) failed: {} (continuing)",
-                job.public_id, e
-            );
-        } else {
-            tracing::info!(
-                "boot_resume_jobs: marked {} ({:?}) failed",
-                job.public_id,
-                job.status
-            );
+            Ok(true) => {
+                tracing::info!(
+                    "boot_resume_jobs: marked {} ({:?}) failed",
+                    job.public_id,
+                    job.status
+                );
+            }
+            Ok(false) => {
+                tracing::info!(
+                    "boot_resume_jobs: skip fail for {} (snapshot status={:?}; \
+                     row moved or claimed since list)",
+                    job.public_id,
+                    job.status
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "boot_resume_jobs: fail_if_status({}) failed: {} (continuing)",
+                    job.public_id, e
+                );
+            }
         }
     }
 
@@ -364,17 +721,31 @@ async fn boot_resume_jobs(
     for job in pending {
         match job.status {
             JobStatus::Queued => {
-                if let Err(e) = job_store
-                    .fail(
+                // Same fence as interrupted: snapshot said `queued`, but a
+                // concurrent worker may have proven, advertised, signed and
+                // claimed before this write. Status-qualified only.
+                match job_store
+                    .fail_if_status(
                         job.public_id,
+                        &[JobStatus::Queued],
                         "server restarted before processing — please retry",
                     )
                     .await
                 {
-                    eprintln!(
-                        "boot_resume_jobs: fail({}) failed: {} (continuing)",
-                        job.public_id, e
-                    );
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::info!(
+                            "boot_resume_jobs: skip fail for queued {} \
+                             (moved or claimed since list)",
+                            job.public_id
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "boot_resume_jobs: fail_if_status({}) failed: {} (continuing)",
+                            job.public_id, e
+                        );
+                    }
                 }
             }
             JobStatus::AwaitingSignature => {

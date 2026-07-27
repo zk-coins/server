@@ -537,6 +537,11 @@ pub(crate) async fn persist_engine_snapshot(
 /// Schnorr `s` / BatchMember fields are not yet durable — that row was
 /// previously unrecoverable. Either both land or neither does.
 /// **Crate-private durable-write sink** (engine + members_ready intent).
+///
+/// Receive-path / non-job writers use this unfenced form. The job finalise
+/// path **must** use
+/// [`persist_engine_with_pending_members_ready_if_finalise_fence`] so a stale
+/// claim epoch cannot advance the engine after reclaim.
 pub(crate) async fn persist_engine_with_pending_members_ready(
     pool: &PgPool,
     snap: &EngineSnapshot,
@@ -557,6 +562,117 @@ pub(crate) async fn persist_engine_with_pending_members_ready(
         .context("engine+members_ready persist: stack_scan_mode capability check")?;
     clear_all(&mut tx).await?;
     write_all(&mut tx, snap).await?;
+    insert_members_ready_row(
+        &mut tx,
+        owner,
+        pk,
+        r,
+        s,
+        r_prime,
+        build_tip_height,
+        build_tip_hash,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .context("commit engine+members_ready persist tx")?;
+    Ok(())
+}
+
+/// Job-path durable stage: same atomic engine + `members_ready` write as
+/// [`persist_engine_with_pending_members_ready`], but only while the exclusive
+/// finalise claim identified by `fence` is still current **and** the lease is
+/// unexpired.
+///
+/// Returns `Ok(true)` if the write committed, `Ok(false)` if the fence/lease
+/// check lost (no engine or `members_ready` rows written). Same fence predicate
+/// as [`crate::job_store::JobStore::complete_if_finalise_owner`]: token + lease,
+/// not owner identity alone.
+///
+/// The fence check and the engine write share one transaction so a reclaim
+/// between check and commit cannot race the durable stage in.
+pub(crate) async fn persist_engine_with_pending_members_ready_if_finalise_fence(
+    pool: &PgPool,
+    snap: &EngineSnapshot,
+    account_owner: Address,
+    pk: [u8; 32],
+    r: [u8; 32],
+    s: [u8; 32],
+    r_prime: [u8; 32],
+    build_tip_height: u32,
+    build_tip_hash: [u8; 32],
+    fence: crate::job_store::FinaliseFence,
+) -> Result<bool> {
+    use crate::job_store::FINALISE_CLAIM_PHASE;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin fenced engine+members_ready persist tx")?;
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+        .await
+        .context("fenced engine+members_ready: stack_scan_mode capability check")?;
+
+    // Lock the job row and refuse unless this acquisition epoch still holds.
+    // FOR UPDATE serialises against concurrent reclaim / renew rewrites of
+    // finalise_claim on the same row.
+    let owner_text = fence.owner.to_string();
+    let held = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM jobs \
+         WHERE public_id = $1 \
+           AND status = 'broadcasting' \
+           AND phase = $2 \
+           AND request_body #>> '{finalise_claim,owner}' = $3 \
+           AND (request_body #>> '{finalise_claim,fence}')::bigint = $4 \
+           AND (request_body #>> '{finalise_claim,lease_expires_at}') IS NOT NULL \
+           AND (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz > NOW() \
+         FOR UPDATE",
+    )
+    .bind(fence.job_id)
+    .bind(FINALISE_CLAIM_PHASE)
+    .bind(&owner_text)
+    .bind(fence.fence)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("fenced engine+members_ready: claim fence check")?;
+
+    if held.is_none() {
+        // Explicit rollback so a lost fence never leaves an open write tx.
+        tx.rollback()
+            .await
+            .context("rollback fenced engine+members_ready on fence loss")?;
+        return Ok(false);
+    }
+
+    clear_all(&mut tx).await?;
+    write_all(&mut tx, snap).await?;
+    insert_members_ready_row(
+        &mut tx,
+        account_owner,
+        pk,
+        r,
+        s,
+        r_prime,
+        build_tip_height,
+        build_tip_hash,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .context("commit fenced engine+members_ready persist tx")?;
+    Ok(true)
+}
+
+async fn insert_members_ready_row(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: Address,
+    pk: [u8; 32],
+    r: [u8; 32],
+    s: [u8; 32],
+    r_prime: [u8; 32],
+    build_tip_height: u32,
+    build_tip_hash: [u8; 32],
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO v11_pending_publishes \
          (pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
@@ -571,7 +687,7 @@ pub(crate) async fn persist_engine_with_pending_members_ready(
     .bind(i64::from(build_tip_height))
     .bind(build_tip_hash.as_slice())
     .bind(PENDING_PUBLISH_MEMBERS_READY)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .with_context(|| {
         format!(
@@ -579,9 +695,6 @@ pub(crate) async fn persist_engine_with_pending_members_ready(
             hex::encode(pk)
         )
     })?;
-    tx.commit()
-        .await
-        .context("commit engine+members_ready persist tx")?;
     Ok(())
 }
 
