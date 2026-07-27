@@ -597,10 +597,13 @@ impl JobStore {
     /// | `broadcasting` + already [`FINALISE_CLAIM_PHASE`] (any owner) | [`FinaliseClaim::Lost`] |
     /// | terminal / other | [`FinaliseClaim::Lost`] with the observed status |
     ///
-    /// Crash recovery: boot calls [`Self::release_stale_finalise_claim`] before
-    /// re-enqueue; that only succeeds when the lease is expired (or no lease
-    /// was ever registered — abandoned pre-lease / corrupt claim). A live
-    /// concurrent loser **must not** continue into side-effectful finalise.
+    /// Crash recovery: boot calls [`Self::release_stale_finalise_claim`] and
+    /// **honours** the result before re-enqueue: `Ok(true)` or an already-free
+    /// phase → enqueue; `Ok(false)` while still [`FINALISE_CLAIM_PHASE`] → do
+    /// not enqueue as free (deferred reclaim waits for abandonment). Release
+    /// only succeeds when the lease is expired (or no lease was ever
+    /// registered — abandoned pre-lease / corrupt claim). A live concurrent
+    /// loser **must not** continue into side-effectful finalise.
     pub async fn claim_finalise_exclusive(
         &self,
         public_id: Uuid,

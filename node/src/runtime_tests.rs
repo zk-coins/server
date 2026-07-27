@@ -26,14 +26,23 @@
 //! shape; once a third bootstrap test lands the duplicated setup is
 //! worth extracting into a helper.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use crate::account_node::AccountNode;
-use crate::runtime::start_rest_node;
+use crate::job_store::{
+    CreateResult, FinaliseClaim, JobKind, JobStatus, JobStore, FINALISE_CLAIM_PHASE,
+};
+use crate::runtime::{
+    boot_finalise_action_after_release, boot_resume_jobs, start_rest_node, BootFinaliseAction,
+};
 use crate::state::State;
 use crate::test_db::setup_pool;
 use crate::username::UsernameStore;
+use crate::v11::{
+    clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+};
+use dashmap::DashMap;
 
 // Shared-Postgres test infra (issue #181 Optimisation B): see
 // `crate::test_db`. The previous file-local `setup_pool` is gone
@@ -207,3 +216,309 @@ async fn start_rest_node_binds_and_serves_health() {
 // and the SMT collapsed into one value the desync mode the check
 // guarded against can no longer arise, so the test that exercised the
 // `CRITICAL: minting state desync` Err arm is gone too.
+
+static V11_STACK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_v11_stack_for_test() -> MutexGuard<'static, ()> {
+    V11_STACK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Defect 2 (P0): pure decision table — boot action by release result + phase.
+#[test]
+fn boot_finalise_action_decision_table() {
+    // Abandoned claim released → enqueue.
+    assert_eq!(
+        boot_finalise_action_after_release(true, JobStatus::Broadcasting, "publishing"),
+        BootFinaliseAction::EnqueueNow
+    );
+    // Still exclusively claimed under a live lease → do not enqueue as free.
+    assert_eq!(
+        boot_finalise_action_after_release(
+            false,
+            JobStatus::Broadcasting,
+            FINALISE_CLAIM_PHASE
+        ),
+        BootFinaliseAction::DeferUntilAbandoned
+    );
+    // Already free (nothing to release) → enqueue.
+    assert_eq!(
+        boot_finalise_action_after_release(false, JobStatus::Broadcasting, "publishing"),
+        BootFinaliseAction::EnqueueNow
+    );
+    assert_eq!(
+        boot_finalise_action_after_release(false, JobStatus::Broadcasting, "broadcasting"),
+        BootFinaliseAction::EnqueueNow
+    );
+    // Terminal / wrong status → skip.
+    assert_eq!(
+        boot_finalise_action_after_release(false, JobStatus::Completed, "completed"),
+        BootFinaliseAction::Skip
+    );
+    // Unknown phase under broadcasting → skip (do not pretend free).
+    assert_eq!(
+        boot_finalise_action_after_release(false, JobStatus::Broadcasting, "weird_phase"),
+        BootFinaliseAction::Skip
+    );
+}
+
+/// Plant a signed v1.1 job at the host edge under `broadcasting`, with an
+/// exclusive finalise claim owned by `claim_owner` and the given lease.
+async fn plant_edge_job_with_claim(
+    store: &JobStore,
+    claim_owner: uuid::Uuid,
+    lease: std::time::Duration,
+    idem: &str,
+) -> uuid::Uuid {
+    let result = store
+        .create(
+            JobKind::Send,
+            &[0xEDu8; 32],
+            Some(idem),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+
+    let (mut entry, submission) =
+        crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
+    let advertised = crate::v11::awaiting_signature_result_json(&entry);
+    let accepted = crate::v11::accept_wallet_transition_signature(
+        crate::v11::V11ShadowMode::On,
+        entry.network,
+        &entry.pending,
+        &submission,
+    )
+    .expect("verify");
+    entry.install_signature(accepted).expect("install");
+    let outcome = crate::v11::FinaliseOutcome::from_pending_proof_data_with_publisher(
+        &entry.pending,
+        entry.publisher_pubkey,
+    );
+    entry
+        .install_completion(outcome.to_result_json(), 200)
+        .expect("install completion");
+    let persist = crate::v11::DurableFinalisationPersist::from_entry(&entry).expect("encode");
+
+    store
+        .set_awaiting_signature(job_id, 1, advertised)
+        .await
+        .expect("awaiting_signature");
+    let row = store.load(job_id).await.expect("load").expect("row");
+    let mut body = row.request_body;
+    body.as_object_mut().unwrap().insert(
+        crate::v11::FINALISATION_BODY_KEY.to_string(),
+        serde_json::to_value(&persist).unwrap(),
+    );
+    sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+        .bind(&body)
+        .bind(job_id)
+        .execute(store.pool())
+        .await
+        .expect("plant finalisation");
+
+    assert_eq!(
+        store
+            .claim_finalise_exclusive_as(job_id, claim_owner, lease)
+            .await
+            .expect("claim"),
+        FinaliseClaim::Won
+    );
+    job_id
+}
+
+/// Defect 2 (P0): immediate restart of an edge job whose claim is abandoned
+/// (expired lease) must release + enqueue so the dispatcher can drive it —
+/// not strand it by pretending a still-owned claim is free, nor skip free work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn immediate_restart_drives_abandoned_edge_job_forward() {
+    let _guard = lock_v11_stack_for_test();
+    clear_process_stack_mode_for_test();
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let scope = setup_pool().await;
+    let dead_owner = uuid::Uuid::new_v4();
+    let plant_store = JobStore::with_process_owner(scope.pool.clone(), dead_owner);
+    let job_id = plant_edge_job_with_claim(
+        &plant_store,
+        dead_owner,
+        std::time::Duration::from_secs(60),
+        "k-boot-edge-abandoned",
+    )
+    .await;
+
+    // Dead process left an exclusive claim; lease is expired → abandonment.
+    sqlx::query(
+        "UPDATE jobs SET request_body = jsonb_set( \
+             COALESCE(request_body, '{}'::jsonb), \
+             '{finalise_claim,lease_expires_at}', \
+             to_jsonb('1970-01-01T00:00:00Z'::text), \
+             true \
+         ) WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .execute(plant_store.pool())
+    .await
+    .expect("expire lease");
+
+    // Fresh process-generation JobStore (immediate restart).
+    let boot_store = Arc::new(JobStore::new(scope.pool.clone()));
+    let notify_map: Arc<DashMap<uuid::Uuid, Arc<crate::job_dispatcher::JobNotifier>>> =
+        Arc::new(DashMap::new());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+    boot_resume_jobs(&boot_store, &notify_map, &tx)
+        .await
+        .expect("boot_resume_jobs");
+
+    let env = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("boot must enqueue abandoned edge job within 2s")
+        .expect("channel open");
+    assert_eq!(env.public_id, job_id, "boot must re-arm the edge job");
+
+    // Claim is free for the new process.
+    assert_eq!(
+        boot_store
+            .claim_finalise_exclusive(job_id)
+            .await
+            .expect("claim after boot"),
+        FinaliseClaim::Won
+    );
+
+    clear_process_stack_mode_for_test();
+    drop(scope);
+}
+
+/// Defect 2 (P0): a still-live claim must not be enqueued as free; once the
+/// lease expires the deferred reclaim drives the edge job forward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_claim_not_enqueued_then_deferred_reclaim_after_expiry() {
+    let _guard = lock_v11_stack_for_test();
+    clear_process_stack_mode_for_test();
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let scope = setup_pool().await;
+    let dead_owner = uuid::Uuid::new_v4();
+    let plant_store = JobStore::with_process_owner(scope.pool.clone(), dead_owner);
+    // Long enough that boot sees a live lease (not already abandoned).
+    let lease = std::time::Duration::from_secs(60);
+    let job_id = plant_edge_job_with_claim(
+        &plant_store,
+        dead_owner,
+        lease,
+        "k-boot-edge-live-then-expire",
+    )
+    .await;
+
+    let boot_store = Arc::new(JobStore::new(scope.pool.clone()));
+    let notify_map: Arc<DashMap<uuid::Uuid, Arc<crate::job_dispatcher::JobNotifier>>> =
+        Arc::new(DashMap::new());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+    boot_resume_jobs(&boot_store, &notify_map, &tx)
+        .await
+        .expect("boot_resume_jobs");
+
+    // Immediate: live lease → must NOT enqueue as free.
+    let early = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await;
+    assert!(
+        early.is_err(),
+        "live claim must not be enqueued immediately; got {:?}",
+        early.ok().flatten().map(|e| e.public_id)
+    );
+
+    // Simulate lease expiry (dead owner stopped renewing). Deferred reclaim
+    // must then release + enqueue.
+    sqlx::query(
+        "UPDATE jobs SET request_body = jsonb_set( \
+             COALESCE(request_body, '{}'::jsonb), \
+             '{finalise_claim,lease_expires_at}', \
+             to_jsonb('1970-01-01T00:00:00Z'::text), \
+             true \
+         ) WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .execute(boot_store.pool())
+    .await
+    .expect("expire lease after boot");
+
+    let env = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("deferred reclaim must enqueue after lease expiry")
+        .expect("channel open");
+    assert_eq!(env.public_id, job_id);
+
+    assert_eq!(
+        boot_store
+            .claim_finalise_exclusive(job_id)
+            .await
+            .expect("claim after deferred reclaim"),
+        FinaliseClaim::Won
+    );
+
+    clear_process_stack_mode_for_test();
+    drop(scope);
+}
+
+/// Defect 2 (P0): free-phase edge job (no exclusive claim) is enqueued even
+/// though `release_stale` returns `Ok(false)` — nothing to release is not
+/// ownership.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn free_phase_edge_job_enqueued_despite_release_false() {
+    let _guard = lock_v11_stack_for_test();
+    clear_process_stack_mode_for_test();
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let scope = setup_pool().await;
+    let store = JobStore::new(scope.pool.clone());
+    let job_id = plant_edge_job_with_claim(
+        &store,
+        store.process_owner(),
+        std::time::Duration::from_secs(60),
+        "k-boot-edge-free-phase",
+    )
+    .await;
+    // Strip claim → phase `publishing`, still broadcasting + signed capability.
+    // (Force strip: live lease would refuse release_stale; free phase is the
+    // state under test, not the release path.)
+    sqlx::query(
+        "UPDATE jobs SET phase = 'publishing', \
+                request_body = COALESCE(request_body, '{}'::jsonb) - 'finalise_claim' \
+         WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .execute(store.pool())
+    .await
+    .expect("force free phase");
+    assert!(
+        !store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release on free phase"),
+        "precondition: free phase yields Ok(false) from release_stale"
+    );
+
+    let boot_store = Arc::new(JobStore::new(scope.pool.clone()));
+    let notify_map: Arc<DashMap<uuid::Uuid, Arc<crate::job_dispatcher::JobNotifier>>> =
+        Arc::new(DashMap::new());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+    boot_resume_jobs(&boot_store, &notify_map, &tx)
+        .await
+        .expect("boot_resume_jobs");
+
+    let env = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("free-phase edge job must be enqueued")
+        .expect("channel open");
+    assert_eq!(env.public_id, job_id);
+
+    clear_process_stack_mode_for_test();
+    drop(scope);
+}
