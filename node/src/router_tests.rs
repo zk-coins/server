@@ -4429,12 +4429,11 @@ mod jobs_endpoint_tests {
     /// injected finalise hook, production resume path, driven only by DB
     /// bytes that already carry the completion surface (crash after apply).
     ///
-    /// A true production `AppState` also wires `v11_finalise` from an
-    /// `EngineAdapter` when the v1.1 stack is claimed — that needs env pins
-    /// and a multi-minute prove, which this unit test does not run. What
-    /// this locks down is capability completeness for publish+complete:
-    /// resume finishes from durable fields alone without warm maps or a
-    /// hook. Missing any of those fields fails (see incomplete test).
+    /// Reaches [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`]: §7.5 job
+    /// result on the row + `completed`. Does **not** drive on-chain
+    /// AggregateStateNullifierV3 (bitcoind / `v11_pending_publishes` — design
+    /// edge of the sync finalise hook). Missing capability fields fail (see
+    /// incomplete test).
     #[tokio::test]
     async fn cold_fresh_appstate_drives_completion_from_durable_capability_alone() {
         use crate::v11::{
@@ -4668,6 +4667,169 @@ mod jobs_endpoint_tests {
 
         clear_process_stack_mode_for_test();
         drop(pool);
+    }
+
+    /// Defect 3: a non-terminal losing resumer must leave the winner's
+    /// `notify_map` entry intact — observe the loss and return, no cleanup.
+    #[tokio::test]
+    async fn losing_resumer_leaves_winner_notify_map_intact() {
+        use crate::job_dispatcher::JobNotifier;
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        };
+        use std::time::Duration;
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let (job_id, _) =
+            plant_signed_finalisation_job(&state.job_store, 0xE3, "k-loser-notify", true).await;
+
+        // Winner already holds the exclusive claim (live owner).
+        assert_eq!(
+            state
+                .job_store
+                .claim_finalise_exclusive(job_id)
+                .await
+                .expect("winner claim"),
+            crate::job_store::FinaliseClaim::Won
+        );
+
+        // Shared notify state that belongs to the winner / live dispatcher.
+        let notifier = Arc::new(JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier.clone());
+        assert!(
+            state.job_notify_map.get(&job_id).is_some(),
+            "precondition: winner notify present"
+        );
+
+        // Loser resume: claim lost, non-terminal — must not remove notify.
+        crate::job_dispatcher::process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            crate::job_dispatcher::JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("loser process returns Ok");
+
+        assert!(
+            state.job_notify_map.get(&job_id).is_some(),
+            "losing resumer must not remove the winner's notify_map entry"
+        );
+        // Job still broadcasting under the winner's claim — not failed/completed
+        // by the loser.
+        let row = state.job_store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(
+            row.status,
+            crate::job_store::JobStatus::Broadcasting,
+            "loser must not terminal-flip the winner's job; status={:?} err={:?}",
+            row.status,
+            row.error
+        );
+        assert_eq!(row.phase, crate::job_store::FINALISE_CLAIM_PHASE);
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Defect 1: resume drives exactly to the documented host edge
+    /// ([`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`]) — §7.5 job complete
+    /// after durable completion surface — and does not silently stop earlier.
+    /// Remaining work is on-chain AggregateStateNullifierV3 (bitcoind), a
+    /// design edge of the sync finalise hook, not a hidden host stop.
+    #[tokio::test]
+    async fn resume_drives_to_documented_host_edge_not_silent_stop() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        };
+        use std::time::Duration;
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
+        let plant_store = crate::job_store::JobStore::new((*pool).clone());
+        // Durable completion_result already present: crash after prove+apply,
+        // before host complete — the resumable window up to the host edge.
+        let (job_id, entry) =
+            plant_signed_finalisation_job(&plant_store, 0xE4, "k-host-edge", true).await;
+        assert!(
+            entry.has_completion(),
+            "precondition: durable completion surface planted"
+        );
+
+        let state = fresh_app_state_from_pool(Arc::clone(&pool));
+        assert!(
+            state.v11_finalise.is_none(),
+            "edge test must not inject a hook — host path is durable-only"
+        );
+
+        crate::job_dispatcher::process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            crate::job_dispatcher::JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("resume to host edge");
+
+        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(
+            after.status,
+            crate::job_store::JobStatus::Completed,
+            "resume must reach host edge (job completed with §7.5 result); \
+             status={:?} err={:?} — not a silent stop at broadcasting",
+            after.status,
+            after.error
+        );
+        assert_eq!(after.phase, "completed");
+        assert!(
+            after.response_body.is_some() && after.response_status == Some(200),
+            "§7.5 result must be published onto the job row at the host edge"
+        );
+        assert!(
+            after
+                .request_body
+                .get(crate::v11::FINALISATION_BODY_KEY)
+                .is_none(),
+            "terminal strip must clear finalisation at host edge"
+        );
+        assert!(
+            after
+                .request_body
+                .get(crate::job_store::FINALISE_CLAIM_BODY_KEY)
+                .is_none(),
+            "terminal strip must clear finalise_claim at host edge"
+        );
+
+        // Documented edge is host-complete, not chain publish. The constant
+        // names the remaining step so a capability cannot claim chain coverage.
+        let edge = crate::job_dispatcher::JOB_FINALISE_HOST_EDGE;
+        assert!(
+            edge.contains("AggregateStateNullifierV3") && edge.contains("bitcoind"),
+            "JOB_FINALISE_HOST_EDGE must name the chain/bitcoind remainder; got: {edge}"
+        );
+        // No v11_pending_publishes row: this path never stages chain intent.
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM v11_pending_publishes",
+        )
+        .fetch_one(state.job_store.pool())
+        .await
+        .expect("count pending publishes");
+        assert_eq!(
+            pending, 0,
+            "host-edge resume must not invent chain-publish rows; remaining \
+             step is the documented bitcoind edge, not a silent host stop"
+        );
+
+        clear_process_stack_mode_for_test();
+        drop(scope);
     }
 
     /// Resuming finalise twice is harmless: second attempt is claim-lost or

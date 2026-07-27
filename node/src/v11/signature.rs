@@ -243,14 +243,18 @@ impl TryFrom<WalletSignSubmissionWire> for WalletSignSubmission {
 /// counter of the transition being authorised. Callers cannot set a
 /// counter that disagrees with the pending transition.
 ///
-/// ## Durable finalisation (whole path to completion)
+/// ## Durable finalisation (host path up to the documented edge)
 ///
 /// The engine-owned [`FinalisationCapability`] inside this entry carries
 /// the host witness for prove + apply. [`DurableFinalisationPersist`] also
-/// carries every durable dependency of the **remaining** host steps —
-/// publication of the §7.5 result and job completion — so resume is
-/// "load and proceed" through to a terminal status, including after a true
-/// cold boot with an empty in-memory map.
+/// carries every durable dependency of the **remaining host** steps —
+/// §7.5 result install and job completion — so resume is "load and proceed"
+/// through to a terminal job status, including after a true cold boot with
+/// an empty in-memory map.
+///
+/// **Edge:** this capability does **not** cover on-chain AggregateStateNullifierV3
+/// inscription (needs bitcoind + `v11_pending_publishes`). See
+/// [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`].
 #[derive(Clone, Debug)]
 pub struct PendingSignEntry {
     pub pending: PendingTransition,
@@ -461,13 +465,15 @@ pub const PENDING_SIGN_BODY_KEY: &str = "pending_sign";
 /// | `capability` ([`FinalisationCapability`]) | engine / `begin_*` + `/sign` | full pending witness + optional accepted signature — **prove and apply** |
 /// | `network` | process claim at stage | BIP-340 `m_state` for `/sign` re-verify after rehydrate |
 /// | `publisher_pubkey` | original transition request (handed in) | §7.5 completed `result` field |
-/// | `completion_result` | after successful prove+apply | §7.5 JSON published onto the job row — **publication** |
+/// | `completion_result` | after successful prove+apply | §7.5 JSON published onto the job row — **host publication** |
 /// | `completion_status` | paired with result (200) | `JobStore::complete` argument — **job completion** |
 ///
 /// Live engine tip / CoinHist / NfLog are **not** stored: apply re-validates
 /// them. Once `completion_result` is present, resume skips re-apply and
-/// only publishes + completes — so a crash after apply cannot strand a job
-/// that resume cannot finish.
+/// only host-publishes + completes — so a crash after apply cannot strand a
+/// job that resume cannot finish up to
+/// [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`]. On-chain nullifier
+/// broadcast is outside this envelope (design edge: bitcoind required).
 ///
 /// ## Wire encoding
 ///
