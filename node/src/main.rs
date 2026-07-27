@@ -150,17 +150,20 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
     };
 
-    // Build the Plonky2 prover ONCE, up front. Its
+    // Build the Plonky2 prover ONCE, up front. Under the legacy stack its
     // `circuit_digest_bytes` drives the boot-time self-heal below, and
     // the same instance is reused by the `AccountNode` rehydration so we
     // pay the ~14 s circuit build exactly once.
     //
-    // Stage 1 still boots the legacy AccountNode/REST surface even under
+    // Stage 1–2 still boots the legacy AccountNode/REST surface even under
     // `ZKCOINS_V11_SHADOW=1` (Stage 3 swaps prove call-sites). The v11
-    // adapter above only maintains shadow state; the legacy Prover remains
-    // required for the existing REST flows until then.
+    // adapter above maintains exclusive NfLog state; the legacy Prover
+    // remains required for the existing REST flows until Stage 3.
     let prover = zkcoins_prover::Prover::new();
-    let live_digest = prover.circuit_digest_bytes();
+    // Capture legacy digest before moving the prover into AccountNode.
+    // Under v1.1 this value is not the self-heal baseline (pins are), but
+    // the legacy AccountNode still needs the same prover instance.
+    let legacy_live_digest = prover.circuit_digest_bytes();
     println!("Built Plonky2 prover (circuit ready)");
 
     // Load existing state from Postgres (PR-A2). When SMT/MMR rows are
@@ -186,46 +189,57 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // Self-heal on a breaking circuit change. A circuit change makes
     // every persisted proof incompatible with the current circuit; the
     // next AccountUpdate send/mint would fail to prove ("prove failed").
-    // The check runs AFTER the state + account load so the canary
-    // detector (used on the adoption boundary, when no digest is
-    // recorded yet) can recurse a persisted proof through the live
-    // circuit with the REAL commitment-merkle witnesses from the loaded
-    // state — a `circuit_digest` comparison and `Prover::verify` both
-    // miss the failure class where the digest is unchanged but recursion
-    // breaks (verified against the live DEV dump). On a mismatch / stale
-    // probe this resets the proof-dependent state to genesis (the same
-    // consistent tabula rasa as `reset-zkcoins-node`) and stores the new
-    // digest, so no future circuit change can brick DEV/PRD and no
-    // manual reset is needed. A DB error aborts the bootstrap (serving
-    // with half-reset state is worse than failing loudly); proof-store
-    // cleanup failures are logged and swallowed inside the helper.
+    //
+    // Flag off (legacy): digest = legacy `Prover::circuit_digest_bytes`
+    // (bincode HashOut); canary = CMP/MMR AccountUpdate recursion.
+    //
+    // Flag on (v1.1 Gap G5): digest = tagged §1.7.1 pins
+    // `C || C_balance` from the mandatory §3.6 boot pins (no multi-minute
+    // compliance circuit build at boot); canary = predecessor nullifier
+    // + NAV + last ComplianceProof structural probe (full re-prove is
+    // too slow for boot — see `v11::self_heal` module docs; operator
+    // opt-in via `ZKCOINS_V11_SLOW_CANARY=1`).
+    //
+    // On a mismatch / stale probe this resets the proof-dependent state
+    // to genesis and stores the new digest. A DB error aborts bootstrap
+    // (serving with half-reset state is worse than failing loudly).
     let proofs_dir = std::env::var("PROOFS_DIR").unwrap_or_else(|_| "./proofs".to_string());
 
-    // The canary recurses a persisted proof through the live circuit's
-    // AccountUpdate branch. The §8(b)/(c) state-continuity constraints
-    // fix the witnessed account-state pubkey to the key the producing
-    // transition rotated TO (== the NEXT transition's `public_key`).
-    //
-    // Neutral model (Milestone 2): there is NO server-held minting key,
-    // so the node cannot derive any account's current key. The resolver
-    // therefore returns `None` for every account — the canary then
-    // skips each sample (a state-derivation gap, not circuit staleness)
-    // and degrades to `NoSample` → `Baseline` (the data-loss-safe
-    // direction; no genesis wipe). The boot self-heal's digest fast
-    // path (`circuit_digest_meta`) remains the primary staleness signal;
-    // the canary is a secondary probe that simply has no usable sample
-    // under the neutral model. See `AccountNode::canary_recursion`.
+    // Legacy canary: §8(b)/(c) need the account's current pubkey. Neutral
+    // model has no server-held minting key → resolver returns None →
+    // NoSample → Baseline (data-loss-safe). Digest fast path remains primary.
     let current_pubkey_for =
         |_addr: &zkcoins_program::hash::HashDigest,
          _smt: &zkcoins_program::merkle::sparse_merkle_tree::SparseMerkleTree| {
             None::<bitcoin::secp256k1::PublicKey>
         };
-    let heal_decision =
+
+    let heal_decision = if let Some(ref adapter) = v11_adapter {
+        // Live baseline = §3.6 pins already validated at adapter bootstrap.
+        // Re-read pins (cheap, no circuit build). A pin/binary mismatch is
+        // a Stage-3 prove-site concern; self-heal compares DB vs pins.
+        let pins = v11::mode::v11_boot_pins_from_env().expect("v11 pins re-read after adapter boot");
+        let live_digest = v11::encode_v11_live_digest(
+            &pins.network_params.circuit_digest_c(),
+            &pins.network_params.circuit_digest_c_balance(),
+        );
+        println!(
+            "v1.1 self-heal: live digest = tagged C||C_balance from §3.6 pins \
+             (no compliance circuit build at boot; set ZKCOINS_V11_SLOW_CANARY=1 \
+             for verify_transition canary)"
+        );
         node::self_heal::heal_circuit_digest(&pool, &live_digest, &proofs_dir, &|| {
+            v11::v11_canary_for_heal(adapter)
+        })
+        .await
+        .expect("v1.1 circuit-digest self-heal")
+    } else {
+        node::self_heal::heal_circuit_digest(&pool, &legacy_live_digest, &proofs_dir, &|| {
             account_node.canary_recursion(&current_pubkey_for)
         })
         .await
-        .expect("circuit-digest self-heal");
+        .expect("circuit-digest self-heal")
+    };
     println!("Circuit-digest self-heal: {:?}", heal_decision);
 
     // On a reset the in-memory `state` + `account_node` were rehydrated
@@ -233,6 +247,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // they no longer match Postgres. Reload both from the now-empty DB,
     // recovering the prover (and its ~14 s circuit build) from the stale
     // `account_node` so the circuit is still built exactly once.
+    // Under v1.1 also re-init the EngineAdapter (durable tables empty,
+    // in-memory engine still holds pre-reset NfLog / last_proof).
     let (state, account_node) = if heal_decision == node::self_heal::ResetDecision::Reset {
         let prover = account_node.take_prover();
         let state = Arc::new(Mutex::new(
@@ -244,6 +260,13 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             account_node::AccountNode::load_from_pg(Arc::clone(&state), &pool, prover)
                 .await
                 .expect("reload account node after self-heal reset");
+        if let Some(ref adapter) = v11_adapter {
+            adapter
+                .reinit_after_self_heal_reset()
+                .await
+                .expect("reinit v11 engine after self-heal reset");
+            println!("Re-inited v1.1 EngineAdapter to empty genesis after self-heal reset");
+        }
         println!("Reloaded State + AccountNode from genesis after self-heal reset");
         (state, account_node)
     } else {
