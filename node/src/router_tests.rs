@@ -6628,7 +6628,8 @@ mod jobs_endpoint_tests {
 
     /// Defects 2+4: flag-off `GET /` raw body is byte-identical to the
     /// pre-G6 root response (endpoints from the type golden; no attest
-    /// keys). Value equality alone is not enough — compare raw bytes.
+    /// keys). Compare **raw bytes**, never two parsed `Value`s — reparse
+    /// discards key order and would green-wash a sorted-map regression.
     #[tokio::test]
     async fn root_flag_off_is_byte_identical_to_pre_attestation_map() {
         let _lock = lock_v11_stack_for_test();
@@ -6640,17 +6641,19 @@ mod jobs_endpoint_tests {
         let (status, _h, resp) = run(state, req).await;
         assert_eq!(status, StatusCode::OK, "body: {resp}");
 
-        // Expected full body from the frozen endpoints golden + live
-        // version/network (those two fields are env/build derived and
-        // are not part of the G6 surface change).
-        let expected = serde_json::json!({
-            "service": "zkcoins-node",
-            "version": env!("CARGO_PKG_VERSION"),
-            "network": crate::NETWORK_CONFIG.network_name.as_str(),
-            "endpoints": serde_json::from_str::<serde_json::Value>(PRE_G6_ENDPOINTS_JSON).unwrap(),
-            "docs": "https://docs.zkcoins.app",
-        });
-        let expected_raw = serde_json::to_string(&expected).expect("serialize expected");
+        // Frozen outer key order (service → version → network → endpoints
+        // → docs) + frozen endpoints golden. version/network are build/
+        // env derived; the layout bytes around them are not.
+        let expected_raw = format!(
+            concat!(
+                r#"{{"service":"zkcoins-node","version":"{}","network":"{}","endpoints":"#,
+                "{}",
+                r#","docs":"https://docs.zkcoins.app"}}"#,
+            ),
+            env!("CARGO_PKG_VERSION"),
+            crate::NETWORK_CONFIG.network_name,
+            PRE_G6_ENDPOINTS_JSON,
+        );
         assert_eq!(
             resp.as_bytes(),
             expected_raw.as_bytes(),
