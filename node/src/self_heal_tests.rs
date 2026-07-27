@@ -711,11 +711,16 @@ async fn heal_v11_reset_fences_pre_loaded_job_resurrection() {
         "set_status must not resurrect a pre-reset job after generation bump"
     );
 
-    // Worker A's unconditional complete must not mark completed either.
-    store
+    // Worker A's unconditional complete must report zero rows and not mark
+    // completed either.
+    let completed = store
         .complete(job_id, serde_json::json!({"stolen": true}), 200)
         .await
-        .expect("complete Ok");
+        .expect("complete query ok");
+    assert!(
+        !completed,
+        "complete must return false when the generation fence matches 0 rows"
+    );
     let after_complete = store.load(job_id).await.unwrap().unwrap();
     assert_eq!(
         after_complete.status,
@@ -779,10 +784,11 @@ async fn heal_v11_reset_fences_stale_generation_admit() {
         !stale_advanced,
         "stale-generation set_status must report 0 rows (false)"
     );
-    store
+    let completed = store
         .complete(public_id, serde_json::json!({"nope": true}), 200)
         .await
-        .expect("complete");
+        .expect("complete query ok");
+    assert!(!completed, "stale-generation complete must report 0 rows");
     let row = store.load(public_id).await.unwrap().unwrap();
     assert_eq!(
         row.status,
@@ -883,10 +889,11 @@ async fn heal_legacy_reset_fences_pre_loaded_job_resurrection() {
         .await
         .expect("set_status query ok");
     assert!(!resurrected, "legacy pre-reset set_status must report 0 rows");
-    store
+    let completed = store
         .complete(job_id, serde_json::json!({"legacy_stolen": true}), 200)
         .await
-        .expect("complete");
+        .expect("complete query ok");
+    assert!(!completed, "legacy pre-reset complete must report 0 rows");
     let after = store.load(job_id).await.unwrap().unwrap();
     assert_eq!(
         after.status,
@@ -956,6 +963,180 @@ async fn heal_admit_blocks_until_open_generation_bump_commits() {
         job.reset_generation, bumped,
         "admit after open bump must stamp the post-bump generation, never the pre-bump snapshot"
     );
+
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 1 (advancing writers): `set_status` takes the same meta-row lock as
+/// admit before evaluating generation. An open reset bump therefore blocks
+/// the advancing write; after commit the write sees the post-bump generation
+/// and cannot resurrect a job left behind (or still at gen 0).
+///
+/// The old interleaving (statement starts with unlocked subquery snapshot of
+/// gen 0 → blocks on jobs row → reset commits → UPDATE resumes with stale
+/// gen 0 and rewrites reset-failed → broadcasting) cannot be constructed:
+/// the write never evaluates generation without holding the meta lock that
+/// serialises with the bump.
+///
+/// Would go red if `set_status` still used an unlocked scalar subquery.
+#[tokio::test]
+async fn heal_set_status_blocks_until_open_generation_bump_commits() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+
+    let store = crate::job_store::JobStore::new(pool.clone());
+    let account = [0xDEu8; 32];
+    let created = store
+        .create(
+            crate::job_store::JobKind::Mint,
+            &account,
+            Some("advance-during-open-bump"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("create");
+    let job = match created {
+        crate::job_store::CreateResult::Fresh(j) => j,
+        crate::job_store::CreateResult::IdempotentReplay(j) => j,
+    };
+    let job_id = job.public_id;
+    let gen_before = job.reset_generation;
+
+    // Open reset-shaped tx: bump + fail non-terminal (same order as production
+    // reset), hold locks, do not commit yet.
+    let mut reset_tx = pool.begin().await.expect("begin reset tx");
+    let bumped = db::bump_self_heal_reset_generation_in_tx(&mut reset_tx)
+        .await
+        .expect("bump");
+    assert_eq!(bumped, gen_before + 1);
+    // Fail the job while holding the meta lock (mirrors reset path).
+    sqlx::query(
+        "UPDATE jobs SET status = 'failed', phase = 'failed', \
+                          error = $1, updated_at = NOW(), completed_at = NOW() \
+         WHERE public_id = $2 \
+           AND status IN ('queued', 'proving', 'awaiting_signature', 'broadcasting')",
+    )
+    .bind(db::SELF_HEAL_RESET_JOB_ERROR)
+    .bind(job_id)
+    .execute(&mut *reset_tx)
+    .await
+    .expect("fail job in open reset");
+
+    let set_fut = store.set_status(job_id, crate::job_store::JobStatus::Broadcasting, "broadcasting");
+    tokio::pin!(set_fut);
+    let blocked =
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut set_fut).await;
+    assert!(
+        blocked.is_err(),
+        "set_status must block on self_heal_reset_meta while reset holds the row lock"
+    );
+
+    reset_tx.commit().await.expect("commit reset");
+    let applied = set_fut.await.expect("set_status after commit");
+    assert!(
+        !applied,
+        "after open bump commits, set_status must see post-bump generation and match 0 rows"
+    );
+    let row = store.load(job_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        crate::job_store::JobStatus::Failed,
+        "advancing write must not resurrect a job failed by the concurrent reset"
+    );
+    assert_eq!(row.reset_generation, gen_before);
+
+    clear_process_stack_mode_for_test();
+}
+
+/// Zero-row `complete` is reported (`false`) so callers refuse completed
+/// events / results. Would go red if `complete` still returned `Ok(())`
+/// unconditionally on a generation-fence miss.
+#[tokio::test]
+async fn heal_complete_reports_zero_rows_and_no_completed_event() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+
+    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11");
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let store = crate::job_store::JobStore::new(pool.clone());
+    let account = [0xCEu8; 32];
+    let created = store
+        .create(
+            crate::job_store::JobKind::Send,
+            &account,
+            Some("zero-row-complete"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("create");
+    let job = match created {
+        crate::job_store::CreateResult::Fresh(j) => j,
+        crate::job_store::CreateResult::IdempotentReplay(j) => j,
+    };
+    let job_id = job.public_id;
+
+    // Advance to a non-terminal status so a bug that ignored the generation
+    // fence would actually flip the row to completed.
+    assert!(store
+        .set_status(job_id, crate::job_store::JobStatus::Broadcasting, "broadcasting")
+        .await
+        .expect("set broadcasting"));
+
+    // Bump generation without bulk-fail — isolates the fence.
+    let mut tx = pool.begin().await.expect("begin");
+    db::bump_self_heal_reset_generation_in_tx(&mut tx)
+        .await
+        .expect("bump");
+    tx.commit().await.expect("commit");
+
+    // Subscriber setup mirrors the dispatcher: only publish completed when
+    // complete returns true.
+    let notifier = std::sync::Arc::new(crate::job_dispatcher::JobNotifier::new());
+    let mut phase_rx = notifier.phase_tx.subscribe();
+    let notify_map: crate::job_dispatcher::JobNotifyMap =
+        std::sync::Arc::new(dashmap::DashMap::new());
+    notify_map.insert(job_id, notifier);
+
+    let applied = store
+        .complete(job_id, serde_json::json!({"stolen": true}), 200)
+        .await
+        .expect("complete query ok");
+    assert!(
+        !applied,
+        "generation fence must yield Ok(false) from complete, not silent Ok(())"
+    );
+
+    // Dispatcher contract (process_send_commit): publish completed only on true.
+    if applied {
+        crate::job_dispatcher::publish_phase(
+            &notify_map,
+            job_id,
+            crate::job_dispatcher::JobPhaseEvent {
+                status: crate::job_store::JobStatus::Completed,
+                phase: "completed".to_string(),
+                proof_id: None,
+                result: Some(serde_json::json!({"stolen": true})),
+                error: None,
+            },
+        );
+    }
+
+    assert!(
+        phase_rx.try_recv().is_err(),
+        "no completed phase event must be published when complete matches 0 rows"
+    );
+    let row = store.load(job_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        crate::job_store::JobStatus::Broadcasting,
+        "zero-row complete must leave the durable row untouched"
+    );
+    assert_ne!(row.status, crate::job_store::JobStatus::Completed);
 
     clear_process_stack_mode_for_test();
 }

@@ -251,6 +251,43 @@ async fn set_status_reports_false_when_no_row_matches() {
     assert!(!applied, "missing public_id must yield Ok(false)");
 }
 
+/// Zero-row `complete` returns `Ok(false)` (not a silent `Ok(())`).
+#[tokio::test]
+async fn complete_reports_false_when_no_row_matches() {
+    let (store, _c) = setup_store().await;
+    let missing = uuid::Uuid::new_v4();
+    let applied = store
+        .complete(missing, serde_json::json!({}), 200)
+        .await
+        .expect("query ok");
+    assert!(!applied, "missing public_id must yield Ok(false) from complete");
+}
+
+/// Terminal-status guard: `set_status` must not resurrect a failed row
+/// even under a live generation (second line of defence after the lock).
+#[tokio::test]
+async fn set_status_refuses_terminal_rows() {
+    let (store, _c) = setup_store().await;
+    let CreateResult::Fresh(job) = store
+        .create(JobKind::Mint, &account_addr(90), None, sample_mint_body())
+        .await
+        .expect("create")
+    else {
+        panic!("expected Fresh");
+    };
+    assert!(store
+        .fail(job.public_id, "terminal")
+        .await
+        .expect("fail"));
+    let applied = store
+        .set_status(job.public_id, JobStatus::Broadcasting, "broadcasting")
+        .await
+        .expect("set_status");
+    assert!(!applied, "must not advance a failed job");
+    let after = store.load(job.public_id).await.unwrap().unwrap();
+    assert_eq!(after.status, JobStatus::Failed);
+}
+
 #[tokio::test]
 async fn set_awaiting_signature_persists_proof_id() {
     let (store, _c) = setup_store().await;
@@ -265,10 +302,11 @@ async fn set_awaiting_signature_persists_proof_id() {
         "account_state_hash": "aa".repeat(32),
         "output_coins_root": "bb".repeat(32),
     });
-    store
+    let applied = store
         .set_awaiting_signature(job.public_id, 42, result.clone())
         .await
         .expect("set_awaiting_signature");
+    assert!(applied, "set_awaiting_signature must report true when one row matches");
     let after = store.load(job.public_id).await.unwrap().unwrap();
     assert_eq!(after.status, JobStatus::AwaitingSignature);
     assert_eq!(after.phase, "awaiting_signature");
@@ -290,10 +328,11 @@ async fn complete_persists_response_body_and_status() {
         panic!("expected Fresh");
     };
     let body = serde_json::json!({"success": true, "proof_id": 7});
-    store
+    let completed = store
         .complete(job.public_id, body.clone(), 200)
         .await
         .expect("complete");
+    assert!(completed, "complete must report true when one row matches");
     let after = store.load(job.public_id).await.unwrap().unwrap();
     assert_eq!(after.status, JobStatus::Completed);
     assert_eq!(after.phase, "completed");
@@ -313,10 +352,11 @@ async fn fail_persists_error_and_completed_at() {
     else {
         panic!("expected Fresh");
     };
-    store
+    let failed = store
         .fail(job.public_id, "Insufficient funds")
         .await
         .expect("fail");
+    assert!(failed, "fail must report true when one row matches");
     let after = store.load(job.public_id).await.unwrap().unwrap();
     assert_eq!(after.status, JobStatus::Failed);
     assert_eq!(after.error.as_deref(), Some("Insufficient funds"));

@@ -486,7 +486,14 @@ async fn process_mint(
         Ok(r) => r,
         Err(e) => {
             let msg = format!("invalid mint request body: {}", e);
-            job_store.fail(public_id, &msg).await?;
+            if !job_store.fail(public_id, &msg).await? {
+                tracing::warn!(
+                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
+                );
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -523,7 +530,14 @@ async fn process_mint(
                     return Ok(());
                 }
             }
-            job_store.fail(public_id, &message).await?;
+            if !job_store.fail(public_id, &message).await? {
+                tracing::warn!(
+                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
+                );
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -576,7 +590,14 @@ async fn process_mint(
                 msg
             );
             let err = fail_error_string(&msg);
-            job_store.fail(public_id, &err).await?;
+            if !job_store.fail(public_id, &err).await? {
+                tracing::warn!(
+                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
+                );
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -593,20 +614,34 @@ async fn process_mint(
             return Ok(());
         }
     };
-    if let Err(e) = job_store
+    match job_store
         .set_awaiting_signature(public_id, proof_id as i64, result.clone())
         .await
     {
-        // Defect 3: staged map + envelope + notifier must not survive a
-        // failed status transition.
-        tracing::error!(
-            "Job dispatcher: mint job {} set_awaiting_signature failed: {}",
-            public_id,
-            e
-        );
-        cleanup_pending_sign(job_store, app_state, public_id).await;
-        notify_map.remove(&public_id);
-        return Err(e.into());
+        Ok(true) => {}
+        Ok(false) => {
+            // Zero rows: cancel / generation fence / concurrent advance.
+            // Staged map + envelope + notifier must not survive.
+            tracing::warn!(
+                "Job dispatcher: mint job {} set_awaiting_signature matched 0 rows; cleaning up",
+                public_id
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+        Err(e) => {
+            // Defect 3: staged map + envelope + notifier must not survive a
+            // failed status transition.
+            tracing::error!(
+                "Job dispatcher: mint job {} set_awaiting_signature failed: {}",
+                public_id,
+                e
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Err(e.into());
+        }
     }
     // Cancel may have won between stage and status write (WHERE filters).
     match job_store.load(public_id).await? {
@@ -1024,7 +1059,14 @@ async fn process_send_initial(
         Ok(r) => r,
         Err(e) => {
             let msg = format!("invalid send request body: {}", e);
-            job_store.fail(public_id, &msg).await?;
+            if !job_store.fail(public_id, &msg).await? {
+                tracing::warn!(
+                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
+                );
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -1061,7 +1103,14 @@ async fn process_send_initial(
                     return Ok(());
                 }
             }
-            job_store.fail(public_id, &message).await?;
+            if !job_store.fail(public_id, &message).await? {
+                tracing::warn!(
+                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
+                );
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -1121,7 +1170,14 @@ async fn process_send_initial(
                 msg
             );
             let err = fail_error_string(&msg);
-            job_store.fail(public_id, &err).await?;
+            if !job_store.fail(public_id, &err).await? {
+                tracing::warn!(
+                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
+                );
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -1138,20 +1194,32 @@ async fn process_send_initial(
             return Ok(());
         }
     };
-    if let Err(e) = job_store
+    match job_store
         .set_awaiting_signature(public_id, proof_id as i64, result.clone())
         .await
     {
-        // Defect 3: staged map + envelope + notifier must not survive a
-        // failed status transition.
-        tracing::error!(
-            "Job dispatcher: send job {} set_awaiting_signature failed: {}",
-            public_id,
-            e
-        );
-        cleanup_pending_sign(job_store, app_state, public_id).await;
-        notify_map.remove(&public_id);
-        return Err(e.into());
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                "Job dispatcher: send job {} set_awaiting_signature matched 0 rows; cleaning up",
+                public_id
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+        Err(e) => {
+            // Defect 3: staged map + envelope + notifier must not survive a
+            // failed status transition.
+            tracing::error!(
+                "Job dispatcher: send job {} set_awaiting_signature failed: {}",
+                public_id,
+                e
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Err(e.into());
+        }
     }
     match job_store.load(public_id).await? {
         Some(j) if j.status == JobStatus::AwaitingSignature => {}
@@ -1435,7 +1503,14 @@ async fn wait_for_commit(
         Ok(c) => c,
         Err(e) => {
             let msg = format!("invalid commit body: {}", e);
-            job_store.fail(public_id, &msg).await?;
+            if !job_store.fail(public_id, &msg).await? {
+                tracing::warn!(
+                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
+                );
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -1486,9 +1561,21 @@ async fn wait_for_commit(
     };
     match commit_outcome {
         Ok((response_body, response_status)) => {
-            job_store
+            if !job_store
                 .complete(public_id, response_body.clone(), response_status as i16)
-                .await?;
+                .await?
+            {
+                // Zero rows: generation fence / terminal / missing. Never
+                // publish completed against a row that did not advance
+                // (e.g. reset failed the job while commit_flow was in flight).
+                tracing::warn!(
+                    "Job dispatcher: job {} complete matched 0 rows; refusing completed event",
+                    public_id
+                );
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -1509,7 +1596,16 @@ async fn wait_for_commit(
                 status.as_u16(),
                 message
             );
-            job_store.fail(public_id, &message).await?;
+            if !job_store.fail(public_id, &message).await? {
+                tracing::warn!(
+                    "Job dispatcher: job {} fail matched 0 rows after commit error; \
+                     not publishing failed event",
+                    public_id
+                );
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -1803,35 +1899,39 @@ pub const JOB_FINALISE_HOST_EDGE: &str =
 /// assembled from recollection is the same class of evidence as a test that
 /// checks its own logic. Two prior hand sweeps each missed entries.
 ///
-/// Every job-advancing write below includes
-/// `reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)`
-/// unless noted. Admit additionally takes `SELECT … FOR UPDATE` on the meta
-/// row so it serialises with the reset bump (mutual exclusion, not MVCC order).
+/// Every job-advancing write below opens a transaction, takes
+/// `SELECT generation … FOR UPDATE` on `self_heal_reset_meta` (same construct
+/// as admit / reset bump — mutual exclusion, not an unlocked MVCC snapshot),
+/// and binds the locked generation into `reset_generation = $N`. A bare
+/// scalar subquery is **not** a fence.
 ///
-/// | Write | Actual `WHERE` / lock (ground truth) | Fences on |
-/// |-------|--------------------------------------|-----------|
-/// | [`JobStore::create`] (`INSERT`) | admit tx: `SELECT generation … FOR UPDATE` then `INSERT … reset_generation = $8`; `ON CONFLICT (account_address, idempotency_key) … DO NOTHING` | **meta row lock** + partial unique key |
-/// | [`JobStore::set_status`] | `WHERE public_id = $3 AND reset_generation = (SELECT generation …)` | generation; returns **bool** (0 rows = false) |
-/// | [`JobStore::set_status_if`] | `WHERE public_id = $3 AND status = $4 AND reset_generation = …` | status CAS + generation |
-/// | [`JobStore::set_awaiting_signature`] | `WHERE public_id = $3 AND status IN ('queued', 'proving') AND reset_generation = …` | status CAS + generation |
-/// | [`JobStore::complete`] | `WHERE public_id = $3 AND reset_generation = …` | generation (legacy unqualified status) |
-/// | [`JobStore::complete_if_status`] | `WHERE public_id = $3 AND status = ANY($4) AND phase IS DISTINCT FROM $5 AND reset_generation = …` | status + not claim phase + generation |
-/// | [`JobStore::complete_if_finalise_owner`] | `WHERE public_id = $3 AND status = 'broadcasting' AND phase = $4 AND owner AND fence AND lease > NOW() AND reset_generation = …` | claim fence + lease + generation |
-/// | [`JobStore::fail`] | `WHERE public_id = $2 AND reset_generation = …` | generation |
-/// | [`JobStore::fail_if_status`] | `WHERE public_id = $2 AND status = ANY($3) AND phase IS DISTINCT FROM $4 AND reset_generation = …` | status + not claim phase + generation |
-/// | [`JobStore::fail_if_finalise_owner`] | claim fence + lease + `reset_generation = …` | claim fence + lease + generation |
-/// | [`JobStore::claim_finalise_exclusive`] path A | `WHERE public_id = $6 AND status = $7 AND reset_generation = …` | status CAS + generation; **mints** fence |
-/// | [`JobStore::claim_finalise_exclusive`] path B | `WHERE public_id = $5 AND status = 'broadcasting' AND phase IN ('publishing','broadcasting') AND reset_generation = …` | free phase + generation; **mints** fence |
-/// | [`JobStore::renew_finalise_claim`] | claim owner+fence + `reset_generation = …` | claim fence + generation |
-/// | [`JobStore::release_stale_finalise_claim`] | `WHERE public_id = $1 AND status = 'broadcasting' AND phase = $2 AND (lease NULL OR <= NOW()) AND reset_generation = …` | abandoned lease + generation |
-/// | [`JobStore::replace_request_body_if_status`] | `WHERE public_id = $2 AND status = $3 AND reset_generation = …` | status CAS + generation |
-/// | [`JobStore::replace_request_body_if_cleanup_safe`] | `WHERE public_id = $2 AND status <> 'awaiting_signature' AND phase IS DISTINCT FROM $3 AND reset_generation = …` | not handoff + not claim + generation |
-/// | [`JobStore::merge_finalisation_if_finalise_owner`] | claim fence + lease + `reset_generation = …` | claim fence + lease + generation |
-/// | [`JobStore::cancel`] | `WHERE public_id = $1 AND status = 'queued' AND reset_generation = …` | status CAS + generation |
-/// | [`JobStore::cancel_not_yet_published`] | `WHERE public_id = $1 AND status IN ('queued','proving','awaiting_signature') AND reset_generation = …` | status CAS + generation |
-/// | Legacy commit-payload (`router` → [`JobStore::replace_request_body_if_status`]) | `WHERE public_id = $2 AND status = 'awaiting_signature' AND reset_generation = …` | status + generation |
-/// | Self-heal fail non-terminal (`db::fail_non_terminal_jobs_for_self_heal_in_tx`) | `WHERE status IN ('queued','proving','awaiting_signature','broadcasting')` | reset path (bulk fail; not generation-fenced by design) |
-/// | Finalise hook → engine snapshot + `members_ready` | (not a `jobs` row write) | **fence + owner + lease** via [`crate::v11::finalise_accepted_prove_persist_and_stage`] |
+/// Zero-row audit: every write reports visibility (`bool`, `FinaliseClaim`,
+/// or `CreateResult`). Callers must act on zero rows — silent `Ok(())` is
+/// forbidden.
+///
+/// | Write | Actual `WHERE` / lock (ground truth) | Zero-row report |
+/// |-------|--------------------------------------|-----------------|
+/// | [`JobStore::create`] (`INSERT`) | tx: `SELECT generation … FOR UPDATE` then `INSERT … reset_generation = $8` | `CreateResult` |
+/// | [`JobStore::set_status`] | lock gen; `WHERE public_id AND reset_generation = $4 AND status NOT IN (terminal)` | **bool** |
+/// | [`JobStore::set_status_if`] | lock gen; `WHERE public_id AND status = $4 AND reset_generation = $5` | **bool** |
+/// | [`JobStore::set_awaiting_signature`] | lock gen; `WHERE public_id AND status IN (queued,proving) AND reset_generation = $4` | **bool** |
+/// | [`JobStore::complete`] | lock gen; `WHERE public_id AND reset_generation = $4 AND status NOT IN (terminal)` | **bool** |
+/// | [`JobStore::complete_if_status`] | lock gen; status ANY + not claim phase + `reset_generation = $6` | **bool** |
+/// | [`JobStore::complete_if_finalise_owner`] | lock gen; claim fence + lease + `reset_generation = $7` | **bool** |
+/// | [`JobStore::fail`] | lock gen; `WHERE public_id AND reset_generation = $3 AND status NOT IN (terminal)` | **bool** |
+/// | [`JobStore::fail_if_status`] | lock gen; status ANY + not claim phase + `reset_generation = $5` | **bool** |
+/// | [`JobStore::fail_if_finalise_owner`] | lock gen; claim fence + lease + `reset_generation = $6` | **bool** |
+/// | [`JobStore::claim_finalise_exclusive`] path A/B | lock gen once; status/phase CAS + `reset_generation = $N`; **mints** fence | `FinaliseClaim` |
+/// | [`JobStore::renew_finalise_claim`] | lock gen; claim owner+fence + `reset_generation = $7` | **bool** |
+/// | [`JobStore::release_stale_finalise_claim`] | lock gen; abandoned lease + `reset_generation = $3` | **bool** |
+/// | [`JobStore::replace_request_body_if_status`] | lock gen; status CAS + `reset_generation = $4` | **bool** |
+/// | [`JobStore::replace_request_body_if_cleanup_safe`] | lock gen; not handoff + not claim + `reset_generation = $4` | **bool** |
+/// | [`JobStore::merge_finalisation_if_finalise_owner`] | lock gen; claim fence + lease + `reset_generation = $7` | **bool** |
+/// | [`JobStore::cancel`] | lock gen; queued + `reset_generation = $2` | **bool** |
+/// | [`JobStore::cancel_not_yet_published`] | lock gen; cancellable set + `reset_generation = $2` | **bool** |
+/// | Legacy commit-payload (`router` → [`JobStore::replace_request_body_if_status`]) | same as replace_request_body_if_status | **bool** |
+/// | Self-heal fail non-terminal (`db::fail_non_terminal_jobs_for_self_heal_in_tx`) | `WHERE status IN (non-terminal)` inside reset tx (holds meta lock via bump) | bulk reset path |
+/// | Finalise hook → engine snapshot + `members_ready` | (not a `jobs` row write) | fence via [`crate::v11::finalise_accepted_prove_persist_and_stage`] |
 ///
 /// After the claim is won, durable transition commits are fenced on the
 /// **acquisition fencing token** plus a still-valid lease — not on owner

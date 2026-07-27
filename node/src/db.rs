@@ -1045,10 +1045,13 @@ pub async fn reset_proof_dependent_state_tx(
     tx.commit().await
 }
 
-/// SQL predicate fragment: job row is still in the current self-heal
-/// admission epoch. Every job-advancing write in [`crate::job_store`]
-/// must include this so a pre-reset worker cannot resurrect work after
-/// [`bump_self_heal_reset_generation_in_tx`].
+/// Historical scalar form of the generation fence. **Do not use in new
+/// writes:** under MVCC an unlocked subquery can still see a pre-bump
+/// generation after a concurrent reset commits while the jobs-row lock is
+/// held. Production job-advancing writes take
+/// `SELECT generation … FOR UPDATE` (same construct as admit) and bind the
+/// locked value: `reset_generation = $N`. See
+/// [`crate::job_store::JobStore`] `begin_with_locked_generation`.
 pub const JOB_RESET_GENERATION_FENCE_SQL: &str =
     "reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)";
 

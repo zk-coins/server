@@ -221,9 +221,9 @@ pub struct Job {
     pub proof_id: Option<i64>,
     pub error: Option<String>,
     pub progress: i16,
-    /// Self-heal admission epoch stamped at INSERT from
-    /// `self_heal_reset_meta.generation`. Job-advancing writes require this
-    /// to still equal the live meta generation (see migration 0023).
+    /// Self-heal admission epoch stamped at INSERT from a locked read of
+    /// `self_heal_reset_meta.generation` (see migration 0023). Job-advancing
+    /// writes re-lock that row and require `reset_generation = $locked`.
     pub reset_generation: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -403,6 +403,31 @@ impl JobStore {
         self.process_owner
     }
 
+    /// Open a transaction and lock the live self-heal generation.
+    ///
+    /// **Locking construct (shared with admit + reset):**
+    /// `SELECT generation FROM self_heal_reset_meta WHERE id = 1 FOR UPDATE`
+    /// takes a conflicting row lock with
+    /// [`crate::db::bump_self_heal_reset_generation_in_tx`]'s `UPDATE … generation
+    /// = generation + 1`. Every job-advancing write **must** read generation
+    /// through this locked path and bind the returned value into the UPDATE
+    /// predicate (`reset_generation = $N`). An unlocked scalar subquery
+    /// `reset_generation = (SELECT generation …)` is **not** a fence: under
+    /// MVCC a statement that began before a concurrent reset committed can
+    /// still see the pre-bump generation after the jobs-row lock is released,
+    /// resurrect a reset-failed job, and report `rows_affected() == 1`.
+    async fn begin_with_locked_generation(
+        &self,
+    ) -> sqlx::Result<(sqlx::Transaction<'_, sqlx::Postgres>, i64)> {
+        let mut tx = self.pool.begin().await?;
+        let (generation,): (i64,) = sqlx::query_as(
+            "SELECT generation FROM self_heal_reset_meta WHERE id = 1 FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        Ok((tx, generation))
+    }
+
     /// Admit a fresh job.
     ///
     /// Stripe-style idempotency: when `idem_key` is `Some` and the
@@ -423,23 +448,8 @@ impl JobStore {
         request_body: serde_json::Value,
     ) -> sqlx::Result<CreateResult> {
         // Mutual exclusion with self-heal reset (not mere ordering):
-        // reset holds a row lock on `self_heal_reset_meta` via its
-        // `UPDATE … generation = generation + 1`. A plain scalar SELECT of
-        // generation sees only the last **committed** snapshot under MVCC
-        // and can stamp a stale epoch after the reset UPDATE but before
-        // its COMMIT. `SELECT … FOR UPDATE` takes a conflicting lock on
-        // the same singleton row, so admit and reset serialise: admit
-        // either stamps the pre-bump generation (and is then failed by
-        // the reset's fail-UPDATE) or waits and stamps the post-bump
-        // generation after the reset commits. There is no open window
-        // where a concurrent INSERT can commit a generation the reset
-        // has already advanced past without seeing it.
-        let mut tx = self.pool.begin().await?;
-        let (generation,): (i64,) = sqlx::query_as(
-            "SELECT generation FROM self_heal_reset_meta WHERE id = 1 FOR UPDATE",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        // see [`Self::begin_with_locked_generation`].
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
 
         let public_id = Uuid::new_v4();
         let inserted_row = sqlx::query(
@@ -523,32 +533,37 @@ impl JobStore {
     /// dispatcher can publish dispatch-level progress milestones
     /// without churning the constraint-enforced status.
     ///
-    /// Fenced on the self-heal reset generation: a pre-reset worker that
-    /// still holds a loaded `public_id` cannot resurrect a row after
-    /// [`crate::db::reset_v11_proof_dependent_state_tx`] /
-    /// [`crate::db::reset_proof_dependent_state_tx`] bumped the epoch.
+    /// **Lock + fence:** acquires [`Self::begin_with_locked_generation`]
+    /// then binds the locked generation into the UPDATE. Second line of
+    /// defence: never advances a row that is already terminal
+    /// (`completed` / `failed` / `cancelled`) — not a substitute for the
+    /// lock, but blocks resurrection if a stale writer races a reset that
+    /// already failed the job under the same generation.
     ///
     /// Returns `Ok(true)` when exactly one row was updated, `Ok(false)`
-    /// when zero rows matched (stale generation, missing job, or other
-    /// fence miss). Callers **must** act on `false` — never treat a
-    /// no-op write as success and continue side effects against possibly
-    /// wiped state (no silent fallback).
+    /// when zero rows matched (stale generation, terminal row, missing
+    /// job). Callers **must** act on `false` — never treat a no-op write
+    /// as success and continue side effects against possibly wiped state.
     pub async fn set_status(
         &self,
         public_id: Uuid,
         status: JobStatus,
         phase: &str,
     ) -> sqlx::Result<bool> {
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET status = $1, phase = $2, updated_at = NOW() \
              WHERE public_id = $3 \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $4 \
+               AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(status.as_str())
         .bind(phase)
         .bind(public_id)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -564,28 +579,34 @@ impl JobStore {
     /// later overwrites, and surfaced on the `awaiting_signature`
     /// `GET /api/jobs/:id` snapshot + SSE phase event. The `proof_id`
     /// is read back by `POST /api/jobs/:id/commit` to look the proof up.
+    ///
+    /// Returns `Ok(true)` when one row advanced, `Ok(false)` on zero rows
+    /// (status CAS miss, generation fence, or missing job). Callers must
+    /// act on `false` — no silent fallback.
     pub async fn set_awaiting_signature(
         &self,
         public_id: Uuid,
         proof_id: i64,
         result: serde_json::Value,
-    ) -> sqlx::Result<()> {
+    ) -> sqlx::Result<bool> {
         // Only advance from proving (or queued, defensive). Never overwrite
         // a cancelled / terminal row — cancel may have won during prove.
-        // Also fenced on the self-heal reset generation.
-        sqlx::query(
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
+        let q = sqlx::query(
             "UPDATE jobs SET status = 'awaiting_signature', phase = 'awaiting_signature', \
                               proof_id = $1, response_body = $2, updated_at = NOW() \
              WHERE public_id = $3 \
                AND status IN ('queued', 'proving') \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $4",
         )
         .bind(proof_id)
         .bind(&result)
         .bind(public_id)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        tx.commit().await?;
+        Ok(q.rows_affected() == 1)
     }
 
     /// Move a job to the `completed` terminal state. Stamps the
@@ -597,32 +618,39 @@ impl JobStore {
     /// must not retain a restart envelope that boot recovery could treat
     /// as live work.
     ///
-    /// **Legacy behaviour:** applies regardless of current status (same
-    /// SQL shape as pre-v1.1) **except** the self-heal reset-generation
-    /// fence — a pre-reset worker cannot complete a row after the epoch
-    /// advanced. Status-qualified completion for the v1.1 path lives on
-    /// [`Self::complete_if_status`].
+    /// **Legacy behaviour:** status-unqualified except the locked
+    /// generation fence and a terminal-status guard (never re-complete an
+    /// already-terminal row). Status-qualified completion for the v1.1
+    /// path lives on [`Self::complete_if_status`].
+    ///
+    /// Returns `Ok(true)` when one row completed, `Ok(false)` when zero
+    /// rows matched. Callers **must** act on `false` — never publish a
+    /// `completed` event / result against a row that did not advance.
     pub async fn complete(
         &self,
         public_id: Uuid,
         response_body: serde_json::Value,
         response_status: i16,
-    ) -> sqlx::Result<()> {
-        sqlx::query(
+    ) -> sqlx::Result<bool> {
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
+        let result = sqlx::query(
             "UPDATE jobs SET status = 'completed', phase = 'completed', \
                               response_body = $1, response_status = $2, \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
                                   - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               progress = 100, updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $3 \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $4 \
+               AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(&response_body)
         .bind(response_status)
         .bind(public_id)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Status-qualified complete: only applies when the row is still in
@@ -643,6 +671,7 @@ impl JobStore {
             return Ok(false);
         }
         let statuses: Vec<String> = expected.iter().map(|s| s.as_str().to_string()).collect();
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET status = 'completed', phase = 'completed', \
                               response_body = $1, response_status = $2, \
@@ -651,15 +680,17 @@ impl JobStore {
                               progress = 100, updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $3 AND status = ANY($4::text[]) \
                AND phase IS DISTINCT FROM $5 \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $6",
         )
         .bind(&response_body)
         .bind(response_status)
         .bind(public_id)
         .bind(&statuses)
         .bind(FINALISE_CLAIM_PHASE)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -682,6 +713,7 @@ impl JobStore {
         response_status: i16,
     ) -> sqlx::Result<bool> {
         let owner_text = owner.to_string();
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET status = 'completed', phase = 'completed', \
                               response_body = $1, response_status = $2, \
@@ -695,7 +727,7 @@ impl JobStore {
                AND (request_body #>> '{finalise_claim,fence}')::bigint = $6 \
                AND (request_body #>> '{finalise_claim,lease_expires_at}') IS NOT NULL \
                AND (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz > NOW() \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $7",
         )
         .bind(&response_body)
         .bind(response_status)
@@ -703,8 +735,10 @@ impl JobStore {
         .bind(FINALISE_CLAIM_PHASE)
         .bind(&owner_text)
         .bind(fence)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -716,24 +750,31 @@ impl JobStore {
     /// with the status flip so a failed cleanup path cannot leave a
     /// restart envelope on a terminal row.
     ///
-    /// **Legacy behaviour:** applies regardless of current status
-    /// **except** the self-heal reset-generation fence. Status-qualified
+    /// **Legacy behaviour:** status-unqualified except the locked
+    /// generation fence and a terminal-status guard. Status-qualified
     /// fail for the v1.1 path lives on [`Self::fail_if_status`].
-    pub async fn fail(&self, public_id: Uuid, error: &str) -> sqlx::Result<()> {
-        sqlx::query(
+    ///
+    /// Returns `Ok(true)` when one row failed, `Ok(false)` on zero rows.
+    /// Callers must act on `false` (no silent fallback).
+    pub async fn fail(&self, public_id: Uuid, error: &str) -> sqlx::Result<bool> {
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
+        let result = sqlx::query(
             "UPDATE jobs SET status = 'failed', phase = 'failed', \
                               error = $1, \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
                                   - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $2 \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $3 \
+               AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(error)
         .bind(public_id)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Status-qualified fail for **unclaimed** rows only.
@@ -753,6 +794,7 @@ impl JobStore {
             return Ok(false);
         }
         let statuses: Vec<String> = expected.iter().map(|s| s.as_str().to_string()).collect();
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET status = 'failed', phase = 'failed', \
                               error = $1, \
@@ -761,14 +803,16 @@ impl JobStore {
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $2 AND status = ANY($3::text[]) \
                AND phase IS DISTINCT FROM $4 \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $5",
         )
         .bind(error)
         .bind(public_id)
         .bind(&statuses)
         .bind(FINALISE_CLAIM_PHASE)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -783,6 +827,7 @@ impl JobStore {
         error: &str,
     ) -> sqlx::Result<bool> {
         let owner_text = owner.to_string();
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET status = 'failed', phase = 'failed', \
                               error = $1, \
@@ -796,15 +841,17 @@ impl JobStore {
                AND (request_body #>> '{finalise_claim,fence}')::bigint = $5 \
                AND (request_body #>> '{finalise_claim,lease_expires_at}') IS NOT NULL \
                AND (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz > NOW() \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $6",
         )
         .bind(error)
         .bind(public_id)
         .bind(FINALISE_CLAIM_PHASE)
         .bind(&owner_text)
         .bind(fence)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -819,17 +866,20 @@ impl JobStore {
         to: JobStatus,
         phase: &str,
     ) -> sqlx::Result<bool> {
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET status = $1, phase = $2, updated_at = NOW() \
              WHERE public_id = $3 AND status = $4 \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $5",
         )
         .bind(to.as_str())
         .bind(phase)
         .bind(public_id)
         .bind(from.as_str())
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -880,6 +930,7 @@ impl JobStore {
         let path = vec![FINALISE_CLAIM_BODY_KEY.to_string()];
         let owner_text = owner.to_string();
         let lease_secs = lease_secs_i64(lease);
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
 
         // Path A: fresh claim from awaiting_signature.
         // `lease_expires_at` is `NOW() + lease` — Postgres clock only (the
@@ -900,7 +951,7 @@ impl JobStore {
                     ), \
                     updated_at = NOW() \
              WHERE public_id = $6 AND status = $7 \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1) \
+               AND reset_generation = $8 \
              RETURNING (request_body #>> '{finalise_claim,fence}')::bigint AS fence",
         )
         .bind(JobStatus::Broadcasting.as_str())
@@ -910,10 +961,12 @@ impl JobStore {
         .bind(lease_secs as f64)
         .bind(public_id)
         .bind(JobStatus::AwaitingSignature.as_str())
-        .fetch_optional(&self.pool)
+        .bind(generation)
+        .fetch_optional(&mut *tx)
         .await?;
         if let Some(row) = row {
             let fence: i64 = row.try_get("fence")?;
+            tx.commit().await?;
             return Ok(FinaliseClaim::Won { fence });
         }
 
@@ -937,7 +990,7 @@ impl JobStore {
              WHERE public_id = $5 \
                AND status = 'broadcasting' \
                AND phase IN ('publishing', 'broadcasting') \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1) \
+               AND reset_generation = $6 \
              RETURNING (request_body #>> '{finalise_claim,fence}')::bigint AS fence",
         )
         .bind(FINALISE_CLAIM_PHASE)
@@ -945,17 +998,27 @@ impl JobStore {
         .bind(&owner_text)
         .bind(lease_secs as f64)
         .bind(public_id)
-        .fetch_optional(&self.pool)
+        .bind(generation)
+        .fetch_optional(&mut *tx)
         .await?;
         if let Some(row) = row {
             let fence: i64 = row.try_get("fence")?;
+            tx.commit().await?;
             return Ok(FinaliseClaim::Won { fence });
         }
 
-        let status = match self.load(public_id).await? {
-            Some(j) => j.status,
+        let status = match sqlx::query("SELECT status FROM jobs WHERE public_id = $1")
+            .bind(public_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            Some(r) => {
+                let s: String = r.try_get("status")?;
+                JobStatus::from_db_str(&s).unwrap_or(JobStatus::Failed)
+            }
             None => JobStatus::Failed,
         };
+        tx.commit().await?;
         Ok(FinaliseClaim::Lost { observed: status })
     }
 
@@ -976,6 +1039,7 @@ impl JobStore {
         let path = vec![FINALISE_CLAIM_BODY_KEY.to_string()];
         let owner_text = owner.to_string();
         let lease_secs = lease_secs_i64(lease);
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET request_body = jsonb_set( \
                     COALESCE(request_body, '{}'::jsonb), \
@@ -994,7 +1058,7 @@ impl JobStore {
                AND phase = $6 \
                AND request_body #>> '{finalise_claim,owner}' = $2 \
                AND (request_body #>> '{finalise_claim,fence}')::bigint = $3 \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $7",
         )
         .bind(&path)
         .bind(&owner_text)
@@ -1002,8 +1066,10 @@ impl JobStore {
         .bind(lease_secs as f64)
         .bind(public_id)
         .bind(FINALISE_CLAIM_PHASE)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1027,6 +1093,7 @@ impl JobStore {
     /// A live owner's unexpired lease **must not** be released by a boot sweep
     /// in another process: that would reintroduce double-execution.
     pub async fn release_stale_finalise_claim(&self, public_id: Uuid) -> sqlx::Result<bool> {
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET phase = 'publishing', \
                     request_body = COALESCE(request_body, '{}'::jsonb) - 'finalise_claim', \
@@ -1038,12 +1105,14 @@ impl JobStore {
                      (request_body #>> '{finalise_claim,lease_expires_at}') IS NULL \
                   OR (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz <= NOW() \
                ) \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $3",
         )
         .bind(public_id)
         .bind(FINALISE_CLAIM_PHASE)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1064,16 +1133,19 @@ impl JobStore {
         expected: JobStatus,
         new_body: &serde_json::Value,
     ) -> sqlx::Result<bool> {
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET request_body = $1, updated_at = NOW() \
              WHERE public_id = $2 AND status = $3 \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $4",
         )
         .bind(new_body)
         .bind(public_id)
         .bind(expected.as_str())
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1094,18 +1166,21 @@ impl JobStore {
         public_id: Uuid,
         new_body: &serde_json::Value,
     ) -> sqlx::Result<bool> {
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET request_body = $1, updated_at = NOW() \
              WHERE public_id = $2 \
                AND status <> 'awaiting_signature' \
                AND phase IS DISTINCT FROM $3 \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $4",
         )
         .bind(new_body)
         .bind(public_id)
         .bind(FINALISE_CLAIM_PHASE)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1125,6 +1200,7 @@ impl JobStore {
     ) -> sqlx::Result<bool> {
         let path = vec![crate::v11::FINALISATION_BODY_KEY.to_string()];
         let owner_text = owner.to_string();
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET request_body = jsonb_set( \
                     COALESCE(request_body, '{}'::jsonb), \
@@ -1140,7 +1216,7 @@ impl JobStore {
                AND (request_body #>> '{finalise_claim,fence}')::bigint = $6 \
                AND (request_body #>> '{finalise_claim,lease_expires_at}') IS NOT NULL \
                AND (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz > NOW() \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $7",
         )
         .bind(&path)
         .bind(finalisation)
@@ -1148,8 +1224,10 @@ impl JobStore {
         .bind(FINALISE_CLAIM_PHASE)
         .bind(&owner_text)
         .bind(fence)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1167,17 +1245,20 @@ impl JobStore {
     pub async fn cancel(&self, public_id: Uuid) -> sqlx::Result<bool> {
         // Legacy cancel stays queued-only. Strip keys for rows that never
         // held a finalisation envelope too (no-op on missing keys).
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET status = 'cancelled', phase = 'cancelled', \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
                                   - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $1 AND status = 'queued' \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $2",
         )
         .bind(public_id)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1196,6 +1277,7 @@ impl JobStore {
     /// job was already past the cancellable set (or not found). The
     /// v1 cancel handler maps `false` to `409 wrong_phase`.
     pub async fn cancel_not_yet_published(&self, public_id: Uuid) -> sqlx::Result<bool> {
+        let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET status = 'cancelled', phase = 'cancelled', \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
@@ -1203,11 +1285,13 @@ impl JobStore {
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $1 \
                AND status IN ('queued', 'proving', 'awaiting_signature') \
-               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
+               AND reset_generation = $2",
         )
         .bind(public_id)
-        .execute(&self.pool)
+        .bind(generation)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
