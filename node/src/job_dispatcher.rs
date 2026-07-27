@@ -516,9 +516,7 @@ async fn process_attest_balance(
                 }
             };
             // §7.5 result for attest_balance: only `attestation` is present.
-            let result = serde_json::json!({
-                "attestation": hex::encode(bytes),
-            });
+            let result = crate::v11::completed_attest_result(&bytes);
             job_store.complete(public_id, result.clone(), 200).await?;
             publish_phase(
                 notify_map,
