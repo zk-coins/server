@@ -3,13 +3,15 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use serde::{Deserialize, Serialize};
+
 use super::encoding::{hc, HcInput};
 use super::error::SpecError;
 use super::tags::{TAG_COINHIST_LEAF, TAG_COINHIST_NODE};
 use zkcoins_program::hash::HashDigest;
 
 /// Leaf state of a coin-history SMT entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum CoinHistState {
     Absent = 0,
@@ -103,7 +105,7 @@ pub fn coinhist_root_after_first_insert(key_be: &[u8; 32], state: CoinHistState)
 /// (leaf-adjacent), `siblings[255]` is the level-256 sibling (root-adjacent)
 /// — same bottom-to-top convention as `coinhist_root_after_first_insert`
 /// and the section 1.7.5 wire `inclusion_proof` layout.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoinHistProof {
     pub state: CoinHistState,
     /// Always exactly 256 entries for a well-formed proof.

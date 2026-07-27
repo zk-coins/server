@@ -238,7 +238,8 @@ pub struct AppState {
     /// `awaiting_signature` under a v1.1 claim; consumed by
     /// [`jobs_sign_handler`] and the dispatcher finalise path. Empty /
     /// unused under the legacy stack. Restart-safe: also persisted under
-    /// `request_body.pending_sign` and rehydrated on boot resume.
+    /// In-memory staging of the durable finalisation capability; also
+    /// persisted under `request_body.finalisation` and rehydrated on boot.
     pub(crate) pending_sign_map: crate::v11::PendingSignMap,
     /// Optional v1.1 finalise driver. Under a v1.1 claim an accepted
     /// `/sign` **must** go through this (install signature → prove
@@ -2556,18 +2557,12 @@ pub(crate) async fn jobs_sign_handler(
         }
     };
 
-    // Ordering (Defect 2): **persist the signature before** claiming the
-    // handoff as SIGNALED. A crash between signal and persist must not
-    // leave a job marked signalled with nothing durable behind it.
+    // Ordering: **install the signature into the durable FinalisationCapability
+    // before** claiming the handoff as SIGNALED. A crash between signal and
+    // persist must not leave a job marked signalled with nothing durable.
     //
-    // Crash windows after the fix (see `wait_for_commit` for the table):
-    // - after verify, before persist → no durable sign, WAITING; wallet
-    //   retries `/sign`
-    // - after persist, before CAS → durable sign, WAITING; wallet may
-    //   retry `/sign`, or boot resume auto-finalises from the blob
-    // - after CAS, before notify → durable + SIGNALED; boot resume
-    //   re-arms and auto-finalises from durable `sign`
-    // - after notify → normal finalise; crash mid-finalise same as above
+    // The write is status-qualified on `awaiting_signature`: if cancel or
+    // timeout already moved the row, the update fails rather than applying.
     //
     // Acceptance still requires a parked dispatcher: reporting
     // signature_accepted when nothing will finalise is worse than failing.
@@ -2584,40 +2579,88 @@ pub(crate) async fn jobs_sign_handler(
             .into_response();
     };
 
-    // Persist the verified TransitionSignature on the job row under `sign`
-    // so the dispatcher can finalise without re-accepting untrusted bytes.
-    // Keep the staged pending in the map until finalise consumes it — a
-    // second /sign while still awaiting is rejected by the status gate once
-    // the dispatcher advances the row.
-    let mut merged = job.request_body.clone();
-    let sign_value = serde_json::json!({
-        "pk_i": hex::encode(accepted.pk_i),
-        "signature": hex::encode(accepted.signature),
-        "r_prime": hex::encode(accepted.r_prime),
-    });
-    let obj = merged
-        .as_object_mut()
-        .expect("jobs.request_body is always a JSON object (admit handlers enforce)");
-    obj.insert("sign".to_string(), sign_value);
-
-    if let Err(e) =
-        sqlx::query("UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2")
-            .bind(&merged)
-            .bind(id)
-            .execute(state.job_store.pool())
-            .await
-    {
-        tracing::error!("Failed to merge sign payload into job row: {}", e);
-        // Handoff still WAITING — no SIGNALED without durable state.
+    // Install signature on the in-memory entry and on the durable capability.
+    let mut entry = entry;
+    if let Err(err) = entry.install_signature(accepted.clone()) {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(v11_error_body("internal_error", "Failed to persist sign payload")),
+            StatusCode::CONFLICT,
+            Json(v11_error_body("invalid_signature", err.message)),
         )
             .into_response();
     }
+    state.pending_sign_map.insert(id, entry.clone());
+
+    let finalisation_value = match crate::v11::DurableFinalisationPersist::from_entry(&entry) {
+        Ok(p) => match serde_json::to_value(p) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(v11_error_body(
+                        "internal_error",
+                        format!("encode durable finalisation: {e}"),
+                    )),
+                )
+                    .into_response();
+            }
+        },
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(v11_error_body(
+                    "internal_error",
+                    format!("encode durable finalisation: {e}"),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let mut merged = job.request_body.clone();
+    let obj = merged
+        .as_object_mut()
+        .expect("jobs.request_body is always a JSON object (admit handlers enforce)");
+    obj.insert(
+        crate::v11::FINALISATION_BODY_KEY.to_string(),
+        finalisation_value,
+    );
+    // Drop legacy split keys if present.
+    obj.remove(crate::v11::PENDING_SIGN_BODY_KEY);
+    obj.remove("sign");
+
+    match state
+        .job_store
+        .replace_request_body_if_status(id, JobStatus::AwaitingSignature, &merged)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            // Status moved (cancel / timeout / concurrent finalise).
+            return (
+                StatusCode::CONFLICT,
+                Json(v11_error_body(
+                    "wrong_phase",
+                    "signature verified but job is no longer awaiting_signature; \
+                     status-qualified persist refused",
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!("Failed to persist durable finalisation signature: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(v11_error_body(
+                    "internal_error",
+                    "Failed to persist durable finalisation signature",
+                )),
+            )
+                .into_response();
+        }
+    }
 
     // Durable first, then CAS. If the dispatcher already timed out, refuse
-    // acceptance even though the sign blob is on the row (wallet must not
+    // acceptance even though the capability is signed (wallet must not
     // treat the work as done when nothing will finalise).
     if !notifier.try_signal_accept() {
         return (
