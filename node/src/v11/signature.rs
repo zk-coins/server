@@ -910,7 +910,7 @@ pub fn finalise_accepted_prove_outside_lock(
 
 /// Production job-path finalise: prove outside the lock, apply under the
 /// write gate, then **atomically** persist the engine snapshot and stage
-/// `v11_pending_publishes` (`members_ready`).
+/// `v11_pending_publishes` (`members_ready`) **under the claim fence**.
 ///
 /// This is what makes [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`] a
 /// durable handoff: a crash after this function returns leaves the account
@@ -918,12 +918,23 @@ pub fn finalise_accepted_prove_outside_lock(
 /// up. On-chain AggregateStateNullifierV3 broadcast still needs bitcoind;
 /// that step is outside the host edge, not a silent skip of durability.
 ///
+/// ## Fence
+///
+/// `fence` is the acquisition token from
+/// [`crate::job_store::JobStore::claim_finalise_exclusive`]. The engine +
+/// `members_ready` commit uses the same token+lease predicate as the job-row
+/// host-edge writes. A stale epoch (including same-owner reclaim) returns
+/// [`crate::job_store::FINALISE_FENCE_LOST`] without writing; the caller must
+/// quiet-exit rather than terminal-fail another claim's job.
+///
 /// ## Resume / crash after durable stage
 ///
 /// If a `members_ready` (or later) row already exists for `signature.pk_i`,
 /// prove+apply are skipped and the §7.5 outcome is rebuilt from the pending
-/// witness. Re-applying an already-advanced account would fail; the staged
-/// row is the durable signal that apply already landed.
+/// witness **only while `fence` still holds**. Re-applying an already-advanced
+/// account would fail; the staged row is the durable signal that apply already
+/// landed. A lost fence refuses the resume shortcut so a stale worker cannot
+/// drive host-edge completion after reclaim.
 ///
 /// ## Lease liveness
 ///
@@ -934,10 +945,14 @@ pub async fn finalise_accepted_prove_persist_and_stage(
     pending: PendingTransition,
     signature: TransitionSignature,
     publisher_pubkey: Option<[u8; 32]>,
+    fence: crate::job_store::FinaliseFence,
 ) -> Result<FinaliseOutcome, String> {
+    use crate::job_store::FINALISE_FENCE_LOST;
     use crate::v11::db_v11;
 
     // Already durable from a prior attempt that crashed after stage.
+    // Still require a live fence: a stale epoch must not re-enter host-edge
+    // completion after another claim reclaimed the job.
     match db_v11::load_pending_publish(adapter.pool(), signature.pk_i)
         .await
         .map_err(|e| format!("load_pending_publish before finalise: {e:#}"))?
@@ -952,9 +967,13 @@ pub async fn finalise_accepted_prove_persist_and_stage(
                     hex_lower(&pending.owner.0),
                 ));
             }
+            if !claim_fence_still_holds(adapter.pool(), fence).await? {
+                return Err(FINALISE_FENCE_LOST.to_string());
+            }
             tracing::info!(
                 pk = %hex_lower(&signature.pk_i),
                 status = %row.status,
+                fence = fence.fence,
                 "v1.1 finalise: pending publish already durable; \
                  skipping re-prove/re-apply (crash-resume after stage)"
             );
@@ -981,7 +1000,7 @@ pub async fn finalise_accepted_prove_persist_and_stage(
     .map_err(|e| format!("prove_pending_transition_detached join: {e}"))?
     .map_err(|e| format!("prove_pending_transition_detached failed: {e:#}"))?;
 
-    // Write gate: snapshot → apply → atomic engine + members_ready → restore on fail.
+    // Write gate: snapshot → apply → atomic fenced engine + members_ready → restore on fail.
     let _write_gate = adapter.lock_writes().await;
     let pre = adapter.snapshot_live();
 
@@ -1017,7 +1036,7 @@ pub async fn finalise_accepted_prove_persist_and_stage(
     })?;
 
     let snap = adapter.snapshot_live();
-    if let Err(e) = db_v11::persist_engine_with_pending_members_ready(
+    match db_v11::persist_engine_with_pending_members_ready_if_finalise_fence(
         adapter.pool(),
         &snap,
         owner,
@@ -1027,21 +1046,35 @@ pub async fn finalise_accepted_prove_persist_and_stage(
         signature.r_prime,
         tip_height_u32,
         tip_hash,
+        fence,
     )
     .await
     {
-        if let Err(restore_err) = adapter.restore_live(pre) {
+        Ok(true) => {
+            // Intent is durable. Never restore_live after this point.
+        }
+        Ok(false) => {
+            if let Err(restore_err) = adapter.restore_live(pre) {
+                return Err(format!(
+                    "v1.1 finalise: claim fence/lease lost before durable stage; \
+                     engine restore also failed ({restore_err:#})"
+                ));
+            }
+            return Err(FINALISE_FENCE_LOST.to_string());
+        }
+        Err(e) => {
+            if let Err(restore_err) = adapter.restore_live(pre) {
+                return Err(format!(
+                    "v1.1 finalise: atomic engine+members_ready persist failed ({e:#}); \
+                     engine restore also failed ({restore_err:#})"
+                ));
+            }
             return Err(format!(
-                "v1.1 finalise: atomic engine+members_ready persist failed ({e:#}); \
-                 engine restore also failed ({restore_err:#})"
+                "v1.1 finalise: atomic engine+members_ready persist failed; \
+                 engine restored (no silent credit): {e:#}"
             ));
         }
-        return Err(format!(
-            "v1.1 finalise: atomic engine+members_ready persist failed; \
-             engine restored (no silent credit): {e:#}"
-        ));
     }
-    // Intent is durable. Never restore_live after this point.
 
     let pd = &applied.proved().proof_data;
     Ok(FinaliseOutcome {
@@ -1051,6 +1084,33 @@ pub async fn finalise_accepted_prove_persist_and_stage(
         output_coin_ids,
         publisher_pubkey,
     })
+}
+
+/// True while `fence` is still the current claim epoch with an unexpired lease.
+async fn claim_fence_still_holds(
+    pool: &sqlx::PgPool,
+    fence: crate::job_store::FinaliseFence,
+) -> Result<bool, String> {
+    use crate::job_store::FINALISE_CLAIM_PHASE;
+    let owner_text = fence.owner.to_string();
+    let held = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM jobs \
+         WHERE public_id = $1 \
+           AND status = 'broadcasting' \
+           AND phase = $2 \
+           AND request_body #>> '{finalise_claim,owner}' = $3 \
+           AND (request_body #>> '{finalise_claim,fence}')::bigint = $4 \
+           AND (request_body #>> '{finalise_claim,lease_expires_at}') IS NOT NULL \
+           AND (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz > NOW()",
+    )
+    .bind(fence.job_id)
+    .bind(FINALISE_CLAIM_PHASE)
+    .bind(&owner_text)
+    .bind(fence.fence)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("claim fence liveness check failed: {e:#}"))?;
+    Ok(held.is_some())
 }
 
 /// Register a live [`PendingSignEntry`] produced by `StateEngine::begin_*`

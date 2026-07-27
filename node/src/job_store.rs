@@ -64,6 +64,27 @@ pub enum FinaliseClaim {
     Lost { observed: JobStatus },
 }
 
+/// Acquisition fence for one exclusive finalise claim epoch.
+///
+/// Carry this into **every** durable write for the claim — job-row transitions
+/// **and** the engine snapshot / `members_ready` stage. Owner identity alone
+/// is not enough: after same-owner reclaim the old token must lose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinaliseFence {
+    /// Job this claim was won for.
+    pub job_id: Uuid,
+    /// Process-generation owner recorded on the claim.
+    pub owner: Uuid,
+    /// Monotonic token from [`FinaliseClaim::Won::fence`].
+    pub fence: i64,
+}
+
+/// Well-known error when a fenced durable stage refuses to commit because the
+/// claim epoch is no longer current (or the lease expired). Callers must
+/// quiet-exit — never terminal-fail a job another epoch may hold.
+pub const FINALISE_FENCE_LOST: &str =
+    "finalise_fence_lost: claim epoch no longer current or lease expired";
+
 /// Phase string written when a resumer wins [`JobStore::claim_finalise_exclusive`].
 /// Distinct from free-form `"publishing"` / `"broadcasting"` so a second
 /// concurrent claim against an already-claimed row fails the CAS.

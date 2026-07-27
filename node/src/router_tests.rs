@@ -3553,7 +3553,7 @@ mod jobs_endpoint_tests {
         let finalise_called_hook = Arc::clone(&finalise_called);
 
         let (mut state, _pool, _c) = jobs_test_state().await;
-        state.v11_finalise = Some(Arc::new(move |pending, signature| {
+        state.v11_finalise = Some(Arc::new(move |pending, signature, _fence| {
             let finalise_called_hook = Arc::clone(&finalise_called_hook);
             Box::pin(async move {
                 finalise_called_hook.store(true, Ordering::SeqCst);
@@ -3632,7 +3632,18 @@ mod jobs_endpoint_tests {
             .expect("signed durable finalisation on row after /sign");
         let sig = entry.signature.clone().expect("signature installed");
         let hook = state.v11_finalise.as_ref().expect("hook");
-        let outcome = hook(entry.pending, sig).await.expect("finalise");
+        // Direct spy invocation (not via claim): dummy fence for type shape.
+        let outcome = hook(
+            entry.pending,
+            sig,
+            crate::job_store::FinaliseFence {
+                job_id,
+                owner: state.job_store.process_owner(),
+                fence: 0,
+            },
+        )
+        .await
+        .expect("finalise");
         assert!(
             finalise_called.load(Ordering::SeqCst),
             "finalise hook must have been invoked"
@@ -4594,7 +4605,7 @@ mod jobs_endpoint_tests {
         .await;
 
         let barrier_in_hook = Arc::clone(&barrier);
-        state.v11_finalise = Some(Arc::new(move |pending, _sig| {
+        state.v11_finalise = Some(Arc::new(move |pending, _sig, _fence| {
             let hook_count_h = Arc::clone(&hook_count_h);
             let _ = barrier_in_hook;
             Box::pin(async move {
@@ -4902,7 +4913,7 @@ mod jobs_endpoint_tests {
         let mut state = fresh_app_state_from_pool(Arc::clone(&pool));
         let hook_count = Arc::new(AtomicUsize::new(0));
         let hook_count_h = Arc::clone(&hook_count);
-        state.v11_finalise = Some(Arc::new(move |pending, _sig| {
+        state.v11_finalise = Some(Arc::new(move |pending, _sig, _fence| {
             let hook_count_h = Arc::clone(&hook_count_h);
             Box::pin(async move {
                 hook_count_h.fetch_add(1, Ordering::SeqCst);
@@ -4973,13 +4984,23 @@ mod jobs_endpoint_tests {
         )
         .await;
         let pool_for_hook = Arc::clone(&pool);
-        state.v11_finalise = Some(Arc::new(move |pending, signature| {
+        state.v11_finalise = Some(Arc::new(move |pending, signature, fence| {
             let pool_for_hook = Arc::clone(&pool_for_hook);
             Box::pin(async move {
-                // Mirror production: stage members_ready before returning
-                // the §7.5 outcome (real path also persists the engine).
-                crate::v11::db_v11::insert_pending_publish_members_ready(
+                // Mirror production: stage members_ready under the claim fence
+                // before returning the §7.5 outcome (real path also persists
+                // the engine under the same predicate).
+                let staged = crate::v11::db_v11::persist_engine_with_pending_members_ready_if_finalise_fence(
                     &*pool_for_hook,
+                    &crate::v11::db_v11::EngineSnapshot {
+                        network: zkcoins_program::circuit::compliance::Network::Regtest,
+                        activation_height: 0,
+                        tip_height: 0,
+                        tip_hash: [0u8; 32],
+                        fold_seq: 0,
+                        nflog: vec![],
+                        accounts: vec![],
+                    },
                     pending.owner,
                     signature.pk_i,
                     signature.signature_r(),
@@ -4987,9 +5008,13 @@ mod jobs_endpoint_tests {
                     signature.r_prime,
                     0,
                     [0u8; 32],
+                    fence,
                 )
                 .await
-                .map_err(|e| format!("stage members_ready: {e:#}"))?;
+                .map_err(|e| format!("stage members_ready under fence: {e:#}"))?;
+                if !staged {
+                    return Err(crate::job_store::FINALISE_FENCE_LOST.to_string());
+                }
                 Ok(FinaliseOutcome::from_pending_proof_data(&pending))
             })
         }));
@@ -5038,7 +5063,7 @@ mod jobs_endpoint_tests {
         let finalise_count_hook = Arc::clone(&finalise_count);
 
         let (mut state, _pool, _c) = jobs_test_state().await;
-        state.v11_finalise = Some(Arc::new(move |pending, _sig| {
+        state.v11_finalise = Some(Arc::new(move |pending, _sig, _fence| {
             let finalise_count_hook = Arc::clone(&finalise_count_hook);
             Box::pin(async move {
                 finalise_count_hook.fetch_add(1, Ordering::SeqCst);

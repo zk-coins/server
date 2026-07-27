@@ -267,15 +267,21 @@ pub struct AppState {
 /// Hook the dispatcher invokes after a verified `/sign` to drive
 /// prove → apply → **durable** engine + `v11_pending_publishes` stage.
 ///
-/// Production wires this to
-/// [`crate::v11::finalise_accepted_prove_persist_and_stage`] via the shared
-/// [`crate::v11::EngineAdapter`] (async: multi-minute prove on a blocking
-/// pool, then atomic persist). Tests inject a spy that records the call
-/// without running the multi-minute prove.
+/// The third argument is the exclusive-claim [`crate::job_store::FinaliseFence`]
+/// for this acquisition epoch. Production
+/// [`crate::v11::finalise_accepted_prove_persist_and_stage`] commits the engine
+/// snapshot and `members_ready` only while that fence + lease still hold —
+/// the same predicate as job-row host-edge writes. A fence that stops at the
+/// job-row boundary is decoration; the engine write is the one that matters.
+///
+/// Production wires this via the shared [`crate::v11::EngineAdapter`] (async:
+/// multi-minute prove on a blocking pool, then atomic fenced persist). Tests
+/// inject a spy that records the call without running the multi-minute prove.
 pub type V11FinaliseHook = Arc<
     dyn Fn(
             zkcoins_prover::state_engine::PendingTransition,
             zkcoins_prover::prover_bridge::TransitionSignature,
+            crate::job_store::FinaliseFence,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = Result<crate::v11::FinaliseOutcome, String>>

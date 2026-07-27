@@ -1307,7 +1307,22 @@ async fn wait_for_commit(
             } else {
                 "awaiting_signature timeout".to_string()
             };
-            job_store.fail(public_id, &err).await?;
+            // Fence-aware terminate: only unclaimed `awaiting_signature`.
+            // An exclusive finalise claim (any fence, including a newer epoch
+            // after reclaim) must not be killed by this timeout — bare
+            // `JobStore::fail` would ignore the claim and terminate the winner.
+            let failed = job_store
+                .fail_if_status(public_id, &[JobStatus::AwaitingSignature], &err)
+                .await?;
+            if !failed {
+                tracing::info!(
+                    "Job dispatcher: job {} awaiting_signature timeout was a no-op \
+                     (status moved or exclusive finalise claim holds); \
+                     leaving shared notify state intact",
+                    public_id
+                );
+                return Ok(());
+            }
             // Publish the terminal `failed` event BEFORE removing the
             // notify-map entry so an attached SSE stream receives the
             // final phase frame. The remove() runs after — once every
@@ -1735,27 +1750,31 @@ pub const JOB_FINALISE_HOST_EDGE: &str =
 /// Drive an accepted v1.1 signature through the durable host path up to
 /// [`JOB_FINALISE_HOST_EDGE`].
 ///
-/// ## Steps and durable dependencies
+/// ## Sweep: every write that can complete, terminate, or advance a job
 ///
-/// | Step | Depends on (capability fields) | Guard |
-/// |------|--------------------------------|-------|
-/// | Terminal job | — | status already terminal → no-op |
-/// | Load capability | `finalisation` envelope | rehydrate; refuse incomplete |
-/// | Exclusive claim | status + owner/fence/lease | [`JobStore::claim_finalise_exclusive`] — **loser exits without side effects** |
-/// | Prove + apply + stage | pending + signature | finalise hook (engine + `members_ready`); skip if `completion_result` already set |
-/// | Persist completion | outcome + publisher_pubkey | **fence + lease** `merge_finalisation_if_finalise_owner` |
-/// | Host §7.5 complete | `completion_result` + `completion_status` | **fence + lease** `complete_if_finalise_owner` — **host edge** |
-/// | Fail (pre-claim) | — | `fail_if_status` — unclaimed rows only (never [`FINALISE_CLAIM_PHASE`]) |
-/// | Fail (post-claim) | — | `fail_if_finalise_owner` — stale fence / expired lease cannot fail |
-///
-/// `broadcasting` is an **exclusive claim**, not a permission: exactly one
-/// resumer wins the CAS; the loser observes [`FinaliseClaim::Lost`] and must
-/// not continue into side effects **and must not mutate shared notify state**.
+/// | Write | What it advances / terminates | Fence carried |
+/// |-------|-------------------------------|---------------|
+/// | [`JobStore::claim_finalise_exclusive`] | `awaiting_signature`/`broadcasting` → `broadcasting` + [`FINALISE_CLAIM_PHASE`]; mints fence | **mints** acquisition fence (CAS) |
+/// | [`JobStore::renew_finalise_claim`] | lease only (no status change) | **fence + owner** (stale epoch cannot renew) |
+/// | Finalise hook → engine snapshot + `members_ready` | account/engine + rebroadcast intent (the write that matters most) | **fence + owner + lease** via [`crate::v11::finalise_accepted_prove_persist_and_stage`] |
+/// | [`JobStore::merge_finalisation_if_finalise_owner`] | durable `finalisation` completion surface on the job row | **fence + owner + lease** |
+/// | [`JobStore::complete_if_finalise_owner`] | → `completed` (host §7.5 edge) | **fence + owner + lease** |
+/// | [`JobStore::fail_if_finalise_owner`] | → `failed` while claim held | **fence + owner + lease** |
+/// | [`JobStore::fail_if_status`] (pre-claim / awaiting-signature timeout) | → `failed` for **unclaimed** rows only | status + **not** [`FINALISE_CLAIM_PHASE`] (refuses any held claim / fence) |
+/// | [`JobStore::complete_if_status`] | → `completed` for **unclaimed** rows only | status + **not** [`FINALISE_CLAIM_PHASE`] |
+/// | [`JobStore::set_awaiting_signature`] | → `awaiting_signature` (pre-claim prove leg) | status CAS (`proving`/`queued`); no claim fence yet |
+/// | [`JobStore::set_status` / `set_status_if`] | phase/status advance (pre-claim) | status CAS; no claim fence yet |
+/// | [`JobStore::cancel` / `cancel_not_yet_published`] | → `cancelled` before publish | status CAS; refuses claimed terminal paths |
+/// | Bare [`JobStore::fail`] / [`JobStore::complete`] | legacy unqualified | **none** — must not be used once a claim can exist (timeout fixed) |
 ///
 /// After the claim is won, durable transition commits are fenced on the
 /// **acquisition fencing token** plus a still-valid lease — not on owner
 /// identity or status alone. Dropping a future after lease loss is only
 /// cooperative; the write predicates are the safety mechanism.
+///
+/// `broadcasting` is an **exclusive claim**, not a permission: exactly one
+/// resumer wins the CAS; the loser observes [`FinaliseClaim::Lost`] and must
+/// not continue into side effects **and must not mutate shared notify state**.
 async fn drive_v11_finalise(
     job_store: &JobStore,
     app_state: &AppState,
@@ -1997,9 +2016,10 @@ async fn drive_v11_finalise(
     //
     // What a worker can still do with a stale fence / expired lease:
     // pure in-process work (CPU prove segments between `.await`s, in-memory
-    // apply under a local write gate). It must not commit job-row transitions
-    // — completion persist, terminal complete, and fence-scoped fail all
-    // require the current fence token and an unexpired lease.
+    // apply under a local write gate). It must not commit durable transitions
+    // — engine/`members_ready` stage, completion persist, terminal complete,
+    // and fence-scoped fail all require the current fence token and an
+    // unexpired lease.
     let owned_drive = async {
         // If prove+apply already recorded the §7.5 surface, skip the hook and
         // only publish + complete (crash window after durable stage + completion
@@ -2029,7 +2049,14 @@ async fn drive_v11_finalise(
             // publisher_pubkey is only the staged capability field — no silent
             // fall-back to a root request_body key.
             let publisher_pubkey = entry.publisher_pubkey;
-            let hook_result = hook(entry.pending.clone(), signature).await;
+            let claim = crate::job_store::FinaliseFence {
+                job_id: public_id,
+                owner: claim_owner,
+                fence: claim_fence,
+            };
+            // Fence reaches the hook: production stages engine + members_ready
+            // only while this acquisition epoch still holds.
+            let hook_result = hook(entry.pending.clone(), signature, claim).await;
             match hook_result {
                 Ok(mut outcome) => {
                     if outcome.publisher_pubkey.is_none() {
@@ -2106,6 +2133,17 @@ async fn drive_v11_finalise(
                         return Ok(());
                     }
                     app_state.pending_sign_map.insert(public_id, entry.clone());
+                }
+                Err(e) if e == crate::job_store::FINALISE_FENCE_LOST => {
+                    // Stale epoch lost the engine/members_ready commit (or the
+                    // resume shortcut). Quiet exit — do not terminal-fail a
+                    // job another fence may hold.
+                    tracing::info!(
+                        "Job dispatcher: job {} finalise hook refused durable stage \
+                         (fence/lease lost); leaving shared notify state intact",
+                        public_id
+                    );
+                    return Ok(());
                 }
                 Err(e) => {
                     let msg = format!("v1.1 finalise failed: {e}");

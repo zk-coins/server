@@ -1562,6 +1562,285 @@ async fn current_fence_with_expired_lease_cannot_commit() {
     drop(scope);
 }
 
+/// Defect 1 (P0): a stale fence cannot commit the engine snapshot or stage
+/// `members_ready` — the durable write that matters most carries the same
+/// acquisition fence as the job-row host-edge writes.
+#[tokio::test]
+async fn stale_fence_cannot_commit_engine_snapshot_or_members_ready() {
+    use std::time::Duration;
+    use shared::spec_v1::Address;
+    use zkcoins_program::circuit::compliance::Network;
+    use crate::v11::db_v11::{
+        self, EngineSnapshot, PENDING_PUBLISH_MEMBERS_READY,
+    };
+    use crate::v11::separation::{
+        claim_stack_scan_mode, clear_process_stack_mode_for_test, set_process_stack_mode,
+        ScanStackMode,
+    };
+
+    let _ = clear_process_stack_mode_for_test();
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let scope = setup_pool().await;
+    claim_stack_scan_mode(&scope.pool, ScanStackMode::V11)
+        .await
+        .expect("claim stack_scan_mode v11");
+
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xE8),
+            Some("k-stale-fence-engine"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let old_fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("first claim"),
+    );
+
+    // Same-owner reclaim mints a newer fence.
+    expire_finalise_claim_lease(store.pool(), job_id).await;
+    assert!(
+        store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release"),
+        "expired lease must release"
+    );
+    let new_fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("reclaim"),
+    );
+    assert!(
+        new_fence > old_fence,
+        "reclaim must mint a newer fence; old={old_fence} new={new_fence}"
+    );
+
+    let snap = EngineSnapshot {
+        network: Network::Regtest,
+        activation_height: 0,
+        tip_height: 0,
+        tip_hash: [0u8; 32],
+        fold_seq: 0,
+        nflog: vec![],
+        accounts: vec![],
+    };
+    let account_owner = Address(account_addr(0xE8));
+    let pk = [0xAAu8; 32];
+    let r = [0xBBu8; 32];
+    let s = [0xCCu8; 32];
+    let r_prime = [0xDDu8; 32];
+
+    // Stale epoch must not write engine or members_ready.
+    let stale = FinaliseFence {
+        job_id,
+        owner,
+        fence: old_fence,
+    };
+    assert!(
+        !db_v11::persist_engine_with_pending_members_ready_if_finalise_fence(
+            store.pool(),
+            &snap,
+            account_owner,
+            pk,
+            r,
+            s,
+            r_prime,
+            0,
+            [0u8; 32],
+            stale,
+        )
+        .await
+        .expect("stale fenced persist"),
+        "stale fence must not commit engine+members_ready"
+    );
+    assert!(
+        db_v11::load_pending_publish(store.pool(), pk)
+            .await
+            .expect("load pending")
+            .is_none(),
+        "stale fence must leave no members_ready row"
+    );
+    assert!(
+        db_v11::load_engine_snapshot(store.pool())
+            .await
+            .expect("load engine")
+            .is_none(),
+        "stale fence must leave no engine snapshot"
+    );
+
+    // Current fence commits both.
+    let current = FinaliseFence {
+        job_id,
+        owner,
+        fence: new_fence,
+    };
+    assert!(
+        db_v11::persist_engine_with_pending_members_ready_if_finalise_fence(
+            store.pool(),
+            &snap,
+            account_owner,
+            pk,
+            r,
+            s,
+            r_prime,
+            0,
+            [0u8; 32],
+            current,
+        )
+        .await
+        .expect("current fenced persist"),
+        "current fence must commit engine+members_ready"
+    );
+    let pending = db_v11::load_pending_publish(store.pool(), pk)
+        .await
+        .expect("load pending")
+        .expect("current fence must stage members_ready");
+    assert_eq!(pending.status, PENDING_PUBLISH_MEMBERS_READY);
+    assert!(
+        db_v11::load_engine_snapshot(store.pool())
+            .await
+            .expect("load engine")
+            .is_some(),
+        "current fence must persist engine snapshot"
+    );
+
+    clear_process_stack_mode_for_test();
+    drop(scope);
+}
+
+/// Defect 2 (P0): the awaiting-signature timeout path terminates via
+/// `fail_if_status` (not bare `fail`). A job held under a finalise claim —
+/// including after same-owner reclaim with a newer fence — must not be
+/// killed by the timeout.
+#[tokio::test]
+async fn awaiting_signature_timeout_cannot_terminate_job_under_newer_fence() {
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xE9),
+            Some("k-timeout-newer-fence"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    // First claim (old fence), then reclaim with a strictly newer fence.
+    let old_fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("first claim"),
+    );
+    expire_finalise_claim_lease(store.pool(), job_id).await;
+    assert!(
+        store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release"),
+        "expired lease must release"
+    );
+    let new_fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("reclaim"),
+    );
+    assert!(
+        new_fence > old_fence,
+        "reclaim must mint a newer fence; old={old_fence} new={new_fence}"
+    );
+
+    // Exact predicate the timeout path uses after the fix.
+    let err = "awaiting_signature timeout";
+    assert!(
+        !store
+            .fail_if_status(job_id, &[JobStatus::AwaitingSignature], err)
+            .await
+            .expect("timeout fail_if_status"),
+        "awaiting_signature timeout must not terminate a job held under a claim fence"
+    );
+
+    let row = store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(
+        row.status,
+        JobStatus::Broadcasting,
+        "claimed job must remain broadcasting after timeout attempt"
+    );
+    assert_eq!(row.phase, FINALISE_CLAIM_PHASE);
+    assert!(row.error.is_none(), "timeout must not write an error on a claimed job");
+    assert_eq!(
+        row.request_body
+            .get("finalise_claim")
+            .and_then(|c| c.get("fence"))
+            .and_then(|f| f.as_i64()),
+        Some(new_fence),
+        "newer fence must still be current"
+    );
+
+    // Contrast: an unclaimed awaiting_signature row is still terminable.
+    let result2 = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xEA),
+            Some("k-timeout-unclaimed"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create2");
+    let job2 = match result2 {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job2, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature2");
+    assert!(
+        store
+            .fail_if_status(job2, &[JobStatus::AwaitingSignature], err)
+            .await
+            .expect("timeout on unclaimed"),
+        "timeout must still fail a true unclaimed awaiting_signature job"
+    );
+    let failed = store.load(job2).await.expect("load").expect("row");
+    assert_eq!(failed.status, JobStatus::Failed);
+
+    drop(scope);
+}
+
 /// Pre-claim status-only fail must not terminate a row under exclusive claim.
 #[tokio::test]
 async fn pre_claim_fail_if_status_cannot_terminate_owned_row() {
