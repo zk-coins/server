@@ -298,6 +298,45 @@ pub struct PublishedBatch {
     pub block_anchor: BlockAnchor,
 }
 
+/// Fully constructed, fee-converged commit/reveal pair ready for broadcast.
+///
+/// Produced by [`Publisher::prepare`]. Callers that need crash recovery
+/// **must** persist the raw transactions (consensus-serialised) before
+/// calling [`Publisher::broadcast_commit`] / [`Publisher::broadcast_reveal`],
+/// so a crash between the two legs can finish or safely abandon without
+/// guessing the missing transaction.
+#[derive(Clone, Debug)]
+pub struct PreparedBatch {
+    /// Half-aggregated payload object that will be inscribed.
+    pub aggregate: AggregateStateNullifierV3,
+    /// Exact on-chain payload bytes.
+    pub payload: Vec<u8>,
+    /// Signed commit transaction (ready for `sendrawtransaction`).
+    pub signed_commit: Transaction,
+    /// Complete reveal transaction spending the commit output.
+    pub reveal_tx: Transaction,
+    /// The P2TR commit output that the reveal spends.
+    pub commit_output: TxOut,
+    /// Publisher-chosen §3.5 anchor (see [`PublishedBatch::block_anchor`]).
+    pub block_anchor: BlockAnchor,
+    /// Fee-basis commit vsize (must equal `signed_commit.vsize()`).
+    pub commit_vsize: usize,
+    /// Fee-basis reveal vsize (must equal `reveal_tx.vsize()`).
+    pub reveal_vsize: usize,
+    pub commit_fee: Amount,
+    pub reveal_fee: Amount,
+}
+
+impl PreparedBatch {
+    pub fn commit_txid(&self) -> Txid {
+        self.signed_commit.compute_txid()
+    }
+
+    pub fn reveal_txid(&self) -> Txid {
+        self.reveal_tx.compute_txid()
+    }
+}
+
 /// Full per-input extraction result from a reveal transaction.
 ///
 /// `payloads` holds every `Ok(Some(_))` envelope body. Per-input `Err`
@@ -404,28 +443,29 @@ impl Publisher {
         })
     }
 
-    /// Half-aggregate `members`, verify the aggregate under the publisher's
-    /// network constant, inscribe the payload, sign and broadcast commit then
-    /// reveal to the connected bitcoind.
+    /// Half-aggregate `members`, verify the aggregate, and construct a
+    /// fee-converged signed commit/reveal pair **without** broadcasting.
     ///
-    /// ## Failure modes (nothing is broadcast unless all checks pass)
+    /// Callers that need crash recovery between the two broadcast legs must
+    /// persist [`PreparedBatch::signed_commit`] and [`PreparedBatch::reveal_tx`]
+    /// before calling [`Self::broadcast_commit`] / [`Self::broadcast_reveal`].
+    ///
+    /// ## Failure modes (nothing is broadcast)
     ///
     /// - empty batch / member count exceeds `u16::MAX`
     /// - reveal exceeds [`MAX_STANDARD_TX_WEIGHT`] (checked **before** any
     ///   per-member chain RPC)
     /// - invalid / inconsistent member build tips (§3.5 oldest-tip rule)
     /// - aggregate verification failure (wrong network, corrupted `s`, …)
-    /// - no eligible funding UTXO covers the inscription (arithmetic pre-filter
-    ///   and/or measured fees; attempt limit exhausted)
+    /// - no eligible funding UTXO covers the inscription
     /// - fee/topology fixed-point does not converge
-    /// - selected `block_anchor` reorged out or became too stale before broadcast
     ///
     /// **Batch composition is never auto-split.** An oversized batch fails
     /// with an actionable error; the caller decides how to split.
-    pub fn publish(&self, members: &[BatchMember]) -> Result<PublishedBatch> {
+    pub fn prepare(&self, members: &[BatchMember]) -> Result<PreparedBatch> {
         ensure!(
             !members.is_empty(),
-            "publish requires at least one BatchMember"
+            "prepare requires at least one BatchMember"
         );
         let member_count = members.len();
         ensure!(
@@ -647,6 +687,32 @@ impl Publisher {
             converged.reveal_vsize
         );
 
+        let commit_output = converged
+            .signed_commit
+            .output
+            .first()
+            .cloned()
+            .context("commit transaction has no outputs")?;
+
+        Ok(PreparedBatch {
+            aggregate,
+            payload,
+            signed_commit: converged.signed_commit,
+            reveal_tx: converged.reveal_tx,
+            commit_output,
+            block_anchor,
+            commit_vsize: converged.commit_vsize,
+            reveal_vsize: converged.reveal_vsize,
+            commit_fee: converged.commit_fee,
+            reveal_fee: converged.reveal_fee,
+        })
+    }
+
+    /// Broadcast only the commit leg of a previously prepared pair.
+    ///
+    /// Re-checks the block-anchor identity immediately before
+    /// `sendrawtransaction`. Does **not** broadcast the reveal.
+    pub fn broadcast_commit(&self, prepared: &PreparedBatch) -> Result<Txid> {
         // Test-only injection point: deterministic reorg before the identity
         // re-check (no wall-clock race).
         #[cfg(test)]
@@ -661,28 +727,25 @@ impl Publisher {
             }
         }
 
-        // Re-verify anchor **identity** (not just height gap) immediately
-        // before broadcast. A reorg during fee convergence can replace the
-        // block at the same height; a cached hash from selection would hide
-        // that. Always call getblockhash fresh — bypass any selection cache.
-        self.ensure_anchor_ready_for_broadcast(block_anchor)
+        self.ensure_anchor_ready_for_broadcast(prepared.block_anchor)
             .context("pre-broadcast anchor re-check failed; refusing sendrawtransaction")?;
 
-        let commit_txid = converged.signed_commit.compute_txid();
-        let reveal_txid = converged.reveal_tx.compute_txid();
-        let commit_output = converged
-            .signed_commit
-            .output
-            .first()
-            .cloned()
-            .context("commit transaction has no outputs")?;
-
+        let commit_txid = prepared.commit_txid();
         self.rpc
-            .send_raw_transaction(&converged.signed_commit)
+            .send_raw_transaction(&prepared.signed_commit)
             .with_context(|| format!("sendrawtransaction(commit) failed for {commit_txid}"))?;
+        Ok(commit_txid)
+    }
 
+    /// Broadcast only the reveal leg of a previously prepared pair.
+    ///
+    /// Intended for the resume path after commit is already on chain (or
+    /// immediately after a successful [`Self::broadcast_commit`]).
+    pub fn broadcast_reveal(&self, prepared: &PreparedBatch) -> Result<Txid> {
+        let commit_txid = prepared.commit_txid();
+        let reveal_txid = prepared.reveal_txid();
         self.rpc
-            .send_raw_transaction(&converged.reveal_tx)
+            .send_raw_transaction(&prepared.reveal_tx)
             .with_context(|| {
                 format!(
                     "sendrawtransaction(reveal) failed for {reveal_txid}; \
@@ -690,24 +753,38 @@ impl Publisher {
                      (NUMS key path is unspendable; oversized reveal is unrecoverable)"
                 )
             })?;
+        Ok(reveal_txid)
+    }
+
+    /// Half-aggregate `members`, construct the commit/reveal pair, and
+    /// broadcast both legs. Convenience wrapper around
+    /// [`Self::prepare`] + [`Self::broadcast_commit`] + [`Self::broadcast_reveal`].
+    ///
+    /// Callers that need mid-pair crash recovery must use the split APIs and
+    /// persist the prepared transactions between the two broadcast legs.
+    pub fn publish(&self, members: &[BatchMember]) -> Result<PublishedBatch> {
+        let prepared = self.prepare(members)?;
+        let member_count = members.len();
+        let commit_txid = self.broadcast_commit(&prepared)?;
+        let reveal_txid = self.broadcast_reveal(&prepared)?;
 
         eprintln!(
             "publisher: broadcast commit={commit_txid} ({} vB, fee {} sat) \
              reveal={reveal_txid} ({} vB, fee {} sat) fee_rate={} sat/vB members={member_count}",
-            converged.commit_vsize,
-            converged.commit_fee.to_sat(),
-            converged.reveal_vsize,
-            converged.reveal_fee.to_sat(),
+            prepared.commit_vsize,
+            prepared.commit_fee.to_sat(),
+            prepared.reveal_vsize,
+            prepared.reveal_fee.to_sat(),
             self.config.fee_rate_sat_per_vb
         );
 
         Ok(PublishedBatch {
-            aggregate,
-            payload,
+            aggregate: prepared.aggregate,
+            payload: prepared.payload,
             commit_txid,
             reveal_txid,
-            commit_output,
-            block_anchor,
+            commit_output: prepared.commit_output,
+            block_anchor: prepared.block_anchor,
         })
     }
 

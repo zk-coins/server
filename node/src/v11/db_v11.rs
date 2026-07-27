@@ -5,7 +5,7 @@
 //! accounts without their coin sets). Loads use an equivalent transactional
 //! snapshot so a concurrent write cannot produce a mixed old/new state.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use shared::spec_v1::{
     self as host, AccountState, Address, ChainPosition, Coin, HashDigest, NfLogEntry,
 };
@@ -221,7 +221,8 @@ async fn count_any_v11_rows(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
           + (SELECT COUNT(*) FROM v11_nullifier_index) \
           + (SELECT COUNT(*) FROM v11_accounts) \
           + (SELECT COUNT(*) FROM v11_spendable_coins) \
-          + (SELECT COUNT(*) FROM v11_spent_coins)",
+          + (SELECT COUNT(*) FROM v11_spent_coins) \
+          + (SELECT COUNT(*) FROM v11_pending_publishes)",
     )
     .fetch_one(&mut **tx)
     .await
@@ -513,7 +514,12 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
 /// transaction before any v1.1 table is touched. This is the binding
 /// capability check: a process-local boot pin alone cannot close the
 /// window between an advisory check and a later write.
-pub async fn persist_engine_snapshot(pool: &PgPool, snap: &EngineSnapshot) -> Result<()> {
+/// **Crate-private durable-write sink.** Downstream durable engine writes
+/// go through receive / scan orchestration only.
+pub(crate) async fn persist_engine_snapshot(
+    pool: &PgPool,
+    snap: &EngineSnapshot,
+) -> Result<()> {
     let mut tx = pool.begin().await.context("begin v11 persist tx")?;
     require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
         .await
@@ -521,6 +527,61 @@ pub async fn persist_engine_snapshot(pool: &PgPool, snap: &EngineSnapshot) -> Re
     clear_all(&mut tx).await?;
     write_all(&mut tx, snap).await?;
     tx.commit().await.context("commit v11 persist tx")?;
+    Ok(())
+}
+
+/// Atomically persist the engine snapshot **and** a `members_ready` rebroadcast
+/// intent in one transaction.
+///
+/// Closes the crash window where the account is advanced on disk but the
+/// Schnorr `s` / BatchMember fields are not yet durable — that row was
+/// previously unrecoverable. Either both land or neither does.
+/// **Crate-private durable-write sink** (engine + members_ready intent).
+pub(crate) async fn persist_engine_with_pending_members_ready(
+    pool: &PgPool,
+    snap: &EngineSnapshot,
+    owner: Address,
+    pk: [u8; 32],
+    r: [u8; 32],
+    s: [u8; 32],
+    r_prime: [u8; 32],
+    build_tip_height: u32,
+    build_tip_hash: [u8; 32],
+) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin engine+members_ready persist tx")?;
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+        .await
+        .context("engine+members_ready persist: stack_scan_mode capability check")?;
+    clear_all(&mut tx).await?;
+    write_all(&mut tx, snap).await?;
+    sqlx::query(
+        "INSERT INTO v11_pending_publishes \
+         (pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
+          commit_tx, reveal_tx, commit_txid, reveal_txid, status, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, NULL, $8, NOW(), NOW())",
+    )
+    .bind(pk.as_slice())
+    .bind(owner.0.as_slice())
+    .bind(r.as_slice())
+    .bind(s.as_slice())
+    .bind(r_prime.as_slice())
+    .bind(i64::from(build_tip_height))
+    .bind(build_tip_hash.as_slice())
+    .bind(PENDING_PUBLISH_MEMBERS_READY)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| {
+        format!(
+            "insert v11_pending_publishes members_ready (atomic with engine) pk={}",
+            hex::encode(pk)
+        )
+    })?;
+    tx.commit()
+        .await
+        .context("commit engine+members_ready persist tx")?;
     Ok(())
 }
 
@@ -674,4 +735,272 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pending nullifier-publish recovery (migration 0021)
+// ---------------------------------------------------------------------------
+
+/// Status labels for [`v11_pending_publishes`] (CHECK-constrained).
+pub const PENDING_PUBLISH_MEMBERS_READY: &str = "members_ready";
+pub const PENDING_PUBLISH_CONSTRUCTED: &str = "constructed";
+pub const PENDING_PUBLISH_COMMIT_BROADCAST: &str = "commit_broadcast";
+pub const PENDING_PUBLISH_REVEAL_BROADCAST: &str = "reveal_broadcast";
+pub const PENDING_PUBLISH_COMPLETE: &str = "complete";
+pub const PENDING_PUBLISH_FAILED: &str = "failed";
+
+/// Durable rebroadcast intent for one account-state nullifier.
+#[derive(Clone, Debug)]
+pub struct PendingPublishRow {
+    pub pk: [u8; 32],
+    pub owner: Address,
+    pub r: [u8; 32],
+    pub s: [u8; 32],
+    pub r_prime: [u8; 32],
+    pub build_tip_height: u32,
+    pub build_tip_hash: [u8; 32],
+    pub commit_tx: Option<Vec<u8>>,
+    pub reveal_tx: Option<Vec<u8>>,
+    pub commit_txid: Option<[u8; 32]>,
+    pub reveal_txid: Option<[u8; 32]>,
+    pub status: String,
+}
+
+/// Insert `members_ready` row: Schnorr `s` + BatchMember fields durable,
+/// no raw transactions yet.
+///
+/// **Crate-private durable-write sink.** Production receive uses the atomic
+/// [`persist_engine_with_pending_members_ready`]; this insert remains for
+/// crash-window fixtures that stage a row without rewriting the engine.
+#[allow(dead_code)] // crate-test staging path
+pub(crate) async fn insert_pending_publish_members_ready(
+    pool: &PgPool,
+    owner: Address,
+    pk: [u8; 32],
+    r: [u8; 32],
+    s: [u8; 32],
+    r_prime: [u8; 32],
+    build_tip_height: u32,
+    build_tip_hash: [u8; 32],
+) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin insert pending publish members_ready")?;
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+        .await
+        .context("pending publish insert: stack_scan_mode capability check")?;
+    sqlx::query(
+        "INSERT INTO v11_pending_publishes \
+         (pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
+          commit_tx, reveal_tx, commit_txid, reveal_txid, status, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, NULL, $8, NOW(), NOW())",
+    )
+    .bind(pk.as_slice())
+    .bind(owner.0.as_slice())
+    .bind(r.as_slice())
+    .bind(s.as_slice())
+    .bind(r_prime.as_slice())
+    .bind(i64::from(build_tip_height))
+    .bind(build_tip_hash.as_slice())
+    .bind(PENDING_PUBLISH_MEMBERS_READY)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| {
+        format!(
+            "insert v11_pending_publishes members_ready pk={}",
+            hex::encode(pk)
+        )
+    })?;
+    tx.commit()
+        .await
+        .context("commit insert pending publish members_ready")?;
+    Ok(())
+}
+
+/// Persist constructed commit/reveal pair and advance to `constructed`.
+///
+/// **Crate-private durable-write sink.**
+pub(crate) async fn mark_pending_publish_constructed(
+    pool: &PgPool,
+    pk: [u8; 32],
+    commit_tx: &[u8],
+    reveal_tx: &[u8],
+    commit_txid: [u8; 32],
+    reveal_txid: [u8; 32],
+) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin mark pending publish constructed")?;
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+        .await
+        .context("pending publish constructed: stack_scan_mode capability check")?;
+    let result = sqlx::query(
+        "UPDATE v11_pending_publishes \
+         SET commit_tx = $2, reveal_tx = $3, commit_txid = $4, reveal_txid = $5, \
+             status = $6, updated_at = NOW() \
+         WHERE pk = $1 AND status = $7",
+    )
+    .bind(pk.as_slice())
+    .bind(commit_tx)
+    .bind(reveal_tx)
+    .bind(commit_txid.as_slice())
+    .bind(reveal_txid.as_slice())
+    .bind(PENDING_PUBLISH_CONSTRUCTED)
+    .bind(PENDING_PUBLISH_MEMBERS_READY)
+    .execute(&mut *tx)
+    .await
+    .context("update pending publish to constructed")?;
+    ensure!(
+        result.rows_affected() == 1,
+        "mark_pending_publish_constructed: no members_ready row for pk={}",
+        hex::encode(pk)
+    );
+    tx.commit()
+        .await
+        .context("commit mark pending publish constructed")?;
+    Ok(())
+}
+
+/// Advance status after a successful commit (or reveal) broadcast.
+///
+/// **Crate-private durable-write sink.**
+pub(crate) async fn mark_pending_publish_status(
+    pool: &PgPool,
+    pk: [u8; 32],
+    from_status: &str,
+    to_status: &str,
+) -> Result<()> {
+    ensure!(
+        matches!(
+            to_status,
+            PENDING_PUBLISH_COMMIT_BROADCAST
+                | PENDING_PUBLISH_REVEAL_BROADCAST
+                | PENDING_PUBLISH_COMPLETE
+                | PENDING_PUBLISH_FAILED
+        ),
+        "mark_pending_publish_status: invalid to_status={to_status}"
+    );
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin mark pending publish status")?;
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+        .await
+        .context("pending publish status: stack_scan_mode capability check")?;
+    let result = sqlx::query(
+        "UPDATE v11_pending_publishes \
+         SET status = $2, updated_at = NOW() \
+         WHERE pk = $1 AND status = $3",
+    )
+    .bind(pk.as_slice())
+    .bind(to_status)
+    .bind(from_status)
+    .execute(&mut *tx)
+    .await
+    .context("update pending publish status")?;
+    ensure!(
+        result.rows_affected() == 1,
+        "mark_pending_publish_status: no row pk={} with status={from_status}",
+        hex::encode(pk)
+    );
+    tx.commit()
+        .await
+        .context("commit mark pending publish status")?;
+    Ok(())
+}
+
+/// Load one pending publish by Pk, or `None` if absent.
+pub async fn load_pending_publish(pool: &PgPool, pk: [u8; 32]) -> Result<Option<PendingPublishRow>> {
+    let row = sqlx::query(
+        "SELECT pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
+                commit_tx, reveal_tx, commit_txid, reveal_txid, status \
+         FROM v11_pending_publishes WHERE pk = $1",
+    )
+    .bind(pk.as_slice())
+    .fetch_optional(pool)
+    .await
+    .context("load pending publish")?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    use sqlx::Row;
+    Ok(Some(PendingPublishRow {
+        pk: fixed_32(row.get::<Vec<u8>, _>("pk").as_slice(), "pending.pk")?,
+        owner: Address(fixed_32(
+            row.get::<Vec<u8>, _>("owner").as_slice(),
+            "pending.owner",
+        )?),
+        r: fixed_32(row.get::<Vec<u8>, _>("r").as_slice(), "pending.r")?,
+        s: fixed_32(row.get::<Vec<u8>, _>("s").as_slice(), "pending.s")?,
+        r_prime: fixed_32(row.get::<Vec<u8>, _>("r_prime").as_slice(), "pending.r_prime")?,
+        build_tip_height: u32_from_i64(row.get("build_tip_height"), "pending.build_tip_height")?,
+        build_tip_hash: fixed_32(
+            row.get::<Vec<u8>, _>("build_tip_hash").as_slice(),
+            "pending.build_tip_hash",
+        )?,
+        commit_tx: row.get("commit_tx"),
+        reveal_tx: row.get("reveal_tx"),
+        commit_txid: match row.get::<Option<Vec<u8>>, _>("commit_txid") {
+            None => None,
+            Some(b) => Some(fixed_32(&b, "pending.commit_txid")?),
+        },
+        reveal_txid: match row.get::<Option<Vec<u8>>, _>("reveal_txid") {
+            None => None,
+            Some(b) => Some(fixed_32(&b, "pending.reveal_txid")?),
+        },
+        status: row.get("status"),
+    }))
+}
+
+/// Rows that still need rebroadcast work on boot (`status` not terminal).
+pub async fn list_resumable_pending_publishes(pool: &PgPool) -> Result<Vec<PendingPublishRow>> {
+    let rows = sqlx::query(
+        "SELECT pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
+                commit_tx, reveal_tx, commit_txid, reveal_txid, status \
+         FROM v11_pending_publishes \
+         WHERE status IN ($1, $2, $3) \
+         ORDER BY created_at ASC",
+    )
+    .bind(PENDING_PUBLISH_MEMBERS_READY)
+    .bind(PENDING_PUBLISH_CONSTRUCTED)
+    .bind(PENDING_PUBLISH_COMMIT_BROADCAST)
+    .fetch_all(pool)
+    .await
+    .context("list resumable pending publishes")?;
+    use sqlx::Row;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(PendingPublishRow {
+            pk: fixed_32(row.get::<Vec<u8>, _>("pk").as_slice(), "pending.pk")?,
+            owner: Address(fixed_32(
+                row.get::<Vec<u8>, _>("owner").as_slice(),
+                "pending.owner",
+            )?),
+            r: fixed_32(row.get::<Vec<u8>, _>("r").as_slice(), "pending.r")?,
+            s: fixed_32(row.get::<Vec<u8>, _>("s").as_slice(), "pending.s")?,
+            r_prime: fixed_32(row.get::<Vec<u8>, _>("r_prime").as_slice(), "pending.r_prime")?,
+            build_tip_height: u32_from_i64(
+                row.get("build_tip_height"),
+                "pending.build_tip_height",
+            )?,
+            build_tip_hash: fixed_32(
+                row.get::<Vec<u8>, _>("build_tip_hash").as_slice(),
+                "pending.build_tip_hash",
+            )?,
+            commit_tx: row.get("commit_tx"),
+            reveal_tx: row.get("reveal_tx"),
+            commit_txid: match row.get::<Option<Vec<u8>>, _>("commit_txid") {
+                None => None,
+                Some(b) => Some(fixed_32(&b, "pending.commit_txid")?),
+            },
+            reveal_txid: match row.get::<Option<Vec<u8>>, _>("reveal_txid") {
+                None => None,
+                Some(b) => Some(fixed_32(&b, "pending.reveal_txid")?),
+            },
+            status: row.get("status"),
+        });
+    }
+    Ok(out)
 }

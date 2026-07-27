@@ -688,6 +688,68 @@ async fn run_v11_scan_loop(
         pins.network, pins.activation_height
     );
 
+    // Boot-time resumer for durable AggregateStateNullifierV3 publishes left
+    // mid-flight by a previous crash. Runs before the scan loop so a pending
+    // row is rebroadcast (idempotently) without waiting for an operator to
+    // call `resume_pending_publish` by hand. Publisher env is mandatory under
+    // the v1.1 claim whenever any resumable row exists; connect failure with
+    // pending work is fatal. With an empty table, a connect failure is still
+    // logged loud (receive path will need the publisher later).
+    {
+        use v11::{
+            connect_v11_publisher, resume_all_pending_publishes, v11_publisher_env_from_env,
+        };
+        match v11_publisher_env_from_env(pins.network) {
+            Ok(env) => match connect_v11_publisher(env) {
+                Ok(publisher) => match resume_all_pending_publishes(&adapter, &publisher).await {
+                    Ok(0) => println!("v1.1 resume_all_pending_publishes: nothing pending"),
+                    Ok(n) => println!(
+                        "v1.1 resume_all_pending_publishes: completed {n} pending publish(es)"
+                    ),
+                    Err(e) => {
+                        return Err(format!(
+                            "v1.1 resume_all_pending_publishes failed: {e:#} — refusing to \
+                             continue with unrecovered mid-flight nullifier publishes"
+                        )
+                        .into());
+                    }
+                },
+                Err(e) => {
+                    let pending = node::v11::db_v11::list_resumable_pending_publishes(adapter.pool())
+                        .await
+                        .map(|r| r.len())
+                        .unwrap_or(0);
+                    if pending > 0 {
+                        return Err(format!(
+                            "v1.1 publisher connect failed with {pending} resumable \
+                             pending publish(es): {e:#}"
+                        )
+                        .into());
+                    }
+                    eprintln!(
+                        "v1.1 publisher connect failed (no pending publishes; continuing scan): {e:#}"
+                    );
+                }
+            },
+            Err(e) => {
+                let pending = node::v11::db_v11::list_resumable_pending_publishes(adapter.pool())
+                    .await
+                    .map(|r| r.len())
+                    .unwrap_or(0);
+                if pending > 0 {
+                    return Err(format!(
+                        "v1.1 publisher env incomplete with {pending} resumable \
+                         pending publish(es): {e:#}"
+                    )
+                    .into());
+                }
+                eprintln!(
+                    "v1.1 publisher env incomplete (no pending publishes; continuing scan): {e:#}"
+                );
+            }
+        }
+    }
+
     // Connect is synchronous (blocking RPC). Keep it off the async worker.
     let mut scanner = tokio::task::spawn_blocking(move || {
         zkcoins_prover::scanner::Scanner::connect(scanner_config)

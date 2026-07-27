@@ -6,11 +6,11 @@
 
 use shared::spec_v1::{
     self as host, network_params::NetworkParams, AccountState, Address, ChainPosition, Coin,
-    CoinHistTree, HashDigest, NfLogEntry, ZERO_HASH,
+    CoinHistTree, HashDigest, NfLogEntry, PublishedNullifier, ZERO_HASH,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use zkcoins_program::circuit::compliance::Network;
-use zkcoins_prover::state_engine::{AccountRecord, StateEngine, TrackedCoin};
+use zkcoins_prover::state_engine::{AccountRecord, ScannedNullifier, StateEngine, TrackedCoin};
 
 use super::db_v11::{self, EngineSnapshot};
 use super::mode::{
@@ -51,6 +51,14 @@ fn pos(height: u64, tx_index: u32) -> ChainPosition {
         vin_index: 0,
         member_index: 0,
     }
+}
+
+fn scanned(height: u64, tx_index: u32, pk: [u8; 32], r: [u8; 32]) -> ScannedNullifier {
+    ScannedNullifier::from_survivor(&PublishedNullifier {
+        chain_pos: pos(height, tx_index),
+        pk,
+        r,
+    })
 }
 
 fn coin_id(byte: u8) -> [u8; 32] {
@@ -309,7 +317,7 @@ async fn restart_identity_nflog_and_coinhist_roots() {
     set_process_stack_mode(ScanStackMode::V11);
     adapter
         .with_engine_mut(|eng| {
-            eng.append_nullifier(pos(30, 0), pk(9), r_val(99))
+            eng.append_nullifier(scanned(30, 0, pk(9), r_val(99)))
                 .expect("append fourth nullifier");
         })
         .expect("with_engine_mut under v11 claim");
@@ -489,7 +497,7 @@ use super::separation::{
     claim_process_stack_from_shadow_mode, ensure_legacy_publisher_allowed,
     ensure_v11_publisher_allowed,
 };
-use shared::spec_v1::{LookupResult, PublishedNullifier};
+use shared::spec_v1::LookupResult;
 
 /// Unwrap a ready recon for tests that expect a non-retry classification.
 fn expect_ready(outcome: TipReconcileOutcome) -> PersistedTipReconciliation {
@@ -1208,7 +1216,8 @@ async fn broadcast_inscription_paths_refuse_under_v11_claim() {
     clear_process_stack_mode_for_test();
 }
 
-/// Public `with_engine_mut` refuses without a v1.1 process claim.
+/// Crate-internal `with_engine_mut` refuses without a v1.1 process claim.
+/// (The method is sealed from downstream crates; this covers the runtime gate.)
 #[tokio::test]
 async fn with_engine_mut_refuses_without_v11_claim() {
     clear_process_stack_mode_for_test();

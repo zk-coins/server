@@ -921,6 +921,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "downstream-boundary"
+version = "1.1.0"
+dependencies = [
+ "node",
+ "trybuild",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2132,6 +2140,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "mimalloc",
+ "plonky2",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "serde",
@@ -5397,6 +5406,7 @@ dependencies = [
  "serde",
  "sha2",
  "shared",
+ "trybuild",
  "zkcoins-program-plonky2",
 ]
 

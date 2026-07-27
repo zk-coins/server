@@ -385,7 +385,13 @@ impl AccountNode {
     /// Route a received coin into the `(coin.recipient, coin.asset_id)`
     /// account (Model B). The recipient's account for that asset is
     /// created on demand if it does not exist yet.
+    ///
+    /// Under the v1.1 process claim (`ZKCOINS_V11_SHADOW=1`) this legacy
+    /// bookkeeping path is **refused** — a receive must go through the
+    /// v1.1 transition (`crate::v11::receive`). Silent fall-back would
+    /// credit a coin no compliance proof can justify.
     pub fn receive_coin(&mut self, coin_proof: CoinProof) -> Result<(), &'static str> {
+        crate::v11::refuse_legacy_receive_under_v11()?;
         let recipient = coin_proof.coin.recipient;
         let asset_id = coin_proof.coin.asset_id;
         let key = (recipient, asset_id);
@@ -409,6 +415,12 @@ impl AccountNode {
     /// used by the mint flow's prepare-then-commit path to apply
     /// receives on cloned recipients before the on-chain broadcast
     /// commit window.
+    ///
+    /// **Unchanged under the shadow flag.** The v1.1 refuse gate is on
+    /// [`Self::receive_coin`] (the foreign-coin REST/job entry). This
+    /// helper stays available for the legacy mint prepare path while
+    /// Stage-3 still uses the legacy prover under `ZKCOINS_V11_SHADOW=1`.
+    /// Flag-off behaviour is bit-for-bit identical to pre-G3.
     pub fn receive_coin_into(
         account: &mut Account,
         coin_proof: CoinProof,

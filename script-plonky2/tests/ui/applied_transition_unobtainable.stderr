@@ -1,0 +1,9 @@
+error[E0451]: fields `proved` and `nullifier` of struct `AppliedTransition` are private
+  --> tests/ui/applied_transition_unobtainable.rs:9:9
+   |
+ 8 |     let _ = zkcoins_prover_plonky2::state_engine::AppliedTransition {
+   |             ------------------------------------------------------- in this type
+ 9 |         proved: proved.unwrap(),
+   |         ^^^^^^ private field
+10 |         nullifier: ([0u8; 32], [0u8; 32]),
+   |         ^^^^^^^^^ private field
