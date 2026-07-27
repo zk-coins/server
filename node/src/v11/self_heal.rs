@@ -107,10 +107,10 @@ pub fn encode_v11_live_digest(c: &[u8; 32], c_balance: &[u8; 32]) -> Vec<u8> {
 
 /// Resolve the live v1.1 self-heal digest from the circuits **just built**.
 ///
-/// 1. Registers the §3.6 env pins on [`ProverBridge`].
-/// 2. Forces construction of `C` and `C_balance` for `network`. The pin
-///    check runs at the moment each circuit construction completes
-///    (see `prover_bridge` module docs) — a mismatch refuses.
+/// 1. Obtains the just-built `C` / `C_balance` digests (via
+///    [`ProverBridge::require_live_identity`], after registering the §3.6
+///    pins so construction refuses on mismatch).
+/// 2. Cross-checks those digests against the pins again at this boundary.
 /// 3. Returns [`encode_v11_live_digest`] of the **just-built** pair.
 ///
 /// Returns `Err` when the digests cannot be determined or do not match
@@ -120,37 +120,55 @@ pub fn encode_v11_live_digest(c: &[u8; 32], c_balance: &[u8; 32]) -> Vec<u8> {
 /// This is deliberately **not** `encode_v11_live_digest(pins…)` and not
 /// an embedded generator artefact: only the digests of the circuits this
 /// process constructed can establish §1.7.9.
+///
+/// # Single linear path (no production short-circuit)
+///
+/// The body is always `obtain_just_built → pin-check + encode(built)`.
+/// A test-only override may substitute the **obtain** step with fabricated
+/// digests; it never short-circuits the pin-check / encode tail and is
+/// unreachable from the non-test production binary. Re-introducing
+/// round-1's `return Ok(encode_v11_live_digest(pin_c, pin_c_balance))`
+/// anywhere on this path turns a normal `cargo nextest` run red.
 pub fn resolve_v11_live_digest(
     network: Network,
     pin_c: &[u8; 32],
     pin_c_balance: &[u8; 32],
 ) -> Result<Vec<u8>, String> {
-    // Test-only: inject fabricated "just-built" digests so unit tests can
-    // drive this function without a multi-minute Plonky2 build, while still
-    // executing the pin check + encode(**built**) tail. Production never
-    // sets the override (see unit_tests). Round-1's
-    // `Ok(encode_v11_live_digest(pin_c, pin_c_balance))` shortcut skips this
-    // whole body and goes red under those tests.
+    let (built_c, built_b) = obtain_just_built_digests(network, pin_c, pin_c_balance)?;
+    live_baseline_from_built_digests(&built_c, &built_b, pin_c, pin_c_balance, network)
+}
+
+/// Obtain the digests of the circuits this process just built.
+///
+/// Production always goes through [`ProverBridge`] (install pins, force
+/// construction, return live digests). Under `cfg(test)` only, a thread-
+/// local override may stand in for that build so unit tests stay cheap —
+/// the override returns fabricated **built** digests; it does not encode
+/// pins and does not live inside [`resolve_v11_live_digest`]'s control flow
+/// as an early `Ok`.
+fn obtain_just_built_digests(
+    network: Network,
+    pin_c: &[u8; 32],
+    pin_c_balance: &[u8; 32],
+) -> Result<([u8; 32], [u8; 32]), String> {
     #[cfg(test)]
-    if let Some((c, b)) = test_built_digests_override() {
-        return live_baseline_from_built_digests(&c, &b, pin_c, pin_c_balance, network);
+    if let Some(pair) = test_built_digests_override() {
+        return Ok(pair);
     }
 
     ProverBridge::install_network_pins(network, *pin_c, *pin_c_balance)
         .map_err(|e| e.to_string())?;
-    let bridge = ProverBridge::new(network);
-    let (c, b) = bridge
+    ProverBridge::new(network)
         .require_live_identity()
-        .map_err(|e| format!("cannot determine live circuit digest: {e}"))?;
-    live_baseline_from_built_digests(&c, &b, pin_c, pin_c_balance, network)
+        .map_err(|e| format!("cannot determine live circuit digest: {e}"))
 }
 
 /// Pin-check + encode the **built** pair (never the pins alone).
 ///
-/// Shared by production resolve (after [`ProverBridge::require_live_identity`])
-/// and the test override path. Encoding pins here under a successful check
-/// is observationally equal today, but would green a caller that never
-/// obtained built digests — so the encode arguments stay the built pair.
+/// Shared tail of [`resolve_v11_live_digest`]. Encoding pins here under a
+/// successful check is observationally equal today, but would green a
+/// caller that never obtained built digests — so the encode arguments
+/// stay the built pair.
 fn live_baseline_from_built_digests(
     built_c: &[u8; 32],
     built_c_balance: &[u8; 32],
@@ -171,6 +189,8 @@ fn live_baseline_from_built_digests(
 #[cfg(test)]
 thread_local! {
     /// Optional stand-in for ProverBridge's just-built digests.
+    /// Only consulted by [`obtain_just_built_digests`] — never by an early
+    /// return in [`resolve_v11_live_digest`].
     static TEST_BUILT_DIGESTS: std::cell::Cell<Option<([u8; 32], [u8; 32])>> =
         const { std::cell::Cell::new(None) };
 }
@@ -181,6 +201,9 @@ fn test_built_digests_override() -> Option<([u8; 32], [u8; 32])> {
 }
 
 /// Install fabricated just-built digests for [`resolve_v11_live_digest`] tests.
+///
+/// Substitutes only the obtain step inside [`obtain_just_built_digests`];
+/// pin-check + encode(built) still run through the production resolve path.
 #[cfg(test)]
 pub(crate) fn set_test_built_digests_override(built: Option<([u8; 32], [u8; 32])>) {
     TEST_BUILT_DIGESTS.with(|c| c.set(built));
@@ -677,15 +700,17 @@ mod unit_tests {
         );
     }
 
-    /// Drives [`resolve_v11_live_digest`] with fabricated just-built digests
-    /// (test override standing in for [`ProverBridge::require_live_identity`])
-    /// so a pin/built mismatch refuses through the **production function**.
+    /// Drives the **public** [`resolve_v11_live_digest`] with fabricated
+    /// just-built digests (override stands in only for
+    /// [`obtain_just_built_digests`] / [`ProverBridge::require_live_identity`]).
     ///
-    /// Would go **green** under round-1's defect
-    /// `return Ok(encode_v11_live_digest(pin_c, pin_c_balance))` — that
-    /// shortcut never consults built digests and would `Ok` any pin pair.
-    /// Pure comparison helpers alone cannot catch that; this test calls
-    /// `resolve_v11_live_digest` itself.
+    /// The resolve body is a single linear path: obtain → pin-check +
+    /// encode(**built**). Round-1's
+    /// `return Ok(encode_v11_live_digest(pin_c, pin_c_balance))` never
+    /// consults built digests and would `Ok` any pin pair — this test
+    /// goes **red** under that shortcut because it calls resolve itself
+    /// with divergent pins (and the override no longer short-circuits
+    /// past the production body).
     #[test]
     fn resolve_v11_live_digest_refuses_when_pins_differ_from_built() {
         let built_c = [0xAAu8; 32];
@@ -727,6 +752,64 @@ mod unit_tests {
         assert_eq!(b2, b);
     }
 
+    /// Source guard: production code in this module must not encode pins as
+    /// the live baseline. Complements the behavioural tests — a dual-path
+    /// early `Ok(encode(pins))` on a production-only arm would otherwise
+    /// be invisible to the override-driven tests.
+    ///
+    /// Scans non-comment lines of `self_heal.rs` up to the unit-test module
+    /// for the exact round-1 anti-pattern.
+    #[test]
+    fn resolve_v11_live_digest_source_forbids_encode_pins_shortcut() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/v11/self_heal.rs");
+        let src = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let prod = src
+            .split("#[cfg(test)]\nmod unit_tests")
+            .next()
+            .expect("unit_tests module marker must exist in self_heal.rs");
+
+        let mut code = String::new();
+        for line in prod.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // Drop trailing line comments; keep the code prefix.
+            let code_part = match line.find("//") {
+                Some(i) => &line[..i],
+                None => line,
+            };
+            code.push_str(code_part);
+            code.push('\n');
+        }
+
+        let forbidden = [
+            "encode_v11_live_digest(pin_c, pin_c_balance)",
+            "encode_v11_live_digest(&pin_c, &pin_c_balance)",
+            "encode_v11_live_digest(*pin_c, *pin_c_balance)",
+        ];
+        for pat in forbidden {
+            assert!(
+                !code.contains(pat),
+                "round-1 regression in production source: found `{pat}` — \
+                 live baseline must be encode(just-built), never encode(pins)"
+            );
+        }
+        assert!(
+            code.contains("require_live_identity"),
+            "production resolve path must obtain digests via ProverBridge::require_live_identity"
+        );
+        assert!(
+            code.contains("live_baseline_from_built_digests"),
+            "production resolve path must run the pin-check + encode(built) tail"
+        );
+        assert!(
+            code.contains("encode_v11_live_digest(built_c, built_c_balance)"),
+            "production encode must take the just-built pair, not the pins"
+        );
+    }
+
     /// Plonky2 circuit construction overflows the default test thread
     /// stack; spawn the body on a large stack.
     fn on_large_stack<F, R>(f: F) -> R
@@ -744,8 +827,9 @@ mod unit_tests {
     }
 
     /// Full [`ProverBridge`] wiring (no test override): real circuit build.
-    /// Multi-minute; run with `--run-ignored` for the end-to-end red/green
-    /// proof against an `encode(pins)` shortcut that never builds.
+    /// Multi-minute; run with `--run-ignored` for end-to-end coverage of the
+    /// obtain step. The ordinary run is already bound by the linear resolve
+    /// path + source guard above.
     #[test]
     #[ignore = "multi-minute Plonky2 circuit build via ProverBridge"]
     fn resolve_v11_live_digest_via_real_prover_bridge_refuses_pin_mismatch() {
