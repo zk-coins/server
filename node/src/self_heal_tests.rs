@@ -330,11 +330,11 @@ async fn heal_reset_on_digest_mismatch_wipes_state_and_skips_canary() {
     clear_process_stack_mode_for_test();
 }
 
-/// Defect 2 (round 6): under a v1.1 process claim, Reset must clear
-/// legacy proof-bearing `accounts` (what the reset exists to drop) while
-/// leaving structures v1.1 does not use (SMT/MMR/latest_block) intact.
+/// Under a v1.1 process claim, Reset must wipe v11 proof-dependent tables
+/// + leftover legacy `accounts`, while leaving structures v1.1 does not
+/// use (SMT/MMR/latest_block) intact.
 #[tokio::test]
-async fn heal_reset_under_v11_clears_accounts_preserves_unused_legacy_structures() {
+async fn heal_reset_under_v11_wipes_v11_state_preserves_unused_legacy_structures() {
     clear_process_stack_mode_for_test();
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
@@ -357,6 +357,42 @@ async fn heal_reset_under_v11_clears_accounts_preserves_unused_legacy_structures
     db::upsert_account(&pool, &key, b"stale-v11-account-blob")
         .await
         .expect("seed account under v11");
+    // Seed minimal v11 engine meta + one nflog row so the wipe has rows to drop.
+    sqlx::query(
+        "INSERT INTO v11_engine_meta \
+         (id, network, activation_height, tip_height, tip_hash, fold_seq, updated_at) \
+         VALUES (1, 'regtest', 0, 1, $1, 0, NOW())",
+    )
+    .bind([0xAAu8; 32].as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed v11_engine_meta");
+    sqlx::query(
+        "INSERT INTO v11_nflog_entries \
+         (position, height, tx_index, vin_index, member_index, pk, r) \
+         VALUES (0, 1, 0, 0, 0, $1, $2)",
+    )
+    .bind([0xBBu8; 32].as_slice())
+    .bind([0xCCu8; 32].as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed v11_nflog_entries");
+    sqlx::query(
+        "INSERT INTO v11_accounts \
+         (owner, account_state, nk, genesis_pubkey, last_proof, \
+          last_nav_opening, last_nullifier, last_nullifier_pos, \
+          coin_history_root, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, NULL, NULL, NULL, $6, NOW())",
+    )
+    .bind([0xDDu8; 32].as_slice())
+    .bind([0x01u8; 4].as_slice()) // garbage account_state blob — wipe only
+    .bind([0x02u8; 32].as_slice())
+    .bind([0x03u8; 32].as_slice())
+    .bind([0x04u8; 8].as_slice()) // last_proof present → proof-bearing
+    .bind([0x05u8; 32].as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed v11_accounts");
     // Bypass stack writers: raw insert of structures v1.1 never reads.
     sqlx::query(
         "INSERT INTO smt_state (id, data, updated_at) VALUES (1, $1, NOW()) \
@@ -383,12 +419,16 @@ async fn heal_reset_under_v11_clears_accounts_preserves_unused_legacy_structures
     .await
     .expect("seed latest_block");
 
-    db::store_circuit_digest(&pool, b"OLD-V11")
+    // Changed digest (tagged v11 shape so the test documents the real blob).
+    let old = crate::v11::encode_v11_live_digest(&[0x11; 32], &[0x22; 32]);
+    let new = crate::v11::encode_v11_live_digest(&[0x33; 32], &[0x44; 32]);
+    assert_ne!(old, new, "test oracle: digests must differ");
+    db::store_circuit_digest(&pool, &old)
         .await
         .expect("store old digest");
     assert_eq!(count_accounts(&pool).await, 1);
 
-    let decision = heal_circuit_digest(&pool, b"NEW-V11", proofs_dir, &canary_must_not_run)
+    let decision = heal_circuit_digest(&pool, &new, proofs_dir, &canary_must_not_run)
         .await
         .expect("heal ok under v11");
 
@@ -400,9 +440,26 @@ async fn heal_reset_under_v11_clears_accounts_preserves_unused_legacy_structures
     );
     assert_eq!(
         db::load_circuit_digest(&pool).await.unwrap().as_deref(),
-        Some(&b"NEW-V11"[..]),
-        "digest must update"
+        Some(new.as_slice()),
+        "digest must update to the live pin encoding"
     );
+    // v11 proof-dependent rows must be gone (changed digest triggers reset,
+    // not ignore).
+    let (v11_meta,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v11_engine_meta")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (v11_nflog,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v11_nflog_entries")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (v11_acc,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v11_accounts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(v11_meta, 0, "v11_engine_meta wiped on digest mismatch");
+    assert_eq!(v11_nflog, 0, "v11_nflog_entries wiped on digest mismatch");
+    assert_eq!(v11_acc, 0, "v11_accounts wiped on digest mismatch");
     // Structures v1.1 does not use must remain (not a full legacy wipe).
     assert_eq!(
         db::load_smt(&pool).await.unwrap().as_deref(),
@@ -420,6 +477,115 @@ async fn heal_reset_under_v11_clears_accounts_preserves_unused_legacy_structures
         "latest_block must be preserved under v1.1 reset"
     );
     assert!(!proofs_subdir.exists(), "proof-store dir wiped");
+    clear_process_stack_mode_for_test();
+}
+
+/// Would go red if a changed digest were treated as Keep / ignored.
+#[tokio::test]
+async fn heal_v11_changed_digest_triggers_reset_not_ignore() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let proofs = tempfile::tempdir().expect("tempdir");
+    let proofs_dir = proofs.path().to_str().unwrap();
+
+    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11");
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let old = crate::v11::encode_v11_live_digest(&[0x01; 32], &[0x02; 32]);
+    let new = crate::v11::encode_v11_live_digest(&[0x01; 32], &[0xFF; 32]); // C_balance only
+    db::store_circuit_digest(&pool, &old).await.unwrap();
+
+    let decision = heal_circuit_digest(&pool, &new, proofs_dir, &canary_must_not_run)
+        .await
+        .unwrap();
+    assert_eq!(
+        decision,
+        ResetDecision::Reset,
+        "C_balance change alone must reset (not Keep)"
+    );
+    assert_eq!(
+        db::load_circuit_digest(&pool).await.unwrap().as_deref(),
+        Some(new.as_slice())
+    );
+    clear_process_stack_mode_for_test();
+}
+
+/// Flag-off path: process not claimed v11 → full legacy wipe on mismatch.
+/// Would go red if the v11-only wipe were applied under flag-off.
+#[tokio::test]
+async fn heal_flag_off_self_heal_still_full_legacy_wipe() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let proofs = tempfile::tempdir().expect("tempdir");
+    let proofs_dir = proofs.path().to_str().unwrap();
+
+    // Explicit legacy claim (flag-off process).
+    claim_stack_scan_mode(&pool, ScanStackMode::Legacy)
+        .await
+        .expect("claim legacy");
+    set_process_stack_mode(ScanStackMode::Legacy);
+
+    seed_proof_dependent_state(&pool).await;
+    db::store_circuit_digest(&pool, b"OLD-LEGACY").await.unwrap();
+
+    let decision = heal_circuit_digest(&pool, b"NEW-LEGACY", proofs_dir, &canary_must_not_run)
+        .await
+        .unwrap();
+    assert_eq!(decision, ResetDecision::Reset);
+    assert_eq!(count_accounts(&pool).await, 0);
+    assert_eq!(db::load_smt(&pool).await.unwrap(), None);
+    assert_eq!(db::load_mmr(&pool).await.unwrap(), None);
+    assert_eq!(db::load_latest_block(&pool).await.unwrap(), None);
+    assert_eq!(
+        db::load_circuit_digest(&pool).await.unwrap().as_deref(),
+        Some(&b"NEW-LEGACY"[..])
+    );
+    clear_process_stack_mode_for_test();
+}
+
+/// Adoption-boundary canary Stale under v11 must wipe v11 state.
+#[tokio::test]
+async fn heal_v11_stale_canary_resets_v11_state() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let proofs = tempfile::tempdir().expect("tempdir");
+    let proofs_dir = proofs.path().to_str().unwrap();
+
+    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11");
+    set_process_stack_mode(ScanStackMode::V11);
+
+    sqlx::query(
+        "INSERT INTO v11_engine_meta \
+         (id, network, activation_height, tip_height, tip_hash, fold_seq, updated_at) \
+         VALUES (1, 'regtest', 0, 0, $1, 0, NOW())",
+    )
+    .bind([0u8; 32].as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // No persisted digest → canary consulted.
+    let live = crate::v11::encode_v11_live_digest(&[0xAA; 32], &[0xBB; 32]);
+    let decision = heal_circuit_digest(&pool, &live, proofs_dir, &|| CanaryOutcome::Stale)
+        .await
+        .unwrap();
+    assert_eq!(decision, ResetDecision::Reset);
+    let (v11_meta,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v11_engine_meta")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(v11_meta, 0, "stale canary must wipe v11_engine_meta");
+    assert_eq!(
+        db::load_circuit_digest(&pool).await.unwrap().as_deref(),
+        Some(live.as_slice())
+    );
     clear_process_stack_mode_for_test();
 }
 

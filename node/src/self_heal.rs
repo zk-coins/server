@@ -231,18 +231,22 @@ pub async fn heal_circuit_digest(
             //   * Do NOT wipe SMT/MMR/root-index/latest_block — structures the
             //     v1.1 stack does not use (and that the full legacy wipe would
             //     require a legacy marker to touch).
-            //   * DO clear legacy proof-bearing `accounts` rows and store the
-            //     new digest. A digest-only update left stale proofs in place;
-            //     main reloads them into AccountNode and the next prove fails.
+            //   * DO wipe all v11 proof-dependent tables (NfLog, accounts,
+            //     last_proof/openings, pending publishes) plus leftover
+            //     legacy `accounts`, and store the live pin digest
+            //     (`encode_v11_live_digest(C, C_balance)`). A digest-only
+            //     update left stale ComplianceProofs in place; the next
+            //     AccountUpdate would fail to recurse.
             // Legacy (or unclaimed) path keeps the full proof-dependent wipe.
             match crate::v11::process_stack_mode() {
                 Some(crate::v11::ScanStackMode::V11) => {
                     warn!(
-                        "Self-heal: process is claimed v1.1 — clearing legacy \
-                         proof-bearing accounts + storing circuit digest; leaving \
-                         SMT/MMR/latest_block structures untouched (v1.1 does not use them)"
+                        "Self-heal: process is claimed v1.1 — wiping v11 \
+                         proof-dependent state (NfLog/accounts/pending publishes) \
+                         + leftover legacy accounts; storing circuit digest; \
+                         leaving SMT/MMR/latest_block untouched (v1.1 does not use them)"
                     );
-                    db::reset_legacy_accounts_for_v11_self_heal(pool, live_digest).await?;
+                    db::reset_v11_proof_dependent_state_tx(pool, live_digest).await?;
                 }
                 _ => {
                     db::reset_proof_dependent_state_tx(pool, live_digest).await?;

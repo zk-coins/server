@@ -337,4 +337,24 @@ impl EngineAdapter {
             (nflog_root, accounts)
         })
     }
+
+    /// After a v1.1 self-heal Reset the durable tables are empty but this
+    /// process still holds the pre-reset in-memory engine. Replace it with
+    /// a fresh empty engine and persist so the next restart sees a consistent
+    /// genesis snapshot (meta present, no accounts / NfLog entries).
+    ///
+    /// Requires an exclusive v1.1 process claim — same capability as any
+    /// live-engine mutation. Fails loud if the claim is missing.
+    pub async fn reinit_after_self_heal_reset(&self) -> Result<()> {
+        require_v11_process_for_nflog_write()
+            .context("EngineAdapter::reinit_after_self_heal_reset: stack claim required")?;
+        {
+            let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");
+            guard.engine = StateEngine::new(self.network, self.activation_height);
+            guard.tip_hash = [0u8; 32];
+        }
+        self.persist()
+            .await
+            .context("EngineAdapter::reinit_after_self_heal_reset persist")
+    }
 }

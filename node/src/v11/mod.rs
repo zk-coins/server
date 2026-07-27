@@ -56,6 +56,7 @@ pub mod mode;
 pub mod publish;
 pub mod receive;
 pub mod scan;
+pub mod self_heal;
 pub mod separation;
 pub mod signature;
 
@@ -76,6 +77,12 @@ pub use scan::{
     folded_keys_from_nflog_mirror, members_to_published, observation_tip_still_live,
     reconcile_persisted_tip, sort_canonical, FoldStats, MAX_RECOVERABLE_REORG_DEPTH,
     PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome,
+};
+pub use self_heal::{
+    boot_canary, decode_v11_live_digest, encode_v11_live_digest, evaluate_v11_slow_canary,
+    evaluate_v11_structural_canary, slow_canary_env_enabled, slow_canary_verify_transition,
+    v11_canary_for_heal, V11CanaryNflogView, V11CanarySample, V11StructuralInputs,
+    V11_DIGEST_TAG, V11_LIVE_DIGEST_LEN,
 };
 pub use separation::{
     claim_process_stack_from_shadow_mode, claim_process_stack_from_v11_shadow_env,

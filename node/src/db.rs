@@ -1039,25 +1039,59 @@ pub async fn reset_proof_dependent_state_tx(
     tx.commit().await
 }
 
-/// v1.1 self-heal reset: clear **legacy proof-bearing account state** and
-/// store the live circuit digest, without touching structures the v1.1
-/// stack does not use (SMT / MMR / root index / latest_block).
+/// v1.1 self-heal reset: wipe **all v1.1 proof-dependent state** plus any
+/// leftover legacy proof-bearing `accounts` rows, then store the live
+/// digest. Leaves structures the v1.1 stack does not use untouched
+/// (SMT / MMR / root index / latest_block).
 ///
 /// Under exclusive v1.1 the full [`reset_proof_dependent_state_tx`] is a
 /// legacy-stack writer and must not run (it requires the legacy marker and
-/// would wipe scan tables that stack separation already keeps empty). But
-/// a circuit-digest reset still exists to drop stale `accounts` rows that
-/// carry recursive proofs — those survive a digest-only update and would
-/// be reloaded by `main` into an incompatible AccountNode.
+/// would wipe scan tables that stack separation already keeps empty). A
+/// circuit-digest change on the v1.1 path invalidates every
+/// `ComplianceProof` / NfLog-bound opening at once — the only consistent
+/// recovery is empty-engine genesis for the v11 tables.
+///
+/// Tables wiped (derived from migration 0019 / 0021 + legacy leftovers):
+///
+/// * `v11_pending_publishes` — stale nullifier publish recovery rows
+/// * `v11_spendable_coins` / `v11_spent_coins` — CoinHist leaves
+/// * `v11_accounts` — multi-asset state + last_proof / openings
+/// * `v11_nullifier_index` / `v11_nflog_entries` — NfLog
+/// * `v11_engine_meta` — tip / network pin row
+/// * `accounts` — legacy proof-bearing rows that may still linger
 ///
 /// Does **not** require a legacy stack marker (v1.1 process owns this path).
 /// Does **not** DELETE from `smt_state` / `mmr_state` / `mmr_root_index` /
 /// `latest_block` (v1.1 does not use them; leave them intact).
-pub async fn reset_legacy_accounts_for_v11_self_heal(
+pub async fn reset_v11_proof_dependent_state_tx(
     pool: &PgPool,
     new_digest: &[u8],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // Order: children / dependents first, then parents, then meta.
+    // v11_pending_publishes has no FK to accounts but is proof-dependent.
+    sqlx::query("DELETE FROM v11_pending_publishes")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM v11_spendable_coins")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM v11_spent_coins")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM v11_accounts")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM v11_nullifier_index")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM v11_nflog_entries")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM v11_engine_meta")
+        .execute(&mut *tx)
+        .await?;
+    // Leftover legacy proof-bearing rows (Stage 1–2 dual surface).
     sqlx::query("DELETE FROM accounts")
         .execute(&mut *tx)
         .await?;
