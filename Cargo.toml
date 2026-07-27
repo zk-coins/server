@@ -6,6 +6,9 @@ members = [
     "shared",
     "esplora-bound",
     "stack-policy",
+    # Node-only downstream edge for the sealed plumbing compile-fail matrix.
+    # Must not gain extra direct deps — trybuild flattens them into the UI crate.
+    "downstream-boundary",
 ]
 resolver = "2"
 

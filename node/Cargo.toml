@@ -262,9 +262,9 @@ fs2 = "0.4"
 # `[dependencies]` block above (where the `v4` + `serde` features
 # are already enabled), so no separate dev-dep entry is needed.
 # Compile-fail evidence: raw `esplora_client` unobtainable from `node`
-# (Defect 4), and the sealed v1.1 plumbing matrix (`sealed_plumbing_*`)
-# proving raw publish/DB/adapter/scan-apply sinks are unobtainable from
-# outside the crate.
+# (Defect 4). The sealed v1.1 plumbing matrix lives in the
+# `downstream-boundary` package so its trybuild fixture depends on `node`
+# only (trybuild flattens the host package's direct deps into the UI crate).
 trybuild = "1.0"
 
 [features]

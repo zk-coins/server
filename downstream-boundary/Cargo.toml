@@ -1,0 +1,17 @@
+[package]
+name = "downstream-boundary"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# This package exists solely as a true downstream edge for the sealed
+# plumbing compile-fail matrix. trybuild flattens the *host* package's
+# direct dependencies into the generated UI crate; hosting the matrix
+# under `node` would make `zkcoins-prover` nameable for reasons unrelated
+# to the boundary under test. A downstream fixture must depend on `node`
+# only.
+[dependencies]
+node = { path = "../node" }
+
+[dev-dependencies]
+trybuild = "1.0"
