@@ -6250,8 +6250,8 @@ mod jobs_endpoint_tests {
     async fn attest_balance_route_matches_section_7_5() {
         let _lock = lock_v11_stack_for_test();
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
-            ATTEST_BALANCE_CHALLENGE_DOMAIN,
+            clear_process_stack_mode_for_test, parse_u64_decimal, set_process_stack_mode,
+            ScanStackMode, ATTEST_BALANCE_CHALLENGE_DOMAIN,
         };
         use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
         use shared::spec_v1::{self as host, Address};
@@ -6291,6 +6291,17 @@ mod jobs_endpoint_tests {
         assert_eq!(v["domain"], ATTEST_BALANCE_CHALLENGE_DOMAIN);
         let nonce_hex = v["nonce"].as_str().expect("nonce").to_string();
         assert_eq!(nonce_hex.len(), 64);
+        // §7.1: expiry is a decimal **string**, never a JSON number.
+        assert!(
+            v["expiry"].as_str().is_some(),
+            "expiry must be a decimal string, got: {}",
+            v["expiry"]
+        );
+        assert!(
+            v["expiry"].as_u64().is_none(),
+            "expiry must not be a JSON number"
+        );
+        let _ = parse_u64_decimal(v["expiry"].as_str().unwrap()).expect("canonical u64 string");
 
         let body = serde_json::json!({
             "subject": subject,
@@ -6345,6 +6356,43 @@ mod jobs_endpoint_tests {
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["error"], "malformed_request");
 
+        // Numeric size_ceiling is §7.1-malformed (must be decimal string).
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "subject": subject }).to_string(),
+            ))
+            .unwrap();
+        let (_s, _h, resp) = run(state.clone(), req).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        let nonce_hex = v["nonce"].as_str().unwrap().to_string();
+        let body = serde_json::json!({
+            "subject": subject,
+            "asset_id": hex::encode(asset),
+            "nav_ceiling": hex::encode([0xabu8; 32]),
+            "size_ceiling": 7,
+            "challenge": { "nonce": nonce_hex },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": subject,
+                "public_key": hex::encode(pk0),
+                "nk_commit": hex::encode(nkc_bytes),
+                "signature": "00".repeat(64),
+            }
+        });
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "numeric size_ceiling must be malformed_request: {resp}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+
         let body = serde_json::json!({
             "subject": subject,
             "asset_id": hex::encode(asset),
@@ -6375,7 +6423,7 @@ mod jobs_endpoint_tests {
         let (_s, _h, resp) = run(state.clone(), req).await;
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         let nonce_hex = v["nonce"].as_str().unwrap().to_string();
-        let expiry = v["expiry"].as_u64().unwrap();
+        let expiry = parse_u64_decimal(v["expiry"].as_str().unwrap()).unwrap();
         let nonce: [u8; 32] = hex::decode(&nonce_hex).unwrap().try_into().unwrap();
 
         let ceiling_enc = crate::v11::attest::ceiling_encoding(None, None).unwrap();
@@ -6428,13 +6476,80 @@ mod jobs_endpoint_tests {
         clear_process_stack_mode_for_test();
     }
 
-    /// Pinned `C_balance` digests differ per network.
-    #[test]
-    fn attest_c_balance_digest_is_network_pinned() {
+    /// V1Json extractor: malformed / missing JSON → 400 malformed_request
+    /// (not Axum's default 422).
+    #[tokio::test]
+    async fn attest_balance_malformed_json_returns_malformed_request() {
+        let _lock = lock_v11_stack_for_test();
         use crate::v11::{
-            networks_have_distinct_c_balance_pins, pinned_c_balance_digest,
-            PINNED_C_BALANCE_DIGEST_MAINNET, PINNED_C_BALANCE_DIGEST_TESTNET,
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
         };
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+        let state = test_state();
+
+        // Broken JSON syntax.
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from("{not-json"))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+
+        // Missing required field on admit body.
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+
+        // Not JSON content-type.
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "text/plain")
+            .body(Body::from("x"))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Root closed map advertises the §7.5 attest surface.
+    #[tokio::test]
+    async fn root_advertises_attest_balance_endpoints() {
+        let state = test_state();
+        let req = Request::get("/").body(Body::empty()).unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(
+            v["endpoints"]["attest_balance_challenge"].as_str(),
+            Some("POST /v1/attest/balance/challenge")
+        );
+        assert_eq!(
+            v["endpoints"]["attest_balance"].as_str(),
+            Some("POST /v1/attest/balance")
+        );
+    }
+
+    /// Production digest gate is bound: wrong live digest is rejected,
+    /// pinned digest is accepted. (Constant comparison alone is not enough.)
+    #[test]
+    fn attest_c_balance_digest_gate_is_production_bound() {
+        use crate::v11::{
+            accept_c_balance_network_binding, networks_have_distinct_c_balance_pins,
+            pinned_c_balance_digest, PINNED_C_BALANCE_DIGEST_MAINNET,
+            PINNED_C_BALANCE_DIGEST_TESTNET,
+        };
+        use shared::spec_v1::{network_id_mainnet, network_id_testnet};
         use zkcoins_program::circuit::compliance::Network;
 
         assert!(networks_have_distinct_c_balance_pins(
@@ -6449,10 +6564,38 @@ mod jobs_endpoint_tests {
             pinned_c_balance_digest(Network::Mainnet),
             PINNED_C_BALANCE_DIGEST_MAINNET
         );
-        assert_ne!(
-            PINNED_C_BALANCE_DIGEST_TESTNET,
-            PINNED_C_BALANCE_DIGEST_MAINNET
-        );
+
+        // Production gate accepts the pin for each network.
+        accept_c_balance_network_binding(
+            &network_id_testnet(),
+            &PINNED_C_BALANCE_DIGEST_TESTNET,
+            Network::Testnet,
+        )
+        .expect("pinned testnet digest must pass the production gate");
+        accept_c_balance_network_binding(
+            &network_id_mainnet(),
+            &PINNED_C_BALANCE_DIGEST_MAINNET,
+            Network::Mainnet,
+        )
+        .expect("pinned mainnet digest must pass the production gate");
+
+        // Production gate rejects a wrong live digest.
+        let err = accept_c_balance_network_binding(
+            &network_id_testnet(),
+            &[0u8; 32],
+            Network::Testnet,
+        )
+        .unwrap_err();
+        assert_eq!(err.http_status_and_code(), (503, "circuit_digest_mismatch"));
+
+        // Production gate rejects cross-network network_id.
+        let err = accept_c_balance_network_binding(
+            &network_id_testnet(),
+            &PINNED_C_BALANCE_DIGEST_MAINNET,
+            Network::Mainnet,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::v11::AttestError::ProvingFailed(_)));
     }
 
 }

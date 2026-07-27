@@ -140,8 +140,86 @@ pub struct AttestChallengeRecord {
 pub type AttestChallengeMap = Arc<DashMap<[u8; 32], AttestChallengeRecord>>;
 
 // ---------------------------------------------------------------------------
-// Wire types (§7.5)
+// Wire types (§7.5 / §7.1)
 // ---------------------------------------------------------------------------
+
+/// §7.1 canonical `u64` on the REST surface: a decimal **string** matching
+/// `0|[1-9][0-9]*` (no JSON number — values may exceed the 2⁵³ float
+/// mantissa). Used for `expiry` and `size_ceiling`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct U64Decimal(pub u64);
+
+impl U64Decimal {
+    pub fn format(n: u64) -> String {
+        n.to_string()
+    }
+}
+
+impl<'de> Deserialize<'de> for U64Decimal {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = U64Decimal;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a canonical decimal-string u64 (§7.1: 0|[1-9][0-9]*)")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                parse_u64_decimal(v)
+                    .map(U64Decimal)
+                    .map_err(serde::de::Error::custom)
+            }
+
+            fn visit_borrowed_str<E: serde::de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+                self.visit_str(v)
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                self.visit_str(&v)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _v: u64) -> Result<Self::Value, E> {
+                Err(E::custom(
+                    "u64 field must be a decimal string, not a JSON number (§7.1)",
+                ))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _v: i64) -> Result<Self::Value, E> {
+                Err(E::custom(
+                    "u64 field must be a decimal string, not a JSON number (§7.1)",
+                ))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _v: f64) -> Result<Self::Value, E> {
+                Err(E::custom(
+                    "u64 field must be a decimal string, not a JSON number (§7.1)",
+                ))
+            }
+        }
+        // deserialize_any so a bare JSON number is visited (and rejected)
+        // rather than failing only with a generic type error.
+        deserializer.deserialize_any(V)
+    }
+}
+
+/// Parse a §7.1 canonical decimal-string u64 (`0|[1-9][0-9]*`).
+pub fn parse_u64_decimal(s: &str) -> Result<u64, String> {
+    if s.is_empty() {
+        return Err("empty decimal string".into());
+    }
+    if s == "0" {
+        return Ok(0);
+    }
+    if s.as_bytes()[0] == b'0' {
+        return Err("leading zeros are not allowed in canonical u64 decimal strings".into());
+    }
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("decimal string must contain only ASCII digits".into());
+    }
+    s.parse::<u64>()
+        .map_err(|_| format!("decimal string out of u64 range: {s}"))
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AttestChallengeRequest {
@@ -164,12 +242,14 @@ pub struct AttestChallengeNonce {
 }
 
 /// Body of `POST /v1/attest/balance` (§7.5).
+///
+/// `size_ceiling` is a §7.1 decimal-string u64 (never a JSON number).
 #[derive(Clone, Debug, Deserialize)]
 pub struct AttestBalanceRequest {
     pub subject: String,
     pub asset_id: String,
     pub nav_ceiling: Option<String>,
-    pub size_ceiling: Option<u64>,
+    pub size_ceiling: Option<U64Decimal>,
     pub challenge: AttestChallengeNonce,
     pub ownership_proof: OwnershipProofJson,
 }
@@ -400,7 +480,7 @@ pub fn authorise_attest_balance(
         None => None,
         Some(h) => Some(parse_hex32(h, "nav_ceiling")?),
     };
-    let size_ceiling = req.size_ceiling;
+    let size_ceiling = req.size_ceiling.map(|U64Decimal(n)| n);
     let ceiling_enc = ceiling_encoding(nav_ceiling.as_ref(), size_ceiling)?;
 
     // Subject: Bech32m.
@@ -533,6 +613,18 @@ pub fn serialize_balance_attestation(
     let proof_bytes = bincode::serialize(proof).map_err(|e| {
         AttestError::Internal(format!("serialize C_balance proof: {e}"))
     })?;
+    serialize_balance_attestation_v1(statement, network, &proof_bytes)
+}
+
+/// Canonical §7.1 layout with already-encoded proof bytes.
+///
+/// Production callers use [`serialize_balance_attestation`]; tests inject
+/// fixed proof bytes so the layout is exercised without a circuit prove.
+pub fn serialize_balance_attestation_v1(
+    statement: &BalanceAttestationStatement,
+    network: Network,
+    proof_bytes: &[u8],
+) -> Result<Vec<u8>, AttestError> {
     if proof_bytes.len() > u32::MAX as usize {
         return Err(AttestError::Internal(
             "C_balance proof exceeds u32 length prefix".into(),
@@ -557,8 +649,30 @@ pub fn serialize_balance_attestation(
     out.extend_from_slice(&statement.anchor.signature_r);
     out.extend_from_slice(&nid_bytes);
     out.extend_from_slice(&(proof_bytes.len() as u32).to_be_bytes());
-    out.extend_from_slice(&proof_bytes);
+    out.extend_from_slice(proof_bytes);
     Ok(out)
+}
+
+/// §7.5 completed-job `result` for `attest_balance`: only `attestation`.
+pub fn completed_attest_result(attestation_bytes: &[u8]) -> serde_json::Value {
+    serde_json::json!({
+        "attestation": hex::encode(attestation_bytes),
+    })
+}
+
+/// Require a fully resolved Bitcoin inscription locator, or fail with the
+/// named [`ATTEST_ANCHOR_LOCATOR_EDGE`] (never fabricate zero txid/hash).
+pub fn require_resolved_anchor(
+    txid: Option<[u8; 32]>,
+    block_hash: Option<[u8; 32]>,
+) -> Result<([u8; 32], [u8; 32]), AttestError> {
+    let txid = txid.ok_or_else(|| {
+        AttestError::ProvingFailed(ATTEST_ANCHOR_LOCATOR_EDGE.to_string())
+    })?;
+    let block_hash = block_hash.ok_or_else(|| {
+        AttestError::ProvingFailed(ATTEST_ANCHOR_LOCATOR_EDGE.to_string())
+    })?;
+    Ok((txid, block_hash))
 }
 
 /// Extract the 32-byte `network_id` field from a serialized attestation.
@@ -589,8 +703,39 @@ fn network_id_for(n: Network) -> HashDigest {
 // Network-digest acceptance gate
 // ---------------------------------------------------------------------------
 
+/// Pure production gate: attestation `network_id` + live `C_balance` digest
+/// must bind to `network`.
+///
+/// This is the host-side acceptance body used by
+/// [`accept_attestation_for_network`] and the pre-prove pin check in
+/// [`prove_attestation_for_job`]. Tests **must** call this (or the
+/// thin wrappers below) — comparing pin constants alone does not
+/// exercise the gate, and removing it must turn those tests red.
+pub fn accept_c_balance_network_binding(
+    attestation_network_id: &HashDigest,
+    live_c_balance_digest: &[u8],
+    network: Network,
+) -> Result<(), AttestError> {
+    let expected_nid = network_id_for(network);
+    if *attestation_network_id != expected_nid {
+        return Err(AttestError::ProvingFailed(format!(
+            "attestation network_id does not match node network {:?}",
+            network
+        )));
+    }
+    let pinned = pinned_c_balance_digest(network);
+    if live_c_balance_digest != pinned.as_slice() {
+        return Err(AttestError::CircuitDigestMismatch(format!(
+            "live C_balance digest does not match pinned constant for {:?}",
+            network
+        )));
+    }
+    Ok(())
+}
+
 /// Host-side gate: attestation `network_id` must match the node network,
-/// and the live `C_balance` digest must equal the pinned constant.
+/// and the live `C_balance` digest must equal the pinned constant, then
+/// Plonky2-verify the proof under that circuit.
 ///
 /// Cross-network reject: a proof whose `network_id` is for network B is
 /// refused on a node running network A **before** Plonky2 verify — and
@@ -599,22 +744,9 @@ pub fn accept_attestation_for_network(
     proved: &ProvedAttestation,
     network: Network,
 ) -> Result<(), AttestError> {
-    let expected_nid = network_id_for(network);
-    if proved.network_id != expected_nid {
-        return Err(AttestError::ProvingFailed(format!(
-            "attestation network_id does not match node network {:?}",
-            network
-        )));
-    }
     let bridge = ProverBridge::new(network);
     let live = bridge.balance_circuit_digest_bytes();
-    let pinned = pinned_c_balance_digest(network);
-    if live != pinned {
-        return Err(AttestError::CircuitDigestMismatch(format!(
-            "live C_balance digest does not match pinned constant for {:?}",
-            network
-        )));
-    }
+    accept_c_balance_network_binding(&proved.network_id, &live, network)?;
     bridge
         .verify_attestation(&proved.proof)
         .map_err(|e| AttestError::ProvingFailed(format!("C_balance verify failed: {e}")))?;
@@ -874,12 +1006,8 @@ pub async fn prove_attestation_for_job(
     materials.anchor_txid = txid;
     materials.anchor_block_hash = block_hash;
 
-    let txid = materials.anchor_txid.ok_or_else(|| {
-        AttestError::ProvingFailed(ATTEST_ANCHOR_LOCATOR_EDGE.to_string())
-    })?;
-    let block_hash = materials.anchor_block_hash.ok_or_else(|| {
-        AttestError::ProvingFailed(ATTEST_ANCHOR_LOCATOR_EDGE.to_string())
-    })?;
+    let (txid, block_hash) =
+        require_resolved_anchor(materials.anchor_txid, materials.anchor_block_hash)?;
 
     let balance = materials
         .account_state
@@ -911,15 +1039,11 @@ pub async fn prove_attestation_for_job(
 
     let network = adapter.network();
     let bridge = adapter.bridge();
-    // Pin check before the expensive prove.
+    // Same production gate body as accept_attestation_for_network — pin
+    // check before the expensive prove. network_id is the node's own
+    // (the proof has not been produced yet).
     let live = bridge.balance_circuit_digest_bytes();
-    let pinned = pinned_c_balance_digest(network);
-    if live != pinned {
-        return Err(AttestError::CircuitDigestMismatch(format!(
-            "live C_balance digest does not match pin for {:?}",
-            network
-        )));
-    }
+    accept_c_balance_network_binding(&network_id_for(network), &live, network)?;
 
     let proved = bridge.prove_attestation(&witness).map_err(|e| {
         AttestError::ProvingFailed(format!("prove_attestation failed: {e}"))
@@ -1033,11 +1157,13 @@ mod tests {
         ));
     }
 
+    /// Pinned constants match the generated vector file — and the
+    /// production gate **accepts** each pin when presented as the live
+    /// digest. Constant equality alone is not enough (see
+    /// `accept_gate_rejects_wrong_live_digest`).
     #[test]
-    fn pinned_digests_match_generated_vector_literals() {
+    fn pinned_digests_pass_production_gate_and_match_vectors() {
         // Ground truth: script-plonky2/tests/generated_circuit_digests.txt
-        // (quoted at module top). A regen that changes digests must update
-        // both — this test goes red if only one side moves.
         assert_eq!(
             hex::encode(PINNED_C_BALANCE_DIGEST_MAINNET),
             "0a4202fc772295d6db4eb9c5bd2bbb7a59d45cff1653648dff4681f4ba55d606"
@@ -1049,6 +1175,52 @@ mod tests {
         assert_eq!(
             hex::encode(PINNED_C_BALANCE_DIGEST_REGTEST),
             "bd696087e0e0f47b556a6803ef4fb5b9ebae2327e0438dd405f33752dc90772d"
+        );
+
+        for network in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+            let pinned = pinned_c_balance_digest(network);
+            let nid = network_id_for(network);
+            accept_c_balance_network_binding(&nid, &pinned, network).unwrap_or_else(|e| {
+                panic!("pinned digest must pass production gate for {network:?}: {e:?}")
+            });
+        }
+    }
+
+    /// Defect 1 regression: the production gate must reject a wrong live
+    /// digest. Weakening `accept_c_balance_network_binding` to always-Ok
+    /// turns this test red — that is the proof the gate is bound.
+    #[test]
+    fn accept_gate_rejects_wrong_live_digest() {
+        let network = Network::Testnet;
+        let nid = network_id_for(network);
+        let wrong = [0u8; 32];
+        assert_ne!(wrong, pinned_c_balance_digest(network));
+        let err = accept_c_balance_network_binding(&nid, &wrong, network).unwrap_err();
+        assert_eq!(
+            err.http_status_and_code(),
+            (503, "circuit_digest_mismatch"),
+            "wrong live digest must hit the production CircuitDigestMismatch arm"
+        );
+    }
+
+    /// Cross-network: a testnet `network_id` presented to a mainnet node
+    /// is refused by the production gate (before any Plonky2 verify).
+    #[test]
+    fn accept_gate_rejects_wrong_network_id() {
+        let err = accept_c_balance_network_binding(
+            &network_id_testnet(),
+            &pinned_c_balance_digest(Network::Mainnet),
+            Network::Mainnet,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AttestError::ProvingFailed(_)),
+            "cross-network must fail via production gate, got {err:?}"
+        );
+        assert!(
+            err.message().contains("network_id"),
+            "message must name the network_id mismatch: {}",
+            err.message()
         );
     }
 
@@ -1144,25 +1316,23 @@ mod tests {
         assert_eq!(err.http_status_and_code(), (404, "feature_disabled"));
     }
 
+    /// Canonical §7.1 `BalanceAttestationV1` layout: every fixed field at
+    /// its offset, completed anchor fields present, network_id last PI.
     #[test]
-    fn serialize_balance_attestation_layout_carries_network_id() {
-        // Synthetic statement + empty-ish proof bytes via a minimal
-        // bincode of a dummy — we only check layout offsets and that
-        // network_id differs per network. A real BalanceProof is heavy;
-        // we use bincode of a small placeholder vector that
-        // serialize_balance_attestation wraps. That requires a real
-        // BalanceProof type — skip prove; build only the header fields
-        // via a unit test of network_id_from offset math.
+    fn serialize_balance_attestation_canonical_layout_and_completed_anchor() {
         let subject = Address([0x01; 32]);
-        let asset = host::digest_from_bytes(&[0x02; 32]).unwrap();
+        let asset_bytes = [0x02u8; 32];
+        let asset = host::digest_from_bytes(&asset_bytes).unwrap();
+        let nav = Nav {
+            size: 7,
+            mth: host::nflog_empty(),
+        };
+        let nav_root = digest_to_bytes(&nav.root());
         let statement = BalanceAttestationStatement {
             subject,
             asset_id: asset,
             balance: 99u128,
-            nav_ceiling: Nav {
-                size: 0,
-                mth: host::nflog_empty(),
-            },
+            nav_ceiling: nav,
             anchor: BalanceAnchor {
                 txid: [0x31; 32],
                 block_hash: [0x42; 32],
@@ -1171,38 +1341,133 @@ mod tests {
                 signature_r: [0x22; 32],
             },
         };
-        // We cannot bincode a real BalanceProof without a circuit. Check
-        // the offset math helper against a hand-built buffer instead.
-        let mut fake = vec![0u8; 256 + 32 + 4];
-        let nid = digest_to_bytes(&network_id_testnet());
-        fake[256..288].copy_from_slice(&nid);
-        let extracted = network_id_from_attestation_bytes(&fake).unwrap();
-        assert_eq!(extracted, nid);
-        let other = digest_to_bytes(&network_id_mainnet());
-        assert_ne!(extracted, other);
+        let proof_bytes = b"fake-c-balance-proof-bytes";
+        let bytes =
+            serialize_balance_attestation_v1(&statement, Network::Testnet, proof_bytes).unwrap();
 
-        // Statement fields used so the synthetic value is not dead.
-        assert_eq!(statement.balance, 99);
+        // Fixed header through network_id: 288 bytes, then u32-be len + proof.
+        assert_eq!(bytes.len(), 288 + 4 + proof_bytes.len());
+        assert_eq!(&bytes[0..32], &subject.0);
+        assert_eq!(&bytes[32..64], &asset_bytes);
+        assert_eq!(&bytes[64..80], &99u128.to_be_bytes());
+        assert_eq!(&bytes[80..112], &nav_root);
+        assert_eq!(&bytes[112..120], &7u64.to_be_bytes());
+        // Completed anchor fields (txid, block_hash, height, Pk, R).
+        assert_eq!(&bytes[120..152], &[0x31; 32]);
+        assert_eq!(&bytes[152..184], &[0x42; 32]);
+        assert_eq!(&bytes[184..192], &100u64.to_be_bytes());
+        assert_eq!(&bytes[192..224], &[0x11; 32]);
+        assert_eq!(&bytes[224..256], &[0x22; 32]);
+        let nid = digest_to_bytes(&network_id_testnet());
+        assert_eq!(&bytes[256..288], &nid);
+        assert_eq!(
+            u32::from_be_bytes(bytes[288..292].try_into().unwrap()) as usize,
+            proof_bytes.len()
+        );
+        assert_eq!(&bytes[292..], proof_bytes);
+
+        let extracted = network_id_from_attestation_bytes(&bytes).unwrap();
+        assert_eq!(extracted, nid);
+        assert_ne!(extracted, digest_to_bytes(&network_id_mainnet()));
+    }
+
+    /// Terminal success result carries only `attestation` (hex of V1 bytes).
+    #[test]
+    fn terminal_success_result_is_attestation_only() {
+        let statement = BalanceAttestationStatement {
+            subject: Address([0x01; 32]),
+            asset_id: host::digest_from_bytes(&[0x02; 32]).unwrap(),
+            balance: 1,
+            nav_ceiling: Nav {
+                size: 0,
+                mth: host::nflog_empty(),
+            },
+            anchor: BalanceAnchor {
+                txid: [0x31; 32],
+                block_hash: [0x42; 32],
+                height: 1,
+                public_key: [0x11; 32],
+                signature_r: [0x22; 32],
+            },
+        };
+        let bytes =
+            serialize_balance_attestation_v1(&statement, Network::Regtest, b"proof").unwrap();
+        let result = completed_attest_result(&bytes);
+        let obj = result.as_object().expect("object");
+        assert_eq!(obj.len(), 1, "§7.5 result must contain only attestation");
+        let expected_hex = hex::encode(&bytes);
+        assert_eq!(
+            obj.get("attestation").and_then(|v| v.as_str()),
+            Some(expected_hex.as_str())
+        );
+    }
+
+    /// Named locator-edge error — never fabricate zeros.
+    #[test]
+    fn missing_anchor_locator_is_named_edge() {
+        let err = require_resolved_anchor(None, None).unwrap_err();
+        assert!(matches!(err, AttestError::ProvingFailed(_)));
+        assert!(
+            err.message().starts_with("ATTEST_ANCHOR_LOCATOR_EDGE"),
+            "must use the named edge constant, got: {}",
+            err.message()
+        );
+        assert_eq!(err.message(), ATTEST_ANCHOR_LOCATOR_EDGE);
+
+        // One side present is still the edge (no partial fabricate).
+        let err = require_resolved_anchor(Some([1u8; 32]), None).unwrap_err();
+        assert_eq!(err.message(), ATTEST_ANCHOR_LOCATOR_EDGE);
+
+        let (t, b) = require_resolved_anchor(Some([1u8; 32]), Some([2u8; 32])).unwrap();
+        assert_eq!(t, [1u8; 32]);
+        assert_eq!(b, [2u8; 32]);
     }
 
     #[test]
-    fn accept_attestation_rejects_wrong_network_id_without_verify() {
-        // Construct a ProvedAttestation-like check at the network_id layer
-        // by calling the comparison that accept_attestation_for_network
-        // does first. A full ProvedAttestation needs a real proof; we
-        // unit-test the pin boundary via networks_have_distinct and the
-        // network_id mismatch path through a helper.
-        let testnet_nid = network_id_testnet();
-        let mainnet_nid = network_id_mainnet();
-        assert_ne!(testnet_nid, mainnet_nid);
-        // Simulate the gate's first check.
-        let proved_network_id = testnet_nid;
-        let node_network = Network::Mainnet;
-        let expected = network_id_for(node_network);
-        assert_ne!(
-            proved_network_id, expected,
-            "cross-network must be rejected"
+    fn u64_decimal_wire_rejects_json_number_and_accepts_string() {
+        // size_ceiling as JSON number → deserialize error (§7.1).
+        let num = serde_json::json!({
+            "subject": "x",
+            "asset_id": "00".repeat(32),
+            "size_ceiling": 7,
+            "nav_ceiling": "11".repeat(32),
+            "challenge": { "nonce": "22".repeat(32) },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": "x",
+                "public_key": "00".repeat(32),
+                "nk_commit": "00".repeat(32),
+                "signature": "00".repeat(64),
+            }
+        });
+        let err = serde_json::from_value::<AttestBalanceRequest>(num).unwrap_err();
+        assert!(
+            err.to_string().contains("decimal string") || err.to_string().contains("JSON number"),
+            "got: {err}"
         );
+
+        let ok = serde_json::json!({
+            "subject": "x",
+            "asset_id": "00".repeat(32),
+            "size_ceiling": "7",
+            "nav_ceiling": "11".repeat(32),
+            "challenge": { "nonce": "22".repeat(32) },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": "x",
+                "public_key": "00".repeat(32),
+                "nk_commit": "00".repeat(32),
+                "signature": "00".repeat(64),
+            }
+        });
+        let req: AttestBalanceRequest = serde_json::from_value(ok).unwrap();
+        assert_eq!(req.size_ceiling, Some(U64Decimal(7)));
+
+        assert_eq!(parse_u64_decimal("0").unwrap(), 0);
+        assert_eq!(parse_u64_decimal("18446744073709551615").unwrap(), u64::MAX);
+        assert!(parse_u64_decimal("01").is_err());
+        assert!(parse_u64_decimal("").is_err());
+        assert_eq!(U64Decimal::format(60), "60");
     }
 
     #[test]

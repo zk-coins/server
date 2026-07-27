@@ -2745,10 +2745,13 @@ fn attest_error_response(err: crate::v11::AttestError) -> axum::response::Respon
 /// `POST /v1/attest/balance/challenge` — §7.5 action-bound challenge.
 ///
 /// Body: `{ subject: <zk-address> }`  
-/// Returns: `{ nonce: <hex32>, expiry: <u64>, domain: "zkCoins/v1/AttestBalanceChallenge" }`
+/// Returns: `{ nonce: <hex32>, expiry: <decimal-string u64>, domain: "zkCoins/v1/AttestBalanceChallenge" }`
+///
+/// `expiry` is a §7.1 decimal **string** (never a JSON number). Body
+/// decode uses [`V1Json`] so malformed JSON is `400 malformed_request`.
 pub(crate) async fn attest_balance_challenge_handler(
     State(state): State<AppState>,
-    Json(body): Json<crate::v11::AttestChallengeRequest>,
+    V1Json(body): V1Json<crate::v11::AttestChallengeRequest>,
 ) -> axum::response::Response {
     if !crate::v11::v11_attest_route_active() {
         return attest_error_response(crate::v11::AttestError::FeatureDisabled);
@@ -2762,7 +2765,7 @@ pub(crate) async fn attest_balance_challenge_handler(
             StatusCode::OK,
             Json(serde_json::json!({
                 "nonce": hex::encode(nonce),
-                "expiry": expiry,
+                "expiry": crate::v11::U64Decimal::format(expiry),
                 "domain": crate::v11::ATTEST_BALANCE_CHALLENGE_DOMAIN,
             })),
         )
@@ -2775,9 +2778,11 @@ pub(crate) async fn attest_balance_challenge_handler(
 ///
 /// Returns `202 { job_id }` on success. Auth failures use the closed
 /// codes `unauthorized` / `challenge_expired` / `malformed_request`.
+/// Body decode uses [`V1Json`] so missing/malformed JSON is the closed
+/// `400 malformed_request` (not Axum's 422 rejection).
 pub(crate) async fn attest_balance_handler(
     State(state): State<AppState>,
-    Json(body): Json<crate::v11::AttestBalanceRequest>,
+    V1Json(body): V1Json<crate::v11::AttestBalanceRequest>,
 ) -> axum::response::Response {
     if !crate::v11::v11_attest_route_active() {
         return attest_error_response(crate::v11::AttestError::FeatureDisabled);
@@ -4079,6 +4084,10 @@ pub struct RootEndpoints {
     proof: &'static str,
     inscription: &'static str,
     username_resolve: &'static str,
+    /// §7.5 closed key — Gap G6 balance-attestation challenge.
+    attest_balance_challenge: &'static str,
+    /// §7.5 closed key — Gap G6 balance-attestation admit.
+    attest_balance: &'static str,
     health: &'static str,
     health_ready: &'static str,
     health_publisher: &'static str,
@@ -4121,6 +4130,8 @@ pub(crate) async fn root_handler() -> impl IntoResponse {
             proof: "GET  /api/proof/{id}",
             inscription: "GET  /api/inscriptions/{txid}",
             username_resolve: "GET  /api/username/resolve/{username}",
+            attest_balance_challenge: "POST /v1/attest/balance/challenge",
+            attest_balance: "POST /v1/attest/balance",
             health: "GET  /health",
             health_ready: "GET  /health/ready",
             health_publisher: "GET  /health/publisher",
