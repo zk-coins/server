@@ -1487,12 +1487,20 @@ enum SignalOutcome {
 /// Losing the lease is not a warning: the owner no longer has the right to
 /// apply results. Every variant is fail-closed — work aborts, the result is
 /// discarded, and the job is left for a later resumer once the claim is free.
+///
+/// Dropping the work future is only cooperative (Rust cancel at the next
+/// `.await`). Durable transition commits are fenced separately by
+/// owner-qualified writes ([`JobStore::merge_finalisation_if_finalise_owner`],
+/// [`JobStore::complete_if_finalise_owner`]) so a worker that keeps running
+/// after loss still cannot commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FinaliseLeaseLivenessLost {
     /// `renew_finalise_claim` returned `Ok(false)` — ownership is gone.
     RenewReturnedFalse,
     /// Database / storage error while renewing; liveness cannot be proved.
     RenewError(String),
+    /// A single renew await exceeded its deadline — stalled renew is loss.
+    RenewTimedOut,
     /// The heartbeat task ended (panic or silent exit) while work was in flight.
     HeartbeatTaskEnded,
 }
@@ -1504,6 +1512,9 @@ impl std::fmt::Display for FinaliseLeaseLivenessLost {
                 write!(f, "finalise lease renew returned false (ownership lost)")
             }
             Self::RenewError(e) => write!(f, "finalise lease renew failed: {e}"),
+            Self::RenewTimedOut => {
+                write!(f, "finalise lease renew timed out (stalled renew is loss)")
+            }
             Self::HeartbeatTaskEnded => {
                 write!(f, "finalise lease heartbeat task ended while work in flight")
             }
@@ -1517,23 +1528,28 @@ impl std::fmt::Display for FinaliseLeaseLivenessLost {
 /// while the owner is still alive; a boot sweep then frees it and a second
 /// resumer double-executes. This heartbeat proves liveness continuously.
 ///
-/// **Fail closed:** if renewal returns `Ok(false)`, a renew error occurs, or
-/// the heartbeat task disappears, this future resolves to
-/// [`Err`]`(`[`FinaliseLeaseLivenessLost`]`)` and drops `work` without
-/// yielding its result. Continuing unprotected would reintroduce split-brain.
+/// **Fail closed:** if renewal returns `Ok(false)`, a renew error occurs, a
+/// renew await exceeds `renew_timeout`, or the heartbeat task disappears,
+/// this future resolves to [`Err`]`(`[`FinaliseLeaseLivenessLost`]`)` and
+/// drops `work` without yielding its result. Drop is cooperative — durable
+/// commits still require owner-qualified writes.
 ///
 /// `renew_every` should be well under `lease` (production uses
-/// [`crate::job_store::FINALISE_CLAIM_RENEW_INTERVAL`]). Renewals write
+/// [`crate::job_store::FINALISE_CLAIM_RENEW_INTERVAL`]). `renew_timeout`
+/// bounds each renew await (production:
+/// [`crate::job_store::FINALISE_CLAIM_RENEW_TIMEOUT`]). Renewals write
 /// `NOW() + lease` in Postgres — same clock as claim create and stale release.
 ///
 /// `work` must yield to the async runtime (await points / `spawn_blocking`
-/// for CPU-bound prove) so the heartbeat task can run.
+/// for CPU-bound prove) so the heartbeat task can run. Production covers
+/// prove **and** host-edge completion writes under this heartbeat.
 pub(crate) async fn with_finalise_lease_heartbeat<F, T>(
     job_store: &JobStore,
     public_id: Uuid,
     owner: Uuid,
     lease: std::time::Duration,
     renew_every: std::time::Duration,
+    renew_timeout: std::time::Duration,
     work: F,
 ) -> Result<T, FinaliseLeaseLivenessLost>
 where
@@ -1542,6 +1558,7 @@ where
     let store = job_store.clone();
     with_finalise_lease_heartbeat_renew(
         renew_every,
+        renew_timeout,
         move || {
             let store = store.clone();
             async move {
@@ -1558,8 +1575,12 @@ where
 
 /// Core fail-closed heartbeat loop. `renew` is called on each tick; production
 /// wires [`JobStore::renew_finalise_claim`], tests inject failures.
+///
+/// Each `renew()` await is bounded by `renew_timeout`. A stalled renew is
+/// treated as ownership loss — not an unbounded pause while work runs on.
 pub(crate) async fn with_finalise_lease_heartbeat_renew<R, Fut, F, T>(
     renew_every: std::time::Duration,
+    renew_timeout: std::time::Duration,
     mut renew: R,
     work: F,
 ) -> Result<T, FinaliseLeaseLivenessLost>
@@ -1587,18 +1608,28 @@ where
                     return;
                 }
                 _ = ticker.tick() => {
-                    match renew().await {
-                        Ok(true) => {
+                    // Bound the renew await: a hung DB must not pause fail-closed
+                    // while work continues past lease expiry.
+                    match tokio::time::timeout(renew_timeout, renew()).await {
+                        Err(_) => {
+                            tracing::error!(
+                                timeout_secs = renew_timeout.as_secs(),
+                                "finalise lease renew timed out mid-operation — aborting work"
+                            );
+                            let _ = lost_tx.send(FinaliseLeaseLivenessLost::RenewTimedOut);
+                            return;
+                        }
+                        Ok(Ok(true)) => {
                             tracing::debug!("finalise lease renewed during long operation");
                         }
-                        Ok(false) => {
+                        Ok(Ok(false)) => {
                             tracing::error!(
                                 "finalise lease renew lost ownership mid-operation — aborting work"
                             );
                             let _ = lost_tx.send(FinaliseLeaseLivenessLost::RenewReturnedFalse);
                             return;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::error!(
                                 error = %e,
                                 "finalise lease renew failed mid-operation — aborting work"
@@ -1616,7 +1647,7 @@ where
     tokio::pin!(work);
 
     // Two completion paths only:
-    // 1. `lost_rx` fires → ownership gone, renew error, or heartbeat died
+    // 1. `lost_rx` fires → ownership gone, renew error/timeout, or heartbeat died
     //    (sender dropped without a value). Drop `work` and discard its result.
     // 2. `work` finishes first → stop heartbeat cleanly, return Ok(result)
     //    only if no loss raced in and the heartbeat task did not panic.
@@ -1624,6 +1655,9 @@ where
     // Heartbeat panics drop `lost_tx` without send → `lost_rx` yields `Err`,
     // which is the "task disappeared" signal. `biased` prefers the loss arm
     // when both are ready so a just-lost lease never publishes a result.
+    //
+    // Dropping `work` is cooperative: CPU-bound segments between `.await`
+    // points may still run. Durable writes must themselves require ownership.
     tokio::select! {
         biased;
         lost = &mut lost_rx => {
@@ -1706,13 +1740,18 @@ pub const JOB_FINALISE_HOST_EDGE: &str =
 /// | Load capability | `finalisation` envelope | rehydrate; refuse incomplete |
 /// | Exclusive claim | status + owner/lease | [`JobStore::claim_finalise_exclusive`] — **loser exits without side effects** |
 /// | Prove + apply + stage | pending + signature | finalise hook (engine + `members_ready`); skip if `completion_result` already set |
-/// | Persist completion | outcome + publisher_pubkey | status-qualified body write under `broadcasting` |
-/// | Host §7.5 complete | `completion_result` + `completion_status` | `complete_if_status([broadcasting])` — **host edge** |
-/// | Fail | — | `fail_if_status` from non-terminal only |
+/// | Persist completion | outcome + publisher_pubkey | **owner-qualified** `merge_finalisation_if_finalise_owner` |
+/// | Host §7.5 complete | `completion_result` + `completion_status` | **owner-qualified** `complete_if_finalise_owner` — **host edge** |
+/// | Fail (pre-claim) | — | `fail_if_status` from non-terminal only |
+/// | Fail (post-claim) | — | `fail_if_finalise_owner` — lost worker cannot fail another's job |
 ///
 /// `broadcasting` is an **exclusive claim**, not a permission: exactly one
 /// resumer wins the CAS; the loser observes [`FinaliseClaim::Lost`] and must
 /// not continue into side effects **and must not mutate shared notify state**.
+///
+/// After the claim is won, durable transition commits are fenced on **claim
+/// ownership**, not on status. Dropping a future after lease loss is only
+/// cooperative; the write predicates are the safety mechanism.
 async fn drive_v11_finalise(
     job_store: &JobStore,
     app_state: &AppState,
@@ -1723,6 +1762,7 @@ async fn drive_v11_finalise(
     use crate::job_store::FinaliseClaim;
 
     // Helper: fail with a §7.5 machine code, clean envelopes, drop notify.
+    // Pre-claim only: status-qualified (no exclusive owner yet).
     async fn fail_v11(
         job_store: &JobStore,
         app_state: &AppState,
@@ -1740,6 +1780,46 @@ async fn drive_v11_finalise(
                 &err,
             )
             .await?;
+        publish_phase(
+            notify_map,
+            public_id,
+            JobPhaseEvent {
+                status: JobStatus::Failed,
+                phase: "failed".to_string(),
+                proof_id: None,
+                result: None,
+                error: Some(err),
+            },
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        Ok(())
+    }
+
+    // Post-claim fail: owner-qualified so a lost worker cannot fail a job
+    // another resumer now holds. `Ok(false)` is quiet loss — leave notify.
+    async fn fail_v11_as_owner(
+        job_store: &JobStore,
+        app_state: &AppState,
+        notify_map: &JobNotifyMap,
+        public_id: Uuid,
+        owner: Uuid,
+        code: &str,
+        message: String,
+    ) -> anyhow::Result<()> {
+        let err = crate::v11::encode_job_error(code, message.clone());
+        let failed = job_store
+            .fail_if_finalise_owner(public_id, owner, &err)
+            .await?;
+        if !failed {
+            tracing::info!(
+                %public_id,
+                %owner,
+                "Job dispatcher: fail_if_finalise_owner was a no-op (ownership lost); \
+                 leaving shared notify state intact"
+            );
+            return Ok(());
+        }
         publish_phase(
             notify_map,
             public_id,
@@ -1831,11 +1911,14 @@ async fn drive_v11_finalise(
                 )
                 .await?;
             if !renewed {
-                return fail_v11(
+                // Already claimed then lost before prove — owner fence if we
+                // still hold it; otherwise quiet exit (do not fail another's job).
+                return fail_v11_as_owner(
                     job_store,
                     app_state,
                     notify_map,
                     public_id,
+                    job_store.process_owner(),
                     "internal_error",
                     "v1.1 finalise: won claim but immediate lease renew failed \
                      (lost ownership before prove)"
@@ -1870,6 +1953,8 @@ async fn drive_v11_finalise(
         }
     }
 
+    let claim_owner = job_store.process_owner();
+
     publish_phase(
         notify_map,
         public_id,
@@ -1882,232 +1967,221 @@ async fn drive_v11_finalise(
         },
     );
 
-    // If prove+apply already recorded the §7.5 surface, skip the hook and
-    // only publish + complete (crash window after durable stage + completion
-    // persist, before terminal complete).
-    if !entry.has_completion() {
-        let signature = entry
-            .signature
-            .clone()
-            .expect("ensure_finalise_ready checked signature");
-        let Some(hook) = app_state.v11_finalise.as_ref() else {
-            return fail_v11(
+    // Heartbeat covers prove **and** host-edge completion writes. Dropping
+    // the work future on lease loss is cooperative only; owner-qualified
+    // durable writes are the real fence for anything that still runs.
+    //
+    // What a worker can still do between losing its lease and noticing:
+    // pure in-process work (CPU prove segments between `.await`s, in-memory
+    // apply under a local write gate). It must not commit job-row transitions
+    // — completion persist, terminal complete, and owner-scoped fail all
+    // require `finalise_claim.owner = this process`.
+    let owned_drive = async {
+        // If prove+apply already recorded the §7.5 surface, skip the hook and
+        // only publish + complete (crash window after durable stage + completion
+        // persist, before terminal complete).
+        if !entry.has_completion() {
+            let signature = entry
+                .signature
+                .clone()
+                .expect("ensure_finalise_ready checked signature");
+            let Some(hook) = app_state.v11_finalise.as_ref() else {
+                return fail_v11_as_owner(
+                    job_store,
+                    app_state,
+                    notify_map,
+                    public_id,
+                    claim_owner,
+                    "internal_error",
+                    "v1.1 finalise: no finalise driver and no durable completion_result \
+                     — cannot prove/apply or complete (incomplete capability path; \
+                     refusing to half-finish)"
+                        .to_string(),
+                )
+                .await;
+            };
+
+            // publisher_pubkey is only the staged capability field — no silent
+            // fall-back to a root request_body key.
+            let publisher_pubkey = entry.publisher_pubkey;
+            let hook_result = hook(entry.pending.clone(), signature).await;
+            match hook_result {
+                Ok(mut outcome) => {
+                    if outcome.publisher_pubkey.is_none() {
+                        outcome.publisher_pubkey = publisher_pubkey;
+                    }
+                    let response_body = outcome.to_result_json();
+                    if let Err(e) = entry.install_completion(response_body, 200) {
+                        return fail_v11_as_owner(
+                            job_store,
+                            app_state,
+                            notify_map,
+                            public_id,
+                            claim_owner,
+                            "internal_error",
+                            format!("v1.1 finalise: install_completion failed: {e}"),
+                        )
+                        .await;
+                    }
+                    // Persist completion onto the durable capability **before**
+                    // the terminal complete flip so a crash here is resumable.
+                    // Owner-qualified jsonb_set: lost workers cannot commit;
+                    // concurrent lease renew is not clobbered.
+                    let persist = match crate::v11::DurableFinalisationPersist::from_entry(&entry)
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return fail_v11_as_owner(
+                                job_store,
+                                app_state,
+                                notify_map,
+                                public_id,
+                                claim_owner,
+                                "internal_error",
+                                format!("v1.1 finalise: encode completion capability: {e}"),
+                            )
+                            .await;
+                        }
+                    };
+                    let persist_val = match serde_json::to_value(&persist) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return fail_v11_as_owner(
+                                job_store,
+                                app_state,
+                                notify_map,
+                                public_id,
+                                claim_owner,
+                                "internal_error",
+                                format!(
+                                    "v1.1 finalise: json-encode completion capability: {e}"
+                                ),
+                            )
+                            .await;
+                        }
+                    };
+                    let wrote = job_store
+                        .merge_finalisation_if_finalise_owner(
+                            public_id,
+                            claim_owner,
+                            &persist_val,
+                        )
+                        .await?;
+                    if !wrote {
+                        tracing::info!(
+                            "Job dispatcher: job {} completion persist was a no-op \
+                             (ownership lost or claim free); exiting without re-complete",
+                            public_id
+                        );
+                        // Do not strip notify — may belong to a new owner.
+                        return Ok(());
+                    }
+                    app_state.pending_sign_map.insert(public_id, entry.clone());
+                }
+                Err(e) => {
+                    let msg = format!("v1.1 finalise failed: {e}");
+                    tracing::warn!("Job dispatcher: job {} {}", public_id, msg);
+                    return fail_v11_as_owner(
+                        job_store,
+                        app_state,
+                        notify_map,
+                        public_id,
+                        claim_owner,
+                        "proving_failed",
+                        msg,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        // Host §7.5 job-result publication + terminal complete.
+        // This is [`JOB_FINALISE_HOST_EDGE`] — not on-chain AggregateStateNullifierV3.
+        // Fence is claim ownership, not status alone.
+        if let Err(msg) = crate::v11::ensure_completion_ready(&entry) {
+            return fail_v11_as_owner(
                 job_store,
                 app_state,
                 notify_map,
                 public_id,
+                claim_owner,
                 "internal_error",
-                "v1.1 finalise: no finalise driver and no durable completion_result \
-                 — cannot prove/apply or complete (incomplete capability path; \
-                 refusing to half-finish)"
-                    .to_string(),
+                format!("v1.1 finalise: incomplete capability for host complete: {msg}"),
             )
             .await;
-        };
+        }
+        let response_body = entry
+            .completion_result
+            .clone()
+            .expect("ensure_completion_ready checked");
+        let response_status = entry
+            .completion_status
+            .expect("ensure_completion_ready checked");
+        let completed = job_store
+            .complete_if_finalise_owner(
+                public_id,
+                claim_owner,
+                response_body.clone(),
+                response_status,
+            )
+            .await?;
+        if completed {
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Completed,
+                    phase: "completed".to_string(),
+                    proof_id: None,
+                    result: Some(response_body),
+                    error: None,
+                },
+            );
+            tracing::info!(
+                "Job dispatcher: job {} reached host finalise edge ({}); \
+                 on-chain nullifier publish is not driven by this path",
+                public_id,
+                JOB_FINALISE_HOST_EDGE
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+        } else {
+            tracing::info!(
+                "Job dispatcher: job {} complete_if_finalise_owner was a no-op \
+                 (ownership lost or already terminal); leaving shared notify intact",
+                public_id
+            );
+        }
+        Ok(())
+    };
 
-        // publisher_pubkey is only the staged capability field — no silent
-        // fall-back to a root request_body key.
-        let publisher_pubkey = entry.publisher_pubkey;
-        // Renew the lease for the whole long prove/apply/stage window so a
-        // multi-minute prove cannot outlive a one-shot claim.
-        // Fail closed: any liveness failure aborts and discards the hook
-        // result rather than applying under a lost claim.
-        let hook_result = with_finalise_lease_heartbeat(
-            job_store,
-            public_id,
-            job_store.process_owner(),
-            crate::job_store::FINALISE_CLAIM_LEASE,
-            crate::job_store::FINALISE_CLAIM_RENEW_INTERVAL,
-            hook(entry.pending.clone(), signature),
-        )
-        .await;
-        let hook_result = match hook_result {
-            Ok(inner) => inner,
-            Err(lost) => {
-                // Lease liveness failed: discard any in-flight prove result,
-                // do not fail the job (another resumer must be able to pick
-                // it up once the claim is free), leave shared notify intact.
-                tracing::error!(
-                    %public_id,
-                    reason = %lost,
-                    "Job dispatcher: finalise aborted — lease liveness lost mid-prove; \
-                     result discarded; job left for a later resumer"
-                );
-                return Ok(());
-            }
-        };
-        match hook_result {
-            Ok(mut outcome) => {
-                if outcome.publisher_pubkey.is_none() {
-                    outcome.publisher_pubkey = publisher_pubkey;
-                }
-                let response_body = outcome.to_result_json();
-                if let Err(e) = entry.install_completion(response_body, 200) {
-                    return fail_v11(
-                        job_store,
-                        app_state,
-                        notify_map,
-                        public_id,
-                        "internal_error",
-                        format!("v1.1 finalise: install_completion failed: {e}"),
-                    )
-                    .await;
-                }
-                // Persist completion onto the durable capability **before**
-                // the terminal complete flip so a crash here is resumable.
-                let persist = match crate::v11::DurableFinalisationPersist::from_entry(&entry) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return fail_v11(
-                            job_store,
-                            app_state,
-                            notify_map,
-                            public_id,
-                            "internal_error",
-                            format!("v1.1 finalise: encode completion capability: {e}"),
-                        )
-                        .await;
-                    }
-                };
-                let persist_val = match serde_json::to_value(&persist) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return fail_v11(
-                            job_store,
-                            app_state,
-                            notify_map,
-                            public_id,
-                            "internal_error",
-                            format!("v1.1 finalise: json-encode completion capability: {e}"),
-                        )
-                        .await;
-                    }
-                };
-                // Reload body under broadcasting, merge finalisation key.
-                let latest = job_store.load(public_id).await?;
-                let Some(latest) = latest else {
-                    return fail_v11(
-                        job_store,
-                        app_state,
-                        notify_map,
-                        public_id,
-                        "internal_error",
-                        "v1.1 finalise: job missing while persisting completion".to_string(),
-                    )
-                    .await;
-                };
-                if latest.status != JobStatus::Broadcasting {
-                    // Lost claim or concurrent terminal — do not clobber.
-                    cleanup_pending_sign(job_store, app_state, public_id).await;
-                    notify_map.remove(&public_id);
-                    return Ok(());
-                }
-                let mut body = latest.request_body;
-                body.as_object_mut()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("v1.1 finalise: request_body is not a JSON object")
-                    })?
-                    .insert(crate::v11::FINALISATION_BODY_KEY.to_string(), persist_val);
-                let wrote = job_store
-                    .replace_request_body_if_status(public_id, JobStatus::Broadcasting, &body)
-                    .await?;
-                if !wrote {
-                    tracing::info!(
-                        "Job dispatcher: job {} completion persist was a no-op \
-                         (status moved); exiting without re-complete",
-                        public_id
-                    );
-                    cleanup_pending_sign(job_store, app_state, public_id).await;
-                    notify_map.remove(&public_id);
-                    return Ok(());
-                }
-                app_state.pending_sign_map.insert(public_id, entry.clone());
-            }
-            Err(e) => {
-                let msg = format!("v1.1 finalise failed: {e}");
-                tracing::warn!("Job dispatcher: job {} {}", public_id, msg);
-                let err = crate::v11::encode_job_error("proving_failed", msg);
-                let _ = job_store
-                    .fail_if_status(
-                        public_id,
-                        &[JobStatus::AwaitingSignature, JobStatus::Broadcasting],
-                        &err,
-                    )
-                    .await?;
-                publish_phase(
-                    notify_map,
-                    public_id,
-                    JobPhaseEvent {
-                        status: JobStatus::Failed,
-                        phase: "failed".to_string(),
-                        proof_id: None,
-                        result: None,
-                        error: Some(err),
-                    },
-                );
-                cleanup_pending_sign(job_store, app_state, public_id).await;
-                notify_map.remove(&public_id);
-                return Ok(());
-            }
+    match with_finalise_lease_heartbeat(
+        job_store,
+        public_id,
+        claim_owner,
+        crate::job_store::FINALISE_CLAIM_LEASE,
+        crate::job_store::FINALISE_CLAIM_RENEW_INTERVAL,
+        crate::job_store::FINALISE_CLAIM_RENEW_TIMEOUT,
+        owned_drive,
+    )
+    .await
+    {
+        Ok(inner) => inner,
+        Err(lost) => {
+            // Lease liveness failed: discard any in-flight prove result,
+            // do not fail the job (another resumer must be able to pick
+            // it up once the claim is free), leave shared notify intact.
+            // Even if work segments still run until the next `.await`,
+            // owner-qualified writes refuse commits from this process.
+            tracing::error!(
+                %public_id,
+                reason = %lost,
+                "Job dispatcher: finalise aborted — lease liveness lost mid-operation; \
+                 result discarded; job left for a later resumer"
+            );
+            Ok(())
         }
     }
-
-    // Host §7.5 job-result publication + terminal complete.
-    // This is [`JOB_FINALISE_HOST_EDGE`] — not on-chain AggregateStateNullifierV3.
-    if let Err(msg) = crate::v11::ensure_completion_ready(&entry) {
-        return fail_v11(
-            job_store,
-            app_state,
-            notify_map,
-            public_id,
-            "internal_error",
-            format!("v1.1 finalise: incomplete capability for host complete: {msg}"),
-        )
-        .await;
-    }
-    let response_body = entry
-        .completion_result
-        .clone()
-        .expect("ensure_completion_ready checked");
-    let response_status = entry
-        .completion_status
-        .expect("ensure_completion_ready checked");
-    let completed = job_store
-        .complete_if_status(
-            public_id,
-            &[JobStatus::Broadcasting],
-            response_body.clone(),
-            response_status,
-        )
-        .await?;
-    if completed {
-        publish_phase(
-            notify_map,
-            public_id,
-            JobPhaseEvent {
-                status: JobStatus::Completed,
-                phase: "completed".to_string(),
-                proof_id: None,
-                result: Some(response_body),
-                error: None,
-            },
-        );
-        tracing::info!(
-            "Job dispatcher: job {} reached host finalise edge ({}); \
-             on-chain nullifier publish is not driven by this path",
-            public_id,
-            JOB_FINALISE_HOST_EDGE
-        );
-    } else {
-        tracing::info!(
-            "Job dispatcher: job {} complete_if_status was a no-op (already terminal)",
-            public_id
-        );
-    }
-
-    cleanup_pending_sign(job_store, app_state, public_id).await;
-    notify_map.remove(&public_id);
-    Ok(())
 }
 
 // Retained for any residual call sites; production path uses the capability.

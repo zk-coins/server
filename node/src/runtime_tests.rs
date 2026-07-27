@@ -34,7 +34,8 @@ use crate::job_store::{
     CreateResult, FinaliseClaim, JobKind, JobStatus, JobStore, FINALISE_CLAIM_PHASE,
 };
 use crate::runtime::{
-    boot_finalise_action_after_release, boot_resume_jobs, start_rest_node, BootFinaliseAction,
+    boot_finalise_action_after_release, boot_finalise_disposition, boot_resume_jobs,
+    start_rest_node, BootFinaliseAction, BootRowDisposition,
 };
 use crate::state::State;
 use crate::test_db::setup_pool;
@@ -464,6 +465,52 @@ async fn live_claim_not_enqueued_then_deferred_reclaim_after_expiry() {
 
     clear_process_stack_mode_for_test();
     drop(scope);
+}
+
+/// Defect 2 (P0): a database error at boot leaves the row untouched for
+/// retry — pure disposition table (same decisions `boot_resume_jobs` applies).
+#[test]
+fn boot_db_error_disposition_leaves_row_untouched_for_retry() {
+    // release_stale DB error → no mutation, no enqueue, retry later.
+    assert_eq!(
+        boot_finalise_disposition(Err(()), Ok(None)),
+        BootRowDisposition::LeaveUntouchedForRetry
+    );
+    // release Ok(false) but phase reload DB error → release did not mutate;
+    // leave untouched (do not invent free/owned).
+    assert_eq!(
+        boot_finalise_disposition(Err(()), Err(())),
+        BootRowDisposition::LeaveUntouchedForRetry
+    );
+    assert_eq!(
+        boot_finalise_disposition(Ok(false), Err(())),
+        BootRowDisposition::LeaveUntouchedForRetry
+    );
+    // Successful release → enqueue without needing phase (avoids half-handle
+    // if a subsequent load would have failed under the old `?` path).
+    assert_eq!(
+        boot_finalise_disposition(Ok(true), Err(())),
+        BootRowDisposition::Act(BootFinaliseAction::EnqueueNow)
+    );
+    assert_eq!(
+        boot_finalise_disposition(Ok(true), Ok(None)),
+        BootRowDisposition::Act(BootFinaliseAction::EnqueueNow)
+    );
+    // Ok(false) + still claimed → defer (not free).
+    assert_eq!(
+        boot_finalise_disposition(Ok(false), Ok(Some(FINALISE_CLAIM_PHASE))),
+        BootRowDisposition::Act(BootFinaliseAction::DeferUntilAbandoned)
+    );
+    // Ok(false) + free phase → enqueue.
+    assert_eq!(
+        boot_finalise_disposition(Ok(false), Ok(Some("publishing"))),
+        BootRowDisposition::Act(BootFinaliseAction::EnqueueNow)
+    );
+    // Ok(false) + vanished → skip.
+    assert_eq!(
+        boot_finalise_disposition(Ok(false), Ok(None)),
+        BootRowDisposition::Act(BootFinaliseAction::Skip)
+    );
 }
 
 /// Defect 2 (P0): free-phase edge job (no exclusive claim) is enqueued even

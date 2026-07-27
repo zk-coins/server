@@ -878,6 +878,7 @@ async fn prove_longer_than_lease_period_blocks_second_resumer() {
         owner,
         lease,
         renew_every,
+        Duration::from_secs(5),
         async {
             tokio::time::sleep(long_prove).await;
         },
@@ -926,6 +927,7 @@ async fn heartbeat_renew_false_aborts_work_and_discards_result() {
 
     let result = with_finalise_lease_heartbeat_renew(
         Duration::from_millis(50),
+        Duration::from_secs(5),
         move || {
             let renew_calls_h = Arc::clone(&renew_calls_h);
             async move {
@@ -972,6 +974,7 @@ async fn heartbeat_renew_error_aborts_work_and_discards_result() {
 
     let result = with_finalise_lease_heartbeat_renew(
         Duration::from_millis(50),
+        Duration::from_secs(5),
         || async { Err("simulated db error".to_string()) },
         async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1015,6 +1018,7 @@ async fn heartbeat_task_death_aborts_work_and_discards_result() {
 
     let result = with_finalise_lease_heartbeat_renew(
         Duration::from_millis(50),
+        Duration::from_secs(5),
         move || {
             let calls_h = Arc::clone(&calls_h);
             async move {
@@ -1108,6 +1112,7 @@ async fn mid_prove_lease_loss_aborts_via_real_store_renew() {
         owner,
         lease,
         renew_every,
+        Duration::from_secs(5),
         async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
             work_finished_h.store(true, Ordering::SeqCst);
@@ -1125,6 +1130,180 @@ async fn mid_prove_lease_loss_aborts_via_real_store_renew() {
         !work_finished.load(Ordering::SeqCst),
         "prove work must not complete after lease loss"
     );
+
+    drop(scope);
+}
+
+/// Defect 1 (P0): a stalled `renew()` await is treated as ownership loss,
+/// not an unbounded pause while work keeps running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_renew_is_treated_as_liveness_loss() {
+    use crate::job_dispatcher::{
+        with_finalise_lease_heartbeat_renew, FinaliseLeaseLivenessLost,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let work_finished = Arc::new(AtomicBool::new(false));
+    let work_finished_h = Arc::clone(&work_finished);
+
+    let result = with_finalise_lease_heartbeat_renew(
+        Duration::from_millis(30),
+        Duration::from_millis(80),
+        || async {
+            // Never completes — simulates a hung database round-trip.
+            std::future::pending::<Result<bool, String>>().await
+        },
+        async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            work_finished_h.store(true, Ordering::SeqCst);
+            "should_not_complete"
+        },
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        Err(FinaliseLeaseLivenessLost::RenewTimedOut),
+        "stalled renew must surface as RenewTimedOut"
+    );
+    assert!(
+        !work_finished.load(Ordering::SeqCst),
+        "work must abort when renew stalls past the bound"
+    );
+}
+
+/// Defect 1 (P0): a worker that lost its lease cannot commit completion
+/// (or terminal complete) even if it keeps running — the fence is the
+/// owner-qualified write, not cooperative cancellation.
+#[tokio::test]
+async fn lost_lease_worker_cannot_commit_completion_or_complete() {
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let loser = uuid::Uuid::new_v4();
+    let winner = uuid::Uuid::new_v4();
+    let loser_store = JobStore::with_process_owner(scope.pool.clone(), loser);
+    let winner_store = JobStore::with_process_owner(scope.pool.clone(), winner);
+
+    let result = loser_store
+        .create(
+            JobKind::Send,
+            &account_addr(0xD1),
+            Some("k-lost-cannot-commit"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    loser_store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    assert_eq!(
+        loser_store
+            .claim_finalise_exclusive_as(job_id, loser, Duration::from_secs(60))
+            .await
+            .expect("loser claim"),
+        FinaliseClaim::Won
+    );
+
+    // Steal the claim for another owner (lease expiry + release + re-claim).
+    sqlx::query(
+        "UPDATE jobs SET request_body = jsonb_set( \
+             COALESCE(request_body, '{}'::jsonb), \
+             '{finalise_claim,lease_expires_at}', \
+             to_jsonb('1970-01-01T00:00:00Z'::text), \
+             true \
+         ) WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .execute(loser_store.pool())
+    .await
+    .expect("expire loser lease");
+    assert!(
+        winner_store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release stale"),
+        "expired claim must release"
+    );
+    assert_eq!(
+        winner_store
+            .claim_finalise_exclusive_as(job_id, winner, Duration::from_secs(60))
+            .await
+            .expect("winner claim"),
+        FinaliseClaim::Won
+    );
+
+    // Contrast: status-only complete WOULD still match (status=broadcasting).
+    // That is exactly why the fence must be ownership, not status.
+    // Loser "kept running" and tries owner-qualified commits — must not apply.
+    let completion = serde_json::json!({
+        "pending": {"fake": true},
+        "signature": null,
+        "completion_result": {"ok": true},
+        "completion_status": 200
+    });
+    assert!(
+        !loser_store
+            .merge_finalisation_if_finalise_owner(job_id, loser, &completion)
+            .await
+            .expect("merge attempt"),
+        "lost owner must not persist completion capability"
+    );
+    assert!(
+        !loser_store
+            .complete_if_finalise_owner(job_id, loser, serde_json::json!({"stolen": true}), 200)
+            .await
+            .expect("complete attempt"),
+        "lost owner must not complete the job"
+    );
+    assert!(
+        !loser_store
+            .fail_if_finalise_owner(job_id, loser, "loser must not fail winner's job")
+            .await
+            .expect("fail attempt"),
+        "lost owner must not fail the job"
+    );
+
+    let row = winner_store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(row.status, JobStatus::Broadcasting);
+    assert_eq!(row.phase, FINALISE_CLAIM_PHASE);
+    let winner_s = winner.to_string();
+    let claim_owner = row
+        .request_body
+        .get("finalise_claim")
+        .and_then(|c| c.get("owner"))
+        .and_then(|o| o.as_str());
+    assert_eq!(claim_owner, Some(winner_s.as_str()));
+    assert!(
+        row.request_body.get("finalisation").is_none(),
+        "loser must not have written finalisation"
+    );
+
+    // Winner can still commit under the ownership fence.
+    assert!(
+        winner_store
+            .merge_finalisation_if_finalise_owner(job_id, winner, &completion)
+            .await
+            .expect("winner merge"),
+        "current owner must persist completion"
+    );
+    assert!(
+        winner_store
+            .complete_if_finalise_owner(job_id, winner, serde_json::json!({"ok": true}), 200)
+            .await
+            .expect("winner complete"),
+        "current owner must complete"
+    );
+    let done = winner_store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(done.status, JobStatus::Completed);
 
     drop(scope);
 }
