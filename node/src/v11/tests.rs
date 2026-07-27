@@ -10,7 +10,9 @@ use shared::spec_v1::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use zkcoins_program::circuit::compliance::Network;
-use zkcoins_prover::state_engine::{AccountRecord, ScannedNullifier, StateEngine, TrackedCoin};
+use zkcoins_prover::state_engine::{
+    AccountRecord, MintRequest, OpSecret, ScannedNullifier, StateEngine, TrackedCoin,
+};
 
 use super::db_v11::{self, EngineSnapshot};
 use super::mode::{
@@ -196,6 +198,136 @@ fn flag_defaults_to_off_when_unset() {
     assert!(resolve_v11_shadow_mode(Some("true")).is_err());
     assert!(resolve_v11_shadow_mode(Some("1 ")).is_err());
     assert!(resolve_v11_shadow_mode(Some("legacy")).is_err());
+}
+
+/// Requirement 10: persist the operational bundle, drop local state, restore
+/// via [`db_v11::load_engine_snapshot`], reconstruct the engine, and reproduce
+/// a **prior** `nav_rand` opening from the restored `op_secret`.
+///
+/// Red if `load_engine_snapshot` dropped `op_secret` (e.g. restored as `None`):
+/// the cold engine would then have no secret to re-derive the opening with.
+#[tokio::test]
+async fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
+    use sha2::{Digest, Sha256};
+    use zkcoins_prover::prover_bridge::test_signing::{deterministic_secret, normalized_key};
+
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    claim_v11_marker(&pool).await;
+
+    let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/req10/restore/nk").into();
+    let (_, _, current_pubkey) =
+        normalized_key(deterministic_secret(b"zkCoins/v1/req10/restore/pk0"));
+    let (_, _, next_pubkey) = normalized_key(deterministic_secret(b"zkCoins/v1/req10/restore/pk1"));
+    let op_secret = OpSecret(Sha256::digest(b"zkCoins/v1/req10/restore/op_secret").into());
+    let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
+
+    // --- Live node issues an opening (genesis mint, entry send_counter = 0) ---
+    let engine = StateEngine::new(Network::Testnet, 0);
+    let mint_req = MintRequest {
+        owner,
+        nk,
+        op_secret,
+        current_pubkey,
+        next_pubkey,
+        name: b"Req10 Restore Asset".to_vec(),
+        decimals: 2,
+        amount: 100,
+        issuance_version: 1,
+        cap_total: 0,
+        terms_salt: [0u8; 32],
+        npk_rand: [0x22; 32],
+    };
+    let pending = engine.begin_mint(mint_req).expect("begin_mint");
+    let issued_nav_rand = pending.nav_opening.nav_rand;
+    let entry_counter = pending.witness_wip.prev_account_state.send_counter;
+    assert_eq!(entry_counter, 0, "genesis mint must open at send_counter 0");
+
+    // Persist the operational bundle the way apply would leave it on the
+    // account row: op_secret stored, send_counter advanced past the opening.
+    let mut balances = BTreeMap::new();
+    let minted = pending
+        .witness_wip
+        .output_coins
+        .first()
+        .expect("mint produces one output");
+    balances.insert(host::digest_to_bytes(&minted.asset_id), minted.amount);
+    let mut coinhist = CoinHistTree::new();
+    let coin_id = host::digest_to_bytes(&minted.identifier);
+    coinhist.admit(coin_id).expect("admit minted coin");
+    let post_state = AccountState::new(
+        owner,
+        host::nk_commit(&nk),
+        balances,
+        next_pubkey,
+        entry_counter + 1,
+        coinhist.root(),
+    )
+    .expect("post-mint AccountState");
+    let mut spendable = BTreeMap::new();
+    spendable.insert(
+        coin_id,
+        TrackedCoin {
+            coin: minted.clone(),
+            creating_prev_ash: host::account_state_hash(
+                &pending.witness_wip.prev_account_state,
+            )
+            .expect("prev ash"),
+            coin_index: 0,
+        },
+    );
+    let mut live = StateEngine::new(Network::Testnet, 0);
+    live.insert_account(
+        owner,
+        AccountRecord {
+            state: post_state,
+            coinhist,
+            nk,
+            op_secret: Some(op_secret),
+            genesis_pubkey: current_pubkey,
+            spendable,
+            spent_ids: BTreeSet::new(),
+            last_proof: None,
+            last_nav_opening: Some(pending.nav_opening),
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        },
+    )
+    .expect("insert account with operational bundle");
+
+    let snap = EngineSnapshot::from_engine_with_tip_hash(&live, [0x10; 32]);
+    db_v11::persist_engine_snapshot(&pool, &snap)
+        .await
+        .expect("persist engine snapshot with op_secret");
+
+    // --- Drop every local handle that still knows the secret / opening ---
+    drop(pending);
+    drop(live);
+    drop(snap);
+    drop(engine);
+
+    // --- Fresh node: load snapshot, reconstruct engine, reproduce opening ---
+    let loaded = db_v11::load_engine_snapshot(&pool)
+        .await
+        .expect("load_engine_snapshot")
+        .expect("snapshot must exist after persist");
+    let restored_engine = loaded.into_engine().expect("into_engine");
+    let restored_secret = restored_engine
+        .account(&owner)
+        .expect("account survived restore")
+        .op_secret
+        .expect("op_secret must survive load_engine_snapshot");
+
+    let rebuilt = host::derive_nav_rand(restored_secret.as_bytes(), entry_counter);
+    assert_eq!(
+        rebuilt, issued_nav_rand,
+        "restored op_secret + prior send_counter must reproduce the opening's nav_rand"
+    );
+    assert_ne!(
+        host::derive_nav_rand(restored_secret.as_bytes(), entry_counter + 1),
+        issued_nav_rand,
+        "a later send_counter must not reproduce the prior opening"
+    );
 }
 
 /// Defect 2: a parameter set that does not match its published identifier

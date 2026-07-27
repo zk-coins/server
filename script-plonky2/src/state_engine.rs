@@ -160,7 +160,20 @@ pub struct ReceiveRequest {
 
 /// Operational nav-rand secret (`A/4'`, §1.2). Part of the operational bundle
 /// entrusted to the account's **own** node — never sent to a foreign node,
-/// never logged, and never Debug-printed as raw bytes.
+/// never logged, and never formatted as raw bytes.
+///
+/// ## Formatting / outward surfaces
+///
+/// - [`Debug`] and [`Display`] always print `OpSecret([REDACTED])` so any
+///   `{:?}` / `{}` on a request, pending transition, capability, or account
+///   record is safe by construction (including nested `Job` / panic paths).
+/// - [`serde::Serialize`] / [`serde::Deserialize`] intentionally carry the
+///   raw 32 bytes: durable finalisation persists
+///   `bincode(FinalisationCapability)` (which embeds this secret) and the
+///   account row stores it as `BYTEA`. Those paths are storage, not logs.
+///   Callers that embed the serialized form in a `Debug` surface (e.g. hex
+///   of the capability blob) must redact at *that* type — see
+///   `DurableFinalisationPersist` / `Job`.
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OpSecret(pub [u8; 32]);
 
@@ -171,6 +184,12 @@ impl OpSecret {
 }
 
 impl std::fmt::Debug for OpSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpSecret([REDACTED])")
+    }
+}
+
+impl std::fmt::Display for OpSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("OpSecret([REDACTED])")
     }
@@ -3285,13 +3304,24 @@ mod tests {
             host::derive_nav_rand(req.op_secret.as_bytes(), 1),
             "different send_counter must change nav_rand"
         );
-        // OpSecret must never Debug-print raw bytes.
+        // OpSecret must never Debug-/Display-print raw bytes — including when
+        // nested under a derived-Debug request type.
         let dbg = format!("{:?}", req.op_secret);
         assert_eq!(dbg, "OpSecret([REDACTED])");
+        assert_eq!(format!("{}", req.op_secret), "OpSecret([REDACTED])");
         let raw = format!("{:?}", req.op_secret.as_bytes());
         assert!(
             !dbg.contains(&raw),
             "Debug must not embed the raw secret bytes"
+        );
+        let req_dbg = format!("{req:?}");
+        assert!(
+            req_dbg.contains("OpSecret([REDACTED])"),
+            "MintRequest Debug must redact op_secret; got: {req_dbg}"
+        );
+        assert!(
+            !req_dbg.contains(&raw),
+            "MintRequest Debug must not embed raw op_secret bytes"
         );
     }
 
@@ -3387,9 +3417,16 @@ mod tests {
         );
     }
 
-    /// Requirement 10: a fresh node that restores the operational bundle
-    /// (here: `op_secret` + account `send_counter` history) reproduces a prior
-    /// opening's `nav_rand`. Red if nav_rand were caller-supplied ephemera.
+    /// Requirement 10 (engine-level): drop the live engine, rebuild from a
+    /// persisted-shaped [`AccountRecord`] that carries the operational
+    /// bundle (`op_secret` + `send_counter` history), and reproduce the
+    /// prior opening from the **restored** secret — not from the original
+    /// request still held in locals. Red if `op_secret` were omitted from
+    /// the restored record.
+    ///
+    /// The DB-backed form (persist → `load_engine_snapshot` → `into_engine`)
+    /// lives in `node::v11::tests` so forcing `op_secret: None` on load
+    /// actually fails the suite.
     #[test]
     fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
         let engine = StateEngine::new(Network::Testnet, 0);
@@ -3398,20 +3435,95 @@ mod tests {
         let issued_nav_rand = pending.nav_opening.nav_rand;
         let entry_counter = pending.witness_wip.prev_account_state.send_counter;
         assert_eq!(entry_counter, 0);
+        // Capture only what a durable account row would hold; drop every
+        // live handle that still carries the original request secret.
+        let owner = req.owner;
+        let nk = req.nk;
+        let current_pubkey = req.current_pubkey;
+        let next_pubkey = req.next_pubkey;
+        let name = req.name.clone();
+        let persisted_op_secret = req.op_secret;
+        drop(engine);
+        drop(pending);
+        drop(req);
 
-        // "Fresh node": only the operational secret and the counter that
-        // described the transition — no local pending state.
-        let restored_op_secret = req.op_secret;
-        let rebuilt = host::derive_nav_rand(restored_op_secret.as_bytes(), entry_counter);
+        let cold_state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            current_pubkey,
+            entry_counter,
+            host::coinhist_empty_root(),
+        )
+        .expect("restored empty account state");
+        let cold = StateEngine::from_persisted(
+            Network::Testnet,
+            0,
+            0,
+            0,
+            vec![],
+            vec![(
+                owner,
+                AccountRecord {
+                    state: cold_state,
+                    coinhist: CoinHistTree::new(),
+                    nk,
+                    op_secret: Some(persisted_op_secret),
+                    genesis_pubkey: current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )],
+        )
+        .expect("reconstruct engine from restored bundle");
+        // Do not use `persisted_op_secret` below — only the copy inside `cold`.
+        let _ = persisted_op_secret;
+
+        let restored = cold
+            .account(&owner)
+            .expect("account present after restore")
+            .op_secret
+            .expect("op_secret must be present on restored record");
+        // Equality against the inserted value proves from_persisted kept it;
+        // the bytes for derivation come only from `restored`.
+        assert_eq!(restored, persisted_op_secret);
+        let rebuilt = host::derive_nav_rand(restored.as_bytes(), entry_counter);
         assert_eq!(
             rebuilt, issued_nav_rand,
             "restored bundle must rebuild the opening's nav_rand"
         );
 
-        // A second transition at counter 1 is a different opening.
+        // Re-issue on a brand-new empty engine using only the secret read
+        // back from the reconstructed record (genesis path; the cold
+        // account is deliberately not used for AccountUpdateProof).
+        let reissued = StateEngine::new(Network::Testnet, 0)
+            .begin_mint(MintRequest {
+                owner,
+                nk,
+                op_secret: restored,
+                current_pubkey,
+                next_pubkey,
+                name,
+                decimals: 2,
+                amount: 100,
+                issuance_version: 1,
+                cap_total: 0,
+                terms_salt: [0; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect("re-mint from restored secret");
+        assert_eq!(
+            reissued.nav_opening.nav_rand, issued_nav_rand,
+            "fresh engine keyed by restored op_secret must re-issue the same opening"
+        );
         assert_ne!(
-            host::derive_nav_rand(restored_op_secret.as_bytes(), 1),
-            issued_nav_rand
+            host::derive_nav_rand(restored.as_bytes(), 1),
+            issued_nav_rand,
+            "a different send_counter must not reproduce the prior opening"
         );
     }
 }

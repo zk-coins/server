@@ -201,7 +201,12 @@ impl JobKind {
 ///
 /// Mirrors the column order in migration 0014. Decoded by
 /// [`Job::from_row`] so every read site shares one decode path.
-#[derive(Debug, Clone)]
+///
+/// [`Debug`] redacts durable finalisation material in `request_body`
+/// (`finalisation.capability_bincode_hex` holds bincode of a
+/// [`zkcoins_prover::state_engine::FinalisationCapability`], which
+/// embeds `op_secret`). Logging/`{:?}` on a `Job` must not print that key.
+#[derive(Clone)]
 pub struct Job {
     pub id: i64,
     pub public_id: Uuid,
@@ -219,6 +224,70 @@ pub struct Job {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl std::fmt::Debug for Job {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Job")
+            .field("id", &self.id)
+            .field("public_id", &self.public_id)
+            .field("kind", &self.kind)
+            .field("status", &self.status)
+            .field("phase", &self.phase)
+            .field("account_address", &self.account_address)
+            .field("idempotency_key", &self.idempotency_key)
+            .field(
+                "request_body",
+                &RedactedJobJson(&self.request_body),
+            )
+            .field(
+                "response_body",
+                &self.response_body.as_ref().map(RedactedJobJson),
+            )
+            .field("response_status", &self.response_status)
+            .field("proof_id", &self.proof_id)
+            .field("error", &self.error)
+            .field("progress", &self.progress)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("completed_at", &self.completed_at)
+            .finish()
+    }
+}
+
+/// `Debug` wrapper that redacts `finalisation.capability_bincode_hex` (and
+/// the legacy `pending_sign` key) so `op_secret` inside the bincode blob
+/// never appears in log/panic output.
+struct RedactedJobJson<'a>(&'a serde_json::Value);
+
+impl std::fmt::Debug for RedactedJobJson<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match redact_job_json_for_debug(self.0.clone()) {
+            Ok(v) => write!(f, "{v:?}"),
+            Err(_) => f.write_str("<request_body redaction failed>"),
+        }
+    }
+}
+
+fn redact_job_json_for_debug(mut body: serde_json::Value) -> Result<serde_json::Value, ()> {
+    const REDACTED: &str = "[REDACTED]";
+    if let Some(obj) = body.as_object_mut() {
+        for key in ["finalisation", "pending_sign"] {
+            if let Some(slot) = obj.get_mut(key) {
+                if let Some(inner) = slot.as_object_mut() {
+                    if inner.contains_key("capability_bincode_hex") {
+                        inner.insert(
+                            "capability_bincode_hex".to_string(),
+                            serde_json::Value::String(REDACTED.to_string()),
+                        );
+                    }
+                } else {
+                    *slot = serde_json::Value::String(REDACTED.to_string());
+                }
+            }
+        }
+    }
+    Ok(body)
 }
 
 impl Job {

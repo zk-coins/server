@@ -482,7 +482,11 @@ pub const PENDING_SIGN_BODY_KEY: &str = "pending_sign";
 /// `capability` is **bincode → lowercase hex** so large `ComplianceProof`s
 /// stay off the JSON tree while remaining a single opaque blob. Network,
 /// publisher, and completion stay as plain JSON fields for operators.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// [`Debug`] redacts `capability_bincode_hex`: the blob embeds `op_secret`
+/// via [`PendingTransition`], so printing the hex would leak the key that
+/// keys every `nav_rand` for the account.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DurableFinalisationPersist {
     pub network: String,
     /// Lowercase hex of bincode([`FinalisationCapability`]).
@@ -495,6 +499,18 @@ pub struct DurableFinalisationPersist {
     /// HTTP status for job complete; present iff `completion_result` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_status: Option<i16>,
+}
+
+impl std::fmt::Debug for DurableFinalisationPersist {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableFinalisationPersist")
+            .field("network", &self.network)
+            .field("capability_bincode_hex", &"[REDACTED]")
+            .field("publisher_pubkey", &self.publisher_pubkey)
+            .field("completion_result", &self.completion_result)
+            .field("completion_status", &self.completion_status)
+            .finish()
+    }
 }
 
 impl DurableFinalisationPersist {
