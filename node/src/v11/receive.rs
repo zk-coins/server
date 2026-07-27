@@ -106,7 +106,7 @@ use zkcoins_prover::prover_bridge::{
     ComplianceProof, NavOpening, NullifierOpening, OutputInclusionProof, ReceivedAuthorization,
     TransitionSignature,
 };
-use zkcoins_prover::publisher::{BatchMember, PreparedBatch, PublishedBatch, Publisher};
+use zkcoins_prover::publisher::{BatchMember, PreparedBatch, PublishedBatch};
 use zkcoins_prover::state_engine::{
     AppliedTransition, PendingTransition, ReceiveRequest, StateEngine,
 };
@@ -116,7 +116,7 @@ use super::db_v11::{
     self, PENDING_PUBLISH_COMMIT_BROADCAST, PENDING_PUBLISH_CONSTRUCTED,
     PENDING_PUBLISH_MEMBERS_READY, PENDING_PUBLISH_REVEAL_BROADCAST,
 };
-use super::publish::publish_v11_batch;
+use super::publish::V11Publisher;
 use super::separation::{process_stack_mode, require_v11_process_for_nflog_write, ScanStackMode};
 
 /// Error prefix when the legacy bookkeeping receive is attempted under the
@@ -217,8 +217,13 @@ pub struct PublishedBatchSummary {
     pub nullifier_pks: Vec<[u8; 32]>,
 }
 
-/// Abstraction over the Stage-2 nullifier publisher so unit tests can
-/// record the batch without bitcoind.
+/// Crate-private abstraction over the Stage-2 nullifier publisher so unit
+/// tests can record the batch without bitcoind — **private test polymorphism**.
+///
+/// Not part of the `node` public surface: a downstream crate that depends only
+/// on `node` cannot name this trait, call it via UFCS, or substitute its own
+/// implementation. Production callers hold a [`V11Publisher`]; tests inside
+/// this crate implement the trait for doubles such as `RecordingPublisher`.
 ///
 /// Durable crash recovery uses [`Self::try_prepare`] when the implementation
 /// can construct the commit/reveal pair without broadcasting. Test doubles
@@ -226,7 +231,7 @@ pub struct PublishedBatchSummary {
 /// fall back to [`Self::publish_batch`] after the `members_ready` row is
 /// durable (rebroadcast of the signature is possible; mid-pair recovery of
 /// raw txs is not, because no real txs exist).
-pub trait NullifierBatchPublisher {
+pub(crate) trait NullifierBatchPublisher {
     fn publish_batch(&self, members: &[BatchMember]) -> Result<PublishedBatch>;
 
     /// Construct a fee-converged commit/reveal pair without broadcasting.
@@ -247,21 +252,21 @@ pub trait NullifierBatchPublisher {
     }
 }
 
-impl NullifierBatchPublisher for Publisher {
+impl NullifierBatchPublisher for V11Publisher {
     fn publish_batch(&self, members: &[BatchMember]) -> Result<PublishedBatch> {
-        publish_v11_batch(self, members)
+        V11Publisher::publish_batch(self, members)
     }
 
     fn try_prepare(&self, members: &[BatchMember]) -> Result<Option<PreparedBatch>> {
-        Ok(Some(Publisher::prepare(self, members)?))
+        V11Publisher::try_prepare(self, members)
     }
 
     fn broadcast_commit(&self, prepared: &PreparedBatch) -> Result<bitcoin::Txid> {
-        Publisher::broadcast_commit(self, prepared)
+        V11Publisher::broadcast_commit(self, prepared)
     }
 
     fn broadcast_reveal(&self, prepared: &PreparedBatch) -> Result<bitcoin::Txid> {
-        Publisher::broadcast_reveal(self, prepared)
+        V11Publisher::broadcast_reveal(self, prepared)
     }
 }
 
@@ -353,6 +358,19 @@ pub async fn finalise_publish_persist(
     adapter: &EngineAdapter,
     pending: PendingTransition,
     signature: TransitionSignature,
+    publisher: &V11Publisher,
+    build_tip: BlockAnchor,
+) -> Result<V11ReceiveOutcome> {
+    finalise_publish_persist_with(adapter, pending, signature, publisher, build_tip).await
+}
+
+/// Crate-private generic path — production uses [`finalise_publish_persist`]
+/// with [`V11Publisher`]; in-crate tests substitute a
+/// [`NullifierBatchPublisher`] double.
+pub(crate) async fn finalise_publish_persist_with(
+    adapter: &EngineAdapter,
+    pending: PendingTransition,
+    signature: TransitionSignature,
     publisher: &impl NullifierBatchPublisher,
     build_tip: BlockAnchor,
 ) -> Result<V11ReceiveOutcome> {
@@ -372,7 +390,7 @@ pub async fn finalise_publish_persist(
         "v1.1 receive: prove_pending_transition failed — state unchanged, nothing persisted",
     )?;
 
-    commit_proved_receive(adapter, proved_pending, signature, publisher, build_tip).await
+    commit_proved_receive_with(adapter, proved_pending, signature, publisher, build_tip).await
 }
 
 /// State-critical section after unlocked prove: write-gate → revalidate/apply
@@ -402,6 +420,17 @@ pub async fn finalise_publish_persist(
 /// | commit `signature` (→ member `s` + `r_prime`) | **caller** | byte-equal to the proved envelope signature |
 /// | outcome `admitted_coin_ids` / `new_send_counter` | this transition | taken from the proved witness, not a post-gate live re-read |
 pub async fn commit_proved_receive(
+    adapter: &EngineAdapter,
+    proved_pending: zkcoins_prover::state_engine::ProvedPendingTransition,
+    signature: TransitionSignature,
+    publisher: &V11Publisher,
+    build_tip: BlockAnchor,
+) -> Result<V11ReceiveOutcome> {
+    commit_proved_receive_with(adapter, proved_pending, signature, publisher, build_tip).await
+}
+
+/// Crate-private generic path — see [`commit_proved_receive`].
+pub(crate) async fn commit_proved_receive_with(
     adapter: &EngineAdapter,
     proved_pending: zkcoins_prover::state_engine::ProvedPendingTransition,
     signature: TransitionSignature,
@@ -801,6 +830,15 @@ fn prepared_batch_from_pending_row(
 /// already in the mempool, or already spent are success signals, not errors.
 pub async fn resume_pending_publish(
     adapter: &EngineAdapter,
+    publisher: &V11Publisher,
+    pk: [u8; 32],
+) -> Result<Option<PublishedBatch>> {
+    resume_pending_publish_with(adapter, publisher, pk).await
+}
+
+/// Crate-private generic path — see [`resume_pending_publish`].
+pub(crate) async fn resume_pending_publish_with(
+    adapter: &EngineAdapter,
     publisher: &impl NullifierBatchPublisher,
     pk: [u8; 32],
 ) -> Result<Option<PublishedBatch>> {
@@ -906,6 +944,14 @@ pub async fn resume_pending_publish(
 /// (fail loud) — operators must not silently drop a half-broadcast nullifier.
 pub async fn resume_all_pending_publishes(
     adapter: &EngineAdapter,
+    publisher: &V11Publisher,
+) -> Result<usize> {
+    resume_all_pending_publishes_with(adapter, publisher).await
+}
+
+/// Crate-private generic path — see [`resume_all_pending_publishes`].
+pub(crate) async fn resume_all_pending_publishes_with(
+    adapter: &EngineAdapter,
     publisher: &impl NullifierBatchPublisher,
 ) -> Result<usize> {
     require_v11_process_for_nflog_write()
@@ -913,7 +959,7 @@ pub async fn resume_all_pending_publishes(
     let rows = db_v11::list_resumable_pending_publishes(adapter.pool()).await?;
     let mut completed = 0usize;
     for row in rows {
-        resume_pending_publish(adapter, publisher, row.pk)
+        resume_pending_publish_with(adapter, publisher, row.pk)
             .await
             .with_context(|| {
                 format!(
@@ -935,11 +981,22 @@ pub async fn execute_v11_receive(
     adapter: &EngineAdapter,
     req: V11ReceiveRequest,
     signature: TransitionSignature,
+    publisher: &V11Publisher,
+    build_tip: BlockAnchor,
+) -> Result<V11ReceiveOutcome> {
+    execute_v11_receive_with(adapter, req, signature, publisher, build_tip).await
+}
+
+/// Crate-private generic path — see [`execute_v11_receive`].
+pub(crate) async fn execute_v11_receive_with(
+    adapter: &EngineAdapter,
+    req: V11ReceiveRequest,
+    signature: TransitionSignature,
     publisher: &impl NullifierBatchPublisher,
     build_tip: BlockAnchor,
 ) -> Result<V11ReceiveOutcome> {
     let pending = adapter.with_engine(|engine| verify_and_begin_receive(engine, req))?;
-    finalise_publish_persist(adapter, pending, signature, publisher, build_tip).await
+    finalise_publish_persist_with(adapter, pending, signature, publisher, build_tip).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1992,7 +2049,7 @@ mod tests {
 
         // Resume from members_ready with a construct-capable publisher.
         let publisher = RecordingPublisher::new();
-        let published = resume_pending_publish(&reloaded, &publisher, pk)
+        let published = resume_pending_publish_with(&reloaded, &publisher, pk)
             .await
             .expect("resume")
             .expect("should produce a batch");
@@ -2071,7 +2128,7 @@ mod tests {
         let publisher = RecordingPublisher::with_broadcast_err(
             "sendrawtransaction RPC error: txn-already-known",
         );
-        let published = resume_pending_publish(&adapter, &publisher, pk)
+        let published = resume_pending_publish_with(&adapter, &publisher, pk)
             .await
             .expect("already-known must be success")
             .expect("batch");
@@ -2129,7 +2186,7 @@ mod tests {
         .await
         .expect("c2");
         let bad = RecordingPublisher::with_broadcast_err("connection refused");
-        let err = resume_pending_publish(&adapter, &bad, pk2)
+        let err = resume_pending_publish_with(&adapter, &bad, pk2)
             .await
             .expect_err("generic error must not be success");
         let msg = format!("{err:#}");
@@ -3017,7 +3074,7 @@ mod tests {
         );
 
         let publisher = RecordingPublisher::new();
-        let outcome = commit_proved_receive(
+        let outcome = commit_proved_receive_with(
             &adapter,
             proved,
             signature,
@@ -3119,7 +3176,7 @@ mod tests {
                 })
                 .expect("concurrent post-broadcast append");
         });
-        let outcome = commit_proved_receive(
+        let outcome = commit_proved_receive_with(
             &adapter,
             proved,
             signature,
@@ -3187,7 +3244,7 @@ mod tests {
             .collect();
 
         let publisher = RecordingPublisher::new();
-        let outcome = finalise_publish_persist(
+        let outcome = finalise_publish_persist_with(
             &adapter,
             pending_rx,
             signature,

@@ -26,8 +26,9 @@
 //! Raw publish / DB-write / adapter-mutation / scan-apply sinks are
 //! `pub(crate)` (crate-private). Downstream crates see only capability-
 //! carrying entry points: receive facade, scan apply orchestration, and
-//! publisher connect/env. Assembling a durable effect from raw parts is a
-//! compile error — see `tests/sealed_plumbing_compile_fail_matrix.rs`.
+//! an opaque [`V11Publisher`] from connect/env. The foreign publisher type
+//! never leaves the package; assembling a durable effect from raw parts is
+//! a compile error — see `tests/sealed_plumbing_compile_fail_matrix.rs`.
 
 mod adapter;
 pub mod db_v11;
@@ -42,13 +43,12 @@ pub use mode::{
     parse_network_label, resolve_v11_shadow_mode, v11_shadow_mode_from_env, validate_v11_boot_pins,
     V11BootPins, V11ShadowMode, V11_BOOT_CONFIG_ERROR,
 };
-pub use publish::{connect_v11_publisher, v11_publisher_env_from_env, V11PublisherEnv};
+pub use publish::{connect_v11_publisher, v11_publisher_env_from_env, V11Publisher, V11PublisherEnv};
 pub use receive::{
     commit_proved_receive, execute_v11_receive, finalise_publish_persist,
     refuse_legacy_receive_under_v11, resume_all_pending_publishes, resume_pending_publish,
     verify_and_begin_receive, verify_clause10_slot, verify_creating_nullifier_binding,
-    NullifierBatchPublisher, ReceivedCoinSlot, V11ReceiveOutcome, V11ReceiveRequest,
-    LEGACY_RECEIVE_REFUSED_UNDER_V11,
+    ReceivedCoinSlot, V11ReceiveOutcome, V11ReceiveRequest, LEGACY_RECEIVE_REFUSED_UNDER_V11,
 };
 pub use scan::{
     apply_canonical_survivors, apply_forward_scan, first_boot_requires_full_replace,
