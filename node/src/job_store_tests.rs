@@ -669,6 +669,244 @@ async fn live_owner_claim_survives_boot_release_sweep() {
     drop(scope);
 }
 
+/// Defect 2 (P0): lease expiry is created with Postgres `NOW()`, not host
+/// `Utc::now()`. Host/DB clock skew cannot manufacture abandonment of a
+/// still-live owner because create and evaluate share one clock.
+#[tokio::test]
+async fn finalise_claim_lease_uses_database_clock_not_host() {
+    let (store, _c) = setup_store().await;
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xCC),
+            Some("k-db-clock"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let lease = std::time::Duration::from_secs(300);
+    assert_eq!(
+        store
+            .claim_finalise_exclusive_as(job_id, store.process_owner(), lease)
+            .await
+            .expect("claim"),
+        FinaliseClaim::Won
+    );
+
+    // Remaining lease lifetime measured against DB NOW() must be ≈ lease.
+    let remaining_secs: f64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM ( \
+             (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz \
+             - NOW() \
+         ))::float8 \
+         FROM jobs WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(store.pool())
+    .await
+    .expect("remaining lease");
+    assert!(
+        (remaining_secs - 300.0).abs() < 3.0,
+        "lease_expires_at must be NOW()+lease on the database clock; remaining={remaining_secs}s"
+    );
+
+    // Live under DB comparison — boot cannot free it.
+    assert!(
+        !store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release"),
+        "DB-live lease must not be released"
+    );
+}
+
+/// Defect 2 (P0): host clock cannot expire a lease that is still live on
+/// the database clock. Plant an expiry that is still `> NOW()` in Postgres;
+/// release_stale must refuse regardless of what the host wall clock says.
+#[tokio::test]
+async fn host_db_clock_skew_cannot_expire_live_lease() {
+    let (store, _c) = setup_store().await;
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xCD),
+            Some("k-clock-skew"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+    assert_eq!(
+        store.claim_finalise_exclusive(job_id).await.expect("claim"),
+        FinaliseClaim::Won
+    );
+
+    // Force expiry to a value that is unambiguously live on the DB clock
+    // (NOW() + 1 hour). Even if the host clock were hours ahead, release
+    // only consults Postgres NOW().
+    sqlx::query(
+        "UPDATE jobs SET request_body = jsonb_set( \
+             COALESCE(request_body, '{}'::jsonb), \
+             '{finalise_claim,lease_expires_at}', \
+             to_jsonb((NOW() + interval '1 hour')::text), \
+             true \
+         ) WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .execute(store.pool())
+    .await
+    .expect("plant DB-future expiry");
+
+    assert!(
+        !store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release"),
+        "lease still live on database clock must survive release sweep"
+    );
+    // Second process still loses the exclusive claim.
+    let other = JobStore::with_process_owner(store.pool().clone(), uuid::Uuid::new_v4());
+    assert!(
+        matches!(
+            other.claim_finalise_exclusive(job_id).await.expect("other claim"),
+            FinaliseClaim::Lost {
+                observed: JobStatus::Broadcasting
+            }
+        ),
+        "second resumer must lose while DB-live lease holds"
+    );
+}
+
+/// Defect 2 (P0): a "prove" longer than the lease period does **not** let a
+/// second resumer in, because the owner renews during the long operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prove_longer_than_lease_period_blocks_second_resumer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+    let other = JobStore::with_process_owner(scope.pool.clone(), uuid::Uuid::new_v4());
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xCE),
+            Some("k-long-prove-lease"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    // Short lease so the test budget is seconds, not minutes.
+    let lease = Duration::from_secs(1);
+    let renew_every = Duration::from_millis(250);
+    assert_eq!(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, lease)
+            .await
+            .expect("claim"),
+        FinaliseClaim::Won
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_probe = Arc::clone(&stop);
+    let other_store = other.clone();
+    // Probe: while the long operation runs, a second process must never
+    // free + win the claim.
+    let probe = tokio::spawn(async move {
+        let mut saw_live_block = false;
+        while !stop_probe.load(Ordering::SeqCst) {
+            let released = other_store
+                .release_stale_finalise_claim(job_id)
+                .await
+                .expect("release probe");
+            if released {
+                let claim = other_store
+                    .claim_finalise_exclusive_as(job_id, other_store.process_owner(), lease)
+                    .await
+                    .expect("claim probe");
+                if matches!(claim, FinaliseClaim::Won) {
+                    return Err("second resumer won claim during live long prove".to_string());
+                }
+            } else {
+                saw_live_block = true;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        if !saw_live_block {
+            return Err("probe never observed a live (unreleased) lease".to_string());
+        }
+        Ok(())
+    });
+
+    // Long operation > lease period, with heartbeat renewals (production shape).
+    let long_prove = Duration::from_secs(3);
+    assert!(
+        long_prove > lease,
+        "test requires prove longer than lease"
+    );
+    crate::job_dispatcher::with_finalise_lease_heartbeat(
+        &store,
+        job_id,
+        owner,
+        lease,
+        renew_every,
+        async {
+            tokio::time::sleep(long_prove).await;
+        },
+    )
+    .await;
+
+    stop.store(true, Ordering::SeqCst);
+    probe.await.expect("join probe").expect("probe ok");
+
+    // After the owner stops renewing, the short lease expires and boot may free.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        other
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release after abandon"),
+        "expired lease after owner stopped renewing is abandonment evidence"
+    );
+    assert_eq!(
+        other
+            .claim_finalise_exclusive_as(job_id, other.process_owner(), lease)
+            .await
+            .expect("claim after abandon"),
+        FinaliseClaim::Won
+    );
+
+    drop(scope);
+}
+
 #[tokio::test]
 async fn cancel_from_broadcasting_returns_false_and_leaves_status_untouched() {
     // Nullifier is in flight / published — cancel must refuse.

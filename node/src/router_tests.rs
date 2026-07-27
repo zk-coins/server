@@ -3554,14 +3554,17 @@ mod jobs_endpoint_tests {
 
         let (mut state, _pool, _c) = jobs_test_state().await;
         state.v11_finalise = Some(Arc::new(move |pending, signature| {
-            finalise_called_hook.store(true, Ordering::SeqCst);
-            // The hook receives the staged pending + the accepted signature
-            // — not just a status change. Bind to the pending's ProofData.
-            assert_eq!(
-                signature.pk_i,
-                pending.witness_wip.prev_account_state.current_pubkey
-            );
-            Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            let finalise_called_hook = Arc::clone(&finalise_called_hook);
+            Box::pin(async move {
+                finalise_called_hook.store(true, Ordering::SeqCst);
+                // The hook receives the staged pending + the accepted signature
+                // — not just a status change. Bind to the pending's ProofData.
+                assert_eq!(
+                    signature.pk_i,
+                    pending.witness_wip.prev_account_state.current_pubkey
+                );
+                Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            })
         }));
 
         let result = state
@@ -3629,7 +3632,7 @@ mod jobs_endpoint_tests {
             .expect("signed durable finalisation on row after /sign");
         let sig = entry.signature.clone().expect("signature installed");
         let hook = state.v11_finalise.as_ref().expect("hook");
-        let outcome = hook(entry.pending, sig).expect("finalise");
+        let outcome = hook(entry.pending, sig).await.expect("finalise");
         assert!(
             finalise_called.load(Ordering::SeqCst),
             "finalise hook must have been invoked"
@@ -4592,11 +4595,13 @@ mod jobs_endpoint_tests {
 
         let barrier_in_hook = Arc::clone(&barrier);
         state.v11_finalise = Some(Arc::new(move |pending, _sig| {
-            // Count only after the exclusive claim (hook runs post-claim).
-            hook_count_h.fetch_add(1, Ordering::SeqCst);
-            // Hold the winner briefly so the loser can attempt the CAS.
+            let hook_count_h = Arc::clone(&hook_count_h);
             let _ = barrier_in_hook;
-            Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            Box::pin(async move {
+                // Count only after the exclusive claim (hook runs post-claim).
+                hook_count_h.fetch_add(1, Ordering::SeqCst);
+                Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            })
         }));
 
         let store = state.job_store.clone();
@@ -4735,11 +4740,11 @@ mod jobs_endpoint_tests {
         clear_process_stack_mode_for_test();
     }
 
-    /// Defect 1: resume drives exactly to the documented host edge
+    /// Defect 1 (host edge): resume drives exactly to the documented host edge
     /// ([`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`]) — §7.5 job complete
     /// after durable completion surface — and does not silently stop earlier.
-    /// Remaining work is on-chain AggregateStateNullifierV3 (bitcoind), a
-    /// design edge of the sync finalise hook, not a hidden host stop.
+    /// Remaining work is on-chain AggregateStateNullifierV3 **broadcast**
+    /// (bitcoind); engine + `members_ready` are the durable handoff.
     #[tokio::test]
     async fn resume_drives_to_documented_host_edge_not_silent_stop() {
         use crate::v11::{
@@ -4808,28 +4813,207 @@ mod jobs_endpoint_tests {
             "terminal strip must clear finalise_claim at host edge"
         );
 
-        // Documented edge is host-complete, not chain publish. The constant
-        // names the remaining step so a capability cannot claim chain coverage.
+        // Documented edge is host-complete + durable stage, not chain broadcast.
         let edge = crate::job_dispatcher::JOB_FINALISE_HOST_EDGE;
         assert!(
             edge.contains("AggregateStateNullifierV3") && edge.contains("bitcoind"),
             "JOB_FINALISE_HOST_EDGE must name the chain/bitcoind remainder; got: {edge}"
         );
-        // No v11_pending_publishes row: this path never stages chain intent.
-        let pending: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::BIGINT FROM v11_pending_publishes",
-        )
-        .fetch_one(state.job_store.pool())
-        .await
-        .expect("count pending publishes");
-        assert_eq!(
-            pending, 0,
-            "host-edge resume must not invent chain-publish rows; remaining \
-             step is the documented bitcoind edge, not a silent host stop"
+        assert!(
+            edge.contains("members_ready") || edge.contains("durable_engine"),
+            "JOB_FINALISE_HOST_EDGE must name the durable engine/members_ready handoff; got: {edge}"
         );
 
         clear_process_stack_mode_for_test();
         drop(scope);
+    }
+
+    /// Defect 1 (P0): a crash at the edge leaves a **durable** job — engine
+    /// intent via `v11_pending_publishes` + completion surface — that the
+    /// resume path picks up without re-running the finalise hook.
+    #[tokio::test]
+    async fn crash_at_edge_leaves_durable_job_resume_picks_up() {
+        use crate::v11::{
+            claim_stack_scan_mode, clear_process_stack_mode_for_test, set_process_stack_mode,
+            FinaliseOutcome, ScanStackMode,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
+        claim_stack_scan_mode(&*pool, ScanStackMode::V11)
+            .await
+            .expect("claim stack_scan_mode v11");
+
+        let plant_store = crate::job_store::JobStore::new((*pool).clone());
+        let (job_id, entry) =
+            plant_signed_finalisation_job(&plant_store, 0xE5, "k-crash-edge", false).await;
+        let sig = entry.signature.clone().expect("signed");
+        let owner = entry.pending.owner;
+
+        // Simulate production durable stage at the edge: members_ready for
+        // this nullifier is on disk (engine snapshot co-persisted in prod).
+        crate::v11::db_v11::insert_pending_publish_members_ready(
+            &*pool,
+            owner,
+            sig.pk_i,
+            sig.signature_r(),
+            sig.signature_s(),
+            sig.r_prime,
+            0,
+            [0u8; 32],
+        )
+        .await
+        .expect("stage members_ready at edge");
+
+        // And the §7.5 completion surface is durable (crash after stage +
+        // completion persist, before terminal complete).
+        let mut entry = entry;
+        let outcome = FinaliseOutcome::from_pending_proof_data_with_publisher(
+            &entry.pending,
+            entry.publisher_pubkey,
+        );
+        entry
+            .install_completion(outcome.to_result_json(), 200)
+            .expect("install completion");
+        let persist = crate::v11::DurableFinalisationPersist::from_entry(&entry).expect("encode");
+        let row = plant_store.load(job_id).await.expect("load").expect("row");
+        let mut body = row.request_body;
+        body.as_object_mut().unwrap().insert(
+            crate::v11::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&body)
+            .bind(job_id)
+            .execute(&*pool)
+            .await
+            .expect("plant completion");
+
+        // Fresh AppState — resume from durable bytes; spy hook must not run.
+        let mut state = fresh_app_state_from_pool(Arc::clone(&pool));
+        let hook_count = Arc::new(AtomicUsize::new(0));
+        let hook_count_h = Arc::clone(&hook_count);
+        state.v11_finalise = Some(Arc::new(move |pending, _sig| {
+            let hook_count_h = Arc::clone(&hook_count_h);
+            Box::pin(async move {
+                hook_count_h.fetch_add(1, Ordering::SeqCst);
+                Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            })
+        }));
+
+        crate::job_dispatcher::process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            crate::job_dispatcher::JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("resume after crash at edge");
+
+        assert_eq!(
+            hook_count.load(Ordering::SeqCst),
+            0,
+            "resume with durable completion must not re-run finalise hook"
+        );
+        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(
+            after.status,
+            crate::job_store::JobStatus::Completed,
+            "resume must complete the job left at the edge; status={:?} err={:?}",
+            after.status,
+            after.error
+        );
+        // Publisher work finds the staged intent.
+        let pending = crate::v11::db_v11::load_pending_publish(&*pool, sig.pk_i)
+            .await
+            .expect("load pending")
+            .expect("members_ready must survive crash + resume");
+        assert_eq!(pending.status, crate::v11::db_v11::PENDING_PUBLISH_MEMBERS_READY);
+        assert_eq!(pending.owner, owner);
+
+        clear_process_stack_mode_for_test();
+        drop(scope);
+    }
+
+    /// Defect 1 (P0): when the finalise hook runs, it must leave a durable
+    /// `v11_pending_publishes` row (test double stages intent the way
+    /// production `finalise_accepted_prove_persist_and_stage` does).
+    #[tokio::test]
+    async fn finalise_hook_stages_pending_publish_for_durable_handoff() {
+        use crate::v11::{
+            claim_stack_scan_mode, clear_process_stack_mode_for_test, set_process_stack_mode,
+            FinaliseOutcome, ScanStackMode,
+        };
+        use std::time::Duration;
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let (mut state, pool, _c) = jobs_test_state().await;
+        claim_stack_scan_mode(&*pool, ScanStackMode::V11)
+            .await
+            .expect("claim stack_scan_mode v11");
+
+        let (job_id, entry) = plant_signed_finalisation_job(
+            &state.job_store,
+            0xE6,
+            "k-stage-pending",
+            false,
+        )
+        .await;
+        let pool_for_hook = Arc::clone(&pool);
+        state.v11_finalise = Some(Arc::new(move |pending, signature| {
+            let pool_for_hook = Arc::clone(&pool_for_hook);
+            Box::pin(async move {
+                // Mirror production: stage members_ready before returning
+                // the §7.5 outcome (real path also persists the engine).
+                crate::v11::db_v11::insert_pending_publish_members_ready(
+                    &*pool_for_hook,
+                    pending.owner,
+                    signature.pk_i,
+                    signature.signature_r(),
+                    signature.signature_s(),
+                    signature.r_prime,
+                    0,
+                    [0u8; 32],
+                )
+                .await
+                .map_err(|e| format!("stage members_ready: {e:#}"))?;
+                Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            })
+        }));
+
+        crate::job_dispatcher::process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            crate::job_dispatcher::JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("process finalise with durable stage");
+
+        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(after.status, crate::job_store::JobStatus::Completed);
+        let sig = entry.signature.expect("signed");
+        let pending = crate::v11::db_v11::load_pending_publish(&*pool, sig.pk_i)
+            .await
+            .expect("load")
+            .expect("hook must stage v11_pending_publishes for the publisher handoff");
+        assert_eq!(
+            pending.status,
+            crate::v11::db_v11::PENDING_PUBLISH_MEMBERS_READY
+        );
+
+        clear_process_stack_mode_for_test();
     }
 
     /// Resuming finalise twice is harmless: second attempt is claim-lost or
@@ -4852,8 +5036,11 @@ mod jobs_endpoint_tests {
 
         let (mut state, _pool, _c) = jobs_test_state().await;
         state.v11_finalise = Some(Arc::new(move |pending, _sig| {
-            finalise_count_hook.fetch_add(1, Ordering::SeqCst);
-            Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            let finalise_count_hook = Arc::clone(&finalise_count_hook);
+            Box::pin(async move {
+                finalise_count_hook.fetch_add(1, Ordering::SeqCst);
+                Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            })
         }));
 
         let (job_id, _) =

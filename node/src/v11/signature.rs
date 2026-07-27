@@ -252,8 +252,9 @@ impl TryFrom<WalletSignSubmissionWire> for WalletSignSubmission {
 /// through to a terminal job status, including after a true cold boot with
 /// an empty in-memory map.
 ///
-/// **Edge:** this capability does **not** cover on-chain AggregateStateNullifierV3
-/// inscription (needs bitcoind + `v11_pending_publishes`). See
+/// **Edge:** production finalise stages `v11_pending_publishes`
+/// (`members_ready`) with the engine snapshot; on-chain
+/// AggregateStateNullifierV3 **broadcast** still needs bitcoind. See
 /// [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`].
 #[derive(Clone, Debug)]
 pub struct PendingSignEntry {
@@ -468,12 +469,13 @@ pub const PENDING_SIGN_BODY_KEY: &str = "pending_sign";
 /// | `completion_result` | after successful prove+apply | §7.5 JSON published onto the job row — **host publication** |
 /// | `completion_status` | paired with result (200) | `JobStore::complete` argument — **job completion** |
 ///
-/// Live engine tip / CoinHist / NfLog are **not** stored: apply re-validates
-/// them. Once `completion_result` is present, resume skips re-apply and
-/// only host-publishes + completes — so a crash after apply cannot strand a
-/// job that resume cannot finish up to
-/// [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`]. On-chain nullifier
-/// broadcast is outside this envelope (design edge: bitcoind required).
+/// Live engine tip / CoinHist / NfLog are **not** stored in this envelope:
+/// apply re-validates them, and production finalise persists the engine
+/// plus `v11_pending_publishes` out-of-band. Once `completion_result` is
+/// present, resume skips re-apply and only host-publishes + completes —
+/// so a crash after durable stage cannot strand a job that resume cannot
+/// finish up to [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`]. On-chain
+/// nullifier **broadcast** is outside this envelope (bitcoind required).
 ///
 /// ## Wire encoding
 ///
@@ -871,14 +873,13 @@ pub fn finalise_with_accepted_signature(
     })
 }
 
-/// Production finalise: prove **outside** the engine mutex, then re-acquire
-/// and apply with live re-validation.
+/// Production finalise (in-memory only): prove **outside** the engine mutex,
+/// then re-acquire and apply with live re-validation.
 ///
-/// Matches the receive-path invariant: the multi-minute prove holds neither
-/// the engine lock nor the write gate; [`StateEngine::apply_proved_transition`]
-/// re-checks every live dependency a concurrent scan may have moved.
-/// Staging fits the same shape — a self-contained [`PendingTransition`]
-/// from `begin_*`, not a snapshot that becomes stale mid-prove.
+/// Prefer [`finalise_accepted_prove_persist_and_stage`] on the job path so
+/// the applied engine and `v11_pending_publishes` intent are durable before
+/// the host edge. This sync helper remains for call sites that only need
+/// the in-memory apply (tests / tooling).
 pub fn finalise_accepted_prove_outside_lock(
     adapter: &crate::v11::EngineAdapter,
     pending: PendingTransition,
@@ -897,6 +898,151 @@ pub fn finalise_accepted_prove_outside_lock(
         .with_engine_mut(|engine| engine.apply_proved_transition(proved))
         .map_err(|e| format!("apply_proved_transition (engine lock): {e:#}"))?
         .map_err(|e| format!("apply_proved_transition failed: {e:#}"))?;
+    let pd = &applied.proved().proof_data;
+    Ok(FinaliseOutcome {
+        new_account_state_hash: digest_to_bytes(&pd.new_account_state_hash),
+        output_coins_root: digest_to_bytes(&pd.output_coins_root),
+        input_nullifiers_root: digest_to_bytes(&pd.input_nullifiers_root),
+        output_coin_ids,
+        publisher_pubkey,
+    })
+}
+
+/// Production job-path finalise: prove outside the lock, apply under the
+/// write gate, then **atomically** persist the engine snapshot and stage
+/// `v11_pending_publishes` (`members_ready`).
+///
+/// This is what makes [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`] a
+/// durable handoff: a crash after this function returns leaves the account
+/// advanced on disk and a rebroadcast intent the publisher path can pick
+/// up. On-chain AggregateStateNullifierV3 broadcast still needs bitcoind;
+/// that step is outside the host edge, not a silent skip of durability.
+///
+/// ## Resume / crash after durable stage
+///
+/// If a `members_ready` (or later) row already exists for `signature.pk_i`,
+/// prove+apply are skipped and the §7.5 outcome is rebuilt from the pending
+/// witness. Re-applying an already-advanced account would fail; the staged
+/// row is the durable signal that apply already landed.
+///
+/// ## Lease liveness
+///
+/// The multi-minute prove runs on `spawn_blocking` so the caller's async
+/// lease-renewal heartbeat can keep firing on the runtime.
+pub async fn finalise_accepted_prove_persist_and_stage(
+    adapter: &crate::v11::EngineAdapter,
+    pending: PendingTransition,
+    signature: TransitionSignature,
+    publisher_pubkey: Option<[u8; 32]>,
+) -> Result<FinaliseOutcome, String> {
+    use crate::v11::db_v11;
+
+    // Already durable from a prior attempt that crashed after stage.
+    match db_v11::load_pending_publish(adapter.pool(), signature.pk_i)
+        .await
+        .map_err(|e| format!("load_pending_publish before finalise: {e:#}"))?
+    {
+        Some(row) => {
+            if row.owner.0 != pending.owner.0 {
+                return Err(format!(
+                    "v1.1 finalise: pending publish for pk={} has owner {}, \
+                     pending.owner is {} — refusing silent mismatch",
+                    hex_lower(&signature.pk_i),
+                    hex_lower(&row.owner.0),
+                    hex_lower(&pending.owner.0),
+                ));
+            }
+            tracing::info!(
+                pk = %hex_lower(&signature.pk_i),
+                status = %row.status,
+                "v1.1 finalise: pending publish already durable; \
+                 skipping re-prove/re-apply (crash-resume after stage)"
+            );
+            return Ok(FinaliseOutcome::from_pending_proof_data_with_publisher(
+                &pending,
+                publisher_pubkey,
+            ));
+        }
+        None => {}
+    }
+
+    let output_coin_ids = FinaliseOutcome::output_coin_ids_from_pending(&pending);
+    let owner = pending.owner;
+    let bridge = adapter.bridge();
+    let signature_for_prove = signature.clone();
+    let proved = tokio::task::spawn_blocking(move || {
+        zkcoins_prover::state_engine::StateEngine::prove_pending_transition_detached(
+            &bridge,
+            pending,
+            signature_for_prove,
+        )
+    })
+    .await
+    .map_err(|e| format!("prove_pending_transition_detached join: {e}"))?
+    .map_err(|e| format!("prove_pending_transition_detached failed: {e:#}"))?;
+
+    // Write gate: snapshot → apply → atomic engine + members_ready → restore on fail.
+    let _write_gate = adapter.lock_writes().await;
+    let pre = adapter.snapshot_live();
+
+    let applied = match adapter.with_engine_mut(|engine| engine.apply_proved_transition(proved)) {
+        Ok(Ok(a)) => a,
+        Ok(Err(e)) => {
+            let _ = adapter.restore_live(pre);
+            return Err(format!("apply_proved_transition failed: {e:#}"));
+        }
+        Err(e) => {
+            return Err(format!("apply_proved_transition (engine lock): {e:#}"));
+        }
+    };
+
+    let (pk, r) = applied.nullifier();
+    if signature.pk_i != pk {
+        let _ = adapter.restore_live(pre);
+        return Err(format!(
+            "v1.1 finalise: signature.pk_i does not match applied nullifier Pk"
+        ));
+    }
+    if signature.signature_r() != r {
+        let _ = adapter.restore_live(pre);
+        return Err(format!(
+            "v1.1 finalise: signature R does not match applied nullifier R"
+        ));
+    }
+
+    let tip_hash = adapter.tip_hash();
+    let tip_height = adapter.with_engine(|engine| engine.tip_height());
+    let tip_height_u32 = u32::try_from(tip_height).map_err(|_| {
+        format!("v1.1 finalise: tip_height {tip_height} does not fit u32 for pending publish")
+    })?;
+
+    let snap = adapter.snapshot_live();
+    if let Err(e) = db_v11::persist_engine_with_pending_members_ready(
+        adapter.pool(),
+        &snap,
+        owner,
+        pk,
+        r,
+        signature.signature_s(),
+        signature.r_prime,
+        tip_height_u32,
+        tip_hash,
+    )
+    .await
+    {
+        if let Err(restore_err) = adapter.restore_live(pre) {
+            return Err(format!(
+                "v1.1 finalise: atomic engine+members_ready persist failed ({e:#}); \
+                 engine restore also failed ({restore_err:#})"
+            ));
+        }
+        return Err(format!(
+            "v1.1 finalise: atomic engine+members_ready persist failed; \
+             engine restored (no silent credit): {e:#}"
+        ));
+    }
+    // Intent is durable. Never restore_live after this point.
+
     let pd = &applied.proved().proof_data;
     Ok(FinaliseOutcome {
         new_account_state_hash: digest_to_bytes(&pd.new_account_state_hash),

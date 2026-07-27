@@ -265,15 +265,23 @@ pub struct AppState {
 }
 
 /// Hook the dispatcher invokes after a verified `/sign` to drive
-/// `StateEngine::finalise`. Production wires this to
-/// [`crate::v11::finalise_with_accepted_signature`] via the shared
-/// [`crate::v11::EngineAdapter`]; tests inject a spy that records the
-/// call without running the multi-minute prove.
+/// prove → apply → **durable** engine + `v11_pending_publishes` stage.
+///
+/// Production wires this to
+/// [`crate::v11::finalise_accepted_prove_persist_and_stage`] via the shared
+/// [`crate::v11::EngineAdapter`] (async: multi-minute prove on a blocking
+/// pool, then atomic persist). Tests inject a spy that records the call
+/// without running the multi-minute prove.
 pub type V11FinaliseHook = Arc<
     dyn Fn(
             zkcoins_prover::state_engine::PendingTransition,
             zkcoins_prover::prover_bridge::TransitionSignature,
-        ) -> Result<crate::v11::FinaliseOutcome, String>
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::v11::FinaliseOutcome, String>>
+                    + Send,
+            >,
+        >
         + Send
         + Sync,
 >;
