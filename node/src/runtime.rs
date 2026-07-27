@@ -115,18 +115,20 @@ pub async fn start_rest_node(
         // short-circuiting to "signature_accepted" alone.
         v11_finalise: v11_engine.as_ref().map(|adapter| {
             let adapter = Arc::clone(adapter);
-            let hook: crate::router::V11FinaliseHook = Arc::new(move |pending, signature| {
-                let adapter = Arc::clone(&adapter);
-                // publisher_pubkey is filled by the dispatcher from the job
-                // request_body after the hook returns (hook has no job ctx).
-                // Durable: prove → apply → engine snapshot + members_ready.
-                Box::pin(async move {
-                    crate::v11::finalise_accepted_prove_persist_and_stage(
-                        &adapter, pending, signature, None,
-                    )
-                    .await
-                })
-            });
+            let hook: crate::router::V11FinaliseHook =
+                Arc::new(move |pending, signature, fence| {
+                    let adapter = Arc::clone(&adapter);
+                    // publisher_pubkey is filled by the dispatcher from the job
+                    // request_body after the hook returns.
+                    // Durable + fenced: prove → apply → engine snapshot +
+                    // members_ready only while this claim epoch still holds.
+                    Box::pin(async move {
+                        crate::v11::finalise_accepted_prove_persist_and_stage(
+                            &adapter, pending, signature, None, fence,
+                        )
+                        .await
+                    })
+                });
             hook
         }),
         // Production post-begin registry: `StateEngine::begin_*` writes a
