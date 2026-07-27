@@ -1482,31 +1482,99 @@ enum SignalOutcome {
     TimedOut,
 }
 
+/// Run `work` while periodically renewing the exclusive finalise lease.
+///
+/// A lease that is only asserted once before a multi-minute prove expires
+/// while the owner is still alive; a boot sweep then frees it and a second
+/// resumer double-executes. This heartbeat proves liveness continuously.
+///
+/// `renew_every` should be well under `lease` (production uses
+/// [`crate::job_store::FINALISE_CLAIM_RENEW_INTERVAL`]). Renewals write
+/// `NOW() + lease` in Postgres — same clock as claim create and stale release.
+///
+/// `work` must yield to the async runtime (await points / `spawn_blocking`
+/// for CPU-bound prove) so the heartbeat task can run.
+pub(crate) async fn with_finalise_lease_heartbeat<F, T>(
+    job_store: &JobStore,
+    public_id: Uuid,
+    owner: Uuid,
+    lease: std::time::Duration,
+    renew_every: std::time::Duration,
+    work: F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let store = job_store.clone();
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let heartbeat = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(renew_every);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First `tick` completes immediately; skip so we do not double-renew
+        // at t=0 (caller already renewed after claim).
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = &mut cancel_rx => break,
+                _ = ticker.tick() => {
+                    match store.renew_finalise_claim(public_id, owner, lease).await {
+                        Ok(true) => {
+                            tracing::debug!(
+                                %public_id,
+                                "finalise lease renewed during long operation"
+                            );
+                        }
+                        Ok(false) => {
+                            tracing::warn!(
+                                %public_id,
+                                "finalise lease renew lost ownership mid-operation"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                %public_id,
+                                error = %e,
+                                "finalise lease renew failed mid-operation"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let result = work.await;
+    let _ = cancel_tx.send(());
+    // Do not leave the heartbeat task stranded if the runtime is shutting down.
+    let _ = heartbeat.await;
+    result
+}
+
 /// Documented host edge of the job-path finalise resume.
 ///
 /// ## Where completion ends (and why)
 ///
 /// [`drive_v11_finalise`] drives a job through:
 ///
-/// 1. exclusive claim (owner + lease)
-/// 2. prove + apply via [`crate::router::V11FinaliseHook`] **or** skip when
-///    `completion_result` is already durable (crash after apply)
+/// 1. exclusive claim (owner + lease, renewed during long prove)
+/// 2. prove + apply + **durable** engine snapshot + `v11_pending_publishes`
+///    (`members_ready`) via [`crate::router::V11FinaliseHook`] **or** skip
+///    when `completion_result` is already durable (crash after stage)
 /// 3. persist the §7.5 completion surface on the durable capability
 /// 4. [`JobStore::complete_if_status`] — §7.5 result published onto the job row
 ///
 /// That is the **host edge**. The production hook
-/// ([`crate::v11::finalise_accepted_prove_outside_lock`]) proves and mutates
-/// the **in-memory** engine; it does not persist the engine snapshot, does not
-/// stage `v11_pending_publishes`, and does not broadcast
-/// AggregateStateNullifierV3. On-chain nullifier inscription needs a live
-/// bitcoind wallet ([`crate::v11::V11Publisher`]) and the receive-style
-/// `v11_pending_publishes` pipeline — that is a **design boundary** of the
-/// sync finalise hook (no publisher handle), not merely a test limitation.
+/// ([`crate::v11::finalise_accepted_prove_persist_and_stage`]) leaves the
+/// applied account and a `members_ready` rebroadcast intent on disk so a
+/// restarted node — or later publisher wiring — finds the job exactly at
+/// this edge. On-chain AggregateStateNullifierV3 **broadcast** still needs
+/// a live bitcoind wallet ([`crate::v11::V11Publisher`]); that is outside
+/// the host edge, not a silent skip of durability up to it.
 ///
 /// Resume is covered durably up to this edge so a job can be driven to exactly
-/// the point where a future chain-publish step (or operator recovery) takes over.
+/// the point where chain-publish takes over.
 pub const JOB_FINALISE_HOST_EDGE: &str =
-    "job_result_published_after_engine_apply; on-chain AggregateStateNullifierV3 requires bitcoind + v11_pending_publishes (not wired into V11FinaliseHook)";
+    "job_result_published_after_durable_engine_and_members_ready; on-chain AggregateStateNullifierV3 broadcast requires bitcoind (publisher not driven by this path)";
 
 /// Drive an accepted v1.1 signature through the durable host path up to
 /// [`JOB_FINALISE_HOST_EDGE`].
@@ -1518,7 +1586,7 @@ pub const JOB_FINALISE_HOST_EDGE: &str =
 /// | Terminal job | — | status already terminal → no-op |
 /// | Load capability | `finalisation` envelope | rehydrate; refuse incomplete |
 /// | Exclusive claim | status + owner/lease | [`JobStore::claim_finalise_exclusive`] — **loser exits without side effects** |
-/// | Prove + apply | pending + signature | finalise hook; skip if `completion_result` already set |
+/// | Prove + apply + stage | pending + signature | finalise hook (engine + `members_ready`); skip if `completion_result` already set |
 /// | Persist completion | outcome + publisher_pubkey | status-qualified body write under `broadcasting` |
 /// | Host §7.5 complete | `completion_result` + `completion_status` | `complete_if_status([broadcasting])` — **host edge** |
 /// | Fail | — | `fail_if_status` from non-terminal only |
@@ -1635,14 +1703,27 @@ async fn drive_v11_finalise(
                 public_id,
                 job_store.process_owner()
             );
-            // Renew immediately so a long prove starts with a full lease window.
-            let _ = job_store
+            // Full lease window from Postgres NOW() before the long path.
+            let renewed = job_store
                 .renew_finalise_claim(
                     public_id,
                     job_store.process_owner(),
                     crate::job_store::FINALISE_CLAIM_LEASE,
                 )
                 .await?;
+            if !renewed {
+                return fail_v11(
+                    job_store,
+                    app_state,
+                    notify_map,
+                    public_id,
+                    "internal_error",
+                    "v1.1 finalise: won claim but immediate lease renew failed \
+                     (lost ownership before prove)"
+                        .to_string(),
+                )
+                .await;
+            }
         }
         FinaliseClaim::Lost { observed } => {
             if observed.is_terminal() {
@@ -1683,7 +1764,8 @@ async fn drive_v11_finalise(
     );
 
     // If prove+apply already recorded the §7.5 surface, skip the hook and
-    // only publish + complete (crash window after apply, before complete).
+    // only publish + complete (crash window after durable stage + completion
+    // persist, before terminal complete).
     if !entry.has_completion() {
         let signature = entry
             .signature
@@ -1707,7 +1789,18 @@ async fn drive_v11_finalise(
         // publisher_pubkey is only the staged capability field — no silent
         // fall-back to a root request_body key.
         let publisher_pubkey = entry.publisher_pubkey;
-        match hook(entry.pending.clone(), signature) {
+        // Renew the lease for the whole long prove/apply/stage window so a
+        // multi-minute prove cannot outlive a one-shot claim.
+        let hook_result = with_finalise_lease_heartbeat(
+            job_store,
+            public_id,
+            job_store.process_owner(),
+            crate::job_store::FINALISE_CLAIM_LEASE,
+            crate::job_store::FINALISE_CLAIM_RENEW_INTERVAL,
+            hook(entry.pending.clone(), signature),
+        )
+        .await;
+        match hook_result {
             Ok(mut outcome) => {
                 if outcome.publisher_pubkey.is_none() {
                     outcome.publisher_pubkey = publisher_pubkey;

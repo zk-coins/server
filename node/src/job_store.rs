@@ -66,20 +66,29 @@ pub const FINALISE_CLAIM_BODY_KEY: &str = "finalise_claim";
 /// Default lease for a live finalise owner.
 ///
 /// Sized for a multi-minute prove; a live owner renews (see
-/// [`JobStore::renew_finalise_claim`]) before expiry. "Stale" means the lease
-/// has elapsed without renew — evidence the owner abandoned the claim — not
-/// merely that the phase is [`FINALISE_CLAIM_PHASE`].
+/// [`JobStore::renew_finalise_claim`]) **during** the long operation, not
+/// only once at claim time. "Stale" means the lease has elapsed without
+/// renew — evidence the owner abandoned the claim — not merely that the
+/// phase is [`FINALISE_CLAIM_PHASE`].
 pub const FINALISE_CLAIM_LEASE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// Build the durable claim document stored under [`FINALISE_CLAIM_BODY_KEY`].
-fn finalise_claim_document(owner: Uuid, lease: std::time::Duration) -> serde_json::Value {
-    let expires = Utc::now()
-        + chrono::Duration::from_std(lease).expect("FINALISE_CLAIM_LEASE fits chrono::Duration");
-    serde_json::json!({
-        "owner": owner.to_string(),
-        "lease_expires_at": expires.to_rfc3339(),
-    })
+/// How often a live owner re-extends [`FINALISE_CLAIM_LEASE`] while prove /
+/// apply / durable stage is in flight.
+///
+/// Chosen as one third of the lease so several renewals fit inside the
+/// window even under scheduler jitter; a lease that is only asserted once
+/// at the start cannot outlive a multi-minute prove.
+pub const FINALISE_CLAIM_RENEW_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// Lease seconds as `i64` for Postgres `make_interval(secs => …)`.
+fn lease_secs_i64(lease: std::time::Duration) -> i64 {
+    i64::try_from(lease.as_secs()).expect("finalise claim lease seconds fit i64")
 }
+
+// Lease expiry uses PostgreSQL `NOW()` as the **sole** clock (create, renew,
+// and release_stale all compare against the same source). See the SQL in
+// [`JobStore::claim_finalise_exclusive_as`] / [`JobStore::renew_finalise_claim`].
 
 impl JobStatus {
     pub fn as_str(self) -> &'static str {
@@ -608,21 +617,33 @@ impl JobStore {
         owner: Uuid,
         lease: std::time::Duration,
     ) -> sqlx::Result<FinaliseClaim> {
-        let claim = finalise_claim_document(owner, lease);
         let path = vec![FINALISE_CLAIM_BODY_KEY.to_string()];
+        let owner_text = owner.to_string();
+        let lease_secs = lease_secs_i64(lease);
 
         // Path A: fresh claim from awaiting_signature.
+        // `lease_expires_at` is `NOW() + lease` — Postgres clock only (the
+        // same clock `release_stale_finalise_claim` uses for `<= NOW()`).
         let result = sqlx::query(
             "UPDATE jobs SET status = $1, phase = $2, \
-                    request_body = jsonb_set(COALESCE(request_body, '{}'::jsonb), \
-                                            $3::text[], $4::jsonb, true), \
+                    request_body = jsonb_set( \
+                        COALESCE(request_body, '{}'::jsonb), \
+                        $3::text[], \
+                        jsonb_build_object( \
+                            'owner', $4::text, \
+                            'lease_expires_at', \
+                                NOW() + make_interval(secs => $5::double precision) \
+                        ), \
+                        true \
+                    ), \
                     updated_at = NOW() \
-             WHERE public_id = $5 AND status = $6",
+             WHERE public_id = $6 AND status = $7",
         )
         .bind(JobStatus::Broadcasting.as_str())
         .bind(FINALISE_CLAIM_PHASE)
         .bind(&path)
-        .bind(&claim)
+        .bind(&owner_text)
+        .bind(lease_secs as f64)
         .bind(public_id)
         .bind(JobStatus::AwaitingSignature.as_str())
         .execute(&self.pool)
@@ -636,16 +657,25 @@ impl JobStore {
         // regardless of who the stored owner is (lease release is separate).
         let result = sqlx::query(
             "UPDATE jobs SET phase = $1, \
-                    request_body = jsonb_set(COALESCE(request_body, '{}'::jsonb), \
-                                            $2::text[], $3::jsonb, true), \
+                    request_body = jsonb_set( \
+                        COALESCE(request_body, '{}'::jsonb), \
+                        $2::text[], \
+                        jsonb_build_object( \
+                            'owner', $3::text, \
+                            'lease_expires_at', \
+                                NOW() + make_interval(secs => $4::double precision) \
+                        ), \
+                        true \
+                    ), \
                     updated_at = NOW() \
-             WHERE public_id = $4 \
+             WHERE public_id = $5 \
                AND status = 'broadcasting' \
                AND phase IN ('publishing', 'broadcasting')",
         )
         .bind(FINALISE_CLAIM_PHASE)
         .bind(&path)
-        .bind(&claim)
+        .bind(&owner_text)
+        .bind(lease_secs as f64)
         .bind(public_id)
         .execute(&self.pool)
         .await?;
@@ -662,31 +692,42 @@ impl JobStore {
 
     /// Extend the lease of a claim this process already owns.
     ///
-    /// Returns `true` only when the row is still `broadcasting` /
-    /// [`FINALISE_CLAIM_PHASE`] and `request_body.finalise_claim.owner`
-    /// matches `owner`. A non-owner cannot renew.
+    /// Writes `lease_expires_at = NOW() + lease` (Postgres clock — same
+    /// source as claim create and stale release). Returns `true` only when
+    /// the row is still `broadcasting` / [`FINALISE_CLAIM_PHASE`] and
+    /// `request_body.finalise_claim.owner` matches `owner`. A non-owner
+    /// cannot renew.
     pub async fn renew_finalise_claim(
         &self,
         public_id: Uuid,
         owner: Uuid,
         lease: std::time::Duration,
     ) -> sqlx::Result<bool> {
-        let claim = finalise_claim_document(owner, lease);
         let path = vec![FINALISE_CLAIM_BODY_KEY.to_string()];
+        let owner_text = owner.to_string();
+        let lease_secs = lease_secs_i64(lease);
         let result = sqlx::query(
-            "UPDATE jobs SET request_body = jsonb_set(COALESCE(request_body, '{}'::jsonb), \
-                                            $1::text[], $2::jsonb, true), \
+            "UPDATE jobs SET request_body = jsonb_set( \
+                    COALESCE(request_body, '{}'::jsonb), \
+                    $1::text[], \
+                    jsonb_build_object( \
+                        'owner', $2::text, \
+                        'lease_expires_at', \
+                            NOW() + make_interval(secs => $3::double precision) \
+                    ), \
+                    true \
+                ), \
                     updated_at = NOW() \
-             WHERE public_id = $3 \
+             WHERE public_id = $4 \
                AND status = 'broadcasting' \
-               AND phase = $4 \
-               AND request_body #>> '{finalise_claim,owner}' = $5",
+               AND phase = $5 \
+               AND request_body #>> '{finalise_claim,owner}' = $2",
         )
         .bind(&path)
-        .bind(&claim)
+        .bind(&owner_text)
+        .bind(lease_secs as f64)
         .bind(public_id)
         .bind(FINALISE_CLAIM_PHASE)
-        .bind(owner.to_string())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -704,6 +745,10 @@ impl JobStore {
     /// - `lease_expires_at` is present **and** `<= NOW()` (owner failed to renew)
     /// - `finalise_claim` / `lease_expires_at` is absent (claim never registered a
     ///   live owner — pre-lease row or corrupt; not a protected live process)
+    ///
+    /// Comparison uses Postgres `NOW()` — the same clock that claim/renew
+    /// write into `lease_expires_at`. Host clock skew cannot manufacture
+    /// abandonment of a still-live owner.
     ///
     /// A live owner's unexpired lease **must not** be released by a boot sweep
     /// in another process: that would reintroduce double-execution.
