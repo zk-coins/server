@@ -1057,6 +1057,17 @@ pub const JOB_RESET_GENERATION_FENCE_SQL: &str =
 ///
 /// Call **before** failing non-terminal jobs so any concurrent admit that
 /// stamps the old generation is left behind the live epoch.
+///
+/// **Locking construct:** this `UPDATE` takes a row-level exclusive lock on
+/// the singleton `self_heal_reset_meta` row and holds it until the reset
+/// transaction commits. [`crate::job_store::JobStore::create`] admits with
+/// `SELECT generation … FOR UPDATE` on the same row, so admit and reset are
+/// mutually exclusive (not merely ordered): a concurrent admit either
+/// finishes under the pre-bump generation (and is then covered by the
+/// fail-UPDATE still in this transaction) or blocks until this commit and
+/// then stamps the post-bump generation. Under plain MVCC a scalar SELECT
+/// would keep seeing the old committed generation for the whole uncommitted
+/// bump window — that is the visibility hole this lock closes.
 pub async fn bump_self_heal_reset_generation_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<i64, sqlx::Error> {
@@ -1072,6 +1083,10 @@ pub async fn bump_self_heal_reset_generation_in_tx(
 }
 
 /// Current self-heal reset generation (admission epoch for new jobs).
+///
+/// Read-only snapshot for diagnostics/tests. Production admit uses
+/// `SELECT … FOR UPDATE` inside [`crate::job_store::JobStore::create`] so it
+/// serialises with [`bump_self_heal_reset_generation_in_tx`].
 pub async fn load_self_heal_reset_generation(pool: &PgPool) -> Result<i64, sqlx::Error> {
     let (gen,): (i64,) =
         sqlx::query_as("SELECT generation FROM self_heal_reset_meta WHERE id = 1")

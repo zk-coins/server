@@ -125,45 +125,65 @@ pub fn resolve_v11_live_digest(
     pin_c: &[u8; 32],
     pin_c_balance: &[u8; 32],
 ) -> Result<Vec<u8>, String> {
+    // Test-only: inject fabricated "just-built" digests so unit tests can
+    // drive this function without a multi-minute Plonky2 build, while still
+    // executing the pin check + encode(**built**) tail. Production never
+    // sets the override (see unit_tests). Round-1's
+    // `Ok(encode_v11_live_digest(pin_c, pin_c_balance))` shortcut skips this
+    // whole body and goes red under those tests.
+    #[cfg(test)]
+    if let Some((c, b)) = test_built_digests_override() {
+        return live_baseline_from_built_digests(&c, &b, pin_c, pin_c_balance, network);
+    }
+
     ProverBridge::install_network_pins(network, *pin_c, *pin_c_balance)
         .map_err(|e| e.to_string())?;
     let bridge = ProverBridge::new(network);
     let (c, b) = bridge
         .require_live_identity()
         .map_err(|e| format!("cannot determine live circuit digest: {e}"))?;
-    // Construction already refused on mismatch; re-assert so the self-heal
-    // blob is never encode(pins) without a successful live check.
-    zkcoins_prover::circuit_identity::require_live_digests_match_pins(
-        &c,
-        &b,
-        pin_c,
-        pin_c_balance,
-        network,
-    )?;
-    Ok(encode_v11_live_digest(&c, &b))
+    live_baseline_from_built_digests(&c, &b, pin_c, pin_c_balance, network)
 }
 
-/// Pure form of the live-digest refusal used by tests that simulate a
-/// binary whose **real** (built) circuit digests differ from the pins
-/// without paying a multi-minute Plonky2 build.
+/// Pin-check + encode the **built** pair (never the pins alone).
 ///
-/// Production boot must use [`resolve_v11_live_digest`] (which builds the
-/// real circuits). This helper is the same comparison construction-time
-/// runs — a test that would go red if mismatch were treated as Ok.
-pub fn refuse_if_built_differs_from_pins(
+/// Shared by production resolve (after [`ProverBridge::require_live_identity`])
+/// and the test override path. Encoding pins here under a successful check
+/// is observationally equal today, but would green a caller that never
+/// obtained built digests — so the encode arguments stay the built pair.
+fn live_baseline_from_built_digests(
     built_c: &[u8; 32],
     built_c_balance: &[u8; 32],
     pin_c: &[u8; 32],
     pin_c_balance: &[u8; 32],
     network: Network,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     zkcoins_prover::circuit_identity::require_live_digests_match_pins(
         built_c,
         built_c_balance,
         pin_c,
         pin_c_balance,
         network,
-    )
+    )?;
+    Ok(encode_v11_live_digest(built_c, built_c_balance))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Optional stand-in for ProverBridge's just-built digests.
+    static TEST_BUILT_DIGESTS: std::cell::Cell<Option<([u8; 32], [u8; 32])>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn test_built_digests_override() -> Option<([u8; 32], [u8; 32])> {
+    TEST_BUILT_DIGESTS.with(|c| c.get())
+}
+
+/// Install fabricated just-built digests for [`resolve_v11_live_digest`] tests.
+#[cfg(test)]
+pub(crate) fn set_test_built_digests_override(built: Option<([u8; 32], [u8; 32])>) {
+    TEST_BUILT_DIGESTS.with(|c| c.set(built));
 }
 
 /// Decode a blob previously produced by [`encode_v11_live_digest`].
@@ -657,54 +677,97 @@ mod unit_tests {
         );
     }
 
-    /// Simulates a binary whose **real** (just-built) circuit digests
-    /// differ from the §3.6 pins. The construction-time check must refuse
-    /// — that is the whole point of §1.7.9.
+    /// Drives [`resolve_v11_live_digest`] with fabricated just-built digests
+    /// (test override standing in for [`ProverBridge::require_live_identity`])
+    /// so a pin/built mismatch refuses through the **production function**.
     ///
-    /// Divergence is simulated by feeding distinct built vs pin pairs into
-    /// the same pure comparison the prover bridge runs after each circuit
-    /// construction (no multi-minute Plonky2 build required here).
-    ///
-    /// Would go red if mismatch were treated as Ok / silent pass, or if
-    /// the live baseline were encode(pins) without looking at built digests.
+    /// Would go **green** under round-1's defect
+    /// `return Ok(encode_v11_live_digest(pin_c, pin_c_balance))` — that
+    /// shortcut never consults built digests and would `Ok` any pin pair.
+    /// Pure comparison helpers alone cannot catch that; this test calls
+    /// `resolve_v11_live_digest` itself.
     #[test]
-    fn refuse_when_real_built_circuit_differs_from_pins() {
+    fn resolve_v11_live_digest_refuses_when_pins_differ_from_built() {
         let built_c = [0xAAu8; 32];
         let built_b = [0xBBu8; 32];
         let mut pin_c = built_c;
-        pin_c[0] ^= 0xFF; // pins claim a different C than the one just built
-        let err = refuse_if_built_differs_from_pins(
-            &built_c,
-            &built_b,
-            &pin_c,
-            &built_b,
-            Network::Regtest,
-        )
-        .expect_err("built/pin divergence must refuse");
+        pin_c[0] ^= 0xFF;
+        assert_ne!(
+            encode_v11_live_digest(&pin_c, &built_b),
+            encode_v11_live_digest(&built_c, &built_b),
+            "test oracle: pin encoding must differ from built encoding"
+        );
+        set_test_built_digests_override(Some((built_c, built_b)));
+        let err = resolve_v11_live_digest(Network::Regtest, &pin_c, &built_b)
+            .expect_err("built/pin divergence must refuse through resolve_v11_live_digest");
+        set_test_built_digests_override(None);
         assert!(
             err.contains("do not match") || err.contains("Refusing"),
-            "refusal must be loud: {err}"
-        );
-        // encode(pins) must never be accepted as "live" under mismatch.
-        let pin_encoding = encode_v11_live_digest(&pin_c, &built_b);
-        let built_encoding = encode_v11_live_digest(&built_c, &built_b);
-        assert_ne!(
-            pin_encoding, built_encoding,
-            "test oracle: pin and built encodings must differ"
+            "refusal must be loud via resolve_v11_live_digest: {err}"
         );
     }
 
-    /// Matching built digests and pins must accept (the happy path after
-    /// construction-time check).
+    /// Happy path through [`resolve_v11_live_digest`]: when pins equal the
+    /// just-built digests, the live baseline is `encode(built)`.
     #[test]
-    fn accept_when_real_built_circuit_matches_pins() {
+    fn resolve_v11_live_digest_returns_encoding_of_just_built_circuits() {
         let c = [0x11u8; 32];
         let b = [0x22u8; 32];
-        refuse_if_built_differs_from_pins(&c, &b, &c, &b, Network::Regtest)
-            .expect("identical built/pin pair must pass");
-        let live = encode_v11_live_digest(&c, &b);
+        set_test_built_digests_override(Some((c, b)));
+        let live = resolve_v11_live_digest(Network::Regtest, &c, &b)
+            .expect("matching pins must accept through resolve_v11_live_digest");
+        set_test_built_digests_override(None);
+        assert_eq!(
+            live,
+            encode_v11_live_digest(&c, &b),
+            "live baseline must be encode(just-built)"
+        );
         let (c2, b2) = decode_v11_live_digest(&live).expect("tagged blob");
         assert_eq!(c2, c);
         assert_eq!(b2, b);
+    }
+
+    /// Plonky2 circuit construction overflows the default test thread
+    /// stack; spawn the body on a large stack.
+    fn on_large_stack<F, R>(f: F) -> R
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name("v11-digest-resolve".into())
+            .stack_size(128 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn large-stack thread")
+            .join()
+            .expect("large-stack thread panicked")
+    }
+
+    /// Full [`ProverBridge`] wiring (no test override): real circuit build.
+    /// Multi-minute; run with `--run-ignored` for the end-to-end red/green
+    /// proof against an `encode(pins)` shortcut that never builds.
+    #[test]
+    #[ignore = "multi-minute Plonky2 circuit build via ProverBridge"]
+    fn resolve_v11_live_digest_via_real_prover_bridge_refuses_pin_mismatch() {
+        on_large_stack(|| {
+            // Ensure the override is off so we hit ProverBridge.
+            set_test_built_digests_override(None);
+            let network = Network::Testnet;
+            let bridge = ProverBridge::new(network);
+            let (built_c, built_b) = bridge
+                .require_live_identity()
+                .expect("unpinned ProverBridge build");
+            let mut pin_c = built_c;
+            pin_c[0] ^= 0xFF;
+            let err = resolve_v11_live_digest(network, &pin_c, &built_b)
+                .expect_err("real ProverBridge path must refuse pin mismatch");
+            assert!(
+                err.contains("do not match")
+                    || err.contains("Refusing")
+                    || err.contains("cannot determine")
+                    || err.contains("does not match"),
+                "refusal must be loud: {err}"
+            );
+        });
     }
 }

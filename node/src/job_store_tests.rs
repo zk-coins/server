@@ -229,13 +229,26 @@ async fn set_status_advances_status_and_phase() {
     else {
         panic!("expected Fresh");
     };
-    store
+    let applied = store
         .set_status(job.public_id, JobStatus::Proving, "running_prover")
         .await
         .expect("set_status");
+    assert!(applied, "set_status must report true when one row matches");
     let after = store.load(job.public_id).await.unwrap().unwrap();
     assert_eq!(after.status, JobStatus::Proving);
     assert_eq!(after.phase, "running_prover");
+}
+
+/// Zero-row `set_status` returns `Ok(false)` (not a silent `Ok(())`).
+#[tokio::test]
+async fn set_status_reports_false_when_no_row_matches() {
+    let (store, _c) = setup_store().await;
+    let missing = uuid::Uuid::new_v4();
+    let applied = store
+        .set_status(missing, JobStatus::Proving, "proving")
+        .await
+        .expect("query ok");
+    assert!(!applied, "missing public_id must yield Ok(false)");
 }
 
 #[tokio::test]

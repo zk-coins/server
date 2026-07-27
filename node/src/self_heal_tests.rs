@@ -695,11 +695,15 @@ async fn heal_v11_reset_fences_pre_loaded_job_resurrection() {
         "failed job keeps its pre-reset generation (left behind the live epoch)"
     );
 
-    // Worker A's unconditional set_status (public_id only) must not resurrect.
-    store
+    // Worker A's set_status must report zero rows and not resurrect.
+    let advanced = store
         .set_status(job_id, crate::job_store::JobStatus::Proving, "proving")
         .await
-        .expect("set_status returns Ok even when 0 rows match");
+        .expect("set_status query ok");
+    assert!(
+        !advanced,
+        "set_status must return false when the generation fence matches 0 rows"
+    );
     let after_status = store.load(job_id).await.unwrap().unwrap();
     assert_eq!(
         after_status.status,
@@ -767,10 +771,14 @@ async fn heal_v11_reset_fences_stale_generation_admit() {
     .expect("plant stale-gen job");
 
     let store = crate::job_store::JobStore::new(pool.clone());
-    store
+    let stale_advanced = store
         .set_status(public_id, crate::job_store::JobStatus::Proving, "proving")
         .await
-        .expect("set_status");
+        .expect("set_status query ok");
+    assert!(
+        !stale_advanced,
+        "stale-generation set_status must report 0 rows (false)"
+    );
     store
         .complete(public_id, serde_json::json!({"nope": true}), 200)
         .await
@@ -798,14 +806,15 @@ async fn heal_v11_reset_fences_stale_generation_admit() {
         crate::job_store::CreateResult::IdempotentReplay(j) => j,
     };
     assert_eq!(fresh_job.reset_generation, live_gen);
-    store
+    let advanced_ok = store
         .set_status(
             fresh_job.public_id,
             crate::job_store::JobStatus::Proving,
             "proving",
         )
         .await
-        .expect("post-reset set_status");
+        .expect("post-reset set_status query");
+    assert!(advanced_ok, "live-generation set_status must update 1 row");
     let advanced = store.load(fresh_job.public_id).await.unwrap().unwrap();
     assert_eq!(advanced.status, crate::job_store::JobStatus::Proving);
 
@@ -869,10 +878,11 @@ async fn heal_legacy_reset_fences_pre_loaded_job_resurrection() {
         "operator must see the self-heal wipe reason on the legacy path too"
     );
 
-    store
+    let resurrected = store
         .set_status(job_id, crate::job_store::JobStatus::Proving, "proving")
         .await
-        .expect("set_status");
+        .expect("set_status query ok");
+    assert!(!resurrected, "legacy pre-reset set_status must report 0 rows");
     store
         .complete(job_id, serde_json::json!({"legacy_stolen": true}), 200)
         .await
@@ -882,6 +892,125 @@ async fn heal_legacy_reset_fences_pre_loaded_job_resurrection() {
         after.status,
         crate::job_store::JobStatus::Failed,
         "legacy pre-reset worker must not complete after generation bump"
+    );
+
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 1: admit and reset are mutually exclusive via a row lock on
+/// `self_heal_reset_meta`, not merely ordered under MVCC.
+///
+/// Interleaving that **used** to be possible: reset UPDATE bumps generation
+/// (uncommitted) → concurrent `create` reads committed gen via plain SELECT
+/// → INSERT stamps the stale gen → reset commits. That window is closed by
+/// `SELECT … FOR UPDATE` on admit against the same row the reset UPDATEs.
+///
+/// This test holds an open bump transaction and shows create only completes
+/// after the bump commits, stamping the **new** generation. The old "admit
+/// after UPDATE, before COMMIT" race cannot be constructed without the
+/// admit blocking on the lock.
+#[tokio::test]
+async fn heal_admit_blocks_until_open_generation_bump_commits() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+
+    let gen_before = db::load_self_heal_reset_generation(&pool)
+        .await
+        .expect("load gen");
+
+    // Open reset-shaped tx: bump generation, hold the row lock, do not commit yet.
+    let mut reset_tx = pool.begin().await.expect("begin reset tx");
+    let bumped = db::bump_self_heal_reset_generation_in_tx(&mut reset_tx)
+        .await
+        .expect("bump");
+    assert_eq!(bumped, gen_before + 1);
+
+    let store = crate::job_store::JobStore::new(pool.clone());
+    let account = [0xABu8; 32];
+    let create_fut = store.create(
+        crate::job_store::JobKind::Mint,
+        &account,
+        Some("admit-during-open-bump"),
+        serde_json::json!({}),
+    );
+
+    // While the bump holds FOR UPDATE / exclusive lock, admit must not finish
+    // under the old generation. Give it a short window; it should still be
+    // pending when we poll with a timeout.
+    tokio::pin!(create_fut);
+    let blocked = tokio::time::timeout(std::time::Duration::from_millis(200), &mut create_fut).await;
+    assert!(
+        blocked.is_err(),
+        "create must block on self_heal_reset_meta while reset holds the row lock"
+    );
+
+    // Commit the bump — admit should proceed and stamp the new generation.
+    reset_tx.commit().await.expect("commit bump");
+    let created = create_fut.await.expect("create after commit");
+    let job = match created {
+        crate::job_store::CreateResult::Fresh(j) => j,
+        crate::job_store::CreateResult::IdempotentReplay(j) => j,
+    };
+    assert_eq!(
+        job.reset_generation, bumped,
+        "admit after open bump must stamp the post-bump generation, never the pre-bump snapshot"
+    );
+
+    clear_process_stack_mode_for_test();
+}
+
+/// Zero-row `set_status` is reported (`false`) so callers can refuse side
+/// effects. Would go red if `set_status` still returned `Ok(())` unconditionally.
+#[tokio::test]
+async fn heal_set_status_reports_zero_rows_on_generation_fence() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+
+    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11");
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let store = crate::job_store::JobStore::new(pool.clone());
+    let account = [0x99u8; 32];
+    let created = store
+        .create(
+            crate::job_store::JobKind::Mint,
+            &account,
+            Some("zero-row-set-status"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("create");
+    let job = match created {
+        crate::job_store::CreateResult::Fresh(j) => j,
+        crate::job_store::CreateResult::IdempotentReplay(j) => j,
+    };
+
+    // Bump generation without failing the job — isolates the fence from the
+    // bulk fail-UPDATE so we know false is from the generation predicate.
+    let mut tx = pool.begin().await.expect("begin");
+    db::bump_self_heal_reset_generation_in_tx(&mut tx)
+        .await
+        .expect("bump");
+    tx.commit().await.expect("commit");
+
+    let applied = store
+        .set_status(
+            job.public_id,
+            crate::job_store::JobStatus::Proving,
+            "proving",
+        )
+        .await
+        .expect("query ok");
+    assert!(!applied, "generation fence must yield Ok(false), not silent Ok");
+    let row = store.load(job.public_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        crate::job_store::JobStatus::Queued,
+        "zero-row set_status must leave the row untouched"
     );
 
     clear_process_stack_mode_for_test();

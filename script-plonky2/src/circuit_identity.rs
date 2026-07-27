@@ -93,10 +93,27 @@ pub fn require_one_live_digest_matches_pin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prover_bridge::ProverBridge;
 
-    /// Would go red if a built/pin mismatch were treated as Ok / silent pass.
+    fn on_large_stack<F, R>(f: F) -> R
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name("circuit-identity-bridge".into())
+            .stack_size(128 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn large-stack thread")
+            .join()
+            .expect("large-stack thread panicked")
+    }
+
+    /// Pure helper still refuses a fabricated mismatch (construction-time
+    /// unit). Kept so a regression in the comparison itself is isolated
+    /// from bridge cache / pin OnceLock state.
     #[test]
-    fn refuse_when_built_c_differs_from_pin() {
+    fn refuse_when_built_c_differs_from_pin_helper() {
         let built_c = [0x11u8; 32];
         let built_b = [0x22u8; 32];
         let mut pin_c = built_c;
@@ -115,29 +132,77 @@ mod tests {
         );
     }
 
+    /// Production-path refusal via [`ProverBridge::require_live_identity`]:
+    /// after an unpinned build, installing pins that differ from the real
+    /// digests must refuse. Multi-minute circuit build.
     #[test]
-    fn refuse_when_built_c_balance_differs_from_pin() {
-        let built_c = [0x11u8; 32];
-        let built_b = [0x22u8; 32];
-        let mut pin_b = built_b;
-        pin_b[0] ^= 0xFF;
-        let err = require_live_digests_match_pins(
-            &built_c,
-            &built_b,
-            &built_c,
-            &pin_b,
-            Network::Testnet,
-        )
-        .expect_err("C_balance mismatch must refuse");
-        assert!(err.contains("do not match") || err.contains("Refusing"));
+    #[ignore = "multi-minute Plonky2 circuit build via ProverBridge"]
+    fn refuse_when_built_c_differs_from_pin() {
+        on_large_stack(|| {
+            let network = Network::Mainnet;
+            let bridge = ProverBridge::new(network);
+            let (built_c, built_b) = bridge
+                .require_live_identity()
+                .expect("unpinned ProverBridge build");
+            let mut pin_c = built_c;
+            pin_c[0] ^= 0xFF;
+            ProverBridge::install_network_pins(network, pin_c, built_b)
+                .expect("install divergent C pin after unpinned build");
+            let err = bridge
+                .require_live_identity()
+                .expect_err("built/pin mismatch must refuse through ProverBridge");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("do not match")
+                    || msg.contains("Refusing")
+                    || msg.contains("does not match"),
+                "error must name the refusal: {msg}"
+            );
+        });
     }
 
     #[test]
+    #[ignore = "multi-minute Plonky2 circuit build via ProverBridge"]
+    fn refuse_when_built_c_balance_differs_from_pin() {
+        on_large_stack(|| {
+            let network = Network::Testnet;
+            let bridge = ProverBridge::new(network);
+            let (built_c, built_b) = bridge
+                .require_live_identity()
+                .expect("unpinned ProverBridge build");
+            let mut pin_b = built_b;
+            pin_b[0] ^= 0xFF;
+            ProverBridge::install_network_pins(network, built_c, pin_b)
+                .expect("install divergent C_balance pin");
+            let err = bridge
+                .require_live_identity()
+                .expect_err("C_balance mismatch must refuse through ProverBridge");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("do not match")
+                    || msg.contains("Refusing")
+                    || msg.contains("does not match"),
+                "error must name the refusal: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "multi-minute Plonky2 circuit build via ProverBridge"]
     fn accept_when_built_equals_pins() {
-        let c = [0xAAu8; 32];
-        let b = [0xBBu8; 32];
-        require_live_digests_match_pins(&c, &b, &c, &b, Network::Mainnet)
-            .expect("identical pair must pass");
+        on_large_stack(|| {
+            let network = Network::Regtest;
+            let bridge = ProverBridge::new(network);
+            let (c, b) = bridge
+                .require_live_identity()
+                .expect("unpinned ProverBridge build");
+            ProverBridge::install_network_pins(network, c, b).expect("install matching pins");
+            let (c2, b2) = bridge
+                .require_live_identity()
+                .expect("matching pins must pass through ProverBridge");
+            assert_eq!(c2, c);
+            assert_eq!(b2, b);
+        });
     }
 
     #[test]

@@ -457,9 +457,19 @@ async fn process_mint(
     job: Job,
 ) -> anyhow::Result<()> {
     let public_id = job.public_id;
-    job_store
+    if !job_store
         .set_status(public_id, JobStatus::Proving, "proving")
-        .await?;
+        .await?
+    {
+        // Zero rows: generation fence or concurrent terminal — do not prove
+        // against wiped / foreign state (no silent fallback).
+        tracing::warn!(
+            "Job dispatcher: mint job {} set_status(proving) matched 0 rows; aborting",
+            public_id
+        );
+        notify_map.remove(&public_id);
+        return Ok(());
+    }
     publish_phase(
         notify_map,
         public_id,
@@ -987,9 +997,17 @@ async fn process_send_initial(
     job: Job,
 ) -> anyhow::Result<()> {
     let public_id = job.public_id;
-    job_store
+    if !job_store
         .set_status(public_id, JobStatus::Proving, "proving")
-        .await?;
+        .await?
+    {
+        tracing::warn!(
+            "Job dispatcher: send job {} set_status(proving) matched 0 rows; aborting",
+            public_id
+        );
+        notify_map.remove(&public_id);
+        return Ok(());
+    }
     publish_phase(
         notify_map,
         public_id,
@@ -1435,9 +1453,21 @@ async fn wait_for_commit(
         }
     };
 
-    job_store
+    if !job_store
         .set_status(public_id, JobStatus::Broadcasting, "broadcasting")
-        .await?;
+        .await?
+    {
+        // Zero rows: self-heal fence / missing row. Never run commit flows
+        // against wiped proof state after a silent no-op status write.
+        tracing::warn!(
+            "Job dispatcher: job {} set_status(broadcasting) matched 0 rows; \
+             refusing mint_commit_flow/commit_flow",
+            public_id
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        return Ok(());
+    }
     publish_phase(
         notify_map,
         public_id,
@@ -1767,35 +1797,41 @@ pub const JOB_FINALISE_HOST_EDGE: &str =
 ///
 /// ## Sweep: every SQL write that mutates a job row
 ///
-/// **Derivation method (do not compose from memory):** grep every
-/// `UPDATE jobs` / `INSERT INTO jobs` in production code, quote the
-/// actual `WHERE` clause, then state the fence from that clause alone.
-/// A table assembled from recollection is the same class of evidence as
-/// a test that checks its own logic.
+/// **Derivation method (do not compose from memory):**
+/// `rg -n 'UPDATE jobs SET|INSERT INTO jobs' node/src --glob '!**/*_tests.rs'`
+/// then open each hit and quote the actual `WHERE` (or admit lock). A table
+/// assembled from recollection is the same class of evidence as a test that
+/// checks its own logic. Two prior hand sweeps each missed entries.
 ///
-/// | Write | Actual `WHERE` (ground truth) | Fences on |
-/// |-------|------------------------------|-----------|
-/// | [`JobStore::create`] (`INSERT`) | `ON CONFLICT (account_address, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING` | partial unique key (idempotency) |
-/// | [`JobStore::set_status`] | `WHERE public_id = $3` | **public_id only** — no status predicate |
-/// | [`JobStore::set_status_if`] | `WHERE public_id = $3 AND status = $4` | status CAS |
-/// | [`JobStore::set_awaiting_signature`] | `WHERE public_id = $3 AND status IN ('queued', 'proving')` | status CAS (pre-claim) |
-/// | [`JobStore::complete`] | `WHERE public_id = $3` | **public_id only** — legacy unqualified |
-/// | [`JobStore::complete_if_status`] | `WHERE public_id = $3 AND status = ANY($4::text[]) AND phase IS DISTINCT FROM $5` | status + **not** [`FINALISE_CLAIM_PHASE`] |
-/// | [`JobStore::complete_if_finalise_owner`] | `WHERE public_id = $3 AND status = 'broadcasting' AND phase = $4 AND owner = $5 AND fence = $6 AND lease_expires_at IS NOT NULL AND lease_expires_at > NOW()` | **status + phase + owner + fence + unexpired lease** |
-/// | [`JobStore::fail`] | `WHERE public_id = $2` | **public_id only** — legacy unqualified |
-/// | [`JobStore::fail_if_status`] | `WHERE public_id = $2 AND status = ANY($3::text[]) AND phase IS DISTINCT FROM $4` | status + **not** [`FINALISE_CLAIM_PHASE`] |
-/// | [`JobStore::fail_if_finalise_owner`] | `WHERE public_id = $2 AND status = 'broadcasting' AND phase = $3 AND owner = $4 AND fence = $5 AND lease_expires_at IS NOT NULL AND lease_expires_at > NOW()` | **status + phase + owner + fence + unexpired lease** |
-/// | [`JobStore::claim_finalise_exclusive`] path A | `WHERE public_id = $6 AND status = $7` (`awaiting_signature` → claim) | status CAS; **mints** fence |
-/// | [`JobStore::claim_finalise_exclusive`] path B | `WHERE public_id = $5 AND status = 'broadcasting' AND phase IN ('publishing', 'broadcasting')` | status + free phase; **mints** fence |
-/// | [`JobStore::renew_finalise_claim`] | `WHERE public_id = $5 AND status = 'broadcasting' AND phase = $6 AND owner = $2 AND fence = $3` | **status + phase + owner + fence** (lease rewrite) |
-/// | [`JobStore::release_stale_finalise_claim`] | `WHERE public_id = $1 AND status = 'broadcasting' AND phase = $2 AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())` | status + claimed phase + **expired/absent lease** |
-/// | [`JobStore::replace_request_body_if_status`] | `WHERE public_id = $2 AND status = $3` | status CAS (pre-claim capability / accepted signature) |
-/// | [`JobStore::replace_request_body_if_cleanup_safe`] | `WHERE public_id = $2 AND status <> 'awaiting_signature' AND phase IS DISTINCT FROM $3` | not live handoff + **not** [`FINALISE_CLAIM_PHASE`] |
-/// | [`JobStore::merge_finalisation_if_finalise_owner`] | `WHERE public_id = $3 AND status = 'broadcasting' AND phase = $4 AND owner = $5 AND fence = $6 AND lease_expires_at IS NOT NULL AND lease_expires_at > NOW()` | **status + phase + owner + fence + unexpired lease** |
-/// | [`JobStore::cancel`] | `WHERE public_id = $1 AND status = 'queued'` | status CAS (legacy queued-only) |
-/// | [`JobStore::cancel_not_yet_published`] | `WHERE public_id = $1 AND status IN ('queued', 'proving', 'awaiting_signature')` | status CAS (v1.1 pre-publish) |
-/// | Legacy commit-payload write (`router` commit route) | `WHERE public_id = $2` | **public_id only** — flag-off commit path |
-/// | Finalise hook → engine snapshot + `members_ready` | (not a `jobs` row write; account/engine + rebroadcast) | **fence + owner + lease** via [`crate::v11::finalise_accepted_prove_persist_and_stage`] |
+/// Every job-advancing write below includes
+/// `reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)`
+/// unless noted. Admit additionally takes `SELECT … FOR UPDATE` on the meta
+/// row so it serialises with the reset bump (mutual exclusion, not MVCC order).
+///
+/// | Write | Actual `WHERE` / lock (ground truth) | Fences on |
+/// |-------|--------------------------------------|-----------|
+/// | [`JobStore::create`] (`INSERT`) | admit tx: `SELECT generation … FOR UPDATE` then `INSERT … reset_generation = $8`; `ON CONFLICT (account_address, idempotency_key) … DO NOTHING` | **meta row lock** + partial unique key |
+/// | [`JobStore::set_status`] | `WHERE public_id = $3 AND reset_generation = (SELECT generation …)` | generation; returns **bool** (0 rows = false) |
+/// | [`JobStore::set_status_if`] | `WHERE public_id = $3 AND status = $4 AND reset_generation = …` | status CAS + generation |
+/// | [`JobStore::set_awaiting_signature`] | `WHERE public_id = $3 AND status IN ('queued', 'proving') AND reset_generation = …` | status CAS + generation |
+/// | [`JobStore::complete`] | `WHERE public_id = $3 AND reset_generation = …` | generation (legacy unqualified status) |
+/// | [`JobStore::complete_if_status`] | `WHERE public_id = $3 AND status = ANY($4) AND phase IS DISTINCT FROM $5 AND reset_generation = …` | status + not claim phase + generation |
+/// | [`JobStore::complete_if_finalise_owner`] | `WHERE public_id = $3 AND status = 'broadcasting' AND phase = $4 AND owner AND fence AND lease > NOW() AND reset_generation = …` | claim fence + lease + generation |
+/// | [`JobStore::fail`] | `WHERE public_id = $2 AND reset_generation = …` | generation |
+/// | [`JobStore::fail_if_status`] | `WHERE public_id = $2 AND status = ANY($3) AND phase IS DISTINCT FROM $4 AND reset_generation = …` | status + not claim phase + generation |
+/// | [`JobStore::fail_if_finalise_owner`] | claim fence + lease + `reset_generation = …` | claim fence + lease + generation |
+/// | [`JobStore::claim_finalise_exclusive`] path A | `WHERE public_id = $6 AND status = $7 AND reset_generation = …` | status CAS + generation; **mints** fence |
+/// | [`JobStore::claim_finalise_exclusive`] path B | `WHERE public_id = $5 AND status = 'broadcasting' AND phase IN ('publishing','broadcasting') AND reset_generation = …` | free phase + generation; **mints** fence |
+/// | [`JobStore::renew_finalise_claim`] | claim owner+fence + `reset_generation = …` | claim fence + generation |
+/// | [`JobStore::release_stale_finalise_claim`] | `WHERE public_id = $1 AND status = 'broadcasting' AND phase = $2 AND (lease NULL OR <= NOW()) AND reset_generation = …` | abandoned lease + generation |
+/// | [`JobStore::replace_request_body_if_status`] | `WHERE public_id = $2 AND status = $3 AND reset_generation = …` | status CAS + generation |
+/// | [`JobStore::replace_request_body_if_cleanup_safe`] | `WHERE public_id = $2 AND status <> 'awaiting_signature' AND phase IS DISTINCT FROM $3 AND reset_generation = …` | not handoff + not claim + generation |
+/// | [`JobStore::merge_finalisation_if_finalise_owner`] | claim fence + lease + `reset_generation = …` | claim fence + lease + generation |
+/// | [`JobStore::cancel`] | `WHERE public_id = $1 AND status = 'queued' AND reset_generation = …` | status CAS + generation |
+/// | [`JobStore::cancel_not_yet_published`] | `WHERE public_id = $1 AND status IN ('queued','proving','awaiting_signature') AND reset_generation = …` | status CAS + generation |
+/// | Legacy commit-payload (`router` → [`JobStore::replace_request_body_if_status`]) | `WHERE public_id = $2 AND status = 'awaiting_signature' AND reset_generation = …` | status + generation |
+/// | Self-heal fail non-terminal (`db::fail_non_terminal_jobs_for_self_heal_in_tx`) | `WHERE status IN ('queued','proving','awaiting_signature','broadcasting')` | reset path (bulk fail; not generation-fenced by design) |
+/// | Finalise hook → engine snapshot + `members_ready` | (not a `jobs` row write) | **fence + owner + lease** via [`crate::v11::finalise_accepted_prove_persist_and_stage`] |
 ///
 /// After the claim is won, durable transition commits are fenced on the
 /// **acquisition fencing token** plus a still-valid lease — not on owner

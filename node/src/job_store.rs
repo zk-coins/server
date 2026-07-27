@@ -422,18 +422,31 @@ impl JobStore {
         idem_key: Option<&str>,
         request_body: serde_json::Value,
     ) -> sqlx::Result<CreateResult> {
+        // Mutual exclusion with self-heal reset (not mere ordering):
+        // reset holds a row lock on `self_heal_reset_meta` via its
+        // `UPDATE … generation = generation + 1`. A plain scalar SELECT of
+        // generation sees only the last **committed** snapshot under MVCC
+        // and can stamp a stale epoch after the reset UPDATE but before
+        // its COMMIT. `SELECT … FOR UPDATE` takes a conflicting lock on
+        // the same singleton row, so admit and reset serialise: admit
+        // either stamps the pre-bump generation (and is then failed by
+        // the reset's fail-UPDATE) or waits and stamps the post-bump
+        // generation after the reset commits. There is no open window
+        // where a concurrent INSERT can commit a generation the reset
+        // has already advanced past without seeing it.
+        let mut tx = self.pool.begin().await?;
+        let (generation,): (i64,) = sqlx::query_as(
+            "SELECT generation FROM self_heal_reset_meta WHERE id = 1 FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+
         let public_id = Uuid::new_v4();
-        // Stamp the live self-heal admission epoch so a concurrent reset
-        // that bumps the generation leaves this row (if it raced with a
-        // stale read) or any pre-reset worker unable to advance it.
         let inserted_row = sqlx::query(
             "INSERT INTO jobs \
              (public_id, kind, status, phase, account_address, idempotency_key, request_body, \
               reset_generation) \
-             VALUES ( \
-               $1, $2, $3, $4, $5, $6, $7, \
-               (SELECT generation FROM self_heal_reset_meta WHERE id = 1) \
-             ) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (account_address, idempotency_key) \
                  WHERE idempotency_key IS NOT NULL \
                  DO NOTHING \
@@ -446,10 +459,12 @@ impl JobStore {
         .bind(&account[..])
         .bind(idem_key)
         .bind(&request_body)
-        .fetch_optional(&self.pool)
+        .bind(generation)
+        .fetch_optional(&mut *tx)
         .await?;
 
         if let Some(row) = inserted_row {
+            tx.commit().await?;
             return Job::from_row(&row).map(CreateResult::Fresh);
         }
 
@@ -463,8 +478,9 @@ impl JobStore {
         )
         .bind(&account[..])
         .bind(idem_key)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Job::from_row(&existing).map(CreateResult::IdempotentReplay)
     }
 
@@ -511,13 +527,19 @@ impl JobStore {
     /// still holds a loaded `public_id` cannot resurrect a row after
     /// [`crate::db::reset_v11_proof_dependent_state_tx`] /
     /// [`crate::db::reset_proof_dependent_state_tx`] bumped the epoch.
+    ///
+    /// Returns `Ok(true)` when exactly one row was updated, `Ok(false)`
+    /// when zero rows matched (stale generation, missing job, or other
+    /// fence miss). Callers **must** act on `false` — never treat a
+    /// no-op write as success and continue side effects against possibly
+    /// wiped state (no silent fallback).
     pub async fn set_status(
         &self,
         public_id: Uuid,
         status: JobStatus,
         phase: &str,
-    ) -> sqlx::Result<()> {
-        sqlx::query(
+    ) -> sqlx::Result<bool> {
+        let result = sqlx::query(
             "UPDATE jobs SET status = $1, phase = $2, updated_at = NOW() \
              WHERE public_id = $3 \
                AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
@@ -527,7 +549,7 @@ impl JobStore {
         .bind(public_id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     /// Move a `send` job to `awaiting_signature` and persist the
@@ -1015,7 +1037,8 @@ impl JobStore {
                AND ( \
                      (request_body #>> '{finalise_claim,lease_expires_at}') IS NULL \
                   OR (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz <= NOW() \
-               )",
+               ) \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(public_id)
         .bind(FINALISE_CLAIM_PHASE)

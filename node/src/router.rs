@@ -2290,21 +2290,35 @@ pub(crate) async fn jobs_commit_handler(
         .expect("jobs.request_body is always a JSON object (admit handlers enforce)");
     obj.insert("commit".to_string(), commit_value);
 
-    if let Err(e) =
-        sqlx::query("UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2")
-            .bind(&merged)
-            .bind(id)
-            .execute(state.job_store.pool())
-            .await
+    // Generation-fenced + status CAS (same shape as the v1.1 sign route).
+    // A bare `WHERE public_id = $2` would rewrite a pre-reset row after a
+    // self-heal wipe and could wake the dispatcher against wiped state.
+    match state
+        .job_store
+        .replace_request_body_if_status(id, JobStatus::AwaitingSignature, &merged)
+        .await
     {
-        tracing::error!("Failed to merge commit payload into job row: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(JobErrorResponse {
-                error: "Failed to persist commit payload".to_string(),
-            }),
-        )
-            .into_response();
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(JobErrorResponse {
+                    error: "Job is no longer awaiting signature (or was invalidated by a reset)"
+                        .to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!("Failed to merge commit payload into job row: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(JobErrorResponse {
+                    error: "Failed to persist commit payload".to_string(),
+                }),
+            )
+                .into_response();
+        }
     }
 
     // Wake the dispatcher's `wait_for_commit` task. If no entry

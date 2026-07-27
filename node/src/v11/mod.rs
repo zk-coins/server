@@ -80,7 +80,7 @@ pub use scan::{
 };
 pub use self_heal::{
     boot_canary, decode_v11_live_digest, encode_v11_live_digest, evaluate_v11_slow_canary,
-    evaluate_v11_structural_canary, refuse_if_built_differs_from_pins, resolve_v11_live_digest,
+    evaluate_v11_structural_canary, resolve_v11_live_digest,
     slow_canary_env_enabled, slow_canary_verify_transition, v11_canary_for_heal,
     V11CanaryNflogView, V11CanarySample, V11StructuralInputs, V11_DIGEST_TAG, V11_LIVE_DIGEST_LEN,
 };

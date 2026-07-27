@@ -19,10 +19,12 @@
 -- * Singleton `self_heal_reset_meta.generation` is the current admission
 --   epoch (starts at 0).
 -- * Every `jobs` row is stamped with `reset_generation` at INSERT time from
---   the current meta generation.
--- * A self-heal reset BUMPS the meta generation first, then fails non-terminal
---   jobs WITHOUT rewriting their `reset_generation` — those rows are left
---   behind the live epoch.
+--   the current meta generation, under `SELECT … FOR UPDATE` on this row so
+--   admit and reset are mutually exclusive (plain scalar SELECT would see
+--   the last committed generation for the whole uncommitted bump window).
+-- * A self-heal reset BUMPS the meta generation first (row lock until commit),
+--   then fails non-terminal jobs WITHOUT rewriting their `reset_generation`
+--   — those rows are left behind the live epoch.
 -- * Every job-advancing write requires
 --     `jobs.reset_generation = (SELECT generation FROM self_heal_reset_meta)`
 --   so a pre-reset worker (or a stale-generation admit) cannot resurrect or
