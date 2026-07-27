@@ -241,19 +241,23 @@ pub struct AppState {
     /// `request_body.pending_sign` and rehydrated on boot resume.
     pub(crate) pending_sign_map: crate::v11::PendingSignMap,
     /// Optional v1.1 finalise driver. Under a v1.1 claim an accepted
-    /// `/sign` **must** go through this (install signature →
-    /// `StateEngine::finalise` or a test double) rather than completing
-    /// the job with the signature material alone. `None` under the
-    /// legacy stack; under v1.1 a missing driver fails the job loud.
+    /// `/sign` **must** go through this (install signature → prove
+    /// outside the engine lock → apply with live re-validation, or a
+    /// test double) rather than completing the job with the signature
+    /// material alone. `None` under the legacy stack; under v1.1 a
+    /// missing driver fails the job loud.
     pub(crate) v11_finalise: Option<V11FinaliseHook>,
-    /// Optional source of a **live** [`PendingSignEntry`] after the prove
-    /// leg. Under a v1.1 claim the dispatcher stages this via
-    /// [`crate::v11::stage_pending_sign`] before advertising
-    /// `awaiting_signature`. Production Stage 3 wires
-    /// `StateEngine::begin_*` (or the flow return) here; until then
-    /// production leaves this `None` and v1.1 jobs fail closed at the
-    /// advertisement step. Tests inject fixture entries so the
-    /// dispatcher staging path is exercised without a multi-minute prove.
+    /// Production registry of live [`PendingSignEntry`] values produced
+    /// by `StateEngine::begin_*`. Keyed by job id; the dispatcher takes
+    /// the entry once when entering `awaiting_signature` and stages it
+    /// via [`crate::v11::stage_pending_sign`]. Empty under the legacy
+    /// stack. Writers: [`crate::v11::register_live_pending_after_begin`].
+    pub(crate) v11_live_pending_after_begin: crate::v11::PendingSignMap,
+    /// Optional extra source of a live pending after the prove leg
+    /// (tests inject fixtures without a multi-minute prove; production
+    /// prefers [`Self::v11_live_pending_after_begin`]). `None` return
+    /// from both sources → v1.1 jobs fail closed at advertisement (no
+    /// silent ash‖ocr).
     pub(crate) v11_pending_after_prove: Option<V11PendingAfterProveHook>,
 }
 
@@ -2549,16 +2553,22 @@ pub(crate) async fn jobs_sign_handler(
         }
     };
 
-    // Acceptance requires a parked dispatcher that will process the
-    // signature. Reporting signature_accepted when nothing will finalise
-    // is worse than failing — the wallet would believe the work is done.
-    // §7.5 has no dedicated "dispatcher down" code → internal_error.
+    // Ordering (Defect 2): **persist the signature before** claiming the
+    // handoff as SIGNALED. A crash between signal and persist must not
+    // leave a job marked signalled with nothing durable behind it.
     //
-    // Race (Defect 2): a clone of a notifier that was present a moment
-    // earlier is not enough — the dispatcher can time out between the
-    // clone and the wake. Claim the handoff with CAS first; only then
-    // persist and wake. If the CAS fails, the dispatcher has already
-    // left (or another signal won) and we refuse acceptance.
+    // Crash windows after this reorder:
+    // - after verify, before persist → no durable sign, handoff still
+    //   WAITING; wallet may retry `/sign`
+    // - after persist, before CAS → durable sign, handoff still WAITING;
+    //   wallet may retry `/sign` (re-persist is idempotent)
+    // - after CAS, before notify → durable + SIGNALED; process death
+    //   re-arms on boot resume; in-process the notify is the next line
+    // - after notify → normal finalise path
+    //
+    // Acceptance still requires a parked dispatcher: reporting
+    // signature_accepted when nothing will finalise is worse than failing.
+    // §7.5 has no dedicated "dispatcher down" code → internal_error.
     let Some(notifier) = state.job_notify_map.get(&id).map(|e| e.value().clone()) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2570,18 +2580,6 @@ pub(crate) async fn jobs_sign_handler(
         )
             .into_response();
     };
-    if !notifier.try_signal_accept() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(v11_error_body(
-                "internal_error",
-                "signature verified but the dispatcher is no longer waiting to finalise \
-                 this job (timed out or already signaled); refusing acceptance so the \
-                 wallet does not treat the work as done",
-            )),
-        )
-            .into_response();
-    }
 
     // Persist the verified TransitionSignature on the job row under `sign`
     // so the dispatcher can finalise without re-accepting untrusted bytes.
@@ -2607,9 +2605,7 @@ pub(crate) async fn jobs_sign_handler(
             .await
     {
         tracing::error!("Failed to merge sign payload into job row: {}", e);
-        // Handoff already claimed SIGNALED; the dispatcher will wake and
-        // fail on a missing/invalid sign blob or we leave it timed-out
-        // path. Surface the persist failure to the wallet.
+        // Handoff still WAITING — no SIGNALED without durable state.
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(v11_error_body("internal_error", "Failed to persist sign payload")),
@@ -2617,9 +2613,23 @@ pub(crate) async fn jobs_sign_handler(
             .into_response();
     }
 
-    // Wake only after durable persist — acceptance and processing are
-    // coupled: 200 signature_accepted means the dispatcher has been
-    // claimed (CAS) and notified to drive finalise.
+    // Durable first, then CAS. If the dispatcher already timed out, refuse
+    // acceptance even though the sign blob is on the row (wallet must not
+    // treat the work as done when nothing will finalise).
+    if !notifier.try_signal_accept() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(v11_error_body(
+                "internal_error",
+                "signature verified and persisted but the dispatcher is no longer waiting \
+                 to finalise this job (timed out or already signaled); refusing acceptance \
+                 so the wallet does not treat the work as done",
+            )),
+        )
+            .into_response();
+    }
+
+    // Wake only after durable persist + successful CAS.
     notifier.commit_wake.notify_one();
     (
         StatusCode::OK,
@@ -2824,11 +2834,23 @@ pub(crate) async fn jobs_cancel_handler(
     }
 }
 
+/// §7.5: a job is cancellable while its nullifier is **not yet published**.
+/// `queued`, `proving`, and `awaiting_signature` qualify; once the job
+/// enters `broadcasting`/`publishing` the nullifier is in flight and
+/// cancel is refused.
+fn job_is_cancellable(status: JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::Queued | JobStatus::Proving | JobStatus::AwaitingSignature
+    )
+}
+
 /// `POST /v1/jobs/:id/cancel` — §7.5 normative cancel route.
 ///
-/// Same lifecycle as the legacy `/api` cancel (queued only), but every
-/// outward error uses the closed §7.5 `{error, message}` body. Wrong
-/// phase → `wrong_phase`; unknown job → `job_not_found`.
+/// Cancels a **not-yet-published** job (`queued` | `proving` |
+/// `awaiting_signature`). Once the nullifier is broadcast
+/// (`broadcasting` / completed), cancel is refused as `wrong_phase`.
+/// Outward errors use the closed §7.5 `{error, message}` body.
 pub(crate) async fn jobs_cancel_v1_handler(
     State(state): State<AppState>,
     V1JobId(id): V1JobId,
@@ -2843,14 +2865,15 @@ pub(crate) async fn jobs_cancel_v1_handler(
             )
                 .into_response();
         }
-        Ok(Some(job)) if job.status != JobStatus::Queued => {
+        Ok(Some(job)) if !job_is_cancellable(job.status) => {
             return (
                 StatusCode::CONFLICT,
                 Json(v11_error_body(
                     "wrong_phase",
                     format!(
-                        "Job is in status `{}`, not `queued` (only queued jobs are cancellable)",
-                        job.status.as_str()
+                        "Job is in status `{}` and is no longer cancellable \
+                         (nullifier already published or terminal)",
+                        v11_status_wire(job.status)
                     ),
                 )),
             )
@@ -2869,6 +2892,23 @@ pub(crate) async fn jobs_cancel_v1_handler(
 
     match state.job_store.cancel(id).await {
         Ok(true) => {
+            // Strip staged sign material so a cancelled awaiting_signature
+            // job does not leave a restart envelope or in-memory entry.
+            state.pending_sign_map.remove(&id);
+            state.v11_live_pending_after_begin.remove(&id);
+            if let Ok(Some(job)) = state.job_store.load(id).await {
+                let mut body = job.request_body;
+                if crate::v11::strip_pending_sign_from_body(&mut body) {
+                    let _ = sqlx::query(
+                        "UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2",
+                    )
+                    .bind(&body)
+                    .bind(id)
+                    .execute(state.job_store.pool())
+                    .await;
+                }
+            }
+            let err_body = crate::v11::encode_job_error("internal_error", "cancelled");
             crate::job_dispatcher::publish_phase(
                 &state.job_notify_map,
                 id,
@@ -2877,9 +2917,15 @@ pub(crate) async fn jobs_cancel_v1_handler(
                     phase: "cancelled".to_string(),
                     proof_id: None,
                     result: None,
-                    error: None,
+                    error: Some(err_body),
                 },
             );
+            // Wake a parked awaiting_signature dispatcher so it observes
+            // the terminal status instead of waiting for timeout.
+            if let Some(notifier) = state.job_notify_map.get(&id).map(|e| e.value().clone()) {
+                let _ = notifier.try_claim_timeout();
+                notifier.commit_wake.notify_one();
+            }
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"status": "cancelled", "job_id": id})),
@@ -2887,7 +2933,8 @@ pub(crate) async fn jobs_cancel_v1_handler(
                 .into_response()
         }
         Ok(false) => (
-            // Lost the race with the dispatcher between load and cancel.
+            // Lost the race with the dispatcher between load and cancel
+            // (e.g. nullifier published into broadcasting).
             StatusCode::CONFLICT,
             Json(v11_error_body(
                 "wrong_phase",
@@ -2908,35 +2955,206 @@ pub(crate) async fn jobs_cancel_v1_handler(
 
 /// `GET /v1/jobs/:id/stream` — §7.5 normative SSE route.
 ///
-/// Implements the stream by delegating to the same notifier/broadcast
-/// substrate as `/api/jobs/:id/stream`, but unknown ids and DB failures
+/// Emits `event: phase` for non-terminal updates, `event: complete` for a
+/// successful terminal job, and `event: error` for `failed` / `cancelled`
+/// with a closed enumeration `error` object. Unknown ids and DB failures
 /// return the closed §7.5 error body (never a bare framework status).
 pub(crate) async fn stream_job_v1_handler(
     V1JobId(id): V1JobId,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    match stream_job_handler(Path(id), State(state)).await {
-        Ok(sse) => sse.into_response(),
-        Err(StatusCode::NOT_FOUND) => (
-            StatusCode::NOT_FOUND,
-            Json(v11_error_body("job_not_found", "Job not found")),
-        )
-            .into_response(),
-        Err(StatusCode::INTERNAL_SERVER_ERROR) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(v11_error_body("internal_error", "Failed to load job")),
-        )
-            .into_response(),
-        Err(other) => (
-            other,
-            Json(v11_error_body(
-                "internal_error",
-                format!("stream failed with status {}", other.as_u16()),
-            )),
-        )
-            .into_response(),
+
+    let job = match state.job_store.load(id).await {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(v11_error_body("job_not_found", "Job not found")),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!("JobStore::load failed in v1 stream handler: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(v11_error_body("internal_error", "Failed to load job")),
+            )
+                .into_response();
+        }
+    };
+
+    let notifier = state
+        .job_notify_map
+        .entry(id)
+        .or_insert_with(|| Arc::new(JobNotifier::new()))
+        .clone();
+    let rx = notifier.phase_tx.subscribe();
+    let stream = build_phase_stream_v1(job, rx);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(SSE_HEARTBEAT_INTERVAL))
+        .into_response()
+}
+
+/// §7.5 SSE stream: terminal `failed`/`cancelled` → `event: error` with
+/// enumeration body; `completed` → `event: complete`; else `event: phase`.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn build_phase_stream_v1(
+    job: Job,
+    mut rx: tokio::sync::broadcast::Receiver<JobPhaseEvent>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        let initial = initial_event_from_job_v1(&job);
+        let is_terminal = job.status.is_terminal();
+        yield Ok(initial);
+        if is_terminal {
+            return;
+        }
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let is_terminal = event.status.is_terminal();
+                    yield Ok(event_from_phase_v1(&event, job.public_id, job.kind.as_str()));
+                    if is_terminal {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
     }
+}
+
+/// §7.5 initial SSE frame from a job row.
+pub(crate) fn initial_event_from_job_v1(job: &Job) -> Event {
+    let status_wire = v11_status_wire(job.status);
+    let (event_name, payload) = match job.status {
+        JobStatus::Completed => (
+            "complete",
+            serde_json::json!({
+                "job_id": job.public_id,
+                "kind": job.kind.as_str(),
+                "status": status_wire,
+                "result": job.response_body.clone().unwrap_or(serde_json::Value::Null),
+            }),
+        ),
+        JobStatus::Failed | JobStatus::Cancelled => (
+            "error",
+            serde_json::json!({
+                "job_id": job.public_id,
+                "status": status_wire,
+                "error": crate::v11::decode_job_error(job.error.as_deref(), job.status),
+            }),
+        ),
+        JobStatus::AwaitingSignature => {
+            let mut data = serde_json::json!({
+                "status": status_wire,
+                "progress": v11_progress_wire(job.progress),
+            });
+            if let Some(surface) = job.response_body.clone() {
+                data.as_object_mut()
+                    .expect("object")
+                    .insert("awaiting_signature".to_string(), surface);
+            }
+            if !job.phase.is_empty() {
+                data.as_object_mut()
+                    .expect("object")
+                    .insert(
+                        "phase".to_string(),
+                        serde_json::Value::String(job.phase.clone()),
+                    );
+            }
+            ("phase", data)
+        }
+        _ => {
+            let mut data = serde_json::json!({
+                "status": status_wire,
+                "progress": v11_progress_wire(job.progress),
+            });
+            if !job.phase.is_empty() {
+                data.as_object_mut()
+                    .expect("object")
+                    .insert(
+                        "phase".to_string(),
+                        serde_json::Value::String(job.phase.clone()),
+                    );
+            }
+            ("phase", data)
+        }
+    };
+    Event::default()
+        .event(event_name)
+        .json_data(payload)
+        .expect("Event::json_data cannot fail for a freshly built serde_json::Value")
+}
+
+/// §7.5 SSE frame from a dispatcher phase event.
+pub(crate) fn event_from_phase_v1(event: &JobPhaseEvent, job_id: Uuid, kind: &str) -> Event {
+    let status_wire = v11_status_wire(event.status);
+    let (event_name, payload) = match event.status {
+        JobStatus::Completed => (
+            "complete",
+            serde_json::json!({
+                "job_id": job_id,
+                "kind": kind,
+                "status": status_wire,
+                "result": event.result.clone().unwrap_or(serde_json::Value::Null),
+            }),
+        ),
+        JobStatus::Failed | JobStatus::Cancelled => {
+            let error = match event.error.as_deref() {
+                Some(raw) => crate::v11::decode_job_error(Some(raw), event.status),
+                None => crate::v11::decode_job_error(None, event.status),
+            };
+            (
+                "error",
+                serde_json::json!({
+                    "job_id": job_id,
+                    "status": status_wire,
+                    "error": error,
+                }),
+            )
+        }
+        JobStatus::AwaitingSignature => {
+            let mut data = serde_json::json!({
+                "status": status_wire,
+                "progress": 0.0,
+            });
+            if let Some(surface) = event.result.clone() {
+                data.as_object_mut()
+                    .expect("object")
+                    .insert("awaiting_signature".to_string(), surface);
+            }
+            if !event.phase.is_empty() {
+                data.as_object_mut()
+                    .expect("object")
+                    .insert(
+                        "phase".to_string(),
+                        serde_json::Value::String(event.phase.clone()),
+                    );
+            }
+            ("phase", data)
+        }
+        _ => {
+            let mut data = serde_json::json!({
+                "status": status_wire,
+                "progress": 0.0,
+            });
+            if !event.phase.is_empty() {
+                data.as_object_mut()
+                    .expect("object")
+                    .insert(
+                        "phase".to_string(),
+                        serde_json::Value::String(event.phase.clone()),
+                    );
+            }
+            ("phase", data)
+        }
+    };
+    Event::default()
+        .event(event_name)
+        .json_data(payload)
+        .expect("Event::json_data cannot fail for a freshly built serde_json::Value")
 }
 
 // =======================================================================

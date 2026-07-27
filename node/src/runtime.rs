@@ -109,27 +109,28 @@ pub async fn start_rest_node(
         v11_scan_caught_up: v11_readiness.scan_caught_up,
         v11_finality_ok: v11_readiness.finality_ok,
         pending_sign_map: Arc::new(DashMap::new()),
-        // Production finalise: install the accepted signature and call
-        // StateEngine::finalise on the shared engine. Under the v1.1 claim
-        // a missing driver fails the job loud rather than short-circuiting
-        // to "signature_accepted" alone.
-        v11_finalise: v11_engine.map(|adapter| {
+        // Production finalise: prove outside the engine lock, then apply
+        // with live re-validation (receive-path invariant). Under the v1.1
+        // claim a missing driver fails the job loud rather than
+        // short-circuiting to "signature_accepted" alone.
+        v11_finalise: v11_engine.as_ref().map(|adapter| {
+            let adapter = Arc::clone(adapter);
             let hook: crate::router::V11FinaliseHook = Arc::new(move |pending, signature| {
                 // publisher_pubkey is filled by the dispatcher from the job
                 // request_body after the hook returns (hook has no job ctx).
-                adapter.with_engine_mut(|engine| {
-                    crate::v11::finalise_with_accepted_signature(
-                        engine, pending, signature, None,
-                    )
-                })
-                .map_err(|e| e.to_string())?
+                crate::v11::finalise_accepted_prove_outside_lock(
+                    &adapter, pending, signature, None,
+                )
             });
             hook
         }),
-        // Stage 3 prove (`StateEngine::begin_*`) is not yet wired into
-        // send_flow/mint_flow. Until it is, production leaves this None and
-        // v1.1 jobs fail closed when entering awaiting_signature (no silent
-        // ash‖ocr). Tests inject fixture PendingSignEntry values.
+        // Production post-begin registry: `StateEngine::begin_*` writes a
+        // live PendingSignEntry here; the dispatcher takes it when the job
+        // enters awaiting_signature and stages via stage_pending_sign.
+        // Under the legacy stack the map stays empty and is unused.
+        v11_live_pending_after_begin: Arc::new(DashMap::new()),
+        // Optional test/fixture hook. Production prefers the live map above;
+        // both are consulted by resolve_live_pending_after_prove.
         v11_pending_after_prove: None,
     };
 

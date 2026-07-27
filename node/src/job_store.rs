@@ -340,10 +340,13 @@ impl JobStore {
         proof_id: i64,
         result: serde_json::Value,
     ) -> sqlx::Result<()> {
+        // Only advance from proving (or queued, defensive). Never overwrite
+        // a cancelled / terminal row — cancel may have won during prove.
         sqlx::query(
             "UPDATE jobs SET status = 'awaiting_signature', phase = 'awaiting_signature', \
                               proof_id = $1, response_body = $2, updated_at = NOW() \
-             WHERE public_id = $3",
+             WHERE public_id = $3 \
+               AND status IN ('queued', 'proving')",
         )
         .bind(proof_id)
         .bind(&result)
@@ -392,20 +395,22 @@ impl JobStore {
         Ok(())
     }
 
-    /// Attempt to cancel a job. Only succeeds when the job is still
-    /// `queued` — past that the dispatcher has already paid prove
-    /// cost and a mid-flight cancel would leave persistent state
-    /// inconsistent (commitment proof persisted, dispatcher partway
-    /// through broadcast).
+    /// Attempt to cancel a job that is **not yet published** (§7.5).
+    ///
+    /// Succeeds for `queued`, `proving`, and `awaiting_signature` — the
+    /// nullifier has not reached the chain. Once the job is
+    /// `broadcasting` (or terminal), cancel is refused so a published
+    /// nullifier cannot be rolled back by a status flip.
     ///
     /// Returns `Ok(true)` if cancellation applied, `Ok(false)` if the
-    /// job was already past `queued` (or not found). The admit
-    /// handler maps `false` to `409 Conflict`.
+    /// job was already past the cancellable set (or not found). The
+    /// v1 cancel handler maps `false` to `409 wrong_phase`.
     pub async fn cancel(&self, public_id: Uuid) -> sqlx::Result<bool> {
         let result = sqlx::query(
             "UPDATE jobs SET status = 'cancelled', phase = 'cancelled', \
                               updated_at = NOW(), completed_at = NOW() \
-             WHERE public_id = $1 AND status = 'queued'",
+             WHERE public_id = $1 \
+               AND status IN ('queued', 'proving', 'awaiting_signature')",
         )
         .bind(public_id)
         .execute(&self.pool)

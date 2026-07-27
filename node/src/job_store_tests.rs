@@ -320,7 +320,8 @@ async fn cancel_from_queued_returns_true_and_marks_cancelled() {
 }
 
 #[tokio::test]
-async fn cancel_from_proving_returns_false_and_leaves_status_untouched() {
+async fn cancel_from_proving_returns_true_and_marks_cancelled() {
+    // §7.5: proving is not-yet-published — cancel must apply.
     let (store, _c) = setup_store().await;
     let CreateResult::Fresh(job) = store
         .create(JobKind::Mint, &account_addr(15), None, sample_mint_body())
@@ -334,9 +335,30 @@ async fn cancel_from_proving_returns_false_and_leaves_status_untouched() {
         .await
         .expect("set proving");
     let applied = store.cancel(job.public_id).await.expect("cancel");
-    assert!(!applied, "cancel from non-queued state must not apply");
+    assert!(applied, "cancel from proving must apply (§7.5 not-yet-published)");
     let after = store.load(job.public_id).await.unwrap().unwrap();
-    assert_eq!(after.status, JobStatus::Proving);
+    assert_eq!(after.status, JobStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn cancel_from_broadcasting_returns_false_and_leaves_status_untouched() {
+    // Nullifier is in flight / published — cancel must refuse.
+    let (store, _c) = setup_store().await;
+    let CreateResult::Fresh(job) = store
+        .create(JobKind::Mint, &account_addr(115), None, sample_mint_body())
+        .await
+        .expect("create")
+    else {
+        panic!("expected Fresh");
+    };
+    store
+        .set_status(job.public_id, JobStatus::Broadcasting, "broadcasting")
+        .await
+        .expect("set broadcasting");
+    let applied = store.cancel(job.public_id).await.expect("cancel");
+    assert!(!applied, "cancel from broadcasting must not apply");
+    let after = store.load(job.public_id).await.unwrap().unwrap();
+    assert_eq!(after.status, JobStatus::Broadcasting);
 }
 
 #[tokio::test]

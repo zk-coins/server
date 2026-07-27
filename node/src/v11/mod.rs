@@ -87,13 +87,14 @@ pub use separation::{
 pub use signature::{
     accept_wallet_transition_signature, awaiting_signature_result_json, decode_job_error,
     encode_job_error, ensure_finalise_ready, ensure_v11_signature_path,
-    finalise_with_accepted_signature, legacy_awaiting_signature_result_json,
-    publisher_pubkey_from_request_body, refuse_legacy_commitment_under_v11,
+    finalise_accepted_prove_outside_lock, finalise_with_accepted_signature,
+    legacy_awaiting_signature_result_json, publisher_pubkey_from_request_body,
+    refuse_legacy_commitment_under_v11, register_live_pending_after_begin,
     rehydrate_pending_sign, select_awaiting_signature_result, sign_rejection, stage_pending_sign,
-    strip_pending_sign_from_body, v11_sign_route_active, verify_transition_signature_material,
-    FinaliseOutcome, PendingSignEntry, PendingSignMap, SignatureCheck, StagedSignPersist,
-    TransitionSignatureError, WalletSignSubmission, WalletSignSubmissionWire,
-    LEGACY_COMMITMENT_REFUSED_UNDER_V11, PENDING_SIGN_BODY_KEY,
+    strip_pending_sign_from_body, take_live_pending_after_begin, v11_sign_route_active,
+    verify_transition_signature_material, FinaliseOutcome, PendingSignEntry, PendingSignMap,
+    SignatureCheck, StagedSignPersist, TransitionSignatureError, WalletSignSubmission,
+    WalletSignSubmissionWire, LEGACY_COMMITMENT_REFUSED_UNDER_V11, PENDING_SIGN_BODY_KEY,
 };
 
 #[cfg(test)]
