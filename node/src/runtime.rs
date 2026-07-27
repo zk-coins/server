@@ -126,6 +126,11 @@ pub async fn start_rest_node(
             });
             hook
         }),
+        // Stage 3 prove (`StateEngine::begin_*`) is not yet wired into
+        // send_flow/mint_flow. Until it is, production leaves this None and
+        // v1.1 jobs fail closed when entering awaiting_signature (no silent
+        // ash‖ocr). Tests inject fixture PendingSignEntry values.
+        v11_pending_after_prove: None,
     };
 
     // No minting-account bootstrap: the neutral model has no

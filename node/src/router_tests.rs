@@ -99,6 +99,7 @@ fn test_state() -> AppState {
         v11_finality_ok: None,
         pending_sign_map: Arc::new(dashmap::DashMap::new()),
         v11_finalise: None,
+        v11_pending_after_prove: None,
     }
 }
 
@@ -2414,6 +2415,7 @@ fn mint_test_state() -> AppState {
         v11_finality_ok: None,
         pending_sign_map: Arc::new(dashmap::DashMap::new()),
         v11_finalise: None,
+        v11_pending_after_prove: None,
     }
 }
 
@@ -3942,6 +3944,208 @@ mod jobs_endpoint_tests {
         );
 
         clear_process_stack_mode_for_test();
+    }
+
+    /// Defect 1 (round 5): a job that reaches `awaiting_signature` through
+    /// the dispatcher's production staging site (`stage_and_select_awaiting_signature`
+    /// → `stage_pending_sign`) can be signed via `/v1`.
+    #[tokio::test]
+    async fn dispatcher_staging_path_allows_v1_sign() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        };
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let (mut state, _pool, _c) = jobs_test_state().await;
+        let (entry, submission) =
+            crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
+
+        // Prove-path hook supplies the live pending (Stage 3 will wire
+        // StateEngine::begin_* here). The dispatcher staging site is
+        // what actually calls stage_pending_sign.
+        let entry_for_hook = entry.clone();
+        state.v11_pending_after_prove = Some(Arc::new(move |_job_id| Some(entry_for_hook.clone())));
+
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xD1u8; 32],
+                Some("k-disp-stage"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        // Production site the dispatcher invokes after prove.
+        let live = state
+            .v11_pending_after_prove
+            .as_ref()
+            .and_then(|h| h(job_id));
+        let advertised = crate::job_dispatcher::stage_and_select_awaiting_signature(
+            &state.job_store,
+            &state,
+            job_id,
+            "aa".repeat(32).as_str(),
+            "bb".repeat(32).as_str(),
+            live,
+        )
+        .await
+        .expect("dispatcher staging must succeed with a live pending");
+        assert!(
+            advertised.get("proof_data_hash").is_some(),
+            "v1.1 surface required: {advertised}"
+        );
+        assert!(
+            state.pending_sign_map.get(&job_id).is_some(),
+            "stage_pending_sign must populate pending_sign_map"
+        );
+        // Restart envelope persisted.
+        let row = state.job_store.load(job_id).await.expect("load").expect("row");
+        assert!(
+            row.request_body.get(crate::v11::PENDING_SIGN_BODY_KEY).is_some(),
+            "pending_sign envelope must be on the job row"
+        );
+
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier);
+
+        let body = serde_json::json!({
+            "signature": hex::encode(submission.signature),
+            "s2c_nonce": hex::encode(submission.s2c_nonce),
+        });
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["status"], "signature_accepted");
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Defect 2 (round 5): dispatcher disappearing between clone and wake
+    /// (handoff CAS lost to timeout) yields rejection, not acceptance.
+    #[tokio::test]
+    async fn jobs_sign_rejects_when_dispatcher_handoff_already_timed_out() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        };
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xD2u8; 32],
+                Some("k-handoff-race"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (entry, submission) =
+            crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v11::awaiting_signature_result_json(&entry);
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        state.pending_sign_map.insert(job_id, entry);
+
+        // Notifier is present (clone would succeed) but the dispatcher has
+        // already claimed timeout — the CAS must refuse acceptance.
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        assert!(
+            notifier.try_claim_timeout(),
+            "simulate dispatcher timeout claiming the handoff"
+        );
+        state.job_notify_map.insert(job_id, notifier);
+
+        let body = serde_json::json!({
+            "signature": hex::encode(submission.signature),
+            "s2c_nonce": hex::encode(submission.s2c_nonce),
+        });
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "internal_error");
+        assert_ne!(v["status"], "signature_accepted");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no longer waiting")
+                || v["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("timed out"),
+            "message should describe the handoff race: {resp}"
+        );
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Defect 4 (round 5): normative `/v1/jobs/:id/stream` and `/cancel`
+    /// are registered and return §7.5 bodies (never a bare framework 404).
+    #[tokio::test]
+    async fn v1_stream_and_cancel_are_registered_with_section_7_5_errors() {
+        let (state, _pool, _c) = jobs_test_state().await;
+
+        // Unknown job → job_not_found on both normative routes.
+        let unknown = uuid::Uuid::new_v4();
+        let req = Request::get(format!("/v1/jobs/{}/stream", unknown))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "stream body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "job_not_found");
+        assert!(v.get("message").is_some());
+
+        let req = Request::post(format!("/v1/jobs/{}/cancel", unknown))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "cancel body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "job_not_found");
+
+        // Malformed UUID → malformed_request (V1JobId extractor).
+        let req = Request::post("/v1/jobs/not-a-uuid/cancel")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
     }
 
     // ---- DB-error 500 arms ----

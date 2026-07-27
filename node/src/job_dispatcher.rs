@@ -51,6 +51,7 @@
 //! that the `/api/jobs/*` integration tests in `router_tests.rs`
 //! verify against a real testcontainer Postgres.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,6 +97,14 @@ pub(crate) const PHASE_CHANNEL_CAPACITY: usize = 32;
 ///   only gets `Lagged` back, the dispatcher's `.send().ok()` ignores
 ///   that arm).
 ///
+/// Handoff state between `/sign` (or legacy `/commit`) and a parked
+/// dispatcher. CAS closes the race where the handler clones a notifier,
+/// the dispatcher times out and leaves, and the handler still reports
+/// acceptance.
+pub const HANDOFF_WAITING: u8 = 0;
+pub const HANDOFF_SIGNALED: u8 = 1;
+pub const HANDOFF_TIMED_OUT: u8 = 2;
+
 /// Held inside `Arc<JobNotifier>` so cloning the map entry is cheap
 /// and the broadcast channel survives until every receiver drops.
 #[derive(Debug)]
@@ -111,6 +120,11 @@ pub struct JobNotifier {
     /// pressure — and the SSE stream's initial-state push covers any
     /// event the listener missed before subscribing.
     pub phase_tx: broadcast::Sender<JobPhaseEvent>,
+    /// Atomic handoff: only one of route-signal / dispatcher-timeout wins.
+    /// Acceptance requires a successful CAS from [`HANDOFF_WAITING`] to
+    /// [`HANDOFF_SIGNALED`] at the moment of the wake — not a clone that
+    /// was valid a moment earlier.
+    pub handoff: AtomicU8,
 }
 
 impl JobNotifier {
@@ -121,7 +135,37 @@ impl JobNotifier {
         Self {
             commit_wake: Arc::new(Notify::new()),
             phase_tx,
+            handoff: AtomicU8::new(HANDOFF_WAITING),
         }
+    }
+
+    /// Route-side claim: the verified signature (or legacy commit) is
+    /// about to wake the dispatcher. Returns `true` only when the
+    /// dispatcher is still waiting — a timed-out or already-signaled
+    /// handoff refuses so the caller cannot report acceptance for work
+    /// that will never run.
+    pub fn try_signal_accept(&self) -> bool {
+        self.handoff
+            .compare_exchange(
+                HANDOFF_WAITING,
+                HANDOFF_SIGNALED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Dispatcher-side claim: the awaiting-signature wait timed out.
+    /// Returns `true` only when no route has already claimed the handoff.
+    pub fn try_claim_timeout(&self) -> bool {
+        self.handoff
+            .compare_exchange(
+                HANDOFF_WAITING,
+                HANDOFF_TIMED_OUT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 }
 
@@ -454,24 +498,29 @@ async fn process_mint(
         .or_insert_with(|| Arc::new(JobNotifier::new()))
         .clone();
 
-    let pending = app_state
-        .pending_sign_map
-        .get(&public_id)
-        .map(|e| e.clone());
-    let result = match crate::v11::select_awaiting_signature_result(
+    // Production staging site: under v1.1 a live PendingTransition must be
+    // staged via stage_pending_sign before the job advertises. Source is the
+    // prove-path hook (Stage 3 wires StateEngine::begin_*; tests inject).
+    let live_pending = resolve_live_pending_after_prove(app_state, public_id);
+    let result = match stage_and_select_awaiting_signature(
+        job_store,
+        app_state,
+        public_id,
         &commit_hashes.account_state_hash,
         &commit_hashes.output_coins_root,
-        pending.as_ref(),
-    ) {
+        live_pending,
+    )
+    .await
+    {
         Ok(v) => v,
-        Err(e) => {
-            let msg = e.to_string();
+        Err(msg) => {
             tracing::warn!(
                 "Job dispatcher: mint job {} refused awaiting_signature advertisement: {}",
                 public_id,
                 msg
             );
-            job_store.fail(public_id, &msg).await?;
+            let err = fail_error_string(&msg);
+            job_store.fail(public_id, &err).await?;
             publish_phase(
                 notify_map,
                 public_id,
@@ -480,21 +529,14 @@ async fn process_mint(
                     phase: "failed".to_string(),
                     proof_id: None,
                     result: None,
-                    error: Some(msg),
+                    error: Some(err),
                 },
             );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
             notify_map.remove(&public_id);
             return Ok(());
         }
     };
-    if let Some(entry) = pending.as_ref() {
-        if let Err(e) = persist_pending_sign_on_job(job_store, public_id, entry).await {
-            let msg = format!("failed to persist pending_sign for restart safety: {e}");
-            job_store.fail(public_id, &msg).await?;
-            notify_map.remove(&public_id);
-            return Ok(());
-        }
-    }
     job_store
         .set_awaiting_signature(public_id, proof_id as i64, result.clone())
         .await?;
@@ -597,6 +639,92 @@ async fn persist_pending_sign_on_job(
         .execute(job_store.pool())
         .await?;
     Ok(())
+}
+
+/// Resolve a live pending after the prove leg under a v1.1 claim.
+///
+/// Production path: [`crate::router::AppState::v11_pending_after_prove`] —
+/// Stage 3 wires `StateEngine::begin_*` here (or returns a pending from
+/// the flow). Until that hook is wired, production under v1.1 fails
+/// closed at [`stage_and_select_awaiting_signature`] (no silent ash‖ocr).
+/// Tests inject a fixture via the same hook so the dispatcher staging
+/// path is exercised without a multi-minute prove.
+fn resolve_live_pending_after_prove(
+    app_state: &AppState,
+    public_id: Uuid,
+) -> Option<crate::v11::PendingSignEntry> {
+    if !crate::v11::v11_sign_route_active() {
+        return None;
+    }
+    app_state
+        .v11_pending_after_prove
+        .as_ref()
+        .and_then(|hook| hook(public_id))
+}
+
+/// Production staging site for a job entering `awaiting_signature`.
+///
+/// Under a v1.1 claim this is the **only** path that writes
+/// `pending_sign_map` for a live job: it calls [`crate::v11::stage_pending_sign`],
+/// persists the restart envelope, and builds the §7.5 advertisement.
+/// Flag-off ignores `pending` and returns legacy ash‖ocr.
+///
+/// On any failure after `stage_pending_sign`, the map entry is cleaned
+/// up before returning `Err` (Defect 3 — no best-effort leftover).
+pub(crate) async fn stage_and_select_awaiting_signature(
+    job_store: &JobStore,
+    app_state: &AppState,
+    public_id: Uuid,
+    legacy_ash: &str,
+    legacy_ocr: &str,
+    pending: Option<crate::v11::PendingSignEntry>,
+) -> Result<serde_json::Value, String> {
+    let staged_ref = if let Some(entry) = pending {
+        // Canonical production writer — tests must not insert into the
+        // map by hand if they want to exercise this path.
+        let _persist_json =
+            crate::v11::stage_pending_sign(&app_state.pending_sign_map, public_id, entry);
+        let Some(guard) = app_state.pending_sign_map.get(&public_id) else {
+            return Err(
+                "stage_pending_sign did not leave a map entry (internal lifecycle bug)"
+                    .to_string(),
+            );
+        };
+        let entry_clone = guard.clone();
+        drop(guard);
+        if let Err(e) = persist_pending_sign_on_job(job_store, public_id, &entry_clone).await {
+            app_state.pending_sign_map.remove(&public_id);
+            return Err(format!(
+                "failed to persist pending_sign for restart safety: {e}"
+            ));
+        }
+        Some(entry_clone)
+    } else {
+        None
+    };
+
+    match crate::v11::select_awaiting_signature_result(
+        legacy_ash,
+        legacy_ocr,
+        staged_ref.as_ref(),
+    ) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // v1.1 without a staged pending — clean any partial state.
+            app_state.pending_sign_map.remove(&public_id);
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Job `error` column for a failed transition into awaiting_signature.
+/// Structured JSON under v1.1; plain string under flag-off (legacy).
+fn fail_error_string(message: &str) -> String {
+    if crate::v11::v11_sign_route_active() {
+        crate::v11::encode_job_error("proving_failed", message)
+    } else {
+        message.to_string()
+    }
 }
 
 /// Stale-envelope cleanup (Defect 3).
@@ -760,27 +888,28 @@ async fn process_send_initial(
     // Under a v1.1 claim the job advertises the §7.5 ProofData surface
     // (from a staged PendingSignEntry), not legacy ash/ocr — a wallet
     // that signed ash/ocr would be rejected at `/sign`. Flag-off keeps
-    // the legacy ash/ocr fields unchanged. When a staged entry is
-    // present, also persist its restart-safe envelope under
-    // request_body.pending_sign.
-    let pending = app_state
-        .pending_sign_map
-        .get(&public_id)
-        .map(|e| e.clone());
-    let result = match crate::v11::select_awaiting_signature_result(
+    // the legacy ash/ocr fields unchanged. Staging goes through
+    // stage_pending_sign (the only production writer of pending_sign_map).
+    let live_pending = resolve_live_pending_after_prove(app_state, public_id);
+    let result = match stage_and_select_awaiting_signature(
+        job_store,
+        app_state,
+        public_id,
         &commit_hashes.account_state_hash,
         &commit_hashes.output_coins_root,
-        pending.as_ref(),
-    ) {
+        live_pending,
+    )
+    .await
+    {
         Ok(v) => v,
-        Err(e) => {
-            let msg = e.to_string();
+        Err(msg) => {
             tracing::warn!(
                 "Job dispatcher: send job {} refused awaiting_signature advertisement: {}",
                 public_id,
                 msg
             );
-            job_store.fail(public_id, &msg).await?;
+            let err = fail_error_string(&msg);
+            job_store.fail(public_id, &err).await?;
             publish_phase(
                 notify_map,
                 public_id,
@@ -789,21 +918,14 @@ async fn process_send_initial(
                     phase: "failed".to_string(),
                     proof_id: None,
                     result: None,
-                    error: Some(msg),
+                    error: Some(err),
                 },
             );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
             notify_map.remove(&public_id);
             return Ok(());
         }
     };
-    if let Some(entry) = pending.as_ref() {
-        if let Err(e) = persist_pending_sign_on_job(job_store, public_id, entry).await {
-            let msg = format!("failed to persist pending_sign for restart safety: {e}");
-            job_store.fail(public_id, &msg).await?;
-            notify_map.remove(&public_id);
-            return Ok(());
-        }
-    }
     job_store
         .set_awaiting_signature(public_id, proof_id as i64, result.clone())
         .await?;
@@ -903,9 +1025,21 @@ async fn wait_for_commit(
     kind: JobKind,
     notifier: Arc<JobNotifier>,
 ) -> anyhow::Result<()> {
+    // Park until the route signals (CAS → notify) or the timeout claims
+    // the handoff. The CAS on JobNotifier::handoff closes the race where
+    // the route clones a live notifier, the dispatcher times out, and
+    // the route still reports acceptance.
     let outcome = tokio::select! {
         _ = notifier.commit_wake.notified() => SignalOutcome::Signaled,
-        _ = tokio::time::sleep(awaiting_signature_timeout) => SignalOutcome::TimedOut,
+        _ = tokio::time::sleep(awaiting_signature_timeout) => {
+            if notifier.try_claim_timeout() {
+                SignalOutcome::TimedOut
+            } else {
+                // Route already claimed SIGNALED (possibly mid-race with
+                // this timeout). Process the signature; do not fail.
+                SignalOutcome::Signaled
+            }
+        }
     };
 
     match outcome {
@@ -914,11 +1048,14 @@ async fn wait_for_commit(
                 "Job dispatcher: send job {} timed out in awaiting_signature",
                 public_id
             );
-            // §7.5 has no dedicated timeout code → internal_error.
-            let err = crate::v11::encode_job_error(
-                "internal_error",
-                "awaiting_signature timeout",
-            );
+            // Defect 5: flag-off stores the plain legacy string byte-for-byte.
+            // v1.1 uses the structured §7.5 {error, message} JSON (no dedicated
+            // timeout code → internal_error).
+            let err = if crate::v11::v11_sign_route_active() {
+                crate::v11::encode_job_error("internal_error", "awaiting_signature timeout")
+            } else {
+                "awaiting_signature timeout".to_string()
+            };
             job_store.fail(public_id, &err).await?;
             // Publish the terminal `failed` event BEFORE removing the
             // notify-map entry so an attached SSE stream receives the
@@ -947,6 +1084,7 @@ async fn wait_for_commit(
         Some(j) => j,
         None => {
             tracing::warn!("Job dispatcher: post-signal load missed job {}", public_id);
+            cleanup_pending_sign(job_store, app_state, public_id).await;
             notify_map.remove(&public_id);
             return Ok(());
         }
@@ -995,6 +1133,7 @@ async fn wait_for_commit(
                     error: Some(msg),
                 },
             );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
             notify_map.remove(&public_id);
             return Ok(());
         }
@@ -1212,8 +1351,22 @@ async fn drive_v11_finalise(
         },
     );
 
-    let publisher_pubkey =
-        crate::v11::publisher_pubkey_from_request_body(&job.request_body);
+    // Malformed publisher_pubkey is fail-closed (no silent drop).
+    let publisher_pubkey = match crate::v11::publisher_pubkey_from_request_body(&job.request_body)
+    {
+        Ok(pk) => pk,
+        Err(msg) => {
+            return fail_v11(
+                job_store,
+                app_state,
+                notify_map,
+                public_id,
+                "malformed_request",
+                msg,
+            )
+            .await;
+        }
+    };
 
     match hook(entry.pending, signature) {
         Ok(mut outcome) => {

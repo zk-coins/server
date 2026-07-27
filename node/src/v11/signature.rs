@@ -625,19 +625,43 @@ pub fn finalise_with_accepted_signature(
 }
 
 /// Optional `publisher_pubkey` from a job's original transition request
-/// body (§7.5 presence matrix). Hex-32, lowercase; malformed → absent
-/// (fail-closed: never invent a publisher).
-pub fn publisher_pubkey_from_request_body(request_body: &serde_json::Value) -> Option<[u8; 32]> {
-    let raw = request_body.get("publisher_pubkey")?.as_str()?;
+/// body (§7.5 presence matrix).
+///
+/// - Field **absent** → `Ok(None)` (self-publish / no external publisher).
+/// - Field **present and well-formed** (exactly 64 lowercase hex chars) →
+///   `Ok(Some(pk))`.
+/// - Field **present but malformed** (wrong type, wrong length, uppercase,
+///   non-hex) → `Err` — never silently drops a bad publisher (no silent
+///   fallback to "absent").
+pub fn publisher_pubkey_from_request_body(
+    request_body: &serde_json::Value,
+) -> Result<Option<[u8; 32]>, String> {
+    let Some(value) = request_body.get("publisher_pubkey") else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_str() else {
+        return Err(
+            "publisher_pubkey must be a lowercase hex string of exactly 64 characters".to_string(),
+        );
+    };
     if raw.len() != 64
         || raw
             .bytes()
             .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
     {
-        return None;
+        return Err(format!(
+            "publisher_pubkey must be exactly 64 lowercase hex characters; got len={}",
+            raw.len()
+        ));
     }
-    let bytes = hex::decode(raw).ok()?;
-    <[u8; 32]>::try_from(bytes).ok()
+    let bytes = hex::decode(raw).map_err(|e| format!("publisher_pubkey hex decode failed: {e}"))?;
+    let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+        format!(
+            "publisher_pubkey must decode to 32 bytes; got {}",
+            v.len()
+        )
+    })?;
+    Ok(Some(arr))
 }
 
 /// Build the §7.5 `awaiting_signature` object from staged pending
@@ -741,29 +765,78 @@ pub fn encode_job_error(code: &str, message: impl Into<String>) -> String {
     .to_string()
 }
 
+/// Closed §7.5 `machine_code` set admissible on job poll `error` objects.
+/// A stored JSON `"error"` string is **not** automatically valid — only
+/// members of this set (plus the additional surface codes below) may leave
+/// the node outward. Anything else is remapped via [`classify_stored_failure`].
+const CLOSED_OUTWARD_ERROR_CODES: &[&str] = &[
+    // Jobs-family table (§7.5)
+    "invalid_input_coin",
+    "insufficient_balance",
+    "bounds_exceeded",
+    "unknown_publisher",
+    "stale_message",
+    "invalid_signature",
+    "job_not_found",
+    "wrong_phase",
+    "proving_failed",
+    "publish_rejected",
+    "circuit_digest_mismatch",
+    // Cross-surface closed set
+    "malformed_request",
+    "idempotency_conflict",
+    "unauthorized",
+    "scope_exceeded",
+    "challenge_expired",
+    "session_expired",
+    "not_found",
+    "payload_too_large",
+    "retention_hold",
+    "rate_limited",
+    "dependency_not_final",
+    "internal_error",
+    "feature_disabled",
+];
+
+fn is_closed_outward_error_code(code: &str) -> bool {
+    CLOSED_OUTWARD_ERROR_CODES.contains(&code)
+}
+
 /// Decode a stored job error into the §7.5 poll `error` object.
 ///
-/// Accepts the structured JSON produced by [`encode_job_error`]. Free-form
-/// legacy strings are mapped into the closed enumeration (never invented
-/// codes): default `proving_failed` for failed jobs, `internal_error` for
-/// cancelled / unclassifiable. Empty stored error still yields a body so
-/// the poll envelope never omits `error` on failed/cancelled.
+/// Accepts the structured JSON produced by [`encode_job_error`] **only when
+/// the `"error"` field is a closed §7.5 machine code**. A stored value is
+/// not automatically valid — free-form or invented codes are remapped via
+/// [`classify_stored_failure`]. Free-form legacy strings are likewise mapped
+/// into the closed enumeration: default `proving_failed` for failed jobs,
+/// `internal_error` for cancelled / unclassifiable. Empty stored error still
+/// yields a body so the poll envelope never omits `error` on failed/cancelled.
 pub fn decode_job_error(raw: Option<&str>, status: crate::job_store::JobStatus) -> serde_json::Value {
     if let Some(s) = raw {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-            if v.get("error").and_then(|e| e.as_str()).is_some() {
-                // Ensure message is present.
-                if v.get("message").is_none() {
-                    let mut obj = v;
-                    obj.as_object_mut()
-                        .expect("object")
-                        .insert(
-                            "message".to_string(),
-                            serde_json::Value::String(String::new()),
-                        );
-                    return obj;
+            if let Some(code) = v.get("error").and_then(|e| e.as_str()) {
+                if is_closed_outward_error_code(code) {
+                    // Ensure message is present.
+                    if v.get("message").is_none() {
+                        let mut obj = v;
+                        obj.as_object_mut()
+                            .expect("object")
+                            .insert(
+                                "message".to_string(),
+                                serde_json::Value::String(String::new()),
+                            );
+                        return obj;
+                    }
+                    return v;
                 }
-                return v;
+                // Invented / non-closed code in stored JSON — reclassify.
+                let message = v
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or(s)
+                    .to_string();
+                let remapped = classify_stored_failure(code, status);
+                return serde_json::json!({ "error": remapped, "message": message });
             }
         }
         let code = classify_stored_failure(s, status);
@@ -1913,5 +1986,56 @@ mod tests {
         let cancelled = decode_job_error(None, JobStatus::Cancelled);
         assert_eq!(cancelled["error"], "internal_error");
         assert!(cancelled.get("message").is_some());
+    }
+
+    #[test]
+    fn decode_job_error_rejects_invented_stored_codes() {
+        use crate::job_store::JobStatus;
+        // A stored JSON "error" is not automatically valid.
+        let invented = r#"{"error":"dispatcher_not_waiting","message":"gone"}"#;
+        let v = decode_job_error(Some(invented), JobStatus::Failed);
+        assert_ne!(v["error"], "dispatcher_not_waiting");
+        assert!(
+            is_closed_outward_error_code(v["error"].as_str().unwrap()),
+            "must remap to a closed code: {v}"
+        );
+        assert_eq!(v["message"], "gone");
+    }
+
+    #[test]
+    fn publisher_pubkey_absent_ok_malformed_fails() {
+        // Absent → Ok(None).
+        let body = serde_json::json!({"kind": "send"});
+        assert_eq!(publisher_pubkey_from_request_body(&body).unwrap(), None);
+
+        // Well-formed → Ok(Some).
+        let pk = "ab".repeat(32);
+        let body = serde_json::json!({"publisher_pubkey": pk});
+        let got = publisher_pubkey_from_request_body(&body).unwrap().unwrap();
+        assert_eq!(hex::encode(got), pk);
+
+        // Malformed (uppercase) → Err, never silent None.
+        let body = serde_json::json!({"publisher_pubkey": "AB".repeat(32)});
+        assert!(publisher_pubkey_from_request_body(&body).is_err());
+
+        // Malformed (wrong length) → Err.
+        let body = serde_json::json!({"publisher_pubkey": "aa".repeat(16)});
+        assert!(publisher_pubkey_from_request_body(&body).is_err());
+
+        // Malformed (non-string) → Err.
+        let body = serde_json::json!({"publisher_pubkey": 42});
+        assert!(publisher_pubkey_from_request_body(&body).is_err());
+    }
+
+    #[test]
+    fn flag_off_timeout_error_is_plain_legacy_string() {
+        // Defect 5: the stored timeout value under flag-off must remain
+        // exactly the historical plain string (byte-identical).
+        let legacy = "awaiting_signature timeout";
+        assert_eq!(legacy.as_bytes(), b"awaiting_signature timeout");
+        // Structured form is only for the v1.1 path.
+        let structured = encode_job_error("internal_error", legacy);
+        assert_ne!(structured.as_bytes(), legacy.as_bytes());
+        assert!(structured.contains("internal_error"));
     }
 }

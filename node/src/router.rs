@@ -246,6 +246,15 @@ pub struct AppState {
     /// the job with the signature material alone. `None` under the
     /// legacy stack; under v1.1 a missing driver fails the job loud.
     pub(crate) v11_finalise: Option<V11FinaliseHook>,
+    /// Optional source of a **live** [`PendingSignEntry`] after the prove
+    /// leg. Under a v1.1 claim the dispatcher stages this via
+    /// [`crate::v11::stage_pending_sign`] before advertising
+    /// `awaiting_signature`. Production Stage 3 wires
+    /// `StateEngine::begin_*` (or the flow return) here; until then
+    /// production leaves this `None` and v1.1 jobs fail closed at the
+    /// advertisement step. Tests inject fixture entries so the
+    /// dispatcher staging path is exercised without a multi-minute prove.
+    pub(crate) v11_pending_after_prove: Option<V11PendingAfterProveHook>,
 }
 
 /// Hook the dispatcher invokes after a verified `/sign` to drive
@@ -261,6 +270,13 @@ pub type V11FinaliseHook = Arc<
         + Send
         + Sync,
 >;
+
+/// Hook the dispatcher invokes after the prove leg under a v1.1 claim to
+/// obtain the live [`crate::v11::PendingSignEntry`] that
+/// [`crate::v11::stage_pending_sign`] must stage. `None` return → the
+/// job fails closed (no silent ash‖ocr under v1.1).
+pub type V11PendingAfterProveHook =
+    Arc<dyn Fn(uuid::Uuid) -> Option<crate::v11::PendingSignEntry> + Send + Sync>;
 
 // Response types for our API
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -2270,12 +2286,12 @@ pub(crate) async fn jobs_commit_handler(
     }
 
     // Wake the dispatcher's `wait_for_commit` task. If no entry
-    // exists in the notify_map the dispatcher already gave up
-    // (e.g. timed out and removed the entry); surface 409 so the
-    // wallet does not silently spin.
+    // exists in the notify_map — or the handoff CAS fails because the
+    // dispatcher already timed out — surface 409 so the wallet does
+    // not silently spin.
     let notifier = state.job_notify_map.get(&id).map(|e| e.value().clone());
     match notifier {
-        Some(n) => {
+        Some(n) if n.try_signal_accept() => {
             n.commit_wake.notify_one();
             (
                 StatusCode::OK,
@@ -2283,7 +2299,7 @@ pub(crate) async fn jobs_commit_handler(
             )
                 .into_response()
         }
-        None => (
+        Some(_) | None => (
             StatusCode::CONFLICT,
             Json(JobErrorResponse {
                 error: "Job is no longer waiting for a signature".to_string(),
@@ -2537,6 +2553,12 @@ pub(crate) async fn jobs_sign_handler(
     // signature. Reporting signature_accepted when nothing will finalise
     // is worse than failing — the wallet would believe the work is done.
     // §7.5 has no dedicated "dispatcher down" code → internal_error.
+    //
+    // Race (Defect 2): a clone of a notifier that was present a moment
+    // earlier is not enough — the dispatcher can time out between the
+    // clone and the wake. Claim the handoff with CAS first; only then
+    // persist and wake. If the CAS fails, the dispatcher has already
+    // left (or another signal won) and we refuse acceptance.
     let Some(notifier) = state.job_notify_map.get(&id).map(|e| e.value().clone()) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2548,6 +2570,18 @@ pub(crate) async fn jobs_sign_handler(
         )
             .into_response();
     };
+    if !notifier.try_signal_accept() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(v11_error_body(
+                "internal_error",
+                "signature verified but the dispatcher is no longer waiting to finalise \
+                 this job (timed out or already signaled); refusing acceptance so the \
+                 wallet does not treat the work as done",
+            )),
+        )
+            .into_response();
+    }
 
     // Persist the verified TransitionSignature on the job row under `sign`
     // so the dispatcher can finalise without re-accepting untrusted bytes.
@@ -2573,6 +2607,9 @@ pub(crate) async fn jobs_sign_handler(
             .await
     {
         tracing::error!("Failed to merge sign payload into job row: {}", e);
+        // Handoff already claimed SIGNALED; the dispatcher will wake and
+        // fail on a missing/invalid sign blob or we leave it timed-out
+        // path. Surface the persist failure to the wallet.
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(v11_error_body("internal_error", "Failed to persist sign payload")),
@@ -2582,7 +2619,7 @@ pub(crate) async fn jobs_sign_handler(
 
     // Wake only after durable persist — acceptance and processing are
     // coupled: 200 signature_accepted means the dispatcher has been
-    // notified to drive finalise.
+    // claimed (CAS) and notified to drive finalise.
     notifier.commit_wake.notify_one();
     (
         StatusCode::OK,
@@ -2784,6 +2821,121 @@ pub(crate) async fn jobs_cancel_handler(
             )
                 .into_response()
         }
+    }
+}
+
+/// `POST /v1/jobs/:id/cancel` — §7.5 normative cancel route.
+///
+/// Same lifecycle as the legacy `/api` cancel (queued only), but every
+/// outward error uses the closed §7.5 `{error, message}` body. Wrong
+/// phase → `wrong_phase`; unknown job → `job_not_found`.
+pub(crate) async fn jobs_cancel_v1_handler(
+    State(state): State<AppState>,
+    V1JobId(id): V1JobId,
+) -> axum::response::Response {
+    // Distinguish job_not_found from wrong_phase (legacy cancel folds both
+    // into a single Ok(false) conflict).
+    match state.job_store.load(id).await {
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(v11_error_body("job_not_found", "Job not found")),
+            )
+                .into_response();
+        }
+        Ok(Some(job)) if job.status != JobStatus::Queued => {
+            return (
+                StatusCode::CONFLICT,
+                Json(v11_error_body(
+                    "wrong_phase",
+                    format!(
+                        "Job is in status `{}`, not `queued` (only queued jobs are cancellable)",
+                        job.status.as_str()
+                    ),
+                )),
+            )
+                .into_response();
+        }
+        Ok(Some(_)) => {}
+        Err(e) => {
+            tracing::error!("JobStore::load failed in v1 cancel: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(v11_error_body("internal_error", "Failed to load job")),
+            )
+                .into_response();
+        }
+    }
+
+    match state.job_store.cancel(id).await {
+        Ok(true) => {
+            crate::job_dispatcher::publish_phase(
+                &state.job_notify_map,
+                id,
+                JobPhaseEvent {
+                    status: JobStatus::Cancelled,
+                    phase: "cancelled".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: None,
+                },
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "cancelled", "job_id": id})),
+            )
+                .into_response()
+        }
+        Ok(false) => (
+            // Lost the race with the dispatcher between load and cancel.
+            StatusCode::CONFLICT,
+            Json(v11_error_body(
+                "wrong_phase",
+                "Job is no longer in a cancellable state",
+            )),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("JobStore::cancel failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(v11_error_body("internal_error", "Failed to cancel job")),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /v1/jobs/:id/stream` — §7.5 normative SSE route.
+///
+/// Implements the stream by delegating to the same notifier/broadcast
+/// substrate as `/api/jobs/:id/stream`, but unknown ids and DB failures
+/// return the closed §7.5 error body (never a bare framework status).
+pub(crate) async fn stream_job_v1_handler(
+    V1JobId(id): V1JobId,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match stream_job_handler(Path(id), State(state)).await {
+        Ok(sse) => sse.into_response(),
+        Err(StatusCode::NOT_FOUND) => (
+            StatusCode::NOT_FOUND,
+            Json(v11_error_body("job_not_found", "Job not found")),
+        )
+            .into_response(),
+        Err(StatusCode::INTERNAL_SERVER_ERROR) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(v11_error_body("internal_error", "Failed to load job")),
+        )
+            .into_response(),
+        Err(other) => (
+            other,
+            Json(v11_error_body(
+                "internal_error",
+                format!("stream failed with status {}", other.as_u16()),
+            )),
+        )
+            .into_response(),
     }
 }
 
@@ -4009,9 +4161,12 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/jobs/:id/stream", get(stream_job_handler))
         .route("/api/jobs/:id/commit", post(jobs_commit_handler))
         // §7.5 normative surface (v1.1 claim). Legacy `/api/jobs/*` stays
-        // as-is; the v1.1 sign + poll envelopes live only under `/v1/`.
+        // as-is; the v1.1 sign + poll + stream + cancel envelopes live
+        // under `/v1/` (never a bare framework 404 for a normative path).
         .route("/v1/jobs/:id", get(get_job_v1_handler))
         .route("/v1/jobs/:id/sign", post(jobs_sign_handler))
+        .route("/v1/jobs/:id/stream", get(stream_job_v1_handler))
+        .route("/v1/jobs/:id/cancel", post(jobs_cancel_v1_handler))
         .route("/api/jobs/:id/cancel", post(jobs_cancel_handler))
         .route("/api/inscriptions/:txid", get(get_inscription_handler))
         .route(
