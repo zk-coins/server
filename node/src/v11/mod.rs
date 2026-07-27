@@ -28,7 +28,8 @@
 //! carrying entry points: receive facade, scan apply orchestration, and
 //! an opaque [`V11Publisher`] from connect/env. The foreign publisher type
 //! never leaves the package; assembling a durable effect from raw parts is
-//! a compile error — see `tests/sealed_plumbing_compile_fail_matrix.rs`.
+//! a compile error — see the `downstream-boundary` package
+//! (`sealed_plumbing_compile_fail_matrix`).
 
 mod adapter;
 pub mod db_v11;
