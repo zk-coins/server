@@ -1482,8 +1482,34 @@ enum SignalOutcome {
     TimedOut,
 }
 
-/// Drive an accepted v1.1 signature through the **whole path to completion**
-/// from the durable host capability.
+/// Documented host edge of the job-path finalise resume.
+///
+/// ## Where completion ends (and why)
+///
+/// [`drive_v11_finalise`] drives a job through:
+///
+/// 1. exclusive claim (owner + lease)
+/// 2. prove + apply via [`crate::router::V11FinaliseHook`] **or** skip when
+///    `completion_result` is already durable (crash after apply)
+/// 3. persist the §7.5 completion surface on the durable capability
+/// 4. [`JobStore::complete_if_status`] — §7.5 result published onto the job row
+///
+/// That is the **host edge**. The production hook
+/// ([`crate::v11::finalise_accepted_prove_outside_lock`]) proves and mutates
+/// the **in-memory** engine; it does not persist the engine snapshot, does not
+/// stage `v11_pending_publishes`, and does not broadcast
+/// AggregateStateNullifierV3. On-chain nullifier inscription needs a live
+/// bitcoind wallet ([`crate::v11::V11Publisher`]) and the receive-style
+/// `v11_pending_publishes` pipeline — that is a **design boundary** of the
+/// sync finalise hook (no publisher handle), not merely a test limitation.
+///
+/// Resume is covered durably up to this edge so a job can be driven to exactly
+/// the point where a future chain-publish step (or operator recovery) takes over.
+pub const JOB_FINALISE_HOST_EDGE: &str =
+    "job_result_published_after_engine_apply; on-chain AggregateStateNullifierV3 requires bitcoind + v11_pending_publishes (not wired into V11FinaliseHook)";
+
+/// Drive an accepted v1.1 signature through the durable host path up to
+/// [`JOB_FINALISE_HOST_EDGE`].
 ///
 /// ## Steps and durable dependencies
 ///
@@ -1491,15 +1517,15 @@ enum SignalOutcome {
 /// |------|--------------------------------|-------|
 /// | Terminal job | — | status already terminal → no-op |
 /// | Load capability | `finalisation` envelope | rehydrate; refuse incomplete |
-/// | Exclusive claim | status | [`JobStore::claim_finalise_exclusive`] — **loser exits** |
+/// | Exclusive claim | status + owner/lease | [`JobStore::claim_finalise_exclusive`] — **loser exits without side effects** |
 /// | Prove + apply | pending + signature | finalise hook; skip if `completion_result` already set |
 /// | Persist completion | outcome + publisher_pubkey | status-qualified body write under `broadcasting` |
-/// | Publish + complete | `completion_result` + `completion_status` | `complete_if_status([broadcasting])` |
+/// | Host §7.5 complete | `completion_result` + `completion_status` | `complete_if_status([broadcasting])` — **host edge** |
 /// | Fail | — | `fail_if_status` from non-terminal only |
 ///
 /// `broadcasting` is an **exclusive claim**, not a permission: exactly one
 /// resumer wins the CAS; the loser observes [`FinaliseClaim::Lost`] and must
-/// not continue into side effects.
+/// not continue into side effects **and must not mutate shared notify state**.
 async fn drive_v11_finalise(
     job_store: &JobStore,
     app_state: &AppState,
@@ -1605,9 +1631,18 @@ async fn drive_v11_finalise(
     match job_store.claim_finalise_exclusive(public_id).await? {
         FinaliseClaim::Won => {
             tracing::info!(
-                "Job dispatcher: job {} won exclusive finalise claim",
-                public_id
+                "Job dispatcher: job {} won exclusive finalise claim (owner={})",
+                public_id,
+                job_store.process_owner()
             );
+            // Renew immediately so a long prove starts with a full lease window.
+            let _ = job_store
+                .renew_finalise_claim(
+                    public_id,
+                    job_store.process_owner(),
+                    crate::job_store::FINALISE_CLAIM_LEASE,
+                )
+                .await?;
         }
         FinaliseClaim::Lost { observed } => {
             if observed.is_terminal() {
@@ -1616,19 +1651,21 @@ async fn drive_v11_finalise(
                     public_id,
                     observed
                 );
+                // Terminal: no winner is mid-flight. Safe to drop local maps.
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
                 return Ok(());
             }
             // Another resumer owns this job — observe the loss and stop.
             // Do **not** continue just because status is broadcasting.
+            // Do **not** remove notify_map: that entry now belongs to the
+            // winner (or the live dispatcher that still parks the wallet).
             tracing::info!(
                 "Job dispatcher: job {} finalise claim lost (observed {:?}); \
-                 refusing to continue into side effects",
+                 refusing side effects; leaving shared notify state intact",
                 public_id,
                 observed
             );
-            notify_map.remove(&public_id);
             return Ok(());
         }
     }
@@ -1786,7 +1823,8 @@ async fn drive_v11_finalise(
         }
     }
 
-    // Publication + job completion — requires the full completion surface.
+    // Host §7.5 job-result publication + terminal complete.
+    // This is [`JOB_FINALISE_HOST_EDGE`] — not on-chain AggregateStateNullifierV3.
     if let Err(msg) = crate::v11::ensure_completion_ready(&entry) {
         return fail_v11(
             job_store,
@@ -1794,7 +1832,7 @@ async fn drive_v11_finalise(
             notify_map,
             public_id,
             "internal_error",
-            format!("v1.1 finalise: incomplete capability for publish/complete: {msg}"),
+            format!("v1.1 finalise: incomplete capability for host complete: {msg}"),
         )
         .await;
     }
@@ -1826,8 +1864,10 @@ async fn drive_v11_finalise(
             },
         );
         tracing::info!(
-            "Job dispatcher: job {} completed after v1.1 finalise (publish+complete)",
-            public_id
+            "Job dispatcher: job {} reached host finalise edge ({}); \
+             on-chain nullifier publish is not driven by this path",
+            public_id,
+            JOB_FINALISE_HOST_EDGE
         );
     } else {
         tracing::info!(

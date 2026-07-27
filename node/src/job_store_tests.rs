@@ -517,12 +517,39 @@ async fn claim_finalise_exclusive_only_one_winner_from_awaiting_signature() {
     let row = store.load(job_id).await.expect("load").expect("row");
     assert_eq!(row.status, JobStatus::Broadcasting);
     assert_eq!(row.phase, FINALISE_CLAIM_PHASE);
+    let claim = row
+        .request_body
+        .get(FINALISE_CLAIM_BODY_KEY)
+        .expect("won claim must plant finalise_claim");
+    let owner_str = store.process_owner().to_string();
+    assert_eq!(
+        claim.get("owner").and_then(|v| v.as_str()),
+        Some(owner_str.as_str()),
+        "claim owner must be this store's process_owner"
+    );
+    assert!(
+        claim.get("lease_expires_at").and_then(|v| v.as_str()).is_some(),
+        "claim must carry lease_expires_at"
+    );
 
-    // Boot releases the dead owner's claim so a single resumer can re-acquire.
-    assert!(store
-        .release_stale_finalise_claim(job_id)
-        .await
-        .expect("release"));
+    // Live (unexpired) lease must survive a boot-style release sweep.
+    assert!(
+        !store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release live"),
+        "live owner lease must not be released by boot sweep"
+    );
+
+    // Expire the lease — evidence the owner abandoned.
+    expire_finalise_claim_lease(store.pool(), job_id).await;
+    assert!(
+        store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release expired"),
+        "expired lease is evidence of abandonment"
+    );
     let c = store.claim_finalise_exclusive(job_id).await.expect("claim c");
     assert_eq!(c, FinaliseClaim::Won, "after release, claim must win again");
     let d = store.claim_finalise_exclusive(job_id).await.expect("claim d");
@@ -530,6 +557,116 @@ async fn claim_finalise_exclusive_only_one_winner_from_awaiting_signature() {
         matches!(d, FinaliseClaim::Lost { .. }),
         "second after re-claim must lose; got {d:?}"
     );
+}
+
+/// Plant an expired lease on a `finalise_claimed` row (test helper).
+async fn expire_finalise_claim_lease(pool: &sqlx::PgPool, job_id: uuid::Uuid) {
+    sqlx::query(
+        "UPDATE jobs SET request_body = jsonb_set( \
+             COALESCE(request_body, '{}'::jsonb), \
+             '{finalise_claim,lease_expires_at}', \
+             to_jsonb('1970-01-01T00:00:00Z'::text), \
+             true \
+         ) WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .expect("expire lease");
+}
+
+/// Defect 2: a live owner's claim survives a boot release sweep; only an
+/// expired lease (abandonment evidence) is reclaimable.
+#[tokio::test]
+async fn live_owner_claim_survives_boot_release_sweep() {
+    let scope = setup_pool().await;
+    let owner_live = uuid::Uuid::new_v4();
+    let owner_boot = uuid::Uuid::new_v4();
+    let live_store = JobStore::with_process_owner(scope.pool.clone(), owner_live);
+    let boot_store = JobStore::with_process_owner(scope.pool.clone(), owner_boot);
+
+    let result = live_store
+        .create(
+            JobKind::Send,
+            &account_addr(0xCB),
+            Some("k-live-lease"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    live_store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    assert_eq!(
+        live_store
+            .claim_finalise_exclusive(job_id)
+            .await
+            .expect("live claim"),
+        FinaliseClaim::Won
+    );
+
+    // Boot sweep in a *different* process must not free a live lease.
+    assert!(
+        !boot_store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("boot release"),
+        "boot must not release a live owner's unexpired claim"
+    );
+    assert!(
+        matches!(
+            boot_store
+                .claim_finalise_exclusive(job_id)
+                .await
+                .expect("boot re-claim"),
+            FinaliseClaim::Lost {
+                observed: JobStatus::Broadcasting
+            }
+        ),
+        "second process must lose while live lease holds"
+    );
+
+    // Live owner can renew.
+    assert!(
+        live_store
+            .renew_finalise_claim(job_id, owner_live, FINALISE_CLAIM_LEASE)
+            .await
+            .expect("renew"),
+        "live owner must renew its own claim"
+    );
+    // Foreign owner cannot renew.
+    assert!(
+        !boot_store
+            .renew_finalise_claim(job_id, owner_boot, FINALISE_CLAIM_LEASE)
+            .await
+            .expect("foreign renew"),
+        "non-owner must not renew"
+    );
+
+    // After lease expiry, boot may release with abandonment evidence.
+    expire_finalise_claim_lease(live_store.pool(), job_id).await;
+    assert!(
+        boot_store
+            .release_stale_finalise_claim(job_id)
+            .await
+            .expect("release after expiry"),
+        "expired lease is abandonment evidence"
+    );
+    assert_eq!(
+        boot_store
+            .claim_finalise_exclusive(job_id)
+            .await
+            .expect("boot claim after release"),
+        FinaliseClaim::Won
+    );
+
+    drop(scope);
 }
 
 #[tokio::test]

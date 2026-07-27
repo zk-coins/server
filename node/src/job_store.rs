@@ -57,6 +57,30 @@ pub enum FinaliseClaim {
 /// concurrent claim against an already-claimed row fails the CAS.
 pub const FINALISE_CLAIM_PHASE: &str = "finalise_claimed";
 
+/// JSON key under `jobs.request_body` for the exclusive finalise claim lease.
+///
+/// Shape: `{ "owner": "<uuid>", "lease_expires_at": "<RFC3339>" }`.
+/// Written atomically with the phase CAS so a claim always has an owner.
+pub const FINALISE_CLAIM_BODY_KEY: &str = "finalise_claim";
+
+/// Default lease for a live finalise owner.
+///
+/// Sized for a multi-minute prove; a live owner renews (see
+/// [`JobStore::renew_finalise_claim`]) before expiry. "Stale" means the lease
+/// has elapsed without renew — evidence the owner abandoned the claim — not
+/// merely that the phase is [`FINALISE_CLAIM_PHASE`].
+pub const FINALISE_CLAIM_LEASE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Build the durable claim document stored under [`FINALISE_CLAIM_BODY_KEY`].
+fn finalise_claim_document(owner: Uuid, lease: std::time::Duration) -> serde_json::Value {
+    let expires = Utc::now()
+        + chrono::Duration::from_std(lease).expect("FINALISE_CLAIM_LEASE fits chrono::Duration");
+    serde_json::json!({
+        "owner": owner.to_string(),
+        "lease_expires_at": expires.to_rfc3339(),
+    })
+}
+
 impl JobStatus {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -211,14 +235,32 @@ pub enum CreateResult {
 /// Cheap to clone via the inner `PgPool` (which is itself
 /// `Arc`-shaped) so the dispatcher, the resumer, and every route
 /// handler can each hold a `JobStore` without coordinating.
+///
+/// `process_owner` is a process-generation identity for exclusive finalise
+/// claims: clones of the same store share it; a distinct [`Self::new`] (or
+/// [`Self::with_process_owner`]) is a different owner.
 #[derive(Clone)]
 pub struct JobStore {
     pool: PgPool,
+    /// Process-generation token written into every won finalise claim.
+    process_owner: Uuid,
 }
 
 impl JobStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            process_owner: Uuid::new_v4(),
+        }
+    }
+
+    /// Construct with an explicit process owner (tests that plant a live
+    /// claim under a known identity).
+    pub fn with_process_owner(pool: PgPool, process_owner: Uuid) -> Self {
+        Self {
+            pool,
+            process_owner,
+        }
     }
 
     /// Borrow the underlying pool — needed by callers that thread
@@ -226,6 +268,11 @@ impl JobStore {
     /// the same connection.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Process-generation identity this store uses as finalise claim owner.
+    pub fn process_owner(&self) -> Uuid {
+        self.process_owner
     }
 
     /// Admit a fresh job.
@@ -398,7 +445,7 @@ impl JobStore {
             "UPDATE jobs SET status = 'completed', phase = 'completed', \
                               response_body = $1, response_status = $2, \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
-                                  - 'finalisation' - 'pending_sign' - 'sign'), \
+                                  - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               progress = 100, updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $3",
         )
@@ -430,7 +477,7 @@ impl JobStore {
             "UPDATE jobs SET status = 'completed', phase = 'completed', \
                               response_body = $1, response_status = $2, \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
-                                  - 'finalisation' - 'pending_sign' - 'sign'), \
+                                  - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               progress = 100, updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $3 AND status = ANY($4::text[])",
         )
@@ -458,7 +505,7 @@ impl JobStore {
             "UPDATE jobs SET status = 'failed', phase = 'failed', \
                               error = $1, \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
-                                  - 'finalisation' - 'pending_sign' - 'sign'), \
+                                  - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $2",
         )
@@ -485,7 +532,7 @@ impl JobStore {
             "UPDATE jobs SET status = 'failed', phase = 'failed', \
                               error = $1, \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
-                                  - 'finalisation' - 'pending_sign' - 'sign'), \
+                                  - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $2 AND status = ANY($3::text[])",
         )
@@ -521,51 +568,84 @@ impl JobStore {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Exclusive claim of a job for v1.1 finalise (prove → apply → publish
-    /// result → complete).
+    /// Exclusive claim of a job for v1.1 finalise (prove → apply → host
+    /// §7.5 job result → complete). See [`crate::job_dispatcher`] for the
+    /// documented host edge vs on-chain AggregateStateNullifierV3 publish.
     ///
     /// `broadcasting` is a **claim**, not a permission label: exactly one
     /// resumer may win. Two concurrent readers of `awaiting_signature` both
     /// attempt this CAS; only one sees [`FinaliseClaim::Won`].
     ///
+    /// The winner's [`Self::process_owner`] and a lease
+    /// ([`FINALISE_CLAIM_LEASE`]) are written into `request_body.finalise_claim`
+    /// atomically with the phase CAS. A live owner renews the lease; boot
+    /// may release only when the lease has expired (owner abandoned).
+    ///
     /// | Prior status / phase | Outcome |
     /// |---------------------|---------|
-    /// | `awaiting_signature` | CAS → `broadcasting` + [`FINALISE_CLAIM_PHASE`]; winner gets [`FinaliseClaim::Won`] |
-    /// | `broadcasting` + unclaimed phase (`publishing` / `broadcasting`) | CAS phase → [`FINALISE_CLAIM_PHASE`]; winner gets [`FinaliseClaim::Won`] |
-    /// | `broadcasting` + already [`FINALISE_CLAIM_PHASE`] | [`FinaliseClaim::Lost`] — another resumer owns the claim |
+    /// | `awaiting_signature` | CAS → `broadcasting` + [`FINALISE_CLAIM_PHASE`] + owner/lease; [`FinaliseClaim::Won`] |
+    /// | `broadcasting` + unclaimed phase (`publishing` / `broadcasting`) | CAS phase + owner/lease; [`FinaliseClaim::Won`] |
+    /// | `broadcasting` + already [`FINALISE_CLAIM_PHASE`] (any owner) | [`FinaliseClaim::Lost`] |
     /// | terminal / other | [`FinaliseClaim::Lost`] with the observed status |
     ///
-    /// Crash recovery: boot must call [`Self::release_stale_finalise_claim`]
-    /// before re-enqueue so a dead owner's `finalise_claimed` phase becomes
-    /// reclaimable. A live concurrent loser **must not** continue into
-    /// side-effectful finalise — a second broadcast is not made harmless by
-    /// the first also having happened.
+    /// Crash recovery: boot calls [`Self::release_stale_finalise_claim`] before
+    /// re-enqueue; that only succeeds when the lease is expired (or no lease
+    /// was ever registered — abandoned pre-lease / corrupt claim). A live
+    /// concurrent loser **must not** continue into side-effectful finalise.
     pub async fn claim_finalise_exclusive(
         &self,
         public_id: Uuid,
     ) -> sqlx::Result<FinaliseClaim> {
+        self.claim_finalise_exclusive_as(public_id, self.process_owner, FINALISE_CLAIM_LEASE)
+            .await
+    }
+
+    /// Claim with an explicit owner + lease (tests; production uses
+    /// [`Self::claim_finalise_exclusive`]).
+    pub async fn claim_finalise_exclusive_as(
+        &self,
+        public_id: Uuid,
+        owner: Uuid,
+        lease: std::time::Duration,
+    ) -> sqlx::Result<FinaliseClaim> {
+        let claim = finalise_claim_document(owner, lease);
+        let path = vec![FINALISE_CLAIM_BODY_KEY.to_string()];
+
         // Path A: fresh claim from awaiting_signature.
-        let advanced = self
-            .set_status_if(
-                public_id,
-                JobStatus::AwaitingSignature,
-                JobStatus::Broadcasting,
-                FINALISE_CLAIM_PHASE,
-            )
-            .await?;
-        if advanced {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = $1, phase = $2, \
+                    request_body = jsonb_set(COALESCE(request_body, '{}'::jsonb), \
+                                            $3::text[], $4::jsonb, true), \
+                    updated_at = NOW() \
+             WHERE public_id = $5 AND status = $6",
+        )
+        .bind(JobStatus::Broadcasting.as_str())
+        .bind(FINALISE_CLAIM_PHASE)
+        .bind(&path)
+        .bind(&claim)
+        .bind(public_id)
+        .bind(JobStatus::AwaitingSignature.as_str())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 1 {
             return Ok(FinaliseClaim::Won);
         }
 
         // Path B: crash-resume while already broadcasting with an unclaimed
-        // phase. Rows still at FINALISE_CLAIM_PHASE are owned — refuse.
+        // phase. Rows still at FINALISE_CLAIM_PHASE are owned — refuse
+        // regardless of who the stored owner is (lease release is separate).
         let result = sqlx::query(
-            "UPDATE jobs SET phase = $1, updated_at = NOW() \
-             WHERE public_id = $2 \
+            "UPDATE jobs SET phase = $1, \
+                    request_body = jsonb_set(COALESCE(request_body, '{}'::jsonb), \
+                                            $2::text[], $3::jsonb, true), \
+                    updated_at = NOW() \
+             WHERE public_id = $4 \
                AND status = 'broadcasting' \
                AND phase IN ('publishing', 'broadcasting')",
         )
         .bind(FINALISE_CLAIM_PHASE)
+        .bind(&path)
+        .bind(&claim)
         .bind(public_id)
         .execute(&self.pool)
         .await?;
@@ -580,19 +660,65 @@ impl JobStore {
         Ok(FinaliseClaim::Lost { observed: status })
     }
 
-    /// Boot-only: release a dead process's exclusive finalise claim so a
+    /// Extend the lease of a claim this process already owns.
+    ///
+    /// Returns `true` only when the row is still `broadcasting` /
+    /// [`FINALISE_CLAIM_PHASE`] and `request_body.finalise_claim.owner`
+    /// matches `owner`. A non-owner cannot renew.
+    pub async fn renew_finalise_claim(
+        &self,
+        public_id: Uuid,
+        owner: Uuid,
+        lease: std::time::Duration,
+    ) -> sqlx::Result<bool> {
+        let claim = finalise_claim_document(owner, lease);
+        let path = vec![FINALISE_CLAIM_BODY_KEY.to_string()];
+        let result = sqlx::query(
+            "UPDATE jobs SET request_body = jsonb_set(COALESCE(request_body, '{}'::jsonb), \
+                                            $1::text[], $2::jsonb, true), \
+                    updated_at = NOW() \
+             WHERE public_id = $3 \
+               AND status = 'broadcasting' \
+               AND phase = $4 \
+               AND request_body #>> '{finalise_claim,owner}' = $5",
+        )
+        .bind(&path)
+        .bind(&claim)
+        .bind(public_id)
+        .bind(FINALISE_CLAIM_PHASE)
+        .bind(owner.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Boot-only: release an **abandoned** exclusive finalise claim so a
     /// single restarted resumer can re-acquire it.
     ///
-    /// Sets phase from [`FINALISE_CLAIM_PHASE`] back to `publishing` while
-    /// status remains `broadcasting`. Does **not** run while a live owner
-    /// holds the claim mid-finalise in the same process — only boot calls
-    /// this before re-enqueue.
+    /// Sets phase from [`FINALISE_CLAIM_PHASE`] back to `publishing` and
+    /// strips `finalise_claim` while status remains `broadcasting`.
+    ///
+    /// ## Evidence of abandonment (required)
+    ///
+    /// Release applies only when at least one of:
+    /// - `lease_expires_at` is present **and** `<= NOW()` (owner failed to renew)
+    /// - `finalise_claim` / `lease_expires_at` is absent (claim never registered a
+    ///   live owner — pre-lease row or corrupt; not a protected live process)
+    ///
+    /// A live owner's unexpired lease **must not** be released by a boot sweep
+    /// in another process: that would reintroduce double-execution.
     pub async fn release_stale_finalise_claim(&self, public_id: Uuid) -> sqlx::Result<bool> {
         let result = sqlx::query(
-            "UPDATE jobs SET phase = 'publishing', updated_at = NOW() \
+            "UPDATE jobs SET phase = 'publishing', \
+                    request_body = COALESCE(request_body, '{}'::jsonb) - 'finalise_claim', \
+                    updated_at = NOW() \
              WHERE public_id = $1 \
                AND status = 'broadcasting' \
-               AND phase = $2",
+               AND phase = $2 \
+               AND ( \
+                     (request_body #>> '{finalise_claim,lease_expires_at}') IS NULL \
+                  OR (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz <= NOW() \
+               )",
         )
         .bind(public_id)
         .bind(FINALISE_CLAIM_PHASE)
@@ -643,7 +769,7 @@ impl JobStore {
         let result = sqlx::query(
             "UPDATE jobs SET status = 'cancelled', phase = 'cancelled', \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
-                                  - 'finalisation' - 'pending_sign' - 'sign'), \
+                                  - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $1 AND status = 'queued'",
         )
@@ -671,7 +797,7 @@ impl JobStore {
         let result = sqlx::query(
             "UPDATE jobs SET status = 'cancelled', phase = 'cancelled', \
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
-                                  - 'finalisation' - 'pending_sign' - 'sign'), \
+                                  - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $1 \
                AND status IN ('queued', 'proving', 'awaiting_signature')",
