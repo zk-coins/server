@@ -700,7 +700,7 @@ async fn run_v11_scan_loop(
             connect_v11_publisher, resume_all_pending_publishes, v11_publisher_env_from_env,
         };
         match v11_publisher_env_from_env(pins.network) {
-            Ok(env) => match connect_v11_publisher(env.into_config()) {
+            Ok(env) => match connect_v11_publisher(env) {
                 Ok(publisher) => match resume_all_pending_publishes(&adapter, &publisher).await {
                     Ok(0) => println!("v1.1 resume_all_pending_publishes: nothing pending"),
                     Ok(n) => println!(
