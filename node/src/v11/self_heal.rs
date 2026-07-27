@@ -3,18 +3,24 @@
 //!
 //! # What the boot check compares
 //!
-//! Under `ZKCOINS_V11_SHADOW=1` the live digest blob is the tagged encoding
-//! of the §3.6 boot pins `circuit_digest(C)` and `circuit_digest(C_balance)`
-//! (see [`encode_v11_live_digest`]). The boot path compares that blob
-//! byte-for-byte against `circuit_digest_meta` via the shared
-//! [`crate::self_heal::heal_circuit_digest`] decision function. A mismatch
-//! is always [`crate::self_heal::ResetDecision::Reset`] — never ignored.
+//! Under `ZKCOINS_V11_SHADOW=1` the **live** digest blob is the tagged
+//! encoding of the circuits **this binary actually contains** — the
+//! build-time-embedded digests from
+//! [`zkcoins_prover::circuit_identity`] (same values the offline generator
+//! produced from `C` / `C_balance`). See [`resolve_v11_live_digest`].
 //!
-//! The pins are the protocol constants already mandatory for shadow boot
-//! (`ZKCOINS_CIRCUIT_DIGEST_C` / `_C_BALANCE`). They deliberately avoid a
-//! multi-minute Plonky2 circuit build at boot. Binary digests
-//! ([`crate::v11::EngineAdapter::circuit_digests`]) remain available for
-//! the slow path and for later Stage-3 prove-site cross-checks.
+//! Boot then:
+//! 1. Loads the embedded digests (O(1) — no multi-minute circuit build).
+//! 2. Compares them to the §3.6 env pins (`ZKCOINS_CIRCUIT_DIGEST_C` /
+//!    `_C_BALANCE`). A mismatch **refuses to start** (§1.7.9 — pin circuit
+//!    identity; never proceed under a divergent binary).
+//! 3. Uses the embedded encoding as the self-heal baseline against
+//!    `circuit_digest_meta` via [`crate::self_heal::heal_circuit_digest`].
+//!
+//! Deriving the live baseline from the pins alone would be a tautology
+//! (pins compared to pins) and would let a binary whose real circuit
+//! differs from the pins boot happily. "Cannot determine the live digest"
+//! is a **refusal**, never a pass.
 //!
 //! # Boot canary (adoption boundary, no persisted digest)
 //!
@@ -42,17 +48,21 @@
 //!
 //! | Check | When | Cost | Establishes |
 //! |---|---|---|---|
-//! | Digest compare `C` + `C_balance` | every boot | O(1) | pins vs last recorded baseline |
+//! | Binary embed vs §3.6 pins | every boot | O(1) | this binary's circuits match the network pins |
+//! | Digest compare (embed) vs DB | every boot | O(1) | persisted state was produced under this binary |
 //! | Structural canary (nullifier / NAV / openings) | no digest only | O(accounts) | recursion inputs still present and consistent |
 //! | [`slow_canary_verify_transition`] | operator opt-in | circuit build + verify | live `C` still **accepts** a persisted proof |
 //! | Full re-prove AccountUpdate | not automated here | circuit + prove | live `C` still **produces** a successor proof |
 //!
 //! ## Operator recovery / slow canary
 //!
-//! 1. **Digest mismatch at boot** — node resets v1.1 proof-dependent state
-//!    (NfLog, accounts, pending publishes, legacy `accounts` rows) to empty
-//!    genesis, stores the live pin digest, and re-inits the in-memory
-//!    engine. Operator re-funds / re-mints as for any genesis wipe.
+//! 1. **Digest mismatch at boot** (DB vs binary embed) — node resets v1.1
+//!    proof-dependent state (NfLog, accounts, pending publishes, legacy
+//!    `accounts` rows) **and fails every non-terminal job** (stripping
+//!    durable finalisation / cached completion so a wiped transition
+//!    cannot later report `completed`), stores the live binary digest,
+//!    and re-inits the in-memory engine. Operator re-funds / re-mints as
+//!    for any genesis wipe.
 //! 2. **Slow verify canary** — set `ZKCOINS_V11_SLOW_CANARY=1` before boot.
 //!    Runs `ProverBridge::verify_transition` on a persisted proof (pays the
 //!    circuit build). Failure is loud: Stale → Reset.
@@ -66,6 +76,10 @@
 use shared::spec_v1::accumulator::LookupResult;
 use shared::spec_v1::Nav;
 use tracing::{info, warn};
+use zkcoins_program::circuit::compliance::Network;
+use zkcoins_prover::circuit_identity::{
+    embedded_circuit_digests, require_embedded_matches_pins, EmbeddedCircuitDigests,
+};
 use zkcoins_prover::prover_bridge::{ComplianceProof, NavOpening, NullifierOpening};
 
 use crate::account_node::CanaryOutcome;
@@ -83,13 +97,51 @@ pub const V11_LIVE_DIGEST_LEN: usize = 4 + 32 + 32;
 ///
 /// Both digests are the §1.7.1 32-byte forms (same as
 /// `ProverBridge::circuit_digest_bytes` / `balance_circuit_digest_bytes`
-/// and the §3.6 boot pins).
+/// and the §3.6 boot pins). Production boot obtains these from the
+/// **embedded binary identity** via [`resolve_v11_live_digest`], not by
+/// re-reading the pins alone.
 pub fn encode_v11_live_digest(c: &[u8; 32], c_balance: &[u8; 32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(V11_LIVE_DIGEST_LEN);
     out.extend_from_slice(V11_DIGEST_TAG);
     out.extend_from_slice(c);
     out.extend_from_slice(c_balance);
     out
+}
+
+/// Resolve the live v1.1 self-heal digest from **this binary's circuits**.
+///
+/// 1. Loads build-time-embedded digests
+///    ([`zkcoins_prover::circuit_identity::embedded_circuit_digests`]) —
+///    O(1), no Plonky2 circuit build at boot.
+/// 2. Requires they equal the §3.6 env pins (refuse on mismatch).
+/// 3. Returns [`encode_v11_live_digest`] of the **embedded** pair.
+///
+/// Returns `Err` when the digests cannot be determined or do not match
+/// the pins. Callers **must abort boot** on `Err` — never treat either
+/// case as "fine".
+///
+/// This is deliberately **not** `encode_v11_live_digest(pins…)`: deriving
+/// the live baseline from the pins alone cannot detect a binary whose
+/// real circuit differs from the pin env.
+pub fn resolve_v11_live_digest(
+    network: Network,
+    pin_c: &[u8; 32],
+    pin_c_balance: &[u8; 32],
+) -> Result<Vec<u8>, String> {
+    let embedded: EmbeddedCircuitDigests =
+        require_embedded_matches_pins(network, pin_c, pin_c_balance)?;
+    Ok(encode_v11_live_digest(
+        &embedded.circuit_digest_c,
+        &embedded.circuit_digest_c_balance,
+    ))
+}
+
+/// Embedded digests for `network` without pin comparison (tests / diagnostics).
+///
+/// Production boot must use [`resolve_v11_live_digest`] so pin mismatch
+/// is never skipped.
+pub fn binary_circuit_digests(network: Network) -> Result<EmbeddedCircuitDigests, String> {
+    embedded_circuit_digests(network)
 }
 
 /// Decode a blob previously produced by [`encode_v11_live_digest`].
@@ -325,6 +377,7 @@ pub fn v11_canary_for_heal(adapter: &EngineAdapter) -> CanaryOutcome {
 mod unit_tests {
     use super::*;
     use shared::spec_v1::{digest_from_bytes, nflog_empty};
+    use zkcoins_program::circuit::compliance::Network;
 
     fn nav_zero() -> Nav {
         Nav {
@@ -580,5 +633,72 @@ mod unit_tests {
             evaluate_v11_slow_canary(&inputs, &nflog, true),
             CanaryOutcome::Stale
         );
+    }
+
+    /// Live digest must come from the binary embed, not from re-encoding
+    /// arbitrary pins. Matching pins → Ok(blob of the embedded pair).
+    #[test]
+    fn resolve_v11_live_digest_uses_binary_when_pins_match() {
+        let embedded = binary_circuit_digests(Network::Regtest).expect("embedded");
+        let live = resolve_v11_live_digest(
+            Network::Regtest,
+            &embedded.circuit_digest_c,
+            &embedded.circuit_digest_c_balance,
+        )
+        .expect("matching pins must yield live digest");
+        assert_eq!(
+            live,
+            encode_v11_live_digest(
+                &embedded.circuit_digest_c,
+                &embedded.circuit_digest_c_balance
+            )
+        );
+        let (c, b) = decode_v11_live_digest(&live).expect("tagged blob");
+        assert_eq!(c, embedded.circuit_digest_c);
+        assert_eq!(b, embedded.circuit_digest_c_balance);
+    }
+
+    /// Would go red if pin/binary mismatch were ignored and pins were
+    /// encoded as the live baseline (the historical defect).
+    #[test]
+    fn resolve_v11_live_digest_refuses_when_pins_differ_from_binary() {
+        let embedded = binary_circuit_digests(Network::Regtest).expect("embedded");
+        let mut bad_pin_c = embedded.circuit_digest_c;
+        bad_pin_c[0] ^= 0xFF;
+        // Pins differ from binary: must refuse, NOT return encode(pins).
+        let err = resolve_v11_live_digest(
+            Network::Regtest,
+            &bad_pin_c,
+            &embedded.circuit_digest_c_balance,
+        )
+        .expect_err("pin/binary mismatch must refuse");
+        assert!(
+            err.contains("do not match") || err.contains("Refusing"),
+            "refusal must be loud: {err}"
+        );
+        // The pin encoding must never be accepted as "live" under mismatch.
+        let pin_encoding = encode_v11_live_digest(&bad_pin_c, &embedded.circuit_digest_c_balance);
+        let binary_encoding = encode_v11_live_digest(
+            &embedded.circuit_digest_c,
+            &embedded.circuit_digest_c_balance,
+        );
+        assert_ne!(
+            pin_encoding, binary_encoding,
+            "test oracle: pin and binary encodings must differ"
+        );
+    }
+
+    /// Correspondence check used by the red/green regression demo:
+    /// when the binary digests equal the pins, resolution succeeds and
+    /// the blob is exactly the binary encoding.
+    #[test]
+    fn resolve_v11_live_digest_correspondence_holds_for_embedded_regtest() {
+        let embedded = binary_circuit_digests(Network::Regtest).unwrap();
+        // "Correspondence" = pins that match the binary identity.
+        let pins_c = embedded.circuit_digest_c;
+        let pins_b = embedded.circuit_digest_c_balance;
+        let live = resolve_v11_live_digest(Network::Regtest, &pins_c, &pins_b)
+            .expect("embedded digests must correspond to themselves");
+        assert_eq!(live, encode_v11_live_digest(&pins_c, &pins_b));
     }
 }

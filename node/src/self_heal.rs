@@ -225,7 +225,9 @@ pub async fn heal_circuit_digest(
                 "Circuit changed since the persisted state was written — persisted \
                  proofs are incompatible with the current circuit. Resetting \
                  proof-dependent state to genesis (self-heal) so the node serves \
-                 cleanly."
+                 cleanly. This DESTROYS proof-dependent state (see follow-up \
+                 lines for the exact wipe set) and is irreversible without \
+                 re-funding / re-minting."
             );
             // Under exclusive v1.1:
             //   * Do NOT wipe SMT/MMR/root-index/latest_block — structures the
@@ -233,22 +235,43 @@ pub async fn heal_circuit_digest(
             //     require a legacy marker to touch).
             //   * DO wipe all v11 proof-dependent tables (NfLog, accounts,
             //     last_proof/openings, pending publishes) plus leftover
-            //     legacy `accounts`, and store the live pin digest
-            //     (`encode_v11_live_digest(C, C_balance)`). A digest-only
-            //     update left stale ComplianceProofs in place; the next
-            //     AccountUpdate would fail to recurse.
+            //     legacy `accounts`, fail non-terminal jobs (strip durable
+            //     finalisation / completion_result), and store the live
+            //     binary digest (`encode_v11_live_digest(C, C_balance)` from
+            //     the embed). A digest-only update left stale
+            //     ComplianceProofs in place; the next AccountUpdate would
+            //     fail to recurse.
             // Legacy (or unclaimed) path keeps the full proof-dependent wipe.
             match crate::v11::process_stack_mode() {
                 Some(crate::v11::ScanStackMode::V11) => {
                     warn!(
-                        "Self-heal: process is claimed v1.1 — wiping v11 \
-                         proof-dependent state (NfLog/accounts/pending publishes) \
-                         + leftover legacy accounts; storing circuit digest; \
-                         leaving SMT/MMR/latest_block untouched (v1.1 does not use them)"
+                        "Self-heal reset (v1.1) will DESTROY: \
+                         v11_pending_publishes (stale nullifier publish recovery); \
+                         v11_spendable_coins / v11_spent_coins (CoinHist leaves); \
+                         v11_accounts (multi-asset state + last_proof / openings); \
+                         v11_nullifier_index / v11_nflog_entries (NfLog); \
+                         v11_engine_meta (tip / network pin); \
+                         leftover legacy accounts rows; \
+                         on-disk PROOFS_DIR proof-store files; \
+                         and every non-terminal jobs row (queued/proving/\
+                         awaiting_signature/broadcasting) is marked failed with \
+                         durable finalisation + completion_result stripped so a \
+                         wiped transition cannot later report completed. \
+                         Leaving smt_state / mmr_state / mmr_root_index / \
+                         latest_block untouched (v1.1 does not use them). \
+                         Storing the live binary circuit digest."
                     );
                     db::reset_v11_proof_dependent_state_tx(pool, live_digest).await?;
                 }
                 _ => {
+                    warn!(
+                        "Self-heal reset (legacy) will DESTROY: \
+                         accounts (proof-bearing account blobs); \
+                         smt_state / mmr_state / mmr_root_index / latest_block \
+                         (global scan state); \
+                         on-disk PROOFS_DIR proof-store files. \
+                         Storing the live circuit digest."
+                    );
                     db::reset_proof_dependent_state_tx(pool, live_digest).await?;
                 }
             }

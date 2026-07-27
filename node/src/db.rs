@@ -1039,9 +1039,20 @@ pub async fn reset_proof_dependent_state_tx(
     tx.commit().await
 }
 
+/// Operator-visible error stamped onto every non-terminal `jobs` row when a
+/// circuit-digest self-heal reset wipes proof-dependent state.
+///
+/// A reset must leave **no** job that can later claim success for wiped work
+/// (durable `finalisation` capability + cached `completion_result` would
+/// otherwise let the dispatcher skip prove/apply and mark `completed`).
+pub const SELF_HEAL_RESET_JOB_ERROR: &str = "\
+circuit-digest self-heal reset: proof-dependent state was wiped to genesis; \
+this job cannot complete for a transition that no longer exists";
+
 /// v1.1 self-heal reset: wipe **all v1.1 proof-dependent state** plus any
-/// leftover legacy proof-bearing `accounts` rows, then store the live
-/// digest. Leaves structures the v1.1 stack does not use untouched
+/// leftover legacy proof-bearing `accounts` rows, **fail every non-terminal
+/// job** (stripping durable finalisation / completion cache), then store
+/// the live digest. Leaves structures the v1.1 stack does not use untouched
 /// (SMT / MMR / root index / latest_block).
 ///
 /// Under exclusive v1.1 the full [`reset_proof_dependent_state_tx`] is a
@@ -1059,6 +1070,14 @@ pub async fn reset_proof_dependent_state_tx(
 /// * `v11_nullifier_index` / `v11_nflog_entries` — NfLog
 /// * `v11_engine_meta` — tip / network pin row
 /// * `accounts` — legacy proof-bearing rows that may still linger
+///
+/// Jobs reconciled (not deleted — operator retains the row):
+///
+/// * every non-terminal `jobs` row (`queued` / `proving` /
+///   `awaiting_signature` / `broadcasting`) → `failed` with
+///   [`SELF_HEAL_RESET_JOB_ERROR`], and `request_body` stripped of
+///   `finalisation` / `pending_sign` / `sign` / `finalise_claim` so a
+///   cached `completion_result` cannot later flip the job to `completed`
 ///
 /// Does **not** require a legacy stack marker (v1.1 process owns this path).
 /// Does **not** DELETE from `smt_state` / `mmr_state` / `mmr_root_index` /
@@ -1095,6 +1114,23 @@ pub async fn reset_v11_proof_dependent_state_tx(
     sqlx::query("DELETE FROM accounts")
         .execute(&mut *tx)
         .await?;
+    // Jobs hold a durable finalisation capability and may cache
+    // completion_result under request_body.finalisation. After this wipe
+    // the transition no longer exists — fail every non-terminal row and
+    // strip the envelope so resume cannot report completed for wiped work.
+    // Unconditional (ignores finalise_claim lease): the whole proof world
+    // is being torn down; no epoch may keep a success path.
+    sqlx::query(
+        "UPDATE jobs SET status = 'failed', phase = 'failed', \
+                          error = $1, \
+                          request_body = (COALESCE(request_body, '{}'::jsonb) \
+                              - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
+                          updated_at = NOW(), completed_at = NOW() \
+         WHERE status IN ('queued', 'proving', 'awaiting_signature', 'broadcasting')",
+    )
+    .bind(SELF_HEAL_RESET_JOB_ERROR)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
         "INSERT INTO circuit_digest_meta (id, digest, updated_at) \
          VALUES (1, $1, NOW()) \

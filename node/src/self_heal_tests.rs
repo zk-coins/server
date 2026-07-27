@@ -513,6 +513,126 @@ async fn heal_v11_changed_digest_triggers_reset_not_ignore() {
     clear_process_stack_mode_for_test();
 }
 
+/// A v1.1 reset must leave no job that can later report `completed` for a
+/// transition whose engine state the reset removed. Plants a `broadcasting`
+/// job with durable finalisation + cached `completion_result` (the resume
+/// fast path that skips prove/apply), runs a digest-mismatch heal, and
+/// asserts the row is `failed` with the finalisation envelope stripped.
+///
+/// Would go red if reset only wiped v11 tables and left jobs rows intact.
+#[tokio::test]
+async fn heal_v11_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let proofs = tempfile::tempdir().expect("tempdir");
+    let proofs_dir = proofs.path().to_str().unwrap();
+
+    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11");
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let store = crate::job_store::JobStore::new(pool.clone());
+    let account = [0xABu8; 32];
+    // Durable finalisation with a cached completion_result — exactly the
+    // envelope that would let the dispatcher skip prove/apply and mark
+    // completed after a cold resume.
+    let body = serde_json::json!({
+        "finalisation": {
+            "network": "regtest",
+            "capability_bincode_hex": "00",
+            "publisher_pubkey": null,
+            "completion_result": {
+                "new_account_state_hash": "00".repeat(32),
+                "ok": true
+            },
+            "completion_status": 200
+        },
+        "finalise_claim": {
+            "owner": "00000000-0000-0000-0000-000000000001",
+            "fence": 1,
+            "lease_expires_at": "2099-01-01T00:00:00Z"
+        }
+    });
+    let created = store
+        .create(
+            crate::job_store::JobKind::Send,
+            &account,
+            Some("self-heal-reset-job"),
+            body,
+        )
+        .await
+        .expect("create job");
+    let job_id = match created {
+        crate::job_store::CreateResult::Fresh(j) => j.public_id,
+        crate::job_store::CreateResult::IdempotentReplay(j) => j.public_id,
+    };
+    store
+        .set_status(
+            job_id,
+            crate::job_store::JobStatus::Broadcasting,
+            crate::job_store::FINALISE_CLAIM_PHASE,
+        )
+        .await
+        .expect("advance to broadcasting + claimed");
+
+    let old = crate::v11::encode_v11_live_digest(&[0x11; 32], &[0x22; 32]);
+    let new = crate::v11::encode_v11_live_digest(&[0x33; 32], &[0x44; 32]);
+    db::store_circuit_digest(&pool, &old).await.unwrap();
+
+    let decision = heal_circuit_digest(&pool, &new, proofs_dir, &canary_must_not_run)
+        .await
+        .expect("heal ok");
+    assert_eq!(decision, ResetDecision::Reset);
+
+    let row = store.load(job_id).await.expect("load").expect("job row");
+    assert_eq!(
+        row.status,
+        crate::job_store::JobStatus::Failed,
+        "reset must terminal-fail the job so resume cannot report completed"
+    );
+    assert_eq!(
+        row.error.as_deref(),
+        Some(db::SELF_HEAL_RESET_JOB_ERROR),
+        "operator must see the self-heal wipe reason"
+    );
+    assert!(
+        row.request_body.get("finalisation").is_none(),
+        "finalisation + completion_result must be stripped"
+    );
+    assert!(
+        row.request_body.get("finalise_claim").is_none(),
+        "exclusive finalise claim must be stripped"
+    );
+    // A post-reset complete attempt cannot succeed for a failed row.
+    let completed = store
+        .complete_if_status(
+            job_id,
+            &[
+                crate::job_store::JobStatus::Broadcasting,
+                crate::job_store::JobStatus::Proving,
+            ],
+            serde_json::json!({"stolen": true}),
+            200,
+        )
+        .await
+        .expect("complete_if_status");
+    assert!(
+        !completed,
+        "a failed job must not accept completion after the reset wiped its transition"
+    );
+    let again = store.load(job_id).await.unwrap().unwrap();
+    assert_eq!(again.status, crate::job_store::JobStatus::Failed);
+    assert_ne!(
+        again.status,
+        crate::job_store::JobStatus::Completed,
+        "job must not report completed for wiped work"
+    );
+
+    clear_process_stack_mode_for_test();
+}
+
 /// Flag-off path: process not claimed v11 → full legacy wipe on mismatch.
 /// Would go red if the v11-only wipe were applied under flag-off.
 #[tokio::test]

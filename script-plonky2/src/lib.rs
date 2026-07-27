@@ -26,6 +26,7 @@
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod circuit_identity;
 pub mod half_agg;
 pub mod inscription;
 pub mod prover_bridge;

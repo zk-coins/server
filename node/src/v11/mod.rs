@@ -79,10 +79,10 @@ pub use scan::{
     PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome,
 };
 pub use self_heal::{
-    boot_canary, decode_v11_live_digest, encode_v11_live_digest, evaluate_v11_slow_canary,
-    evaluate_v11_structural_canary, slow_canary_env_enabled, slow_canary_verify_transition,
-    v11_canary_for_heal, V11CanaryNflogView, V11CanarySample, V11StructuralInputs,
-    V11_DIGEST_TAG, V11_LIVE_DIGEST_LEN,
+    binary_circuit_digests, boot_canary, decode_v11_live_digest, encode_v11_live_digest,
+    evaluate_v11_slow_canary, evaluate_v11_structural_canary, resolve_v11_live_digest,
+    slow_canary_env_enabled, slow_canary_verify_transition, v11_canary_for_heal,
+    V11CanaryNflogView, V11CanarySample, V11StructuralInputs, V11_DIGEST_TAG, V11_LIVE_DIGEST_LEN,
 };
 pub use separation::{
     claim_process_stack_from_shadow_mode, claim_process_stack_from_v11_shadow_env,
