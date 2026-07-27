@@ -578,3 +578,107 @@ async fn free_phase_edge_job_enqueued_despite_release_false() {
     clear_process_stack_mode_for_test();
     drop(scope);
 }
+
+/// P0: `boot_resume_jobs` must not terminate a job that was claimed after
+/// the interrupted-list snapshot was taken. Bare `fail` would rewrite any
+/// row by `public_id`; the boot path uses `fail_if_status` against the
+/// snapshot status (and refuses [`FINALISE_CLAIM_PHASE`]).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boot_resume_cannot_fail_job_claimed_since_snapshot() {
+    use std::time::Duration as StdDuration;
+
+    let _guard = lock_v11_stack_for_test();
+    clear_process_stack_mode_for_test();
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let scope = setup_pool().await;
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &[0xB1; 32],
+            Some("k-boot-fail-claimed-since-snapshot"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+
+    // Snapshot status boot would have observed for an interrupted prove.
+    store
+        .set_status(job_id, JobStatus::Proving, "proving")
+        .await
+        .expect("set proving");
+    let snapshot_status = JobStatus::Proving;
+
+    // Concurrent progress after the snapshot: advertise → exclusive claim.
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+    let fence = match store
+        .claim_finalise_exclusive_as(job_id, owner, StdDuration::from_secs(60))
+        .await
+        .expect("claim")
+    {
+        FinaliseClaim::Won { fence } => fence,
+        other => panic!("expected Won, got {other:?}"),
+    };
+
+    // Exact predicate boot uses for the interrupted non-resumable arm.
+    assert!(
+        !store
+            .fail_if_status(
+                job_id,
+                &[snapshot_status],
+                "server restarted before processing — please retry",
+            )
+            .await
+            .expect("fail_if_status"),
+        "snapshot-status fail must be a no-op once the row has moved and been claimed"
+    );
+
+    // Full boot path: unsigned claimed broadcasting is not v11-resumable,
+    // so it takes the fail arm — which must still refuse the claim.
+    let boot_store = Arc::new(JobStore::new(scope.pool.clone()));
+    let notify_map: Arc<DashMap<uuid::Uuid, Arc<crate::job_dispatcher::JobNotifier>>> =
+        Arc::new(DashMap::new());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+    boot_resume_jobs(&boot_store, &notify_map, &tx)
+        .await
+        .expect("boot_resume_jobs");
+
+    // Must not enqueue (not free) and must not have failed the row.
+    let early = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(
+        early.is_err(),
+        "claimed non-resumable job must not be enqueued; got {:?}",
+        early.ok().flatten().map(|e| e.public_id)
+    );
+
+    let row = boot_store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(
+        row.status,
+        JobStatus::Broadcasting,
+        "boot must not fail a job claimed since the snapshot"
+    );
+    assert_eq!(row.phase, FINALISE_CLAIM_PHASE);
+    assert!(row.error.is_none(), "claimed row must not carry a boot error");
+    assert_eq!(
+        row.request_body
+            .get("finalise_claim")
+            .and_then(|c| c.get("fence"))
+            .and_then(|f| f.as_i64()),
+        Some(fence),
+        "claim fence must remain current after boot"
+    );
+
+    clear_process_stack_mode_for_test();
+    drop(scope);
+}

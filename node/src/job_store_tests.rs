@@ -1940,6 +1940,118 @@ async fn pre_claim_fail_if_status_cannot_terminate_owned_row() {
     drop(scope);
 }
 
+/// P0: the dispatcher cleanup rewrite after an unexpected status load
+/// (`replace_request_body_if_cleanup_safe`) must not clobber a claimed row.
+/// Race: `set_awaiting_signature` wins → concurrent sign+claim → origin
+/// worker takes the unexpected-status cleanup branch.
+#[tokio::test]
+async fn cleanup_body_rewrite_cannot_mutate_claimed_row() {
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xC1),
+            Some("k-cleanup-claimed"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    // Plant leftover envelope keys the cleanup path would strip.
+    let row = store.load(job_id).await.expect("load").expect("row");
+    let mut with_envelope = row.request_body;
+    with_envelope.as_object_mut().unwrap().insert(
+        "pending_sign".to_string(),
+        serde_json::json!({"mode": "initial"}),
+    );
+    with_envelope
+        .as_object_mut()
+        .unwrap()
+        .insert("sign".to_string(), serde_json::json!({"pk_i": "00"}));
+    sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+        .bind(&with_envelope)
+        .bind(job_id)
+        .execute(store.pool())
+        .await
+        .expect("plant envelope");
+
+    let fence = expect_won(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, Duration::from_secs(60))
+            .await
+            .expect("claim"),
+    );
+
+    // Stale cleanup body: what the losing worker would write (stripped
+    // keys, but from a pre-claim load — missing finalise_claim).
+    let stale_cleanup_body = serde_json::json!({
+        "account_address": with_envelope["account_address"],
+        "amount": with_envelope["amount"],
+    });
+
+    assert!(
+        !store
+            .replace_request_body_if_cleanup_safe(job_id, &stale_cleanup_body)
+            .await
+            .expect("cleanup rewrite"),
+        "cleanup rewrite must refuse a finalise_claimed row"
+    );
+
+    let after = store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(after.status, JobStatus::Broadcasting);
+    assert_eq!(after.phase, FINALISE_CLAIM_PHASE);
+    assert_eq!(
+        after
+            .request_body
+            .get("finalise_claim")
+            .and_then(|c| c.get("fence"))
+            .and_then(|f| f.as_i64()),
+        Some(fence),
+        "claim must survive the cleanup branch"
+    );
+    assert!(
+        after.request_body.get("pending_sign").is_some(),
+        "cleanup must not have rewritten the claimed body"
+    );
+
+    // Contrast: unclaimed non-awaiting row is still rewrite-able.
+    sqlx::query(
+        "UPDATE jobs SET phase = 'publishing', \
+                request_body = COALESCE(request_body, '{}'::jsonb) - 'finalise_claim' \
+         WHERE public_id = $1",
+    )
+    .bind(job_id)
+    .execute(store.pool())
+    .await
+    .expect("free claim");
+    // Still broadcasting, not awaiting_signature — cleanup-eligible.
+    assert!(
+        store
+            .replace_request_body_if_cleanup_safe(job_id, &stale_cleanup_body)
+            .await
+            .expect("cleanup on unclaimed"),
+        "cleanup must still rewrite an unclaimed non-awaiting_signature row"
+    );
+    let cleaned = store.load(job_id).await.expect("load").expect("row");
+    assert!(cleaned.request_body.get("pending_sign").is_none());
+    assert!(cleaned.request_body.get("finalise_claim").is_none());
+
+    drop(scope);
+}
+
 #[tokio::test]
 async fn cancel_from_broadcasting_returns_false_and_leaves_status_untouched() {
     // Nullifier is in flight / published — cancel must refuse.

@@ -951,6 +951,37 @@ impl JobStore {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Best-effort `request_body` rewrite for dispatcher leftover cleanup
+    /// (`pending_sign` / `sign` strip after an intermediate failure).
+    ///
+    /// Applies only when the row is **not** still in the live sign handoff
+    /// and **not** under an exclusive finalise claim:
+    /// `status <> 'awaiting_signature'` **and**
+    /// `phase IS DISTINCT FROM` [`FINALISE_CLAIM_PHASE`].
+    ///
+    /// Without the claim-phase predicate, a worker that lost the race after
+    /// `set_awaiting_signature` (another process signed + claimed before the
+    /// confirmation load) would rewrite a claimed row and clobber
+    /// `finalise_claim` / concurrent capability merges.
+    pub async fn replace_request_body_if_cleanup_safe(
+        &self,
+        public_id: Uuid,
+        new_body: &serde_json::Value,
+    ) -> sqlx::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET request_body = $1, updated_at = NOW() \
+             WHERE public_id = $2 \
+               AND status <> 'awaiting_signature' \
+               AND phase IS DISTINCT FROM $3",
+        )
+        .bind(new_body)
+        .bind(public_id)
+        .bind(FINALISE_CLAIM_PHASE)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Fence-qualified merge of the durable `finalisation` capability key.
     ///
     /// Uses `jsonb_set` on `{finalisation}` only so a concurrent lease renew
