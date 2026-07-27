@@ -138,7 +138,14 @@ pub fn connect_v11_publisher(config: PublisherConfig) -> Result<Publisher> {
 /// Half-aggregate and inscribe `members` as `AggregateStateNullifierV3`.
 ///
 /// Empty member list fails loud (publisher would also refuse).
-pub fn publish_v11_batch(publisher: &Publisher, members: &[BatchMember]) -> Result<PublishedBatch> {
+///
+/// **Crate-private sink.** Downstream callers must not drive publish from a
+/// free-standing batch of members; use the receive / resume orchestration
+/// entry points that already carry a capability.
+pub(crate) fn publish_v11_batch(
+    publisher: &Publisher,
+    members: &[BatchMember],
+) -> Result<PublishedBatch> {
     ensure_v11_publisher_allowed()?;
     if members.is_empty() {
         bail!("publish_v11_batch requires at least one BatchMember (no empty inscription)");

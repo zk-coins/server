@@ -1216,7 +1216,8 @@ async fn broadcast_inscription_paths_refuse_under_v11_claim() {
     clear_process_stack_mode_for_test();
 }
 
-/// Public `with_engine_mut` refuses without a v1.1 process claim.
+/// Crate-internal `with_engine_mut` refuses without a v1.1 process claim.
+/// (The method is sealed from downstream crates; this covers the runtime gate.)
 #[tokio::test]
 async fn with_engine_mut_refuses_without_v11_claim() {
     clear_process_stack_mode_for_test();

@@ -1293,6 +1293,9 @@ mod tests {
         broadcast_err: Mutex<Option<String>>,
         commit_calls: Mutex<u32>,
         reveal_calls: Mutex<u32>,
+        /// Optional side-effect on successful `broadcast_commit` (e.g. concurrent
+        /// scanner append after this receive's broadcast).
+        on_commit: Mutex<Option<Box<dyn Fn() + Send>>>,
     }
 
     impl RecordingPublisher {
@@ -1302,11 +1305,17 @@ mod tests {
                 broadcast_err: Mutex::new(None),
                 commit_calls: Mutex::new(0),
                 reveal_calls: Mutex::new(0),
+                on_commit: Mutex::new(None),
             }
         }
         fn with_broadcast_err(err: &str) -> Self {
             let p = Self::new();
             *p.broadcast_err.lock().expect("lock") = Some(err.to_string());
+            p
+        }
+        fn with_on_commit(on_commit: impl Fn() + Send + 'static) -> Self {
+            let p = Self::new();
+            *p.on_commit.lock().expect("lock") = Some(Box::new(on_commit));
             p
         }
         fn published_members(&self) -> Vec<BatchMember> {
@@ -1406,6 +1415,9 @@ mod tests {
             *self.commit_calls.lock().expect("lock") += 1;
             if let Some(err) = self.broadcast_err.lock().expect("lock").as_ref() {
                 bail!("{err}");
+            }
+            if let Some(hook) = self.on_commit.lock().expect("lock").as_ref() {
+                hook();
             }
             Ok(prepared.commit_txid())
         }
@@ -2532,25 +2544,33 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Capability pins + pure host revalidation (no hollow proved envelope)
+    // Capability pins + pure host revalidation + sealed-API race/e2e coverage
     // -----------------------------------------------------------------------
     //
     // A cheap `ProvedPendingTransition` constructor is deliberately unavailable
     // to this crate: the defining crate gates hollow mint on `#[cfg(test)]`
     // only, which is never set for dependency library builds. Race /
-    // orchestration tests that previously used a hollow stand-in are not kept
-    // as default-suite coverage — they would require a production-reachable
-    // door. Full commit orchestration is covered by the ignored genuine-prove
-    // fixture below; pure host checks below do not need the capability.
+    // orchestration tests that previously used a hollow stand-in are restored
+    // below as `#[ignore]` fixtures that mint the capability via the real
+    // prove path (same sealed orchestration entry points as production).
     //
-    // Dropped (would need a production-reachable hollow constructor):
-    // - concurrent_scanner_append_during_prove_still_commits
-    // - concurrent_append_after_broadcast_still_reported_success
-    // - outcome_fields_scoped_to_this_transition_with_unrelated_coin
-    // - production_path_receive_begin_finalise_publish_persist_reload (hollow)
-    // Their durable guarantees are exercised by
-    // `production_path_receive_with_genuine_prove_via_verify_and_begin` (ignore)
-    // and engine-level unit tests in `zkcoins-prover-plonky2`.
+    // Coverage map (lost hollow fixtures → restored coverage):
+    // | Lost (hollow) | Now |
+    // |---------------|-----|
+    // | concurrent_scanner_append_during_prove_still_commits | ignore, real prove |
+    // | concurrent_append_after_broadcast_still_reported_success | ignore, real prove |
+    // | production_path_receive_begin_finalise_publish_persist_reload | ignore genuine prove + reload |
+    // | outcome_fields…with_unrelated_coin (manual account rebuild) | **gap** — see note below |
+    //
+    // **Explicit gap:** the hollow fixture rewrote Bob's spendable via
+    // `StateEngine::from_persisted` to inject an unrelated coin U, then
+    // checked `admitted_coin_ids` listed only the new receive. That account
+    // surgery is not available on the sealed surface without a hollow apply.
+    // Partial coverage: genuine-prove e2e asserts `admitted_coin_ids.len()==1`
+    // and equals the single received slot (not a live full-spendable dump).
+    // A two-receive genuine-prove path that leaves two spendable coins would
+    // close the gap fully but is not reconstructed here (five multi-minute
+    // proves); name it rather than ship a silent weaker default-suite stand-in.
 
     /// Type-level: durable commit takes a [`ProvedPendingTransition`]
     /// capability (not bare pending + proof parts). Production mint is the
@@ -2665,37 +2685,23 @@ mod tests {
         );
     }
 
-    /// Heavy production path with a **genuine** Plonky2 prove, entered through
-    /// [`verify_and_begin_receive`] and [`finalise_publish_persist`].
-    ///
-    /// Sole full-orchestration fixture after removal of the hollow proved
-    /// envelope seam. Publisher construct/broadcast remains the fake
-    /// `RecordingPublisher` only — neither real publisher construction nor
-    /// chain inclusion is established here.
-    #[tokio::test]
-    #[ignore = "heavy: real Plonky2 prove for mint+send+receive (minutes); run with --ignored --release"]
-    async fn production_path_receive_with_genuine_prove_via_verify_and_begin() {
-        use crate::test_db::setup_pool;
-        use crate::v11::db_v11;
-        use crate::v11::separation::claim_stack_scan_mode;
-        use crate::v11::EngineAdapter;
+    /// Shared genuine mint→send setup yielding a Bob receive pending ready for
+    /// prove/commit on the sealed API (crate-internal adapter sinks only).
+    async fn genuine_bob_receive_ready(
+        adapter: &crate::v11::EngineAdapter,
+    ) -> (
+        PendingTransition,
+        TransitionSignature,
+        Address,
+        [u8; 32],
+        [u8; 32],
+        BlockAnchor,
+    ) {
         use zkcoins_prover::prover_bridge::test_signing::{
             deterministic_secret, normalized_key, sign_transition,
         };
         use zkcoins_prover::prover_bridge::{OutputInclusionProof, TransitionMode};
         use zkcoins_prover::state_engine::{MintRequest, ScannedNullifier, SendRequest};
-
-        clear_process_stack_mode_for_test();
-        set_process_stack_mode(ScanStackMode::V11);
-
-        let scope = setup_pool().await;
-        let pool = scope.pool.clone();
-        claim_stack_scan_mode(&pool, ScanStackMode::V11)
-            .await
-            .expect("claim");
-        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Testnet, 0)
-            .await
-            .expect("adapter");
 
         let alice_nk: [u8; 32] =
             Sha256::digest(b"zkCoins/v1/state-engine/receive-e2e/alice-nk").into();
@@ -2714,7 +2720,7 @@ mod tests {
                     nk: alice_nk,
                     current_pubkey: alice_pk0,
                     next_pubkey: alice_pk1,
-                    name: b"G3 production e2e asset".to_vec(),
+                    name: b"G3 sealed e2e asset".to_vec(),
                     decimals: 2,
                     amount: 100,
                     issuance_version: 1,
@@ -2929,18 +2935,262 @@ mod tests {
             &pending_rx.proof_data,
             Network::Testnet,
         );
-        // Align caller-supplied build_tip with the live adapter tip identity.
         let tip_hash = [0xEE; 32];
-        adapter.set_tip_hash(tip_hash).expect("set tip_hash for commit");
+        adapter
+            .set_tip_hash(tip_hash)
+            .expect("set tip_hash for commit");
         let build_tip = BlockAnchor {
             block_hash: tip_hash,
             height: 120,
         };
+        (
+            pending_rx,
+            bob_sig.transition,
+            bob_owner,
+            bob_pk0,
+            tip_hash,
+            build_tip,
+        )
+    }
+
+    /// Concurrent scanner append lands **during** the prove window (after
+    /// unlocked real prove, before write-gate apply). Receive must still commit.
+    #[tokio::test]
+    #[ignore = "heavy: real Plonky2 prove + concurrent scan race; run with --ignored --release"]
+    async fn concurrent_scanner_append_during_prove_still_commits() {
+        use crate::test_db::setup_pool;
+        use crate::v11::db_v11;
+        use crate::v11::separation::claim_stack_scan_mode;
+        use crate::v11::EngineAdapter;
+        use zkcoins_prover::state_engine::ScannedNullifier;
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim");
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Testnet, 0)
+            .await
+            .expect("adapter");
+
+        let (pending, signature, owner, current_pubkey, _tip_hash, build_tip) =
+            genuine_bob_receive_ready(&adapter).await;
+        let nflog_size_at_prove = adapter.with_engine(|e| e.nflog().nav().size);
+
+        let bridge = adapter.bridge();
+        let proved = StateEngine::prove_pending_transition_detached(
+            &bridge,
+            pending,
+            signature.clone(),
+        )
+        .expect("real prove");
+
+        // Concurrent scanner append during the prove→apply window.
+        let concurrent_pk = xonly_from_label(b"v11-rx/race/concurrent-pk");
+        let concurrent_r = xonly_from_label(b"v11-rx/race/concurrent-r");
+        adapter
+            .with_engine_mut(|engine| {
+                engine
+                    .append_nullifier(ScannedNullifier::from_survivor(
+                        &shared::spec_v1::PublishedNullifier {
+                            chain_pos: host::ChainPosition {
+                                height: 115,
+                                tx_index: 0,
+                                vin_index: 0,
+                                member_index: 0,
+                            },
+                            pk: concurrent_pk,
+                            r: concurrent_r,
+                        },
+                    ))
+                    .expect("concurrent append during prove");
+            })
+            .expect("mutate");
+        let size_after_concurrent = adapter.with_engine(|e| e.nflog().nav().size);
+        assert_eq!(
+            size_after_concurrent,
+            nflog_size_at_prove + 1,
+            "scanner moved the global NfLog during prove"
+        );
+
+        let publisher = RecordingPublisher::new();
+        let outcome = commit_proved_receive(
+            &adapter,
+            proved,
+            signature,
+            &publisher,
+            build_tip,
+        )
+        .await
+        .expect("receive must commit despite concurrent append during prove");
+
+        assert_eq!(outcome.owner, owner);
+        assert_eq!(outcome.nullifier.0, current_pubkey);
+        assert_eq!(outcome.new_send_counter, 1);
+        assert_eq!(outcome.admitted_coin_ids.len(), 1);
+        assert_eq!(*publisher.commit_calls.lock().expect("lock"), 1);
+        assert_eq!(*publisher.reveal_calls.lock().expect("lock"), 1);
+
+        adapter.with_engine(|engine| {
+            assert_eq!(engine.nflog().nav().size, size_after_concurrent);
+            assert!(matches!(
+                engine.nflog().lookup(current_pubkey),
+                LookupResult::Absent
+            ));
+            assert!(matches!(
+                engine.nflog().lookup(concurrent_pk),
+                LookupResult::Present { .. }
+            ));
+            let rec = engine.account(&owner).expect("credited");
+            assert!(rec.last_nullifier.is_some());
+            assert!(rec.last_nullifier_pos.is_none());
+        });
+
+        let pending_row = db_v11::load_pending_publish(&pool, current_pubkey)
+            .await
+            .expect("load")
+            .expect("durable intent");
+        assert_eq!(
+            pending_row.status,
+            db_v11::PENDING_PUBLISH_REVEAL_BROADCAST
+        );
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Concurrent scanner append lands **after** a successful broadcast.
+    /// Outcome must remain success — decided from this transition alone.
+    #[tokio::test]
+    #[ignore = "heavy: real Plonky2 prove + post-broadcast race; run with --ignored --release"]
+    async fn concurrent_append_after_broadcast_still_reported_success() {
+        use crate::test_db::setup_pool;
+        use crate::v11::separation::claim_stack_scan_mode;
+        use crate::v11::EngineAdapter;
+        use std::sync::Arc;
+        use zkcoins_prover::state_engine::ScannedNullifier;
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim");
+        let adapter = Arc::new(
+            EngineAdapter::load_or_create(pool.clone(), Network::Testnet, 0)
+                .await
+                .expect("adapter"),
+        );
+
+        let (pending, signature, owner, current_pubkey, _tip_hash, build_tip) =
+            genuine_bob_receive_ready(&adapter).await;
+        let bridge = adapter.bridge();
+        let proved = StateEngine::prove_pending_transition_detached(
+            &bridge,
+            pending,
+            signature.clone(),
+        )
+        .expect("real prove");
+
+        let concurrent_pk = xonly_from_label(b"v11-rx/race/post-bc-pk");
+        let concurrent_r = xonly_from_label(b"v11-rx/race/post-bc-r");
+        let adapter_hook = Arc::clone(&adapter);
+        let publisher = RecordingPublisher::with_on_commit(move || {
+            adapter_hook
+                .with_engine_mut(|engine| {
+                    engine
+                        .append_nullifier(ScannedNullifier::from_survivor(
+                            &shared::spec_v1::PublishedNullifier {
+                                chain_pos: host::ChainPosition {
+                                    height: 116,
+                                    tx_index: 0,
+                                    vin_index: 0,
+                                    member_index: 0,
+                                },
+                                pk: concurrent_pk,
+                                r: concurrent_r,
+                            },
+                        ))
+                        .expect("append after broadcast");
+                })
+                .expect("concurrent post-broadcast append");
+        });
+        let outcome = commit_proved_receive(
+            &adapter,
+            proved,
+            signature,
+            &publisher,
+            build_tip,
+        )
+        .await
+        .expect(
+            "successful broadcast must not be reported as failure when an unrelated \
+             scanner append moves the global NfLog afterwards",
+        );
+
+        assert_eq!(outcome.owner, owner);
+        assert_eq!(outcome.nullifier.0, current_pubkey);
+        assert_eq!(*publisher.commit_calls.lock().expect("lock"), 1);
+        adapter.with_engine(|engine| {
+            assert!(
+                matches!(
+                    engine.nflog().lookup(concurrent_pk),
+                    LookupResult::Present { .. }
+                ),
+                "post-broadcast concurrent append must be visible"
+            );
+            assert!(engine.account(&owner).is_some());
+        });
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Heavy production path with a **genuine** Plonky2 prove, entered through
+    /// [`verify_and_begin_receive`] and [`finalise_publish_persist`], then
+    /// boot reload — replaces the deleted hollow
+    /// `production_path_receive_begin_finalise_publish_persist_reload`.
+    ///
+    /// Publisher construct/broadcast remains the fake `RecordingPublisher`
+    /// only — neither real publisher construction nor chain inclusion is
+    /// established here.
+    #[tokio::test]
+    #[ignore = "heavy: real Plonky2 prove for mint+send+receive (minutes); run with --ignored --release"]
+    async fn production_path_receive_with_genuine_prove_via_verify_and_begin() {
+        use crate::test_db::setup_pool;
+        use crate::v11::db_v11;
+        use crate::v11::separation::claim_stack_scan_mode;
+        use crate::v11::EngineAdapter;
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim");
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Testnet, 0)
+            .await
+            .expect("adapter");
+
+        let (pending_rx, signature, bob_owner, bob_pk0, _tip_hash, build_tip) =
+            genuine_bob_receive_ready(&adapter).await;
+        let admitted_from_pending: Vec<[u8; 32]> = pending_rx
+            .witness_wip
+            .received_coins
+            .iter()
+            .map(|c| host::digest_to_bytes(&c.identifier))
+            .collect();
+
         let publisher = RecordingPublisher::new();
         let outcome = finalise_publish_persist(
             &adapter,
             pending_rx,
-            bob_sig.transition,
+            signature,
             &publisher,
             build_tip,
         )
@@ -2949,15 +3199,16 @@ mod tests {
 
         assert_eq!(outcome.nullifier.0, bob_pk0);
         assert_eq!(outcome.new_send_counter, 1);
-        assert_eq!(outcome.admitted_coin_ids.len(), 1);
+        assert_eq!(
+            outcome.admitted_coin_ids, admitted_from_pending,
+            "outcome coins must come from this transition's witness, not a live re-read"
+        );
+        assert_eq!(*publisher.commit_calls.lock().expect("lock"), 1);
+        assert_eq!(*publisher.reveal_calls.lock().expect("lock"), 1);
         adapter.with_engine(|engine| {
             let bob = engine.account(&bob_owner).expect("Bob");
-            assert_eq!(
-                bob.state
-                    .balances
-                    .get(&host::digest_to_bytes(&mint_asset)),
-                Some(&30)
-            );
+            assert_eq!(bob.state.send_counter, 1);
+            assert!(bob.last_nullifier.is_some());
             assert!(bob.last_nullifier_pos.is_none());
             assert!(matches!(
                 engine.nflog().lookup(bob_pk0),
@@ -2969,6 +3220,26 @@ mod tests {
             .expect("load")
             .expect("pending");
         assert_eq!(row.status, db_v11::PENDING_PUBLISH_REVEAL_BROADCAST);
+
+        // Boot reload (hollow fixture previously asserted this path).
+        let reloaded = EngineAdapter::load_or_create(pool.clone(), Network::Testnet, 0)
+            .await
+            .expect("reload");
+        reloaded.with_engine(|engine| {
+            let rec = engine.account(&bob_owner).expect("account persisted");
+            assert_eq!(rec.state.send_counter, 1);
+            assert!(rec.last_nullifier.is_some());
+            assert!(rec.last_nullifier_pos.is_none());
+            assert!(matches!(
+                engine.nflog().lookup(bob_pk0),
+                LookupResult::Absent
+            ));
+        });
+        let row2 = db_v11::load_pending_publish(&pool, bob_pk0)
+            .await
+            .expect("load after reload")
+            .expect("pending still durable");
+        assert_eq!(row2.status, db_v11::PENDING_PUBLISH_REVEAL_BROADCAST);
 
         clear_process_stack_mode_for_test();
     }

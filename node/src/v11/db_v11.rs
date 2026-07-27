@@ -514,7 +514,12 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
 /// transaction before any v1.1 table is touched. This is the binding
 /// capability check: a process-local boot pin alone cannot close the
 /// window between an advisory check and a later write.
-pub async fn persist_engine_snapshot(pool: &PgPool, snap: &EngineSnapshot) -> Result<()> {
+/// **Crate-private durable-write sink.** Downstream durable engine writes
+/// go through receive / scan orchestration only.
+pub(crate) async fn persist_engine_snapshot(
+    pool: &PgPool,
+    snap: &EngineSnapshot,
+) -> Result<()> {
     let mut tx = pool.begin().await.context("begin v11 persist tx")?;
     require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
         .await
@@ -531,7 +536,8 @@ pub async fn persist_engine_snapshot(pool: &PgPool, snap: &EngineSnapshot) -> Re
 /// Closes the crash window where the account is advanced on disk but the
 /// Schnorr `s` / BatchMember fields are not yet durable — that row was
 /// previously unrecoverable. Either both land or neither does.
-pub async fn persist_engine_with_pending_members_ready(
+/// **Crate-private durable-write sink** (engine + members_ready intent).
+pub(crate) async fn persist_engine_with_pending_members_ready(
     pool: &PgPool,
     snap: &EngineSnapshot,
     owner: Address,
@@ -762,7 +768,12 @@ pub struct PendingPublishRow {
 
 /// Insert `members_ready` row: Schnorr `s` + BatchMember fields durable,
 /// no raw transactions yet.
-pub async fn insert_pending_publish_members_ready(
+///
+/// **Crate-private durable-write sink.** Production receive uses the atomic
+/// [`persist_engine_with_pending_members_ready`]; this insert remains for
+/// crash-window fixtures that stage a row without rewriting the engine.
+#[allow(dead_code)] // crate-test staging path
+pub(crate) async fn insert_pending_publish_members_ready(
     pool: &PgPool,
     owner: Address,
     pk: [u8; 32],
@@ -808,7 +819,9 @@ pub async fn insert_pending_publish_members_ready(
 }
 
 /// Persist constructed commit/reveal pair and advance to `constructed`.
-pub async fn mark_pending_publish_constructed(
+///
+/// **Crate-private durable-write sink.**
+pub(crate) async fn mark_pending_publish_constructed(
     pool: &PgPool,
     pk: [u8; 32],
     commit_tx: &[u8],
@@ -851,7 +864,9 @@ pub async fn mark_pending_publish_constructed(
 }
 
 /// Advance status after a successful commit (or reveal) broadcast.
-pub async fn mark_pending_publish_status(
+///
+/// **Crate-private durable-write sink.**
+pub(crate) async fn mark_pending_publish_status(
     pool: &PgPool,
     pk: [u8; 32],
     from_status: &str,
