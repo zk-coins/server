@@ -1482,11 +1482,45 @@ enum SignalOutcome {
     TimedOut,
 }
 
+/// Why finalise lost demonstrable lease liveness mid-operation.
+///
+/// Losing the lease is not a warning: the owner no longer has the right to
+/// apply results. Every variant is fail-closed — work aborts, the result is
+/// discarded, and the job is left for a later resumer once the claim is free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FinaliseLeaseLivenessLost {
+    /// `renew_finalise_claim` returned `Ok(false)` — ownership is gone.
+    RenewReturnedFalse,
+    /// Database / storage error while renewing; liveness cannot be proved.
+    RenewError(String),
+    /// The heartbeat task ended (panic or silent exit) while work was in flight.
+    HeartbeatTaskEnded,
+}
+
+impl std::fmt::Display for FinaliseLeaseLivenessLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RenewReturnedFalse => {
+                write!(f, "finalise lease renew returned false (ownership lost)")
+            }
+            Self::RenewError(e) => write!(f, "finalise lease renew failed: {e}"),
+            Self::HeartbeatTaskEnded => {
+                write!(f, "finalise lease heartbeat task ended while work in flight")
+            }
+        }
+    }
+}
+
 /// Run `work` while periodically renewing the exclusive finalise lease.
 ///
 /// A lease that is only asserted once before a multi-minute prove expires
 /// while the owner is still alive; a boot sweep then frees it and a second
 /// resumer double-executes. This heartbeat proves liveness continuously.
+///
+/// **Fail closed:** if renewal returns `Ok(false)`, a renew error occurs, or
+/// the heartbeat task disappears, this future resolves to
+/// [`Err`]`(`[`FinaliseLeaseLivenessLost`]`)` and drops `work` without
+/// yielding its result. Continuing unprotected would reintroduce split-brain.
 ///
 /// `renew_every` should be well under `lease` (production uses
 /// [`crate::job_store::FINALISE_CLAIM_RENEW_INTERVAL`]). Renewals write
@@ -1501,12 +1535,44 @@ pub(crate) async fn with_finalise_lease_heartbeat<F, T>(
     lease: std::time::Duration,
     renew_every: std::time::Duration,
     work: F,
-) -> T
+) -> Result<T, FinaliseLeaseLivenessLost>
 where
     F: std::future::Future<Output = T>,
 {
     let store = job_store.clone();
+    with_finalise_lease_heartbeat_renew(
+        renew_every,
+        move || {
+            let store = store.clone();
+            async move {
+                store
+                    .renew_finalise_claim(public_id, owner, lease)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        },
+        work,
+    )
+    .await
+}
+
+/// Core fail-closed heartbeat loop. `renew` is called on each tick; production
+/// wires [`JobStore::renew_finalise_claim`], tests inject failures.
+pub(crate) async fn with_finalise_lease_heartbeat_renew<R, Fut, F, T>(
+    renew_every: std::time::Duration,
+    mut renew: R,
+    work: F,
+) -> Result<T, FinaliseLeaseLivenessLost>
+where
+    R: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<bool, String>> + Send,
+    F: std::future::Future<Output = T>,
+{
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    // Heartbeat reports loss on this channel. Dropping the sender without a
+    // value (panic / silent exit) is itself a liveness failure.
+    let (lost_tx, mut lost_rx) = tokio::sync::oneshot::channel::<FinaliseLeaseLivenessLost>();
+
     let heartbeat = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(renew_every);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1515,27 +1581,30 @@ where
         ticker.tick().await;
         loop {
             tokio::select! {
-                _ = &mut cancel_rx => break,
+                _ = &mut cancel_rx => {
+                    // Clean stop after work completed; do not signal loss.
+                    // Dropping lost_tx without send is fine — receiver is gone.
+                    return;
+                }
                 _ = ticker.tick() => {
-                    match store.renew_finalise_claim(public_id, owner, lease).await {
+                    match renew().await {
                         Ok(true) => {
-                            tracing::debug!(
-                                %public_id,
-                                "finalise lease renewed during long operation"
-                            );
+                            tracing::debug!("finalise lease renewed during long operation");
                         }
                         Ok(false) => {
-                            tracing::warn!(
-                                %public_id,
-                                "finalise lease renew lost ownership mid-operation"
+                            tracing::error!(
+                                "finalise lease renew lost ownership mid-operation — aborting work"
                             );
+                            let _ = lost_tx.send(FinaliseLeaseLivenessLost::RenewReturnedFalse);
+                            return;
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                %public_id,
+                            tracing::error!(
                                 error = %e,
-                                "finalise lease renew failed mid-operation"
+                                "finalise lease renew failed mid-operation — aborting work"
                             );
+                            let _ = lost_tx.send(FinaliseLeaseLivenessLost::RenewError(e));
+                            return;
                         }
                     }
                 }
@@ -1543,11 +1612,61 @@ where
         }
     });
 
-    let result = work.await;
-    let _ = cancel_tx.send(());
-    // Do not leave the heartbeat task stranded if the runtime is shutting down.
-    let _ = heartbeat.await;
-    result
+    // Pin work so we can cancel it by dropping when liveness is lost.
+    tokio::pin!(work);
+
+    // Two completion paths only:
+    // 1. `lost_rx` fires → ownership gone, renew error, or heartbeat died
+    //    (sender dropped without a value). Drop `work` and discard its result.
+    // 2. `work` finishes first → stop heartbeat cleanly, return Ok(result)
+    //    only if no loss raced in and the heartbeat task did not panic.
+    //
+    // Heartbeat panics drop `lost_tx` without send → `lost_rx` yields `Err`,
+    // which is the "task disappeared" signal. `biased` prefers the loss arm
+    // when both are ready so a just-lost lease never publishes a result.
+    tokio::select! {
+        biased;
+        lost = &mut lost_rx => {
+            // Liveness can no longer be demonstrated: drop `work`, discard result.
+            drop(work);
+            let _ = heartbeat.await;
+            match lost {
+                Ok(reason) => Err(reason),
+                // Sender dropped without a value → heartbeat task disappeared.
+                Err(_) => Err(FinaliseLeaseLivenessLost::HeartbeatTaskEnded),
+            }
+        }
+        result = &mut work => {
+            // Check loss *before* cancelling the heartbeat: a clean cancel
+            // drops `lost_tx` and would otherwise look like "task disappeared".
+            match lost_rx.try_recv() {
+                Ok(reason) => {
+                    let _ = cancel_tx.send(());
+                    let _ = heartbeat.await;
+                    return Err(reason);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    let _ = cancel_tx.send(());
+                    let _ = heartbeat.await;
+                    return Err(FinaliseLeaseLivenessLost::HeartbeatTaskEnded);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+            let _ = cancel_tx.send(());
+            match heartbeat.await {
+                Ok(()) => Ok(result),
+                // Heartbeat panicked after work completed: still fail closed —
+                // we cannot assert the lease was live for the whole operation.
+                Err(join_err) => {
+                    tracing::error!(
+                        error = %join_err,
+                        "finalise lease heartbeat panicked after work completed — discarding result"
+                    );
+                    Err(FinaliseLeaseLivenessLost::HeartbeatTaskEnded)
+                }
+            }
+        }
+    }
 }
 
 /// Documented host edge of the job-path finalise resume.
@@ -1791,6 +1910,8 @@ async fn drive_v11_finalise(
         let publisher_pubkey = entry.publisher_pubkey;
         // Renew the lease for the whole long prove/apply/stage window so a
         // multi-minute prove cannot outlive a one-shot claim.
+        // Fail closed: any liveness failure aborts and discards the hook
+        // result rather than applying under a lost claim.
         let hook_result = with_finalise_lease_heartbeat(
             job_store,
             public_id,
@@ -1800,6 +1921,21 @@ async fn drive_v11_finalise(
             hook(entry.pending.clone(), signature),
         )
         .await;
+        let hook_result = match hook_result {
+            Ok(inner) => inner,
+            Err(lost) => {
+                // Lease liveness failed: discard any in-flight prove result,
+                // do not fail the job (another resumer must be able to pick
+                // it up once the claim is free), leave shared notify intact.
+                tracing::error!(
+                    %public_id,
+                    reason = %lost,
+                    "Job dispatcher: finalise aborted — lease liveness lost mid-prove; \
+                     result discarded; job left for a later resumer"
+                );
+                return Ok(());
+            }
+        };
         match hook_result {
             Ok(mut outcome) => {
                 if outcome.publisher_pubkey.is_none() {

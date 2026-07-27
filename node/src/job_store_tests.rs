@@ -882,7 +882,8 @@ async fn prove_longer_than_lease_period_blocks_second_resumer() {
             tokio::time::sleep(long_prove).await;
         },
     )
-    .await;
+    .await
+    .expect("long prove must complete while lease is kept alive by heartbeat");
 
     stop.store(true, Ordering::SeqCst);
     probe.await.expect("join probe").expect("probe ok");
@@ -902,6 +903,227 @@ async fn prove_longer_than_lease_period_blocks_second_resumer() {
             .await
             .expect("claim after abandon"),
         FinaliseClaim::Won
+    );
+
+    drop(scope);
+}
+
+/// Defect 1 (P0): a renewal that returns `Ok(false)` mid-prove aborts the
+/// operation and discards the result — fail closed, not a logged warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_renew_false_aborts_work_and_discards_result() {
+    use crate::job_dispatcher::{
+        with_finalise_lease_heartbeat_renew, FinaliseLeaseLivenessLost,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let renew_calls = Arc::new(AtomicUsize::new(0));
+    let work_finished = Arc::new(AtomicBool::new(false));
+    let renew_calls_h = Arc::clone(&renew_calls);
+    let work_finished_h = Arc::clone(&work_finished);
+
+    let result = with_finalise_lease_heartbeat_renew(
+        Duration::from_millis(50),
+        move || {
+            let renew_calls_h = Arc::clone(&renew_calls_h);
+            async move {
+                renew_calls_h.fetch_add(1, Ordering::SeqCst);
+                // Every renew loses ownership — fail closed on first tick.
+                Ok(false)
+            }
+        },
+        async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            work_finished_h.store(true, Ordering::SeqCst);
+            "should_not_be_returned"
+        },
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        Err(FinaliseLeaseLivenessLost::RenewReturnedFalse),
+        "Ok(false) renew must abort with RenewReturnedFalse"
+    );
+    assert!(
+        !work_finished.load(Ordering::SeqCst),
+        "work must be cancelled — result discarded, not completed"
+    );
+    assert!(
+        renew_calls.load(Ordering::SeqCst) >= 1,
+        "renew must have been attempted"
+    );
+}
+
+/// Defect 1 (P0): a renew database/storage error mid-prove aborts work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_renew_error_aborts_work_and_discards_result() {
+    use crate::job_dispatcher::{
+        with_finalise_lease_heartbeat_renew, FinaliseLeaseLivenessLost,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let work_finished = Arc::new(AtomicBool::new(false));
+    let work_finished_h = Arc::clone(&work_finished);
+
+    let result = with_finalise_lease_heartbeat_renew(
+        Duration::from_millis(50),
+        || async { Err("simulated db error".to_string()) },
+        async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            work_finished_h.store(true, Ordering::SeqCst);
+            42
+        },
+    )
+    .await;
+
+    match result {
+        Err(FinaliseLeaseLivenessLost::RenewError(msg)) => {
+            assert!(
+                msg.contains("simulated db error"),
+                "error text must surface; got {msg}"
+            );
+        }
+        other => panic!("expected RenewError, got {other:?}"),
+    }
+    assert!(
+        !work_finished.load(Ordering::SeqCst),
+        "work must stop when renew errors"
+    );
+}
+
+/// Defect 1 (P0): if the heartbeat task dies silently, work must stop.
+/// A panic inside renew drops the loss channel without a value — the same
+/// signal as a task that disappears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_task_death_aborts_work_and_discards_result() {
+    use crate::job_dispatcher::{
+        with_finalise_lease_heartbeat_renew, FinaliseLeaseLivenessLost,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let work_finished = Arc::new(AtomicBool::new(false));
+    let work_finished_h = Arc::clone(&work_finished);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_h = Arc::clone(&calls);
+
+    let result = with_finalise_lease_heartbeat_renew(
+        Duration::from_millis(50),
+        move || {
+            let calls_h = Arc::clone(&calls_h);
+            async move {
+                let n = calls_h.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // Panic on the first real renew: heartbeat task dies.
+                    panic!("simulated heartbeat task death");
+                }
+                Ok(true)
+            }
+        },
+        async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            work_finished_h.store(true, Ordering::SeqCst);
+            "should_not_complete"
+        },
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        Err(FinaliseLeaseLivenessLost::HeartbeatTaskEnded),
+        "heartbeat death must surface as HeartbeatTaskEnded"
+    );
+    assert!(
+        !work_finished.load(Ordering::SeqCst),
+        "work must stop when the heartbeat task disappears"
+    );
+}
+
+/// Defect 1 (P0): integration — steal the claim mid-operation so
+/// `renew_finalise_claim` returns `Ok(false)`; the heartbeat wrapper aborts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mid_prove_lease_loss_aborts_via_real_store_renew() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let scope = setup_pool().await;
+    let owner = uuid::Uuid::new_v4();
+    let store = JobStore::with_process_owner(scope.pool.clone(), owner);
+
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xCF),
+            Some("k-mid-prove-loss"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let lease = Duration::from_secs(30);
+    let renew_every = Duration::from_millis(80);
+    assert_eq!(
+        store
+            .claim_finalise_exclusive_as(job_id, owner, lease)
+            .await
+            .expect("claim"),
+        FinaliseClaim::Won
+    );
+
+    // After a short delay, strip the claim so the next renew returns false.
+    let pool = scope.pool.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        sqlx::query(
+            "UPDATE jobs SET phase = 'publishing', \
+                    request_body = COALESCE(request_body, '{}'::jsonb) - 'finalise_claim' \
+             WHERE public_id = $1",
+        )
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("steal claim");
+    });
+
+    let work_finished = Arc::new(AtomicBool::new(false));
+    let work_finished_h = Arc::clone(&work_finished);
+    let outcome = crate::job_dispatcher::with_finalise_lease_heartbeat(
+        &store,
+        job_id,
+        owner,
+        lease,
+        renew_every,
+        async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            work_finished_h.store(true, Ordering::SeqCst);
+            "applied"
+        },
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        Err(crate::job_dispatcher::FinaliseLeaseLivenessLost::RenewReturnedFalse),
+        "stolen claim must abort the in-flight operation"
+    );
+    assert!(
+        !work_finished.load(Ordering::SeqCst),
+        "prove work must not complete after lease loss"
     );
 
     drop(scope);
