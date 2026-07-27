@@ -477,6 +477,14 @@ async fn process_mint(
                 message
             );
             note_prove_outcome(app_state, Err(message.as_str())).await;
+            // Cancel may have won while proving; do not overwrite cancelled.
+            if let Ok(Some(j)) = job_store.load(public_id).await {
+                if j.status == JobStatus::Cancelled {
+                    cleanup_pending_sign(job_store, app_state, public_id).await;
+                    notify_map.remove(&public_id);
+                    return Ok(());
+                }
+            }
             job_store.fail(public_id, &message).await?;
             publish_phase(
                 notify_map,
@@ -493,6 +501,15 @@ async fn process_mint(
         }
     };
 
+    // Cancel may have won during the prove leg.
+    if let Ok(Some(j)) = job_store.load(public_id).await {
+        if j.status == JobStatus::Cancelled {
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
+
     let notifier = notify_map
         .entry(public_id)
         .or_insert_with(|| Arc::new(JobNotifier::new()))
@@ -500,7 +517,8 @@ async fn process_mint(
 
     // Production staging site: under v1.1 a live PendingTransition must be
     // staged via stage_pending_sign before the job advertises. Source is the
-    // prove-path hook (Stage 3 wires StateEngine::begin_*; tests inject).
+    // post-begin registry (begin_* → register_live_pending_after_begin) or
+    // the optional test hook.
     let live_pending = resolve_live_pending_after_prove(app_state, public_id);
     let result = match stage_and_select_awaiting_signature(
         job_store,
@@ -537,9 +555,40 @@ async fn process_mint(
             return Ok(());
         }
     };
-    job_store
+    if let Err(e) = job_store
         .set_awaiting_signature(public_id, proof_id as i64, result.clone())
-        .await?;
+        .await
+    {
+        // Defect 3: staged map + envelope + notifier must not survive a
+        // failed status transition.
+        tracing::error!(
+            "Job dispatcher: mint job {} set_awaiting_signature failed: {}",
+            public_id,
+            e
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        return Err(e.into());
+    }
+    // Cancel may have won between stage and status write (WHERE filters).
+    match job_store.load(public_id).await? {
+        Some(j) if j.status == JobStatus::AwaitingSignature => {}
+        Some(j) if j.status == JobStatus::Cancelled => {
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+        other => {
+            tracing::warn!(
+                "Job dispatcher: mint job {} not in awaiting_signature after set ({:?}); cleaning up",
+                public_id,
+                other.map(|j| j.status)
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
     publish_phase(
         notify_map,
         public_id,
@@ -641,14 +690,17 @@ async fn persist_pending_sign_on_job(
     Ok(())
 }
 
-/// Resolve a live pending after the prove leg under a v1.1 claim.
+/// Resolve a live pending after the prove / begin leg under a v1.1 claim.
 ///
-/// Production path: [`crate::router::AppState::v11_pending_after_prove`] —
-/// Stage 3 wires `StateEngine::begin_*` here (or returns a pending from
-/// the flow). Until that hook is wired, production under v1.1 fails
-/// closed at [`stage_and_select_awaiting_signature`] (no silent ash‖ocr).
-/// Tests inject a fixture via the same hook so the dispatcher staging
-/// path is exercised without a multi-minute prove.
+/// Production path: consume a [`PendingSignEntry`] that `StateEngine::begin_*`
+/// registered via [`crate::v11::register_live_pending_after_begin`] into
+/// [`crate::router::AppState::v11_live_pending_after_begin`]. The pending is
+/// self-contained (witness + ProofData); finalise re-validates live
+/// dependencies rather than re-reading a snapshot a concurrent scan can move.
+///
+/// Tests may also inject a fixture via
+/// [`crate::router::AppState::v11_pending_after_prove`]. Missing both sources
+/// fails closed at [`stage_and_select_awaiting_signature`] (no silent ash‖ocr).
 fn resolve_live_pending_after_prove(
     app_state: &AppState,
     public_id: Uuid,
@@ -656,10 +708,25 @@ fn resolve_live_pending_after_prove(
     if !crate::v11::v11_sign_route_active() {
         return None;
     }
+    if let Some(entry) = crate::v11::take_live_pending_after_begin(
+        &app_state.v11_live_pending_after_begin,
+        public_id,
+    ) {
+        return Some(entry);
+    }
     app_state
         .v11_pending_after_prove
         .as_ref()
         .and_then(|hook| hook(public_id))
+}
+
+/// Test-visible alias of [`resolve_live_pending_after_prove`].
+#[cfg(test)]
+pub(crate) fn resolve_live_pending_after_prove_for_test(
+    app_state: &AppState,
+    public_id: Uuid,
+) -> Option<crate::v11::PendingSignEntry> {
+    resolve_live_pending_after_prove(app_state, public_id)
 }
 
 /// Production staging site for a job entering `awaiting_signature`.
@@ -858,6 +925,13 @@ async fn process_send_initial(
                 message
             );
             note_prove_outcome(app_state, Err(message.as_str())).await;
+            if let Ok(Some(j)) = job_store.load(public_id).await {
+                if j.status == JobStatus::Cancelled {
+                    cleanup_pending_sign(job_store, app_state, public_id).await;
+                    notify_map.remove(&public_id);
+                    return Ok(());
+                }
+            }
             job_store.fail(public_id, &message).await?;
             publish_phase(
                 notify_map,
@@ -873,6 +947,15 @@ async fn process_send_initial(
             return Ok(());
         }
     };
+
+    // Cancel may have won during the prove leg.
+    if let Ok(Some(j)) = job_store.load(public_id).await {
+        if j.status == JobStatus::Cancelled {
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
 
     // Register a JobNotifier *before* persisting `awaiting_signature`
     // so a fast wallet that polls and POSTs `/commit` immediately
@@ -926,9 +1009,39 @@ async fn process_send_initial(
             return Ok(());
         }
     };
-    job_store
+    if let Err(e) = job_store
         .set_awaiting_signature(public_id, proof_id as i64, result.clone())
-        .await?;
+        .await
+    {
+        // Defect 3: staged map + envelope + notifier must not survive a
+        // failed status transition.
+        tracing::error!(
+            "Job dispatcher: send job {} set_awaiting_signature failed: {}",
+            public_id,
+            e
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        return Err(e.into());
+    }
+    match job_store.load(public_id).await? {
+        Some(j) if j.status == JobStatus::AwaitingSignature => {}
+        Some(j) if j.status == JobStatus::Cancelled => {
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+        other => {
+            tracing::warn!(
+                "Job dispatcher: send job {} not in awaiting_signature after set ({:?}); cleaning up",
+                public_id,
+                other.map(|j| j.status)
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
     publish_phase(
         notify_map,
         public_id,
@@ -1089,6 +1202,20 @@ async fn wait_for_commit(
             return Ok(());
         }
     };
+
+    // Cancel won the race (wallet cancelled while we were parked, or
+    // the cancel handler claimed the handoff and woke us). Do not
+    // overwrite a cancelled row with fail/complete.
+    if job.status == JobStatus::Cancelled || job.status.is_terminal() {
+        tracing::info!(
+            "Job dispatcher: job {} is terminal ({:?}) after handoff wake; exiting",
+            public_id,
+            job.status
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        return Ok(());
+    }
 
     // v1.1 path: `/v1/jobs/{id}/sign` already verified via
     // accept_wallet_transition_signature and persisted the TransitionSignature

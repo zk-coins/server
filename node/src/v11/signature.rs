@@ -597,9 +597,9 @@ impl FinaliseOutcome {
 /// Drive an accepted wallet signature into [`StateEngine::finalise`].
 ///
 /// Installs the signature on the pending witness and calls `finalise`.
-/// This is the **only** production path from a verified `/sign` body to
-/// a completed job under a v1.1 claim — the dispatcher must not mark the
-/// job completed with the signature material alone.
+/// Prefer [`finalise_accepted_prove_outside_lock`] on the production job
+/// path so the multi-minute prove does not hold the engine mutex (the
+/// receive-path invariant: prove outside the lock, re-validate on apply).
 ///
 /// `publisher_pubkey` is the §7.5 optional result field (echo of the
 /// transition's external publisher target, when present).
@@ -622,6 +622,63 @@ pub fn finalise_with_accepted_signature(
         output_coin_ids,
         publisher_pubkey,
     })
+}
+
+/// Production finalise: prove **outside** the engine mutex, then re-acquire
+/// and apply with live re-validation.
+///
+/// Matches the receive-path invariant: the multi-minute prove holds neither
+/// the engine lock nor the write gate; [`StateEngine::apply_proved_transition`]
+/// re-checks every live dependency a concurrent scan may have moved.
+/// Staging fits the same shape — a self-contained [`PendingTransition`]
+/// from `begin_*`, not a snapshot that becomes stale mid-prove.
+pub fn finalise_accepted_prove_outside_lock(
+    adapter: &crate::v11::EngineAdapter,
+    pending: PendingTransition,
+    signature: TransitionSignature,
+    publisher_pubkey: Option<[u8; 32]>,
+) -> Result<FinaliseOutcome, String> {
+    let output_coin_ids = FinaliseOutcome::output_coin_ids_from_pending(&pending);
+    let bridge = adapter.bridge();
+    let proved = zkcoins_prover::state_engine::StateEngine::prove_pending_transition_detached(
+        &bridge,
+        pending,
+        signature,
+    )
+    .map_err(|e| format!("prove_pending_transition_detached failed: {e:#}"))?;
+    let applied = adapter
+        .with_engine_mut(|engine| engine.apply_proved_transition(proved))
+        .map_err(|e| format!("apply_proved_transition (engine lock): {e:#}"))?
+        .map_err(|e| format!("apply_proved_transition failed: {e:#}"))?;
+    let pd = &applied.proved().proof_data;
+    Ok(FinaliseOutcome {
+        new_account_state_hash: digest_to_bytes(&pd.new_account_state_hash),
+        output_coins_root: digest_to_bytes(&pd.output_coins_root),
+        input_nullifiers_root: digest_to_bytes(&pd.input_nullifiers_root),
+        output_coin_ids,
+        publisher_pubkey,
+    })
+}
+
+/// Register a live [`PendingSignEntry`] produced by `StateEngine::begin_*`
+/// so the dispatcher can stage it when the job enters `awaiting_signature`.
+///
+/// Production write site for the post-begin registry. The dispatcher
+/// consumes the entry once via [`take_live_pending_after_begin`].
+pub fn register_live_pending_after_begin(
+    map: &PendingSignMap,
+    job_id: Uuid,
+    entry: PendingSignEntry,
+) {
+    map.insert(job_id, entry);
+}
+
+/// Take (consume) a live pending registered by [`register_live_pending_after_begin`].
+pub fn take_live_pending_after_begin(
+    map: &PendingSignMap,
+    job_id: Uuid,
+) -> Option<PendingSignEntry> {
+    map.remove(&job_id).map(|(_, e)| e)
 }
 
 /// Optional `publisher_pubkey` from a job's original transition request
