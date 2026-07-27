@@ -376,6 +376,17 @@ async fn boot_resume_jobs(
                 Ok(Some(e)) if e.signature.is_some()
             );
         if resumable_v11 {
+            // Dead process may have left phase = finalise_claimed; release so
+            // the single boot resumer can re-acquire the exclusive claim.
+            if let Err(e) = job_store
+                .release_stale_finalise_claim(job.public_id)
+                .await
+            {
+                eprintln!(
+                    "boot_resume_jobs: release_stale_finalise_claim({}) failed: {} (continuing)",
+                    job.public_id, e
+                );
+            }
             let notifier = Arc::new(JobNotifier::new());
             job_notify_map.insert(job.public_id, notifier);
             if let Err(e) = job_tx

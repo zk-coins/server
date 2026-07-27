@@ -1482,18 +1482,24 @@ enum SignalOutcome {
     TimedOut,
 }
 
-/// Drive an accepted v1.1 signature into finalise from the durable capability.
+/// Drive an accepted v1.1 signature through the **whole path to completion**
+/// from the durable host capability.
 ///
-/// ## Idempotency of each step
+/// ## Steps and durable dependencies
 ///
-/// | Step | Guard |
-/// |------|-------|
-/// | Terminal job | status already completed/failed/cancelled → no-op return |
-/// | Load capability | rehydrate full [`FinalisationCapability`]; refuse if unsigned |
-/// | Enter publishing | `set_status_if(awaiting_signature → broadcasting)`; if already broadcasting, continue |
-/// | Prove + apply | engine re-validates live deps; job status prevents double-complete |
-/// | Complete | `complete_if_status([broadcasting])` — second resume after complete is no-op |
-/// | Fail | `fail_if_status` from non-terminal only |
+/// | Step | Depends on (capability fields) | Guard |
+/// |------|--------------------------------|-------|
+/// | Terminal job | — | status already terminal → no-op |
+/// | Load capability | `finalisation` envelope | rehydrate; refuse incomplete |
+/// | Exclusive claim | status | [`JobStore::claim_finalise_exclusive`] — **loser exits** |
+/// | Prove + apply | pending + signature | finalise hook; skip if `completion_result` already set |
+/// | Persist completion | outcome + publisher_pubkey | status-qualified body write under `broadcasting` |
+/// | Publish + complete | `completion_result` + `completion_status` | `complete_if_status([broadcasting])` |
+/// | Fail | — | `fail_if_status` from non-terminal only |
+///
+/// `broadcasting` is an **exclusive claim**, not a permission: exactly one
+/// resumer wins the CAS; the loser observes [`FinaliseClaim::Lost`] and must
+/// not continue into side effects.
 async fn drive_v11_finalise(
     job_store: &JobStore,
     app_state: &AppState,
@@ -1501,6 +1507,8 @@ async fn drive_v11_finalise(
     public_id: Uuid,
     job: &Job,
 ) -> anyhow::Result<()> {
+    use crate::job_store::FinaliseClaim;
+
     // Helper: fail with a §7.5 machine code, clean envelopes, drop notify.
     async fn fail_v11(
         job_store: &JobStore,
@@ -1547,8 +1555,9 @@ async fn drive_v11_finalise(
         return Ok(());
     }
 
-    // Prefer durable capability (cold boot); fall back to in-memory map.
-    let entry = match crate::v11::rehydrate_pending_sign(&job.request_body) {
+    // Prefer durable capability (cold boot). In-memory map is only a warm
+    // cache of the same envelope — never a substitute for missing fields.
+    let mut entry = match crate::v11::rehydrate_pending_sign(&job.request_body) {
         Ok(Some(e)) => e,
         Ok(None) => match app_state.pending_sign_map.get(&public_id).map(|e| e.clone()) {
             Some(e) => e,
@@ -1579,87 +1588,49 @@ async fn drive_v11_finalise(
         }
     };
 
-    let signature = match entry.signature.clone() {
-        Some(s) => s,
-        None => {
-            return fail_v11(
-                job_store,
-                app_state,
-                notify_map,
-                public_id,
-                "internal_error",
-                "v1.1 finalise: durable capability has no installed signature".to_string(),
-            )
-            .await;
-        }
-    };
-
-    let Some(hook) = app_state.v11_finalise.as_ref() else {
+    // Prove+apply readiness (signature). Completion surface may still be absent.
+    if let Err(msg) = crate::v11::ensure_finalise_ready(&entry) {
         return fail_v11(
             job_store,
             app_state,
             notify_map,
             public_id,
             "internal_error",
-            "v1.1 finalise: no finalise driver configured on AppState \
-             (wire EngineAdapter::finalise or a test hook; refusing to \
-             complete with signature material alone)"
-                .to_string(),
+            format!("v1.1 finalise: {msg}"),
         )
         .await;
-    };
+    }
 
-    // Status-qualified enter publishing. Already broadcasting (mid-finalise
-    // crash) continues; any other status aborts without clobbering.
-    if job.status == JobStatus::AwaitingSignature {
-        let advanced = job_store
-            .set_status_if(
-                public_id,
-                JobStatus::AwaitingSignature,
-                JobStatus::Broadcasting,
-                "publishing",
-            )
-            .await?;
-        if !advanced {
-            // Cancel/timeout won, or concurrent finalise already moved us.
-            let latest = job_store.load(public_id).await?;
-            if let Some(j) = latest {
-                if j.status.is_terminal() {
-                    cleanup_pending_sign(job_store, app_state, public_id).await;
-                    notify_map.remove(&public_id);
-                    return Ok(());
-                }
-                if j.status != JobStatus::Broadcasting {
-                    return fail_v11(
-                        job_store,
-                        app_state,
-                        notify_map,
-                        public_id,
-                        "internal_error",
-                        format!(
-                            "v1.1 finalise: status-qualified enter publishing failed; \
-                             job is now {:?}",
-                            j.status
-                        ),
-                    )
-                    .await;
-                }
+    // Exclusive claim — broadcasting is ownership, not permission.
+    match job_store.claim_finalise_exclusive(public_id).await? {
+        FinaliseClaim::Won => {
+            tracing::info!(
+                "Job dispatcher: job {} won exclusive finalise claim",
+                public_id
+            );
+        }
+        FinaliseClaim::Lost { observed } => {
+            if observed.is_terminal() {
+                tracing::info!(
+                    "Job dispatcher: job {} finalise claim lost; already terminal ({:?})",
+                    public_id,
+                    observed
+                );
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
             }
+            // Another resumer owns this job — observe the loss and stop.
+            // Do **not** continue just because status is broadcasting.
+            tracing::info!(
+                "Job dispatcher: job {} finalise claim lost (observed {:?}); \
+                 refusing to continue into side effects",
+                public_id,
+                observed
+            );
+            notify_map.remove(&public_id);
+            return Ok(());
         }
-    } else if job.status != JobStatus::Broadcasting {
-        return fail_v11(
-            job_store,
-            app_state,
-            notify_map,
-            public_id,
-            "internal_error",
-            format!(
-                "v1.1 finalise: refusing from status {:?} (expected awaiting_signature \
-                 or broadcasting)",
-                job.status
-            ),
-        )
-        .await;
     }
 
     publish_phase(
@@ -1667,94 +1638,202 @@ async fn drive_v11_finalise(
         public_id,
         JobPhaseEvent {
             status: JobStatus::Broadcasting,
-            phase: "publishing".to_string(),
+            phase: crate::job_store::FINALISE_CLAIM_PHASE.to_string(),
             proof_id: None,
             result: None,
             error: None,
         },
     );
 
-    // Publisher from the durable capability (captured at stage); fall back
-    // to request_body scan for older rows that only stored it at the root.
-    let publisher_pubkey = match entry.publisher_pubkey {
-        Some(pk) => Some(pk),
-        None => match crate::v11::publisher_pubkey_from_request_body(&job.request_body) {
-            Ok(pk) => pk,
-            Err(msg) => {
-                return fail_v11(
-                    job_store,
-                    app_state,
-                    notify_map,
-                    public_id,
-                    "malformed_request",
-                    msg,
-                )
-                .await;
-            }
-        },
-    };
+    // If prove+apply already recorded the §7.5 surface, skip the hook and
+    // only publish + complete (crash window after apply, before complete).
+    if !entry.has_completion() {
+        let signature = entry
+            .signature
+            .clone()
+            .expect("ensure_finalise_ready checked signature");
+        let Some(hook) = app_state.v11_finalise.as_ref() else {
+            return fail_v11(
+                job_store,
+                app_state,
+                notify_map,
+                public_id,
+                "internal_error",
+                "v1.1 finalise: no finalise driver and no durable completion_result \
+                 — cannot prove/apply or complete (incomplete capability path; \
+                 refusing to half-finish)"
+                    .to_string(),
+            )
+            .await;
+        };
 
-    match hook(entry.pending, signature) {
-        Ok(mut outcome) => {
-            if outcome.publisher_pubkey.is_none() {
-                outcome.publisher_pubkey = publisher_pubkey;
+        // publisher_pubkey is only the staged capability field — no silent
+        // fall-back to a root request_body key.
+        let publisher_pubkey = entry.publisher_pubkey;
+        match hook(entry.pending.clone(), signature) {
+            Ok(mut outcome) => {
+                if outcome.publisher_pubkey.is_none() {
+                    outcome.publisher_pubkey = publisher_pubkey;
+                }
+                let response_body = outcome.to_result_json();
+                if let Err(e) = entry.install_completion(response_body, 200) {
+                    return fail_v11(
+                        job_store,
+                        app_state,
+                        notify_map,
+                        public_id,
+                        "internal_error",
+                        format!("v1.1 finalise: install_completion failed: {e}"),
+                    )
+                    .await;
+                }
+                // Persist completion onto the durable capability **before**
+                // the terminal complete flip so a crash here is resumable.
+                let persist = match crate::v11::DurableFinalisationPersist::from_entry(&entry) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return fail_v11(
+                            job_store,
+                            app_state,
+                            notify_map,
+                            public_id,
+                            "internal_error",
+                            format!("v1.1 finalise: encode completion capability: {e}"),
+                        )
+                        .await;
+                    }
+                };
+                let persist_val = match serde_json::to_value(&persist) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return fail_v11(
+                            job_store,
+                            app_state,
+                            notify_map,
+                            public_id,
+                            "internal_error",
+                            format!("v1.1 finalise: json-encode completion capability: {e}"),
+                        )
+                        .await;
+                    }
+                };
+                // Reload body under broadcasting, merge finalisation key.
+                let latest = job_store.load(public_id).await?;
+                let Some(latest) = latest else {
+                    return fail_v11(
+                        job_store,
+                        app_state,
+                        notify_map,
+                        public_id,
+                        "internal_error",
+                        "v1.1 finalise: job missing while persisting completion".to_string(),
+                    )
+                    .await;
+                };
+                if latest.status != JobStatus::Broadcasting {
+                    // Lost claim or concurrent terminal — do not clobber.
+                    cleanup_pending_sign(job_store, app_state, public_id).await;
+                    notify_map.remove(&public_id);
+                    return Ok(());
+                }
+                let mut body = latest.request_body;
+                body.as_object_mut()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("v1.1 finalise: request_body is not a JSON object")
+                    })?
+                    .insert(crate::v11::FINALISATION_BODY_KEY.to_string(), persist_val);
+                let wrote = job_store
+                    .replace_request_body_if_status(public_id, JobStatus::Broadcasting, &body)
+                    .await?;
+                if !wrote {
+                    tracing::info!(
+                        "Job dispatcher: job {} completion persist was a no-op \
+                         (status moved); exiting without re-complete",
+                        public_id
+                    );
+                    cleanup_pending_sign(job_store, app_state, public_id).await;
+                    notify_map.remove(&public_id);
+                    return Ok(());
+                }
+                app_state.pending_sign_map.insert(public_id, entry.clone());
             }
-            let response_body = outcome.to_result_json();
-            let completed = job_store
-                .complete_if_status(
-                    public_id,
-                    &[JobStatus::Broadcasting],
-                    response_body.clone(),
-                    200,
-                )
-                .await?;
-            if completed {
+            Err(e) => {
+                let msg = format!("v1.1 finalise failed: {e}");
+                tracing::warn!("Job dispatcher: job {} {}", public_id, msg);
+                let err = crate::v11::encode_job_error("proving_failed", msg);
+                let _ = job_store
+                    .fail_if_status(
+                        public_id,
+                        &[JobStatus::AwaitingSignature, JobStatus::Broadcasting],
+                        &err,
+                    )
+                    .await?;
                 publish_phase(
                     notify_map,
                     public_id,
                     JobPhaseEvent {
-                        status: JobStatus::Completed,
-                        phase: "completed".to_string(),
+                        status: JobStatus::Failed,
+                        phase: "failed".to_string(),
                         proof_id: None,
-                        result: Some(response_body),
-                        error: None,
+                        result: None,
+                        error: Some(err),
                     },
                 );
-                tracing::info!(
-                    "Job dispatcher: job {} completed after v1.1 finalise",
-                    public_id
-                );
-            } else {
-                // Concurrent complete already landed — resume is harmless.
-                tracing::info!(
-                    "Job dispatcher: job {} complete_if_status was a no-op (already terminal)",
-                    public_id
-                );
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
             }
         }
-        Err(e) => {
-            let msg = format!("v1.1 finalise failed: {e}");
-            tracing::warn!("Job dispatcher: job {} {}", public_id, msg);
-            let err = crate::v11::encode_job_error("proving_failed", msg);
-            let _ = job_store
-                .fail_if_status(
-                    public_id,
-                    &[JobStatus::AwaitingSignature, JobStatus::Broadcasting],
-                    &err,
-                )
-                .await?;
-            publish_phase(
-                notify_map,
-                public_id,
-                JobPhaseEvent {
-                    status: JobStatus::Failed,
-                    phase: "failed".to_string(),
-                    proof_id: None,
-                    result: None,
-                    error: Some(err),
-                },
-            );
-        }
+    }
+
+    // Publication + job completion — requires the full completion surface.
+    if let Err(msg) = crate::v11::ensure_completion_ready(&entry) {
+        return fail_v11(
+            job_store,
+            app_state,
+            notify_map,
+            public_id,
+            "internal_error",
+            format!("v1.1 finalise: incomplete capability for publish/complete: {msg}"),
+        )
+        .await;
+    }
+    let response_body = entry
+        .completion_result
+        .clone()
+        .expect("ensure_completion_ready checked");
+    let response_status = entry
+        .completion_status
+        .expect("ensure_completion_ready checked");
+    let completed = job_store
+        .complete_if_status(
+            public_id,
+            &[JobStatus::Broadcasting],
+            response_body.clone(),
+            response_status,
+        )
+        .await?;
+    if completed {
+        publish_phase(
+            notify_map,
+            public_id,
+            JobPhaseEvent {
+                status: JobStatus::Completed,
+                phase: "completed".to_string(),
+                proof_id: None,
+                result: Some(response_body),
+                error: None,
+            },
+        );
+        tracing::info!(
+            "Job dispatcher: job {} completed after v1.1 finalise (publish+complete)",
+            public_id
+        );
+    } else {
+        tracing::info!(
+            "Job dispatcher: job {} complete_if_status was a no-op (already terminal)",
+            public_id
+        );
     }
 
     cleanup_pending_sign(job_store, app_state, public_id).await;

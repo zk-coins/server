@@ -243,13 +243,14 @@ impl TryFrom<WalletSignSubmissionWire> for WalletSignSubmission {
 /// counter of the transition being authorised. Callers cannot set a
 /// counter that disagrees with the pending transition.
 ///
-/// ## Durable finalisation
+/// ## Durable finalisation (whole path to completion)
 ///
 /// The engine-owned [`FinalisationCapability`] inside this entry carries
-/// the **full** host witness. Persisting via [`DurableFinalisationPersist`]
-/// therefore makes resume "load and proceed" — including after a true cold
-/// boot with an empty in-memory map. There is no verification-only partial
-/// reconstruction and no `finalise_safe` gate.
+/// the host witness for prove + apply. [`DurableFinalisationPersist`] also
+/// carries every durable dependency of the **remaining** host steps —
+/// publication of the §7.5 result and job completion — so resume is
+/// "load and proceed" through to a terminal status, including after a true
+/// cold boot with an empty in-memory map.
 #[derive(Clone, Debug)]
 pub struct PendingSignEntry {
     pub pending: PendingTransition,
@@ -260,6 +261,13 @@ pub struct PendingSignEntry {
     /// §7.5 optional result field captured at stage time from the original
     /// transition request (caller-supplied; revalidated on complete).
     pub publisher_pubkey: Option<[u8; 32]>,
+    /// §7.5 `result` JSON after a successful prove+apply. Present once the
+    /// side-effectful engine step has finished so resume can **publish and
+    /// complete** without re-running apply. `None` until that step lands.
+    pub completion_result: Option<serde_json::Value>,
+    /// HTTP status paired with [`Self::completion_result`] for
+    /// `JobStore::complete` (always `Some(200)` once result is set).
+    pub completion_status: Option<i16>,
 }
 
 impl PendingSignEntry {
@@ -272,6 +280,8 @@ impl PendingSignEntry {
             network,
             signature: None,
             publisher_pubkey: None,
+            completion_result: None,
+            completion_status: None,
         }
     }
 
@@ -312,14 +322,121 @@ impl PendingSignEntry {
         self.signature = Some(sig);
         Ok(())
     }
+
+    /// Record the §7.5 completion surface after a successful prove+apply.
+    ///
+    /// Both fields are required together — never store a result without its
+    /// status or invent a default status.
+    pub fn install_completion(
+        &mut self,
+        result: serde_json::Value,
+        status: i16,
+    ) -> Result<(), String> {
+        if !result.is_object() {
+            return Err(
+                "install_completion: result must be a JSON object (§7.5 job result)".to_string(),
+            );
+        }
+        if status != 200 {
+            return Err(format!(
+                "install_completion: success path requires HTTP 200; got {status}"
+            ));
+        }
+        self.completion_result = Some(result);
+        self.completion_status = Some(status);
+        Ok(())
+    }
+
+    /// True when prove+apply has already produced a durable completion
+    /// surface — resume may publish/complete without re-running the hook.
+    pub fn has_completion(&self) -> bool {
+        self.completion_result.is_some() && self.completion_status.is_some()
+    }
 }
 
-/// Finalise readiness: a durable capability is always complete by construction.
+/// Finalise readiness for the **prove+apply** leg: signature must be installed.
 ///
-/// Kept as a named check so call sites stay explicit. Returns `Ok` for every
-/// well-formed entry; the previous verification-grade refuse path is gone.
-pub fn ensure_finalise_ready(_entry: &PendingSignEntry) -> Result<(), String> {
+/// Publication and job completion additionally require
+/// [`PendingSignEntry::has_completion`] (or a live finalise driver to produce
+/// it). Kept as a named check so call sites stay explicit — never a silent
+/// "always Ok".
+pub fn ensure_finalise_ready(entry: &PendingSignEntry) -> Result<(), String> {
+    if entry.signature.is_none() {
+        return Err(
+            "finalise readiness: durable capability has no installed signature \
+             (wallet /sign has not accepted authorisation)"
+                .to_string(),
+        );
+    }
     Ok(())
+}
+
+/// Completeness of the durable host capability for the **whole path** to a
+/// terminal job (prove/apply + publish result + complete).
+///
+/// Every field the remaining steps depend on must be present. A missing
+/// field fails loud — resume must not half-finish.
+///
+/// | Field | Required for |
+/// |-------|----------------|
+/// | engine capability (pending witness) | prove + apply |
+/// | `signature` | prove + apply |
+/// | `network` | BIP-340 re-verify / process identity |
+/// | `completion_result` + `completion_status` | publish §7.5 result + job complete |
+/// | `publisher_pubkey` | optional — only when the original request carried one |
+pub fn ensure_completion_ready(entry: &PendingSignEntry) -> Result<(), String> {
+    ensure_finalise_ready(entry)?;
+    match (&entry.completion_result, entry.completion_status) {
+        (Some(result), Some(status)) => {
+            if !result.is_object() {
+                return Err(
+                    "completion readiness: completion_result must be a JSON object".to_string(),
+                );
+            }
+            if status != 200 {
+                return Err(format!(
+                    "completion readiness: completion_status must be 200; got {status}"
+                ));
+            }
+            // Publisher on the result must match the staged value when both set.
+            if let Some(pk) = &entry.publisher_pubkey {
+                let expected = hex_lower(pk);
+                match result.get("publisher_pubkey").and_then(|v| v.as_str()) {
+                    Some(got) if got == expected => {}
+                    Some(got) => {
+                        return Err(format!(
+                            "completion readiness: completion_result.publisher_pubkey \
+                             {got} does not match staged publisher_pubkey {expected}"
+                        ));
+                    }
+                    None => {
+                        return Err(
+                            "completion readiness: staged publisher_pubkey present but \
+                             completion_result omits publisher_pubkey"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        (None, None) => Err(
+            "completion readiness: missing completion_result and completion_status \
+             (prove+apply has not recorded the §7.5 surface; resume cannot publish \
+             or complete without re-running finalise)"
+                .to_string(),
+        ),
+        (Some(_), None) => Err(
+            "completion readiness: completion_result present without completion_status \
+             (incomplete capability field set)"
+                .to_string(),
+        ),
+        (None, Some(_)) => Err(
+            "completion readiness: completion_status present without completion_result \
+             (incomplete capability field set)"
+                .to_string(),
+        ),
+    }
 }
 
 /// Per-job map of staged v1.1 sign material. Keyed by job `public_id`.
@@ -335,24 +452,28 @@ pub const FINALISATION_BODY_KEY: &str = "finalisation";
 pub const PENDING_SIGN_BODY_KEY: &str = "pending_sign";
 
 /// Durable job-row envelope: one record containing everything needed to
-/// resume finalise after a true process restart.
+/// resume the **whole path to completion** after a true process restart.
 ///
-/// ## Contents (derived from what finalise + job completion depend on)
+/// ## Contents (derived from what each step depends on, including handed-in values)
 ///
 /// | Field | Source | Why |
 /// |-------|--------|-----|
-/// | `capability` ([`FinalisationCapability`]) | engine / `begin_*` + `/sign` | full pending witness + optional accepted signature — prove and apply |
+/// | `capability` ([`FinalisationCapability`]) | engine / `begin_*` + `/sign` | full pending witness + optional accepted signature — **prove and apply** |
 /// | `network` | process claim at stage | BIP-340 `m_state` for `/sign` re-verify after rehydrate |
-/// | `publisher_pubkey` | original transition request | §7.5 completed `result` field (caller-supplied) |
+/// | `publisher_pubkey` | original transition request (handed in) | §7.5 completed `result` field |
+/// | `completion_result` | after successful prove+apply | §7.5 JSON published onto the job row — **publication** |
+/// | `completion_status` | paired with result (200) | `JobStore::complete` argument — **job completion** |
 ///
 /// Live engine tip / CoinHist / NfLog are **not** stored: apply re-validates
-/// them. Resume is therefore reading this record and proceeding.
+/// them. Once `completion_result` is present, resume skips re-apply and
+/// only publishes + completes — so a crash after apply cannot strand a job
+/// that resume cannot finish.
 ///
 /// ## Wire encoding
 ///
 /// `capability` is **bincode → lowercase hex** so large `ComplianceProof`s
-/// stay off the JSON tree while remaining a single opaque blob. Network and
-/// publisher stay as plain JSON fields for operators reading the row.
+/// stay off the JSON tree while remaining a single opaque blob. Network,
+/// publisher, and completion stay as plain JSON fields for operators.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DurableFinalisationPersist {
     pub network: String,
@@ -360,10 +481,40 @@ pub struct DurableFinalisationPersist {
     pub capability_bincode_hex: String,
     /// Lowercase hex of the external publisher, when the request carried one.
     pub publisher_pubkey: Option<String>,
+    /// §7.5 result object after prove+apply; absent until that step succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_result: Option<serde_json::Value>,
+    /// HTTP status for job complete; present iff `completion_result` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_status: Option<i16>,
 }
 
 impl DurableFinalisationPersist {
     pub fn from_entry(entry: &PendingSignEntry) -> Result<Self, String> {
+        // Fail closed on split completion fields before persisting.
+        match (&entry.completion_result, entry.completion_status) {
+            (None, None) => {}
+            (Some(r), Some(s)) => {
+                if !r.is_object() {
+                    return Err(
+                        "DurableFinalisationPersist: completion_result must be a JSON object"
+                            .to_string(),
+                    );
+                }
+                if s != 200 {
+                    return Err(format!(
+                        "DurableFinalisationPersist: completion_status must be 200; got {s}"
+                    ));
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(
+                    "DurableFinalisationPersist: completion_result and completion_status \
+                     must both be set or both be absent (incomplete capability)"
+                        .to_string(),
+                );
+            }
+        }
         let capability = entry.capability();
         let bytes = bincode::serialize(&capability)
             .map_err(|e| format!("bincode serialize FinalisationCapability: {e}"))?;
@@ -371,6 +522,8 @@ impl DurableFinalisationPersist {
             network: network_label(entry.network).to_string(),
             capability_bincode_hex: hex_lower(&bytes),
             publisher_pubkey: entry.publisher_pubkey.as_ref().map(|pk| hex_lower(pk)),
+            completion_result: entry.completion_result.clone(),
+            completion_status: entry.completion_status,
         })
     }
 
@@ -384,6 +537,13 @@ impl DurableFinalisationPersist {
                 ),
             )
         })?;
+        if self.capability_bincode_hex.is_empty() {
+            return Err(TransitionSignatureError::new(
+                SignatureCheck::PendingEnvelope,
+                "persisted finalisation capability_bincode_hex is missing/empty \
+                 (incomplete capability)",
+            ));
+        }
         if self
             .capability_bincode_hex
             .bytes()
@@ -438,11 +598,50 @@ impl DurableFinalisationPersist {
                 Some(arr)
             }
         };
+        // Completion fields must arrive as a pair — incomplete splits fail loud.
+        let (completion_result, completion_status) =
+            match (self.completion_result, self.completion_status) {
+                (None, None) => (None, None),
+                (Some(r), Some(s)) => {
+                    if !r.is_object() {
+                        return Err(TransitionSignatureError::new(
+                            SignatureCheck::PendingEnvelope,
+                            "persisted completion_result must be a JSON object",
+                        ));
+                    }
+                    if s != 200 {
+                        return Err(TransitionSignatureError::new(
+                            SignatureCheck::PendingEnvelope,
+                            format!(
+                                "persisted completion_status must be 200; got {s} \
+                                 (incomplete/invalid capability)"
+                            ),
+                        ));
+                    }
+                    (Some(r), Some(s))
+                }
+                (Some(_), None) => {
+                    return Err(TransitionSignatureError::new(
+                        SignatureCheck::PendingEnvelope,
+                        "persisted completion_result without completion_status \
+                         (incomplete capability)",
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(TransitionSignatureError::new(
+                        SignatureCheck::PendingEnvelope,
+                        "persisted completion_status without completion_result \
+                         (incomplete capability)",
+                    ));
+                }
+            };
         Ok(PendingSignEntry {
             pending: capability.pending().clone(),
             network,
             signature: capability.signature().cloned(),
             publisher_pubkey,
+            completion_result,
+            completion_status,
         })
     }
 }
@@ -2026,8 +2225,11 @@ mod tests {
             &submission,
         )
         .expect("rehydrated pending must still verify the wallet signature");
-        // Rehydrated capability is finalise-ready by construction.
-        ensure_finalise_ready(&rehydrated).expect("durable rehydrate is finalise-ready");
+        // Unsigned rehydrate is not finalise-ready (signature required).
+        assert!(
+            ensure_finalise_ready(&rehydrated).is_err(),
+            "unsigned durable capability must not be finalise-ready"
+        );
     }
 
     #[test]
@@ -2048,6 +2250,58 @@ mod tests {
             "signature must survive durable round-trip"
         );
         ensure_finalise_ready(&rehydrated).expect("signed rehydrate is finalise-ready");
+        // Completion surface still absent until prove+apply records it.
+        assert!(
+            ensure_completion_ready(&rehydrated).is_err(),
+            "signed-only capability is not completion-ready"
+        );
+    }
+
+    #[test]
+    fn completion_surface_round_trips_and_is_completion_ready() {
+        let (mut entry, submission) = test_fixtures::v5_mainnet_entry_and_submission();
+        let accepted = accept_wallet_transition_signature(
+            V11ShadowMode::On,
+            entry.network,
+            &entry.pending,
+            &submission,
+        )
+        .expect("accept");
+        entry.install_signature(accepted).expect("install");
+        let outcome = FinaliseOutcome::from_pending_proof_data_with_publisher(
+            &entry.pending,
+            entry.publisher_pubkey,
+        );
+        entry
+            .install_completion(outcome.to_result_json(), 200)
+            .expect("install completion");
+        let persist = DurableFinalisationPersist::from_entry(&entry).expect("encode");
+        let rehydrated = persist.into_entry().expect("into_entry");
+        ensure_completion_ready(&rehydrated).expect("full capability is completion-ready");
+        assert!(rehydrated.has_completion());
+    }
+
+    #[test]
+    fn incomplete_capability_missing_completion_status_refuses_rehydrate() {
+        let (mut entry, submission) = test_fixtures::v5_mainnet_entry_and_submission();
+        let accepted = accept_wallet_transition_signature(
+            V11ShadowMode::On,
+            entry.network,
+            &entry.pending,
+            &submission,
+        )
+        .expect("accept");
+        entry.install_signature(accepted).expect("install");
+        let mut persist = DurableFinalisationPersist::from_entry(&entry).expect("encode");
+        persist.completion_result = Some(serde_json::json!({ "new_account_state_hash": "00" }));
+        // completion_status deliberately omitted → incomplete pair.
+        let err = persist.into_entry().expect_err("split completion must refuse");
+        assert_eq!(err.check, SignatureCheck::PendingEnvelope);
+        assert!(
+            err.message.contains("incomplete"),
+            "err={}",
+            err.message
+        );
     }
 
     #[test]

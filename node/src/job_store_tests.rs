@@ -482,6 +482,57 @@ async fn fail_atomically_strips_pending_sign_envelope() {
 }
 
 #[tokio::test]
+async fn claim_finalise_exclusive_only_one_winner_from_awaiting_signature() {
+    let (store, _c) = setup_store().await;
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xCA),
+            Some("k-claim-exclusive"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    store
+        .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+
+    let a = store.claim_finalise_exclusive(job_id).await.expect("claim a");
+    let b = store.claim_finalise_exclusive(job_id).await.expect("claim b");
+    assert_eq!(a, FinaliseClaim::Won, "first claim must win");
+    assert!(
+        matches!(
+            b,
+            FinaliseClaim::Lost {
+                observed: JobStatus::Broadcasting
+            }
+        ),
+        "second claim must lose with observed broadcasting; got {b:?}"
+    );
+    let row = store.load(job_id).await.expect("load").expect("row");
+    assert_eq!(row.status, JobStatus::Broadcasting);
+    assert_eq!(row.phase, FINALISE_CLAIM_PHASE);
+
+    // Boot releases the dead owner's claim so a single resumer can re-acquire.
+    assert!(store
+        .release_stale_finalise_claim(job_id)
+        .await
+        .expect("release"));
+    let c = store.claim_finalise_exclusive(job_id).await.expect("claim c");
+    assert_eq!(c, FinaliseClaim::Won, "after release, claim must win again");
+    let d = store.claim_finalise_exclusive(job_id).await.expect("claim d");
+    assert!(
+        matches!(d, FinaliseClaim::Lost { .. }),
+        "second after re-claim must lose; got {d:?}"
+    );
+}
+
+#[tokio::test]
 async fn cancel_from_broadcasting_returns_false_and_leaves_status_untouched() {
     // Nullifier is in flight / published — cancel must refuse.
     let (store, _c) = setup_store().await;
