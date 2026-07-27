@@ -51,11 +51,15 @@
 //! rather than short-circuited to a status change.
 //!
 //! ## Gap G7 — re-mint into existing asset accounts
-//! [`mint`] exposes the flag-gated entry for token-standard-1 re-issuance
-//! via [`StateEngine::begin_mint`](zkcoins_prover::state_engine::StateEngine::begin_mint)
-//! (AccountUpdateProof + `asset_issuance`). Token-standard-2 re-mint and
-//! over-cap mints are refused naming §6.5 clauses (f)/(e). Legacy
-//! `prepare_mint` remint refusal is unchanged with the flag off.
+//! [`mint`] exposes the process-claim-gated entry for token-standard-1
+//! re-issuance via
+//! [`StateEngine::begin_mint`](zkcoins_prover::state_engine::StateEngine::begin_mint)
+//! (AccountUpdateProof + `asset_issuance`). The gate is the boot-time
+//! [`ScanStackMode::V11`] process claim (from `ZKCOINS_V11_SHADOW=1`) —
+//! same registry as publisher / NfLog policy — not a caller-selected mode
+//! label. Token-standard-2 re-mint and over-cap mints are refused naming
+//! §6.5 clauses (f)/(e). Legacy `prepare_mint` remint refusal is
+//! unchanged with the flag off.
 
 mod adapter;
 pub mod db_v11;

@@ -1,0 +1,11 @@
+error[E0603]: function `engine_begin_mint` is private
+ --> tests/ui/v11_mint_engine_sink_unobtainable.rs:7:30
+  |
+7 |     let _ = node::v11::mint::engine_begin_mint;
+  |                              ^^^^^^^^^^^^^^^^^ private function
+  |
+note: the function `engine_begin_mint` is defined here
+ --> src/v11/mint.rs
+  |
+  | fn engine_begin_mint(engine: &StateEngine, req: MintRequest) -> Result<PendingTransition> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
