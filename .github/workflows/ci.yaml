@@ -205,7 +205,7 @@ jobs:
     if: >-
       (github.event_name == 'push' || github.event.pull_request.draft == false)
       && contains(github.event.pull_request.labels.*.name, 'ci:full')
-    runs-on: [self-hosted, m3-ultra]
+    runs-on: [self-hosted, zkcoins-node]
     timeout-minutes: 120
     env:
       # All three chain-shaping env vars are required by the node
@@ -274,12 +274,25 @@ jobs:
       - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # Point `testcontainers` at the Colima socket under the runner
-      # user's home (see the `DOCKER_HOST` comment in the job env block
-      # above). Set in a step so the path resolves from `$HOME` at
-      # runtime instead of being hard-coded.
-      - name: Set DOCKER_HOST for Colima socket
-        run: echo "DOCKER_HOST=unix://$HOME/.colima/default/docker.sock" >> "$GITHUB_ENV"
+      # The `testcontainers` workload runs in a dedicated, resource-
+      # capped Colima profile (`ci`) instead of the host's default
+      # Docker profile. Runner hosts may share their default profile
+      # with unrelated workloads; a separate profile guarantees the
+      # CI Postgres containers can never contend with (or be starved
+      # by) anything else on the host. The profile is created once per
+      # host (see the runner provisioning docs); this step only boots
+      # it if it is not already running. `--activate=false` keeps the
+      # host's global Docker context untouched — the job talks to the
+      # profile exclusively via the explicit DOCKER_HOST below.
+      - name: Ensure dedicated CI Docker profile is running
+        run: colima status ci >/dev/null 2>&1 || colima start ci --activate=false
+
+      # Point `testcontainers` at the `ci` profile's socket (see the
+      # `DOCKER_HOST` comment in the job env block above). Set in a
+      # step so the path resolves from `$HOME` at runtime instead of
+      # being hard-coded.
+      - name: Set DOCKER_HOST for CI Colima profile socket
+        run: echo "DOCKER_HOST=unix://$HOME/.colima/ci/docker.sock" >> "$GITHUB_ENV"
 
       # `sccache` (compile cache) and `cargo-nextest` (test runner)
       # are installed once per runner via Homebrew. Idempotent: no-op

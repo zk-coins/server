@@ -155,7 +155,7 @@ jobs:
   api-e2e:
     name: API E2E against DEV
     needs: build-and-deploy
-    runs-on: [self-hosted, m3-ultra]
+    runs-on: [self-hosted, zkcoins-node]
     timeout-minutes: 30
     env:
       RUSTC_WRAPPER: sccache

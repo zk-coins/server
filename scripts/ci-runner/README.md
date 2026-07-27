@@ -96,7 +96,7 @@ ssh "$RUNNER_HOST" "bash -lc '
     --url https://github.com/zk-coins/node \
     --token ${RUNNER_TOKEN} \
     --name \"\$(hostname -s)\" \
-    --labels self-hosted,macOS,ARM64,m3-ultra,zkcoins-prover \
+    --labels self-hosted,macOS,ARM64,zkcoins-node \
     --work _work \
     --replace
 '"
@@ -155,7 +155,7 @@ ssh "$RUNNER_HOST" "bash -lc '
     --url https://github.com/zk-coins/node \
     --token ${TOKEN} \
     --name \"${NEW_NAME}\" \
-    --labels self-hosted,macOS,ARM64,m3-ultra,zkcoins-prover \
+    --labels self-hosted,macOS,ARM64,zkcoins-node \
     --work _work \
     --replace
   ./svc.sh install
@@ -227,9 +227,9 @@ gh api repos/zk-coins/node/actions/runners \
   | jq '.runners | sort_by(.name) | map({name, status, busy, labels: [.labels[].name]})'
 ```
 
-Healthy pool: 6 entries, every one reports `"status": "online"` and
-carries the labels `self-hosted, macOS, ARM64, m3-ultra,
-zkcoins-prover`.
+Healthy pool: 2 entries, every one reports `"status": "online"` and
+carries the labels `self-hosted, macOS, ARM64,
+zkcoins-node`.
 
 ## Activating the CI jobs (historical — done)
 
