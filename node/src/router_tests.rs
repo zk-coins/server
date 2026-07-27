@@ -3722,26 +3722,39 @@ mod jobs_endpoint_tests {
     }
 
     /// Durable finalisation rehydrate carries a full capability (not a
-    /// verification-grade partial). Resume can finalise from the bytes alone.
+    /// verification-grade partial). Signed resume is finalise-ready; completion
+    /// still needs the post-apply surface.
     #[tokio::test]
     async fn rehydrated_durable_finalisation_is_finalise_ready() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, ensure_finalise_ready, set_process_stack_mode,
-            DurableFinalisationPersist, ScanStackMode,
+            clear_process_stack_mode_for_test, ensure_completion_ready, ensure_finalise_ready,
+            set_process_stack_mode, DurableFinalisationPersist, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
         clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
-        let (entry, _) =
+        let (mut entry, submission) =
             crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let accepted = crate::v11::accept_wallet_transition_signature(
+            crate::v11::V11ShadowMode::On,
+            entry.network,
+            &entry.pending,
+            &submission,
+        )
+        .expect("verify");
+        entry.install_signature(accepted).expect("install");
         let rehydrated = DurableFinalisationPersist::from_entry(&entry)
             .expect("encode")
             .into_entry()
             .expect("rehydrate");
-        ensure_finalise_ready(&rehydrated).expect("durable rehydrate is finalise-ready");
-        ensure_finalise_ready(&entry).expect("live-staged is finalise-ready");
+        ensure_finalise_ready(&rehydrated).expect("signed durable rehydrate is finalise-ready");
+        ensure_finalise_ready(&entry).expect("live-staged signed is finalise-ready");
+        assert!(
+            ensure_completion_ready(&rehydrated).is_err(),
+            "signed-only capability is not completion-ready without completion_result"
+        );
 
         clear_process_stack_mode_for_test();
     }
@@ -4298,40 +4311,26 @@ mod jobs_endpoint_tests {
         clear_process_stack_mode_for_test();
     }
 
-    /// True fresh-state boot: drive a signed durable capability to completion
-    /// with **no** in-memory carry-over. After planting durable bytes on the
-    /// job row, every process map is cleared (pending, notify, live-begin)
-    /// before resume — the same empty-map shape a restarted node builds.
-    #[tokio::test]
-    async fn fresh_state_boot_drives_durable_finalisation_to_completion() {
-        use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, FinaliseOutcome,
-            ScanStackMode,
-        };
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::Duration;
-
-        let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
-        set_process_stack_mode(ScanStackMode::V11);
-
-        let finalise_called = Arc::new(AtomicBool::new(false));
-        let finalise_called_hook = Arc::clone(&finalise_called);
-        let (mut state, pool, _scope) = jobs_test_state().await;
-
-        let result = state
-            .job_store
+    /// Helper: plant a signed durable capability (optionally with completion
+    /// surface) on a fresh send job at `awaiting_signature`.
+    async fn plant_signed_finalisation_job(
+        store: &crate::job_store::JobStore,
+        owner_tag: u8,
+        idem: &str,
+        with_completion: bool,
+    ) -> (uuid::Uuid, crate::v11::PendingSignEntry) {
+        let result = store
             .create(
                 crate::job_store::JobKind::Send,
-                &[0xD5u8; 32],
-                Some("k-fresh-boot"),
+                &[owner_tag; 32],
+                Some(idem),
                 serde_json::json!({}),
             )
             .await
             .expect("create");
         let job_id = match result {
             crate::job_store::CreateResult::Fresh(j) => j.public_id,
-            _ => panic!(),
+            _ => panic!("expected fresh job"),
         };
 
         let (mut entry, submission) =
@@ -4345,6 +4344,15 @@ mod jobs_endpoint_tests {
         )
         .expect("verify");
         entry.install_signature(accepted).expect("install");
+        if with_completion {
+            let outcome = crate::v11::FinaliseOutcome::from_pending_proof_data_with_publisher(
+                &entry.pending,
+                entry.publisher_pubkey,
+            );
+            entry
+                .install_completion(outcome.to_result_json(), 200)
+                .expect("install completion");
+        }
         let persist = crate::v11::DurableFinalisationPersist::from_entry(&entry).expect("encode");
         let mut body = serde_json::json!({});
         body.as_object_mut().unwrap().insert(
@@ -4354,17 +4362,16 @@ mod jobs_endpoint_tests {
         sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
             .bind(&body)
             .bind(job_id)
-            .execute(pool.as_ref())
+            .execute(store.pool())
             .await
             .expect("persist durable finalisation");
-        state
-            .job_store
+        store
             .set_awaiting_signature(job_id, 1, advertised)
             .await
             .expect("awaiting_signature");
-        // set_awaiting_signature does not clear request_body; re-assert durable
-        // bytes so the row alone is sufficient for resume.
-        let row = state.job_store.load(job_id).await.expect("load").expect("row");
+        // Re-plant after status flip (set_awaiting_signature does not clear
+        // request_body keys we need, but keep the durable blob authoritative).
+        let row = store.load(job_id).await.expect("load").expect("row");
         let mut body = row.request_body;
         body.as_object_mut().unwrap().insert(
             crate::v11::FINALISATION_BODY_KEY.to_string(),
@@ -4373,23 +4380,84 @@ mod jobs_endpoint_tests {
         sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
             .bind(&body)
             .bind(job_id)
-            .execute(pool.as_ref())
+            .execute(store.pool())
             .await
             .expect("replant durable");
+        (job_id, entry)
+    }
 
-        // Genuinely fresh process state: empty maps + cold finalise hook.
-        // Production boot constructs empty DashMaps the same way.
-        state.pending_sign_map.clear();
-        state.job_notify_map.clear();
-        state.v11_live_pending_after_begin.clear();
-        state.v11_finalise = Some(Arc::new(move |pending, _sig| {
-            finalise_called_hook.store(true, Ordering::SeqCst);
-            Ok(FinaliseOutcome::from_pending_proof_data(&pending))
-        }));
-        assert!(
-            state.pending_sign_map.is_empty() && state.job_notify_map.is_empty(),
-            "fresh-state boot must start with empty process maps"
-        );
+    /// Build a **genuinely fresh** AppState from the pool (new Arcs, empty
+    /// maps, `v11_finalise = None`) — the shape production boot constructs,
+    /// not a warm state with maps cleared.
+    fn fresh_app_state_from_pool(pool: Arc<sqlx::PgPool>) -> AppState {
+        let state = Arc::new(Mutex::new(State::new()));
+        let account_node = AccountNode::new(Arc::clone(&state));
+        let proofs_dir = tempfile::tempdir().expect("proofs tempdir").keep();
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8);
+        std::mem::forget(rx);
+        AppState {
+            account_node: Arc::new(Mutex::new(account_node)),
+            proof_store: Arc::new(ProofStore::new(
+                proofs_dir.to_str().expect("utf-8"),
+            )),
+            mint_store: Arc::new(crate::router::MintStore::new()),
+            username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
+            pool: Arc::clone(&pool),
+            esplora_config: Arc::new(crate::publisher::EsploraConfig {
+                url: "http://127.0.0.1:1/api".to_string(),
+                is_mainnet: false,
+                network_name: "Mutinynet".to_string(),
+                ws_url: None,
+            }),
+            prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            prover_health: Arc::new(crate::prover_health::ProverHealth::new()),
+            job_store: Arc::new(crate::job_store::JobStore::new((*pool).clone())),
+            job_tx: tx,
+            job_notify_map: Arc::new(dashmap::DashMap::new()),
+            v11_scan_caught_up: None,
+            v11_finality_ok: None,
+            pending_sign_map: Arc::new(dashmap::DashMap::new()),
+            // Production cold path: no injected hook. Completion must come
+            // from the durable capability alone (or a real EngineAdapter).
+            v11_finalise: None,
+            v11_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
+            v11_pending_after_prove: None,
+        }
+    }
+
+    /// Cold boot: fresh `AppState` (new construction, not map-clear), **no**
+    /// injected finalise hook, production resume path, driven only by DB
+    /// bytes that already carry the completion surface (crash after apply).
+    ///
+    /// A true production `AppState` also wires `v11_finalise` from an
+    /// `EngineAdapter` when the v1.1 stack is claimed — that needs env pins
+    /// and a multi-minute prove, which this unit test does not run. What
+    /// this locks down is capability completeness for publish+complete:
+    /// resume finishes from durable fields alone without warm maps or a
+    /// hook. Missing any of those fields fails (see incomplete test).
+    #[tokio::test]
+    async fn cold_fresh_appstate_drives_completion_from_durable_capability_alone() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        };
+        use std::time::Duration;
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
+        // Plant durable bytes with a store bound only to the pool.
+        let plant_store = crate::job_store::JobStore::new((*pool).clone());
+        let (job_id, _entry) =
+            plant_signed_finalisation_job(&plant_store, 0xD5, "k-cold-fresh", true).await;
+
+        // Genuinely fresh AppState — new Arcs, empty maps, no hook.
+        let state = fresh_app_state_from_pool(Arc::clone(&pool));
+        assert!(state.v11_finalise.is_none(), "cold test must not inject a hook");
+        assert!(state.pending_sign_map.is_empty());
+        assert!(state.job_notify_map.is_empty());
 
         crate::job_dispatcher::process_envelope_for_test(
             &state.job_store,
@@ -4399,28 +4467,211 @@ mod jobs_endpoint_tests {
             crate::job_dispatcher::JobEnvelope { public_id: job_id },
         )
         .await
-        .expect("fresh-state boot process");
+        .expect("cold resume process");
 
+        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(
+            after.status,
+            crate::job_store::JobStatus::Completed,
+            "cold resume must complete from durable completion_result; status={:?} err={:?}",
+            after.status,
+            after.error
+        );
+        assert!(after.request_body.get(crate::v11::FINALISATION_BODY_KEY).is_none());
+        assert!(after.response_body.is_some());
+        let result = after.response_body.as_ref().unwrap();
+        assert!(result.get("new_account_state_hash").is_some());
+
+        clear_process_stack_mode_for_test();
+        drop(scope);
+    }
+
+    /// Incomplete capability (signed, no completion surface, no hook): resume
+    /// must **fail** rather than silently half-finish at broadcasting.
+    #[tokio::test]
+    async fn incomplete_capability_without_completion_fails_resume() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        };
+        use std::time::Duration;
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
+        let plant_store = crate::job_store::JobStore::new((*pool).clone());
+        // Signed but no completion_result — prove+apply never recorded.
+        let (job_id, _) =
+            plant_signed_finalisation_job(&plant_store, 0xD7, "k-incomplete", false).await;
+
+        let state = fresh_app_state_from_pool(Arc::clone(&pool));
+        assert!(state.v11_finalise.is_none());
+
+        crate::job_dispatcher::process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            crate::job_dispatcher::JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("process returns Ok after fail_v11");
+
+        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(
+            after.status,
+            crate::job_store::JobStatus::Failed,
+            "incomplete capability must fail, not complete or stick at broadcasting; \
+             status={:?} err={:?}",
+            after.status,
+            after.error
+        );
+        let err = after.error.as_deref().unwrap_or("");
         assert!(
-            finalise_called.load(Ordering::SeqCst),
-            "fresh-state boot must drive finalise from durable capability alone"
+            err.contains("completion_result")
+                || err.contains("incomplete")
+                || err.contains("no finalise driver"),
+            "error must name the missing capability path; got: {err}"
+        );
+        // Must not reach completed: response_status stays unset (awaiting_signature
+        // may still hold the wallet advertisement in response_body — that is not
+        // a terminal success publish).
+        assert!(
+            after.response_status.is_none(),
+            "must not publish a completed HTTP status; got {:?}",
+            after.response_status
+        );
+        assert!(
+            after.completed_at.is_some(),
+            "failed terminal must stamp completed_at"
+        );
+        // Durable envelope stripped on fail — cannot be half-finished and resumed.
+        assert!(
+            after
+                .request_body
+                .get(crate::v11::FINALISATION_BODY_KEY)
+                .is_none(),
+            "fail must strip finalisation envelope: {:?}",
+            after.request_body
+        );
+
+        clear_process_stack_mode_for_test();
+        drop(scope);
+    }
+
+    /// Two concurrent resumers race on `awaiting_signature`: exactly one wins
+    /// the exclusive broadcasting claim and runs side effects; the loser
+    /// observes the loss and does not continue.
+    #[tokio::test]
+    async fn concurrent_resumers_exactly_one_wins_exclusive_claim() {
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, FinaliseOutcome,
+            ScanStackMode,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let _stack_guard = lock_v11_stack_for_test();
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let hook_count = Arc::new(AtomicUsize::new(0));
+        let hook_count_h = Arc::clone(&hook_count);
+        // Gate: both tasks reach the claim, then proceed together.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let (mut state, pool, _scope) = jobs_test_state().await;
+        let (job_id, _) = plant_signed_finalisation_job(
+            &state.job_store,
+            0xE0,
+            "k-race-claim",
+            false,
+        )
+        .await;
+
+        let barrier_in_hook = Arc::clone(&barrier);
+        state.v11_finalise = Some(Arc::new(move |pending, _sig| {
+            // Count only after the exclusive claim (hook runs post-claim).
+            hook_count_h.fetch_add(1, Ordering::SeqCst);
+            // Hold the winner briefly so the loser can attempt the CAS.
+            let _ = barrier_in_hook;
+            Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+        }));
+
+        let store = state.job_store.clone();
+        let notify = state.job_notify_map.clone();
+        let state_a = state.clone();
+        let state_b = state.clone();
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+
+        let j1 = tokio::spawn(async move {
+            b1.wait().await;
+            crate::job_dispatcher::process_envelope_for_test(
+                &store,
+                &state_a,
+                &notify,
+                Duration::from_secs(30),
+                crate::job_dispatcher::JobEnvelope { public_id: job_id },
+            )
+            .await
+        });
+        let store2 = state.job_store.clone();
+        let notify2 = state.job_notify_map.clone();
+        let j2 = tokio::spawn(async move {
+            b2.wait().await;
+            crate::job_dispatcher::process_envelope_for_test(
+                &store2,
+                &state_b,
+                &notify2,
+                Duration::from_secs(30),
+                crate::job_dispatcher::JobEnvelope { public_id: job_id },
+            )
+            .await
+        });
+
+        let (r1, r2) = tokio::join!(j1, j2);
+        r1.expect("join1").expect("process1");
+        r2.expect("join2").expect("process2");
+
+        assert_eq!(
+            hook_count.load(Ordering::SeqCst),
+            1,
+            "exactly one resumer must run the finalise hook (exclusive claim)"
         );
         let after = state.job_store.load(job_id).await.expect("load").expect("row");
         assert_eq!(
             after.status,
             crate::job_store::JobStatus::Completed,
-            "job must reach completed; status={:?} err={:?}",
+            "winner must complete the job; status={:?} err={:?}",
             after.status,
             after.error
         );
-        assert!(after.request_body.get(crate::v11::FINALISATION_BODY_KEY).is_none());
-        assert!(after.request_body.get("sign").is_none());
+
+        // Direct claim API: a third attempt against a terminal job loses.
+        let claim = state
+            .job_store
+            .claim_finalise_exclusive(job_id)
+            .await
+            .expect("claim");
+        assert!(
+            matches!(
+                claim,
+                crate::job_store::FinaliseClaim::Lost {
+                    observed: crate::job_store::JobStatus::Completed
+                }
+            ),
+            "claim after complete must be Lost; got {claim:?}"
+        );
 
         clear_process_stack_mode_for_test();
+        drop(pool);
     }
 
-    /// Resuming finalise twice is harmless: second attempt is a status-guarded
-    /// no-op (job already completed; no double-credit / double-complete).
+    /// Resuming finalise twice is harmless: second attempt is claim-lost or
+    /// terminal no-op (job already completed; no double-credit / double-complete).
     #[tokio::test]
     async fn resume_finalise_twice_is_harmless() {
         use crate::v11::{
@@ -4443,62 +4694,8 @@ mod jobs_endpoint_tests {
             Ok(FinaliseOutcome::from_pending_proof_data(&pending))
         }));
 
-        let result = state
-            .job_store
-            .create(
-                crate::job_store::JobKind::Send,
-                &[0xE1u8; 32],
-                Some("k-resume-twice"),
-                serde_json::json!({}),
-            )
-            .await
-            .expect("create");
-        let job_id = match result {
-            crate::job_store::CreateResult::Fresh(j) => j.public_id,
-            _ => panic!(),
-        };
-
-        let (mut entry, submission) =
-            crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
-        let advertised = crate::v11::awaiting_signature_result_json(&entry);
-        let accepted = crate::v11::accept_wallet_transition_signature(
-            crate::v11::V11ShadowMode::On,
-            entry.network,
-            &entry.pending,
-            &submission,
-        )
-        .expect("verify");
-        entry.install_signature(accepted).expect("install");
-        let persist = crate::v11::DurableFinalisationPersist::from_entry(&entry).expect("encode");
-        let mut body = serde_json::json!({});
-        body.as_object_mut().unwrap().insert(
-            crate::v11::FINALISATION_BODY_KEY.to_string(),
-            serde_json::to_value(&persist).unwrap(),
-        );
-        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
-            .bind(&body)
-            .bind(job_id)
-            .execute(state.job_store.pool())
-            .await
-            .expect("persist");
-        state
-            .job_store
-            .set_awaiting_signature(job_id, 1, advertised)
-            .await
-            .expect("awaiting_signature");
-        // Durable body after status flip.
-        let row = state.job_store.load(job_id).await.expect("load").expect("row");
-        let mut body = row.request_body;
-        body.as_object_mut().unwrap().insert(
-            crate::v11::FINALISATION_BODY_KEY.to_string(),
-            serde_json::to_value(&persist).unwrap(),
-        );
-        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
-            .bind(&body)
-            .bind(job_id)
-            .execute(state.job_store.pool())
-            .await
-            .expect("replant");
+        let (job_id, _) =
+            plant_signed_finalisation_job(&state.job_store, 0xE1, "k-resume-twice", false).await;
 
         state.pending_sign_map.clear();
         state.job_notify_map.clear();

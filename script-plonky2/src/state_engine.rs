@@ -196,16 +196,19 @@ pub struct PendingTransition {
     pub nav_opening: NavOpening,
 }
 
-/// Durable, engine-owned finalisation capability.
+/// Durable, engine-owned finalisation capability for **prove + apply**.
 ///
 /// Contains **everything** [`StateEngine::finalise`] /
 /// [`StateEngine::prove_pending_transition_detached`] +
-/// [`StateEngine::apply_proved_transition`] need from the host side, so a
-/// restarted process resumes by loading this record and proceeding — not by
-/// reassembling a partial witness from several host envelopes and hoping the
-/// pieces agree.
+/// [`StateEngine::apply_proved_transition`] need from the host side.
 ///
-/// ## Contents (derived from what finalise depends on)
+/// Host-side publication of the §7.5 job result and job completion carry
+/// additional durable fields on the node envelope (`completion_result` /
+/// `completion_status` / `publisher_pubkey`) — derived the same way, from
+/// what those steps depend on including handed-in values. This engine type
+/// deliberately stops at prove/apply; the node composes the full path.
+///
+/// ## Contents (derived from what prove/apply depends on)
 ///
 /// | Field | Why it is here |
 /// |-------|----------------|
@@ -218,11 +221,11 @@ pub struct PendingTransition {
 ///
 /// ## Idempotency of consumers
 ///
-/// This type is pure data. Callers make resume safe with a **status guard**
-/// (only finalise while the job is non-terminal / in the expected phase) and
-/// by treating a second `finalise` after a successful apply as a job-level
-/// no-op (account already advanced; do not re-credit). The engine itself
-/// fails loud on a second apply against a moved account head.
+/// This type is pure data. Callers make resume safe with an **exclusive
+/// status claim** (only one resumer may enter finalise) and by persisting
+/// the completion surface after apply so a second resume publishes and
+/// completes without re-applying. The engine itself fails loud on a second
+/// apply against a moved account head.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FinalisationCapability {
     pending: PendingTransition,

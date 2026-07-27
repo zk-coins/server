@@ -37,6 +37,26 @@ pub enum JobStatus {
     Cancelled,
 }
 
+/// Result of an exclusive finalise claim on a job row.
+///
+/// `broadcasting` is not a permission label ("you may run the hook") — it is
+/// an exclusive claim that exactly one resumer may hold. A loser must observe
+/// [`FinaliseClaim::Lost`] and stop; continuing would double-apply /
+/// double-complete side effects that status alone does not make idempotent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinaliseClaim {
+    /// This caller won the CAS and owns finalise for the job.
+    Won,
+    /// Another resumer holds (or held) the claim, or the job moved on.
+    /// `observed` is the status after the failed CAS — never invent success.
+    Lost { observed: JobStatus },
+}
+
+/// Phase string written when a resumer wins [`JobStore::claim_finalise_exclusive`].
+/// Distinct from free-form `"publishing"` / `"broadcasting"` so a second
+/// concurrent claim against an already-claimed row fails the CAS.
+pub const FINALISE_CLAIM_PHASE: &str = "finalise_claimed";
+
 impl JobStatus {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -496,6 +516,86 @@ impl JobStore {
         .bind(phase)
         .bind(public_id)
         .bind(from.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Exclusive claim of a job for v1.1 finalise (prove → apply → publish
+    /// result → complete).
+    ///
+    /// `broadcasting` is a **claim**, not a permission label: exactly one
+    /// resumer may win. Two concurrent readers of `awaiting_signature` both
+    /// attempt this CAS; only one sees [`FinaliseClaim::Won`].
+    ///
+    /// | Prior status / phase | Outcome |
+    /// |---------------------|---------|
+    /// | `awaiting_signature` | CAS → `broadcasting` + [`FINALISE_CLAIM_PHASE`]; winner gets [`FinaliseClaim::Won`] |
+    /// | `broadcasting` + unclaimed phase (`publishing` / `broadcasting`) | CAS phase → [`FINALISE_CLAIM_PHASE`]; winner gets [`FinaliseClaim::Won`] |
+    /// | `broadcasting` + already [`FINALISE_CLAIM_PHASE`] | [`FinaliseClaim::Lost`] — another resumer owns the claim |
+    /// | terminal / other | [`FinaliseClaim::Lost`] with the observed status |
+    ///
+    /// Crash recovery: boot must call [`Self::release_stale_finalise_claim`]
+    /// before re-enqueue so a dead owner's `finalise_claimed` phase becomes
+    /// reclaimable. A live concurrent loser **must not** continue into
+    /// side-effectful finalise — a second broadcast is not made harmless by
+    /// the first also having happened.
+    pub async fn claim_finalise_exclusive(
+        &self,
+        public_id: Uuid,
+    ) -> sqlx::Result<FinaliseClaim> {
+        // Path A: fresh claim from awaiting_signature.
+        let advanced = self
+            .set_status_if(
+                public_id,
+                JobStatus::AwaitingSignature,
+                JobStatus::Broadcasting,
+                FINALISE_CLAIM_PHASE,
+            )
+            .await?;
+        if advanced {
+            return Ok(FinaliseClaim::Won);
+        }
+
+        // Path B: crash-resume while already broadcasting with an unclaimed
+        // phase. Rows still at FINALISE_CLAIM_PHASE are owned — refuse.
+        let result = sqlx::query(
+            "UPDATE jobs SET phase = $1, updated_at = NOW() \
+             WHERE public_id = $2 \
+               AND status = 'broadcasting' \
+               AND phase IN ('publishing', 'broadcasting')",
+        )
+        .bind(FINALISE_CLAIM_PHASE)
+        .bind(public_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            return Ok(FinaliseClaim::Won);
+        }
+
+        let status = match self.load(public_id).await? {
+            Some(j) => j.status,
+            None => JobStatus::Failed,
+        };
+        Ok(FinaliseClaim::Lost { observed: status })
+    }
+
+    /// Boot-only: release a dead process's exclusive finalise claim so a
+    /// single restarted resumer can re-acquire it.
+    ///
+    /// Sets phase from [`FINALISE_CLAIM_PHASE`] back to `publishing` while
+    /// status remains `broadcasting`. Does **not** run while a live owner
+    /// holds the claim mid-finalise in the same process — only boot calls
+    /// this before re-enqueue.
+    pub async fn release_stale_finalise_claim(&self, public_id: Uuid) -> sqlx::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET phase = 'publishing', updated_at = NOW() \
+             WHERE public_id = $1 \
+               AND status = 'broadcasting' \
+               AND phase = $2",
+        )
+        .bind(public_id)
+        .bind(FINALISE_CLAIM_PHASE)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
