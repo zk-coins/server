@@ -320,11 +320,55 @@ async fn cancel_from_queued_returns_true_and_marks_cancelled() {
 }
 
 #[tokio::test]
-async fn cancel_from_proving_returns_true_and_marks_cancelled() {
-    // §7.5: proving is not-yet-published — cancel must apply.
+async fn cancel_legacy_rejects_proving_and_awaiting_signature() {
+    // Defect 1: shared JobStore::cancel stays queued-only under flag-off /
+    // legacy `/api` path — proving and awaiting_signature must refuse.
+    let (store, _c) = setup_store().await;
+    let CreateResult::Fresh(proving) = store
+        .create(JobKind::Mint, &account_addr(15), None, sample_mint_body())
+        .await
+        .expect("create proving")
+    else {
+        panic!("expected Fresh");
+    };
+    store
+        .set_status(proving.public_id, JobStatus::Proving, "proving")
+        .await
+        .expect("set proving");
+    let applied = store.cancel(proving.public_id).await.expect("cancel");
+    assert!(
+        !applied,
+        "legacy cancel must reject proving (pre-v1.1 byte-identical)"
+    );
+    let after = store.load(proving.public_id).await.unwrap().unwrap();
+    assert_eq!(after.status, JobStatus::Proving);
+
+    let CreateResult::Fresh(asig) = store
+        .create(JobKind::Mint, &account_addr(16), None, sample_mint_body())
+        .await
+        .expect("create awaiting")
+    else {
+        panic!("expected Fresh");
+    };
+    store
+        .set_awaiting_signature(asig.public_id, 1, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+    let applied = store.cancel(asig.public_id).await.expect("cancel");
+    assert!(
+        !applied,
+        "legacy cancel must reject awaiting_signature"
+    );
+    let after = store.load(asig.public_id).await.unwrap().unwrap();
+    assert_eq!(after.status, JobStatus::AwaitingSignature);
+}
+
+#[tokio::test]
+async fn cancel_not_yet_published_accepts_proving_and_awaiting_signature() {
+    // §7.5 / v1.1 path only: proving and awaiting_signature are cancellable.
     let (store, _c) = setup_store().await;
     let CreateResult::Fresh(job) = store
-        .create(JobKind::Mint, &account_addr(15), None, sample_mint_body())
+        .create(JobKind::Mint, &account_addr(17), None, sample_mint_body())
         .await
         .expect("create")
     else {
@@ -334,10 +378,107 @@ async fn cancel_from_proving_returns_true_and_marks_cancelled() {
         .set_status(job.public_id, JobStatus::Proving, "proving")
         .await
         .expect("set proving");
-    let applied = store.cancel(job.public_id).await.expect("cancel");
-    assert!(applied, "cancel from proving must apply (§7.5 not-yet-published)");
+    let applied = store
+        .cancel_not_yet_published(job.public_id)
+        .await
+        .expect("cancel_not_yet_published");
+    assert!(
+        applied,
+        "v1.1 cancel from proving must apply (§7.5 not-yet-published)"
+    );
     let after = store.load(job.public_id).await.unwrap().unwrap();
     assert_eq!(after.status, JobStatus::Cancelled);
+
+    let CreateResult::Fresh(asig) = store
+        .create(JobKind::Mint, &account_addr(18), None, sample_mint_body())
+        .await
+        .expect("create")
+    else {
+        panic!("expected Fresh");
+    };
+    // Plant a restart envelope so the atomic strip is observable.
+    sqlx::query(
+        "UPDATE jobs SET request_body = $1 WHERE public_id = $2",
+    )
+    .bind(serde_json::json!({
+        "pending_sign": {"mode": "initial"},
+        "sign": {"pk_i": "00"}
+    }))
+    .bind(asig.public_id)
+    .execute(store.pool())
+    .await
+    .expect("plant envelope");
+    store
+        .set_awaiting_signature(asig.public_id, 2, serde_json::json!({}))
+        .await
+        .expect("awaiting_signature");
+    // set_awaiting_signature does not clear request_body; re-plant after.
+    sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+        .bind(serde_json::json!({
+            "pending_sign": {"mode": "initial"},
+            "sign": {"pk_i": "00"}
+        }))
+        .bind(asig.public_id)
+        .execute(store.pool())
+        .await
+        .expect("replant");
+    let applied = store
+        .cancel_not_yet_published(asig.public_id)
+        .await
+        .expect("cancel awaiting");
+    assert!(applied);
+    let after = store.load(asig.public_id).await.unwrap().unwrap();
+    assert_eq!(after.status, JobStatus::Cancelled);
+    assert!(
+        after.request_body.get("pending_sign").is_none(),
+        "atomic cancel must strip pending_sign: {:?}",
+        after.request_body
+    );
+    assert!(
+        after.request_body.get("sign").is_none(),
+        "atomic cancel must strip sign: {:?}",
+        after.request_body
+    );
+}
+
+#[tokio::test]
+async fn fail_atomically_strips_pending_sign_envelope() {
+    // Defect 3: fail must not leave a restart envelope that boot could
+    // rehydrate. Strip is atomic with the status flip.
+    let (store, _c) = setup_store().await;
+    let CreateResult::Fresh(job) = store
+        .create(JobKind::Send, &account_addr(19), None, sample_mint_body())
+        .await
+        .expect("create")
+    else {
+        panic!("expected Fresh");
+    };
+    sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+        .bind(serde_json::json!({
+            "pending_sign": {"mode": "initial", "network": "mainnet"},
+            "other": "kept"
+        }))
+        .bind(job.public_id)
+        .execute(store.pool())
+        .await
+        .expect("plant");
+    store
+        .fail(job.public_id, "awaiting_signature timeout")
+        .await
+        .expect("fail");
+    let after = store.load(job.public_id).await.unwrap().unwrap();
+    assert_eq!(after.status, JobStatus::Failed);
+    assert!(
+        after.request_body.get("pending_sign").is_none(),
+        "fail must atomically strip pending_sign: {:?}",
+        after.request_body
+    );
+    assert_eq!(
+        after.request_body.get("other").and_then(|v| v.as_str()),
+        Some("kept"),
+        "unrelated keys must survive: {:?}",
+        after.request_body
+    );
 }
 
 #[tokio::test]

@@ -129,8 +129,8 @@ pub async fn start_rest_node(
         // enters awaiting_signature and stages via stage_pending_sign.
         // Under the legacy stack the map stays empty and is unused.
         v11_live_pending_after_begin: Arc::new(DashMap::new()),
-        // Optional test/fixture hook. Production prefers the live map above;
-        // both are consulted by resolve_live_pending_after_prove.
+        // Test-only injection point (Defect 4): never installed in production.
+        #[cfg(test)]
         v11_pending_after_prove: None,
     };
 

@@ -298,6 +298,27 @@ pub fn spawn(
 
 /// Drive a single envelope through one state-machine step. The
 /// outer loop in [`spawn`] calls this for every received envelope.
+///
+/// Test-visible so boot-resume / crash-window recovery can be exercised
+/// without spinning the full dispatcher channel.
+#[cfg(test)]
+pub(crate) async fn process_envelope_for_test(
+    job_store: &JobStore,
+    app_state: &AppState,
+    notify_map: &JobNotifyMap,
+    awaiting_signature_timeout: Duration,
+    env: JobEnvelope,
+) -> anyhow::Result<()> {
+    process_envelope(
+        job_store,
+        app_state,
+        notify_map,
+        awaiting_signature_timeout,
+        env,
+    )
+    .await
+}
+
 async fn process_envelope(
     job_store: &JobStore,
     app_state: &AppState,
@@ -698,9 +719,9 @@ async fn persist_pending_sign_on_job(
 /// self-contained (witness + ProofData); finalise re-validates live
 /// dependencies rather than re-reading a snapshot a concurrent scan can move.
 ///
-/// Tests may also inject a fixture via
-/// [`crate::router::AppState::v11_pending_after_prove`]. Missing both sources
-/// fails closed at [`stage_and_select_awaiting_signature`] (no silent ash‖ocr).
+/// Under `cfg(test)` an optional fixture hook may also supply an entry.
+/// Missing the production registry fails closed at
+/// [`stage_and_select_awaiting_signature`] (no silent ash‖ocr).
 fn resolve_live_pending_after_prove(
     app_state: &AppState,
     public_id: Uuid,
@@ -714,10 +735,17 @@ fn resolve_live_pending_after_prove(
     ) {
         return Some(entry);
     }
-    app_state
-        .v11_pending_after_prove
-        .as_ref()
-        .and_then(|hook| hook(public_id))
+    #[cfg(test)]
+    {
+        if let Some(entry) = app_state
+            .v11_pending_after_prove
+            .as_ref()
+            .and_then(|hook| hook(public_id))
+        {
+            return Some(entry);
+        }
+    }
+    None
 }
 
 /// Test-visible alias of [`resolve_live_pending_after_prove`].
@@ -794,13 +822,20 @@ fn fail_error_string(message: &str) -> String {
     }
 }
 
-/// Stale-envelope cleanup (Defect 3).
+/// In-memory staging cleanup after a job leaves the sign handoff.
 ///
-/// Runs when a job leaves `awaiting_signature` for a terminal (or
-/// post-sign) status: successful finalise, finalise failure, awaiting
-/// timeout, or legacy commit completion/failure. Strips
-/// `request_body.pending_sign` and drops the in-memory map entry so
-/// completed/failed rows do not accumulate restart envelopes.
+/// Terminal status transitions (`fail` / `complete` /
+/// `cancel` / `cancel_not_yet_published`) strip `pending_sign` and
+/// `sign` from `request_body` **atomically** with the status flip
+/// (Defect 3). This helper therefore only drops the in-memory map
+/// entry for those paths.
+///
+/// When the status did **not** transition (e.g. `set_awaiting_signature`
+/// failed after `stage_pending_sign`, or cancel won and left the row
+/// cancelled via a separate path), this also best-effort strips any
+/// leftover envelope. A leftover on a non-`awaiting_signature` row is
+/// harmless: boot resume and `/sign` only rehydrate when status is
+/// `awaiting_signature`, so a stale envelope cannot resurrect a job.
 async fn cleanup_pending_sign(
     job_store: &JobStore,
     app_state: &AppState,
@@ -810,12 +845,30 @@ async fn cleanup_pending_sign(
     let Ok(Some(job)) = job_store.load(public_id).await else {
         return;
     };
-    let mut body = job.request_body;
-    if !crate::v11::strip_pending_sign_from_body(&mut body) {
+    // Terminal transitions already stripped the keys. Only touch the
+    // row when an envelope remains on a non-awaiting_signature status
+    // (intermediate failure / cancel race).
+    if job.status == JobStatus::AwaitingSignature {
         return;
     }
+    let mut body = job.request_body;
+    if !crate::v11::strip_pending_sign_from_body(&mut body) {
+        // Also drop a durable `sign` blob if present without pending_sign.
+        if body
+            .as_object_mut()
+            .map(|o| o.remove("sign").is_some())
+            .unwrap_or(false)
+        {
+            // fall through to persist
+        } else {
+            return;
+        }
+    } else {
+        let _ = body.as_object_mut().map(|o| o.remove("sign"));
+    }
     if let Err(e) = sqlx::query(
-        "UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2",
+        "UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2 \
+         AND status <> 'awaiting_signature'",
     )
     .bind(&body)
     .bind(public_id)
@@ -823,7 +876,8 @@ async fn cleanup_pending_sign(
     .await
     {
         tracing::warn!(
-            "Job dispatcher: failed to strip pending_sign for job {}: {}",
+            "Job dispatcher: best-effort strip of leftover pending_sign for job {} failed: {} \
+             (harmless: rehydrate is gated on awaiting_signature)",
             public_id,
             e
         );
@@ -1129,6 +1183,25 @@ async fn process_send_resume(
 /// the broadcast leg via the kind-appropriate flow: [`mint_commit_flow`]
 /// for a `Mint` job (which runs the soundness gate), [`commit_flow`]
 /// for a `Send`. On timeout, fail the job.
+///
+/// ## Crash recovery (Defect 2)
+///
+/// `/sign` persists the verified signature **before** CAS/notify. If the
+/// process dies after that persist, boot resume re-enqueues the job and
+/// this function sees a durable `request_body.sign` **before** parking:
+/// it drives finalise immediately so a job the wallet already saw as
+/// `signature_accepted` is not left waiting for a second `/sign`.
+///
+/// Crash windows after the fix:
+/// | Window | Durable | Handoff | Resume yields |
+/// | after verify, before persist | none | WAITING | wallet retries `/sign` |
+/// | after persist, before CAS | `sign` | WAITING | wallet may retry `/sign` (re-persist idempotent); process death → boot auto-finalise |
+/// | after CAS, before notify | `sign` | SIGNALED | process death → boot re-arms + auto-finalise from durable `sign` |
+/// | after notify, before finalise completes | `sign` | SIGNALED | same: boot auto-finalise |
+///
+/// Auto-finalise still requires a live (`finalise_safe`) staged pending
+/// in `pending_sign_map`. A rehydrated verification-grade envelope alone
+/// refuses finalise (wallet must resubmit the transition on this process).
 async fn wait_for_commit(
     job_store: &JobStore,
     app_state: &AppState,
@@ -1138,6 +1211,31 @@ async fn wait_for_commit(
     kind: JobKind,
     notifier: Arc<JobNotifier>,
 ) -> anyhow::Result<()> {
+    // Defect 2: durable signature already on the row (crash after
+    // persist / CAS / notify, or boot resume of a signed job). Drive
+    // finalise without waiting for another wallet round-trip.
+    if crate::v11::v11_sign_route_active() {
+        if let Ok(Some(job)) = job_store.load(public_id).await {
+            if job.status == JobStatus::AwaitingSignature {
+                if let Some(sign_val) = job.request_body.get("sign").cloned() {
+                    tracing::info!(
+                        "Job dispatcher: job {} has durable sign on resume — driving finalise",
+                        public_id
+                    );
+                    return drive_v11_finalise(
+                        job_store,
+                        app_state,
+                        notify_map,
+                        public_id,
+                        &job,
+                        sign_val,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
     // Park until the route signals (CAS → notify) or the timeout claims
     // the handoff. The CAS on JobNotifier::handoff closes the race where
     // the route clones a live notifier, the dispatcher times out, and

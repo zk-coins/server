@@ -359,6 +359,10 @@ impl JobStore {
     /// Move a job to the `completed` terminal state. Stamps the
     /// cached response body + status code so an idempotent replay
     /// returns byte-identical JSON.
+    ///
+    /// Atomically strips `pending_sign` / `sign` keys from
+    /// `request_body` (Defect 3): a terminal row must not retain a
+    /// restart envelope that boot recovery could treat as live work.
     pub async fn complete(
         &self,
         public_id: Uuid,
@@ -368,6 +372,8 @@ impl JobStore {
         sqlx::query(
             "UPDATE jobs SET status = 'completed', phase = 'completed', \
                               response_body = $1, response_status = $2, \
+                              request_body = (COALESCE(request_body, '{}'::jsonb) \
+                                  - 'pending_sign' - 'sign'), \
                               progress = 100, updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $3",
         )
@@ -382,10 +388,17 @@ impl JobStore {
     /// Move a job to the `failed` terminal state with an error
     /// message. The wallet surfaces `error` verbatim in the
     /// `KNOWN_SERVER_ERRORS` mapping table.
+    ///
+    /// Atomically strips `pending_sign` / `sign` from `request_body`
+    /// with the status flip (Defect 3) so a failed cleanup path cannot
+    /// leave a restart envelope on a terminal row.
     pub async fn fail(&self, public_id: Uuid, error: &str) -> sqlx::Result<()> {
         sqlx::query(
             "UPDATE jobs SET status = 'failed', phase = 'failed', \
-                              error = $1, updated_at = NOW(), completed_at = NOW() \
+                              error = $1, \
+                              request_body = (COALESCE(request_body, '{}'::jsonb) \
+                                  - 'pending_sign' - 'sign'), \
+                              updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $2",
         )
         .bind(error)
@@ -395,19 +408,50 @@ impl JobStore {
         Ok(())
     }
 
-    /// Attempt to cancel a job that is **not yet published** (§7.5).
+    /// Legacy cancel: only succeeds while the job is still `queued`.
+    ///
+    /// Flag-off / `/api/jobs/:id/cancel` behaviour is byte-identical to
+    /// pre-v1.1: once the prove leg has started the row is no longer
+    /// cancellable. Do **not** widen this method — §7.5 not-yet-published
+    /// cancellation lives on [`Self::cancel_not_yet_published`] and is
+    /// used only by the v1.1 route.
+    ///
+    /// Returns `Ok(true)` if cancellation applied, `Ok(false)` if the
+    /// job was already past `queued` (or not found). The admit handler
+    /// maps `false` to `409 Conflict`.
+    pub async fn cancel(&self, public_id: Uuid) -> sqlx::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'cancelled', phase = 'cancelled', \
+                              request_body = (COALESCE(request_body, '{}'::jsonb) \
+                                  - 'pending_sign' - 'sign'), \
+                              updated_at = NOW(), completed_at = NOW() \
+             WHERE public_id = $1 AND status = 'queued'",
+        )
+        .bind(public_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// §7.5 cancel for the **v1.1** path only (`POST /v1/jobs/:id/cancel`).
     ///
     /// Succeeds for `queued`, `proving`, and `awaiting_signature` — the
     /// nullifier has not reached the chain. Once the job is
     /// `broadcasting` (or terminal), cancel is refused so a published
     /// nullifier cannot be rolled back by a status flip.
     ///
+    /// Atomically strips `pending_sign` / `sign` from `request_body` so a
+    /// cancelled `awaiting_signature` row cannot resurrect via boot
+    /// rehydrate (Defect 3).
+    ///
     /// Returns `Ok(true)` if cancellation applied, `Ok(false)` if the
     /// job was already past the cancellable set (or not found). The
     /// v1 cancel handler maps `false` to `409 wrong_phase`.
-    pub async fn cancel(&self, public_id: Uuid) -> sqlx::Result<bool> {
+    pub async fn cancel_not_yet_published(&self, public_id: Uuid) -> sqlx::Result<bool> {
         let result = sqlx::query(
             "UPDATE jobs SET status = 'cancelled', phase = 'cancelled', \
+                              request_body = (COALESCE(request_body, '{}'::jsonb) \
+                                  - 'pending_sign' - 'sign'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $1 \
                AND status IN ('queued', 'proving', 'awaiting_signature')",

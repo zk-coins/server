@@ -253,11 +253,13 @@ pub struct AppState {
     /// via [`crate::v11::stage_pending_sign`]. Empty under the legacy
     /// stack. Writers: [`crate::v11::register_live_pending_after_begin`].
     pub(crate) v11_live_pending_after_begin: crate::v11::PendingSignMap,
-    /// Optional extra source of a live pending after the prove leg
-    /// (tests inject fixtures without a multi-minute prove; production
-    /// prefers [`Self::v11_live_pending_after_begin`]). `None` return
-    /// from both sources → v1.1 jobs fail closed at advertisement (no
-    /// silent ash‖ocr).
+    /// Test-only extra source of a live pending after the prove leg
+    /// (fixtures without a multi-minute prove). Production never
+    /// installs this — the live path is
+    /// [`Self::v11_live_pending_after_begin`] alone. Kept behind
+    /// `cfg(test)` so it cannot be mistaken for a production resolver
+    /// input (Defect 4).
+    #[cfg(test)]
     pub(crate) v11_pending_after_prove: Option<V11PendingAfterProveHook>,
 }
 
@@ -275,10 +277,11 @@ pub type V11FinaliseHook = Arc<
         + Sync,
 >;
 
-/// Hook the dispatcher invokes after the prove leg under a v1.1 claim to
-/// obtain the live [`crate::v11::PendingSignEntry`] that
-/// [`crate::v11::stage_pending_sign`] must stage. `None` return → the
-/// job fails closed (no silent ash‖ocr under v1.1).
+/// Test-only hook the dispatcher may consult after the prove leg under a
+/// v1.1 claim. Production uses only
+/// [`AppState::v11_live_pending_after_begin`]. Behind `cfg(test)` so it is
+/// not compiled into the production binary (Defect 4).
+#[cfg(test)]
 pub type V11PendingAfterProveHook =
     Arc<dyn Fn(uuid::Uuid) -> Option<crate::v11::PendingSignEntry> + Send + Sync>;
 
@@ -2557,14 +2560,14 @@ pub(crate) async fn jobs_sign_handler(
     // handoff as SIGNALED. A crash between signal and persist must not
     // leave a job marked signalled with nothing durable behind it.
     //
-    // Crash windows after this reorder:
-    // - after verify, before persist → no durable sign, handoff still
-    //   WAITING; wallet may retry `/sign`
-    // - after persist, before CAS → durable sign, handoff still WAITING;
-    //   wallet may retry `/sign` (re-persist is idempotent)
-    // - after CAS, before notify → durable + SIGNALED; process death
-    //   re-arms on boot resume; in-process the notify is the next line
-    // - after notify → normal finalise path
+    // Crash windows after the fix (see `wait_for_commit` for the table):
+    // - after verify, before persist → no durable sign, WAITING; wallet
+    //   retries `/sign`
+    // - after persist, before CAS → durable sign, WAITING; wallet may
+    //   retry `/sign`, or boot resume auto-finalises from the blob
+    // - after CAS, before notify → durable + SIGNALED; boot resume
+    //   re-arms and auto-finalises from durable `sign`
+    // - after notify → normal finalise; crash mid-finalise same as above
     //
     // Acceptance still requires a parked dispatcher: reporting
     // signature_accepted when nothing will finalise is worse than failing.
@@ -2890,24 +2893,14 @@ pub(crate) async fn jobs_cancel_v1_handler(
         }
     }
 
-    match state.job_store.cancel(id).await {
+    // v1.1 path only — widened not-yet-published set. Legacy
+    // `/api/jobs/:id/cancel` keeps `JobStore::cancel` (queued only).
+    match state.job_store.cancel_not_yet_published(id).await {
         Ok(true) => {
-            // Strip staged sign material so a cancelled awaiting_signature
-            // job does not leave a restart envelope or in-memory entry.
+            // Envelope strip is atomic with the status flip in
+            // `cancel_not_yet_published`. Drop in-memory staging only.
             state.pending_sign_map.remove(&id);
             state.v11_live_pending_after_begin.remove(&id);
-            if let Ok(Some(job)) = state.job_store.load(id).await {
-                let mut body = job.request_body;
-                if crate::v11::strip_pending_sign_from_body(&mut body) {
-                    let _ = sqlx::query(
-                        "UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2",
-                    )
-                    .bind(&body)
-                    .bind(id)
-                    .execute(state.job_store.pool())
-                    .await;
-                }
-            }
             let err_body = crate::v11::encode_job_error("internal_error", "cancelled");
             crate::job_dispatcher::publish_phase(
                 &state.job_notify_map,
@@ -2943,7 +2936,7 @@ pub(crate) async fn jobs_cancel_v1_handler(
         )
             .into_response(),
         Err(e) => {
-            tracing::error!("JobStore::cancel failed: {}", e);
+            tracing::error!("JobStore::cancel_not_yet_published failed: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(v11_error_body("internal_error", "Failed to cancel job")),
