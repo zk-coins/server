@@ -875,8 +875,14 @@ fn fail_error_string(message: &str) -> String {
 /// When the status did **not** transition (e.g. `set_awaiting_signature`
 /// failed after `stage_pending_sign`, or cancel won and left the row
 /// cancelled via a separate path), this also best-effort strips any
-/// leftover envelope. A leftover on a non-`awaiting_signature` row is
-/// harmless: boot resume and `/sign` only rehydrate when status is
+/// leftover envelope — **but only while the row is not under an exclusive
+/// finalise claim**. After `set_awaiting_signature` another process can
+/// sign + claim before this worker's confirmation load; the unexpected-
+/// status branch must not rewrite that claimed row (see
+/// [`JobStore::replace_request_body_if_cleanup_safe`]).
+///
+/// A leftover on a non-`awaiting_signature`, unclaimed row is harmless:
+/// boot resume and `/sign` only rehydrate when status is
 /// `awaiting_signature`, so a stale envelope cannot resurrect a job.
 async fn cleanup_pending_sign(
     job_store: &JobStore,
@@ -887,10 +893,13 @@ async fn cleanup_pending_sign(
     let Ok(Some(job)) = job_store.load(public_id).await else {
         return;
     };
-    // Terminal transitions already stripped the keys. Only touch the
-    // row when an envelope remains on a non-awaiting_signature status
-    // (intermediate failure / cancel race).
+    // Live sign handoff: leave the envelope for the wallet / /sign path.
     if job.status == JobStatus::AwaitingSignature {
+        return;
+    }
+    // Exclusive finalise claim: never rewrite the claim holder's body
+    // (even if a concurrent claim raced past our confirmation load).
+    if job.phase == crate::job_store::FINALISE_CLAIM_PHASE {
         return;
     }
     let mut body = job.request_body;
@@ -908,21 +917,27 @@ async fn cleanup_pending_sign(
     } else {
         let _ = body.as_object_mut().map(|o| o.remove("sign"));
     }
-    if let Err(e) = sqlx::query(
-        "UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2 \
-         AND status <> 'awaiting_signature'",
-    )
-    .bind(&body)
-    .bind(public_id)
-    .execute(job_store.pool())
-    .await
+    // Fence is in the SQL: refuses awaiting_signature and FINALISE_CLAIM_PHASE.
+    match job_store
+        .replace_request_body_if_cleanup_safe(public_id, &body)
+        .await
     {
-        tracing::warn!(
-            "Job dispatcher: best-effort strip of leftover pending_sign for job {} failed: {} \
-             (harmless: rehydrate is gated on awaiting_signature)",
-            public_id,
-            e
-        );
+        Ok(false) => {
+            tracing::info!(
+                "Job dispatcher: cleanup body rewrite skipped for job {} \
+                 (awaiting_signature or claimed since load)",
+                public_id
+            );
+        }
+        Ok(true) => {}
+        Err(e) => {
+            tracing::warn!(
+                "Job dispatcher: best-effort strip of leftover pending_sign for job {} failed: {} \
+                 (harmless: rehydrate is gated on awaiting_signature)",
+                public_id,
+                e
+            );
+        }
     }
 }
 
@@ -1750,22 +1765,37 @@ pub const JOB_FINALISE_HOST_EDGE: &str =
 /// Drive an accepted v1.1 signature through the durable host path up to
 /// [`JOB_FINALISE_HOST_EDGE`].
 ///
-/// ## Sweep: every write that can complete, terminate, or advance a job
+/// ## Sweep: every SQL write that mutates a job row
 ///
-/// | Write | What it advances / terminates | Fence carried |
-/// |-------|-------------------------------|---------------|
-/// | [`JobStore::claim_finalise_exclusive`] | `awaiting_signature`/`broadcasting` → `broadcasting` + [`FINALISE_CLAIM_PHASE`]; mints fence | **mints** acquisition fence (CAS) |
-/// | [`JobStore::renew_finalise_claim`] | lease only (no status change) | **fence + owner** (stale epoch cannot renew) |
-/// | Finalise hook → engine snapshot + `members_ready` | account/engine + rebroadcast intent (the write that matters most) | **fence + owner + lease** via [`crate::v11::finalise_accepted_prove_persist_and_stage`] |
-/// | [`JobStore::merge_finalisation_if_finalise_owner`] | durable `finalisation` completion surface on the job row | **fence + owner + lease** |
-/// | [`JobStore::complete_if_finalise_owner`] | → `completed` (host §7.5 edge) | **fence + owner + lease** |
-/// | [`JobStore::fail_if_finalise_owner`] | → `failed` while claim held | **fence + owner + lease** |
-/// | [`JobStore::fail_if_status`] (pre-claim / awaiting-signature timeout) | → `failed` for **unclaimed** rows only | status + **not** [`FINALISE_CLAIM_PHASE`] (refuses any held claim / fence) |
-/// | [`JobStore::complete_if_status`] | → `completed` for **unclaimed** rows only | status + **not** [`FINALISE_CLAIM_PHASE`] |
-/// | [`JobStore::set_awaiting_signature`] | → `awaiting_signature` (pre-claim prove leg) | status CAS (`proving`/`queued`); no claim fence yet |
-/// | [`JobStore::set_status` / `set_status_if`] | phase/status advance (pre-claim) | status CAS; no claim fence yet |
-/// | [`JobStore::cancel` / `cancel_not_yet_published`] | → `cancelled` before publish | status CAS; refuses claimed terminal paths |
-/// | Bare [`JobStore::fail`] / [`JobStore::complete`] | legacy unqualified | **none** — must not be used once a claim can exist (timeout fixed) |
+/// **Derivation method (do not compose from memory):** grep every
+/// `UPDATE jobs` / `INSERT INTO jobs` in production code, quote the
+/// actual `WHERE` clause, then state the fence from that clause alone.
+/// A table assembled from recollection is the same class of evidence as
+/// a test that checks its own logic.
+///
+/// | Write | Actual `WHERE` (ground truth) | Fences on |
+/// |-------|------------------------------|-----------|
+/// | [`JobStore::create`] (`INSERT`) | `ON CONFLICT (account_address, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING` | partial unique key (idempotency) |
+/// | [`JobStore::set_status`] | `WHERE public_id = $3` | **public_id only** — no status predicate |
+/// | [`JobStore::set_status_if`] | `WHERE public_id = $3 AND status = $4` | status CAS |
+/// | [`JobStore::set_awaiting_signature`] | `WHERE public_id = $3 AND status IN ('queued', 'proving')` | status CAS (pre-claim) |
+/// | [`JobStore::complete`] | `WHERE public_id = $3` | **public_id only** — legacy unqualified |
+/// | [`JobStore::complete_if_status`] | `WHERE public_id = $3 AND status = ANY($4::text[]) AND phase IS DISTINCT FROM $5` | status + **not** [`FINALISE_CLAIM_PHASE`] |
+/// | [`JobStore::complete_if_finalise_owner`] | `WHERE public_id = $3 AND status = 'broadcasting' AND phase = $4 AND owner = $5 AND fence = $6 AND lease_expires_at IS NOT NULL AND lease_expires_at > NOW()` | **status + phase + owner + fence + unexpired lease** |
+/// | [`JobStore::fail`] | `WHERE public_id = $2` | **public_id only** — legacy unqualified |
+/// | [`JobStore::fail_if_status`] | `WHERE public_id = $2 AND status = ANY($3::text[]) AND phase IS DISTINCT FROM $4` | status + **not** [`FINALISE_CLAIM_PHASE`] |
+/// | [`JobStore::fail_if_finalise_owner`] | `WHERE public_id = $2 AND status = 'broadcasting' AND phase = $3 AND owner = $4 AND fence = $5 AND lease_expires_at IS NOT NULL AND lease_expires_at > NOW()` | **status + phase + owner + fence + unexpired lease** |
+/// | [`JobStore::claim_finalise_exclusive`] path A | `WHERE public_id = $6 AND status = $7` (`awaiting_signature` → claim) | status CAS; **mints** fence |
+/// | [`JobStore::claim_finalise_exclusive`] path B | `WHERE public_id = $5 AND status = 'broadcasting' AND phase IN ('publishing', 'broadcasting')` | status + free phase; **mints** fence |
+/// | [`JobStore::renew_finalise_claim`] | `WHERE public_id = $5 AND status = 'broadcasting' AND phase = $6 AND owner = $2 AND fence = $3` | **status + phase + owner + fence** (lease rewrite) |
+/// | [`JobStore::release_stale_finalise_claim`] | `WHERE public_id = $1 AND status = 'broadcasting' AND phase = $2 AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())` | status + claimed phase + **expired/absent lease** |
+/// | [`JobStore::replace_request_body_if_status`] | `WHERE public_id = $2 AND status = $3` | status CAS (pre-claim capability / accepted signature) |
+/// | [`JobStore::replace_request_body_if_cleanup_safe`] | `WHERE public_id = $2 AND status <> 'awaiting_signature' AND phase IS DISTINCT FROM $3` | not live handoff + **not** [`FINALISE_CLAIM_PHASE`] |
+/// | [`JobStore::merge_finalisation_if_finalise_owner`] | `WHERE public_id = $3 AND status = 'broadcasting' AND phase = $4 AND owner = $5 AND fence = $6 AND lease_expires_at IS NOT NULL AND lease_expires_at > NOW()` | **status + phase + owner + fence + unexpired lease** |
+/// | [`JobStore::cancel`] | `WHERE public_id = $1 AND status = 'queued'` | status CAS (legacy queued-only) |
+/// | [`JobStore::cancel_not_yet_published`] | `WHERE public_id = $1 AND status IN ('queued', 'proving', 'awaiting_signature')` | status CAS (v1.1 pre-publish) |
+/// | Legacy commit-payload write (`router` commit route) | `WHERE public_id = $2` | **public_id only** — flag-off commit path |
+/// | Finalise hook → engine snapshot + `members_ready` | (not a `jobs` row write; account/engine + rebroadcast) | **fence + owner + lease** via [`crate::v11::finalise_accepted_prove_persist_and_stage`] |
 ///
 /// After the claim is won, durable transition commits are fenced on the
 /// **acquisition fencing token** plus a still-valid lease — not on owner

@@ -678,23 +678,41 @@ pub(crate) async fn boot_resume_jobs(
             }
             continue;
         }
-        if let Err(e) = job_store
-            .fail(
+        // Status-qualified fail against the status observed in this
+        // snapshot — never bare `fail`. Between list and write another
+        // process can advance the row to `awaiting_signature` and win a
+        // finalise claim; bare fail would then terminate an owned epoch.
+        // `fail_if_status` refuses any held claim (`phase IS DISTINCT FROM
+        // FINALISE_CLAIM_PHASE`) and is a no-op when status has moved on.
+        match job_store
+            .fail_if_status(
                 job.public_id,
+                &[job.status],
                 "server restarted before processing — please retry",
             )
             .await
         {
-            eprintln!(
-                "boot_resume_jobs: fail({}) failed: {} (continuing)",
-                job.public_id, e
-            );
-        } else {
-            tracing::info!(
-                "boot_resume_jobs: marked {} ({:?}) failed",
-                job.public_id,
-                job.status
-            );
+            Ok(true) => {
+                tracing::info!(
+                    "boot_resume_jobs: marked {} ({:?}) failed",
+                    job.public_id,
+                    job.status
+                );
+            }
+            Ok(false) => {
+                tracing::info!(
+                    "boot_resume_jobs: skip fail for {} (snapshot status={:?}; \
+                     row moved or claimed since list)",
+                    job.public_id,
+                    job.status
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "boot_resume_jobs: fail_if_status({}) failed: {} (continuing)",
+                    job.public_id, e
+                );
+            }
         }
     }
 
@@ -703,17 +721,31 @@ pub(crate) async fn boot_resume_jobs(
     for job in pending {
         match job.status {
             JobStatus::Queued => {
-                if let Err(e) = job_store
-                    .fail(
+                // Same fence as interrupted: snapshot said `queued`, but a
+                // concurrent worker may have proven, advertised, signed and
+                // claimed before this write. Status-qualified only.
+                match job_store
+                    .fail_if_status(
                         job.public_id,
+                        &[JobStatus::Queued],
                         "server restarted before processing — please retry",
                     )
                     .await
                 {
-                    eprintln!(
-                        "boot_resume_jobs: fail({}) failed: {} (continuing)",
-                        job.public_id, e
-                    );
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::info!(
+                            "boot_resume_jobs: skip fail for queued {} \
+                             (moved or claimed since list)",
+                            job.public_id
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "boot_resume_jobs: fail_if_status({}) failed: {} (continuing)",
+                            job.public_id, e
+                        );
+                    }
                 }
             }
             JobStatus::AwaitingSignature => {
