@@ -81,6 +81,13 @@ pub const FINALISE_CLAIM_LEASE: std::time::Duration = std::time::Duration::from_
 pub const FINALISE_CLAIM_RENEW_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(5 * 60);
 
+/// Bound on a single `renew_finalise_claim` await inside the lease heartbeat.
+///
+/// A hung database round-trip must count as liveness failure, not an
+/// unbounded pause while prove/apply work continues past lease expiry.
+/// Sized well under [`FINALISE_CLAIM_LEASE`] and under one renew interval.
+pub const FINALISE_CLAIM_RENEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Lease seconds as `i64` for Postgres `make_interval(secs => …)`.
 fn lease_secs_i64(lease: std::time::Duration) -> i64 {
     i64::try_from(lease.as_secs()).expect("finalise claim lease seconds fit i64")
@@ -471,6 +478,10 @@ impl JobStore {
     ///
     /// Used by the v1.1 finalise path so a second resume after a terminal
     /// flip is a no-op (idempotent) rather than rewriting `completed`.
+    ///
+    /// **Not** a claim fence: a worker that lost its exclusive finalise
+    /// lease can still match `status = broadcasting`. Host-edge completion
+    /// under a claim uses [`Self::complete_if_finalise_owner`].
     pub async fn complete_if_status(
         &self,
         public_id: Uuid,
@@ -494,6 +505,43 @@ impl JobStore {
         .bind(response_status)
         .bind(public_id)
         .bind(&statuses)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Owner-qualified complete: the durable host-edge fence.
+    ///
+    /// Applies only while `owner` still holds the exclusive finalise claim
+    /// (`broadcasting` + [`FINALISE_CLAIM_PHASE`] + matching
+    /// `request_body.finalise_claim.owner`). A worker that lost its lease —
+    /// even if it never noticed and kept running — cannot commit completion.
+    /// Status alone is not the fence: after reclaim another owner may still
+    /// be `broadcasting`.
+    pub async fn complete_if_finalise_owner(
+        &self,
+        public_id: Uuid,
+        owner: Uuid,
+        response_body: serde_json::Value,
+        response_status: i16,
+    ) -> sqlx::Result<bool> {
+        let owner_text = owner.to_string();
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'completed', phase = 'completed', \
+                              response_body = $1, response_status = $2, \
+                              request_body = (COALESCE(request_body, '{}'::jsonb) \
+                                  - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
+                              progress = 100, updated_at = NOW(), completed_at = NOW() \
+             WHERE public_id = $3 \
+               AND status = 'broadcasting' \
+               AND phase = $4 \
+               AND request_body #>> '{finalise_claim,owner}' = $5",
+        )
+        .bind(&response_body)
+        .bind(response_status)
+        .bind(public_id)
+        .bind(FINALISE_CLAIM_PHASE)
+        .bind(&owner_text)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -527,6 +575,10 @@ impl JobStore {
 
     /// Status-qualified fail: only applies when the row is still in one
     /// of `expected`. Returns `true` if the row was updated.
+    ///
+    /// **Not** a claim fence after exclusive finalise is won — use
+    /// [`Self::fail_if_finalise_owner`] so a lost worker cannot fail a job
+    /// another owner holds.
     pub async fn fail_if_status(
         &self,
         public_id: Uuid,
@@ -548,6 +600,35 @@ impl JobStore {
         .bind(error)
         .bind(public_id)
         .bind(&statuses)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Owner-qualified fail: only while `owner` holds the exclusive finalise
+    /// claim. Same fence as [`Self::complete_if_finalise_owner`].
+    pub async fn fail_if_finalise_owner(
+        &self,
+        public_id: Uuid,
+        owner: Uuid,
+        error: &str,
+    ) -> sqlx::Result<bool> {
+        let owner_text = owner.to_string();
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'failed', phase = 'failed', \
+                              error = $1, \
+                              request_body = (COALESCE(request_body, '{}'::jsonb) \
+                                  - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
+                              updated_at = NOW(), completed_at = NOW() \
+             WHERE public_id = $2 \
+               AND status = 'broadcasting' \
+               AND phase = $3 \
+               AND request_body #>> '{finalise_claim,owner}' = $4",
+        )
+        .bind(error)
+        .bind(public_id)
+        .bind(FINALISE_CLAIM_PHASE)
+        .bind(&owner_text)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -782,6 +863,10 @@ impl JobStore {
     /// the row's status still equals `expected`. Callers load, mutate, and
     /// write back under this CAS so a concurrent status flip (cancel /
     /// timeout) cannot accept a stale body write.
+    ///
+    /// **Not** a claim fence after exclusive finalise is won — use
+    /// [`Self::merge_finalisation_if_finalise_owner`] for completion-capability
+    /// persistence under a claim.
     pub async fn replace_request_body_if_status(
         &self,
         public_id: Uuid,
@@ -795,6 +880,43 @@ impl JobStore {
         .bind(new_body)
         .bind(public_id)
         .bind(expected.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Owner-qualified merge of the durable `finalisation` capability key.
+    ///
+    /// Uses `jsonb_set` on `{finalisation}` only so a concurrent lease renew
+    /// (which rewrites `finalise_claim.lease_expires_at`) is not clobbered.
+    /// Applies only while `owner` still holds the exclusive finalise claim.
+    /// Dropping a future is cooperative; this write is the real fence.
+    pub async fn merge_finalisation_if_finalise_owner(
+        &self,
+        public_id: Uuid,
+        owner: Uuid,
+        finalisation: &serde_json::Value,
+    ) -> sqlx::Result<bool> {
+        let path = vec![crate::v11::FINALISATION_BODY_KEY.to_string()];
+        let owner_text = owner.to_string();
+        let result = sqlx::query(
+            "UPDATE jobs SET request_body = jsonb_set( \
+                    COALESCE(request_body, '{}'::jsonb), \
+                    $1::text[], \
+                    $2::jsonb, \
+                    true \
+                ), \
+                    updated_at = NOW() \
+             WHERE public_id = $3 \
+               AND status = 'broadcasting' \
+               AND phase = $4 \
+               AND request_body #>> '{finalise_claim,owner}' = $5",
+        )
+        .bind(&path)
+        .bind(finalisation)
+        .bind(public_id)
+        .bind(FINALISE_CLAIM_PHASE)
+        .bind(&owner_text)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)

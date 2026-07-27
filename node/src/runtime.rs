@@ -370,6 +370,12 @@ async fn rearm_and_enqueue_v11_finalise(
 /// Poll until the exclusive finalise claim is abandoned (or the job leaves
 /// broadcasting), then release + enqueue. Prevents stranding after an
 /// immediate restart while a dead owner's lease has not yet expired.
+///
+/// **Durable:** no fixed deadline. A slow-dying owner (lease still renewing
+/// or wall-clock lag before abandonment) must not cause silent job loss.
+/// This task keeps trying until the claim is free, the job is terminal /
+/// non-broadcasting, or the process exits. A later boot re-lists interrupted
+/// `broadcasting` rows and schedules reclaim again if needed.
 fn spawn_deferred_finalise_reclaim(
     job_store: Arc<JobStore>,
     job_notify_map: Arc<DashMap<uuid::Uuid, Arc<JobNotifier>>>,
@@ -377,21 +383,10 @@ fn spawn_deferred_finalise_reclaim(
     public_id: uuid::Uuid,
 ) {
     tokio::spawn(async move {
-        // Bound the poll: lease is FINALISE_CLAIM_LEASE (15 min) max for a
-        // live owner that stopped renewing; poll frequently enough that a
-        // short test lease is reclaimed promptly.
+        // Poll frequently enough that a short test lease is reclaimed promptly.
+        // No wall-clock deadline: abandoning after N minutes was silent loss.
         let poll = std::time::Duration::from_millis(200);
-        let deadline = tokio::time::Instant::now()
-            + crate::job_store::FINALISE_CLAIM_LEASE
-            + std::time::Duration::from_secs(30);
         loop {
-            if tokio::time::Instant::now() > deadline {
-                tracing::error!(
-                    %public_id,
-                    "boot_resume_jobs: deferred finalise reclaim timed out — job may be stranded"
-                );
-                return;
-            }
             tokio::time::sleep(poll).await;
 
             let row = match job_store.load(public_id).await {
@@ -424,13 +419,30 @@ fn spawn_deferred_finalise_reclaim(
                     continue;
                 }
             };
-            // Re-load phase after release (release mutates phase when Ok(true)).
+            // When release succeeds the claim is free — enqueue without a
+            // second load (a DB error on re-load must not strand a freed row).
+            if released {
+                tracing::info!(
+                    %public_id,
+                    "boot_resume_jobs: deferred reclaim — claim free, enqueueing"
+                );
+                rearm_and_enqueue_v11_finalise(public_id, &job_notify_map, &job_tx).await;
+                return;
+            }
+            // Re-load phase after a no-op release (still need free-vs-owned).
             let phase = match job_store.load(public_id).await {
                 Ok(Some(j)) => j.phase,
                 Ok(None) => return,
-                Err(_) => row.phase.clone(),
+                Err(e) => {
+                    tracing::warn!(
+                        %public_id,
+                        error = %e,
+                        "boot_resume_jobs: deferred reclaim phase reload failed; retrying"
+                    );
+                    continue;
+                }
             };
-            match boot_finalise_action_after_release(released, JobStatus::Broadcasting, &phase) {
+            match boot_finalise_action_after_release(false, JobStatus::Broadcasting, &phase) {
                 BootFinaliseAction::EnqueueNow => {
                     tracing::info!(
                         %public_id,
@@ -494,6 +506,45 @@ pub(crate) fn boot_finalise_action_after_release(
     }
 }
 
+/// Boot disposition for one interrupted v1.1 edge row, including DB-error
+/// paths. Pure — no I/O.
+///
+/// | `release` | `phase_reload` (only if `Ok(false)`) | Disposition |
+/// |-----------|--------------------------------------|-------------|
+/// | `Err` | — | [`BootRowDisposition::LeaveUntouchedForRetry`] — no mutation |
+/// | `Ok(true)` | ignored | [`BootRowDisposition::Act`]`(EnqueueNow)` — claim freed; enqueue without second load |
+/// | `Ok(false)` | `Err` | [`BootRowDisposition::LeaveUntouchedForRetry`] — row not mutated by release |
+/// | `Ok(false)` | `Ok(None)` | [`BootRowDisposition::Act`]`(Skip)` — row vanished |
+/// | `Ok(false)` | `Ok(Some(phase))` | [`BootRowDisposition::Act`]`(`[`boot_finalise_action_after_release`]`)` |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BootRowDisposition {
+    /// Database error before or without a successful mutation — leave the
+    /// row as-is for a later boot/retry. Never half-process.
+    LeaveUntouchedForRetry,
+    /// A defined action for this row.
+    Act(BootFinaliseAction),
+}
+
+/// Pure error-path + success-path decision for one resumable v1.1 edge row.
+pub(crate) fn boot_finalise_disposition(
+    release: Result<bool, ()>,
+    phase_reload: Result<Option<&str>, ()>,
+) -> BootRowDisposition {
+    match release {
+        Err(()) => BootRowDisposition::LeaveUntouchedForRetry,
+        Ok(true) => BootRowDisposition::Act(BootFinaliseAction::EnqueueNow),
+        Ok(false) => match phase_reload {
+            Err(()) => BootRowDisposition::LeaveUntouchedForRetry,
+            Ok(None) => BootRowDisposition::Act(BootFinaliseAction::Skip),
+            Ok(Some(phase)) => BootRowDisposition::Act(boot_finalise_action_after_release(
+                false,
+                JobStatus::Broadcasting,
+                phase,
+            )),
+        },
+    }
+}
+
 /// Job-API boot-time resumer. Walks every non-terminal row in the
 /// `jobs` table and applies the partition described in
 /// `JobStore::list_interrupted_for_resume` /
@@ -532,36 +583,64 @@ pub(crate) async fn boot_resume_jobs(
             // Honour release_stale: only enqueue when the claim is free.
             // Ignoring Ok(false) re-enqueued still-owned jobs; the loser
             // then exited and the edge job was stranded forever.
-            let released = match job_store
+            //
+            // On a database error the row must stay **entirely untouched**
+            // and be retried (next boot) — never half-process (e.g. release
+            // then abort before enqueue via `?` on a subsequent load).
+            // Decision table: [`boot_finalise_disposition`].
+            let release_result = match job_store
                 .release_stale_finalise_claim(job.public_id)
                 .await
             {
-                Ok(r) => r,
+                Ok(r) => Ok(r),
                 Err(e) => {
-                    // Fail closed for this row — do not enqueue as if free.
                     eprintln!(
                         "boot_resume_jobs: release_stale_finalise_claim({}) failed: {} \
-                         (not enqueueing; fail closed)",
+                         (row left untouched for retry; fail closed)",
                         job.public_id, e
                     );
-                    continue;
+                    Err(())
                 }
             };
 
-            // Re-load phase after the release attempt (release mutates it).
-            let phase = match job_store.load(job.public_id).await? {
-                Some(j) => j.phase,
-                None => {
-                    tracing::warn!(
-                        "boot_resume_jobs: job {} vanished after release attempt",
-                        job.public_id
-                    );
-                    continue;
-                }
+            // Phase reload only when release was Ok(false). On Ok(true) the
+            // disposition enqueues without a second load so a load error
+            // cannot strand a just-freed claim.
+            let phase_reload: Result<Option<String>, ()> = match release_result {
+                Ok(false) => match job_store.load(job.public_id).await {
+                    Ok(Some(j)) => Ok(Some(j.phase)),
+                    Ok(None) => {
+                        tracing::warn!(
+                            "boot_resume_jobs: job {} vanished after release attempt",
+                            job.public_id
+                        );
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "boot_resume_jobs: load({}) after release_stale failed: {} \
+                             (row left untouched for retry; fail closed)",
+                            job.public_id, e
+                        );
+                        Err(())
+                    }
+                },
+                // Not consulted when release is Err or Ok(true).
+                _ => Ok(None),
             };
-            let action = boot_finalise_action_after_release(released, JobStatus::Broadcasting, &phase);
-            match action {
-                BootFinaliseAction::EnqueueNow => {
+
+            let disposition = boot_finalise_disposition(
+                release_result,
+                phase_reload
+                    .as_ref()
+                    .map(|o| o.as_deref())
+                    .map_err(|_| ()),
+            );
+            match disposition {
+                BootRowDisposition::LeaveUntouchedForRetry => {
+                    // Already logged; continue to next interrupted row.
+                }
+                BootRowDisposition::Act(BootFinaliseAction::EnqueueNow) => {
                     rearm_and_enqueue_v11_finalise(
                         job.public_id,
                         job_notify_map,
@@ -569,7 +648,11 @@ pub(crate) async fn boot_resume_jobs(
                     )
                     .await;
                 }
-                BootFinaliseAction::DeferUntilAbandoned => {
+                BootRowDisposition::Act(BootFinaliseAction::DeferUntilAbandoned) => {
+                    let phase = phase_reload
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| crate::job_store::FINALISE_CLAIM_PHASE.to_string());
                     tracing::info!(
                         "boot_resume_jobs: job {} still under a live finalise claim \
                          (phase={}); not enqueueing as free — scheduling reclaim",
@@ -583,10 +666,10 @@ pub(crate) async fn boot_resume_jobs(
                         job.public_id,
                     );
                 }
-                BootFinaliseAction::Skip => {
+                BootRowDisposition::Act(BootFinaliseAction::Skip) => {
                     tracing::info!(
                         "boot_resume_jobs: job {} not enqueued after release \
-                         (released={released}, phase={phase})",
+                         (disposition=Skip)",
                         job.public_id
                     );
                 }
