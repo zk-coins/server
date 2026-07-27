@@ -2266,7 +2266,7 @@ async fn job_status_round_trip_covers_all_variants() {
 
 #[tokio::test]
 async fn job_kind_round_trip_covers_all_variants() {
-    for k in [JobKind::Mint, JobKind::Send] {
+    for k in [JobKind::Mint, JobKind::Send, JobKind::AttestBalance] {
         assert_eq!(JobKind::from_db_str(k.as_str()), Some(k));
     }
     assert!(JobKind::from_db_str("nonsense").is_none());

@@ -139,6 +139,9 @@ pub async fn start_rest_node(
         // Test-only injection point (Defect 4): never installed in production.
         #[cfg(test)]
         v11_pending_after_prove: None,
+        v11_engine: v11_engine.clone(),
+        attest_challenges: Arc::new(DashMap::new()),
+        public_hosts: Arc::new(crate::v11::public_hosts_from_env()),
     };
 
     // No minting-account bootstrap: the neutral model has no

@@ -178,6 +178,8 @@ impl JobStatus {
 pub enum JobKind {
     Mint,
     Send,
+    /// §7.5 `POST /v1/attest/balance` — `C_balance` proving job (Gap G6).
+    AttestBalance,
 }
 
 impl JobKind {
@@ -185,6 +187,7 @@ impl JobKind {
         match self {
             JobKind::Mint => "mint",
             JobKind::Send => "send",
+            JobKind::AttestBalance => "attest_balance",
         }
     }
 
@@ -192,6 +195,7 @@ impl JobKind {
         match s {
             "mint" => Some(JobKind::Mint),
             "send" => Some(JobKind::Send),
+            "attest_balance" => Some(JobKind::AttestBalance),
             _ => None,
         }
     }

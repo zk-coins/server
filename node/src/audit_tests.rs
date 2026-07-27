@@ -158,6 +158,9 @@ async fn build_state_with_pool() -> (AppState, SchemaScope) {
         v11_finalise: None,
         v11_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
         v11_pending_after_prove: None,
+        v11_engine: None,
+        attest_challenges: Arc::new(dashmap::DashMap::new()),
+        public_hosts: Arc::new(vec!["node.test".to_string()]),
     };
     // tempdir lives until the test ends (Drop on test exit).
     std::mem::forget(tmp);

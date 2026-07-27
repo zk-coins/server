@@ -51,6 +51,7 @@
 //! rather than short-circuited to a status change.
 
 mod adapter;
+pub mod attest;
 pub mod db_v11;
 pub mod mode;
 pub mod publish;
@@ -60,6 +61,15 @@ pub mod separation;
 pub mod signature;
 
 pub use adapter::EngineAdapter;
+pub use attest::{
+    accept_attestation_for_network, authorise_attest_balance, ensure_v11_attest_path,
+    issue_attest_challenge, networks_have_distinct_c_balance_pins, pinned_c_balance_digest,
+    prove_attestation_for_job, public_hosts_from_env, serialize_balance_attestation,
+    unix_now, v11_attest_route_active, AttestBalanceRequest, AttestChallengeMap,
+    AttestChallengeRequest, AttestError, AttestJobBody, ATTEST_ANCHOR_LOCATOR_EDGE,
+    ATTEST_BALANCE_CHALLENGE_DOMAIN, PINNED_C_BALANCE_DIGEST_MAINNET,
+    PINNED_C_BALANCE_DIGEST_REGTEST, PINNED_C_BALANCE_DIGEST_TESTNET,
+};
 pub use mode::{
     parse_network_label, resolve_v11_shadow_mode, v11_shadow_mode_from_env, validate_v11_boot_pins,
     V11BootPins, V11ShadowMode, V11_BOOT_CONFIG_ERROR,
