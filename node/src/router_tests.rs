@@ -4693,13 +4693,16 @@ mod jobs_endpoint_tests {
             plant_signed_finalisation_job(&state.job_store, 0xE3, "k-loser-notify", true).await;
 
         // Winner already holds the exclusive claim (live owner).
-        assert_eq!(
-            state
-                .job_store
-                .claim_finalise_exclusive(job_id)
-                .await
-                .expect("winner claim"),
-            crate::job_store::FinaliseClaim::Won
+        assert!(
+            matches!(
+                state
+                    .job_store
+                    .claim_finalise_exclusive(job_id)
+                    .await
+                    .expect("winner claim"),
+                crate::job_store::FinaliseClaim::Won { .. }
+            ),
+            "winner claim must win"
         );
 
         // Shared notify state that belongs to the winner / live dispatcher.

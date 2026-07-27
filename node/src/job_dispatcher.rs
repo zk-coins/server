@@ -1490,9 +1490,10 @@ enum SignalOutcome {
 ///
 /// Dropping the work future is only cooperative (Rust cancel at the next
 /// `.await`). Durable transition commits are fenced separately by
-/// owner-qualified writes ([`JobStore::merge_finalisation_if_finalise_owner`],
+/// **fencing-token + lease** writes ([`JobStore::merge_finalisation_if_finalise_owner`],
 /// [`JobStore::complete_if_finalise_owner`]) so a worker that keeps running
-/// after loss still cannot commit.
+/// after loss — even under the same owner UUID after reclaim — still cannot
+/// commit with a stale fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FinaliseLeaseLivenessLost {
     /// `renew_finalise_claim` returned `Ok(false)` — ownership is gone.
@@ -1532,13 +1533,14 @@ impl std::fmt::Display for FinaliseLeaseLivenessLost {
 /// renew await exceeds `renew_timeout`, or the heartbeat task disappears,
 /// this future resolves to [`Err`]`(`[`FinaliseLeaseLivenessLost`]`)` and
 /// drops `work` without yielding its result. Drop is cooperative — durable
-/// commits still require owner-qualified writes.
+/// commits still require the claim fence (token + unexpired lease).
 ///
 /// `renew_every` should be well under `lease` (production uses
 /// [`crate::job_store::FINALISE_CLAIM_RENEW_INTERVAL`]). `renew_timeout`
 /// bounds each renew await (production:
 /// [`crate::job_store::FINALISE_CLAIM_RENEW_TIMEOUT`]). Renewals write
-/// `NOW() + lease` in Postgres — same clock as claim create and stale release.
+/// `NOW() + lease` in Postgres — same clock as claim create and stale release
+/// — and must match the acquisition `fence`.
 ///
 /// `work` must yield to the async runtime (await points / `spawn_blocking`
 /// for CPU-bound prove) so the heartbeat task can run. Production covers
@@ -1547,6 +1549,7 @@ pub(crate) async fn with_finalise_lease_heartbeat<F, T>(
     job_store: &JobStore,
     public_id: Uuid,
     owner: Uuid,
+    fence: i64,
     lease: std::time::Duration,
     renew_every: std::time::Duration,
     renew_timeout: std::time::Duration,
@@ -1563,7 +1566,7 @@ where
             let store = store.clone();
             async move {
                 store
-                    .renew_finalise_claim(public_id, owner, lease)
+                    .renew_finalise_claim(public_id, owner, fence, lease)
                     .await
                     .map_err(|e| e.to_string())
             }
@@ -1714,7 +1717,7 @@ where
 ///    (`members_ready`) via [`crate::router::V11FinaliseHook`] **or** skip
 ///    when `completion_result` is already durable (crash after stage)
 /// 3. persist the §7.5 completion surface on the durable capability
-/// 4. [`JobStore::complete_if_status`] — §7.5 result published onto the job row
+/// 4. [`JobStore::complete_if_finalise_owner`] — §7.5 result published onto the job row
 ///
 /// That is the **host edge**. The production hook
 /// ([`crate::v11::finalise_accepted_prove_persist_and_stage`]) leaves the
@@ -1738,19 +1741,20 @@ pub const JOB_FINALISE_HOST_EDGE: &str =
 /// |------|--------------------------------|-------|
 /// | Terminal job | — | status already terminal → no-op |
 /// | Load capability | `finalisation` envelope | rehydrate; refuse incomplete |
-/// | Exclusive claim | status + owner/lease | [`JobStore::claim_finalise_exclusive`] — **loser exits without side effects** |
+/// | Exclusive claim | status + owner/fence/lease | [`JobStore::claim_finalise_exclusive`] — **loser exits without side effects** |
 /// | Prove + apply + stage | pending + signature | finalise hook (engine + `members_ready`); skip if `completion_result` already set |
-/// | Persist completion | outcome + publisher_pubkey | **owner-qualified** `merge_finalisation_if_finalise_owner` |
-/// | Host §7.5 complete | `completion_result` + `completion_status` | **owner-qualified** `complete_if_finalise_owner` — **host edge** |
-/// | Fail (pre-claim) | — | `fail_if_status` from non-terminal only |
-/// | Fail (post-claim) | — | `fail_if_finalise_owner` — lost worker cannot fail another's job |
+/// | Persist completion | outcome + publisher_pubkey | **fence + lease** `merge_finalisation_if_finalise_owner` |
+/// | Host §7.5 complete | `completion_result` + `completion_status` | **fence + lease** `complete_if_finalise_owner` — **host edge** |
+/// | Fail (pre-claim) | — | `fail_if_status` — unclaimed rows only (never [`FINALISE_CLAIM_PHASE`]) |
+/// | Fail (post-claim) | — | `fail_if_finalise_owner` — stale fence / expired lease cannot fail |
 ///
 /// `broadcasting` is an **exclusive claim**, not a permission: exactly one
 /// resumer wins the CAS; the loser observes [`FinaliseClaim::Lost`] and must
 /// not continue into side effects **and must not mutate shared notify state**.
 ///
-/// After the claim is won, durable transition commits are fenced on **claim
-/// ownership**, not on status. Dropping a future after lease loss is only
+/// After the claim is won, durable transition commits are fenced on the
+/// **acquisition fencing token** plus a still-valid lease — not on owner
+/// identity or status alone. Dropping a future after lease loss is only
 /// cooperative; the write predicates are the safety mechanism.
 async fn drive_v11_finalise(
     job_store: &JobStore,
@@ -1762,7 +1766,9 @@ async fn drive_v11_finalise(
     use crate::job_store::FinaliseClaim;
 
     // Helper: fail with a §7.5 machine code, clean envelopes, drop notify.
-    // Pre-claim only: status-qualified (no exclusive owner yet).
+    // Pre-claim only: status-qualified and **never** touches a claimed row
+    // (`fail_if_status` refuses [`FINALISE_CLAIM_PHASE`]). Terminal writes
+    // on an owned epoch must use the fence path below.
     async fn fail_v11(
         job_store: &JobStore,
         app_state: &AppState,
@@ -1772,14 +1778,24 @@ async fn drive_v11_finalise(
         message: String,
     ) -> anyhow::Result<()> {
         let err = crate::v11::encode_job_error(code, message.clone());
-        // Status-qualified: do not overwrite a concurrent complete/cancel.
-        let _ = job_store
+        // Unclaimed only: do not terminate a row another epoch owns.
+        let failed = job_store
             .fail_if_status(
                 public_id,
                 &[JobStatus::AwaitingSignature, JobStatus::Broadcasting],
                 &err,
             )
             .await?;
+        if !failed {
+            // Row is terminal, claimed, or already moved — do not strip
+            // notify that may belong to a live claim holder.
+            tracing::info!(
+                %public_id,
+                "Job dispatcher: pre-claim fail_if_status was a no-op \
+                 (owned, terminal, or moved); leaving shared notify intact"
+            );
+            return Ok(());
+        }
         publish_phase(
             notify_map,
             public_id,
@@ -1796,26 +1812,29 @@ async fn drive_v11_finalise(
         Ok(())
     }
 
-    // Post-claim fail: owner-qualified so a lost worker cannot fail a job
-    // another resumer now holds. `Ok(false)` is quiet loss — leave notify.
+    // Post-claim fail: fence-qualified so a lost/stale worker cannot fail a
+    // job another epoch holds (including same-owner reclaim). `Ok(false)` is
+    // quiet loss — leave notify.
     async fn fail_v11_as_owner(
         job_store: &JobStore,
         app_state: &AppState,
         notify_map: &JobNotifyMap,
         public_id: Uuid,
         owner: Uuid,
+        fence: i64,
         code: &str,
         message: String,
     ) -> anyhow::Result<()> {
         let err = crate::v11::encode_job_error(code, message.clone());
         let failed = job_store
-            .fail_if_finalise_owner(public_id, owner, &err)
+            .fail_if_finalise_owner(public_id, owner, fence, &err)
             .await?;
         if !failed {
             tracing::info!(
                 %public_id,
                 %owner,
-                "Job dispatcher: fail_if_finalise_owner was a no-op (ownership lost); \
+                fence,
+                "Job dispatcher: fail_if_finalise_owner was a no-op (fence/lease lost); \
                  leaving shared notify state intact"
             );
             return Ok(());
@@ -1894,31 +1913,35 @@ async fn drive_v11_finalise(
         .await;
     }
 
-    // Exclusive claim — broadcasting is ownership, not permission.
-    match job_store.claim_finalise_exclusive(public_id).await? {
-        FinaliseClaim::Won => {
+    // Exclusive claim — broadcasting is ownership, not permission. The fence
+    // token minted here is the only credential durable writes accept.
+    let claim_fence = match job_store.claim_finalise_exclusive(public_id).await? {
+        FinaliseClaim::Won { fence } => {
             tracing::info!(
-                "Job dispatcher: job {} won exclusive finalise claim (owner={})",
+                "Job dispatcher: job {} won exclusive finalise claim (owner={}, fence={})",
                 public_id,
-                job_store.process_owner()
+                job_store.process_owner(),
+                fence
             );
             // Full lease window from Postgres NOW() before the long path.
             let renewed = job_store
                 .renew_finalise_claim(
                     public_id,
                     job_store.process_owner(),
+                    fence,
                     crate::job_store::FINALISE_CLAIM_LEASE,
                 )
                 .await?;
             if !renewed {
-                // Already claimed then lost before prove — owner fence if we
-                // still hold it; otherwise quiet exit (do not fail another's job).
+                // Already claimed then lost before prove — fence if we still
+                // hold this epoch; otherwise quiet exit.
                 return fail_v11_as_owner(
                     job_store,
                     app_state,
                     notify_map,
                     public_id,
                     job_store.process_owner(),
+                    fence,
                     "internal_error",
                     "v1.1 finalise: won claim but immediate lease renew failed \
                      (lost ownership before prove)"
@@ -1926,6 +1949,7 @@ async fn drive_v11_finalise(
                 )
                 .await;
             }
+            fence
         }
         FinaliseClaim::Lost { observed } => {
             if observed.is_terminal() {
@@ -1951,7 +1975,7 @@ async fn drive_v11_finalise(
             );
             return Ok(());
         }
-    }
+    };
 
     let claim_owner = job_store.process_owner();
 
@@ -1968,14 +1992,14 @@ async fn drive_v11_finalise(
     );
 
     // Heartbeat covers prove **and** host-edge completion writes. Dropping
-    // the work future on lease loss is cooperative only; owner-qualified
-    // durable writes are the real fence for anything that still runs.
+    // the work future on lease loss is cooperative only; fence + lease
+    // durable writes are the real barrier for anything that still runs.
     //
-    // What a worker can still do between losing its lease and noticing:
+    // What a worker can still do with a stale fence / expired lease:
     // pure in-process work (CPU prove segments between `.await`s, in-memory
     // apply under a local write gate). It must not commit job-row transitions
-    // — completion persist, terminal complete, and owner-scoped fail all
-    // require `finalise_claim.owner = this process`.
+    // — completion persist, terminal complete, and fence-scoped fail all
+    // require the current fence token and an unexpired lease.
     let owned_drive = async {
         // If prove+apply already recorded the §7.5 surface, skip the hook and
         // only publish + complete (crash window after durable stage + completion
@@ -1992,6 +2016,7 @@ async fn drive_v11_finalise(
                     notify_map,
                     public_id,
                     claim_owner,
+                    claim_fence,
                     "internal_error",
                     "v1.1 finalise: no finalise driver and no durable completion_result \
                      — cannot prove/apply or complete (incomplete capability path; \
@@ -2018,6 +2043,7 @@ async fn drive_v11_finalise(
                             notify_map,
                             public_id,
                             claim_owner,
+                            claim_fence,
                             "internal_error",
                             format!("v1.1 finalise: install_completion failed: {e}"),
                         )
@@ -2025,7 +2051,7 @@ async fn drive_v11_finalise(
                     }
                     // Persist completion onto the durable capability **before**
                     // the terminal complete flip so a crash here is resumable.
-                    // Owner-qualified jsonb_set: lost workers cannot commit;
+                    // Fence-qualified jsonb_set: stale epochs cannot commit;
                     // concurrent lease renew is not clobbered.
                     let persist = match crate::v11::DurableFinalisationPersist::from_entry(&entry)
                     {
@@ -2037,6 +2063,7 @@ async fn drive_v11_finalise(
                                 notify_map,
                                 public_id,
                                 claim_owner,
+                                claim_fence,
                                 "internal_error",
                                 format!("v1.1 finalise: encode completion capability: {e}"),
                             )
@@ -2052,6 +2079,7 @@ async fn drive_v11_finalise(
                                 notify_map,
                                 public_id,
                                 claim_owner,
+                                claim_fence,
                                 "internal_error",
                                 format!(
                                     "v1.1 finalise: json-encode completion capability: {e}"
@@ -2064,16 +2092,17 @@ async fn drive_v11_finalise(
                         .merge_finalisation_if_finalise_owner(
                             public_id,
                             claim_owner,
+                            claim_fence,
                             &persist_val,
                         )
                         .await?;
                     if !wrote {
                         tracing::info!(
                             "Job dispatcher: job {} completion persist was a no-op \
-                             (ownership lost or claim free); exiting without re-complete",
+                             (fence/lease lost or claim free); exiting without re-complete",
                             public_id
                         );
-                        // Do not strip notify — may belong to a new owner.
+                        // Do not strip notify — may belong to a new epoch.
                         return Ok(());
                     }
                     app_state.pending_sign_map.insert(public_id, entry.clone());
@@ -2087,6 +2116,7 @@ async fn drive_v11_finalise(
                         notify_map,
                         public_id,
                         claim_owner,
+                        claim_fence,
                         "proving_failed",
                         msg,
                     )
@@ -2097,7 +2127,7 @@ async fn drive_v11_finalise(
 
         // Host §7.5 job-result publication + terminal complete.
         // This is [`JOB_FINALISE_HOST_EDGE`] — not on-chain AggregateStateNullifierV3.
-        // Fence is claim ownership, not status alone.
+        // Fence is claim token + unexpired lease, not status or owner alone.
         if let Err(msg) = crate::v11::ensure_completion_ready(&entry) {
             return fail_v11_as_owner(
                 job_store,
@@ -2105,6 +2135,7 @@ async fn drive_v11_finalise(
                 notify_map,
                 public_id,
                 claim_owner,
+                claim_fence,
                 "internal_error",
                 format!("v1.1 finalise: incomplete capability for host complete: {msg}"),
             )
@@ -2121,6 +2152,7 @@ async fn drive_v11_finalise(
             .complete_if_finalise_owner(
                 public_id,
                 claim_owner,
+                claim_fence,
                 response_body.clone(),
                 response_status,
             )
@@ -2148,7 +2180,7 @@ async fn drive_v11_finalise(
         } else {
             tracing::info!(
                 "Job dispatcher: job {} complete_if_finalise_owner was a no-op \
-                 (ownership lost or already terminal); leaving shared notify intact",
+                 (fence/lease lost or already terminal); leaving shared notify intact",
                 public_id
             );
         }
@@ -2159,6 +2191,7 @@ async fn drive_v11_finalise(
         job_store,
         public_id,
         claim_owner,
+        claim_fence,
         crate::job_store::FINALISE_CLAIM_LEASE,
         crate::job_store::FINALISE_CLAIM_RENEW_INTERVAL,
         crate::job_store::FINALISE_CLAIM_RENEW_TIMEOUT,
@@ -2172,7 +2205,7 @@ async fn drive_v11_finalise(
             // do not fail the job (another resumer must be able to pick
             // it up once the claim is free), leave shared notify intact.
             // Even if work segments still run until the next `.await`,
-            // owner-qualified writes refuse commits from this process.
+            // fence-qualified writes refuse commits from this epoch.
             tracing::error!(
                 %public_id,
                 reason = %lost,
