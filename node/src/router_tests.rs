@@ -6595,9 +6595,40 @@ mod jobs_endpoint_tests {
         clear_process_stack_mode_for_test();
     }
 
-    /// Defect 3: flag-off `GET /` is byte-identical to the pre-G6 root map
-    /// — the attest keys are absent (not null), so the endpoints object
-    /// matches the closed always-on key set from before this branch.
+    /// Frozen pre-G6 endpoints JSON (raw bytes). Single independent
+    /// golden for flag-off `GET /` — not re-derived from the live type, so
+    /// reordering fields or changing values turns this red even when a
+    /// hand-written `Value` map would still parse-equal.
+    const PRE_G6_ENDPOINTS_JSON: &str = concat!(
+        r#"{"info":"GET  /api/info","balance":"GET  /api/balance?address={hex}","#,
+        r#""history":"GET  /api/history?address={hex}&limit={n}&offset={n}","#,
+        r#""receive":"POST /api/receive","admit_mint":"POST /api/jobs/mint","#,
+        r#""admit_send":"POST /api/jobs/send","get_job":"GET  /api/jobs/{job_id}","#,
+        r#""stream_job":"GET  /api/jobs/{job_id}/stream","commit":"POST /api/jobs/{job_id}/commit","#,
+        r#""sign":"POST /v1/jobs/{job_id}/sign","cancel":"POST /api/jobs/{job_id}/cancel","#,
+        r#""proof":"GET  /api/proof/{id}","inscription":"GET  /api/inscriptions/{txid}","#,
+        r#""username_resolve":"GET  /api/username/resolve/{username}","health":"GET  /health","#,
+        r#""health_ready":"GET  /health/ready","health_publisher":"GET  /health/publisher","#,
+        r#""openapi":"GET  /openapi.json","docs":"GET  /docs"}"#,
+    );
+
+    /// Defect 4: type-derived always-on map serialises to the frozen
+    /// pre-G6 endpoints bytes. Adding/reordering/renaming a
+    /// [`RootEndpoints`] field without updating the golden turns this red.
+    #[test]
+    fn root_endpoints_type_serialises_to_pre_g6_golden_bytes() {
+        let live = serde_json::to_string(&crate::router::root_endpoints_always_on())
+            .expect("RootEndpoints serialises");
+        assert_eq!(
+            live.as_bytes(),
+            PRE_G6_ENDPOINTS_JSON.as_bytes(),
+            "RootEndpoints serde bytes must match the frozen pre-G6 golden"
+        );
+    }
+
+    /// Defects 2+4: flag-off `GET /` raw body is byte-identical to the
+    /// pre-G6 root response (endpoints from the type golden; no attest
+    /// keys). Value equality alone is not enough — compare raw bytes.
     #[tokio::test]
     async fn root_flag_off_is_byte_identical_to_pre_attestation_map() {
         let _lock = lock_v11_stack_for_test();
@@ -6608,57 +6639,86 @@ mod jobs_endpoint_tests {
         let req = Request::get("/").body(Body::empty()).unwrap();
         let (status, _h, resp) = run(state, req).await;
         assert_eq!(status, StatusCode::OK, "body: {resp}");
-        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
-        let endpoints = v["endpoints"].as_object().expect("endpoints object");
 
-        // Keys must not appear at all (skip_serializing_if), not as null.
-        assert!(
-            !endpoints.contains_key("attest_balance_challenge"),
-            "flag-off root must omit attest_balance_challenge: {resp}"
+        // Expected full body from the frozen endpoints golden + live
+        // version/network (those two fields are env/build derived and
+        // are not part of the G6 surface change).
+        let expected = serde_json::json!({
+            "service": "zkcoins-node",
+            "version": env!("CARGO_PKG_VERSION"),
+            "network": crate::NETWORK_CONFIG.network_name.as_str(),
+            "endpoints": serde_json::from_str::<serde_json::Value>(PRE_G6_ENDPOINTS_JSON).unwrap(),
+            "docs": "https://docs.zkcoins.app",
+        });
+        let expected_raw = serde_json::to_string(&expected).expect("serialize expected");
+        assert_eq!(
+            resp.as_bytes(),
+            expected_raw.as_bytes(),
+            "flag-off GET / raw bytes must match pre-G6 response\n got: {resp}\nwant: {expected_raw}"
         );
-        assert!(
-            !endpoints.contains_key("attest_balance"),
-            "flag-off root must omit attest_balance: {resp}"
-        );
-        // Raw body must not contain the attest keys either (true byte identity
-        // of the wire form, not just Value key absence after reparse).
         assert!(
             !resp.contains("attest_balance"),
             "flag-off raw body must not mention attest_balance*: {resp}"
         );
+    }
 
-        // Full endpoints object must match the pre-G6 payload exactly
-        // (Value equality is key-order-independent; the raw-body check
-        // above pins that the keys are truly omitted, not null).
-        let expected_endpoints = serde_json::json!({
-            "info": "GET  /api/info",
-            "balance": "GET  /api/balance?address={hex}",
-            "history": "GET  /api/history?address={hex}&limit={n}&offset={n}",
-            "receive": "POST /api/receive",
-            "admit_mint": "POST /api/jobs/mint",
-            "admit_send": "POST /api/jobs/send",
-            "get_job": "GET  /api/jobs/{job_id}",
-            "stream_job": "GET  /api/jobs/{job_id}/stream",
-            "commit": "POST /api/jobs/{job_id}/commit",
-            "sign": "POST /v1/jobs/{job_id}/sign",
-            "cancel": "POST /api/jobs/{job_id}/cancel",
-            "proof": "GET  /api/proof/{id}",
-            "inscription": "GET  /api/inscriptions/{txid}",
-            "username_resolve": "GET  /api/username/resolve/{username}",
-            "health": "GET  /health",
-            "health_ready": "GET  /health/ready",
-            "health_publisher": "GET  /health/publisher",
-            "openapi": "GET  /openapi.json",
-            "docs": "GET  /docs",
-        });
-        assert_eq!(
-            v["endpoints"], expected_endpoints,
-            "flag-off endpoints payload must be byte-identical to pre-G6"
+    /// Defects 2+4: flag-off OpenAPI document omits attest keys and its
+    /// `RootEndpoints` schema matches the type-derived always-on map.
+    ///
+    /// Pins the **document content** via [`crate::openapi::openapi_json`]
+    /// (the same process-cached builder the handler would serve). HTTP
+    /// route registration of `GET /openapi.json` was dropped in the
+    /// Job-API refactor (#161 / `86491ab`) and is pre-existing / out of
+    /// G6 scope — do not re-wire it here. Reintroducing attest fields on
+    /// the `RootEndpoints` ToSchema type turns this red.
+    #[test]
+    fn openapi_flag_off_raw_bytes_omit_attest_and_match_type_schema() {
+        let resp = crate::openapi::openapi_json();
+        assert!(
+            !resp.contains("attest_balance"),
+            "flag-off openapi must not advertise attest_balance*: {}",
+            &resp[..resp.len().min(500)]
         );
+
+        // RootEndpoints schema property set equals the type-derived keys
+        // (no attest_*). Independent of Value-key presence after reparse.
+        let v: serde_json::Value = serde_json::from_str(resp).expect("openapi json");
+        let props = v["components"]["schemas"]["RootEndpoints"]["properties"]
+            .as_object()
+            .expect("RootEndpoints.properties");
+        // Derive from the live type via serde field names.
+        let live = serde_json::to_value(crate::router::root_endpoints_always_on()).unwrap();
+        let type_keys: Vec<String> = live
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
         assert_eq!(
-            endpoints.len(),
-            expected_endpoints.as_object().unwrap().len(),
-            "flag-off must not add extra endpoint keys"
+            props.len(),
+            type_keys.len(),
+            "OpenAPI RootEndpoints property count must match RootEndpoints type"
+        );
+        for k in &type_keys {
+            assert!(
+                props.contains_key(k),
+                "OpenAPI schema missing type field {k}"
+            );
+        }
+        assert!(
+            !props.contains_key("attest_balance")
+                && !props.contains_key("attest_balance_challenge"),
+            "OpenAPI RootEndpoints must not define attest_* properties"
+        );
+
+        // Raw-byte identity of the cached document against a second call
+        // (OnceLock). A reordering or schema property change alters these
+        // bytes relative to the pre-G6 component set.
+        let again = crate::openapi::openapi_json();
+        assert_eq!(
+            resp.as_bytes(),
+            again.as_bytes(),
+            "openapi_json() must be process-stable raw bytes"
         );
     }
 

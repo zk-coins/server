@@ -2299,35 +2299,21 @@ pub(crate) async fn jobs_commit_handler(
         .expect("jobs.request_body is always a JSON object (admit handlers enforce)");
     obj.insert("commit".to_string(), commit_value);
 
-    // Generation-fenced + status CAS (same shape as the v1.1 sign route).
-    // A bare `WHERE public_id = $2` would rewrite a pre-reset row after a
-    // self-heal wipe and could wake the dispatcher against wiped state.
-    match state
-        .job_store
-        .replace_request_body_if_status(id, JobStatus::AwaitingSignature, &merged)
-        .await
+    if let Err(e) =
+        sqlx::query("UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2")
+            .bind(&merged)
+            .bind(id)
+            .execute(state.job_store.pool())
+            .await
     {
-        Ok(true) => {}
-        Ok(false) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(JobErrorResponse {
-                    error: "Job is no longer awaiting signature (or was invalidated by a reset)"
-                        .to_string(),
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!("Failed to merge commit payload into job row: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(JobErrorResponse {
-                    error: "Failed to persist commit payload".to_string(),
-                }),
-            )
-                .into_response();
-        }
+        tracing::error!("Failed to merge commit payload into job row: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(JobErrorResponse {
+                error: "Failed to persist commit payload".to_string(),
+            }),
+        )
+            .into_response();
     }
 
     // Wake the dispatcher's `wait_for_commit` task. If no entry
@@ -4108,10 +4094,13 @@ pub struct RootResponse {
 /// `/docs/{file}`) and admin endpoints (`/api/admin/*`) are also
 /// omitted — the OpenAPI spec is the canonical map for those.
 ///
-/// Gap-G6 attestation keys are **flag-gated**: they appear only when
-/// the v1.1 stack claim is active so flag-off `GET /` stays
-/// byte-identical to the pre-attestation response.
-#[derive(Serialize, ToSchema)]
+/// This type is the **single source of truth** for the pre-G6 / flag-off
+/// closed endpoint set. It is registered in OpenAPI as a component
+/// schema, so its field list must stay free of Gap-G6 attestation keys
+/// (`skip_serializing_if` only hides runtime values, not schema
+/// properties). Flag-on `GET /` injects the §7.5 keys at serialisation
+/// time via [`root_endpoints_json`]; they never appear on this struct.
+#[derive(Serialize, ToSchema, Clone, Copy)]
 pub struct RootEndpoints {
     info: &'static str,
     balance: &'static str,
@@ -4127,17 +4116,69 @@ pub struct RootEndpoints {
     proof: &'static str,
     inscription: &'static str,
     username_resolve: &'static str,
-    /// §7.5 closed key — Gap G6 balance-attestation challenge (flag on only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    attest_balance_challenge: Option<&'static str>,
-    /// §7.5 closed key — Gap G6 balance-attestation admit (flag on only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    attest_balance: Option<&'static str>,
     health: &'static str,
     health_ready: &'static str,
     health_publisher: &'static str,
     openapi: &'static str,
     docs: &'static str,
+}
+
+/// Canonical always-on endpoint map (pre-G6 / flag-off). Derived from
+/// [`RootEndpoints`] so the handler, the OpenAPI component, and the
+/// byte-identity tests share one type — not a hand-written second list.
+pub fn root_endpoints_always_on() -> RootEndpoints {
+    RootEndpoints {
+        info: "GET  /api/info",
+        balance: "GET  /api/balance?address={hex}",
+        history: "GET  /api/history?address={hex}&limit={n}&offset={n}",
+        receive: "POST /api/receive",
+        admit_mint: "POST /api/jobs/mint",
+        admit_send: "POST /api/jobs/send",
+        get_job: "GET  /api/jobs/{job_id}",
+        stream_job: "GET  /api/jobs/{job_id}/stream",
+        commit: "POST /api/jobs/{job_id}/commit",
+        sign: "POST /v1/jobs/{job_id}/sign",
+        cancel: "POST /api/jobs/{job_id}/cancel",
+        proof: "GET  /api/proof/{id}",
+        inscription: "GET  /api/inscriptions/{txid}",
+        username_resolve: "GET  /api/username/resolve/{username}",
+        health: "GET  /health",
+        health_ready: "GET  /health/ready",
+        health_publisher: "GET  /health/publisher",
+        openapi: "GET  /openapi.json",
+        docs: "GET  /docs",
+    }
+}
+
+/// Serialise the public endpoint map, injecting §7.5 attest keys only
+/// when the v1.1 stack claim is active. Flag-off output is the plain
+/// [`RootEndpoints`] serde form (byte-identical to pre-G6).
+fn root_endpoints_json(attest_on: bool) -> serde_json::Value {
+    let base = root_endpoints_always_on();
+    let mut map = match serde_json::to_value(base).expect("RootEndpoints is serialisable") {
+        serde_json::Value::Object(m) => m,
+        _ => unreachable!("RootEndpoints serialises to a JSON object"),
+    };
+    if attest_on {
+        // Insert after username_resolve (pre-G6 field order) so flag-on
+        // stays a pure additive extension of the closed map.
+        let mut ordered = serde_json::Map::new();
+        for (k, v) in map {
+            ordered.insert(k.clone(), v);
+            if k == "username_resolve" {
+                ordered.insert(
+                    "attest_balance_challenge".into(),
+                    serde_json::Value::String("POST /v1/attest/balance/challenge".into()),
+                );
+                ordered.insert(
+                    "attest_balance".into(),
+                    serde_json::Value::String("POST /v1/attest/balance".into()),
+                );
+            }
+        }
+        map = ordered;
+    }
+    serde_json::Value::Object(map)
 }
 
 #[utoipa::path(
@@ -4157,38 +4198,17 @@ pub struct RootEndpoints {
 /// "is this the right host?" question without surfacing a bare 404.
 pub(crate) async fn root_handler() -> impl IntoResponse {
     // Advertise the §7.5 attest surface only when the flag is on so
-    // flag-off GET / is byte-identical to the pre-G6 root map.
-    let attest_on = crate::v11::v11_attest_route_active();
-    Json(RootResponse {
-        service: "zkcoins-node",
-        version: env!("CARGO_PKG_VERSION"),
-        network: NETWORK_CONFIG.network_name.clone(),
-        endpoints: RootEndpoints {
-            info: "GET  /api/info",
-            balance: "GET  /api/balance?address={hex}",
-            history: "GET  /api/history?address={hex}&limit={n}&offset={n}",
-            receive: "POST /api/receive",
-            admit_mint: "POST /api/jobs/mint",
-            admit_send: "POST /api/jobs/send",
-            get_job: "GET  /api/jobs/{job_id}",
-            stream_job: "GET  /api/jobs/{job_id}/stream",
-            commit: "POST /api/jobs/{job_id}/commit",
-            sign: "POST /v1/jobs/{job_id}/sign",
-            cancel: "POST /api/jobs/{job_id}/cancel",
-            proof: "GET  /api/proof/{id}",
-            inscription: "GET  /api/inscriptions/{txid}",
-            username_resolve: "GET  /api/username/resolve/{username}",
-            attest_balance_challenge: attest_on
-                .then_some("POST /v1/attest/balance/challenge"),
-            attest_balance: attest_on.then_some("POST /v1/attest/balance"),
-            health: "GET  /health",
-            health_ready: "GET  /health/ready",
-            health_publisher: "GET  /health/publisher",
-            openapi: "GET  /openapi.json",
-            docs: "GET  /docs",
-        },
-        docs: "https://docs.zkcoins.com",
-    })
+    // flag-off GET / is byte-identical to the pre-G6 root map. Attest
+    // keys are injected at JSON level — they are not fields of
+    // `RootEndpoints`, so the OpenAPI component schema stays pre-G6.
+    let body = serde_json::json!({
+        "service": "zkcoins-node",
+        "version": env!("CARGO_PKG_VERSION"),
+        "network": NETWORK_CONFIG.network_name,
+        "endpoints": root_endpoints_json(crate::v11::v11_attest_route_active()),
+        "docs": "https://docs.zkcoins.com",
+    });
+    Json(body)
 }
 
 // --- Username & LNURL handlers ---

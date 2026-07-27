@@ -35,7 +35,11 @@
 //! - a durable scanner-owned `pk → (txid, block_hash)` index (not in
 //!   this worktree; scanner folds Pk/R only), or
 //! - a still-live `v11_pending_publishes.reveal_txid` for **this
-//!   node's own** publish of that nullifier (partial, until GC).
+//!   node's own** publish of that nullifier (partial, until GC), plus
+//!   the inclusion-block hash: live `tip_hash` when the nullifier
+//!   height equals the tip, otherwise the durable `block_log` row at
+//!   that height (completed anchors sit ≥6 confirmations below tip, so
+//!   they **must** use `block_log` — tip-hash alone can never serve them).
 //!
 //! When the locator cannot be resolved the job fails loud with
 //! [`ATTEST_ANCHOR_LOCATOR_EDGE`] — never fabricates zero txid/block_hash.
@@ -806,7 +810,8 @@ pub fn networks_have_distinct_c_balance_pins(a: Network, b: Network) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Materials required from the engine for an attestation witness.
-struct AttestMaterials {
+#[derive(Debug)]
+pub(crate) struct AttestMaterials {
     account_state: shared::spec_v1::AccountState,
     compliance_proof: zkcoins_prover::prover_bridge::ComplianceProof,
     nav_opening: zkcoins_prover::prover_bridge::NavOpening,
@@ -820,7 +825,10 @@ struct AttestMaterials {
     anchor_block_hash: Option<[u8; 32]>,
 }
 
-fn collect_materials(
+/// Assemble engine materials for an attestation (includes the §5.7
+/// completed-anchor gate). `pub(crate)` so production-path tests can
+/// drive it without going through a full `C_balance` prove.
+pub(crate) fn collect_materials(
     adapter: &EngineAdapter,
     subject: &Address,
     asset_id: &[u8; 32],
@@ -963,8 +971,51 @@ fn collect_materials(
     })
 }
 
+/// Pick the inclusion-block hash for a nullifier at `nullifier_height`.
+///
+/// - **At tip** (`nullifier_height == tip_height`): the adapter's live
+///   `tip_hash` (all-zero refused).
+/// - **Below tip** (confirmed, including every ≥6-confirmation-final
+///   completed anchor): the durable scanner `block_log` entry for that
+///   height (`historical_hash`). The adapter only retains the tip hash,
+///   so historical heights cannot come from `tip_hash`.
+///
+/// Returns `None` when no trustworthy non-zero hash is available — the
+/// caller must surface [`ATTEST_ANCHOR_LOCATOR_EDGE`], never fabricate.
+pub fn block_hash_for_anchor_height(
+    nullifier_height: u64,
+    tip_height: u64,
+    tip_hash: [u8; 32],
+    historical_hash: Option<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    let candidate = if nullifier_height == tip_height {
+        Some(tip_hash)
+    } else if nullifier_height < tip_height {
+        historical_hash
+    } else {
+        // Nullifier height above the engine tip is not on this scan view.
+        None
+    }?;
+    if candidate == [0u8; 32] {
+        None
+    } else {
+        Some(candidate)
+    }
+}
+
 /// Resolve Bitcoin locator from still-live pending publishes (partial path).
-async fn resolve_anchor_locator(
+///
+/// Yields `(reveal_txid, inclusion_block_hash)` when both can be resolved:
+/// - `txid` from `v11_pending_publishes.reveal_txid` for this Pk
+/// - `block_hash` via [`block_hash_for_anchor_height`] — tip hash when the
+///   nullifier sits at the tip, otherwise the `block_log` hash for the
+///   inclusion height (so a completed anchor at height `h` with tip
+///   `≥ h+5` still resolves).
+///
+/// For a confirmed-but-not-tip anchor this therefore returns
+/// `Some(reveal_txid)` + `Some(block_log_hash_at_nullifier_height)`, not
+/// the live tip hash.
+pub(crate) async fn resolve_anchor_locator(
     adapter: &EngineAdapter,
     pk: &[u8; 32],
     nullifier_height: u64,
@@ -973,19 +1024,21 @@ async fn resolve_anchor_locator(
         .await
         .map_err(|e| AttestError::Internal(format!("load pending publish: {e}")))?;
     let txid = pending.and_then(|p| p.reveal_txid);
-    // block_hash: only trustworthy when the nullifier height equals tip
-    // and we hold tip_hash — otherwise refuse rather than guess.
-    let block_hash = if txid.is_some() && nullifier_height == adapter.with_engine(|e| e.tip_height())
-    {
-        let h = adapter.tip_hash();
-        if h == [0u8; 32] {
-            None
-        } else {
-            Some(h)
-        }
+    if txid.is_none() {
+        return Ok((None, None));
+    }
+
+    let tip_height = adapter.with_engine(|e| e.tip_height());
+    let tip_hash = adapter.tip_hash();
+    let historical = if nullifier_height < tip_height {
+        crate::db::load_block_hash_at_height(adapter.pool(), nullifier_height)
+            .await
+            .map_err(|e| AttestError::Internal(format!("load block_log at height: {e}")))?
     } else {
         None
     };
+    let block_hash =
+        block_hash_for_anchor_height(nullifier_height, tip_height, tip_hash, historical);
     Ok((txid, block_hash))
 }
 
@@ -1602,6 +1655,311 @@ mod tests {
         let (t, b) = require_resolved_anchor(Some([1u8; 32]), Some([2u8; 32])).unwrap();
         assert_eq!(t, [1u8; 32]);
         assert_eq!(b, [2u8; 32]);
+    }
+
+    /// Pure height→hash selection: tip hash only at the tip; historical
+    /// (completed) heights take the durable hash, never the live tip.
+    #[test]
+    fn block_hash_for_anchor_height_tip_vs_historical() {
+        let tip_hash = [0xAAu8; 32];
+        let hist = [0xBBu8; 32];
+        // At tip → tip_hash.
+        assert_eq!(
+            block_hash_for_anchor_height(105, 105, tip_hash, Some(hist)),
+            Some(tip_hash)
+        );
+        // Confirmed-but-not-tip (completed-anchor shape) → historical.
+        assert_eq!(
+            block_hash_for_anchor_height(100, 105, tip_hash, Some(hist)),
+            Some(hist)
+        );
+        // Missing historical at non-tip → None (edge, no tip-hash guess).
+        assert_eq!(
+            block_hash_for_anchor_height(100, 105, tip_hash, None),
+            None
+        );
+        // All-zero tip hash refused.
+        assert_eq!(
+            block_hash_for_anchor_height(105, 105, [0u8; 32], None),
+            None
+        );
+        // Height above tip refused.
+        assert_eq!(
+            block_hash_for_anchor_height(110, 105, tip_hash, Some(hist)),
+            None
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Production-path fixtures (engine + NfLog + collect_materials)
+    // -----------------------------------------------------------------------
+
+    fn hollow_compliance_proof() -> zkcoins_prover::prover_bridge::ComplianceProof {
+        use plonky2::field::polynomial::PolynomialCoeffs;
+        use plonky2::field::types::Field;
+        use plonky2::fri::proof::FriProof;
+        use plonky2::hash::merkle_tree::MerkleCap;
+        use plonky2::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
+        use zkcoins_program::F;
+
+        ProofWithPublicInputs {
+            proof: Proof {
+                wires_cap: MerkleCap(vec![]),
+                plonk_zs_partial_products_cap: MerkleCap(vec![]),
+                quotient_polys_cap: MerkleCap(vec![]),
+                openings: OpeningSet {
+                    constants: vec![],
+                    plonk_sigmas: vec![],
+                    wires: vec![],
+                    plonk_zs: vec![],
+                    plonk_zs_next: vec![],
+                    partial_products: vec![],
+                    quotient_polys: vec![],
+                    lookup_zs: vec![],
+                    lookup_zs_next: vec![],
+                },
+                opening_proof: FriProof {
+                    commit_phase_merkle_caps: vec![],
+                    query_round_proofs: vec![],
+                    final_poly: PolynomialCoeffs::new(vec![]),
+                    pow_witness: F::ZERO,
+                },
+            },
+            public_inputs: vec![F::ZERO; 4],
+        }
+    }
+
+    /// Seed an adapter with one first-occurrence nullifier at `fold_height`,
+    /// tip advanced to `tip_height`, and a subject account whose last
+    /// nullifier points at that fold. Classification is derived from the
+    /// live NfLog (not caller-supplied).
+    async fn seeded_attest_adapter(
+        fold_height: u64,
+        tip_height: u64,
+    ) -> (
+        crate::test_db::SchemaScope,
+        EngineAdapter,
+        Address,
+        [u8; 32],
+        [u8; 32],
+        [u8; 32],
+    ) {
+        use shared::spec_v1::{AccountState, ChainPosition, CoinHistTree, PublishedNullifier};
+        use std::collections::{BTreeMap, BTreeSet};
+        use zkcoins_prover::prover_bridge::{NavOpening, NullifierOpening};
+        use zkcoins_prover::state_engine::{AccountRecord, ScannedNullifier};
+
+        use super::super::separation::{
+            claim_stack_scan_mode, clear_process_stack_mode_for_test, set_process_stack_mode,
+            ScanStackMode,
+        };
+        use crate::test_db::setup_pool;
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim v11");
+
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("adapter");
+
+        let pk = [0x11u8; 32];
+        let r = [0x22u8; 32];
+        let r_prime = [0x33u8; 32];
+        let owner = Address([0xA1u8; 32]);
+        let asset_id = [0xAAu8; 32];
+        let inclusion_hash = [0xBBu8; 32];
+        let tip_hash = [0xCCu8; 32];
+
+        adapter
+            .with_engine_mut(|engine| {
+                engine.set_tip_height(fold_height);
+                let pos = engine
+                    .append_nullifier(ScannedNullifier::from_survivor(&PublishedNullifier {
+                        chain_pos: ChainPosition {
+                            height: fold_height,
+                            tx_index: 0,
+                            vin_index: 0,
+                            member_index: 0,
+                        },
+                        pk,
+                        r,
+                    }))
+                    .expect("fold winning nullifier");
+                assert_eq!(pos, 0);
+
+                let mut balances = BTreeMap::new();
+                balances.insert(asset_id, 7u128);
+                let coinhist = CoinHistTree::new();
+                let state = AccountState::new(
+                    owner,
+                    host::ZERO_HASH,
+                    balances,
+                    pk,
+                    1,
+                    coinhist.root(),
+                )
+                .expect("AccountState");
+                let record = AccountRecord {
+                    state,
+                    coinhist,
+                    nk: [0xD1; 32],
+                    genesis_pubkey: [0xB0; 32],
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: Some(hollow_compliance_proof()),
+                    last_nav_opening: Some(NavOpening {
+                        nav: Nav {
+                            size: 0,
+                            mth: host::nflog_empty(),
+                        },
+                        nav_rand: [0x55; 32],
+                    }),
+                    last_nullifier: Some(NullifierOpening {
+                        public_key: pk,
+                        signature_r: r,
+                        r_prime,
+                    }),
+                    last_nullifier_pos: Some(0),
+                };
+                engine.insert_account(owner, record).expect("insert account");
+                // Advance tip well past the fold so size_final covers pos 0
+                // (FINALITY_CONFIRMATIONS = 6 → tip ≥ fold_height + 5).
+                engine.set_tip_height(tip_height);
+            })
+            .expect("mutate engine");
+        adapter.set_tip_hash(tip_hash).expect("tip hash");
+
+        // Retain reveal_txid for this node's own publish of the nullifier.
+        sqlx::query(
+            "INSERT INTO v11_pending_publishes \
+             (pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
+              commit_tx, reveal_tx, commit_txid, reveal_txid, status, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'reveal_broadcast',NOW(),NOW())",
+        )
+        .bind(pk.as_slice())
+        .bind(owner.0.as_slice())
+        .bind(r.as_slice())
+        .bind([0x44u8; 32].as_slice())
+        .bind(r_prime.as_slice())
+        .bind(i64::try_from(fold_height).unwrap())
+        .bind(inclusion_hash.as_slice())
+        .bind([0x01u8; 8].as_slice()) // dummy commit_tx
+        .bind([0x02u8; 8].as_slice()) // dummy reveal_tx
+        .bind([0x03u8; 32].as_slice()) // commit_txid
+        .bind([0x31u8; 32].as_slice()) // reveal_txid
+        .execute(&pool)
+        .await
+        .expect("insert pending publish with reveal_txid");
+
+        // Durable inclusion hash for the fold height (confirmed-but-not-tip).
+        crate::db::insert_block_log(
+            &pool,
+            &crate::db::BlockLogEntry {
+                block_hash: inclusion_hash.to_vec(),
+                block_height: Some(i64::try_from(fold_height).unwrap()),
+                inscription_count: 1,
+                processing_duration_us: None,
+            },
+        )
+        .await
+        .expect("insert block_log at fold height");
+
+        (scope, adapter, owner, asset_id, [0x31u8; 32], inclusion_hash)
+    }
+
+    /// Defect 1: a genuinely final anchor (tip well beyond fold height)
+    /// passes the completed-anchor gate **and** resolves its Bitcoin
+    /// locator — so a completed attestation can reach the prove step.
+    ///
+    /// Turns red if `resolve_anchor_locator` again requires
+    /// `nullifier_height == tip_height` (block_hash becomes None while
+    /// size_final already covers the fold).
+    #[tokio::test]
+    async fn final_anchor_below_tip_resolves_locator_and_collects() {
+        use super::super::separation::clear_process_stack_mode_for_test;
+
+        let fold_height = 100u64;
+        let tip_height = 105u64; // ≥ fold + 5 → size_final covers pos 0
+        let (_scope, adapter, owner, asset_id, reveal_txid, inclusion_hash) =
+            seeded_attest_adapter(fold_height, tip_height).await;
+
+        // Live classification from NfLog (not caller-supplied).
+        let classification = adapter.with_engine(|e| {
+            let rec = e.account(&owner).expect("account");
+            let nf = rec.last_nullifier.as_ref().expect("nullifier");
+            e.nflog().classify(nf.public_key, nf.signature_r)
+        });
+        assert_eq!(classification, SpendClassification::ValidFirstSpend);
+
+        let materials = collect_materials(&adapter, &owner, &asset_id, None)
+            .expect("completed first-occurrence inside size_final must collect");
+        assert_eq!(materials.nullifier_height, fold_height);
+        assert_eq!(materials.nullifier_pos, 0);
+
+        let (txid, block_hash) =
+            resolve_anchor_locator(&adapter, &materials.nullifier.public_key, materials.nullifier_height)
+                .await
+                .expect("locator resolve");
+        assert_eq!(txid, Some(reveal_txid), "txid from pending.reveal_txid");
+        assert_eq!(
+            block_hash,
+            Some(inclusion_hash),
+            "confirmed-but-not-tip block_hash from block_log at fold height, not tip_hash"
+        );
+        require_resolved_anchor(txid, block_hash).expect("resolved locator");
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Defect 3: completed-anchor gate is bound on the production path
+    /// (`collect_materials` → `require_completed_anchor` with classification
+    /// from the live NfLog). A not-yet-final first occurrence must fail
+    /// here — deleting the production call at collect_materials turns
+    /// this red (collect succeeds without the gate).
+    #[tokio::test]
+    async fn collect_materials_requires_completed_anchor_via_production_path() {
+        use super::super::separation::clear_process_stack_mode_for_test;
+
+        // fold at tip-1: with tip = fold+1, size_final excludes the fold
+        // (needs tip ≥ fold+5). ValidFirstSpend but not final.
+        let fold_height = 100u64;
+        let tip_height = 101u64;
+        let (_scope, adapter, owner, asset_id, _txid, _hash) =
+            seeded_attest_adapter(fold_height, tip_height).await;
+
+        let (classification, size_final, pos) = adapter.with_engine(|e| {
+            let rec = e.account(&owner).expect("account");
+            let nf = rec.last_nullifier.as_ref().expect("nullifier");
+            let classification = e.nflog().classify(nf.public_key, nf.signature_r);
+            let size_final = e.nflog().size_final(e.tip_height());
+            let pos = rec.last_nullifier_pos.expect("pos");
+            (classification, size_final, pos)
+        });
+        assert_eq!(classification, SpendClassification::ValidFirstSpend);
+        assert!(
+            pos >= size_final,
+            "fixture must be not-yet-final: pos={pos} size_final={size_final}"
+        );
+
+        let err = collect_materials(&adapter, &owner, &asset_id, None)
+            .expect_err("not-yet-final first occurrence must fail via production gate");
+        assert!(
+            matches!(err, AttestError::ProvingFailed(_)),
+            "got {err:?}"
+        );
+        assert!(
+            err.message().contains("size_final") || err.message().contains("completed"),
+            "production gate message: {}",
+            err.message()
+        );
+
+        clear_process_stack_mode_for_test();
     }
 
     #[test]

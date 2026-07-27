@@ -613,6 +613,47 @@ pub async fn load_latest_block(pool: &PgPool) -> Result<Option<[u8; 32]>, sqlx::
     }
 }
 
+/// Load the block hash for a scanned height from the durable `block_log`
+/// audit trail (most recent row at that height, if any).
+///
+/// Used by the §5.7 attestation anchor locator when the nullifier's
+/// inclusion height is below the live tip — `EngineAdapter` only retains
+/// `tip_hash`, so historical heights must come from this scanner-written
+/// log. Missing row → `Ok(None)` (caller fails loud with the locator edge;
+/// never invent a hash).
+pub async fn load_block_hash_at_height(
+    pool: &PgPool,
+    height: u64,
+) -> Result<Option<[u8; 32]>, sqlx::Error> {
+    let height_i64 = i64::try_from(height).map_err(|_| {
+        sqlx::Error::Decode(format!("block height {height} does not fit i64").into())
+    })?;
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT block_hash FROM block_log \
+         WHERE block_height = $1 \
+         ORDER BY processed_at DESC \
+         LIMIT 1",
+    )
+    .bind(height_i64)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        None => Ok(None),
+        Some((bytes,)) => {
+            let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                sqlx::Error::Decode(
+                    format!(
+                        "block_log.block_hash has unexpected length {} (expected 32)",
+                        bytes.len()
+                    )
+                    .into(),
+                )
+            })?;
+            Ok(Some(arr))
+        }
+    }
+}
+
 /// Atomically write SMT, MMR, `latest_block`, and (optionally) the
 /// freshly-inserted `mmr_root_index` row in one transaction.
 ///
