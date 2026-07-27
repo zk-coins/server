@@ -479,17 +479,21 @@ pub const PENDING_SIGN_BODY_KEY: &str = "pending_sign";
 ///
 /// ## Wire encoding
 ///
-/// `capability` is **bincode → lowercase hex** so large `ComplianceProof`s
-/// stay off the JSON tree while remaining a single opaque blob. Network,
-/// publisher, and completion stay as plain JSON fields for operators.
+/// `capability` is **`FinalisationCapability::to_durable_bytes` → lowercase
+/// hex** so large `ComplianceProof`s stay off the JSON tree while remaining a
+/// single opaque blob. That encode path is the only serde/bincode entry that
+/// carries `op_secret`; `PendingTransition` / `FinalisationCapability` do not
+/// derive `Serialize`. Network, publisher, and completion stay as plain JSON
+/// fields for operators.
 ///
 /// [`Debug`] redacts `capability_bincode_hex`: the blob embeds `op_secret`
-/// via [`PendingTransition`], so printing the hex would leak the key that
-/// keys every `nav_rand` for the account.
+/// via the durable wire of [`PendingTransition`], so printing the hex would
+/// leak the key that keys every `nav_rand` for the account. (The hex itself
+/// remains in storage JSON — that residual is named, not implied.)
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DurableFinalisationPersist {
     pub network: String,
-    /// Lowercase hex of bincode([`FinalisationCapability`]).
+    /// Lowercase hex of [`FinalisationCapability::to_durable_bytes`].
     pub capability_bincode_hex: String,
     /// Lowercase hex of the external publisher, when the request carried one.
     pub publisher_pubkey: Option<String>,
@@ -540,8 +544,11 @@ impl DurableFinalisationPersist {
             }
         }
         let capability = entry.capability();
-        let bytes = bincode::serialize(&capability)
-            .map_err(|e| format!("bincode serialize FinalisationCapability: {e}"))?;
+        // Explicit durable path only — FinalisationCapability is not
+        // general-purpose Serializable (keeps OpSecret unreachable via serde).
+        let bytes = capability
+            .to_durable_bytes()
+            .map_err(|e| format!("durable encode FinalisationCapability: {e}"))?;
         Ok(Self {
             network: network_label(entry.network).to_string(),
             capability_bincode_hex: hex_lower(&bytes),
@@ -585,10 +592,10 @@ impl DurableFinalisationPersist {
                 format!("persisted finalisation capability hex: {e}"),
             )
         })?;
-        let capability: FinalisationCapability = bincode::deserialize(&bytes).map_err(|e| {
+        let capability = FinalisationCapability::from_durable_bytes(&bytes).map_err(|e| {
             TransitionSignatureError::new(
                 SignatureCheck::PendingEnvelope,
-                format!("persisted finalisation capability bincode: {e}"),
+                format!("persisted finalisation capability durable decode: {e}"),
             )
         })?;
         let publisher_pubkey = match self.publisher_pubkey {
@@ -1756,7 +1763,7 @@ pub mod test_fixtures {
             nav_opening,
             // Signature-gate fixtures never exercise nav_rand derivation; a
             // constant stands in so the skeleton type is constructible.
-            op_secret: OpSecret([0u8; 32]),
+            op_secret: OpSecret::new([0u8; 32]),
         }
     }
 
@@ -1977,7 +1984,7 @@ mod tests {
             nav_opening,
             // Signature-gate fixtures never exercise nav_rand derivation; a
             // constant stands in so the skeleton type is constructible.
-            op_secret: OpSecret([0u8; 32]),
+            op_secret: OpSecret::new([0u8; 32]),
         }
     }
 

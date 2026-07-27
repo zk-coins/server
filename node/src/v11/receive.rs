@@ -1676,7 +1676,7 @@ mod tests {
             V11ReceiveRequest {
                 owner: Address([0; 32]),
                 nk: [1; 32],
-                op_secret: OpSecret([4; 32]),
+                op_secret: OpSecret::new([4; 32]),
                 current_pubkey: [2; 32],
                 slots: vec![],
                 next_pubkey: [3; 32],
@@ -2004,7 +2004,7 @@ mod tests {
                     state,
                     coinhist: host::CoinHistTree::new(),
                     nk,
-                    op_secret: Some(OpSecret([0xA1; 32])),
+                    op_secret: Some(OpSecret::new([0xA1; 32])),
                     genesis_pubkey: current_pubkey,
                     spendable: std::collections::BTreeMap::new(),
                     spent_ids: std::collections::BTreeSet::new(),
@@ -2303,7 +2303,7 @@ mod tests {
                 V11ReceiveRequest {
                     owner,
                     nk,
-                    op_secret: OpSecret([0x41; 32]),
+                    op_secret: OpSecret::new([0x41; 32]),
                     current_pubkey,
                     slots,
                     next_pubkey: xonly_from_label(b"v11-rx/multi/sk1"),
@@ -2489,7 +2489,7 @@ mod tests {
                 state,
                 coinhist: hist,
                 nk,
-                op_secret: Some(OpSecret([0xA1; 32])),
+                op_secret: Some(OpSecret::new([0xA1; 32])),
                 genesis_pubkey: current_pubkey,
                 spendable,
                 spent_ids: std::collections::BTreeSet::new(),
@@ -2782,7 +2782,7 @@ mod tests {
                 engine.begin_mint(MintRequest {
                     owner: alice_owner,
                     nk: alice_nk,
-                    op_secret: OpSecret(Sha256::digest(b"v11-rx/alice-op_secret").into()),
+                    op_secret: OpSecret::new(Sha256::digest(b"v11-rx/alice-op_secret").into()),
                     current_pubkey: alice_pk0,
                     next_pubkey: alice_pk1,
                     name: b"G3 sealed e2e asset".to_vec(),
@@ -2981,7 +2981,7 @@ mod tests {
                     V11ReceiveRequest {
                         owner: bob_owner,
                         nk: bob_nk,
-                        op_secret: OpSecret([0x41; 32]),
+                        op_secret: OpSecret::new([0x41; 32]),
                         current_pubkey: bob_pk0,
                         slots: vec![slot],
                         next_pubkey: bob_pk1,

@@ -486,7 +486,10 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
 
         let op_secret = match op_secret_b {
             None => None,
-            Some(b) => Some(OpSecret(fixed_32(&b, "account.op_secret")?)),
+            Some(b) => Some(OpSecret::from_account_row_bytea(fixed_32(
+                &b,
+                "account.op_secret",
+            )?)),
         };
 
         accounts.push(AccountSnapshot {
@@ -804,7 +807,7 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
             Some(p) => Some(as_i64_u64(p, "last_nullifier_pos")?),
         };
 
-        let op_secret_bytes = account.op_secret.map(|s| s.0);
+        let op_secret_bytes = account.op_secret.map(|s| s.to_account_row_bytea());
         sqlx::query(
             "INSERT INTO v11_accounts \
              (owner, account_state, nk, op_secret, genesis_pubkey, last_proof, last_nav_opening, \

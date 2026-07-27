@@ -160,26 +160,58 @@ pub struct ReceiveRequest {
 
 /// Operational nav-rand secret (`A/4'`, §1.2). Part of the operational bundle
 /// entrusted to the account's **own** node — never sent to a foreign node,
-/// never logged, and never formatted as raw bytes.
+/// never logged, and never handed out as raw bytes to arbitrary callers.
 ///
-/// ## Formatting / outward surfaces
+/// ## Unreachability (not merely formatting)
 ///
-/// - [`Debug`] and [`Display`] always print `OpSecret([REDACTED])` so any
-///   `{:?}` / `{}` on a request, pending transition, capability, or account
-///   record is safe by construction (including nested `Job` / panic paths).
-/// - [`serde::Serialize`] / [`serde::Deserialize`] intentionally carry the
-///   raw 32 bytes: durable finalisation persists
-///   `bincode(FinalisationCapability)` (which embeds this secret) and the
-///   account row stores it as `BYTEA`. Those paths are storage, not logs.
-///   Callers that embed the serialized form in a `Debug` surface (e.g. hex
-///   of the capability blob) must redact at *that* type — see
-///   `DurableFinalisationPersist` / `Job`.
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct OpSecret(pub [u8; 32]);
+/// The inner `[u8; 32]` is **private**. There is no public field, no
+/// `as_bytes`, and no [`serde::Serialize`] / [`serde::Deserialize`] on this
+/// type — so `format!("{:?}", secret.0)`, `secret.as_bytes()`, and
+/// `serde_json::to_string(&secret)` are all unobtainable outside this module.
+///
+/// - [`Debug`] / [`Display`] always print `OpSecret([REDACTED])`, so a newly
+///   added `{:?}` on any containing type (`MintRequest`, `PendingTransition`,
+///   `AccountSnapshot`, …) cannot print the key.
+/// - The **sole in-process consumer** of the raw material is
+///   [`OpSecret::derive_nav_rand`] (HKDF for §1.4 `nav_rand`). That is visible
+///   on the type: callers derive; they do not extract.
+/// - Durable paths that must still touch bytes are **explicit and narrow**:
+///   - [`OpSecret::to_account_row_bytea`] / [`from_account_row_bytea`] for the
+///     `v11_accounts.op_secret` BYTEA column;
+///   - [`FinalisationCapability::to_durable_bytes`] /
+///     [`from_durable_bytes`] (private wire layout; no general-purpose
+///     `Serialize` on `PendingTransition` / `FinalisationCapability`).
+///
+/// What remains open: those two durable codecs, and the opaque hex blob
+/// `capability_bincode_hex` once produced (Debug-redacted on
+/// `DurableFinalisationPersist` / `Job`, but still present in storage JSON).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct OpSecret([u8; 32]);
 
 impl OpSecret {
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+    /// Construct from the account's operational-bundle secret material.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Sole in-process use of the raw secret: HKDF → `nav_rand` (§1.4).
+    ///
+    /// `nav_rand = HKDF("zkCoins/v1/NavRand", op_secret ‖ u64-be(send_counter))`.
+    pub fn derive_nav_rand(self, send_counter: u64) -> [u8; 32] {
+        host::derive_nav_rand(&self.0, send_counter)
+    }
+
+    /// Encode for the `v11_accounts.op_secret` BYTEA column.
+    ///
+    /// Narrow durable path only — not a general-purpose byte accessor and not
+    /// reachable via `Debug`/`Serialize` of containing types.
+    pub fn to_account_row_bytea(self) -> [u8; 32] {
+        self.0
+    }
+
+    /// Decode from the `v11_accounts.op_secret` BYTEA column.
+    pub const fn from_account_row_bytea(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 }
 
@@ -234,7 +266,13 @@ pub struct AccountRecord {
 }
 
 /// Phase-1 output: witness ready for the wallet to sign (`awaiting_signature`).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// **No** derived `Serialize`/`Deserialize`: the embedded [`OpSecret`] must
+/// not become reachable through general-purpose serialisation of this type.
+/// Durable resume goes only through
+/// [`FinalisationCapability::to_durable_bytes`] /
+/// [`FinalisationCapability::from_durable_bytes`].
+#[derive(Clone, Debug)]
 pub struct PendingTransition {
     /// Full `TransitionWitness` with a placeholder signature; `finalise`
     /// overwrites `transition_signature` before proving.
@@ -247,8 +285,53 @@ pub struct PendingTransition {
     /// NAV opening used for this transition (stored on apply).
     pub nav_opening: NavOpening,
     /// Operational nav-rand secret resolved for this transition (bundle).
-    /// Persisted onto the account on apply; Debug-redacted.
+    /// Persisted onto the account on apply; Debug-redacted; not serde-reachable.
     pub op_secret: OpSecret,
+}
+
+/// Private bincode wire for [`PendingTransition`].
+///
+/// Field order and types match the historical derived layout (where
+/// `OpSecret` was a serde newtype over `[u8; 32]`) so existing
+/// `capability_bincode_hex` blobs remain loadable. The wire type is never
+/// public — the only encode/decode entry points are
+/// [`FinalisationCapability::to_durable_bytes`] /
+/// [`from_durable_bytes`](FinalisationCapability::from_durable_bytes).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct PendingTransitionWire {
+    witness_wip: TransitionWitness,
+    proof_data: ProofData,
+    proof_data_hash: [u8; 32],
+    mode: TransitionMode,
+    owner: Address,
+    nav_opening: NavOpening,
+    op_secret: [u8; 32],
+}
+
+impl PendingTransition {
+    fn to_wire(&self) -> PendingTransitionWire {
+        PendingTransitionWire {
+            witness_wip: self.witness_wip.clone(),
+            proof_data: self.proof_data.clone(),
+            proof_data_hash: self.proof_data_hash,
+            mode: self.mode,
+            owner: self.owner,
+            nav_opening: self.nav_opening,
+            op_secret: self.op_secret.0,
+        }
+    }
+
+    fn from_wire(wire: PendingTransitionWire) -> Self {
+        Self {
+            witness_wip: wire.witness_wip,
+            proof_data: wire.proof_data,
+            proof_data_hash: wire.proof_data_hash,
+            mode: wire.mode,
+            owner: wire.owner,
+            nav_opening: wire.nav_opening,
+            op_secret: OpSecret(wire.op_secret),
+        }
+    }
 }
 
 /// Durable, engine-owned finalisation capability for **prove + apply**.
@@ -274,6 +357,16 @@ pub struct PendingTransition {
 /// **not** snapshotted here: apply re-validates those against the live engine
 /// after prove (same invariant as the receive path).
 ///
+/// ## Persistence boundary
+///
+/// This type does **not** derive `Serialize`/`Deserialize`. The only supported
+/// durable encoding is [`to_durable_bytes`](Self::to_durable_bytes) /
+/// [`from_durable_bytes`](Self::from_durable_bytes) (private wire; embeds
+/// `op_secret` as raw bytes for resume). General-purpose `bincode::serialize`
+/// / `serde_json::to_string` on this type or on [`PendingTransition`] do not
+/// compile — so a newly added `{:?}` is not the only redaction; the secret is
+/// not reachable through containing-type serde either.
+///
 /// ## Idempotency of consumers
 ///
 /// This type is pure data. Callers make resume safe with an **exclusive
@@ -281,9 +374,16 @@ pub struct PendingTransition {
 /// the completion surface after apply so a second resume publishes and
 /// completes without re-applying. The engine itself fails loud on a second
 /// apply against a moved account head.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct FinalisationCapability {
     pending: PendingTransition,
+    signature: Option<TransitionSignature>,
+}
+
+/// Private bincode wire for [`FinalisationCapability`] (historical layout).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct FinalisationCapabilityWire {
+    pending: PendingTransitionWire,
     signature: Option<TransitionSignature>,
 }
 
@@ -336,6 +436,31 @@ impl FinalisationCapability {
             )
         })?;
         Ok((self.pending, sig))
+    }
+
+    /// Explicit durable encoding for job-row resume (`capability_bincode_hex`).
+    ///
+    /// The only supported serialisation path that carries `op_secret`. Not
+    /// reachable via derived `Serialize` on this type or on
+    /// [`PendingTransition`]. Wire layout matches the historical
+    /// `bincode(FinalisationCapability)` newtype encoding of `OpSecret`.
+    pub fn to_durable_bytes(&self) -> Result<Vec<u8>> {
+        let wire = FinalisationCapabilityWire {
+            pending: self.pending.to_wire(),
+            signature: self.signature.clone(),
+        };
+        bincode::serialize(&wire)
+            .context("bincode serialize FinalisationCapability durable wire")
+    }
+
+    /// Inverse of [`to_durable_bytes`](Self::to_durable_bytes).
+    pub fn from_durable_bytes(bytes: &[u8]) -> Result<Self> {
+        let wire: FinalisationCapabilityWire = bincode::deserialize(bytes)
+            .context("bincode deserialize FinalisationCapability durable wire")?;
+        Ok(Self {
+            pending: PendingTransition::from_wire(wire.pending),
+            signature: wire.signature,
+        })
     }
 }
 
@@ -810,7 +935,7 @@ impl StateEngine {
         )
         .context("construct new AccountState after mint")?;
 
-        let nav_rand = host::derive_nav_rand(req.op_secret.as_bytes(), entry_send_counter);
+        let nav_rand = req.op_secret.derive_nav_rand(entry_send_counter);
         let nav = self.size_final_nav()?;
         let nav_opening = NavOpening {
             nav,
@@ -1094,7 +1219,7 @@ impl StateEngine {
         )
         .context("construct new AccountState after send")?;
 
-        let nav_rand = host::derive_nav_rand(op_secret.as_bytes(), entry_send_counter);
+        let nav_rand = op_secret.derive_nav_rand(entry_send_counter);
         let nav = self.size_final_nav()?;
         let nav_opening = NavOpening {
             nav,
@@ -1266,7 +1391,7 @@ impl StateEngine {
         )
         .context("construct new AccountState after receive")?;
 
-        let nav_rand = host::derive_nav_rand(req.op_secret.as_bytes(), entry_send_counter);
+        let nav_rand = req.op_secret.derive_nav_rand(entry_send_counter);
         let nav = self.size_final_nav()?;
         let nav_opening = NavOpening {
             nav,
@@ -2189,7 +2314,7 @@ mod tests {
     }
 
     fn label_op_secret(label: &[u8]) -> OpSecret {
-        OpSecret(Sha256::digest(label).into())
+        OpSecret::new(Sha256::digest(label).into())
     }
 
     fn build_funded_fixture(bridge: &ProverBridge) -> FundedFixture {
@@ -3063,7 +3188,7 @@ mod tests {
         // Host acceptance: the send's nav was size_final=1 at prove time; after
         // scan-fold size grows, but the proved nav remains a canonical prefix.
         // send_counter at entry is 1 (post-mint); nav_rand is derived, not caller-set.
-        let expected_send_nav_rand = host::derive_nav_rand(fixture.op_secret.as_bytes(), 1);
+        let expected_send_nav_rand = fixture.op_secret.derive_nav_rand(1);
         engine
             .verify_incoming_transition(
                 &applied.proved,
@@ -3297,31 +3422,33 @@ mod tests {
             pending_a.nav_opening.nav_rand, pending_b.nav_opening.nav_rand,
             "identical (op_secret, entry send_counter=0) must match"
         );
-        let expected = host::derive_nav_rand(req.op_secret.as_bytes(), 0);
+        let expected = req.op_secret.derive_nav_rand(0);
         assert_eq!(pending_a.nav_opening.nav_rand, expected);
         assert_ne!(
             pending_a.nav_opening.nav_rand,
-            host::derive_nav_rand(req.op_secret.as_bytes(), 1),
+            req.op_secret.derive_nav_rand(1),
             "different send_counter must change nav_rand"
         );
         // OpSecret must never Debug-/Display-print raw bytes — including when
-        // nested under a derived-Debug request type.
-        let dbg = format!("{:?}", req.op_secret);
+        // nested under a derived-Debug request type. Known material is checked
+        // so we do not need a raw-byte accessor to prove redaction.
+        let known = OpSecret::new([0xAB; 32]);
+        let dbg = format!("{:?}", known);
         assert_eq!(dbg, "OpSecret([REDACTED])");
-        assert_eq!(format!("{}", req.op_secret), "OpSecret([REDACTED])");
-        let raw = format!("{:?}", req.op_secret.as_bytes());
+        assert_eq!(format!("{}", known), "OpSecret([REDACTED])");
         assert!(
-            !dbg.contains(&raw),
-            "Debug must not embed the raw secret bytes"
+            !dbg.to_lowercase().contains("ab"),
+            "Debug must not embed the raw secret hex"
         );
         let req_dbg = format!("{req:?}");
         assert!(
             req_dbg.contains("OpSecret([REDACTED])"),
             "MintRequest Debug must redact op_secret; got: {req_dbg}"
         );
+        let pending_dbg = format!("{pending_a:?}");
         assert!(
-            !req_dbg.contains(&raw),
-            "MintRequest Debug must not embed raw op_secret bytes"
+            pending_dbg.contains("OpSecret([REDACTED])"),
+            "PendingTransition Debug must redact op_secret; got: {pending_dbg}"
         );
     }
 
@@ -3491,7 +3618,7 @@ mod tests {
         // Equality against the inserted value proves from_persisted kept it;
         // the bytes for derivation come only from `restored`.
         assert_eq!(restored, persisted_op_secret);
-        let rebuilt = host::derive_nav_rand(restored.as_bytes(), entry_counter);
+        let rebuilt = restored.derive_nav_rand(entry_counter);
         assert_eq!(
             rebuilt, issued_nav_rand,
             "restored bundle must rebuild the opening's nav_rand"
@@ -3521,7 +3648,7 @@ mod tests {
             "fresh engine keyed by restored op_secret must re-issue the same opening"
         );
         assert_ne!(
-            host::derive_nav_rand(restored.as_bytes(), 1),
+            restored.derive_nav_rand(1),
             issued_nav_rand,
             "a different send_counter must not reproduce the prior opening"
         );

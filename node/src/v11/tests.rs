@@ -149,7 +149,7 @@ fn seeded_engine() -> StateEngine {
         state,
         coinhist: hist,
         nk: pk(0xD1),
-        op_secret: Some(zkcoins_prover::state_engine::OpSecret(pk(0xD2))),
+        op_secret: Some(zkcoins_prover::state_engine::OpSecret::new(pk(0xD2))),
         genesis_pubkey: pk(0xB0),
         spendable,
         spent_ids,
@@ -219,7 +219,8 @@ async fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
     let (_, _, current_pubkey) =
         normalized_key(deterministic_secret(b"zkCoins/v1/req10/restore/pk0"));
     let (_, _, next_pubkey) = normalized_key(deterministic_secret(b"zkCoins/v1/req10/restore/pk1"));
-    let op_secret = OpSecret(Sha256::digest(b"zkCoins/v1/req10/restore/op_secret").into());
+    let op_secret =
+        OpSecret::new(Sha256::digest(b"zkCoins/v1/req10/restore/op_secret").into());
     let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
 
     // --- Live node issues an opening (genesis mint, entry send_counter = 0) ---
@@ -318,13 +319,13 @@ async fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
         .op_secret
         .expect("op_secret must survive load_engine_snapshot");
 
-    let rebuilt = host::derive_nav_rand(restored_secret.as_bytes(), entry_counter);
+    let rebuilt = restored_secret.derive_nav_rand(entry_counter);
     assert_eq!(
         rebuilt, issued_nav_rand,
         "restored op_secret + prior send_counter must reproduce the opening's nav_rand"
     );
     assert_ne!(
-        host::derive_nav_rand(restored_secret.as_bytes(), entry_counter + 1),
+        restored_secret.derive_nav_rand(entry_counter + 1),
         issued_nav_rand,
         "a later send_counter must not reproduce the prior opening"
     );

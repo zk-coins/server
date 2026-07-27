@@ -9,7 +9,7 @@ fn main() {
     let _ = ReceiveRequest {
         owner: Address([0u8; 32]),
         nk: [0u8; 32],
-        op_secret: OpSecret([0u8; 32]),
+        op_secret: OpSecret::new([0u8; 32]),
         current_pubkey: [0u8; 32],
         received_coins: Vec::new(),
         received_auth: Vec::new(),
