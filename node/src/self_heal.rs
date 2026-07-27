@@ -269,7 +269,10 @@ pub async fn heal_circuit_digest(
                          accounts (proof-bearing account blobs); \
                          smt_state / mmr_state / mmr_root_index / latest_block \
                          (global scan state); \
-                         on-disk PROOFS_DIR proof-store files. \
+                         on-disk PROOFS_DIR proof-store files; \
+                         and every non-terminal jobs row is marked failed with \
+                         the self-heal reset generation bumped so a concurrent \
+                         writer cannot resurrect or complete wiped work. \
                          Storing the live circuit digest."
                     );
                     db::reset_proof_dependent_state_tx(pool, live_digest).await?;

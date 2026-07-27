@@ -221,6 +221,10 @@ pub struct Job {
     pub proof_id: Option<i64>,
     pub error: Option<String>,
     pub progress: i16,
+    /// Self-heal admission epoch stamped at INSERT from
+    /// `self_heal_reset_meta.generation`. Job-advancing writes require this
+    /// to still equal the live meta generation (see migration 0023).
+    pub reset_generation: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -328,6 +332,7 @@ impl Job {
             proof_id: row.try_get("proof_id")?,
             error: row.try_get("error")?,
             progress: row.try_get("progress")?,
+            reset_generation: row.try_get("reset_generation")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
             completed_at: row.try_get("completed_at")?,
@@ -418,10 +423,17 @@ impl JobStore {
         request_body: serde_json::Value,
     ) -> sqlx::Result<CreateResult> {
         let public_id = Uuid::new_v4();
+        // Stamp the live self-heal admission epoch so a concurrent reset
+        // that bumps the generation leaves this row (if it raced with a
+        // stale read) or any pre-reset worker unable to advance it.
         let inserted_row = sqlx::query(
             "INSERT INTO jobs \
-             (public_id, kind, status, phase, account_address, idempotency_key, request_body) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             (public_id, kind, status, phase, account_address, idempotency_key, request_body, \
+              reset_generation) \
+             VALUES ( \
+               $1, $2, $3, $4, $5, $6, $7, \
+               (SELECT generation FROM self_heal_reset_meta WHERE id = 1) \
+             ) \
              ON CONFLICT (account_address, idempotency_key) \
                  WHERE idempotency_key IS NOT NULL \
                  DO NOTHING \
@@ -494,6 +506,11 @@ impl JobStore {
     /// free-form refinement of the coarse status enum so the
     /// dispatcher can publish dispatch-level progress milestones
     /// without churning the constraint-enforced status.
+    ///
+    /// Fenced on the self-heal reset generation: a pre-reset worker that
+    /// still holds a loaded `public_id` cannot resurrect a row after
+    /// [`crate::db::reset_v11_proof_dependent_state_tx`] /
+    /// [`crate::db::reset_proof_dependent_state_tx`] bumped the epoch.
     pub async fn set_status(
         &self,
         public_id: Uuid,
@@ -502,7 +519,8 @@ impl JobStore {
     ) -> sqlx::Result<()> {
         sqlx::query(
             "UPDATE jobs SET status = $1, phase = $2, updated_at = NOW() \
-             WHERE public_id = $3",
+             WHERE public_id = $3 \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(status.as_str())
         .bind(phase)
@@ -532,11 +550,13 @@ impl JobStore {
     ) -> sqlx::Result<()> {
         // Only advance from proving (or queued, defensive). Never overwrite
         // a cancelled / terminal row — cancel may have won during prove.
+        // Also fenced on the self-heal reset generation.
         sqlx::query(
             "UPDATE jobs SET status = 'awaiting_signature', phase = 'awaiting_signature', \
                               proof_id = $1, response_body = $2, updated_at = NOW() \
              WHERE public_id = $3 \
-               AND status IN ('queued', 'proving')",
+               AND status IN ('queued', 'proving') \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(proof_id)
         .bind(&result)
@@ -556,8 +576,10 @@ impl JobStore {
     /// as live work.
     ///
     /// **Legacy behaviour:** applies regardless of current status (same
-    /// SQL shape as pre-v1.1). Status-qualified completion for the v1.1
-    /// path lives on [`Self::complete_if_status`].
+    /// SQL shape as pre-v1.1) **except** the self-heal reset-generation
+    /// fence — a pre-reset worker cannot complete a row after the epoch
+    /// advanced. Status-qualified completion for the v1.1 path lives on
+    /// [`Self::complete_if_status`].
     pub async fn complete(
         &self,
         public_id: Uuid,
@@ -570,7 +592,8 @@ impl JobStore {
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
                                   - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               progress = 100, updated_at = NOW(), completed_at = NOW() \
-             WHERE public_id = $3",
+             WHERE public_id = $3 \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(&response_body)
         .bind(response_status)
@@ -605,7 +628,8 @@ impl JobStore {
                                   - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               progress = 100, updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $3 AND status = ANY($4::text[]) \
-               AND phase IS DISTINCT FROM $5",
+               AND phase IS DISTINCT FROM $5 \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(&response_body)
         .bind(response_status)
@@ -648,7 +672,8 @@ impl JobStore {
                AND request_body #>> '{finalise_claim,owner}' = $5 \
                AND (request_body #>> '{finalise_claim,fence}')::bigint = $6 \
                AND (request_body #>> '{finalise_claim,lease_expires_at}') IS NOT NULL \
-               AND (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz > NOW()",
+               AND (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz > NOW() \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(&response_body)
         .bind(response_status)
@@ -669,8 +694,9 @@ impl JobStore {
     /// with the status flip so a failed cleanup path cannot leave a
     /// restart envelope on a terminal row.
     ///
-    /// **Legacy behaviour:** applies regardless of current status.
-    /// Status-qualified fail for the v1.1 path lives on [`Self::fail_if_status`].
+    /// **Legacy behaviour:** applies regardless of current status
+    /// **except** the self-heal reset-generation fence. Status-qualified
+    /// fail for the v1.1 path lives on [`Self::fail_if_status`].
     pub async fn fail(&self, public_id: Uuid, error: &str) -> sqlx::Result<()> {
         sqlx::query(
             "UPDATE jobs SET status = 'failed', phase = 'failed', \
@@ -678,7 +704,8 @@ impl JobStore {
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
                                   - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               updated_at = NOW(), completed_at = NOW() \
-             WHERE public_id = $2",
+             WHERE public_id = $2 \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(error)
         .bind(public_id)
@@ -711,7 +738,8 @@ impl JobStore {
                                   - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $2 AND status = ANY($3::text[]) \
-               AND phase IS DISTINCT FROM $4",
+               AND phase IS DISTINCT FROM $4 \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(error)
         .bind(public_id)
@@ -745,7 +773,8 @@ impl JobStore {
                AND request_body #>> '{finalise_claim,owner}' = $4 \
                AND (request_body #>> '{finalise_claim,fence}')::bigint = $5 \
                AND (request_body #>> '{finalise_claim,lease_expires_at}') IS NOT NULL \
-               AND (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz > NOW()",
+               AND (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz > NOW() \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(error)
         .bind(public_id)
@@ -770,7 +799,8 @@ impl JobStore {
     ) -> sqlx::Result<bool> {
         let result = sqlx::query(
             "UPDATE jobs SET status = $1, phase = $2, updated_at = NOW() \
-             WHERE public_id = $3 AND status = $4",
+             WHERE public_id = $3 AND status = $4 \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(to.as_str())
         .bind(phase)
@@ -848,6 +878,7 @@ impl JobStore {
                     ), \
                     updated_at = NOW() \
              WHERE public_id = $6 AND status = $7 \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1) \
              RETURNING (request_body #>> '{finalise_claim,fence}')::bigint AS fence",
         )
         .bind(JobStatus::Broadcasting.as_str())
@@ -884,6 +915,7 @@ impl JobStore {
              WHERE public_id = $5 \
                AND status = 'broadcasting' \
                AND phase IN ('publishing', 'broadcasting') \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1) \
              RETURNING (request_body #>> '{finalise_claim,fence}')::bigint AS fence",
         )
         .bind(FINALISE_CLAIM_PHASE)
@@ -939,7 +971,8 @@ impl JobStore {
                AND status = 'broadcasting' \
                AND phase = $6 \
                AND request_body #>> '{finalise_claim,owner}' = $2 \
-               AND (request_body #>> '{finalise_claim,fence}')::bigint = $3",
+               AND (request_body #>> '{finalise_claim,fence}')::bigint = $3 \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(&path)
         .bind(&owner_text)
@@ -1010,7 +1043,8 @@ impl JobStore {
     ) -> sqlx::Result<bool> {
         let result = sqlx::query(
             "UPDATE jobs SET request_body = $1, updated_at = NOW() \
-             WHERE public_id = $2 AND status = $3",
+             WHERE public_id = $2 AND status = $3 \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(new_body)
         .bind(public_id)
@@ -1041,7 +1075,8 @@ impl JobStore {
             "UPDATE jobs SET request_body = $1, updated_at = NOW() \
              WHERE public_id = $2 \
                AND status <> 'awaiting_signature' \
-               AND phase IS DISTINCT FROM $3",
+               AND phase IS DISTINCT FROM $3 \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(new_body)
         .bind(public_id)
@@ -1081,7 +1116,8 @@ impl JobStore {
                AND request_body #>> '{finalise_claim,owner}' = $5 \
                AND (request_body #>> '{finalise_claim,fence}')::bigint = $6 \
                AND (request_body #>> '{finalise_claim,lease_expires_at}') IS NOT NULL \
-               AND (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz > NOW()",
+               AND (request_body #>> '{finalise_claim,lease_expires_at}')::timestamptz > NOW() \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(&path)
         .bind(finalisation)
@@ -1113,7 +1149,8 @@ impl JobStore {
                               request_body = (COALESCE(request_body, '{}'::jsonb) \
                                   - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               updated_at = NOW(), completed_at = NOW() \
-             WHERE public_id = $1 AND status = 'queued'",
+             WHERE public_id = $1 AND status = 'queued' \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(public_id)
         .execute(&self.pool)
@@ -1142,7 +1179,8 @@ impl JobStore {
                                   - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $1 \
-               AND status IN ('queued', 'proving', 'awaiting_signature')",
+               AND status IN ('queued', 'proving', 'awaiting_signature') \
+               AND reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)",
         )
         .bind(public_id)
         .execute(&self.pool)

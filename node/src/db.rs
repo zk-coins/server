@@ -1027,6 +1027,12 @@ pub async fn reset_proof_dependent_state_tx(
     sqlx::query("DELETE FROM latest_block")
         .execute(&mut *tx)
         .await?;
+    // Fence concurrent job writers (same shape as the v1.1 path): bump the
+    // self-heal reset generation so every job-advancing write that still
+    // carries a pre-reset generation loses, fail non-terminal jobs, and
+    // leave their reset_generation behind the live epoch.
+    bump_self_heal_reset_generation_in_tx(&mut tx).await?;
+    fail_non_terminal_jobs_for_self_heal_in_tx(&mut tx).await?;
     sqlx::query(
         "INSERT INTO circuit_digest_meta (id, digest, updated_at) \
          VALUES (1, $1, NOW()) \
@@ -1037,6 +1043,62 @@ pub async fn reset_proof_dependent_state_tx(
     .execute(&mut *tx)
     .await?;
     tx.commit().await
+}
+
+/// SQL predicate fragment: job row is still in the current self-heal
+/// admission epoch. Every job-advancing write in [`crate::job_store`]
+/// must include this so a pre-reset worker cannot resurrect work after
+/// [`bump_self_heal_reset_generation_in_tx`].
+pub const JOB_RESET_GENERATION_FENCE_SQL: &str =
+    "reset_generation = (SELECT generation FROM self_heal_reset_meta WHERE id = 1)";
+
+/// Bump the process-wide self-heal reset generation inside an open
+/// transaction. Returns the new generation.
+///
+/// Call **before** failing non-terminal jobs so any concurrent admit that
+/// stamps the old generation is left behind the live epoch.
+pub async fn bump_self_heal_reset_generation_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<i64, sqlx::Error> {
+    let (gen,): (i64,) = sqlx::query_as(
+        "UPDATE self_heal_reset_meta \
+         SET generation = generation + 1 \
+         WHERE id = 1 \
+         RETURNING generation",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(gen)
+}
+
+/// Current self-heal reset generation (admission epoch for new jobs).
+pub async fn load_self_heal_reset_generation(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let (gen,): (i64,) =
+        sqlx::query_as("SELECT generation FROM self_heal_reset_meta WHERE id = 1")
+            .fetch_one(pool)
+            .await?;
+    Ok(gen)
+}
+
+/// Fail every non-terminal job and strip durable finalisation / claim
+/// envelopes. Does **not** rewrite `reset_generation` — pre-reset rows stay
+/// behind the live epoch so job-advancing writes fenced on
+/// [`JOB_RESET_GENERATION_FENCE_SQL`] cannot resurrect them.
+async fn fail_non_terminal_jobs_for_self_heal_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE jobs SET status = 'failed', phase = 'failed', \
+                          error = $1, \
+                          request_body = (COALESCE(request_body, '{}'::jsonb) \
+                              - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
+                          updated_at = NOW(), completed_at = NOW() \
+         WHERE status IN ('queued', 'proving', 'awaiting_signature', 'broadcasting')",
+    )
+    .bind(SELF_HEAL_RESET_JOB_ERROR)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Operator-visible error stamped onto every non-terminal `jobs` row when a
@@ -1114,23 +1176,16 @@ pub async fn reset_v11_proof_dependent_state_tx(
     sqlx::query("DELETE FROM accounts")
         .execute(&mut *tx)
         .await?;
-    // Jobs hold a durable finalisation capability and may cache
-    // completion_result under request_body.finalisation. After this wipe
-    // the transition no longer exists — fail every non-terminal row and
-    // strip the envelope so resume cannot report completed for wiped work.
-    // Unconditional (ignores finalise_claim lease): the whole proof world
-    // is being torn down; no epoch may keep a success path.
-    sqlx::query(
-        "UPDATE jobs SET status = 'failed', phase = 'failed', \
-                          error = $1, \
-                          request_body = (COALESCE(request_body, '{}'::jsonb) \
-                              - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
-                          updated_at = NOW(), completed_at = NOW() \
-         WHERE status IN ('queued', 'proving', 'awaiting_signature', 'broadcasting')",
-    )
-    .bind(SELF_HEAL_RESET_JOB_ERROR)
-    .execute(&mut *tx)
-    .await?;
+    // Fence concurrent job writers first: bump the self-heal reset
+    // generation so every job-advancing write that still carries a
+    // pre-reset generation (loaded before this commit) loses the CAS —
+    // including unconditional set_status / complete that match public_id
+    // only. Then fail non-terminal rows and strip durable finalisation
+    // without rewriting their reset_generation (they stay behind the
+    // live epoch). A job INSERT that races after the fail-UPDATE with a
+    // stale generation is likewise refused by the same fence.
+    bump_self_heal_reset_generation_in_tx(&mut tx).await?;
+    fail_non_terminal_jobs_for_self_heal_in_tx(&mut tx).await?;
     sqlx::query(
         "INSERT INTO circuit_digest_meta (id, digest, updated_at) \
          VALUES (1, $1, NOW()) \

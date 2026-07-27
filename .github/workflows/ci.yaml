@@ -364,6 +364,17 @@ jobs:
             --test-threads 8 \
             -E 'not binary(api_remote)'
 
+      # §1.7.9 circuit-digest generator: builds real C / C_balance for every
+      # network and verifies the committed generated_circuit_digests.txt
+      # matches. Multi-minute; kept out of default cargo test via #[ignore],
+      # but a test that cannot run cannot fail — this job (test-and-coverage
+      # under the ci:full label / Release PRs) is the one that actually runs
+      # it. Does NOT set REGEN_CIRCUIT_DIGESTS (verify-only; no file rewrite).
+      - name: Verify live circuit digests vs committed generated_circuit_digests.txt
+        run: |
+          cargo test -p zkcoins-prover-plonky2 --release --test generated_circuit_digests_test \
+            generate_circuit_digests -- --ignored --nocapture
+
       # On gate failure, re-format the existing llvm-cov data (no
       # re-run, no new test execution — `report` reads the on-disk
       # profraw / profdata produced by the previous step) and emit

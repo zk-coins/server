@@ -633,6 +633,260 @@ async fn heal_v11_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
     clear_process_stack_mode_for_test();
 }
 
+/// Defect 2: pre-reset worker cannot resurrect a job after the v1.1 reset.
+///
+/// Interleaving: A loads a queued job → B commits the reset (bumps generation,
+/// fails non-terminal) → A calls unconditional `set_status` / `complete`
+/// matching `public_id` only. Without the generation fence those writes
+/// resurrect the row as proving/completed against wiped tables.
+///
+/// Would go red if `set_status` / `complete` matched `public_id` only.
+#[tokio::test]
+async fn heal_v11_reset_fences_pre_loaded_job_resurrection() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let proofs = tempfile::tempdir().expect("tempdir");
+    let proofs_dir = proofs.path().to_str().unwrap();
+
+    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11");
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let store = crate::job_store::JobStore::new(pool.clone());
+    let account = [0xCDu8; 32];
+    let created = store
+        .create(
+            crate::job_store::JobKind::Mint,
+            &account,
+            Some("pre-reset-load"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("create");
+    let job = match created {
+        crate::job_store::CreateResult::Fresh(j) => j,
+        crate::job_store::CreateResult::IdempotentReplay(j) => j,
+    };
+    let job_id = job.public_id;
+    let gen_before = job.reset_generation;
+    assert_eq!(gen_before, 0, "fresh DB starts at generation 0");
+
+    // Simulate worker A holding the loaded public_id (status still queued).
+    let old = crate::v11::encode_v11_live_digest(&[0x01; 32], &[0x02; 32]);
+    let new = crate::v11::encode_v11_live_digest(&[0x03; 32], &[0x04; 32]);
+    db::store_circuit_digest(&pool, &old).await.unwrap();
+
+    let decision = heal_circuit_digest(&pool, &new, proofs_dir, &canary_must_not_run)
+        .await
+        .expect("heal ok");
+    assert_eq!(decision, ResetDecision::Reset);
+
+    let gen_after = db::load_self_heal_reset_generation(&pool)
+        .await
+        .expect("load gen");
+    assert_eq!(gen_after, gen_before + 1, "reset must bump generation");
+
+    let row = store.load(job_id).await.unwrap().unwrap();
+    assert_eq!(row.status, crate::job_store::JobStatus::Failed);
+    assert_eq!(
+        row.reset_generation, gen_before,
+        "failed job keeps its pre-reset generation (left behind the live epoch)"
+    );
+
+    // Worker A's unconditional set_status (public_id only) must not resurrect.
+    store
+        .set_status(job_id, crate::job_store::JobStatus::Proving, "proving")
+        .await
+        .expect("set_status returns Ok even when 0 rows match");
+    let after_status = store.load(job_id).await.unwrap().unwrap();
+    assert_eq!(
+        after_status.status,
+        crate::job_store::JobStatus::Failed,
+        "set_status must not resurrect a pre-reset job after generation bump"
+    );
+
+    // Worker A's unconditional complete must not mark completed either.
+    store
+        .complete(job_id, serde_json::json!({"stolen": true}), 200)
+        .await
+        .expect("complete Ok");
+    let after_complete = store.load(job_id).await.unwrap().unwrap();
+    assert_eq!(
+        after_complete.status,
+        crate::job_store::JobStatus::Failed,
+        "complete must not succeed for a pre-reset generation"
+    );
+    assert_ne!(after_complete.status, crate::job_store::JobStatus::Completed);
+
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 2: a job stamped with a stale generation after the reset cannot
+/// complete against wiped state (simulates an admit that raced past the
+/// fail-UPDATE with a pre-bump generation read).
+///
+/// Would go red if job-advancing writes ignored `reset_generation`.
+#[tokio::test]
+async fn heal_v11_reset_fences_stale_generation_admit() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let proofs = tempfile::tempdir().expect("tempdir");
+    let proofs_dir = proofs.path().to_str().unwrap();
+
+    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        .await
+        .expect("claim v11");
+    set_process_stack_mode(ScanStackMode::V11);
+
+    let old = crate::v11::encode_v11_live_digest(&[0x11; 32], &[0x22; 32]);
+    let new = crate::v11::encode_v11_live_digest(&[0x33; 32], &[0x44; 32]);
+    db::store_circuit_digest(&pool, &old).await.unwrap();
+    let decision = heal_circuit_digest(&pool, &new, proofs_dir, &canary_must_not_run)
+        .await
+        .expect("heal ok");
+    assert_eq!(decision, ResetDecision::Reset);
+    let live_gen = db::load_self_heal_reset_generation(&pool).await.unwrap();
+    assert!(live_gen > 0);
+
+    // Plant a job with a *stale* generation (the race: INSERT saw old gen).
+    let public_id = uuid::Uuid::new_v4();
+    let account = [0xEFu8; 32];
+    sqlx::query(
+        "INSERT INTO jobs \
+         (public_id, kind, status, phase, account_address, request_body, reset_generation) \
+         VALUES ($1, 'mint', 'queued', 'queued', $2, '{}'::jsonb, $3)",
+    )
+    .bind(public_id)
+    .bind(&account[..])
+    .bind(live_gen - 1)
+    .execute(&pool)
+    .await
+    .expect("plant stale-gen job");
+
+    let store = crate::job_store::JobStore::new(pool.clone());
+    store
+        .set_status(public_id, crate::job_store::JobStatus::Proving, "proving")
+        .await
+        .expect("set_status");
+    store
+        .complete(public_id, serde_json::json!({"nope": true}), 200)
+        .await
+        .expect("complete");
+    let row = store.load(public_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        crate::job_store::JobStatus::Queued,
+        "stale-generation job must not advance after reset"
+    );
+    assert_ne!(row.status, crate::job_store::JobStatus::Completed);
+
+    // A legitimate post-reset admit stamps the live generation and can advance.
+    let fresh = store
+        .create(
+            crate::job_store::JobKind::Mint,
+            &account,
+            Some("post-reset-fresh"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("create");
+    let fresh_job = match fresh {
+        crate::job_store::CreateResult::Fresh(j) => j,
+        crate::job_store::CreateResult::IdempotentReplay(j) => j,
+    };
+    assert_eq!(fresh_job.reset_generation, live_gen);
+    store
+        .set_status(
+            fresh_job.public_id,
+            crate::job_store::JobStatus::Proving,
+            "proving",
+        )
+        .await
+        .expect("post-reset set_status");
+    let advanced = store.load(fresh_job.public_id).await.unwrap().unwrap();
+    assert_eq!(advanced.status, crate::job_store::JobStatus::Proving);
+
+    clear_process_stack_mode_for_test();
+}
+
+/// Defect 3: legacy reset must fence jobs the same way (generation bump +
+/// fail non-terminal + generation fence on advancing writes).
+///
+/// Would go red if `reset_proof_dependent_state_tx` still left jobs
+/// untouched / unfenced.
+#[tokio::test]
+async fn heal_legacy_reset_fences_pre_loaded_job_resurrection() {
+    clear_process_stack_mode_for_test();
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let proofs = tempfile::tempdir().expect("tempdir");
+    let proofs_dir = proofs.path().to_str().unwrap();
+
+    claim_stack_scan_mode(&pool, ScanStackMode::Legacy)
+        .await
+        .expect("claim legacy");
+    set_process_stack_mode(ScanStackMode::Legacy);
+
+    let store = crate::job_store::JobStore::new(pool.clone());
+    let account = [0x77u8; 32];
+    let created = store
+        .create(
+            crate::job_store::JobKind::Send,
+            &account,
+            Some("legacy-pre-reset"),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("create");
+    let job = match created {
+        crate::job_store::CreateResult::Fresh(j) => j,
+        crate::job_store::CreateResult::IdempotentReplay(j) => j,
+    };
+    let job_id = job.public_id;
+    let gen_before = job.reset_generation;
+
+    db::store_circuit_digest(&pool, b"OLD-LEGACY").await.unwrap();
+    let decision = heal_circuit_digest(&pool, b"NEW-LEGACY", proofs_dir, &canary_must_not_run)
+        .await
+        .expect("heal ok");
+    assert_eq!(decision, ResetDecision::Reset);
+
+    let gen_after = db::load_self_heal_reset_generation(&pool).await.unwrap();
+    assert_eq!(gen_after, gen_before + 1);
+
+    let row = store.load(job_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.status,
+        crate::job_store::JobStatus::Failed,
+        "legacy reset must fail non-terminal jobs"
+    );
+    assert_eq!(
+        row.error.as_deref(),
+        Some(db::SELF_HEAL_RESET_JOB_ERROR),
+        "operator must see the self-heal wipe reason on the legacy path too"
+    );
+
+    store
+        .set_status(job_id, crate::job_store::JobStatus::Proving, "proving")
+        .await
+        .expect("set_status");
+    store
+        .complete(job_id, serde_json::json!({"legacy_stolen": true}), 200)
+        .await
+        .expect("complete");
+    let after = store.load(job_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.status,
+        crate::job_store::JobStatus::Failed,
+        "legacy pre-reset worker must not complete after generation bump"
+    );
+
+    clear_process_stack_mode_for_test();
+}
+
 /// Flag-off path: process not claimed v11 → full legacy wipe on mismatch.
 /// Would go red if the v11-only wipe were applied under flag-off.
 #[tokio::test]

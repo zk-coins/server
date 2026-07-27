@@ -137,9 +137,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             let adapter = node::v11::EngineAdapter::load_or_create_from_env((*pool).clone())
                 .await
                 .expect("v11 EngineAdapter bootstrap");
-            // Live digests for self-heal come from the build-time embed
-            // (`zkcoins_prover::circuit_identity`), not from ProverBridge here:
-            // calling circuit_digest_bytes forces a multi-minute circuit build.
+            // Live digests for self-heal are taken from the circuits the
+            // prover bridge just built (construction-time §1.7.9 pin check).
             // Stage 1 still boots the legacy Prover for AccountNode/REST until
             // Stage 3.
             println!(
@@ -196,9 +195,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // (bincode HashOut); canary = CMP/MMR AccountUpdate recursion.
     //
     // Flag on (v1.1 Gap G5): digest = tagged §1.7.1 `C || C_balance` of the
-    // circuits **this binary embeds** (build-time artefact — no multi-minute
-    // compliance circuit build at boot). Boot refuses when the embed does
-    // not match the §3.6 pins, and when the embed cannot be determined.
+    // circuits **just built** through ProverBridge. Construction digests
+    // each circuit and refuses when it does not match the §3.6 pins
+    // (§1.7.9 — not pins-vs-pins, not an embedded generator artefact).
     // Canary = predecessor nullifier + NAV + last ComplianceProof structural
     // probe (full re-prove is too slow for boot — see `v11::self_heal`
     // module docs; operator opt-in via `ZKCOINS_V11_SLOW_CANARY=1`).
@@ -218,10 +217,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         };
 
     let heal_decision = if let Some(ref adapter) = v11_adapter {
-        // Live baseline = digests of the circuits this binary contains
-        // (build-time embed), cross-checked against §3.6 pins. Pins alone
-        // must not supply the live blob — that is a tautology and cannot
-        // catch a binary/pin divergence (§1.7.9).
+        // Live baseline = digests of the circuits just constructed via
+        // ProverBridge, cross-checked against §3.6 pins at construction.
+        // Pins alone must not supply the live blob (§1.7.9).
         let pins = v11::mode::v11_boot_pins_from_env().expect("v11 pins re-read after adapter boot");
         let live_digest = v11::resolve_v11_live_digest(
             pins.network,
@@ -229,12 +227,12 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             &pins.network_params.circuit_digest_c_balance(),
         )
         .unwrap_or_else(|e| {
-            panic!("v1.1 live circuit digest (binary embed vs §3.6 pins): {e}");
+            panic!("v1.1 live circuit digest (just-built circuit vs §3.6 pins): {e}");
         });
         println!(
-            "v1.1 self-heal: live digest = tagged C||C_balance from this binary's \
-             embedded circuit digests (matched §3.6 pins; no compliance circuit \
-             build at boot; set ZKCOINS_V11_SLOW_CANARY=1 for verify_transition canary)"
+            "v1.1 self-heal: live digest = tagged C||C_balance from the circuits \
+             just built through ProverBridge (matched §3.6 pins at construction; \
+             set ZKCOINS_V11_SLOW_CANARY=1 for verify_transition canary)"
         );
         node::self_heal::heal_circuit_digest(&pool, &live_digest, &proofs_dir, &|| {
             v11::v11_canary_for_heal(adapter)

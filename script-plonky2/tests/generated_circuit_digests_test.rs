@@ -14,7 +14,20 @@
 //! `C_balance` additionally pins `C`'s verifier data), so digests are emitted
 //! for each of `Mainnet`, `Testnet`, and `Regtest`.
 //!
-//! Re-run explicitly (builds real circuits; takes many minutes):
+//! ## CI
+//!
+//! This test is multi-minute (real `C` / `C_balance` builds for three
+//! networks) so it stays `#[ignore]` for default `cargo test` / PR lint.
+//! The heavy CI job `test-and-coverage` (`ci:full` label) runs it with
+//! `--ignored` in **verify** mode: digests are built from the live
+//! circuits and must equal the committed
+//! `generated_circuit_digests.txt`. A test that cannot run cannot fail —
+//! the full gate is a job that actually runs on Release / labeled PRs.
+//!
+//! Local regen (writes the vector file):
+//! `REGEN_CIRCUIT_DIGESTS=1 cargo test -p zkcoins-prover-plonky2 --test generated_circuit_digests_test generate_circuit_digests -- --ignored --nocapture`
+//!
+//! Local / CI verify (no write; fails on drift):
 //! `cargo test -p zkcoins-prover-plonky2 --test generated_circuit_digests_test generate_circuit_digests -- --ignored --nocapture`
 
 use std::collections::BTreeMap;
@@ -52,11 +65,15 @@ fn circuit_digest_hex(digest: &HashDigest) -> String {
 }
 
 /// Builds `C` and `C_balance` for every network tag, extracts digests and
-/// build metrics, and writes the sorted `name = value` vector file.
+/// build metrics, then **verifies** them against the committed vector file
+/// (or rewrites it when `REGEN_CIRCUIT_DIGESTS=1`).
 ///
-/// Flagged `#[ignore]` because each circuit build is multi-minute wall time.
+/// Flagged `#[ignore]` for default `cargo test` (multi-minute). Runs in CI
+/// under the `test-and-coverage` job (`ci:full`) via `--ignored` — see the
+/// module docs. A drift between the live circuits and the committed file
+/// fails the test (the generator is not allowed to be a silent no-op).
 #[test]
-#[ignore]
+#[ignore = "multi-minute real circuit builds; CI: test-and-coverage (ci:full) runs with --ignored"]
 fn generate_circuit_digests() {
     let networks = [Network::Mainnet, Network::Testnet, Network::Regtest];
     assert!(
@@ -227,13 +244,39 @@ fn generate_circuit_digests() {
         .map(|(name, value)| format!("{name} = {value}"))
         .collect();
     lines.push(String::new()); // trailing newline
+    let generated = lines.join("\n");
 
     let path = PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/generated_circuit_digests.txt"
     ));
-    fs::write(&path, lines.join("\n")).expect("write generated_circuit_digests.txt");
-    println!("wrote {}", path.display());
+
+    // Default: verify the committed file matches the just-built digests.
+    // REGEN_CIRCUIT_DIGESTS=1: rewrite the file (developer after a real
+    // circuit change). CI never sets REGEN — it must fail on drift.
+    let regen = matches!(
+        std::env::var("REGEN_CIRCUIT_DIGESTS").as_deref(),
+        Ok("1")
+    );
+    if regen {
+        fs::write(&path, &generated).expect("write generated_circuit_digests.txt");
+        println!("REGEN: wrote {}", path.display());
+    } else {
+        let committed = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read committed digests file {}: {e} \
+                 (set REGEN_CIRCUIT_DIGESTS=1 to create it)",
+                path.display()
+            )
+        });
+        assert_eq!(
+            committed, generated,
+            "live circuit digests diverge from committed generated_circuit_digests.txt — \
+             either the circuits changed (run with REGEN_CIRCUIT_DIGESTS=1 and commit) \
+             or the generator no longer matches prover_bridge construction"
+        );
+        println!("verified {} matches live circuits", path.display());
+    }
 
     let written = fs::read_to_string(&path).expect("read back digests file");
     for label in [

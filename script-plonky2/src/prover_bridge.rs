@@ -5,7 +5,20 @@
 //! original compliance and balance circuit fixtures. They deliberately build
 //! no constraints: the frozen circuits remain owned by
 //! `zkcoins-program-plonky2`.
+//!
+//! ## Circuit identity (§1.7.9)
+//!
+//! `C` and `C_balance` are built lazily on first use (prove / verify /
+//! digest). When the operator has registered §3.6 pins via
+//! [`ProverBridge::install_network_pins`], each construction **immediately**
+//! digests the circuit that was just built and compares it to the pin.
+//! A mismatch is a hard refusal — not a warning and not a degrade path.
+//!
+//! Until both circuits for a pinned network have been built and checked,
+//! every proving / verifying entry point refuses so a divergent binary
+//! cannot serve proofs under matching env pins.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -285,9 +298,58 @@ pub struct ProvedAttestation {
     pub network_id: HashDigest,
 }
 
+/// §3.6 pins for one network, registered before the first circuit build.
+#[derive(Clone, Copy, Debug)]
+struct NetworkPins {
+    c: [u8; 32],
+    c_balance: [u8; 32],
+}
+
+fn pins_slot(network: Network) -> &'static OnceLock<NetworkPins> {
+    static MAINNET: OnceLock<NetworkPins> = OnceLock::new();
+    static TESTNET: OnceLock<NetworkPins> = OnceLock::new();
+    static REGTEST: OnceLock<NetworkPins> = OnceLock::new();
+    match network {
+        Network::Mainnet => &MAINNET,
+        Network::Testnet => &TESTNET,
+        Network::Regtest => &REGTEST,
+    }
+}
+
+fn c_verified_flag(network: Network) -> &'static AtomicBool {
+    static MAINNET: AtomicBool = AtomicBool::new(false);
+    static TESTNET: AtomicBool = AtomicBool::new(false);
+    static REGTEST: AtomicBool = AtomicBool::new(false);
+    match network {
+        Network::Mainnet => &MAINNET,
+        Network::Testnet => &TESTNET,
+        Network::Regtest => &REGTEST,
+    }
+}
+
+fn balance_verified_flag(network: Network) -> &'static AtomicBool {
+    static MAINNET: AtomicBool = AtomicBool::new(false);
+    static TESTNET: AtomicBool = AtomicBool::new(false);
+    static REGTEST: AtomicBool = AtomicBool::new(false);
+    match network {
+        Network::Mainnet => &MAINNET,
+        Network::Testnet => &TESTNET,
+        Network::Regtest => &REGTEST,
+    }
+}
+
+/// Outcome of a circuit cache slot: the built circuit, or a permanent refusal
+/// if construction-time pin check failed (or digests could not be determined).
+enum CircuitSlot<T> {
+    Ready(T),
+    Refused(String),
+}
+
 /// Cached production prover/verifier for one compile-time network.
 ///
 /// `C` and `C_balance` are each built at most once per network per process.
+/// When pins are installed, construction digests the just-built circuit and
+/// refuses on pin mismatch (§1.7.9).
 #[derive(Clone, Copy, Debug)]
 pub struct ProverBridge {
     network: Network,
@@ -298,7 +360,8 @@ impl ProverBridge {
     /// use (prove, verify, digest, or gate-count) and then cached process-wide.
     ///
     /// Construction itself is cheap so persistence / adapter tests can hold a
-    /// bridge handle without paying the multi-minute circuit build.
+    /// bridge handle without paying the multi-minute circuit build. The §1.7.9
+    /// pin check runs at the moment construction completes (see module docs).
     pub fn new(network: Network) -> Self {
         Self { network }
     }
@@ -307,12 +370,85 @@ impl ProverBridge {
         self.network
     }
 
+    /// Register §3.6 pins for `network` before the first circuit construction.
+    ///
+    /// Production boot under v1.1 **must** call this with the env pins so the
+    /// construction-time check has something to compare the real circuit
+    /// against. Idempotent when the same pair is re-installed; refuses if a
+    /// different pair is attempted (no silent overwrite).
+    pub fn install_network_pins(
+        network: Network,
+        pin_c: [u8; 32],
+        pin_c_balance: [u8; 32],
+    ) -> Result<()> {
+        let pins = NetworkPins {
+            c: pin_c,
+            c_balance: pin_c_balance,
+        };
+        match pins_slot(network).set(pins) {
+            Ok(()) => Ok(()),
+            Err(existing) => {
+                if existing.c == pin_c && existing.c_balance == pin_c_balance {
+                    Ok(())
+                } else {
+                    bail!(
+                        "circuit pins for {:?} already installed with a different pair; \
+                         refusing to overwrite (no silent pin swap)",
+                        network
+                    )
+                }
+            }
+        }
+    }
+
+    /// Whether both circuits for this network have been built and pin-checked
+    /// (or built with no pins registered — unpinned test paths).
+    ///
+    /// When pins **are** registered, proving paths must not run until this
+    /// is true (construction is the check). Unpinned: always `true` once
+    /// both caches are warm, else `false` until first use warms them.
+    pub fn identity_ready(&self) -> bool {
+        match pins_slot(self.network).get() {
+            Some(_) => {
+                c_verified_flag(self.network).load(Ordering::Acquire)
+                    && balance_verified_flag(self.network).load(Ordering::Acquire)
+            }
+            None => true, // no pins → no identity gate
+        }
+    }
+
+    /// Force-build both circuits for this network and run the construction-
+    /// time pin check. Returns the live §1.7.1 digests.
+    ///
+    /// This is the honest self-heal / boot path: digests come from the
+    /// circuits that were just constructed, not from an embedded text file
+    /// or from re-encoding the pins.
+    pub fn require_live_identity(&self) -> Result<([u8; 32], [u8; 32])> {
+        let c = self.circuit_digest_bytes_result()?;
+        let b = self.balance_circuit_digest_bytes_result()?;
+        if let Some(pins) = pins_slot(self.network).get() {
+            crate::circuit_identity::require_live_digests_match_pins(
+                &c,
+                &b,
+                &pins.c,
+                &pins.c_balance,
+                self.network,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+        }
+        Ok((c, b))
+    }
+
     pub fn compliance_gate_count(&self) -> usize {
-        compliance_circuit(self.network).gate_count
+        compliance_circuit(self.network)
+            .expect("compliance circuit identity")
+            .gate_count
     }
 
     pub fn balance_gate_count(&self) -> usize {
-        balance_circuit(self.network).gate_count
+        balance_circuit(self.network)
+            .expect("balance circuit identity")
+            .gate_count
     }
 
     /// §1.7.1 32-byte encoding of `C`'s `verifier_only.circuit_digest`.
@@ -323,12 +459,20 @@ impl ProverBridge {
     /// (`shared::spec_v1::digest_to_bytes`: each limb `to_canonical_u64` as
     /// 8-byte big-endian). Callers that compare against a pinned network
     /// constant or `/v1/info.circuit_digests.C` MUST use this form.
+    ///
+    /// Builds `C` on first use. When pins are installed, construction
+    /// refuses if the just-built digest does not match the pin.
     pub fn circuit_digest_bytes(&self) -> [u8; 32] {
-        let digest = compliance_circuit(self.network)
-            .data
-            .verifier_only
-            .circuit_digest;
-        host::digest_to_bytes(&digest)
+        self.circuit_digest_bytes_result()
+            .expect("compliance circuit identity")
+    }
+
+    /// Fallible form of [`Self::circuit_digest_bytes`] for boot / self-heal.
+    pub fn circuit_digest_bytes_result(&self) -> Result<[u8; 32]> {
+        let circuit = compliance_circuit(self.network)?;
+        Ok(host::digest_to_bytes(
+            &circuit.data.verifier_only.circuit_digest,
+        ))
     }
 
     /// §1.7.1 32-byte encoding of `C_balance`'s `verifier_only.circuit_digest`.
@@ -336,16 +480,39 @@ impl ProverBridge {
     /// Same encoding contract as [`Self::circuit_digest_bytes`]. Eagerly
     /// initializes the cached balance circuit for this network if needed.
     pub fn balance_circuit_digest_bytes(&self) -> [u8; 32] {
-        let digest = balance_circuit(self.network)
-            .data
-            .verifier_only
-            .circuit_digest;
-        host::digest_to_bytes(&digest)
+        self.balance_circuit_digest_bytes_result()
+            .expect("balance circuit identity")
+    }
+
+    /// Fallible form of [`Self::balance_circuit_digest_bytes`] for boot / self-heal.
+    pub fn balance_circuit_digest_bytes_result(&self) -> Result<[u8; 32]> {
+        let circuit = balance_circuit(self.network)?;
+        Ok(host::digest_to_bytes(
+            &circuit.data.verifier_only.circuit_digest,
+        ))
+    }
+
+    /// Refuse proving when pins are installed but construction-time identity
+    /// has not passed for both circuits yet.
+    fn ensure_proving_identity(&self) -> Result<()> {
+        if pins_slot(self.network).get().is_some() && !self.identity_ready() {
+            // Force construction (runs the pin check at build completion).
+            let _ = self.require_live_identity()?;
+        }
+        if pins_slot(self.network).get().is_some() && !self.identity_ready() {
+            bail!(
+                "circuit identity for {:?} is not ready — refusing proving path \
+                 until construction-time pin check passes (§1.7.9)",
+                self.network
+            );
+        }
+        Ok(())
     }
 
     /// Assemble all `ComplianceTargets`, then produce a genuine cyclic proof.
     pub fn prove_transition(&self, witness: &TransitionWitness) -> Result<ProvedTransition> {
-        let circuit = compliance_circuit(self.network);
+        self.ensure_proving_identity()?;
+        let circuit = compliance_circuit(self.network)?;
         if let Some(predecessor) = &witness.prev_proof {
             self.verify_transition(predecessor)
                 .context("transition predecessor proof is unacceptable")?;
@@ -393,7 +560,8 @@ impl ProverBridge {
     /// checks. Those host/node responsibilities are outside this bridge
     /// (P1-E.2/P1-G).
     pub fn verify_transition(&self, proof: &ComplianceProof) -> Result<()> {
-        let circuit = compliance_circuit(self.network);
+        self.ensure_proving_identity()?;
+        let circuit = compliance_circuit(self.network)?;
         circuit
             .data
             .verify(proof.clone())
@@ -438,10 +606,11 @@ impl ProverBridge {
     /// Assemble every `C_balance` target and produce a genuine non-cyclic
     /// balance-attestation proof.
     pub fn prove_attestation(&self, witness: &AttestationWitness) -> Result<ProvedAttestation> {
+        self.ensure_proving_identity()?;
         self.verify_transition(&witness.compliance_proof)
             .context("attestation embeds an unacceptable compliance proof")?;
         validate_attestation(witness)?;
-        let circuit = balance_circuit(self.network);
+        let circuit = balance_circuit(self.network)?;
         let partial = assemble_attestation_witness(circuit, witness, self.network)?;
         let proof = circuit
             .data
@@ -465,37 +634,83 @@ impl ProverBridge {
     /// the disclosed Bitcoin anchor. Those §5.7 host checks are outside this
     /// bridge (P1-E.2/P1-G).
     pub fn verify_attestation(&self, proof: &BalanceProof) -> Result<()> {
-        balance_circuit(self.network)
+        self.ensure_proving_identity()?;
+        balance_circuit(self.network)?
             .data
             .verify(proof.clone())
             .context("balance-attestation proof verification failed")
     }
 }
 
-fn compliance_circuit(network: Network) -> &'static SkeletonCircuit {
-    static MAINNET: OnceLock<SkeletonCircuit> = OnceLock::new();
-    static TESTNET: OnceLock<SkeletonCircuit> = OnceLock::new();
-    static REGTEST: OnceLock<SkeletonCircuit> = OnceLock::new();
+/// Build `C` once per network. When pins are installed, the digest of the
+/// circuit that was **just built** is compared to the pin immediately —
+/// that is the §1.7.9 check (not an embedded text file, not the pins
+/// compared to themselves).
+fn compliance_circuit(network: Network) -> Result<&'static SkeletonCircuit> {
+    static MAINNET: OnceLock<CircuitSlot<SkeletonCircuit>> = OnceLock::new();
+    static TESTNET: OnceLock<CircuitSlot<SkeletonCircuit>> = OnceLock::new();
+    static REGTEST: OnceLock<CircuitSlot<SkeletonCircuit>> = OnceLock::new();
     let cache = match network {
         Network::Mainnet => &MAINNET,
         Network::Testnet => &TESTNET,
         Network::Regtest => &REGTEST,
     };
-    cache.get_or_init(|| {
-        build_skeleton_circuit(CircuitConfig::standard_recursion_zk_config(), network)
-    })
+    let slot = cache.get_or_init(|| {
+        let circuit =
+            build_skeleton_circuit(CircuitConfig::standard_recursion_zk_config(), network);
+        let built = host::digest_to_bytes(&circuit.data.verifier_only.circuit_digest);
+        if let Some(pins) = pins_slot(network).get() {
+            if let Err(e) = crate::circuit_identity::require_one_live_digest_matches_pin(
+                "C",
+                &built,
+                &pins.c,
+                network,
+            ) {
+                return CircuitSlot::Refused(e);
+            }
+        }
+        c_verified_flag(network).store(true, Ordering::Release);
+        CircuitSlot::Ready(circuit)
+    });
+    match slot {
+        CircuitSlot::Ready(c) => Ok(c),
+        CircuitSlot::Refused(e) => Err(anyhow::anyhow!(e.clone())),
+    }
 }
 
-fn balance_circuit(network: Network) -> &'static BalanceCircuit {
-    static MAINNET: OnceLock<BalanceCircuit> = OnceLock::new();
-    static TESTNET: OnceLock<BalanceCircuit> = OnceLock::new();
-    static REGTEST: OnceLock<BalanceCircuit> = OnceLock::new();
+/// Build `C_balance` once per network (depends on `C`). Same construction-
+/// time pin check as [`compliance_circuit`].
+fn balance_circuit(network: Network) -> Result<&'static BalanceCircuit> {
+    static MAINNET: OnceLock<CircuitSlot<BalanceCircuit>> = OnceLock::new();
+    static TESTNET: OnceLock<CircuitSlot<BalanceCircuit>> = OnceLock::new();
+    static REGTEST: OnceLock<CircuitSlot<BalanceCircuit>> = OnceLock::new();
     let cache = match network {
         Network::Mainnet => &MAINNET,
         Network::Testnet => &TESTNET,
         Network::Regtest => &REGTEST,
     };
-    cache.get_or_init(|| build_c_balance_circuit(compliance_circuit(network), network))
+    // C must exist first (and have passed its pin check when pins are set).
+    let compliance = compliance_circuit(network)?;
+    let slot = cache.get_or_init(|| {
+        let circuit = build_c_balance_circuit(compliance, network);
+        let built = host::digest_to_bytes(&circuit.data.verifier_only.circuit_digest);
+        if let Some(pins) = pins_slot(network).get() {
+            if let Err(e) = crate::circuit_identity::require_one_live_digest_matches_pin(
+                "C_balance",
+                &built,
+                &pins.c_balance,
+                network,
+            ) {
+                return CircuitSlot::Refused(e);
+            }
+        }
+        balance_verified_flag(network).store(true, Ordering::Release);
+        CircuitSlot::Ready(circuit)
+    });
+    match slot {
+        CircuitSlot::Ready(c) => Ok(c),
+        CircuitSlot::Refused(e) => Err(anyhow::anyhow!(e.clone())),
+    }
 }
 
 fn network_id(network: Network) -> HashDigest {
@@ -1708,7 +1923,10 @@ pub mod test_signing {
     /// real transition proof, but is sufficient for host-only tests that must
     /// reject wrapper/public-input mismatches before cryptographic verify.
     pub(crate) fn base_proved_transition(network: Network) -> ProvedTransition {
-        let proof = super::compliance_circuit(network).base_proof.clone();
+        let proof = super::compliance_circuit(network)
+            .expect("compliance circuit")
+            .base_proof
+            .clone();
         let (proof_data, consumed_pubkey, network_id) =
             extract_transition_public_inputs(&proof).expect("base proof public-input shape");
         ProvedTransition {

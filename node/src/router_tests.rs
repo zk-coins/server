@@ -5697,6 +5697,7 @@ mod jobs_endpoint_tests {
             proof_id,
             error,
             progress: 0,
+            reset_generation: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             completed_at: None,
