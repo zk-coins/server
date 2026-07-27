@@ -262,6 +262,15 @@ pub struct AppState {
     /// input (Defect 4).
     #[cfg(test)]
     pub(crate) v11_pending_after_prove: Option<V11PendingAfterProveHook>,
+    /// Shared v1.1 engine for Gap-G6 balance attestation (and later
+    /// Stage-3 prove paths). `None` under the legacy stack.
+    pub(crate) v11_engine: Option<Arc<crate::v11::EngineAdapter>>,
+    /// Single-use `AttestBalanceChallenge` store (§7.5 / §5.1).
+    pub(crate) attest_challenges: crate::v11::AttestChallengeMap,
+    /// Authoritative hostnames for `chan_bind` (§5.1). From
+    /// `ZKCOINS_PUBLIC_HOST`. Empty → attest auth fails loud (no silent
+    /// localhost default).
+    pub(crate) public_hosts: Arc<Vec<String>>,
 }
 
 /// Hook the dispatcher invokes after a verified `/sign` to drive
@@ -2733,6 +2742,144 @@ fn v11_progress_wire(progress: i16) -> f64 {
     (progress as f64 / 100.0).clamp(0.0, 1.0)
 }
 
+// ---------------------------------------------------------------------------
+// §7.5 Gap G6 — balance attestation
+// ---------------------------------------------------------------------------
+
+/// Map an [`crate::v11::AttestError`] to the §7.5 error body + HTTP status.
+fn attest_error_response(err: crate::v11::AttestError) -> axum::response::Response {
+    let (status, code) = err.http_status_and_code();
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(v11_error_body(code, err.message())),
+    )
+        .into_response()
+}
+
+/// `POST /v1/attest/balance/challenge` — §7.5 action-bound challenge.
+///
+/// Body: `{ subject: <zk-address> }`  
+/// Returns: `{ nonce: <hex32>, expiry: <u64>, domain: "zkCoins/v1/AttestBalanceChallenge" }`
+pub(crate) async fn attest_balance_challenge_handler(
+    State(state): State<AppState>,
+    Json(body): Json<crate::v11::AttestChallengeRequest>,
+) -> axum::response::Response {
+    if !crate::v11::v11_attest_route_active() {
+        return attest_error_response(crate::v11::AttestError::FeatureDisabled);
+    }
+    match crate::v11::issue_attest_challenge(
+        &state.attest_challenges,
+        &body.subject,
+        crate::v11::unix_now(),
+    ) {
+        Ok((nonce, expiry)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "nonce": hex::encode(nonce),
+                "expiry": expiry,
+                "domain": crate::v11::ATTEST_BALANCE_CHALLENGE_DOMAIN,
+            })),
+        )
+            .into_response(),
+        Err(e) => attest_error_response(e),
+    }
+}
+
+/// `POST /v1/attest/balance` — §7.5 OwnershipProof-gated admit.
+///
+/// Returns `202 { job_id }` on success. Auth failures use the closed
+/// codes `unauthorized` / `challenge_expired` / `malformed_request`.
+pub(crate) async fn attest_balance_handler(
+    State(state): State<AppState>,
+    Json(body): Json<crate::v11::AttestBalanceRequest>,
+) -> axum::response::Response {
+    if !crate::v11::v11_attest_route_active() {
+        return attest_error_response(crate::v11::AttestError::FeatureDisabled);
+    }
+
+    let authorised = match crate::v11::authorise_attest_balance(
+        &state.attest_challenges,
+        state.public_hosts.as_slice(),
+        &body,
+        crate::v11::unix_now(),
+    ) {
+        Ok(b) => b,
+        Err(e) => return attest_error_response(e),
+    };
+
+    // Engine must be present under a v1.1 claim (wired at boot).
+    if state.v11_engine.is_none() {
+        return attest_error_response(crate::v11::AttestError::Internal(
+            "v11 EngineAdapter not available for attestation".into(),
+        ));
+    }
+
+    let request_value = match serde_json::to_value(&authorised) {
+        Ok(v) => v,
+        Err(e) => {
+            return attest_error_response(crate::v11::AttestError::Internal(format!(
+                "encode AttestJobBody: {e}"
+            )));
+        }
+    };
+
+    let create_result = match state
+        .job_store
+        .create(
+            JobKind::AttestBalance,
+            &authorised.subject,
+            None,
+            request_value,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("JobStore::create (attest_balance) failed: {}", e);
+            return attest_error_response(crate::v11::AttestError::Internal(
+                "Failed to admit attestation job".into(),
+            ));
+        }
+    };
+
+    let job = match create_result {
+        CreateResult::Fresh(j) | CreateResult::IdempotentReplay(j) => j,
+    };
+
+    // Enqueue for the dispatcher (same channel as mint/send).
+    if let Err(e) = state
+        .job_tx
+        .send(crate::job_dispatcher::JobEnvelope {
+            public_id: job.public_id,
+        })
+        .await
+    {
+        tracing::error!("attest job enqueue failed: {}", e);
+        let _ = state
+            .job_store
+            .fail(
+                job.public_id,
+                &crate::v11::encode_job_error(
+                    "internal_error",
+                    format!("enqueue failed: {e}"),
+                ),
+            )
+            .await;
+        return attest_error_response(crate::v11::AttestError::Internal(
+            "Failed to enqueue attestation job".into(),
+        ));
+    }
+
+    // §7.5: `202 { job_id }` — no status field on this admit response.
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "job_id": job.public_id.to_string(),
+        })),
+    )
+        .into_response()
+}
+
 /// `GET /v1/jobs/:id` — §7.5 poll envelope.
 ///
 /// - `status` is the closed §7.5 set (`accepted` / `publishing` aliases).
@@ -4449,6 +4596,12 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/v1/jobs/:id/sign", post(jobs_sign_handler))
         .route("/v1/jobs/:id/stream", get(stream_job_v1_handler))
         .route("/v1/jobs/:id/cancel", post(jobs_cancel_v1_handler))
+        // §7.5 Gap G6 — balance attestation (flag-gated inside handlers).
+        .route(
+            "/v1/attest/balance/challenge",
+            post(attest_balance_challenge_handler),
+        )
+        .route("/v1/attest/balance", post(attest_balance_handler))
         .route("/api/jobs/:id/cancel", post(jobs_cancel_handler))
         .route("/api/inscriptions/:txid", get(get_inscription_handler))
         .route(

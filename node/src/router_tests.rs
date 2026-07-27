@@ -101,6 +101,9 @@ fn test_state() -> AppState {
         v11_finalise: None,
         v11_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
         v11_pending_after_prove: None,
+        v11_engine: None,
+        attest_challenges: Arc::new(dashmap::DashMap::new()),
+        public_hosts: Arc::new(vec!["node.test".to_string()]),
     }
 }
 
@@ -2418,6 +2421,9 @@ fn mint_test_state() -> AppState {
         v11_finalise: None,
         v11_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
         v11_pending_after_prove: None,
+        v11_engine: None,
+        attest_challenges: Arc::new(dashmap::DashMap::new()),
+        public_hosts: Arc::new(vec!["node.test".to_string()]),
     }
 }
 
@@ -4436,6 +4442,9 @@ mod jobs_endpoint_tests {
             v11_finalise: None,
             v11_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
             v11_pending_after_prove: None,
+            v11_engine: None,
+            attest_challenges: Arc::new(dashmap::DashMap::new()),
+            public_hosts: Arc::new(vec!["node.test".to_string()]),
         }
     }
 
@@ -6190,6 +6199,263 @@ mod jobs_endpoint_tests {
         assert_eq!(ev.status, JobStatus::Cancelled);
         assert_eq!(ev.phase, "cancelled");
     }
+
+    // -----------------------------------------------------------------------
+    // Gap G6 — §7.5 balance attestation surface
+    // -----------------------------------------------------------------------
+
+    /// Flag-off: both attest routes refuse with `feature_disabled` (404).
+    #[tokio::test]
+    async fn attest_balance_flag_off_returns_feature_disabled() {
+        let _lock = lock_v11_stack_for_test();
+        use crate::v11::clear_process_stack_mode_for_test;
+        clear_process_stack_mode_for_test();
+
+        let state = test_state();
+        let body = serde_json::json!({
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gtw4c"
+        });
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "feature_disabled");
+
+        let body = serde_json::json!({
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gtw4c",
+            "asset_id": "00".repeat(32),
+            "challenge": { "nonce": "11".repeat(32) },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gtw4c",
+                "public_key": "00".repeat(32),
+                "nk_commit": "00".repeat(32),
+                "signature": "00".repeat(64),
+            }
+        });
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "feature_disabled");
+    }
+
+    /// §7.5 path + envelope + closed error codes under a v1.1 claim.
+    #[tokio::test]
+    async fn attest_balance_route_matches_section_7_5() {
+        let _lock = lock_v11_stack_for_test();
+        use crate::v11::{
+            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            ATTEST_BALANCE_CHALLENGE_DOMAIN,
+        };
+        use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+        use shared::spec_v1::{self as host, Address};
+
+        clear_process_stack_mode_for_test();
+        set_process_stack_mode(ScanStackMode::V11);
+
+        let host_name = "node.test";
+        let (mut state, pool, _scope) = jobs_test_state().await;
+        // DB marker + process claim so EngineAdapter::persist is allowed.
+        crate::v11::claim_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect("claim v11 stack_scan_mode");
+        state.public_hosts = Arc::new(vec![host_name.to_string()]);
+
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[0x42u8; 32]).unwrap();
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        let pk0 = xonly.serialize();
+        let nk = [0x11u8; 32];
+        let nkc = host::nk_commit(&nk);
+        let nkc_bytes = host::digest_to_bytes(&nkc);
+        let subject_bytes = host::address(&pk0, nkc);
+        let subject = Address(subject_bytes).to_bech32m();
+        let asset = [0x22u8; 32];
+
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "subject": subject }).to_string(),
+            ))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "challenge body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["domain"], ATTEST_BALANCE_CHALLENGE_DOMAIN);
+        let nonce_hex = v["nonce"].as_str().expect("nonce").to_string();
+        assert_eq!(nonce_hex.len(), 64);
+
+        let body = serde_json::json!({
+            "subject": subject,
+            "asset_id": hex::encode(asset),
+            "challenge": { "nonce": nonce_hex },
+            "ownership_proof": {
+                "type": "grant",
+                "subject": subject,
+                "public_key": hex::encode(pk0),
+                "nk_commit": hex::encode(nkc_bytes),
+                "signature": "00".repeat(64),
+            }
+        });
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "unauthorized");
+
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "subject": subject }).to_string(),
+            ))
+            .unwrap();
+        let (_s, _h, resp) = run(state.clone(), req).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        let nonce_hex = v["nonce"].as_str().unwrap().to_string();
+
+        let body = serde_json::json!({
+            "subject": subject,
+            "asset_id": hex::encode(asset),
+            "nav_ceiling": hex::encode([0xabu8; 32]),
+            "challenge": { "nonce": nonce_hex },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": subject,
+                "public_key": hex::encode(pk0),
+                "nk_commit": hex::encode(nkc_bytes),
+                "signature": "00".repeat(64),
+            }
+        });
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+
+        let body = serde_json::json!({
+            "subject": subject,
+            "asset_id": hex::encode(asset),
+            "challenge": { "nonce": "ff".repeat(32) },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": subject,
+                "public_key": hex::encode(pk0),
+                "nk_commit": hex::encode(nkc_bytes),
+                "signature": "00".repeat(64),
+            }
+        });
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::GONE, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "challenge_expired");
+
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "subject": subject }).to_string(),
+            ))
+            .unwrap();
+        let (_s, _h, resp) = run(state.clone(), req).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        let nonce_hex = v["nonce"].as_str().unwrap().to_string();
+        let expiry = v["expiry"].as_u64().unwrap();
+        let nonce: [u8; 32] = hex::decode(&nonce_hex).unwrap().try_into().unwrap();
+
+        let ceiling_enc = crate::v11::attest::ceiling_encoding(None, None).unwrap();
+        let request_hash =
+            crate::v11::attest::attest_request_hash(&subject_bytes, &asset, &ceiling_enc);
+        let cb = crate::v11::attest::chan_bind_for_host(host_name);
+        let chal = crate::v11::attest::attest_challenge_message(
+            &nonce,
+            &cb,
+            &subject_bytes,
+            expiry,
+            &request_hash,
+        );
+        let msg = Message::from_digest_slice(&chal).unwrap();
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp);
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(sig.as_ref());
+
+        let adapter = crate::v11::EngineAdapter::load_or_create(
+            (*pool).clone(),
+            zkcoins_program::circuit::compliance::Network::Regtest,
+            0,
+        )
+        .await
+        .expect("engine");
+        state.v11_engine = Some(std::sync::Arc::new(adapter));
+
+        let body = serde_json::json!({
+            "subject": subject,
+            "asset_id": hex::encode(asset),
+            "challenge": { "nonce": hex::encode(nonce) },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": subject,
+                "public_key": hex::encode(pk0),
+                "nk_commit": hex::encode(nkc_bytes),
+                "signature": hex::encode(sig_bytes),
+            }
+        });
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert!(v.get("job_id").and_then(|j| j.as_str()).is_some());
+        assert!(v.get("status").is_none(), "§7.5 admit is {{ job_id }} only");
+
+        clear_process_stack_mode_for_test();
+    }
+
+    /// Pinned `C_balance` digests differ per network.
+    #[test]
+    fn attest_c_balance_digest_is_network_pinned() {
+        use crate::v11::{
+            networks_have_distinct_c_balance_pins, pinned_c_balance_digest,
+            PINNED_C_BALANCE_DIGEST_MAINNET, PINNED_C_BALANCE_DIGEST_TESTNET,
+        };
+        use zkcoins_program::circuit::compliance::Network;
+
+        assert!(networks_have_distinct_c_balance_pins(
+            Network::Testnet,
+            Network::Mainnet
+        ));
+        assert_eq!(
+            pinned_c_balance_digest(Network::Testnet),
+            PINNED_C_BALANCE_DIGEST_TESTNET
+        );
+        assert_eq!(
+            pinned_c_balance_digest(Network::Mainnet),
+            PINNED_C_BALANCE_DIGEST_MAINNET
+        );
+        assert_ne!(
+            PINNED_C_BALANCE_DIGEST_TESTNET,
+            PINNED_C_BALANCE_DIGEST_MAINNET
+        );
+    }
+
 }
 
 // =======================================================================
@@ -7933,3 +8199,6 @@ async fn jobs_mint_stale_timestamp_is_rejected() {
     let (status, _b) = send_request(http).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+// ---------------------------------------------------------------------------
+

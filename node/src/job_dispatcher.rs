@@ -387,6 +387,10 @@ async fn process_envelope(
             )
             .await
         }
+        // Gap G6: attest_balance has no awaiting_signature phase (§7.5).
+        (JobKind::AttestBalance, JobStatus::Queued | JobStatus::Proving) => {
+            process_attest_balance(job_store, app_state, notify_map, job).await
+        }
         // Mid-finalise crash: durable signed capability + broadcasting.
         // Resume finalise without re-parking on /sign.
         (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting)
@@ -399,6 +403,165 @@ async fn process_envelope(
                 "Job dispatcher: envelope for {} in unexpected state {:?}; skipping",
                 env.public_id,
                 job.status
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Drive an `attest_balance` job: `proving → completed` with
+/// `result.attestation`, or `failed`. No wallet signature phase.
+///
+/// EDGE: see [`crate::v11::ATTEST_ANCHOR_LOCATOR_EDGE`] when the Bitcoin
+/// inscription locator cannot be resolved from engine + pending-publish
+/// state. A failed prove never invents an empty attestation.
+async fn process_attest_balance(
+    job_store: &JobStore,
+    app_state: &AppState,
+    notify_map: &JobNotifyMap,
+    job: Job,
+) -> anyhow::Result<()> {
+    let public_id = job.public_id;
+    job_store
+        .set_status(public_id, JobStatus::Proving, "proving")
+        .await?;
+    publish_phase(
+        notify_map,
+        public_id,
+        JobPhaseEvent {
+            status: JobStatus::Proving,
+            phase: "proving".to_string(),
+            proof_id: None,
+            result: None,
+            error: None,
+        },
+    );
+
+    let body: crate::v11::AttestJobBody = match serde_json::from_value(job.request_body.clone()) {
+        Ok(b) => b,
+        Err(e) => {
+            let msg = crate::v11::encode_job_error(
+                "proving_failed",
+                format!("invalid attest job body: {e}"),
+            );
+            job_store.fail(public_id, &msg).await?;
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(msg),
+                },
+            );
+            return Ok(());
+        }
+    };
+
+    let adapter = match &app_state.v11_engine {
+        Some(a) => a,
+        None => {
+            let msg = crate::v11::encode_job_error(
+                "internal_error",
+                "v11 EngineAdapter missing for attest_balance job",
+            );
+            job_store.fail(public_id, &msg).await?;
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(msg),
+                },
+            );
+            return Ok(());
+        }
+    };
+
+    // prove_attestation_for_job is async (DB locator lookup) and internally
+    // runs the multi-minute C_balance prove on the caller's thread. The
+    // single-worker dispatcher already serialises proves, so we await it
+    // directly rather than nesting a second runtime.
+    let outcome = crate::v11::prove_attestation_for_job(adapter.as_ref(), &body).await;
+
+    match outcome {
+        Ok(proved) => {
+            note_prove_outcome(app_state, Ok(())).await;
+            let bytes = match crate::v11::serialize_balance_attestation(
+                &proved.statement,
+                adapter.network(),
+                &proved.proof,
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    let msg = crate::v11::encode_job_error("proving_failed", e.message());
+                    job_store.fail(public_id, &msg).await?;
+                    publish_phase(
+                        notify_map,
+                        public_id,
+                        JobPhaseEvent {
+                            status: JobStatus::Failed,
+                            phase: "failed".to_string(),
+                            proof_id: None,
+                            result: None,
+                            error: Some(msg),
+                        },
+                    );
+                    return Ok(());
+                }
+            };
+            // §7.5 result for attest_balance: only `attestation` is present.
+            let result = serde_json::json!({
+                "attestation": hex::encode(bytes),
+            });
+            job_store.complete(public_id, result.clone(), 200).await?;
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Completed,
+                    phase: "completed".to_string(),
+                    proof_id: None,
+                    result: Some(result),
+                    error: None,
+                },
+            );
+            tracing::info!("Job dispatcher: attest_balance job {} completed", public_id);
+            Ok(())
+        }
+        Err(e) => {
+            let (code, message) = match &e {
+                crate::v11::AttestError::CircuitDigestMismatch(m) => {
+                    ("circuit_digest_mismatch", m.clone())
+                }
+                crate::v11::AttestError::ProvingFailed(m) => ("proving_failed", m.clone()),
+                crate::v11::AttestError::Internal(m) => ("internal_error", m.clone()),
+                other => ("proving_failed", other.message().to_string()),
+            };
+            note_prove_outcome(app_state, Err("prove failed")).await;
+            let msg = crate::v11::encode_job_error(code, message);
+            if let Ok(Some(j)) = job_store.load(public_id).await {
+                if j.status == JobStatus::Cancelled {
+                    notify_map.remove(&public_id);
+                    return Ok(());
+                }
+            }
+            job_store.fail(public_id, &msg).await?;
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(msg),
+                },
             );
             Ok(())
         }
@@ -1558,6 +1721,12 @@ async fn wait_for_commit(
     let commit_outcome = match kind {
         JobKind::Mint => mint_commit_flow(app_state, commit_request).await,
         JobKind::Send => commit_flow(app_state, commit_request).await,
+        // Attest jobs have no awaiting_signature / commit leg (§7.5).
+        JobKind::AttestBalance => {
+            return Err(anyhow::anyhow!(
+                "Job dispatcher: attest_balance has no commit/broadcast leg"
+            ));
+        }
     };
     match commit_outcome {
         Ok((response_body, response_status)) => {
