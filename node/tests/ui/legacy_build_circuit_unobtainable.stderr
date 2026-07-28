@@ -1,0 +1,11 @@
+error[E0603]: function `build_circuit` is private
+ --> tests/ui/legacy_build_circuit_unobtainable.rs:5:45
+  |
+5 |     let _ = zkcoins_program::circuit::main::build_circuit;
+  |                                             ^^^^^^^^^^^^^ private function
+  |
+note: the function `build_circuit` is defined here
+ --> $WORKSPACE/program-plonky2/src/circuit/main.rs
+  |
+  | pub(crate) fn build_circuit() -> StateTransitionCircuit {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

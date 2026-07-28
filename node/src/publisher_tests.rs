@@ -555,6 +555,11 @@ async fn create_and_broadcast_inscription_succeeds_end_to_end_with_mocked_esplor
 async fn setup_phaseb_pool() -> (PgPool, SchemaScope) {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    // Stage 3 Runde 6: pending_inscriptions writers are gated at the SQL
+    // sink — claim legacy so phase-B seed/resume tests can exercise them.
+    crate::v1::claim_stack_scan_mode(&pool, crate::v1::ScanStackMode::Legacy)
+        .await
+        .expect("claim legacy stack for publisher phase-B tests");
     (pool, scope)
 }
 

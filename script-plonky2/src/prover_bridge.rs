@@ -103,7 +103,12 @@ pub struct NullifierOpening {
 }
 
 /// Clause-10 provenance, accumulator, and history evidence for one receipt.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// **No public `Deserialize` (Stage 3 Runde 5):** `creating_proof` must not
+/// load unbound via a free serde entry. Nested durable decode goes through
+/// [`TransitionWitness::decode_bound`] / the private wire used by
+/// `FinalisationCapability::from_durable_bytes`, which bind identity.
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ReceivedAuthorization {
     pub creating_proof: ComplianceProof,
     pub output_inclusion: OutputInclusionProof,
@@ -215,7 +220,18 @@ pub struct PredecessorNullifier {
 /// Compact vectors represent active-prefix circuit slots. Inactive slots are
 /// filled canonically by the bridge. Coin-history proofs retain their semantic
 /// locations: inputs occupy slots 0..8, outputs 8..16, and receipts 16..20.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// ## Load gate (Stage 3 Runde 5)
+///
+/// This type deliberately does **not** derive `Deserialize`. A free
+/// `bincode::deserialize::<TransitionWitness>(…)` would accept a well-formed
+/// proof of another circuit in `prev_proof` / `received_auth[].creating_proof`
+/// without identity bind. The only supported byte → witness path is
+/// [`TransitionWitness::decode_bound`] (or durable resume via
+/// `FinalisationCapability::from_durable_bytes`, which uses the same bind).
+/// Construction in-process (StateEngine `begin_*`) remains a plain struct
+/// literal — no serde.
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct TransitionWitness {
     pub mode: TransitionMode,
     pub prev_account_state: AccountState,
@@ -244,6 +260,183 @@ pub struct TransitionWitness {
     /// `InitialProof`, where the bridge installs the circuit's base proof.
     pub prev_proof: Option<ComplianceProof>,
     pub predecessor_nullifier: Option<PredecessorNullifier>,
+}
+
+/// Crate-private bincode layout for [`TransitionWitness`] / nested
+/// [`ReceivedAuthorization`]. Field order matches the historical derived
+/// `Serialize`/`Deserialize` layout so durable `FinalisationCapability`
+/// blobs remain loadable. Not part of the public API — external crates
+/// use [`TransitionWitness::decode_bound`] only.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TransitionWitnessWire {
+    mode: TransitionMode,
+    prev_account_state: AccountState,
+    new_account_state: AccountState,
+    input_coins: Vec<Coin>,
+    input_auth: Vec<InputAuthorization>,
+    output_templates: Vec<CoinTemplate>,
+    output_coins: Vec<Coin>,
+    output_history_proofs: Vec<Option<CoinHistProof>>,
+    received_coins: Vec<Coin>,
+    received_auth: Vec<ReceivedAuthorizationWire>,
+    asset_issuance: Option<AssetIssuance>,
+    nk: [u8; 32],
+    nav: Nav,
+    nav_rand: [u8; 32],
+    prev_nav_opening: Option<NavOpening>,
+    nav_consistency: Vec<HashDigest>,
+    next_pubkey: [u8; 32],
+    npk_rand: [u8; 32],
+    transition_signature: TransitionSignature,
+    prev_proof: Option<ComplianceProof>,
+    predecessor_nullifier: Option<PredecessorNullifier>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct ReceivedAuthorizationWire {
+    creating_proof: ComplianceProof,
+    output_inclusion: OutputInclusionProof,
+    creating_prev_ash: HashDigest,
+    creating_nullifier: NullifierOpening,
+    creating_nav_inclusion: Vec<HashDigest>,
+    pos_create: u64,
+    creating_nav_opening: NavOpening,
+    creating_nav_consistency: Vec<HashDigest>,
+    history_proof: CoinHistProof,
+}
+
+impl TransitionWitness {
+    pub(crate) fn to_wire(&self) -> TransitionWitnessWire {
+        TransitionWitnessWire {
+            mode: self.mode,
+            prev_account_state: self.prev_account_state.clone(),
+            new_account_state: self.new_account_state.clone(),
+            input_coins: self.input_coins.clone(),
+            input_auth: self.input_auth.clone(),
+            output_templates: self.output_templates.clone(),
+            output_coins: self.output_coins.clone(),
+            output_history_proofs: self.output_history_proofs.clone(),
+            received_coins: self.received_coins.clone(),
+            received_auth: self
+                .received_auth
+                .iter()
+                .map(ReceivedAuthorization::to_wire)
+                .collect(),
+            asset_issuance: self.asset_issuance.clone(),
+            nk: self.nk,
+            nav: self.nav.clone(),
+            nav_rand: self.nav_rand,
+            prev_nav_opening: self.prev_nav_opening.clone(),
+            nav_consistency: self.nav_consistency.clone(),
+            next_pubkey: self.next_pubkey,
+            npk_rand: self.npk_rand,
+            transition_signature: self.transition_signature.clone(),
+            prev_proof: self.prev_proof.clone(),
+            predecessor_nullifier: self.predecessor_nullifier.clone(),
+        }
+    }
+
+    pub(crate) fn from_wire(wire: TransitionWitnessWire) -> Self {
+        Self {
+            mode: wire.mode,
+            prev_account_state: wire.prev_account_state,
+            new_account_state: wire.new_account_state,
+            input_coins: wire.input_coins,
+            input_auth: wire.input_auth,
+            output_templates: wire.output_templates,
+            output_coins: wire.output_coins,
+            output_history_proofs: wire.output_history_proofs,
+            received_coins: wire.received_coins,
+            received_auth: wire
+                .received_auth
+                .into_iter()
+                .map(ReceivedAuthorization::from_wire)
+                .collect(),
+            asset_issuance: wire.asset_issuance,
+            nk: wire.nk,
+            nav: wire.nav,
+            nav_rand: wire.nav_rand,
+            prev_nav_opening: wire.prev_nav_opening,
+            nav_consistency: wire.nav_consistency,
+            next_pubkey: wire.next_pubkey,
+            npk_rand: wire.npk_rand,
+            transition_signature: wire.transition_signature,
+            prev_proof: wire.prev_proof,
+            predecessor_nullifier: wire.predecessor_nullifier,
+        }
+    }
+
+    /// Deserialize a witness from bincode and **bind every embedded
+    /// compliance proof** to `bridge`'s circuit `C` identity.
+    ///
+    /// This is the sole public byte → [`TransitionWitness`] entry. Bare
+    /// `bincode::deserialize::<TransitionWitness>` no longer compiles
+    /// (no `Deserialize` impl). Binds:
+    /// - `prev_proof` when present
+    /// - every `received_auth[i].creating_proof`
+    ///
+    /// A well-formed proof of another circuit fails the same shape /
+    /// cyclic-tail gate as [`ProverBridge::bind_prev_proof_identity`].
+    pub fn decode_bound(bytes: &[u8], bridge: &ProverBridge) -> Result<Self> {
+        let wire: TransitionWitnessWire = bincode::deserialize(bytes).context(
+            "deserialize TransitionWitness wire (bincode); refusing unbound free Deserialize",
+        )?;
+        let witness = Self::from_wire(wire);
+        witness.bind_embedded_proofs(bridge)?;
+        Ok(witness)
+    }
+
+    /// Bind `prev_proof` and every receipt `creating_proof` already present
+    /// on this value (used after private-wire rehydrate).
+    pub(crate) fn bind_embedded_proofs(&self, bridge: &ProverBridge) -> Result<()> {
+        if let Some(ref proof) = self.prev_proof {
+            bridge.bind_prev_proof_identity(proof).context(
+                "TransitionWitness load: prev_proof failed circuit-C identity bind \
+                 (refusing as prev_proof)",
+            )?;
+        }
+        for (index, auth) in self.received_auth.iter().enumerate() {
+            bridge
+                .bind_prev_proof_identity(&auth.creating_proof)
+                .with_context(|| {
+                    format!(
+                        "TransitionWitness load: received_auth[{index}].creating_proof \
+                         failed circuit-C identity bind (refusing as creating_proof)"
+                    )
+                })?;
+        }
+        Ok(())
+    }
+}
+
+impl ReceivedAuthorization {
+    fn to_wire(&self) -> ReceivedAuthorizationWire {
+        ReceivedAuthorizationWire {
+            creating_proof: self.creating_proof.clone(),
+            output_inclusion: self.output_inclusion.clone(),
+            creating_prev_ash: self.creating_prev_ash,
+            creating_nullifier: self.creating_nullifier.clone(),
+            creating_nav_inclusion: self.creating_nav_inclusion.clone(),
+            pos_create: self.pos_create,
+            creating_nav_opening: self.creating_nav_opening.clone(),
+            creating_nav_consistency: self.creating_nav_consistency.clone(),
+            history_proof: self.history_proof.clone(),
+        }
+    }
+
+    fn from_wire(wire: ReceivedAuthorizationWire) -> Self {
+        Self {
+            creating_proof: wire.creating_proof,
+            output_inclusion: wire.output_inclusion,
+            creating_prev_ash: wire.creating_prev_ash,
+            creating_nullifier: wire.creating_nullifier,
+            creating_nav_inclusion: wire.creating_nav_inclusion,
+            pos_create: wire.pos_create,
+            creating_nav_opening: wire.creating_nav_opening,
+            creating_nav_consistency: wire.creating_nav_consistency,
+            history_proof: wire.history_proof,
+        }
+    }
 }
 
 /// A genuine transition proof and its application public outputs.
@@ -340,8 +533,14 @@ fn balance_verified_flag(network: Network) -> &'static AtomicBool {
 
 /// Outcome of a circuit cache slot: the built circuit, or a permanent refusal
 /// if construction-time pin check failed (or digests could not be determined).
+///
+/// `Ready` holds a [`Box`] so the multi-megabyte circuit body never crosses a
+/// thread join / `OnceLock::get_or_init` boundary as a by-value stack object
+/// (the test-runner default stack is ~2 MiB; returning `SkeletonCircuit` by
+/// value there aborts with stack overflow before the 64 MiB build worker
+/// finishes transferring the result).
 enum CircuitSlot<T> {
-    Ready(T),
+    Ready(Box<T>),
     Refused(String),
 }
 
@@ -571,6 +770,52 @@ impl ProverBridge {
         Ok(())
     }
 
+    /// Deserialize durable `last_proof` / `prev_proof` bytes and **bind them
+    /// to this bridge's circuit `C` identity**.
+    ///
+    /// Uses the same construction-time pin path as proving: `C` is built
+    /// (pin-checked when pins are installed), then
+    /// [`check_cyclic_proof_verifier_data`] refuses any proof whose cyclic
+    /// verifier-data tail is not that of `C`. A well-formed **legacy**
+    /// `zkcoins_prover::Proof` (same Rust type alias, different circuit)
+    /// deserializes via bincode but fails this bind — that is the Stage-3
+    /// load gate. Garbage bytes fail at deserialize.
+    ///
+    /// Does not re-run full Plonky2 `verify` (that stays on the prove /
+    /// slow-canary path). Identity is the circuit-digest tail bound at
+    /// construction; nothing parallel is invented here.
+    pub fn bind_loaded_prev_proof(&self, bytes: &[u8]) -> Result<ComplianceProof> {
+        let proof: ComplianceProof = bincode::deserialize(bytes).context(
+            "deserialize last_proof / prev_proof as ComplianceProof (bincode)",
+        )?;
+        self.bind_prev_proof_identity(&proof)?;
+        Ok(proof)
+    }
+
+    /// Bind an already-deserialized proof to circuit `C` identity (same
+    /// gate as [`Self::bind_loaded_prev_proof`]).
+    pub fn bind_prev_proof_identity(&self, proof: &ComplianceProof) -> Result<()> {
+        // Cheap shape gate **before** constructing `C`. Legacy outer proofs
+        // share the Rust type but not the PI length; refuse them without
+        // paying circuit build (and without requiring a large process stack
+        // for the cyclic-identity path). Wrong-shape is the Stage-3 threat
+        // model for "well-formed proof of another circuit".
+        ensure!(
+            proof.public_inputs.len() == 108,
+            "last_proof / prev_proof has {} public inputs (expected 108 for circuit C); \
+             refusing as prev_proof — well-formed proofs of another circuit are not loadable",
+            proof.public_inputs.len()
+        );
+        self.ensure_proving_identity()?;
+        let circuit = compliance_circuit(self.network)?;
+        check_cyclic_proof_verifier_data(proof, &circuit.data.verifier_only, &circuit.data.common)
+            .context(
+                "last_proof / prev_proof is not bound to circuit C identity \
+                 (wrong circuit or corrupt verifier-data tail); refusing as prev_proof",
+            )?;
+        Ok(())
+    }
+
     /// Re-extract every application public input from the proof and bind it
     /// to the convenience fields carried by `ProvedTransition`.
     ///
@@ -656,24 +901,37 @@ fn compliance_circuit(network: Network) -> Result<&'static SkeletonCircuit> {
         Network::Regtest => &REGTEST,
     };
     let slot = cache.get_or_init(|| {
-        let circuit =
-            build_skeleton_circuit(CircuitConfig::standard_recursion_zk_config(), network);
-        let built = host::digest_to_bytes(&circuit.data.verifier_only.circuit_digest);
-        if let Some(pins) = pins_slot(network).get() {
-            if let Err(e) = crate::circuit_identity::require_one_live_digest_matches_pin(
-                "C",
-                &built,
-                &pins.c,
-                network,
-            ) {
-                return CircuitSlot::Refused(e);
-            }
-        }
-        c_verified_flag(network).store(true, Ordering::Release);
-        CircuitSlot::Ready(circuit)
+        // Build + pin-check on a large stack; only `Box` / `Refused` crosses
+        // back to the caller (test-runner stack is too small for by-value
+        // `SkeletonCircuit` — see `CircuitSlot` docs).
+        std::thread::Builder::new()
+            .name("zkcoins-compliance-cache".to_owned())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let circuit = build_skeleton_circuit(
+                    CircuitConfig::standard_recursion_zk_config(),
+                    network,
+                );
+                let built = host::digest_to_bytes(&circuit.data.verifier_only.circuit_digest);
+                if let Some(pins) = pins_slot(network).get() {
+                    if let Err(e) = crate::circuit_identity::require_one_live_digest_matches_pin(
+                        "C",
+                        &built,
+                        &pins.c,
+                        network,
+                    ) {
+                        return CircuitSlot::Refused(e);
+                    }
+                }
+                c_verified_flag(network).store(true, Ordering::Release);
+                CircuitSlot::Ready(Box::new(circuit))
+            })
+            .expect("compliance cache worker must spawn")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     });
     match slot {
-        CircuitSlot::Ready(c) => Ok(c),
+        CircuitSlot::Ready(c) => Ok(c.as_ref()),
         CircuitSlot::Refused(e) => Err(anyhow::anyhow!(e.clone())),
     }
 }
@@ -692,23 +950,33 @@ fn balance_circuit(network: Network) -> Result<&'static BalanceCircuit> {
     // C must exist first (and have passed its pin check when pins are set).
     let compliance = compliance_circuit(network)?;
     let slot = cache.get_or_init(|| {
-        let circuit = build_c_balance_circuit(compliance, network);
-        let built = host::digest_to_bytes(&circuit.data.verifier_only.circuit_digest);
-        if let Some(pins) = pins_slot(network).get() {
-            if let Err(e) = crate::circuit_identity::require_one_live_digest_matches_pin(
-                "C_balance",
-                &built,
-                &pins.c_balance,
-                network,
-            ) {
-                return CircuitSlot::Refused(e);
-            }
-        }
-        balance_verified_flag(network).store(true, Ordering::Release);
-        CircuitSlot::Ready(circuit)
+        let compliance = compliance; // 'static ref is Copy via reborrow below
+        std::thread::Builder::new()
+            .name("zkcoins-balance-cache".to_owned())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                // `compliance` is `'static`; re-borrow for the balance builder.
+                let circuit = build_c_balance_circuit(compliance, network);
+                let built = host::digest_to_bytes(&circuit.data.verifier_only.circuit_digest);
+                if let Some(pins) = pins_slot(network).get() {
+                    if let Err(e) = crate::circuit_identity::require_one_live_digest_matches_pin(
+                        "C_balance",
+                        &built,
+                        &pins.c_balance,
+                        network,
+                    ) {
+                        return CircuitSlot::Refused(e);
+                    }
+                }
+                balance_verified_flag(network).store(true, Ordering::Release);
+                CircuitSlot::Ready(Box::new(circuit))
+            })
+            .expect("balance cache worker must spawn")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     });
     match slot {
-        CircuitSlot::Ready(c) => Ok(c),
+        CircuitSlot::Ready(c) => Ok(c.as_ref()),
         CircuitSlot::Refused(e) => Err(anyhow::anyhow!(e.clone())),
     }
 }
@@ -1829,10 +2097,9 @@ pub mod test_signing {
         AffinePoint, Curve, CurveScalar, Secp256K1,
     };
 
-    use super::{
-        extract_transition_public_inputs, field_bytes, is_odd, tagged_hash, Network, ProofData,
-        ProvedTransition, TransitionSignature,
-    };
+    use super::{field_bytes, is_odd, tagged_hash, Network, ProofData, TransitionSignature};
+    #[cfg(test)]
+    use super::{extract_transition_public_inputs, ProvedTransition};
     use shared::spec_v1 as host;
 
     #[derive(Clone)]
@@ -1926,6 +2193,9 @@ pub mod test_signing {
     /// Builds the compliance circuit (expensive). Prefer a host-only empty
     /// `ProofWithPublicInputs` for begin_* host tests that only need
     /// `last_proof: Some(_)` and never prove.
+    ///
+    /// Crate-private test helper only (Stage 3 Runde 4: no residual production use).
+    #[cfg(test)]
     pub(crate) fn base_proved_transition(network: Network) -> ProvedTransition {
         let proof = super::compliance_circuit(network)
             .expect("compliance circuit")

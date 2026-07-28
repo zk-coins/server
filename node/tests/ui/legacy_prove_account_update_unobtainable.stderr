@@ -1,0 +1,17 @@
+error[E0603]: function `prove_account_update` is private
+ --> tests/ui/legacy_prove_account_update_unobtainable.rs:5:45
+  |
+5 |     let _ = zkcoins_program::circuit::main::prove_account_update;
+  |                                             ^^^^^^^^^^^^^^^^^^^^ private function
+  |
+note: the function `prove_account_update` is defined here
+ --> $WORKSPACE/program-plonky2/src/circuit/main.rs
+  |
+  | / pub(crate) fn prove_account_update(
+  | |     circuit: &StateTransitionCircuit,
+  | |     account_state: &AccountState,
+  | |     history_root: HashDigest,
+... |
+  | |     asset_id: HashDigest,
+  | | ) -> Result<ProofWithPublicInputs<F, C, D>> {
+  | |___________________________________________^

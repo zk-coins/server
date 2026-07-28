@@ -511,7 +511,7 @@ pub struct StateTransitionCircuit {
 /// Beyond the 5b/5c predicate, this revision wires SPEC §8 (c)(d)(e)
 /// against fixed-shape SMT + MMR inclusion proofs. See module docstring
 /// for the constraint breakdown and the masking pattern.
-pub fn build_circuit() -> StateTransitionCircuit {
+pub(crate) fn build_circuit() -> StateTransitionCircuit {
     // ===== Build aggregator + state-transition common via fixed-point =====
     //
     // Both shapes depend on each other: the aggregator's source-proof
@@ -1822,7 +1822,7 @@ fn dummy_non_inclusion_proof() -> NonInclusionProof {
 /// the test fixtures here demonstrate only the empty-in-coins case.
 /// To prove an Initial proof with active in-coin slots, use
 /// [`prove_initial_with_in_coins`].
-pub fn prove_initial(
+pub(crate) fn prove_initial(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
     history_root: HashDigest,
@@ -1851,7 +1851,7 @@ pub fn prove_initial(
 /// placeholders regardless of the current `coin_history_root` and
 /// running balance — the slot's `active = false` bit masks all
 /// in-circuit checks.
-pub fn prove_initial_with_in_coins(
+pub(crate) fn prove_initial_with_in_coins(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
     history_root: HashDigest,
@@ -1892,7 +1892,7 @@ pub fn prove_initial_with_in_coins(
 /// source.active)` constraint at proof time. Tests and producers that
 /// need an active in-coin must call the `_and_sources` variant.
 #[allow(clippy::too_many_arguments)]
-pub fn prove_initial_with_in_and_out_coins(
+pub(crate) fn prove_initial_with_in_and_out_coins(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
     history_root: HashDigest,
@@ -1933,7 +1933,7 @@ pub fn prove_initial_with_in_and_out_coins(
 /// aggregator.slot.active)` enforces consistency with the
 /// caller-supplied `in_coins` active bits.
 #[allow(clippy::too_many_arguments)]
-pub fn prove_initial_with_in_and_out_coins_and_sources(
+pub(crate) fn prove_initial_with_in_and_out_coins_and_sources(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
     history_root: HashDigest,
@@ -2076,7 +2076,7 @@ fn set_aggregator_proof_witness_from_sources(
 /// The `history_root` parameter must be
 /// `mmr.root_extended(MMR_PROOF_PATH_LEN)` for the same MMR depth
 /// (see [`crate::merkle::merkle_mountain_range::MerkleMountainRange::root_extended`]).
-pub fn prove_account_update(
+pub(crate) fn prove_account_update(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
     history_root: HashDigest,
@@ -2103,7 +2103,7 @@ pub fn prove_account_update(
 /// Like [`prove_account_update`] but with caller-supplied in-coin slot
 /// witnesses. See [`prove_initial_with_in_coins`] for the contract on
 /// the `in_coins` slice.
-pub fn prove_account_update_with_in_coins(
+pub(crate) fn prove_account_update_with_in_coins(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
     history_root: HashDigest,
@@ -2142,7 +2142,7 @@ pub fn prove_account_update_with_in_coins(
 /// all-`None` sources. Only suitable for AccountUpdate transitions
 /// whose `in_coins` are ALL inactive.
 #[allow(clippy::too_many_arguments)]
-pub fn prove_account_update_with_in_and_out_coins(
+pub(crate) fn prove_account_update_with_in_and_out_coins(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
     history_root: HashDigest,
@@ -2177,7 +2177,7 @@ pub fn prove_account_update_with_in_and_out_coins(
 /// == MAX_IN_COINS`; `Some(_)` ⇔ active slot with real source proof;
 /// `None` ⇔ inactive slot.
 #[allow(clippy::too_many_arguments)]
-pub fn prove_account_update_with_in_and_out_coins_and_sources(
+pub(crate) fn prove_account_update_with_in_and_out_coins_and_sources(
     circuit: &StateTransitionCircuit,
     account_state: &AccountState,
     history_root: HashDigest,
@@ -2248,7 +2248,7 @@ pub fn prove_account_update_with_in_and_out_coins_and_sources(
 
 /// Verify a state-transition proof, including the cross-check that its
 /// embedded verifier-data digest matches the circuit's own.
-pub fn verify(
+pub(crate) fn verify(
     circuit: &StateTransitionCircuit,
     proof: &ProofWithPublicInputs<F, C, D>,
 ) -> Result<()> {

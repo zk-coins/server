@@ -329,6 +329,7 @@ async fn load_all_accounts_returns_empty_initially() {
 async fn upsert_account_inserts_then_updates() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     // 64-byte composite (owner||asset_id) account key (Model B).
     let addr = vec![0xAAu8; 64];
     upsert_account(&pool, &addr, b"first").await.unwrap();
@@ -430,6 +431,7 @@ async fn reset_proof_dependent_state_tx_overwrites_existing_digest_row() {
 async fn load_all_accounts_returns_all_inserted() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let a1 = vec![0x01u8; 64];
     let a2 = vec![0x02u8; 64];
     let a3 = vec![0x03u8; 64];
@@ -544,6 +546,7 @@ async fn connect_and_migrate_propagates_connect_failure() {
 async fn commit_mint_tx_upserts_every_account_atomically() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let addr_a = [0xAAu8; 64];
     let data_a = vec![0xA1u8; 8];
     let addr_b = [0xBBu8; 64];
@@ -573,6 +576,7 @@ async fn commit_mint_tx_upserts_every_account_atomically() {
 async fn commit_mint_tx_is_idempotent_on_conflict() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let addr = [0xCCu8; 64];
     let first = vec![0x01u8; 16];
     let second = vec![0x02u8; 24];
@@ -595,6 +599,7 @@ async fn commit_mint_tx_is_idempotent_on_conflict() {
 async fn commit_mint_tx_with_empty_accounts_is_noop() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     commit_mint_tx(&pool, &[])
         .await
         .expect("empty commit must succeed");
@@ -661,6 +666,7 @@ async fn pending_inscription_status_by_commit_txid_returns_none_for_unknown_txid
 async fn pending_inscription_status_by_commit_txid_returns_current_status() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0xCDu8; 32];
     let reveal_txid = [0xCEu8; 32];
     let commitment = b"test-commitment";
@@ -711,6 +717,8 @@ async fn pending_inscription_status_by_commit_txid_returns_current_status() {
 /// Helper: insert a `pending_inscriptions` row in the given starting
 /// status so the atomic-tx tests can exercise the mark-complete step.
 async fn seed_pending_row(pool: &PgPool, commit_txid: &[u8], status: &str) {
+    claim_legacy_stack(pool).await;
+
     // Synthetic reveal txid for tests — not derived from the seed
     // bytes since this helper is only used to drive the status state
     // machine, not the reveal-txid lookup.
@@ -1157,6 +1165,7 @@ async fn insert_state_update_log_writes_row() {
 async fn insert_account_history_writes_row_directly() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let entry = AccountHistoryEntry {
         address: vec![0x99; 32],
         prev_data: None,
@@ -1198,6 +1207,7 @@ async fn insert_username_claim_log_writes_row() {
 async fn insert_tx_mining_log_writes_row() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     // The 0010 FK from `tx_mining_log.commit_txid` to
     // `pending_inscriptions(commit_txid)` requires the parent row first.
     let commit_txid = [0xCC; 32];
@@ -1252,6 +1262,7 @@ async fn insert_boot_log_writes_row() {
 async fn update_pending_failure_reason_records_error_without_changing_status() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0x77; 32];
     let reveal_txid = [0x78; 32];
     insert_pending_inscription(
@@ -1289,6 +1300,7 @@ async fn update_pending_failure_reason_records_error_without_changing_status() {
 async fn upsert_account_with_source_tags_history_via_trigger() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     // The `accounts.address` is the 64-byte composite owner||asset_id
     // key (Model B). The history-capture trigger writes only the 32-byte
     // OWNER prefix into `account_history.address`, so the history queries
@@ -1339,6 +1351,7 @@ async fn get_inscription_summary_returns_none_for_unknown_txid() {
 async fn get_inscription_summary_returns_full_row() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0x12; 32];
     let reveal_txid = [0x34; 32];
     insert_pending_inscription(
@@ -1392,6 +1405,7 @@ async fn load_pending_in_progress_rejects_invalid_kind_in_row() {
     // `sqlx::Error::Decode`.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     sqlx::query(
         "ALTER TABLE pending_inscriptions DROP CONSTRAINT pending_inscriptions_status_check",
     )
@@ -1428,6 +1442,7 @@ async fn get_inscription_summary_rejects_invalid_kind_in_row() {
     // the `GET /api/inscriptions/:txid` handler.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     sqlx::query(
         "ALTER TABLE pending_inscriptions DROP CONSTRAINT pending_inscriptions_status_check",
     )
@@ -1703,6 +1718,7 @@ async fn get_account_history_item_scopes_by_address_and_filters_internal() {
 async fn asset_creator_register_then_query_is_idempotent() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let asset_id = vec![0x11u8; 32];
     let creator = vec![0x02u8; 33];
 
@@ -1735,6 +1751,7 @@ async fn asset_creator_register_then_query_is_idempotent() {
 async fn asset_creator_conflict_true_for_different_creator() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let asset_id = vec![0x22u8; 32];
     let creator = vec![0x02u8; 33];
     let other = vec![0x03u8; 33];

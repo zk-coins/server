@@ -69,13 +69,17 @@ impl ProverMode {
     }
 
     /// Parse a closed vocabulary. Unknown tokens fail loud.
+    ///
+    /// Stage 3 Runde 4: `"legacy"` is **removed** (not merely unreachable).
+    /// Only `"v1"` is accepted.
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw {
-            "legacy" => Ok(ProverMode::Legacy),
             "v1" => Ok(ProverMode::V1),
+            "legacy" => Err(
+                "prover mode \"legacy\" was deleted (Stage 3): circuit::main builders                  and Prover are gone; use \"v1\" (ProverBridge)".into(),
+            ),
             other => Err(format!(
-                "unknown prover mode {other:?}: expected exactly \"legacy\" or \"v1\" \
-                 (no silent default)"
+                "unknown prover mode {other:?}: expected exactly \"v1\"                  (legacy mode deleted in Stage 3; no silent default)"
             )),
         }
     }
@@ -104,13 +108,11 @@ pub fn resolve_prover_mode(
         return ProverMode::parse(raw);
     }
     match v1_shadow_raw {
-        None => Ok(ProverMode::Legacy),
-        Some(s) if s.is_empty() || s == "off" => Ok(ProverMode::Legacy),
-        Some("1") => Ok(ProverMode::V1),
+        // Stage 3 Runde 4: default is v1 (legacy mode deleted).
+        None => Ok(ProverMode::V1),
+        Some(s) if s.is_empty() || s == "off" || s == "1" => Ok(ProverMode::V1),
         Some(other) => Err(format!(
-            "ZKCOINS_V1_SHADOW={other:?} is not supported when selecting R2 probe mode — \
-             use unset / empty / \"off\" for legacy, or \"1\" for v1.1. Refusing to \
-             silently fall back to legacy budgets (that is the false-red this block prevents)"
+            "ZKCOINS_V1_SHADOW={other:?} is not supported when selecting R2 probe mode —              use unset / empty / \"off\" / \"1\" for v1 (legacy mode deleted).              Refusing a silent cross-mode budget selection"
         )),
     }
 }
@@ -449,15 +451,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mode_cli_overrides_shadow() {
-        assert_eq!(
-            resolve_prover_mode(Some("legacy"), Some("1")).unwrap(),
-            ProverMode::Legacy
-        );
+    fn resolve_mode_cli_v1() {
         assert_eq!(
             resolve_prover_mode(Some("v1"), None).unwrap(),
             ProverMode::V1
         );
+    }
+
+    #[test]
+    fn resolve_mode_cli_legacy_refused() {
+        let err = resolve_prover_mode(Some("legacy"), None).expect_err("legacy deleted");
+        assert!(err.contains("deleted") || err.contains("legacy"), "got: {err}");
     }
 
     #[test]
@@ -469,15 +473,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mode_default_is_legacy() {
-        assert_eq!(resolve_prover_mode(None, None).unwrap(), ProverMode::Legacy);
+    fn resolve_mode_default_is_v1() {
+        assert_eq!(resolve_prover_mode(None, None).unwrap(), ProverMode::V1);
         assert_eq!(
             resolve_prover_mode(None, Some("")).unwrap(),
-            ProverMode::Legacy
+            ProverMode::V1
         );
         assert_eq!(
             resolve_prover_mode(None, Some("off")).unwrap(),
-            ProverMode::Legacy
+            ProverMode::V1
         );
     }
 

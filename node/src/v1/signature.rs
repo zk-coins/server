@@ -592,12 +592,13 @@ impl DurableFinalisationPersist {
                 format!("persisted finalisation capability hex: {e}"),
             )
         })?;
-        let capability = FinalisationCapability::from_durable_bytes(&bytes).map_err(|e| {
-            TransitionSignatureError::new(
-                SignatureCheck::PendingEnvelope,
-                format!("persisted finalisation capability durable decode: {e}"),
-            )
-        })?;
+        let capability =
+            FinalisationCapability::from_durable_bytes(&bytes, network).map_err(|e| {
+                TransitionSignatureError::new(
+                    SignatureCheck::PendingEnvelope,
+                    format!("persisted finalisation capability durable decode: {e}"),
+                )
+            })?;
         let publisher_pubkey = match self.publisher_pubkey {
             None => None,
             Some(hex) => {

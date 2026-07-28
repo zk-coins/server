@@ -192,4 +192,10 @@ fn probe_public_api_surface_not_widened() {
     let _ = node::zkcoins_prover;
     let _ = node::v1::zkcoins_prover;
     let _ = node::v1::publish::zkcoins_prover;
+
+    // Stage 3 Runde 4: legacy scan private field (cap unconstructible).
+    // Prover type deleted — also unobtainable. Kept as extra sinks in this
+    // multi-sink file (existing sealed_plumbing matrix). New Stage-3
+    // one-file-one-error cases live under node/tests/ui.
+    let _ = node::legacy_commitment_scan::LegacyCommitmentScanCap { _private: () };
 }

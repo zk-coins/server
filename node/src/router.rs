@@ -920,14 +920,23 @@ impl ProofStore {
 
     // Vestigial pair to `add_proof`; the only call site
     // (`get_proof_handler`) is reached via the legacy `/api/proof/:id`
-    // endpoint kept on disk for wallet-transition compatibility.
-    // See `add_proof` for the deprecation rationale and the
-    // coverage-off reason.
+    // endpoint (now 410 Gone — Stage 3 Runde 5). See `add_proof` for the
+    // deprecation rationale and the coverage-off reason.
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn get_proof(&self, id: u64) -> Option<CoinProof> {
         let path = self.proof_path(id)?;
         let bytes = std::fs::read(&path).ok()?;
         bincode::deserialize(&bytes).ok()
+    }
+
+    /// Test-only: plant opaque bytes under `{id}.bin` so closed-handler
+    /// tests can prove the HTTP path never returns store contents.
+    #[cfg(test)]
+    pub(crate) fn plant_raw_for_test(&self, id: u64, bytes: &[u8]) {
+        let path = self
+            .proof_path(id)
+            .expect("proof store directory exists (created in ProofStore::new)");
+        std::fs::write(&path, bytes).expect("plant proof bytes for test");
     }
 }
 
@@ -1242,54 +1251,18 @@ pub(crate) async fn get_balance_handler(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let err_422 = || {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(BalanceResponse {
-                balance: 0,
-                username: None,
-                num_sends: 0,
-            }),
-        )
-    };
-
-    // `address` (required) + `asset_id` (required under the multi-asset
-    // model — balance is per-(owner, asset_id); the list endpoint
-    // `GET /api/balance/:address` aggregates across assets).
-    let Some(address_hex) = params.get("address") else {
-        return err_422();
-    };
-    let address = match parse_hex_digest(address_hex) {
-        Some(a) => a,
-        None => return err_422(),
-    };
-    let Some(asset_hex) = params.get("asset_id") else {
-        return err_422();
-    };
-    let asset_id = match parse_hex_digest(asset_hex) {
-        Some(a) => a,
-        None => return err_422(),
-    };
-
-    let account_node = lock_or_recover(&state.account_node);
-    let username = {
-        let username_store = lock_or_recover(&state.username_store);
-        username_store.get_username(&address).map(String::from)
-    };
-    let num_sends = account_node
-        .get_account(&address, &asset_id)
-        .map(|a| a.num_sends)
-        .unwrap_or(0);
-    let balance = account_node
-        .get_account_balance(&address, &asset_id)
-        .unwrap_or(0);
+    // Stage 3 Runde 5 (R2): legacy single-asset balance read is closed.
+    // Spec `read.account` (capability-bound ownership / view-grant) is the
+    // replacement surface (`/v1/attest/balance` and later account-state
+    // pull). Never return 200 with zeroed or partial ledger fields — that
+    // would mask the protocol error.
+    let _ = params;
+    let _ = &state;
     (
-        StatusCode::OK,
-        Json(BalanceResponse {
-            balance,
-            username,
-            num_sends,
-        }),
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/balance is removed (Stage 3): legacy AccountNode ledger read is not capability-bound; use the v1 attest / read.account surface"
+        })),
     )
 }
 
@@ -1346,52 +1319,20 @@ pub struct OwnerBalanceResponse {
             body = OwnerBalanceResponse),
     ),
 )]
-/// `GET /api/balance/:address` — list every asset the owner holds with
-/// its per-asset balance, num_sends, and (where known) display
-/// metadata. The multi-asset replacement for the single-balance
-/// `GET /api/balance?address=` query.
+/// `GET /api/balance/:address` — formerly listed every asset the owner
+/// holds. Stage 3 Runde 5 (R2): closed; same capability-bound
+/// `read.account` replacement as [`get_balance_handler`].
 pub(crate) async fn get_owner_balance_handler(
     State(state): State<AppState>,
     Path(address_hex): Path<String>,
 ) -> impl IntoResponse {
-    let empty = |code: StatusCode, address: String| {
-        (
-            code,
-            Json(OwnerBalanceResponse {
-                address,
-                username: None,
-                assets: vec![],
-            }),
-        )
-    };
-    let address = match parse_hex_digest(&address_hex) {
-        Some(a) => a,
-        None => return empty(StatusCode::UNPROCESSABLE_ENTITY, address_hex),
-    };
-
-    let account_node = lock_or_recover(&state.account_node);
-    let username = {
-        let username_store = lock_or_recover(&state.username_store);
-        username_store.get_username(&address).map(String::from)
-    };
-    let assets = account_node
-        .assets_for_owner(&address)
-        .into_iter()
-        .map(|a| AssetBalance {
-            asset_id: hex::encode(digest_to_bytes(&a.asset_id)),
-            name: a.name,
-            decimals: a.decimals,
-            balance: a.balance,
-            num_sends: a.num_sends,
-        })
-        .collect();
+    let _ = address_hex;
+    let _ = &state;
     (
-        StatusCode::OK,
-        Json(OwnerBalanceResponse {
-            address: hex::encode(digest_to_bytes(&address)),
-            username,
-            assets,
-        }),
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/balance/:address is removed (Stage 3): legacy multi-asset AccountNode ledger read is not capability-bound; use the v1 attest / read.account surface"
+        })),
     )
 }
 
@@ -1417,119 +1358,23 @@ pub(crate) async fn get_owner_balance_handler(
             body = HistoryErrorResponse),
     ),
 )]
-/// `GET /api/history?address=<hex>&limit=<n>&offset=<n>` — paginated
-/// per-address transaction history. Implements issue #153.
+/// `GET /api/history` — **closed (Stage 3 Runde 6)**.
 ///
-/// Sort order is fixed `ORDER BY changed_at DESC` (newest first); the
-/// matching test in `router_tests.rs` pins this so a future caller
-/// cannot silently flip the order.
-///
-/// Validation contract (all return HTTP 422 with a
-/// [`HistoryErrorResponse`] — mirrors the `/api/balance` shape so the
-/// whole read surface uses the same status for malformed input):
-///   * `address` missing.
-///   * `address` not valid 32-byte hex.
-///   * `limit` outside `[1, 200]` (the issue's max=200 rule). `limit=0`
-///     is rejected because a successful response with zero items would
-///     be indistinguishable from "no rows", masking the misuse.
-///   * `offset` negative.
-///
-/// A successful response with `offset >= total` returns
-/// `items: [], total: N` so the caller can detect end-of-list without
-/// a second round-trip.
-///
-/// Persistence: pure read from `account_history` (joined with
-/// `observed_inscriptions` + `pending_inscriptions` for the future
-/// txid/block_height/status link — see [`db::AccountHistoryRow`] for
-/// the today-vs-tomorrow story). No new schema work.
+/// Previously paginated decoded legacy `account_history` snapshots
+/// (amount, balance deltas, …) for any address. Address knowledge is
+/// not `read.account` (spec §6.4 / §7.5). Loud HTTP 410; never 200 with
+/// rows and never a 422 validation path that re-probes the store.
 pub(crate) async fn get_history_handler(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<HistoryQuery>,
 ) -> impl IntoResponse {
-    // Resolve defaults first so the rest of the validation block can
-    // assume concrete values. `Option::get().copied().unwrap_or(...)`
-    // would also work but the field is already an `Option<i64>` from
-    // the typed extractor — `unwrap_or` is the same shape.
-    let limit = query.limit.unwrap_or(HISTORY_DEFAULT_LIMIT);
-    let offset = query.offset.unwrap_or(0);
-
-    // --- validation ---
-    let address_hex = match query.address.as_deref() {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(HistoryErrorResponse {
-                    error: "Missing required `address` query parameter",
-                }),
-            )
-                .into_response();
-        }
-    };
-    let address_bytes = match decode_history_address(address_hex) {
-        Ok(b) => b,
-        Err(msg) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(HistoryErrorResponse { error: msg }),
-            )
-                .into_response();
-        }
-    };
-    if !(1..=HISTORY_MAX_LIMIT).contains(&limit) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(HistoryErrorResponse {
-                error: "limit must be in [1, 200]",
-            }),
-        )
-            .into_response();
-    }
-    if offset < 0 {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(HistoryErrorResponse {
-                error: "offset must be non-negative",
-            }),
-        )
-            .into_response();
-    }
-
-    // --- DB read ---
-    // Single round-trip: page rows + filtered total in one query so the
-    // handler carries a single DB error branch.
-    let (rows, total) =
-        match db::list_account_history(&state.pool, &address_bytes, limit, offset).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("get_history_handler: list query failed: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(HistoryErrorResponse {
-                        error: "Database error while reading history",
-                    }),
-                )
-                    .into_response();
-            }
-        };
-
-    // Defense-in-depth safety net: the SQL already filters to
-    // mint/send/receive, so `filter_map` should never actually drop a
-    // row in normal operation. If it does, that's a schema drift bug —
-    // the post-fetch filter prevents a junk row from reaching the wire
-    // until someone fixes the SQL.
-    let items: Vec<HistoryItem> = rows.iter().filter_map(history_row_to_item).collect();
-
+    let _ = (state, query);
     (
-        StatusCode::OK,
-        Json(HistoryResponse {
-            items,
-            total,
-            limit,
-            offset,
-        }),
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/history is removed (Stage 3): unauthenticated legacy account history is closed; use capability-bound v1 read.account"
+        })),
     )
-        .into_response()
 }
 
 #[utoipa::path(
@@ -1552,114 +1397,23 @@ pub(crate) async fn get_history_handler(
             body = HistoryErrorResponse),
     ),
 )]
-/// `GET /api/history/{id}?address=<hex>` — full detail for one
-/// transaction (one `account_history` row), scoped to `address`.
+/// `GET /api/history/{id}` — **closed (Stage 3 Runde 6)**.
 ///
-/// The list endpoint (`GET /api/history`) returns the lean per-row
-/// shape; this returns [`TxDetail`] — the same core fields plus the
-/// decoded account-state snapshot (balance before/after, post-mutation
-/// `num_sends` + commitment pubkey), the verifier circuit digest, and
-/// the on-chain commit output value when present.
-///
-/// Scoping: the row must both have `id` AND belong to `address`, and its
-/// source must be user-facing (`mint`/`send`/`receive`). A mismatch (or
-/// an internal `scanner`/`recovery` row) returns 404 — a caller cannot
-/// read another address's rows or the node's internal mutations by
-/// guessing ids.
-///
-/// Validation: missing/malformed `address` → 422; a non-integer `id` →
-/// 422 (parsed from the path as a string so the contract matches the
-/// list endpoint's 422-on-bad-input rather than axum's default 400).
+/// Previously returned decoded legacy snapshots (`balance_before/after`,
+/// `num_sends_after`, `commitment_public_key`, …) without ownership proof
+/// or view grant. Loud HTTP 410.
 pub(crate) async fn get_history_item_handler(
     State(state): State<AppState>,
     Path(id_raw): Path<String>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    // --- validation: address (required) ---
-    let address_hex = match params.get("address") {
-        Some(s) if !s.is_empty() => s.as_str(),
-        _ => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(HistoryErrorResponse {
-                    error: "Missing required `address` query parameter",
-                }),
-            )
-                .into_response();
-        }
-    };
-    let address_bytes = match decode_history_address(address_hex) {
-        Ok(b) => b,
-        Err(msg) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(HistoryErrorResponse { error: msg }),
-            )
-                .into_response();
-        }
-    };
-    // --- validation: id (positive integer) ---
-    let id = match id_raw.parse::<i64>() {
-        Ok(n) if n > 0 => n,
-        _ => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(HistoryErrorResponse {
-                    error: "id must be a positive integer",
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    // --- DB read: the scoped row ---
-    let row = match db::get_account_history_item(&state.pool, &address_bytes, id).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(HistoryErrorResponse {
-                    error: "Transaction not found",
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::warn!("get_history_item_handler: row query failed: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(HistoryErrorResponse {
-                    error: "Database error while reading transaction",
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    // The verifier circuit digest is node-global (single row). A read
-    // failure degrades the field to `null` rather than failing the whole
-    // detail — it is metadata, not the row itself.
-    let circuit_digest = db::load_circuit_digest(&state.pool).await.ok().flatten();
-
-    // Echo the normalised (lower-case, no `0x`) address so the wire form
-    // is canonical regardless of how the caller spelled it.
-    let address_norm = hex::encode(address_bytes);
-    match tx_detail_from_row(&row, address_norm, circuit_digest) {
-        Some(detail) => (StatusCode::OK, Json(detail)).into_response(),
-        None => {
-            tracing::warn!(
-                "get_history_item_handler: row {} for address could not be decoded",
-                id
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(HistoryErrorResponse {
-                    error: "Database error while reading transaction",
-                }),
-            )
-                .into_response()
-        }
-    }
+    let _ = (state, id_raw, params);
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/history/:id is removed (Stage 3): unauthenticated legacy account history detail is closed; use capability-bound v1 read.account"
+        })),
+    )
 }
 
 #[utoipa::path(
@@ -1674,18 +1428,15 @@ pub(crate) async fn get_history_item_handler(
 )]
 #[cfg(feature = "address-list")]
 pub(crate) async fn get_address_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let account_node = lock_or_recover(&state.account_node);
-
-    // Convert addresses to hex strings
-    let hex_addresses: Vec<String> = account_node
-        .get_addresses()
-        .iter()
-        .map(|addr| format!("0x{}", hex::encode(digest_to_bytes(addr))))
-        .collect();
-
-    Json(AddressesResponse {
-        addresses: hex_addresses,
-    })
+    // Stage 3 Runde 6 (C): listing every rehydrated legacy address is
+    // unauthenticated account enumeration — not `read.account`. Loud 410.
+    let _ = state;
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/address is removed (Stage 3): unauthenticated legacy address list is closed; use capability-bound v1 read.account"
+        })),
+    )
 }
 
 // Vestigial: the wallet's pre-Job-API flow was send-then-receive,
@@ -1720,51 +1471,20 @@ pub(crate) async fn get_address_handler(State(state): State<AppState>) -> impl I
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn receive_coin_handler(
     State(state): State<AppState>,
-    body: Bytes, // Accept raw binary data instead of multipart
+    body: Bytes,
 ) -> impl IntoResponse {
-    // Try to deserialize the binary data as a CoinProof
-    let coin_proof = match bincode::deserialize::<CoinProof>(&body) {
-        Ok(cp) => cp,
-        Err(e) => {
-            // Caller submitted a malformed binary body. The handler
-            // returns a default `SendCoinResponse { success: false }`
-            // (currently a 200 with `success=false`, behaviourally a
-            // client-input rejection); log at `info` so the CI E2E
-            // negative-path tests hitting `/api/receive` with bad
-            // bytes do not surface as `detected_level=error` lines.
-            tracing::info!("Failed to deserialize proof with commitment: {}", e);
-            return Json(SendCoinResponse::default());
-        }
-    };
-    let recipient = coin_proof.coin.recipient;
-    let asset_id = coin_proof.coin.asset_id;
-    // Snapshot the recipient's mutated account inside the (sync) lock
-    // scope so the post-receive Postgres upsert runs without holding
-    // the guard across an `.await` point.
-    let snapshot: Option<Vec<u8>> = {
-        let mut account_node = lock_or_recover(&state.account_node);
-        match account_node.receive_coin(coin_proof) {
-            Ok(_) => account_node
-                .get_account(&recipient, &asset_id)
-                .map(AccountNode::serialize_account),
-            Err(_) => None,
-        }
-    };
-    match snapshot {
-        Some(bytes) => {
-            let addr_bytes = crate::account_node::account_key_bytes(&recipient, &asset_id);
-            if let Err(e) =
-                db::upsert_account_with_source(&state.pool, &addr_bytes, &bytes, "receive").await
-            {
-                eprintln!("Failed to upsert recipient account after receive: {}", e);
-            }
-            Json(SendCoinResponse {
-                success: true,
-                ..Default::default()
-            })
-        }
-        None => Json(SendCoinResponse::default()),
-    }
+    // Stage 3 Runde 4 (B6): legacy `/api/receive` must never mutate durable
+    // state. Prefer explicit, loud refusal over silent 200+success:false.
+    // Route kept so wallets get a clear protocol error (not a bare 404).
+    let _ = body;
+    let _ = &state;
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "success": false,
+            "error": "POST /api/receive is removed (Stage 3): legacy CoinProof receive no longer mutates account state; use the v1 receive transition path"
+        })),
+    )
 }
 
 // Vestigial: paired with `receive_coin_handler` above. See its
@@ -1795,30 +1515,19 @@ pub(crate) async fn get_proof_handler(
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
-    match state.proof_store.get_proof(id) {
-        Some(proof_with_commitment) => {
-            // Serialize the proof and commitment together to binary
-            let binary_data = bincode::serialize(&proof_with_commitment).unwrap_or_default();
-
-            // Set appropriate headers for binary download
-            let mut headers = header::HeaderMap::new();
-            headers.insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static("application/octet-stream"),
-            );
-            headers.insert(
-                header::CONTENT_DISPOSITION,
-                header::HeaderValue::from_static("attachment; filename=\"coin_proof.bin\""),
-            );
-
-            (StatusCode::OK, headers, Bytes::from(binary_data))
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            header::HeaderMap::new(),
-            Bytes::new(),
-        ),
-    }
+    // Stage 3 Runde 5 (R2): legacy `/api/proof/:id` handed out a full
+    // bincode `CoinProof` — including the cleartext `Coin` — with no
+    // capability check. That contradicts capability-bound `read.proof` /
+    // `read.account` (spec §6.4). Loud 410; never 200 with empty/partial
+    // binary and never a 404 that still probes the store.
+    let _ = id;
+    let _ = &state;
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/proof/:id is removed (Stage 3): unauthenticated CoinProof download (cleartext Coin) is closed; use capability-bound v1 read.proof / read.account"
+        })),
+    )
 }
 
 // ===========================================================================
@@ -3668,58 +3377,26 @@ fn job_flow_error(e: flow::FlowError) -> (StatusCode, Json<JobErrorResponse>) {
         (status = 500, description = "Database error.", body = SendCoinResponse),
     ),
 )]
-/// `GET /api/inscriptions/:txid` — operator/forensics lookup of a single
-/// inscription by its commit txid. Surfaces the columns that answer
-/// "what kind of operation was this, and where is it in the publish
-/// pipeline" without exposing the raw commit/reveal/commitment blobs
-/// (those are crash-recovery state, not user-facing).
+/// `GET /api/inscriptions/:txid` — **closed (Stage 3 Runde 6)**.
 ///
-/// Returns 404 when no row exists — the inscription either never went
-/// through this node (e.g. external recovery via `recover_inscription`
-/// CLI) or the txid is unknown.
+/// Previously returned legacy `pending_inscriptions` summary (kind,
+/// status, txids, amount, failure, timestamps) without capability.
+/// **Decision:** 410 Gone rather than rebind to `v1_pending_publishes`.
+/// V1 publish rows are operator crash-recovery state for AggregateState
+/// NullifierV3, not a public account-read surface; capability-bound
+/// `read.account` / job status cover wallet needs. Loud protocol error.
 pub(crate) async fn get_inscription_handler(
     State(state): State<AppState>,
     Path(txid_hex): Path<String>,
 ) -> axum::response::Response {
-    // Bitcoin convention: display txids are big-endian, but the
-    // `pending_inscriptions.commit_txid` column stores raw little-endian
-    // bytes (matching `bitcoin::Txid::as_byte_array()` semantics — see
-    // `publisher.rs` write site). Reverse on parse so a caller can pass
-    // the same hex an explorer shows.
-    let mut bytes = match hex::decode(txid_hex.trim()) {
-        Ok(b) if b.len() == 32 => b,
-        Ok(_) => {
-            return handler_error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "txid must be 32 bytes (64 hex chars)",
-            )
-            .into_response();
-        }
-        Err(_) => {
-            return handler_error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "txid is not valid hex",
-            )
-            .into_response();
-        }
-    };
-    bytes.reverse();
-
-    match crate::db::get_inscription_summary_by_commit_txid(&state.pool, &bytes).await {
-        Ok(Some(summary)) => (StatusCode::OK, Json(summary)).into_response(),
-        Ok(None) => {
-            handler_error_response(StatusCode::NOT_FOUND, "No inscription found for this txid")
-                .into_response()
-        }
-        Err(e) => {
-            eprintln!("get_inscription_handler: db error: {}", e);
-            handler_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database error while looking up inscription",
-            )
-            .into_response()
-        }
-    }
+    let _ = (state, txid_hex);
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/inscriptions/:txid is removed (Stage 3): unauthenticated legacy pending_inscriptions lookup is closed; use capability-bound v1 surfaces"
+        })),
+    )
+        .into_response()
 }
 
 // ---- Admin: R2 probe history --------------------------------------------
@@ -4529,29 +4206,21 @@ pub(crate) async fn claim_username_handler(
         .into_response()
 }
 
-/// Resolve an identifier to an address. Checks the username store first,
-/// then falls back to hex-prefix matching against known account addresses.
-/// Used by the always-on username handlers and the gated LNURL handlers.
+/// Resolve an identifier to an address via the **username store only**.
+///
+/// Stage 3 Runde 6 (C): the hex-prefix scan over `get_addresses()` is
+/// removed — address knowledge / prefix matching is not a
+/// `read.account` capability and leaked full rehydrated legacy addresses.
+/// Username and LNURL resolve exclusively against claimed names.
 fn resolve_identifier(
     state: &AppState,
     identifier: &str,
 ) -> Option<(zkcoins_program::hash::HashDigest, String)> {
     let normalized = identifier.to_lowercase();
-
-    // 1. Check custom username
     let username_store = lock_or_recover(&state.username_store);
-    if let Some(address) = username_store.resolve(&normalized) {
-        return Some((address, normalized));
-    }
-    drop(username_store);
-
-    // 2. Check hex prefix against known addresses
-    let account_node = lock_or_recover(&state.account_node);
-    account_node
-        .get_addresses()
-        .into_iter()
-        .find(|addr| hex::encode(digest_to_bytes(addr)).starts_with(&normalized))
-        .map(|addr| (addr, normalized))
+    username_store
+        .resolve(&normalized)
+        .map(|address| (address, normalized))
 }
 
 #[utoipa::path(

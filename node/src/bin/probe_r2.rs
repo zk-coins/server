@@ -88,10 +88,7 @@ use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use tokio::runtime::Runtime;
 
-use node::r2_budgets::{
-    budgets_for_mode, resolve_prover_mode, ProverMode, R2BudgetSet, LEGACY_BUDGET_COLD_START_MS,
-    LEGACY_BUDGET_PEAK_RSS_KB, LEGACY_BUDGET_WARM_PROVE_MS,
-};
+use node::r2_budgets::{budgets_for_mode, resolve_prover_mode, ProverMode, R2BudgetSet};
 use node::r2_probe::{
     detect, fetch_recent_summary, insert_run, insert_warm_calls, upsert_host, ProbeRun, SummaryRow,
 };
@@ -102,12 +99,7 @@ use shared::spec_v1::{
 use zkcoins_program::circuit::compliance::{
     Network, MAX_RX_COINS, MAX_TX_INPUTS, MAX_TX_OUTPUTS,
 };
-use zkcoins_program::circuit::main::{MAX_IN_COINS, MAX_OUT_COINS, MMR_PROOF_PATH_LEN};
-use zkcoins_program::hash::{digest_to_bytes, hash_bytes, hash_concat, HashDigest as LegacyHash, ZERO_HASH};
-use zkcoins_program::inputs::CommitmentMerkleProofs;
-use zkcoins_program::merkle::merkle_mountain_range::MerkleMountainRange;
-use zkcoins_program::merkle::sparse_merkle_tree::SparseMerkleTree;
-use zkcoins_program::types::{calculate_asset_id, calculate_name_hash, AccountState as LegacyAccountState};
+// hash helpers are pulled in via shared::spec_v1 / host in the v1 fixtures.
 use zkcoins_prover::prover_bridge::test_signing::{
     deterministic_secret, normalized_key, sign_transition, TestSignature,
 };
@@ -115,14 +107,9 @@ use zkcoins_prover::prover_bridge::{
     AssetIssuance, InputAuthorization, NavOpening, NullifierOpening, PredecessorNullifier,
     ProvedTransition, ProverBridge, TransitionMode, TransitionWitness,
 };
-use zkcoins_prover::{MintWitness, Prover};
-
-/// Inner-pad-bits constant the active Phase 2b shape was built with
-/// (see `INNER_PAD_BITS_STAGE_5D_NEXT_5` in
-/// `program-plonky2/src/circuit/main.rs`). Recorded so the R2
-/// regression view can later answer "did the prove wall move when
-/// we changed pad bits?". Legacy-only; v1.1 has no pad-bits concept.
-const INNER_PAD_BITS: i32 = 15;
+// Stage 3: `Prover::new` is sealed to the defining crate's `#[cfg(test)]`.
+// This shipped binary never constructs a legacy `Prover` — measure only
+// via `ProverBridge` (`--prover v1`).
 
 // ===== CLI =====
 
@@ -148,7 +135,7 @@ fn print_usage(program: &str) {
     eprintln!(
         "usage: {program} [--warm-calls N] [--output <path>] [--persist] \
                 [--notes <text>] [--tags a,b,c] \
-                [--prover legacy|v1] [--network mainnet|testnet|regtest] \
+                [--prover v1] [--network mainnet|testnet|regtest] \
                 [--warm-budget-ms <ms>] [--cold-budget-ms <ms>] [--mem-budget-kb <kb>]
 
   --warm-calls N      number of warm prove calls (default 5)
@@ -156,8 +143,8 @@ fn print_usage(program: &str) {
   --persist           persist results into Postgres (requires DATABASE_URL)
   --notes TEXT        free-form note attached to the persisted run
   --tags A,B,C        comma-separated tags attached to the persisted run
-  --prover MODE       legacy (default) or v1 (ProverBridge). When omitted,
-                      ZKCOINS_V1_SHADOW=1 selects v1; unset/empty/off → legacy.
+  --prover MODE       only v1 (ProverBridge). Default when omitted is v1.
+                      legacy is deleted (Stage 3).
   --network NAME      v1 only: mainnet|testnet|regtest (default testnet)
   --warm-budget-ms N  override warm prove budget for this run only
   --cold-budget-ms N  override cold-start budget for this run only
@@ -169,18 +156,13 @@ v1.1 numbers. Missing v1.1 calibration refuses rather than falling back.
 
 env:
   DATABASE_URL         required when --persist is set
-  ZKCOINS_V1_SHADOW   selects v1 when --prover is omitted (1 = v1)
+  ZKCOINS_V1_SHADOW   optional; default probe mode is v1 regardless
   GIT_SHA              optional override for the recorded git sha
   RUSTC_VERSION        optional override for the recorded rustc version
   RUST_LOG             optional, log level (defaults to off here)
 
-legacy default budgets (flag off):
-  warm={warm} ms  cold={cold} ms  mem={mem} KB
-",
-        warm = LEGACY_BUDGET_WARM_PROVE_MS,
-        cold = LEGACY_BUDGET_COLD_START_MS,
-        mem = LEGACY_BUDGET_PEAK_RSS_KB
-    );
+v1 budgets come from sealed measurement samples in node::r2_budgets.
+");
 }
 
 fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
@@ -301,63 +283,6 @@ fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
         prover,
         network,
     })
-}
-
-// ===== Witness construction (legacy) =====
-
-/// Stable test pubkey, mirrors the helper in
-/// `script-plonky2/src/lib.rs::tests::dummy_pubkey`.
-fn dummy_pubkey(seed: u8) -> [u8; 33] {
-    let mut pk = [0u8; 33];
-    pk[0] = 0x02;
-    for (i, b) in pk.iter_mut().enumerate().skip(1) {
-        *b = seed.wrapping_add(i as u8);
-    }
-    pk
-}
-
-/// Off-circuit `CommitmentMerkleProofs` witness. Mirrors the private
-/// `build_test_commitment_witness` helper in
-/// `program-plonky2/src/circuit/main.rs` (test module — not reachable
-/// from this crate). Reproduced here so the probe doesn't need a test
-/// re-export.
-fn build_commitment_witness(
-    prev_asth: LegacyHash,
-    prev_ocr: LegacyHash,
-) -> (CommitmentMerkleProofs, LegacyHash) {
-    let pk_hash = hash_bytes(b"probe-r2-pubkey");
-    let pk_key = digest_to_bytes(&pk_hash);
-
-    let commitment = hash_concat(&prev_asth, &prev_ocr);
-
-    let mut smt = SparseMerkleTree::new();
-    smt.insert(pk_key, commitment)
-        .expect("smt insert (fresh key into fresh tree)");
-    let smt_root = smt.root();
-    let (smt_inclusion, _) = smt
-        .generate_inclusion_proof(&pk_key)
-        .expect("smt inclusion proof");
-
-    let prev_mmr_root = ZERO_HASH;
-    let mmr_leaf = hash_concat(&smt_root, &prev_mmr_root);
-    let mut mmr = MerkleMountainRange::new();
-    mmr.append(mmr_leaf);
-    let history_root_extended = mmr.root_extended(MMR_PROOF_PATH_LEN);
-    let mmr_proof = mmr
-        .get_proof(0)
-        .expect("mmr proof for leaf 0")
-        .extend_to(MMR_PROOF_PATH_LEN);
-
-    let cmp = CommitmentMerkleProofs {
-        commitment_root: smt_root,
-        commitment_proof: smt_inclusion,
-        commitment_root_history_proof: mmr_proof.clone(),
-        commitment_root_mmr_sibling: prev_mmr_root,
-        previous_root_history_proof: (smt_root, mmr_proof),
-        commitment_account_state_hash: prev_asth,
-        commitment_out_coins_root: prev_ocr,
-    };
-    (cmp, history_root_extended)
 }
 
 // ===== Witness construction (v1.1) =====
@@ -716,89 +641,6 @@ struct MeasureResult {
     compliance_gate_count: Option<i32>,
 }
 
-fn measure_legacy(warm_calls: usize) -> Result<MeasureResult, String> {
-    eprintln!("[probe_r2] mode=legacy — Prover::new + prove_initial / prove_account_update");
-    eprintln!(
-        "[probe_r2] shape MAX_IN_COINS={MAX_IN_COINS} MAX_OUT_COINS={MAX_OUT_COINS} \
-         INNER_PAD_BITS={INNER_PAD_BITS}"
-    );
-
-    eprintln!("[probe_r2] building circuit (cold) ...");
-    let t = Instant::now();
-    let prover = Prover::new();
-    let circuit_build_wall_ms = t.elapsed().as_millis() as i64;
-    eprintln!("[probe_r2] circuit_build_wall_ms = {circuit_build_wall_ms}");
-
-    let creator_pubkey = dummy_pubkey(7);
-    let name_hash = calculate_name_hash("PROBE");
-    let decimals: u8 = 8;
-    let asset_id = calculate_asset_id(&creator_pubkey, &name_hash, decimals);
-    let mut account_state = LegacyAccountState::new(creator_pubkey, asset_id);
-    account_state.balance = 1_000_000;
-    let mint_witness = MintWitness {
-        creator_pubkey,
-        name_hash,
-        decimals,
-    };
-
-    eprintln!("[probe_r2] proving initial (cold) ...");
-    let t = Instant::now();
-    let init_proof = prover
-        .prove_initial(&account_state, ZERO_HASH, asset_id, Some(mint_witness))
-        .map_err(|e| format!("prove_initial: {e}"))?;
-    let prove_cold_wall_ms = t.elapsed().as_millis() as i64;
-    eprintln!("[probe_r2] prove_cold_wall_ms = {prove_cold_wall_ms}");
-
-    let t = Instant::now();
-    prover
-        .verify(&init_proof)
-        .map_err(|e| format!("verify cold init: {e}"))?;
-    let verify_wall_ms = t.elapsed().as_millis() as i64;
-
-    let prev_asth = account_state.hash();
-    let prev_ocr = init_proof_out_coins_root_from_init(&prev_asth);
-    let (cmp, history_root_extended) = build_commitment_witness(prev_asth, prev_ocr);
-
-    let mut prove_warm_wall_ms: Vec<i64> = Vec::with_capacity(warm_calls);
-    for i in 0..warm_calls {
-        eprintln!("[probe_r2] warm prove {} / {} ...", i + 1, warm_calls);
-        let t = Instant::now();
-        let update_proof = prover
-            .prove_account_update(
-                &account_state,
-                history_root_extended,
-                &init_proof,
-                &cmp,
-                asset_id,
-            )
-            .map_err(|e| format!("warm prove_account_update #{i}: {e}"))?;
-        let ms = t.elapsed().as_millis() as i64;
-        prove_warm_wall_ms.push(ms);
-        eprintln!("[probe_r2] warm[{i}] = {ms} ms");
-
-        if i == 0 {
-            prover
-                .verify(&update_proof)
-                .map_err(|e| format!("verify warm #{i}: {e}"))?;
-        }
-    }
-
-    Ok(MeasureResult {
-        circuit_build_wall_ms,
-        prove_cold_wall_ms,
-        verify_wall_ms,
-        prove_warm_wall_ms,
-        peak_rss_kb: peak_rss_kb() as i64,
-        max_in_coins: MAX_IN_COINS as i32,
-        max_out_coins: MAX_OUT_COINS as i32,
-        inner_pad_bits: INNER_PAD_BITS,
-        max_tx_inputs: None,
-        max_tx_outputs: None,
-        max_rx_coins: None,
-        compliance_gate_count: None,
-    })
-}
-
 fn measure_v1(warm_calls: usize, network: Network) -> Result<MeasureResult, String> {
     eprintln!(
         "[probe_r2] mode=v1 — ProverBridge + prove_transition (network={network:?})"
@@ -949,8 +791,12 @@ fn run() -> Result<(), String> {
     let rustc_version = detect_rustc_version();
 
     let measured = match mode {
-        ProverMode::Legacy => measure_legacy(args.warm_calls)?,
         ProverMode::V1 => measure_v1(args.warm_calls, args.network)?,
+        ProverMode::Legacy => {
+            return Err(
+                "probe_r2 legacy mode deleted (Stage 3): circuit::main builders and Prover                  are gone; use --prover v1 (or omit --prover; default is v1)".into(),
+            );
+        }
     };
 
     // ===== Report =====
@@ -1194,10 +1040,6 @@ fn pass_marker(ok: bool) -> &'static str {
 /// but kept as a function so the call site reads symmetrically. We
 /// hash a sentinel to obtain that empty-tree root without depending on
 /// the `DEFAULT_HASHES` private indexing.
-fn init_proof_out_coins_root_from_init(_prev_asth: &LegacyHash) -> LegacyHash {
-    SparseMerkleTree::new().root()
-}
-
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,

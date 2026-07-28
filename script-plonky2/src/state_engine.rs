@@ -297,9 +297,13 @@ pub struct PendingTransition {
 /// public — the only encode/decode entry points are
 /// [`FinalisationCapability::to_durable_bytes`] /
 /// [`from_durable_bytes`](FinalisationCapability::from_durable_bytes).
+///
+/// `witness_wip` uses the private witness wire (same byte layout as the
+/// former derived serde of public [`TransitionWitness`]). Decode binds
+/// embedded proofs in [`FinalisationCapability::from_durable_bytes`].
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct PendingTransitionWire {
-    witness_wip: TransitionWitness,
+    witness_wip: crate::prover_bridge::TransitionWitnessWire,
     proof_data: ProofData,
     proof_data_hash: [u8; 32],
     mode: TransitionMode,
@@ -311,7 +315,7 @@ struct PendingTransitionWire {
 impl PendingTransition {
     fn to_wire(&self) -> PendingTransitionWire {
         PendingTransitionWire {
-            witness_wip: self.witness_wip.clone(),
+            witness_wip: self.witness_wip.to_wire(),
             proof_data: self.proof_data.clone(),
             proof_data_hash: self.proof_data_hash,
             mode: self.mode,
@@ -323,7 +327,7 @@ impl PendingTransition {
 
     fn from_wire(wire: PendingTransitionWire) -> Self {
         Self {
-            witness_wip: wire.witness_wip,
+            witness_wip: TransitionWitness::from_wire(wire.witness_wip),
             proof_data: wire.proof_data,
             proof_data_hash: wire.proof_data_hash,
             mode: wire.mode,
@@ -414,7 +418,14 @@ impl FinalisationCapability {
         &self.pending
     }
 
-    pub fn pending_mut(&mut self) -> &mut PendingTransition {
+    /// Mutable access for crate-internal finalise wiring only.
+    ///
+    /// **Visibility (Stage 3 Runde 6):** `pub(crate)`. A public
+    /// `pending_mut` would let downstream replace `witness_wip.prev_proof`
+    /// with an unbound proof after durable load — reopening the load gate
+    /// that [`TransitionWitness::decode_bound`] / `from_durable_bytes`
+    /// enforce. External crates get read-only [`Self::pending`].
+    pub(crate) fn pending_mut(&mut self) -> &mut PendingTransition {
         &mut self.pending
     }
 
@@ -454,11 +465,27 @@ impl FinalisationCapability {
     }
 
     /// Inverse of [`to_durable_bytes`](Self::to_durable_bytes).
-    pub fn from_durable_bytes(bytes: &[u8]) -> Result<Self> {
+    ///
+    /// **Stage 3 load gate:** the wire embeds a full [`TransitionWitness`],
+    /// which may carry `prev_proof` and receipt `creating_proof`s. Every
+    /// durable rehydrate path must bind those proofs to circuit `C`
+    /// identity — raw bincode alone accepts a well-formed proof of another
+    /// circuit (same Rust type alias). Uses the same bind set as
+    /// [`TransitionWitness::decode_bound`].
+    pub fn from_durable_bytes(bytes: &[u8], network: Network) -> Result<Self> {
         let wire: FinalisationCapabilityWire = bincode::deserialize(bytes)
             .context("bincode deserialize FinalisationCapability durable wire")?;
+        let pending = PendingTransition::from_wire(wire.pending);
+        let bridge = ProverBridge::new(network);
+        pending
+            .witness_wip
+            .bind_embedded_proofs(&bridge)
+            .context(
+                "FinalisationCapability durable decode: embedded compliance \
+                 proof(s) failed circuit-C identity bind",
+            )?;
         Ok(Self {
-            pending: PendingTransition::from_wire(wire.pending),
+            pending,
             signature: wire.signature,
         })
     }
@@ -2740,6 +2767,8 @@ mod tests {
                     state,
                     coinhist: CoinHistTree::new(),
                     nk: base.nk,
+                    // Same operational secret the v2 request carries (test_mint_request).
+                    op_secret: Some(base.op_secret),
                     genesis_pubkey: base.current_pubkey,
                     spendable: BTreeMap::new(),
                     spent_ids: BTreeSet::new(),
@@ -2872,6 +2901,8 @@ mod tests {
                     state,
                     coinhist,
                     nk: first.nk,
+                    // Same operational secret the remint request carries.
+                    op_secret: Some(first.op_secret),
                     genesis_pubkey: first.current_pubkey,
                     spendable,
                     spent_ids: BTreeSet::new(),
@@ -2881,7 +2912,8 @@ mod tests {
                             size: 0,
                             mth: host::nflog_empty(),
                         },
-                        nav_rand: [0; 32],
+                        // Prior (genesis) opening: entry send_counter = 0.
+                        nav_rand: first.op_secret.derive_nav_rand(0),
                     }),
                     last_nullifier: Some(NullifierOpening {
                         public_key: predecessor_entry.pk,
@@ -2899,6 +2931,7 @@ mod tests {
         let remint = MintRequest {
             owner: first.owner,
             nk: first.nk,
+            op_secret: first.op_secret,
             current_pubkey: first.next_pubkey,
             next_pubkey: remint_next,
             name: first.name.clone(),
@@ -2907,7 +2940,6 @@ mod tests {
             issuance_version: 1,
             cap_total: 0,
             terms_salt: [0u8; 32],
-            nav_rand: [0x33; 32],
             npk_rand: [0x44; 32],
         };
         let pending = engine.begin_mint(remint).expect("std1 remint must succeed");

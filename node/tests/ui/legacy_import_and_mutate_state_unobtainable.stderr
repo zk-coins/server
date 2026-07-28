@@ -1,0 +1,166 @@
+error[E0603]: function `persist_account` is private
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:16:33
+   |
+16 |     let _ = node::account_node::persist_account;
+   |                                 ^^^^^^^^^^^^^^^ private function
+   |
+note: the function `persist_account` is defined here
+  --> src/account_node.rs
+   |
+   | / pub(crate) async fn persist_account(
+   | |     pool: &PgPool,
+   | |     address: &Address,
+   | |     account: &Account,
+   | | ) -> Result<usize, PersistAccountError> {
+   | |_______________________________________^
+
+error[E0603]: function `upsert_account` is private
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:19:23
+   |
+19 |     let _ = node::db::upsert_account;
+   |                       ^^^^^^^^^^^^^^ private function
+   |
+note: the function `upsert_account` is defined here
+  --> src/db.rs
+   |
+   | / pub(crate) async fn upsert_account(
+   | |     pool: &PgPool,
+   | |     address: &[u8],
+   | |     data: &[u8],
+   | | ) -> Result<(), sqlx::Error> {
+   | |____________________________^
+
+error[E0603]: function `upsert_account_with_source` is private
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:20:23
+   |
+20 |     let _ = node::db::upsert_account_with_source;
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^ private function
+   |
+note: the function `upsert_account_with_source` is defined here
+  --> src/db.rs
+   |
+   | / pub(crate) async fn upsert_account_with_source(
+   | |     pool: &PgPool,
+   | |     address: &[u8],
+   | |     data: &[u8],
+   | |     source: &str,
+   | | ) -> Result<(), sqlx::Error> {
+   | |____________________________^
+
+error[E0603]: function `insert_account_history` is private
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:21:23
+   |
+21 |     let _ = node::db::insert_account_history;
+   |                       ^^^^^^^^^^^^^^^^^^^^^^ private function
+   |
+note: the function `insert_account_history` is defined here
+  --> src/db.rs
+   |
+   | / pub(crate) async fn insert_account_history(
+   | |     pool: &PgPool,
+   | |     entry: &AccountHistoryEntry,
+   | | ) -> Result<(), sqlx::Error> {
+   | |____________________________^
+
+error[E0603]: function `commit_mint_tx` is private
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:22:23
+   |
+22 |     let _ = node::db::commit_mint_tx;
+   |                       ^^^^^^^^^^^^^^ private function
+   |
+note: the function `commit_mint_tx` is defined here
+  --> src/db.rs
+   |
+   | / pub(crate) async fn commit_mint_tx(
+   | |     pool: &PgPool,
+   | |     accounts: &[(&[u8], &[u8])],
+   | | ) -> Result<(), sqlx::Error> {
+   | |____________________________^
+
+error[E0603]: function `register_asset_creator` is private
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:23:23
+   |
+23 |     let _ = node::db::register_asset_creator;
+   |                       ^^^^^^^^^^^^^^^^^^^^^^ private function
+   |
+note: the function `register_asset_creator` is defined here
+  --> src/db.rs
+   |
+   | / pub(crate) async fn register_asset_creator(
+   | |     pool: &PgPool,
+   | |     asset_id: &[u8],
+   | |     creator_pubkey: &[u8],
+   | | ) -> Result<(), sqlx::Error> {
+   | |____________________________^
+
+error[E0603]: function `insert_pending_inscription` is private
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:24:23
+   |
+24 |     let _ = node::db::insert_pending_inscription;
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^ private function
+   |
+note: the function `insert_pending_inscription` is defined here
+  --> src/db.rs
+   |
+   | / pub(crate) async fn insert_pending_inscription(
+   | |     pool: &PgPool,
+   | |     commit_txid: &[u8],
+   | |     reveal_txid: &[u8],
+...  |
+   | |     commit_output_value: i64,
+   | | ) -> Result<bool, sqlx::Error> {
+   | |______________________________^
+
+error[E0603]: function `update_pending_status` is private
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:25:23
+   |
+25 |     let _ = node::db::update_pending_status;
+   |                       ^^^^^^^^^^^^^^^^^^^^^ private function
+   |
+note: the function `update_pending_status` is defined here
+  --> src/db.rs
+   |
+   | / pub(crate) async fn update_pending_status(
+   | |     pool: &PgPool,
+   | |     commit_txid: &[u8],
+   | |     status: &str,
+   | | ) -> Result<(), sqlx::Error> {
+   | |____________________________^
+
+error[E0603]: function `update_pending_failure_reason` is private
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:26:23
+   |
+26 |     let _ = node::db::update_pending_failure_reason;
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private function
+   |
+note: the function `update_pending_failure_reason` is defined here
+  --> src/db.rs
+   |
+   | / pub(crate) async fn update_pending_failure_reason(
+   | |     pool: &PgPool,
+   | |     commit_txid: &[u8],
+   | |     failure_reason: &str,
+   | | ) -> Result<(), sqlx::Error> {
+   | |____________________________^
+
+error[E0624]: method `import_account` is private
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:10:46
+   |
+10 |     let _ = node::account_node::AccountNode::import_account;
+   |                                              ^^^^^^^^^^^^^^ private method
+   |
+  ::: src/account_node.rs
+   |
+   |     pub(crate) fn import_account(&mut self, address: HashDigest, account: Account) {
+   |     ------------------------------------------------------------------------------ private method defined here
+
+error[E0624]: method `state` is private
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:13:46
+   |
+13 |     let _ = node::account_node::AccountNode::state;
+   |                                              ^^^^^ private method
+   |
+  ::: src/account_node.rs
+   |
+   |     pub(crate) fn state(&self) -> &Arc<Mutex<State>> {
+   |     ------------------------------------------------ private method defined here

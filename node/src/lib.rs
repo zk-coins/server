@@ -1,18 +1,46 @@
 //! Library crate root for `node`.
 //!
-//! The node is primarily a binary (`main.rs`), but a few pieces of
-//! it must be reachable from out-of-tree integration tests
-//! (`node/tests/api_remote.rs` in particular). Exposing those
-//! modules through a `lib` target keeps the binary side of the crate
-//! untouched while letting the integration suite import the
-//! `Capabilities` struct (for feature-gate detection on `/api/info`)
-//! and the `CoinProof` struct used to decode the binary blobs
-//! returned by `GET /api/proof/:id`. Other response types remain
-//! reachable through their owning modules but are not currently
-//! consumed by the suite.
+//! # Public surface — Stage 3 Runde 6 positive list
 //!
-//! Everything declared here is also `use`d from `main.rs` so the
-//! production binary keeps working with no change in behaviour.
+//! The default is **crate-private**. Only the items below are `pub`, and
+//! each has a single reason to stay on the external edge. Everything else
+//! is `pub(crate)` or private. Derive additions from the compiler
+//! (`cargo check --workspace --all-targets`), not from guesswork: a failed
+//! external use is either a legitimate list entry or a wrong caller.
+//!
+//! ## Modules (and why they are public)
+//!
+//! - [`account_node`] — binary boot (`load_ledger_from_pg`); integration
+//!   `api_remote` needs [`account_node::CoinProof`]; compile-fail probes name
+//!   sealed methods on `AccountNode`. **Not** public: `import_account`,
+//!   `persist_account`, mutative `state()`.
+//! - [`db`] — binary `connect_and_migrate`; residual read helpers for boot.
+//!   Legacy **write** sinks are `pub(crate)` and gated at the SQL sink.
+//! - [`runtime`] — binary `start_rest_node` / `V1Readiness`.
+//! - [`state`] — binary `State::load_from_pg`.
+//! - [`username`] — binary `UsernameStore::load_from_pg`.
+//! - [`v1`] — binary exclusive stack + gRPC-kernel path; `downstream-boundary`
+//!   compile-fail matrix names sealed sinks on this module tree.
+//! - [`self_heal`] — binary circuit-digest heal on boot.
+//! - [`openapi`] — integration `openapi_smoke` reads `openapi_json` / `DOCS_HTML`.
+//! - [`router`] — integration `api_remote` needs [`router::Capabilities`].
+//! - [`r2_budgets`] / [`r2_probe`] — `probe_r2` binary.
+//! - [`publisher`] — `recover_inscription` binary (legacy resume under claim).
+//! - [`esplora_bound`] — publisher / recover path facade (stack-gated broadcast).
+//! - [`legacy_commitment_scan`] — named only so compile-fail matrices prove the
+//!   scan cap is unconstructible; no production mint of the cap.
+//!
+//! ## Crate-root items
+//!
+//! - `build_network_config_from_env`, `NETWORK_CONFIG`, `USERNAME_DOMAIN`,
+//!   `PUBLISHER_KEY`, `PUBLISHER_ADDRESS`, `DATABASE_URL` — binary / health /
+//!   config edge (fail-loud env, no silent chain defaults).
+//!
+//! Modules **not** on this list (`audit`, `flow`, `job_*`, `scanner*`,
+//! `prover_health`, `persist_state_from_sync_context`, …) are `pub(crate)`.
+//!
+//! Spec: §7.5 — the node is a kernel (gRPC); public clients talk to the API
+//! layer. Capability-bound `read.account` is not “knows an address”.
 
 // Opt in to the unstable `coverage_attribute` feature only when
 // `cargo llvm-cov` defines the `coverage_nightly` cfg (it injects the
@@ -34,32 +62,32 @@
 #![allow(clippy::new_without_default)]
 
 pub mod account_node;
-pub mod audit;
+pub(crate) mod audit;
 pub mod db;
 /// Node-side Esplora boundary: re-exports the `esplora-bound` facade
 /// (sole owner of `esplora-client`) and stack-gates legacy broadcast.
 pub mod esplora_bound;
-pub mod flow;
-pub mod job_dispatcher;
-pub mod job_store;
+pub(crate) mod flow;
+pub(crate) mod job_dispatcher;
+pub(crate) mod job_store;
+/// Stage-3 sealed legacy Commitment → SMT/MMR scan sink (Stage 4 deletes).
+/// Public only so compile-fail matrices can name the sealed cap type.
+pub mod legacy_commitment_scan;
 pub mod openapi;
-pub mod prover_health;
+pub(crate) mod prover_health;
 pub mod publisher;
 pub mod r2_budgets;
 pub mod r2_probe;
 pub mod router;
 pub mod runtime;
-pub mod scanner;
-pub mod scanner_runtime;
-pub mod scanner_ws;
-pub mod scanner_ws_parse;
+pub(crate) mod scanner;
+pub(crate) mod scanner_runtime;
+pub(crate) mod scanner_ws;
+pub(crate) mod scanner_ws_parse;
 pub mod self_heal;
 pub mod state;
 pub mod username;
-/// v1.1 StateEngine adapter, shadow persistence (Stage 1), and exclusive
-/// publisher/scanner dual stack (Stage 2). Behind `ZKCOINS_V1_SHADOW=1`;
-/// default remains the legacy Commitment/SMT stack. Proving stays legacy
-/// until Stage 3.
+/// v1.1 StateEngine adapter + exclusive stack (Stage 2/3).
 pub mod v1;
 
 use crate::publisher::EsploraConfig;
@@ -251,7 +279,7 @@ lazy_static! {
 /// row so the Phase-C write lands in the SAME Postgres transaction as
 /// the SMT/MMR/latest_block snapshot — see the doc-comment on
 /// `db::persist_state_tx` for the heal-on-restart rationale.
-pub fn persist_state_from_sync_context(
+pub(crate) fn persist_state_from_sync_context(
     pool: &PgPool,
     smt: &[u8],
     mmr: &[u8],

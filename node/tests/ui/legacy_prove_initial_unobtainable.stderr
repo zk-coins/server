@@ -1,0 +1,17 @@
+error[E0603]: function `prove_initial` is private
+ --> tests/ui/legacy_prove_initial_unobtainable.rs:5:45
+  |
+5 |     let _ = zkcoins_program::circuit::main::prove_initial;
+  |                                             ^^^^^^^^^^^^^ private function
+  |
+note: the function `prove_initial` is defined here
+ --> $WORKSPACE/program-plonky2/src/circuit/main.rs
+  |
+  | / pub(crate) fn prove_initial(
+  | |     circuit: &StateTransitionCircuit,
+  | |     account_state: &AccountState,
+  | |     history_root: HashDigest,
+  | |     asset_id: HashDigest,
+  | |     mint: Option<MintWitness>,
+  | | ) -> Result<ProofWithPublicInputs<F, C, D>> {
+  | |___________________________________________^

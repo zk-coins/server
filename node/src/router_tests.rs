@@ -287,11 +287,9 @@ fn bitcoin_network_label_maps_both_arms() {
     assert_eq!(bitcoin_network_label(false), BitcoinNetwork::Mutinynet);
 }
 
-// --- GET /api/balance ---
+// --- GET /api/balance (Stage 3 Runde 5: closed, 410) ---
 
-/// `&asset_id=<test_asset_id>` query-string fragment. The single-asset
-/// `/api/balance?address=` endpoint requires an explicit asset_id under
-/// the neutral multi-asset model.
+/// `&asset_id=<test_asset_id>` query-string fragment (legacy URL shape).
 fn asset_q() -> String {
     format!(
         "&asset_id={}",
@@ -299,56 +297,12 @@ fn asset_q() -> String {
     )
 }
 
+/// R2: seeded ledger balance must not leave via GET /api/balance.
+/// Asserts status **and** that the body does not carry the funded amount
+/// (not only that the route exists).
 #[tokio::test]
-async fn balance_unknown_address_returns_ok_with_zero() {
-    // 32 zero bytes in hex = 64 hex chars
-    let address_hex = "00".repeat(32);
-    let uri = format!("/api/balance?address={}{}", address_hex, asset_q());
-    let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::OK);
-
-    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, 0);
-    assert!(resp.username.is_none());
-    // num_sends MUST be 0 for an unobserved address — this is the
-    // canonical "fresh wallet" state the seed-restore flow assumes.
-    // A non-zero default would silently desync the wallet's BIP-32
-    // counter (see `BalanceResponse::num_sends` doc).
-    assert_eq!(resp.num_sends, 0);
-}
-
-#[tokio::test]
-async fn balance_unknown_address_with_claimed_username_returns_username() {
+async fn balance_is_gone_and_does_not_reveal_ledger() {
     let state = test_state();
-    let address_bytes = [0xABu8; 32];
-    let address = zkcoins_program::hash::digest_from_bytes(&address_bytes);
-
-    // Pre-populate the in-memory map (no Postgres round-trip — see
-    // the comment on `insert_for_test`).
-    {
-        let mut store = state.username_store.lock().unwrap();
-        store.insert_for_test("alice", address);
-    }
-
-    let uri = format!(
-        "/api/balance?address={}{}",
-        hex::encode(address_bytes),
-        asset_q()
-    );
-    let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-
-    assert_eq!(status, StatusCode::OK);
-    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, 0);
-    assert_eq!(resp.username, Some("alice".to_string()));
-    assert_eq!(resp.num_sends, 0);
-}
-
-#[tokio::test]
-async fn balance_seeded_account_returns_funded_balance() {
     let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let asset_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_asset_id()));
     let uri = format!(
@@ -356,85 +310,104 @@ async fn balance_seeded_account_returns_funded_balance() {
         address_hex, asset_hex
     );
     let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, body) = send_request(req).await;
+    let (status, body) = send_request_with_state(state, req).await;
 
-    assert_eq!(status, StatusCode::OK);
-
-    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, 1_000_000u64);
-    // The seeded account has not produced any send yet via the test
-    // fixture, so num_sends is 0 here.
-    assert_eq!(resp.num_sends, 0);
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "legacy balance must refuse loud (HTTP 410); body={body}"
+    );
+    let resp: serde_json::Value = serde_json::from_str(&body).expect("JSON error body");
+    let err = resp["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/balance") || err.contains("Stage 3") || err.contains("read.account"),
+        "error must name the removed surface; got {err:?}"
+    );
+    // No funded ledger fields: the fixture holds 1_000_000.
+    assert!(
+        resp.get("balance").is_none(),
+        "410 body must not carry a balance field; got {resp}"
+    );
+    assert!(
+        !body.contains("1000000") && !body.contains("1_000_000"),
+        "body must not leak the seeded balance; got {body}"
+    );
+    assert!(
+        resp.get("num_sends").is_none() && resp.get("assets").is_none(),
+        "410 body must not carry ledger fields; got {resp}"
+    );
 }
 
 #[tokio::test]
-async fn balance_missing_address_param_returns_unprocessable() {
+async fn balance_always_gone_even_without_params() {
     let req = Request::get("/api/balance").body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-
-    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, 0);
-    assert!(resp.username.is_none());
-    assert_eq!(resp.num_sends, 0);
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    assert!(
+        !body.contains("\"balance\""),
+        "must not return BalanceResponse shape; body={body}"
+    );
 }
 
-#[tokio::test]
-async fn balance_invalid_hex_returns_unprocessable() {
-    let req = Request::get("/api/balance?address=not_valid_hex")
-        .body(Body::empty())
-        .unwrap();
-    let (status, _body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn balance_wrong_length_returns_unprocessable() {
-    // 16 bytes = 32 hex chars, but the handler expects exactly 32 bytes
-    let short_hex = "ab".repeat(16);
-    let uri = format!("/api/balance?address={}", short_hex);
-    let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, _body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-// --- GET /api/address ---
+// --- GET /api/address (Stage 3 Runde 6: closed, 410) ---
 
 #[cfg(feature = "address-list")]
 #[tokio::test]
-async fn address_returns_list() {
+async fn address_list_is_gone_and_does_not_reveal_legacy_addresses() {
+    // Seed is present in test_state; closed handler must not enumerate it.
     let req = Request::get("/api/address").body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::OK);
-
-    let resp: AddressesResponse = serde_json::from_str(&body).expect("valid JSON");
-    // The test state has the minting address seeded
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).expect("JSON error body");
+    let err = resp["error"].as_str().unwrap_or("");
     assert!(
-        !resp.addresses.is_empty(),
-        "should contain at least the minting address"
+        err.contains("/api/address") || err.contains("Stage 3") || err.contains("read.account"),
+        "error must name the removed surface; got {err:?}"
     );
-    assert!(
-        resp.addresses[0].starts_with("0x"),
-        "addresses should be 0x-prefixed"
-    );
+    // No address list payload.
+    assert!(resp.get("addresses").is_none(), "must not emit addresses");
 }
 
 // --- POST /api/send with missing fields ---
 
 // --- POST /api/mint with missing fields ---
 
-// --- GET /api/proof/{id} for non-existent proof ---
+// --- GET /api/proof/{id} (Stage 3 Runde 5: closed, 410) ---
+
+/// R2: even when a CoinProof blob is on disk, the route must not hand it
+/// out (cleartext Coin). Status alone is insufficient — assert the body
+/// is not the bincode blob / not 200 octet-stream.
+#[tokio::test]
+async fn proof_is_gone_and_does_not_reveal_coinproof() {
+    let state = test_state();
+    // Plant a recognisable marker blob under a known id. The closed
+    // handler must never return these bytes.
+    let marker = b"CLEARTEXT_COIN_PROOF_MUST_NOT_LEAK";
+    state.proof_store.plant_raw_for_test(42, marker);
+    let req = Request::get("/api/proof/42").body(Body::empty()).unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "legacy proof download must refuse loud (HTTP 410); body={body}"
+    );
+    assert!(
+        !body.as_bytes().windows(marker.len()).any(|w| w == marker),
+        "body must not contain the on-disk CoinProof blob; got {body:?}"
+    );
+    let resp: serde_json::Value = serde_json::from_str(&body).expect("JSON error body");
+    let err = resp["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/proof") || err.contains("Stage 3") || err.contains("read.proof"),
+        "error must name the removed surface; got {err:?}"
+    );
+}
 
 #[tokio::test]
-async fn proof_not_found_returns_404() {
+async fn proof_unknown_id_is_gone_not_404() {
     let req = Request::get("/api/proof/9999").body(Body::empty()).unwrap();
-    let (status, _body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
 }
 
 // --- POST /api/commit with missing fields ---
@@ -479,21 +452,25 @@ async fn resolve_unknown_username_returns_404() {
 }
 
 #[tokio::test]
-async fn resolve_minting_address_by_hex_prefix() {
-    // The minting address starts with "af53a1" — a short prefix is enough
-    // for resolve_identifier to match via hex-prefix fallback.
+async fn resolve_hex_prefix_no_longer_scans_legacy_addresses() {
+    // Stage 3 Runde 6: hex-prefix fallback over get_addresses() is gone.
+    // A known ledger address prefix must not resolve or leak the full address.
     let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
-    let prefix = &full_hex[..8]; // first 8 hex chars
+    let prefix = &full_hex[..8];
 
     let uri = format!("/api/username/resolve/{}", prefix);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
 
-    assert_eq!(status, StatusCode::OK);
-
-    let resp: UsernameResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.address, format!("0x{}", full_hex));
-    assert_eq!(resp.username, prefix);
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "hex prefix must not resolve via legacy address scan; body={body}"
+    );
+    assert!(
+        !body.contains(&full_hex),
+        "body must not leak the full legacy address; got {body}"
+    );
 }
 
 // --- POST /api/username/claim ---
@@ -540,8 +517,9 @@ async fn lnurlp_unknown_user_returns_404() {
 
 #[cfg(feature = "lnurl")]
 #[tokio::test]
-async fn lnurlp_known_address_returns_pay_request() {
-    // The minting address is resolvable by hex prefix through resolve_identifier.
+async fn lnurlp_hex_prefix_no_longer_confirms_legacy_account() {
+    // Stage 3 Runde 6: LNURL must not use hex-prefix scan over legacy
+    // addresses (existence/validity oracle). Only the username store.
     let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let prefix = &full_hex[..8];
 
@@ -552,40 +530,37 @@ async fn lnurlp_known_address_returns_pay_request() {
         .unwrap();
     let (status, body) = send_request(req).await;
 
-    assert_eq!(status, StatusCode::OK);
-
-    let resp: LnurlpResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.tag, "payRequest");
-    assert!(
-        resp.callback.contains(prefix),
-        "callback should include the identifier"
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "hex prefix must not confirm a legacy account; body={body}"
     );
-    assert_eq!(resp.min_sendable, 1_000);
-    assert_eq!(resp.max_sendable, 1_000_000_000_000);
-    assert!(resp.metadata.contains("zkCoins"));
+    assert!(
+        !body.contains("payRequest"),
+        "must not return LNURL-pay metadata for hex prefix; got {body}"
+    );
 }
 
 #[cfg(feature = "lnurl")]
 #[tokio::test]
 async fn lnurlp_localhost_host_returns_http_callback() {
-    // Pins the `host.contains("localhost")` branch of `lnurlp_handler`'s
-    // scheme selection: when the request's Host header points at a local
-    // dev instance, the LNURL callback URL must be served back as `http://`
-    // so wallets following the redirect don't hit a TLS error against
-    // the dev node. The api.zkcoins.app path (covered by
-    // `lnurlp_known_address_returns_pay_request`) already pins the
-    // `https://` arm.
-    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
-    let prefix = &full_hex[..8];
+    // Pins the `host.contains("localhost")` scheme arm for a *claimed*
+    // username (hex-prefix legacy resolve is closed). Seed the username
+    // store so the handler reaches scheme selection.
+    let state = test_state();
+    {
+        let mut store = state.username_store.lock().unwrap();
+        store.commit_after_db("localuser".to_string(), test_owner_address());
+    }
 
-    let uri = format!("/.well-known/lnurlp/{}", prefix);
-    let req = Request::get(&uri)
+    let uri = "/.well-known/lnurlp/localuser";
+    let req = Request::get(uri)
         .header("host", "localhost:8080")
         .body(Body::empty())
         .unwrap();
-    let (status, body) = send_request(req).await;
+    let (status, body) = send_request_with_state(state, req).await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "body={body}");
 
     let resp: LnurlpResponse = serde_json::from_str(&body).expect("valid JSON");
     assert!(
@@ -616,85 +591,31 @@ async fn lnurl_pay_callback_returns_phase2_error() {
     );
 }
 
-// --- Balance includes username field ---
+// --- Legacy balance surface closed (username / num_sends paths) ---
 
 #[tokio::test]
-async fn balance_minting_address_has_no_username() {
-    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
-    let uri = format!("/api/balance?address={}{}", address_hex, asset_q());
-    let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::OK);
-
-    // username should be absent (skip_serializing_if = None)
-    let raw: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(
-        raw.get("username").is_none() || raw["username"].is_null(),
-        "minting address without a claimed username should have no username field"
-    );
-}
-
-#[tokio::test]
-async fn balance_includes_username_when_claimed() {
+async fn balance_claimed_username_still_gone_no_ledger_leak() {
     let state = test_state();
-
-    // Pre-populate the in-memory username map via the test-only
-    // helper (bypasses the async Postgres path; production code
-    // claims via the /api/username/claim handler).
     {
         let mut username_store = state.username_store.lock().unwrap();
         username_store.insert_for_test("satoshi", test_owner_address());
     }
-
     let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let uri = format!("/api/balance?address={}{}", address_hex, asset_q());
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request_with_state(state, req).await;
-
-    assert_eq!(status, StatusCode::OK);
-
-    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, 1_000_000u64);
-    assert_eq!(resp.username, Some("satoshi".to_string()));
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    assert!(
+        !body.contains("satoshi") && !body.contains("1000000"),
+        "must not leak username or balance; body={body}"
+    );
 }
 
-// --- num_sends emission ---
-
-/// `BalanceResponse::num_sends` must reflect the queried account's
-/// per-account send counter (`Account::num_sends`).
-///
-/// The wallet uses this counter to choose its next signing pubkey
-/// (BIP-32 child index). `prev_commitment_pubkey` is no longer
-/// derived from this counter — the server reads it directly from
-/// `Account::commitment_public_key`. See the field doc on
-/// `Account::commitment_public_key` for the bug class that change
-/// eliminated (the wallet's local counter drifting from the server's
-/// after a seed restore or stale-app deploy and surfacing as
-/// `07-send.spec.ts::send-success` 400ing).
-///
-/// Driven via the in-memory `AccountNode` knob rather than a full
-/// `/api/send` round-trip: prover initialisation alone costs ~50 s
-/// of CI time and is exercised by the `api_remote` suite against
-/// the live DEV server. The handler-level guarantee tested here is
-/// "whatever `Account::num_sends` says, the JSON emits".
 #[tokio::test]
-async fn balance_response_emits_num_sends_from_account() {
+async fn balance_num_sends_path_is_gone_no_ledger_leak() {
     let state = test_state();
     let address_bytes = [0x77u8; 32];
     let address = zkcoins_program::hash::digest_from_bytes(&address_bytes);
-
-    // Inject an account whose `proof` is None and
-    // `commitment_public_key` is None but `num_sends` is non-zero —
-    // an impossible production state (the invariant says
-    // `num_sends > 0 iff proof.is_some() iff commitment_public_key.is_some()`),
-    // but the handler does not re-check the invariant on read; it
-    // emits whatever the field holds. Setting `num_sends` directly
-    // is the smallest possible signal that the handler reads the
-    // right field. (The invariant itself is covered by the
-    // `account_node_tests` unit test
-    // `test_send_coins_twice_from_same_account_uses_update_account`,
-    // which exercises the real bump path through `send_coins_inner`.)
     {
         let mut node = state.account_node.lock().unwrap();
         let mut acct = crate::account_node::Account::new_for_asset(test_asset_id());
@@ -702,7 +623,6 @@ async fn balance_response_emits_num_sends_from_account() {
         acct.num_sends = 3;
         node.import_account(address, acct);
     }
-
     let uri = format!(
         "/api/balance?address={}{}",
         hex::encode(address_bytes),
@@ -710,17 +630,14 @@ async fn balance_response_emits_num_sends_from_account() {
     );
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request_with_state(state, req).await;
-
-    assert_eq!(status, StatusCode::OK);
-    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, 42_000);
-    assert_eq!(
-        resp.num_sends, 3,
-        "balance handler must emit the per-account num_sends counter"
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    assert!(
+        !body.contains("42000") && !body.contains("\"num_sends\""),
+        "must not leak num_sends/balance; body={body}"
     );
 }
 
-// --- Concurrent balance reads ---
+// --- Concurrent balance reads (all Gone, no ledger leak) ---
 
 #[tokio::test]
 async fn concurrent_balance_reads_are_consistent() {
@@ -741,11 +658,10 @@ async fn concurrent_balance_reads_are_consistent() {
 
     for handle in handles {
         let (status, body) = handle.await.expect("task should not panic");
-        assert_eq!(status, StatusCode::OK);
-        let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-        assert_eq!(
-            resp.balance, 1_000_000u64,
-            "every concurrent read must see the same minting balance"
+        assert_eq!(status, StatusCode::GONE, "body={body}");
+        assert!(
+            !body.contains("1000000"),
+            "every concurrent read must refuse without leaking balance; body={body}"
         );
     }
 }
@@ -773,15 +689,16 @@ async fn concurrent_reads_with_username_claim() {
         let hex = address_hex.clone();
         handles.push(tokio::spawn(async move {
             if i % 2 == 0 {
-                // Balance request
+                // Legacy balance request — must be Gone, no ledger leak.
                 let req = Request::get(format!("/api/balance?address={}{}", hex, asset_q()))
                     .body(Body::empty())
                     .unwrap();
                 let (status, body) = send_request_with_state(s, req).await;
-                assert_eq!(status, StatusCode::OK);
-                let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-                assert_eq!(resp.balance, 1_000_000u64);
-                assert_eq!(resp.username, Some("testuser".to_string()));
+                assert_eq!(status, StatusCode::GONE, "body={body}");
+                assert!(
+                    !body.contains("1000000") && !body.contains("testuser"),
+                    "must not leak ledger/username; body={body}"
+                );
             } else {
                 // Resolve request
                 let req = Request::get("/api/username/resolve/testuser")
@@ -1711,15 +1628,48 @@ fn send_signature_accepts_valid_signature() {
 /// happy-path upsert.
 
 #[tokio::test]
-async fn receive_coin_with_invalid_bincode_returns_default_response() {
+async fn receive_coin_is_gone_and_does_not_mutate_accounts() {
+    // B6: POST /api/receive must not mutate durable (or in-memory) account
+    // state. Stage 3 Runde 4 removes the legacy CoinProof receive path.
+    let state = test_state();
+    let owner = zkcoins_program::hash::digest_from_bytes(&[0x42u8; 32]);
+    let asset = zkcoins_program::hash::digest_from_bytes(&[0x43u8; 32]);
+    {
+        let mut node = state.account_node.lock().unwrap();
+        let mut acct = crate::account_node::Account::new_for_asset(asset);
+        acct.balance = 7;
+        node.import_account(owner, acct);
+    }
+    let before = {
+        let node = state.account_node.lock().unwrap();
+        let a = node.get_account(&owner, &asset).expect("fixture account");
+        (a.balance, a.coin_queue.len(), a.num_sends)
+    };
+
     let req = Request::post("/api/receive")
         .header("content-type", "application/octet-stream")
         .body(Body::from(vec![0xff, 0xfe, 0xfd, 0xfc]))
         .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send_request_with_state(state.clone(), req).await;
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "legacy receive must refuse loud (HTTP 410), not 200+success:false; body={body}"
+    );
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["success"], false);
+    let err = resp["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/receive") || err.contains("removed") || err.contains("Stage 3"),
+        "error must name the removed endpoint; got {err:?}"
+    );
+
+    let after = {
+        let node = state.account_node.lock().unwrap();
+        let a = node.get_account(&owner, &asset).expect("account still present");
+        (a.balance, a.coin_queue.len(), a.num_sends)
+    };
+    assert_eq!(before, after, "POST /api/receive must not mutate the account");
 }
 
 // -----------------------------------------------------------------
@@ -2445,30 +2395,59 @@ fn mint_test_state() -> AppState {
 
 /// `MintStore::add` / `MintStore::take` are exercised in production only
 /// from `flow::{mint_flow, mint_commit_flow}` (coverage-excluded), so
-/// drive the store directly with a REAL staged issuer-mint. `add`
+/// drive the store directly with a host-shaped staged mint. Stage 3
+/// deleted legacy `prepare_mint` (no Prover) — the store test only needs
+/// a well-formed `StagedMint` value, not a real circuit proof. `add`
 /// returns a 1-based id; `take` consumes — a second `take` of the same
 /// id returns `None`.
 #[test]
 fn mint_store_add_take_roundtrips_and_consumes() {
-    let node = AccountNode::new(Arc::new(Mutex::new(State::new())));
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::polynomial::PolynomialCoeffs;
+    use plonky2::field::types::Field;
+    use plonky2::fri::proof::FriProof;
+    use plonky2::hash::merkle_tree::MerkleCap;
+    use plonky2::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
+
     let secp = secp::Secp256k1::new();
     let creator_obj = bitcoin::secp256k1::SecretKey::from_slice(&[3u8; 32])
         .expect("valid sk")
         .public_key(&secp);
-    let creator = creator_obj.serialize();
-    // Distinct fresh key the mint rotates `next_public_key` to.
-    let next = bitcoin::secp256k1::SecretKey::from_slice(&[4u8; 32])
-        .expect("valid sk")
-        .public_key(&secp)
-        .serialize();
-    let prepared = node
-        .prepare_mint(&creator, "StoreCoin", 8, 1234, &next)
-        .expect("prepare_mint");
+    let asset_id = zkcoins_program::hash::hash_bytes(b"StoreCoin-asset");
+    let owner = zkcoins_program::hash::hash_bytes(&creator_obj.serialize());
+    let mut mutated = crate::account_node::Account::new_for_asset(asset_id);
+    mutated.balance = 1234;
+    // Hollow residual proof shell — MintStore only holds/returns the blob.
+    let hollow_proof = ProofWithPublicInputs {
+        proof: Proof {
+            wires_cap: MerkleCap(vec![]),
+            plonk_zs_partial_products_cap: MerkleCap(vec![]),
+            quotient_polys_cap: MerkleCap(vec![]),
+            openings: OpeningSet {
+                constants: vec![],
+                plonk_sigmas: vec![],
+                wires: vec![],
+                plonk_zs: vec![],
+                plonk_zs_next: vec![],
+                partial_products: vec![],
+                quotient_polys: vec![],
+                lookup_zs: vec![],
+                lookup_zs_next: vec![],
+            },
+            opening_proof: FriProof {
+                commit_phase_merkle_caps: vec![],
+                query_round_proofs: vec![],
+                final_poly: PolynomialCoeffs::new(vec![]),
+                pow_witness: GoldilocksField::ZERO,
+            },
+        },
+        public_inputs: vec![GoldilocksField::ZERO; 4],
+    };
     let staged = crate::router::StagedMint {
-        proof: prepared.proof,
-        owner: prepared.owner,
-        asset_id: prepared.asset_id,
-        mutated_account: prepared.mutated_account,
+        proof: hollow_proof,
+        owner,
+        asset_id,
+        mutated_account: mutated,
         creator_pubkey: creator_obj,
     };
 
@@ -6798,44 +6777,50 @@ mod inscriptions_endpoint_tests {
     }
 
     #[tokio::test]
-    async fn get_inscription_bad_hex_returns_422() {
+    async fn get_inscription_bad_hex_is_gone_not_422() {
         let (app, _pool, _c) = live_pool_router().await;
         let req = Request::get("/api/inscriptions/zzzz")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::GONE);
     }
 
     #[tokio::test]
-    async fn get_inscription_wrong_length_returns_422() {
+    async fn get_inscription_malformed_txid_is_gone_not_422() {
+        // Closed surface: no validation path that could distinguish
+        // malformed vs known — always 410.
         let (app, _pool, _c) = live_pool_router().await;
         let req = Request::get("/api/inscriptions/abcd")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::GONE);
     }
 
     #[tokio::test]
-    async fn get_inscription_unknown_txid_returns_404() {
+    async fn get_inscription_unknown_txid_is_gone_not_404() {
         let (app, _pool, _c) = live_pool_router().await;
         let unknown = "f".repeat(64);
         let req = Request::get(format!("/api/inscriptions/{}", unknown))
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::GONE);
     }
 
     #[tokio::test]
-    async fn get_inscription_known_txid_returns_200_with_summary() {
+    async fn get_inscription_known_txid_is_gone_and_does_not_reveal_pending() {
+        // Stage 3 Runde 6: even with a row planted, the route must not
+        // hand out kind/status/amount/failure from legacy pending_inscriptions.
         let (app, pool, _c) = live_pool_router().await;
-        // Plant a row directly via the DB helper. The endpoint accepts
-        // the display-order (big-endian) hex; we reverse the stored
-        // little-endian bytes to construct the URL.
         let stored_commit: [u8; 32] = [0x42; 32];
         let stored_reveal: [u8; 32] = [0x43; 32];
+        // Claim legacy so the SQL sink gate allows the plant (handler itself
+        // must never return the row).
+        crate::v1::claim_stack_scan_mode(&pool, crate::v1::ScanStackMode::Legacy)
+            .await
+            .expect("claim legacy for plant");
         insert_pending_inscription(
             &pool,
             &stored_commit,
@@ -6856,22 +6841,28 @@ mod inscriptions_endpoint_tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::GONE);
         let body = http_body_util::BodyExt::collect(resp.into_body())
             .await
             .unwrap()
             .to_bytes();
+        let body_str = String::from_utf8_lossy(&body);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["kind"], "mint");
-        assert_eq!(v["status"], "constructed");
-        assert_eq!(v["commit_output_value"], 777);
+        assert!(
+            v.get("kind").is_none() && v.get("status").is_none() && v.get("commit_output_value").is_none(),
+            "must not emit pending_inscriptions summary; got {body_str}"
+        );
+        let err = v["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("/api/inscriptions") || err.contains("Stage 3"),
+            "error must name the removed surface; got {err:?}"
+        );
     }
 
     #[tokio::test]
-    async fn get_inscription_db_error_returns_500() {
+    async fn get_inscription_db_unavailable_is_gone_not_500() {
+        // Closed handler never hits the DB — even after DROP, status is 410.
         let (app, pool, _c) = live_pool_router().await;
-        // DROP the table out from under the handler so the SELECT fails.
-        // CASCADE because tx_mining_log / coin_proof_store have FKs to it.
         sqlx::query("DROP TABLE pending_inscriptions CASCADE")
             .execute(pool.as_ref())
             .await
@@ -6881,7 +6872,7 @@ mod inscriptions_endpoint_tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::GONE);
     }
 }
 
@@ -7226,684 +7217,119 @@ async fn r2_probe_history_limit_clamped_to_max() {
 // ---------------------------------------------------------------------------
 
 // =======================================================================
-// GET /api/history — paginated per-address history (issue #153)
+// GET /api/history + /api/history/:id — Stage 3 Runde 6 closed (410)
 //
-// The handler is read-only against `account_history`; tests below cover
-// both the validation branches (dead pool — handler never reaches the
-// query) and the live-DB branches (live Postgres 17 container, accounts
-// upserted via `upsert_account_with_source` so the migration-0008
-// trigger fills the history rows).
+// Address knowledge is not `read.account`. These tests pin the ban:
+// no decoded legacy snapshots leave the node. Residual helpers
+// (`decode_history_address`, `history_row_to_item`, …) stay unit-tested
+// below for internal residual code; the HTTP surface is gone.
 // =======================================================================
 
-/// Hand back a migrated pool scoped to a fresh per-test schema in
-/// the shared `postgres:17` container (issue #181 Opt B; see
-/// `crate::test_db`) — shared shape with the readiness / r2-probe
-/// live tests above. The `SchemaScope` is returned alongside so the
-/// caller keeps it alive for the duration of the test.
-async fn history_live_pool() -> (Arc<sqlx::PgPool>, crate::test_db::SchemaScope) {
+#[tokio::test]
+async fn history_list_is_gone_and_does_not_reveal_legacy_snapshots() {
+    let (pool, _pg) = {
+        let scope = crate::test_db::setup_pool().await;
+        (Arc::new(scope.pool.clone()), scope)
+    };
+    // Plant history via direct SQL (bypasses gated upsert) so a regression
+    // that re-opens the handler would have rows to leak.
+    let address: [u8; 32] = [7u8; 32];
+    let mut acct = Account::new();
+    acct.balance = 100;
+    let blob = bincode::serialize(&acct).expect("Account serializable");
+    sqlx::query(
+        "INSERT INTO account_history (address, prev_data, new_data, source)          VALUES ($1, NULL, $2, 'mint')",
+    )
+    .bind(&address[..])
+    .bind(&blob)
+    .execute(&*pool)
+    .await
+    .expect("plant history row");
+
+    let state = live_test_state(pool);
+    let req = Request::get(format!("/api/history?address=0x{}", hex::encode(address)))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert!(
+        v.get("items").is_none() && v.get("total").is_none(),
+        "must not emit history items/total; got {body}"
+    );
+    let err = v["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/history") || err.contains("Stage 3") || err.contains("read.account"),
+        "error must name the removed surface; got {err:?}"
+    );
+    // Amount / balance fields must never appear.
+    assert!(
+        !body.contains("\"amount\"") && !body.contains("\"balance_after\""),
+        "body must not carry decoded snapshot fields; got {body}"
+    );
+}
+
+#[tokio::test]
+async fn history_item_is_gone_and_does_not_reveal_decoded_snapshot() {
     let scope = crate::test_db::setup_pool().await;
     let pool = Arc::new(scope.pool.clone());
-    (pool, scope)
-}
-
-/// Seed an `Account { balance, .. }` row for `address` via the
-/// `upsert_account_with_source` path so the migration-0008 trigger
-/// writes the matching `account_history` row with the requested
-/// `source`. Returns the bincode bytes for the caller to chain a
-/// second upsert that mutates the same account (the trigger captures
-/// `prev_data` from the previous row).
-async fn seed_account_history(
-    pool: &sqlx::PgPool,
-    address: &[u8; 32],
-    balance: u64,
-    source: &str,
-) -> Vec<u8> {
-    let mut acct = Account::new();
-    acct.balance = balance;
-    let bytes = bincode::serialize(&acct).expect("Account serializable");
-    // Since migration 0017 `accounts.address` is the 64-byte
-    // `owner ‖ asset_id` composite key (`accounts_address_length` CHECK
-    // = 64). History stays OWNER-keyed: the `accounts_history_capture`
-    // trigger writes only the 32-byte owner prefix into
-    // `account_history`, so `GET /api/history?address=<owner>` still
-    // resolves. Seed under a deterministic composite so repeated calls
-    // for the same `address` hit the same row (UPDATE → history chain).
-    let owner = zkcoins_program::hash::digest_from_bytes(address);
-    let asset_id = zkcoins_program::hash::ZERO_HASH;
-    let key = crate::account_node::account_key_bytes(&owner, &asset_id);
-    crate::db::upsert_account_with_source(pool, key.as_slice(), &bytes, source)
-        .await
-        .expect("upsert seeded account");
-    bytes
-}
-
-#[tokio::test]
-async fn history_missing_address_returns_422() {
-    let req = Request::get("/api/history").body(Body::empty()).unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(
-        v["error"].as_str().unwrap_or("").contains("address"),
-        "expected address-related error, got {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn history_empty_address_returns_422() {
-    // `?address=` (empty string) is treated as missing — same 422 path
-    // as the missing-param case, mirroring `/api/balance`.
-    let req = Request::get("/api/history?address=")
-        .body(Body::empty())
-        .unwrap();
-    let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn history_invalid_hex_returns_422() {
-    let req = Request::get("/api/history?address=not_hex")
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"]
-        .as_str()
-        .unwrap_or("")
-        .to_lowercase()
-        .contains("hex"));
-}
-
-#[tokio::test]
-async fn history_wrong_length_returns_422() {
-    // 16 bytes worth of hex — decoded successfully but not 32 bytes.
-    let address = format!("0x{}", "ab".repeat(16));
-    let req = Request::get(format!("/api/history?address={}", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"].as_str().unwrap_or("").contains("32 bytes"));
-}
-
-#[tokio::test]
-async fn history_limit_zero_returns_422() {
-    let address = "00".repeat(32);
-    let req = Request::get(format!("/api/history?address={}&limit=0", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"].as_str().unwrap_or("").contains("limit"));
-}
-
-#[tokio::test]
-async fn history_limit_above_max_returns_422() {
-    let address = "00".repeat(32);
-    let req = Request::get(format!(
-        "/api/history?address={}&limit={}",
-        address,
-        HISTORY_MAX_LIMIT + 1
-    ))
-    .body(Body::empty())
-    .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"].as_str().unwrap_or("").contains("limit"));
-}
-
-#[tokio::test]
-async fn history_negative_offset_returns_422() {
-    let address = "00".repeat(32);
-    let req = Request::get(format!("/api/history?address={}&offset=-1", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"].as_str().unwrap_or("").contains("offset"));
-}
-
-#[tokio::test]
-async fn history_non_integer_limit_returns_400() {
-    // axum's typed `Query` extractor rejects a non-integer value with
-    // 400 (framework-level) before the handler runs — distinct from the
-    // 422s the handler emits for its own validation branches.
-    let address = "00".repeat(32);
-    let req = Request::get(format!("/api/history?address={}&limit=abc", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn history_db_error_returns_500() {
-    // `test_state()` uses `dead_pool()` — the single
-    // `list_account_history` query fails fast and the handler surfaces
-    // 500 + the documented error string. Collapsing count + list into
-    // one query (round-2 fix) removes the previous dead-arm gap.
-    let address = "00".repeat(32);
-    let req = Request::get(format!("/api/history?address={}", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(
-        v["error"]
-            .as_str()
-            .unwrap_or("")
-            .to_lowercase()
-            .contains("database"),
-        "expected database error, got {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn history_empty_result_returns_ok_with_zero_total() {
-    let (pool, _pg) = history_live_pool().await;
-    let state = live_test_state(pool);
-    let address = "ab".repeat(32);
-    let req = Request::get(format!("/api/history?address=0x{}", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(v["total"], 0);
-    assert_eq!(v["limit"], HISTORY_DEFAULT_LIMIT);
-    assert_eq!(v["offset"], 0);
-    assert_eq!(v["items"].as_array().unwrap().len(), 0);
-}
-
-#[tokio::test]
-async fn history_happy_path_returns_items_newest_first() {
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [7u8; 32];
-
-    // Three mutations on the same address: 0 -> 100 (mint),
-    // 100 -> 250 (receive), 250 -> 150 (send).
-    seed_account_history(&pool, &address, 100, "mint").await;
-    seed_account_history(&pool, &address, 250, "receive").await;
-    seed_account_history(&pool, &address, 150, "send").await;
-
-    let state = live_test_state(pool);
-    let req = Request::get(format!("/api/history?address=0x{}", hex::encode(address)))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(
-        v["total"], 3,
-        "total must reflect every account_history row"
-    );
-    let items = v["items"].as_array().expect("items array");
-    assert_eq!(items.len(), 3, "all three rows returned with default limit");
-
-    // Newest first: send (150), receive (250), mint (100).
-    assert_eq!(items[0]["direction"], "send");
-    assert_eq!(items[0]["amount"], 100, "250 -> 150 is a 100 delta");
-    // No pending_inscriptions row and no observed_inscriptions row for
-    // this address (the seed path doesn't thread the commit_txid GUC),
-    // so the wire status is `pending` — the DB write alone is not an
-    // on-chain confirmation.
-    assert_eq!(items[0]["status"], "pending");
-    assert!(
-        items[0]["txid"].is_null(),
-        "txid is null pre-broadcast link"
-    );
-    assert!(items[0]["counterparty"].is_null());
-    assert!(items[0]["block_height"].is_null());
-    assert!(items[0]["memo"].is_null());
-
-    assert_eq!(items[1]["direction"], "receive");
-    assert_eq!(items[1]["amount"], 150, "100 -> 250 is a 150 delta");
-
-    assert_eq!(items[2]["direction"], "mint");
-    assert_eq!(items[2]["amount"], 100, "0 -> 100 is a 100 delta");
-
-    // id field always present, monotonic descending (newest = highest id)
-    let id0 = items[0]["id"].as_i64().expect("id is i64");
-    let id1 = items[1]["id"].as_i64().expect("id is i64");
-    let id2 = items[2]["id"].as_i64().expect("id is i64");
-    assert!(id0 > id1 && id1 > id2, "ids are monotonic descending");
-}
-
-#[tokio::test]
-async fn history_pagination_offset_beyond_total_returns_empty_items_with_total() {
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [9u8; 32];
-    seed_account_history(&pool, &address, 100, "mint").await;
-    seed_account_history(&pool, &address, 200, "receive").await;
-
-    let state = live_test_state(pool);
-    let req = Request::get(format!(
-        "/api/history?address=0x{}&limit=10&offset=99",
-        hex::encode(address)
-    ))
-    .body(Body::empty())
-    .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(v["total"], 2, "total still reflects the seeded rows");
-    assert_eq!(v["limit"], 10);
-    assert_eq!(v["offset"], 99);
-    assert_eq!(
-        v["items"].as_array().unwrap().len(),
-        0,
-        "offset past total -> empty page"
-    );
-}
-
-#[tokio::test]
-async fn history_limit_clamps_page_size() {
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [11u8; 32];
-    // Five rows.
-    for (i, src) in ["mint", "receive", "send", "receive", "send"]
-        .iter()
-        .enumerate()
-    {
-        seed_account_history(&pool, &address, 100 + 50 * i as u64, src).await;
-    }
-    let state = live_test_state(pool);
-    let req = Request::get(format!(
-        "/api/history?address=0x{}&limit=2",
-        hex::encode(address)
-    ))
-    .body(Body::empty())
-    .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(v["total"], 5);
-    assert_eq!(v["limit"], 2);
-    assert_eq!(v["items"].as_array().unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn history_scanner_source_is_filtered_out() {
-    // `scanner` and `recovery` are internal mutations the user did not
-    // initiate; the SQL pushes the filter so they neither count toward
-    // `total` nor appear in `items`. A post-fetch filter (the previous
-    // behaviour) broke pagination — `total` over-counted and page sizes
-    // would have come back short of the requested `limit`.
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [13u8; 32];
-    seed_account_history(&pool, &address, 100, "scanner").await;
-    seed_account_history(&pool, &address, 200, "mint").await;
-
-    let state = live_test_state(pool);
-    let req = Request::get(format!("/api/history?address=0x{}", hex::encode(address)))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(
-        v["total"], 1,
-        "total reflects the filtered count (scanner row excluded)"
-    );
-    let items = v["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["direction"], "mint");
-}
-
-#[tokio::test]
-async fn history_pagination_walks_mixed_source_dataset_consistently() {
-    // Plant a mixed-source dataset and walk pagination across multiple
-    // pages. The client must see every user-facing row exactly once
-    // across consecutive pages, with `total` matching the cumulative
-    // page sizes — the SQL filter is what makes this true (a post-fetch
-    // filter would have left holes in pages and a `total` that no
-    // page-walk can hit).
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [17u8; 32];
-    // Plant in chronological order; the handler returns newest-first.
-    // 4 user-facing rows (mint, receive, send, receive) interleaved with
-    // 3 internal rows (scanner, scanner, recovery) — the internal rows
-    // must never appear and must never count toward `total`.
-    seed_account_history(&pool, &address, 100, "mint").await;
-    seed_account_history(&pool, &address, 110, "scanner").await;
-    seed_account_history(&pool, &address, 250, "receive").await;
-    seed_account_history(&pool, &address, 260, "scanner").await;
-    seed_account_history(&pool, &address, 150, "send").await;
-    seed_account_history(&pool, &address, 160, "recovery").await;
-    seed_account_history(&pool, &address, 300, "receive").await;
-
-    let state = live_test_state(pool);
-    let mut seen_directions: Vec<String> = Vec::new();
-    let mut total_seen_on_first_page: Option<i64> = None;
-    let mut offset: i64 = 0;
-    let limit: i64 = 2;
-    loop {
-        let req = Request::get(format!(
-            "/api/history?address=0x{}&limit={}&offset={}",
-            hex::encode(address),
-            limit,
-            offset
-        ))
-        .body(Body::empty())
-        .unwrap();
-        let (status, body) = send_request_with_state(state.clone(), req).await;
-        assert_eq!(status, StatusCode::OK, "body={}", body);
-        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-        let total = v["total"].as_i64().expect("total i64");
-        if total_seen_on_first_page.is_none() {
-            total_seen_on_first_page = Some(total);
-        } else {
-            assert_eq!(
-                total_seen_on_first_page,
-                Some(total),
-                "total must stay constant across pages"
-            );
-        }
-        let items = v["items"].as_array().expect("items array");
-        if items.is_empty() {
-            break;
-        }
-        // The page must never come back short of the requested `limit`
-        // unless we've hit the end — that's the property the post-fetch
-        // filter violated.
-        if (offset + items.len() as i64) < total {
-            assert_eq!(
-                items.len() as i64,
-                limit,
-                "page must be full while more rows remain (post-fetch filter would shrink this)"
-            );
-        }
-        for it in items {
-            let d = it["direction"].as_str().expect("direction str").to_string();
-            assert!(
-                matches!(d.as_str(), "mint" | "send" | "receive"),
-                "internal sources must never reach the wire, got {}",
-                d
-            );
-            seen_directions.push(d);
-        }
-        offset += items.len() as i64;
-        if offset >= total {
-            break;
-        }
-    }
-    let total = total_seen_on_first_page.expect("at least one page seen");
-    assert_eq!(total, 4, "filtered total = 4 user-facing rows");
-    assert_eq!(
-        seen_directions.len() as i64,
-        total,
-        "pagination walk yields exactly `total` rows"
-    );
-    // Newest-first: last receive (300), send (150), receive (250), mint (100).
-    assert_eq!(seen_directions, vec!["receive", "send", "receive", "mint"]);
-}
-
-// =======================================================================
-// GET /api/history/{id} — per-transaction detail (TxDetail)
-//
-// Validation branches run against the dead pool (`send_request`); the
-// found / not-found / decoded-snapshot branches run against the live
-// Postgres container, mirroring the list-endpoint tests above.
-// =======================================================================
-
-#[tokio::test]
-async fn history_item_missing_address_returns_422() {
-    let req = Request::get("/api/history/1").body(Body::empty()).unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(
-        v["error"].as_str().unwrap_or("").contains("address"),
-        "expected address-related error, got {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn history_item_empty_address_returns_422() {
-    let req = Request::get("/api/history/1?address=")
-        .body(Body::empty())
-        .unwrap();
-    let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn history_item_invalid_hex_returns_422() {
-    let req = Request::get("/api/history/1?address=not_hex")
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"]
-        .as_str()
-        .unwrap_or("")
-        .to_lowercase()
-        .contains("hex"));
-}
-
-#[tokio::test]
-async fn history_item_non_integer_id_returns_422() {
-    // The id is parsed from the path as a string so a malformed id is a
-    // 422 like every other bad input on the read surface — not axum's
-    // default 400 for a failed typed-Path extraction.
-    let address = "00".repeat(32);
-    let req = Request::get(format!("/api/history/not_a_number?address={}", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"]
-        .as_str()
-        .unwrap_or("")
-        .contains("positive integer"));
-}
-
-#[tokio::test]
-async fn history_item_zero_or_negative_id_returns_422() {
-    let address = "00".repeat(32);
-    for bad in ["0", "-3"] {
-        let req = Request::get(format!("/api/history/{}?address={}", bad, address))
-            .body(Body::empty())
-            .unwrap();
-        let (status, _body) = send_request(req).await;
-        assert_eq!(
-            status,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "id={bad} must 422"
-        );
-    }
-}
-
-#[tokio::test]
-async fn history_item_db_error_returns_500() {
-    // Dead pool: validation passes, the row query fails -> 500 with the
-    // documented error envelope.
-    let address = "00".repeat(32);
-    let req = Request::get(format!("/api/history/1?address={}", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"]
-        .as_str()
-        .unwrap_or("")
-        .to_lowercase()
-        .contains("database"));
-}
-
-#[tokio::test]
-async fn history_item_unknown_id_returns_404() {
-    let (pool, _pg) = history_live_pool().await;
-    let state = live_test_state(pool);
-    let address = "ab".repeat(32);
-    let req = Request::get(format!("/api/history/424242?address={}", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "body={}", body);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(v["error"], "Transaction not found");
-}
-
-#[tokio::test]
-async fn history_item_wrong_address_returns_404() {
-    // Scoping / IDOR guard: a real row id fetched with a different
-    // address must look identical to a missing row.
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [21u8; 32];
-    seed_account_history(&pool, &address, 100, "mint").await;
-    let (rows, _) = crate::db::list_account_history(&pool, &address[..], 10, 0)
-        .await
-        .unwrap();
-    let id = rows[0].id;
-
-    let state = live_test_state(pool);
-    let other = "cd".repeat(32);
-    let req = Request::get(format!("/api/history/{}?address={}", id, other))
-        .body(Body::empty())
-        .unwrap();
-    let (status, _body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn history_item_happy_path_returns_decoded_snapshot() {
-    let (pool, _pg) = history_live_pool().await;
     let address: [u8; 32] = [23u8; 32];
-
-    // Two mutations: 0 -> 100 (mint), then 100 -> 40 (send) so the
-    // detail of the send row carries both balance_before and
-    // balance_after plus the post-mutation num_sends.
-    seed_account_history(&pool, &address, 100, "mint").await;
-    let mut sent = Account::new();
-    sent.balance = 40;
-    sent.num_sends = 1;
-    let bytes = bincode::serialize(&sent).expect("Account serializable");
-    // Mutate the SAME `(owner, asset_id)` account `seed_account_history`
-    // created: since migration 0017 `accounts.address` is the 64-byte
-    // `owner ‖ asset_id` composite, so upsert under the composite (not the
-    // raw 32-byte owner) or the `accounts_address_length` = 64 CHECK trips.
-    // The capture trigger writes the 32-byte owner prefix into
-    // `account_history`, so the send row chains onto the mint row and
-    // `list_account_history(&address)` still resolves it.
-    let owner = zkcoins_program::hash::digest_from_bytes(&address);
-    let asset_id = zkcoins_program::hash::ZERO_HASH;
-    let key = crate::account_node::account_key_bytes(&owner, &asset_id);
-    crate::db::upsert_account_with_source(&pool, key.as_slice(), &bytes, "send")
-        .await
-        .expect("upsert send mutation");
-
-    let (rows, _) = crate::db::list_account_history(&pool, &address[..], 10, 0)
-        .await
-        .unwrap();
-    let send_id = rows[0].id; // newest first
+    let mut acct = Account::new();
+    acct.balance = 40;
+    acct.num_sends = 1;
+    let blob = bincode::serialize(&acct).expect("Account serializable");
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO account_history (address, prev_data, new_data, source)          VALUES ($1, NULL, $2, 'send') RETURNING id",
+    )
+    .bind(&address[..])
+    .bind(&blob)
+    .fetch_one(&*pool)
+    .await
+    .expect("plant detail row");
 
     let state = live_test_state(pool);
     let req = Request::get(format!(
         "/api/history/{}?address=0x{}",
-        send_id,
-        hex::encode(address)
-    ))
-    .body(Body::empty())
-    .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(v["id"].as_i64(), Some(send_id));
-    assert_eq!(
-        v["address"],
-        hex::encode(address),
-        "address echoed normalised (0x stripped, lower-case)"
-    );
-    assert_eq!(v["direction"], "send");
-    assert_eq!(v["amount"], 60, "|40 - 100|");
-    assert_eq!(v["status"], "pending", "no inscription link yet");
-    assert_eq!(v["balance_after"], 40);
-    assert_eq!(v["balance_before"], 100);
-    assert_eq!(v["num_sends_after"], 1);
-    // The seed path sets no commitment pubkey and the fresh schema has
-    // no circuit digest row / inscription rows.
-    assert!(v["commitment_public_key"].is_null());
-    assert!(v["circuit_digest"].is_null());
-    assert!(v["commit_output_value"].is_null());
-    assert!(v["txid"].is_null());
-    assert!(v["block_height"].is_null());
-    assert!(v["counterparty"].is_null());
-    assert!(v["memo"].is_null());
-}
-
-#[tokio::test]
-async fn history_item_surfaces_circuit_digest_when_stored() {
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [27u8; 32];
-    seed_account_history(&pool, &address, 100, "mint").await;
-    crate::db::store_circuit_digest(&pool, &[0xCD; 32])
-        .await
-        .expect("store digest");
-    let (rows, _) = crate::db::list_account_history(&pool, &address[..], 10, 0)
-        .await
-        .unwrap();
-    let id = rows[0].id;
-
-    let state = live_test_state(pool);
-    let req = Request::get(format!(
-        "/api/history/{}?address={}",
         id,
         hex::encode(address)
     ))
     .body(Body::empty())
     .unwrap();
     let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(
-        v["circuit_digest"].as_str(),
-        Some(hex::encode([0xCD; 32]).as_str())
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    for key in [
+        "balance_before",
+        "balance_after",
+        "num_sends_after",
+        "commitment_public_key",
+        "amount",
+    ] {
+        assert!(
+            v.get(key).is_none(),
+            "must not emit {key} from closed detail; got {body}"
+        );
+    }
+    let err = v["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/history") || err.contains("Stage 3") || err.contains("read.account"),
+        "error must name the removed surface; got {err:?}"
     );
 }
 
 #[tokio::test]
-async fn history_item_corrupt_blob_returns_500() {
-    // A row whose new_data is not a valid bincode Account decodes to
-    // None in tx_detail_from_row — the handler maps that to a 500, never
-    // a fabricated detail.
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [29u8; 32];
-    let (id,): (i64,) = sqlx::query_as(
-        "INSERT INTO account_history (address, prev_data, new_data, source) \
-         VALUES ($1, NULL, $2, 'mint') RETURNING id",
-    )
-    .bind(&address[..])
-    .bind(vec![0xFFu8; 4])
-    .fetch_one(&*pool)
-    .await
-    .expect("insert corrupt row");
+async fn history_missing_params_still_gone_not_422() {
+    // Closed surface: no validation oracle — always 410.
+    let req = Request::get("/api/history").body(Body::empty()).unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+}
 
-    let state = live_test_state(pool);
-    let req = Request::get(format!(
-        "/api/history/{}?address={}",
-        id,
-        hex::encode(address)
-    ))
-    .body(Body::empty())
-    .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={}", body);
+#[tokio::test]
+async fn history_item_missing_params_still_gone_not_422() {
+    let req = Request::get("/api/history/1").body(Body::empty()).unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
 }
 
 // --- Pure-function coverage for the helpers --------------------------------
@@ -8378,30 +7804,28 @@ fn verify_mint_signature_rejects_malformed_signature_hex() {
 }
 
 #[tokio::test]
-async fn balance_missing_asset_id_returns_unprocessable() {
-    // Under the multi-asset model the single-balance endpoint requires
-    // an explicit asset_id.
+async fn balance_missing_asset_id_is_gone() {
+    // Route closed regardless of query shape (no 422 that could leak schema).
     let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let uri = format!("/api/balance?address={}", address_hex);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
 }
 
 #[tokio::test]
-async fn balance_invalid_asset_id_returns_unprocessable() {
+async fn balance_invalid_asset_id_is_gone() {
     let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let uri = format!("/api/balance?address={}&asset_id=ZZ", address_hex);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
 }
 
+/// R2: multi-asset owner list must not reveal seeded balances.
 #[tokio::test]
-async fn owner_balance_lists_assets_for_owner() {
+async fn owner_balance_is_gone_and_does_not_reveal_assets() {
     let state = test_state();
-    // Seed a second asset for the same owner so the aggregation has two
-    // entries.
     {
         let mut node = state.account_node.lock().unwrap();
         let other_asset = zkcoins_program::hash::hash_bytes(b"router-test-asset-2");
@@ -8415,39 +7839,44 @@ async fn owner_balance_lists_assets_for_owner() {
     let uri = format!("/api/balance/{}", address_hex);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK);
-    let resp: OwnerBalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.assets.len(), 2);
-    let total: u64 = resp.assets.iter().map(|a| a.balance).sum();
-    assert_eq!(total, 1_000_250);
-    let second = resp
-        .assets
-        .iter()
-        .find(|a| a.name.as_deref() == Some("SECOND"))
-        .expect("second asset present");
-    assert_eq!(second.balance, 250);
-    assert_eq!(second.decimals, Some(6));
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "legacy owner balance must refuse loud (HTTP 410); body={body}"
+    );
+    let resp: serde_json::Value = serde_json::from_str(&body).expect("JSON error body");
+    assert!(
+        resp.get("assets").is_none() && resp.get("balance").is_none(),
+        "must not carry OwnerBalanceResponse fields; got {resp}"
+    );
+    assert!(
+        !body.contains("SECOND") && !body.contains("1000000") && !body.contains("250"),
+        "must not leak asset names or balances; body={body}"
+    );
+    let err = resp["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/balance") || err.contains("Stage 3") || err.contains("read.account"),
+        "error must name the removed surface; got {err:?}"
+    );
 }
 
 #[tokio::test]
-async fn owner_balance_empty_for_unknown_owner() {
+async fn owner_balance_unknown_owner_is_gone() {
     let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
         &zkcoins_program::hash::digest_from_bytes(&[0x55u8; 32]),
     ));
     let uri = format!("/api/balance/{}", address_hex);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::OK);
-    let resp: OwnerBalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert!(resp.assets.is_empty());
+    assert_eq!(status, StatusCode::GONE, "body={body}");
 }
 
 #[tokio::test]
-async fn owner_balance_rejects_malformed_address() {
+async fn owner_balance_malformed_address_is_gone() {
     let uri = "/api/balance/not-hex".to_string();
     let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
 }
 
 #[tokio::test]

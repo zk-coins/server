@@ -11,7 +11,9 @@ use shared::spec_v1::{
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use zkcoins_program::circuit::compliance::Network;
-use zkcoins_prover::prover_bridge::{ComplianceProof, NavOpening, NullifierOpening};
+use zkcoins_prover::prover_bridge::{
+    ComplianceProof, NavOpening, NullifierOpening, ProverBridge,
+};
 use zkcoins_prover::state_engine::{AccountRecord, OpSecret, StateEngine, TrackedCoin};
 
 use super::mode::{network_label, parse_network_label};
@@ -467,9 +469,23 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
             spent_ids.push(fixed_32(&coin_id_b, "spent.coin_id")?);
         }
 
+        // Stage 3: last_proof must be bound to circuit C identity. Raw
+        // bincode of a well-formed *legacy* Proof (same type alias, wrong
+        // circuit) must not become prev_proof. Uses ProverBridge's
+        // construction-time pin / cyclic verifier-data check — not a
+        // parallel mechanism.
         let last_proof = match last_proof_b {
             None => None,
-            Some(b) => Some(bincode::deserialize(&b).context("deserialize last ComplianceProof")?),
+            Some(b) => Some(
+                ProverBridge::new(network)
+                    .bind_loaded_prev_proof(&b)
+                    .with_context(|| {
+                        format!(
+                            "v1_accounts.last_proof for owner {} failed circuit-C identity bind                              (refusing as prev_proof)",
+                            hex::encode(owner_bytes)
+                        )
+                    })?,
+            ),
         };
         let last_nav_opening = match last_nav_b {
             None => None,

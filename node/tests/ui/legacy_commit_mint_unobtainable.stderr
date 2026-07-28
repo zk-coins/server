@@ -1,0 +1,15 @@
+error[E0624]: method `commit_mint` is private
+ --> tests/ui/legacy_commit_mint_unobtainable.rs:5:46
+  |
+5 |       let _ = node::account_node::AccountNode::commit_mint;
+  |                                                ^^^^^^^^^^^ private method
+  |
+ ::: src/account_node.rs
+  |
+  | /     pub(crate) fn commit_mint(
+  | |         &mut self,
+  | |         owner: Address,
+  | |         mut mutated_account: Account,
+  | |         signer: PublicKey,
+  | |     ) {
+  | |_____- private method defined here

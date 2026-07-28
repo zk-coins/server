@@ -433,10 +433,14 @@ pub struct AccountHistoryEntry {
     pub triggering_request_log_id: Option<i64>,
 }
 
-pub async fn insert_account_history(
+/// **Visibility (Stage 3 Runde 6):** `pub(crate)`. Gated at the SQL sink
+/// with [`require_legacy_stack_mode_in_tx`] — not only at callers.
+pub(crate) async fn insert_account_history(
     pool: &PgPool,
     entry: &AccountHistoryEntry,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    require_legacy_stack_mode_in_tx(&mut tx).await?;
     sqlx::query(
         "INSERT INTO account_history \
          (address, prev_data, new_data, source, triggering_commit_txid, triggering_request_log_id) \
@@ -448,9 +452,9 @@ pub async fn insert_account_history(
     .bind(entry.source)
     .bind(entry.triggering_commit_txid.as_deref())
     .bind(entry.triggering_request_log_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(())
+    tx.commit().await
 }
 
 #[derive(Debug, Clone)]
@@ -550,11 +554,15 @@ pub async fn insert_boot_log(pool: &PgPool, entry: &BootLogEntry) -> Result<(), 
 /// `status = 'failed'` stays reserved for truly-terminal callers
 /// (retry exhaustion, operator-initiated abort) — none of which exist
 /// yet, but the CHECK enum keeps the spot ready.
-pub async fn update_pending_failure_reason(
+/// **Visibility (Stage 3 Runde 6):** `pub(crate)`. Gated at the SQL sink
+/// with [`require_legacy_stack_mode_in_tx`].
+pub(crate) async fn update_pending_failure_reason(
     pool: &PgPool,
     commit_txid: &[u8],
     failure_reason: &str,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    require_legacy_stack_mode_in_tx(&mut tx).await?;
     sqlx::query(
         "UPDATE pending_inscriptions \
          SET failure_reason = $1, updated_at = NOW() \
@@ -562,8 +570,9 @@ pub async fn update_pending_failure_reason(
     )
     .bind(failure_reason)
     .bind(commit_txid)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -883,13 +892,16 @@ pub async fn load_all_accounts(pool: &PgPool) -> Result<Vec<(Vec<u8>, Vec<u8>)>,
 /// setting only lives for the duration of this transaction. The
 /// surrounding `BEGIN/COMMIT` is required because `is_local := true`
 /// is a no-op outside a transaction.
-pub async fn upsert_account_with_source(
+/// **Visibility (Stage 3 Runde 6):** `pub(crate)`. Gated at the SQL sink
+/// with [`require_legacy_stack_mode_in_tx`] before any `accounts` write.
+pub(crate) async fn upsert_account_with_source(
     pool: &PgPool,
     address: &[u8],
     data: &[u8],
     source: &str,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    require_legacy_stack_mode_in_tx(&mut tx).await?;
     sqlx::query("SELECT set_config('zkcoins.account_source', $1, true)")
         .bind(source)
         .execute(&mut *tx)
@@ -911,7 +923,15 @@ pub async fn upsert_account_with_source(
 /// the default for callers without semantic context (state replay,
 /// recovery CLI, persist_account from the scanner callback).
 /// Semantically-aware callers should use `upsert_account_with_source`.
-pub async fn upsert_account(pool: &PgPool, address: &[u8], data: &[u8]) -> Result<(), sqlx::Error> {
+///
+/// **Visibility (Stage 3 Runde 6):** `pub(crate)`. Gated at the SQL sink.
+pub(crate) async fn upsert_account(
+    pool: &PgPool,
+    address: &[u8],
+    data: &[u8],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    require_legacy_stack_mode_in_tx(&mut tx).await?;
     sqlx::query(
         "INSERT INTO accounts (address, data, updated_at) \
          VALUES ($1, $2, NOW()) \
@@ -920,8 +940,9 @@ pub async fn upsert_account(pool: &PgPool, address: &[u8], data: &[u8]) -> Resul
     )
     .bind(address)
     .bind(data)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1345,11 +1366,14 @@ pub async fn asset_creator_conflict(
 /// (or a concurrent commit that lost the race) leaves the first-writer
 /// row untouched. The caller has already verified there is no
 /// conflicting creator via [`asset_creator_conflict`].
-pub async fn register_asset_creator(
+/// **Visibility (Stage 3 Runde 6):** `pub(crate)`. Gated at the SQL sink.
+pub(crate) async fn register_asset_creator(
     pool: &PgPool,
     asset_id: &[u8],
     creator_pubkey: &[u8],
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    require_legacy_stack_mode_in_tx(&mut tx).await?;
     sqlx::query(
         "INSERT INTO asset_creators (asset_id, creator_pubkey) \
          VALUES ($1, $2) \
@@ -1357,8 +1381,9 @@ pub async fn register_asset_creator(
     )
     .bind(asset_id)
     .bind(creator_pubkey)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1380,8 +1405,14 @@ pub async fn register_asset_creator(
 /// All UPSERTs share one transaction so the bundle is atomic even on
 /// a partial DB failure — either every recipient + the mutated minting
 /// account land, or none do.
-pub async fn commit_mint_tx(pool: &PgPool, accounts: &[(&[u8], &[u8])]) -> Result<(), sqlx::Error> {
+/// **Visibility (Stage 3 Runde 6):** `pub(crate)`. Gated at the SQL sink
+/// before any `accounts` UPSERT.
+pub(crate) async fn commit_mint_tx(
+    pool: &PgPool,
+    accounts: &[(&[u8], &[u8])],
+) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    require_legacy_stack_mode_in_tx(&mut tx).await?;
     // Tag every `account_history` row written by the trigger as
     // `source = 'mint'`. `set_config(..., is_local := true)` only
     // takes effect for the lifetime of THIS transaction, so the
@@ -1446,8 +1477,9 @@ pub struct PendingInscriptionRow {
 /// crashed before completing), the function returns `Ok(false)` so the
 /// caller can carry on with the existing row instead of double-
 /// inserting. Every other DB error propagates.
+/// **Visibility (Stage 3 Runde 6):** `pub(crate)`. Gated at the SQL sink.
 #[allow(clippy::too_many_arguments)]
-pub async fn insert_pending_inscription(
+pub(crate) async fn insert_pending_inscription(
     pool: &PgPool,
     commit_txid: &[u8],
     reveal_txid: &[u8],
@@ -1457,6 +1489,8 @@ pub async fn insert_pending_inscription(
     reveal_tx: &[u8],
     commit_output_value: i64,
 ) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    require_legacy_stack_mode_in_tx(&mut tx).await?;
     let result = sqlx::query(
         "INSERT INTO pending_inscriptions \
          (commit_txid, reveal_txid, status, kind, commitment, commit_tx, reveal_tx, commit_output_value) \
@@ -1471,19 +1505,24 @@ pub async fn insert_pending_inscription(
     .bind(commit_tx)
     .bind(reveal_tx)
     .bind(commit_output_value)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() == 1)
 }
 
 /// Advance a row to the supplied status. The caller is responsible for
 /// passing a status that the CHECK constraint accepts — using the
 /// `PENDING_STATUS_*` constants guarantees that.
-pub async fn update_pending_status(
+///
+/// **Visibility (Stage 3 Runde 6):** `pub(crate)`. Gated at the SQL sink.
+pub(crate) async fn update_pending_status(
     pool: &PgPool,
     commit_txid: &[u8],
     status: &str,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    require_legacy_stack_mode_in_tx(&mut tx).await?;
     sqlx::query(
         "UPDATE pending_inscriptions \
          SET status = $1, updated_at = NOW() \
@@ -1491,8 +1530,9 @@ pub async fn update_pending_status(
     )
     .bind(status)
     .bind(commit_txid)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
