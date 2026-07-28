@@ -50,21 +50,22 @@
 //! is driven into [`StateEngine::finalise`](zkcoins_prover::state_engine::StateEngine::finalise)
 //! rather than short-circuited to a status change.
 //!
-//! ## Gap G7 — re-mint into existing asset accounts
-//! [`mint`] exposes the process-claim-gated entry for token-standard-1
-//! re-issuance via
-//! [`StateEngine::begin_mint`](zkcoins_prover::state_engine::StateEngine::begin_mint)
-//! (AccountUpdateProof + `asset_issuance`). The gate is the boot-time
-//! [`ScanStackMode::V11`] process claim (from `ZKCOINS_V11_SHADOW=1`) —
-//! same registry as publisher / NfLog policy — not a caller-selected mode
-//! label. Token-standard-2 re-mint and over-cap mints are refused naming
-//! §6.5 clauses (f)/(e). Legacy `prepare_mint` remint refusal is
-//! unchanged with the flag off.
+//! ## Gap G9 — source provenance (CoinHist / creating proof)
+//! Under the v1.1 claim, spend provenance is
+//! [`InputAuthorization`](zkcoins_prover::prover_bridge::InputAuthorization)
+//! (CoinHist leaf `Admitted` + `creating_prev_ash` / `coin_index`); receive
+//! provenance is
+//! [`ReceivedAuthorization`](zkcoins_prover::prover_bridge::ReceivedAuthorization)
+//! (creating proof + clause-10 bindings). The legacy
+//! `InCoinSourceWitness` + source-aggregator path is refused on residual
+//! [`crate::account_node::AccountNode::send_coins`]
+//! ([`refuse_legacy_send_under_v11`]) and is unrepresentable on
+//! [`begin_v11_send`] (no parameter, no field). See [`provenance`].
 
 mod adapter;
 pub mod db_v11;
-pub mod mint;
 pub mod mode;
+pub mod provenance;
 pub mod publish;
 pub mod receive;
 pub mod scan;
@@ -72,10 +73,13 @@ pub mod separation;
 pub mod signature;
 
 pub use adapter::EngineAdapter;
-pub use mint::{begin_v11_mint, ensure_v11_mint_path, V11_MINT_SHADOW_OFF};
 pub use mode::{
     parse_network_label, resolve_v11_shadow_mode, v11_shadow_mode_from_env, validate_v11_boot_pins,
     V11BootPins, V11ShadowMode, V11_BOOT_CONFIG_ERROR,
+};
+pub use provenance::{
+    assert_receive_provenance_is_creating_proof, begin_v11_send, ensure_v11_provenance_path,
+    refuse_legacy_send_under_v11, LEGACY_SEND_REFUSED_UNDER_V11, V11_PROVENANCE_SHADOW_OFF,
 };
 pub use publish::{connect_v11_publisher, v11_publisher_env_from_env, V11Publisher, V11PublisherEnv};
 pub use receive::{

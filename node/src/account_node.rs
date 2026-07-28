@@ -550,6 +550,12 @@ impl AccountNode {
         next_public_key: PublicKey,
         prev_commitment_pubkey: Option<PublicKey>,
     ) -> Result<Vec<CoinProof>, &'static str> {
+        // Under the v1.1 process claim this legacy path builds
+        // `InCoinSourceWitness` + source-aggregator recursion — the wrong
+        // provenance mechanism. Refuse so a v1.1 boot cannot stage that
+        // construct; use `crate::v11::begin_v11_send` (CoinHist /
+        // InputAuthorization) instead. Flag-off / Legacy claim: open.
+        crate::v11::refuse_legacy_send_under_v11()?;
         // A send moves exactly one asset (the in-circuit gate binds
         // `account.asset_id == transition.asset_id`); the asset is the
         // invoices' common asset_id. An empty invoice list has no asset

@@ -1087,6 +1087,14 @@ pub(crate) fn map_send_coins_error(err: &str) -> (StatusCode, &'static str) {
             StatusCode::UNPROCESSABLE_ENTITY,
             "Too many out-coins for one transition",
         ),
+        // Gap G9: residual legacy send under a v1.1 process claim. The
+        // body is the full `LEGACY_SEND_REFUSED_UNDER_V11` string; match
+        // by prefix so a wording tweak of the tail does not silently
+        // become a 500.
+        s if s.starts_with("legacy send refused under ZKCOINS_V11_SHADOW=1") => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "legacy send refused under v1.1; use begin_v11_send (CoinHist provenance)",
+        ),
         s if s.ends_with("failed") => (StatusCode::INTERNAL_SERVER_ERROR, "prove failed"),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
     }

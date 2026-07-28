@@ -1986,6 +1986,22 @@ fn map_send_coins_error_too_many_in_coins_is_422() {
 }
 
 #[test]
+fn map_send_coins_error_legacy_send_refused_under_v11_is_422() {
+    // Gap G9: residual legacy send under a v1.1 claim maps to 422 so the
+    // client can switch to begin_v11_send (CoinHist provenance).
+    let (status, body) = crate::router::map_send_coins_error(
+        "legacy send refused under ZKCOINS_V11_SHADOW=1; use the v1.1 send transition \
+         (begin_v11_send → InputAuthorization / CoinHist + creating_prev_ash). Silent \
+         fall-back to InCoinSourceWitness / source-aggregator is forbidden",
+    );
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body.contains("legacy send refused") || body.contains("begin_v11_send"),
+        "body={body}"
+    );
+}
+
+#[test]
 fn map_send_coins_error_too_many_out_coins_is_422() {
     let (status, body) =
         crate::router::map_send_coins_error("Too many out-coins for one transition");
