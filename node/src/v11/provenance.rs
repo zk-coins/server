@@ -335,7 +335,7 @@ mod tests {
     use zkcoins_prover::prover_bridge::{
         ComplianceProof, NavOpening, NullifierOpening, OutputInclusionProof, TransitionMode,
     };
-    use zkcoins_prover::state_engine::{AccountRecord, ScannedNullifier, TrackedCoin};
+    use zkcoins_prover::state_engine::{AccountRecord, OpSecret, ScannedNullifier, TrackedCoin};
 
     fn host_dummy_last_proof() -> ComplianceProof {
         ProofWithPublicInputs {
@@ -372,10 +372,18 @@ mod tests {
         f()
     }
 
+    /// Deterministic operational secret for G9 provenance fixtures (A/4').
+    /// Stored on the account so `begin_send` derives `nav_rand` rather than
+    /// refusing a missing secret.
+    fn g9_op_secret() -> OpSecret {
+        OpSecret::new(Sha256::digest(b"zkCoins/v1/g9-provenance/op_secret").into())
+    }
+
     /// Seeded account with two Admitted coins and a folded predecessor nullifier.
     fn seeded_spendable_engine() -> (StateEngine, Address, Vec<Coin>, [u8; 32]) {
         let mut engine = StateEngine::new(Network::Testnet, 0);
         let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/g9-provenance/nk").into();
+        let op_secret = g9_op_secret();
         let (_, _, genesis_pubkey) =
             normalized_key(deterministic_secret(b"zkCoins/v1/g9-provenance/pk0"));
         let (_, _, current_pubkey) =
@@ -463,6 +471,7 @@ mod tests {
                     state,
                     coinhist,
                     nk,
+                    op_secret: Some(op_secret),
                     genesis_pubkey,
                     spendable,
                     spent_ids: BTreeSet::new(),
@@ -472,7 +481,9 @@ mod tests {
                             size: 0,
                             mth: host::nflog_empty(),
                         },
-                        nav_rand: [0; 32],
+                        // Prior opening: derived from the account secret at
+                        // the entry send_counter of the previous transition.
+                        nav_rand: op_secret.derive_nav_rand(0),
                     }),
                     last_nullifier: Some(NullifierOpening {
                         public_key: predecessor_entry.pk,
@@ -502,7 +513,6 @@ mod tests {
                 asset_id: coins[0].asset_id,
             }],
             next_pubkey,
-            nav_rand: [0x72; 32],
             npk_rand: [0x73; 32],
         };
 
@@ -547,7 +557,6 @@ mod tests {
                         asset_id: coins[0].asset_id,
                     }],
                     next_pubkey,
-                    nav_rand: [0x72; 32],
                     npk_rand: [0x73; 32],
                 },
             )

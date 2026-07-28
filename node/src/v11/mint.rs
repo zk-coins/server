@@ -112,8 +112,7 @@ mod tests {
     use super::*;
     use crate::v11::mode::V11ShadowMode;
     use crate::v11::separation::{
-        claim_process_stack_from_shadow_mode, clear_process_stack_mode_for_test,
-        set_process_stack_mode, ScanStackMode,
+        claim_process_stack_from_shadow_mode, set_process_stack_mode, ScanStackMode,
     };
     use plonky2::field::goldilocks_field::GoldilocksField;
     use plonky2::field::polynomial::PolynomialCoeffs;
@@ -132,7 +131,7 @@ mod tests {
         ComplianceProof, NavOpening, NullifierOpening, TransitionMode,
     };
     use zkcoins_prover::state_engine::{
-        AccountRecord, MintRequest, ScannedNullifier, StateEngine, TrackedCoin,
+        AccountRecord, MintRequest, OpSecret, ScannedNullifier, StateEngine, TrackedCoin,
     };
 
     /// Host-only dummy recursion proof for `AccountRecord::last_proof`.
@@ -168,6 +167,13 @@ mod tests {
         }
     }
 
+    /// Deterministic operational secret for G7 remint fixtures (A/4').
+    /// Same material is stored on the account and carried on MintRequest so
+    /// the engine's match check (no silent default) succeeds.
+    fn g7_op_secret() -> OpSecret {
+        OpSecret::new(Sha256::digest(b"zkCoins/v1/g7-remint/op_secret").into())
+    }
+
     fn std1_request() -> MintRequest {
         let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/g7-remint/nk").into();
         let (_, _, current_pubkey) =
@@ -177,6 +183,7 @@ mod tests {
         MintRequest {
             owner: Address(host::address(&current_pubkey, host::nk_commit(&nk))),
             nk,
+            op_secret: g7_op_secret(),
             current_pubkey,
             next_pubkey,
             name: b"G7 Remint Asset".to_vec(),
@@ -185,19 +192,17 @@ mod tests {
             issuance_version: 1,
             cap_total: 0,
             terms_salt: [0u8; 32],
-            nav_rand: [0x11; 32],
             npk_rand: [0x22; 32],
         }
     }
 
     /// Claim V11 the same way the binary does after reading
-    /// `ZKCOINS_V11_SHADOW=1`, run `f`, then withdraw the test claim.
+    /// `ZKCOINS_V11_SHADOW=1`. Process claim is monotonic and un-clearable
+    /// outside stack-policy's own `cfg(test)` — rely on process-per-test
+    /// isolation (nextest).
     fn with_v11_process_claim<R>(f: impl FnOnce() -> R) -> R {
-        clear_process_stack_mode_for_test();
         claim_process_stack_from_shadow_mode(V11ShadowMode::On);
-        let out = f();
-        clear_process_stack_mode_for_test();
-        out
+        f()
     }
 
     /// Flag genuinely unset / process not on V11: v1.1 mint path is
@@ -209,12 +214,14 @@ mod tests {
     /// process claim. The caller cannot hand in `V11ShadowMode::On` —
     /// [`begin_v11_mint`] takes no mode parameter; the claim is read from
     /// the process registry (stack-policy).
+    ///
+    /// Unclaimed then Legacy in one process is fine: claim is monotonic
+    /// (None → Legacy). Separate from V11-claim tests (nextest isolation).
     #[test]
     fn begin_v11_mint_refuses_when_shadow_flag_off() {
         let engine = StateEngine::new(Network::Testnet, 0);
 
         // Unclaimed process (flag never observed / boot not run).
-        clear_process_stack_mode_for_test();
         let err = begin_v11_mint(&engine, std1_request())
             .expect_err("unclaimed process must refuse v1.1 mint");
         let msg = format!("{err:#}");
@@ -224,7 +231,6 @@ mod tests {
         );
 
         // Flag-off boot claims Legacy — same refusal surface.
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::Legacy);
         let err = begin_v11_mint(&engine, std1_request())
             .expect_err("legacy claim must refuse v1.1 mint");
@@ -233,7 +239,6 @@ mod tests {
             msg.contains("ZKCOINS_V11_SHADOW is off"),
             "unexpected error: {msg}"
         );
-        clear_process_stack_mode_for_test();
     }
 
     /// Flag-on conformant token-standard-1 re-mint: AccountUpdateProof,
@@ -330,6 +335,8 @@ mod tests {
                         state,
                         coinhist,
                         nk: first.nk,
+                        // Same operational secret the remint request carries.
+                        op_secret: Some(first.op_secret),
                         genesis_pubkey: first.current_pubkey,
                         spendable,
                         spent_ids: BTreeSet::new(),
@@ -339,7 +346,7 @@ mod tests {
                                 size: 0,
                                 mth: host::nflog_empty(),
                             },
-                            nav_rand: [0; 32],
+                            nav_rand: first.op_secret.derive_nav_rand(0),
                         }),
                         last_nullifier: Some(NullifierOpening {
                             public_key: predecessor_pk,
@@ -356,6 +363,7 @@ mod tests {
             let remint = MintRequest {
                 owner: first.owner,
                 nk: first.nk,
+                op_secret: first.op_secret,
                 current_pubkey: first.next_pubkey,
                 next_pubkey: remint_next,
                 name: first.name.clone(),
@@ -364,7 +372,6 @@ mod tests {
                 issuance_version: 1,
                 cap_total: 0,
                 terms_salt: [0u8; 32],
-                nav_rand: [0x33; 32],
                 npk_rand: [0x44; 32],
             };
 
@@ -439,6 +446,9 @@ mod tests {
                         state,
                         coinhist: CoinHistTree::new(),
                         nk: base.nk,
+                        // Real account secret so refusal is clause (f), not
+                        // a missing-op_secret mask.
+                        op_secret: Some(base.op_secret),
                         genesis_pubkey: base.current_pubkey,
                         spendable: BTreeMap::new(),
                         spent_ids: BTreeSet::new(),
@@ -470,10 +480,10 @@ mod tests {
         });
     }
 
-    /// `ensure_v11_mint_path` is process-claim-only (no mode argument).
+    /// `ensure_v11_mint_path` refuses unclaimed and Legacy (process-claim-only).
+    /// Split from the V11-allow case: claim is monotonic, no mid-process reset.
     #[test]
-    fn ensure_v11_mint_path_follows_process_claim() {
-        clear_process_stack_mode_for_test();
+    fn ensure_v11_mint_path_refuses_unclaimed_and_legacy() {
         assert!(
             ensure_v11_mint_path().is_err(),
             "unclaimed must refuse"
@@ -484,10 +494,12 @@ mod tests {
             ensure_v11_mint_path().is_err(),
             "legacy claim must refuse"
         );
-        clear_process_stack_mode_for_test();
+    }
 
+    /// `ensure_v11_mint_path` allows a V11 process claim.
+    #[test]
+    fn ensure_v11_mint_path_allows_v11_claim() {
         set_process_stack_mode(ScanStackMode::V11);
         ensure_v11_mint_path().expect("v11 claim must allow");
-        clear_process_stack_mode_for_test();
     }
 }

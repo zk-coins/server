@@ -1745,17 +1745,17 @@ mod tests {
         [u8; 32],
     ) {
         use shared::spec_v1::{AccountState, ChainPosition, CoinHistTree, PublishedNullifier};
+        use sha2::{Digest, Sha256};
         use std::collections::{BTreeMap, BTreeSet};
         use zkcoins_prover::prover_bridge::{NavOpening, NullifierOpening};
-        use zkcoins_prover::state_engine::{AccountRecord, ScannedNullifier};
+        use zkcoins_prover::state_engine::{AccountRecord, OpSecret, ScannedNullifier};
 
         use super::super::separation::{
-            claim_stack_scan_mode, clear_process_stack_mode_for_test, set_process_stack_mode,
-            ScanStackMode,
+            claim_stack_scan_mode, set_process_stack_mode, ScanStackMode,
         };
         use crate::test_db::setup_pool;
 
-        clear_process_stack_mode_for_test();
+        // Process claim is monotonic; nextest isolates per test. No clear.
         set_process_stack_mode(ScanStackMode::V11);
 
         let scope = setup_pool().await;
@@ -1805,10 +1805,15 @@ mod tests {
                     coinhist.root(),
                 )
                 .expect("AccountState");
+                // Real fixture op_secret (A/4'); nav_rand of the stored opening
+                // is derived from it so the operational bundle is consistent.
+                let op_secret =
+                    OpSecret::new(Sha256::digest(b"zkCoins/v1/g6-attest/op_secret").into());
                 let record = AccountRecord {
                     state,
                     coinhist,
                     nk: [0xD1; 32],
+                    op_secret: Some(op_secret),
                     genesis_pubkey: [0xB0; 32],
                     spendable: BTreeMap::new(),
                     spent_ids: BTreeSet::new(),
@@ -1818,7 +1823,7 @@ mod tests {
                             size: 0,
                             mth: host::nflog_empty(),
                         },
-                        nav_rand: [0x55; 32],
+                        nav_rand: op_secret.derive_nav_rand(0),
                     }),
                     last_nullifier: Some(NullifierOpening {
                         public_key: pk,
@@ -1882,8 +1887,6 @@ mod tests {
     /// size_final already covers the fold).
     #[tokio::test]
     async fn final_anchor_below_tip_resolves_locator_and_collects() {
-        use super::super::separation::clear_process_stack_mode_for_test;
-
         let fold_height = 100u64;
         let tip_height = 105u64; // ≥ fold + 5 → size_final covers pos 0
         let (_scope, adapter, owner, asset_id, reveal_txid, inclusion_hash) =
@@ -1913,8 +1916,6 @@ mod tests {
             "confirmed-but-not-tip block_hash from block_log at fold height, not tip_hash"
         );
         require_resolved_anchor(txid, block_hash).expect("resolved locator");
-
-        clear_process_stack_mode_for_test();
     }
 
     /// Defect 3: completed-anchor gate is bound on the production path
@@ -1924,8 +1925,6 @@ mod tests {
     /// this red (collect succeeds without the gate).
     #[tokio::test]
     async fn collect_materials_requires_completed_anchor_via_production_path() {
-        use super::super::separation::clear_process_stack_mode_for_test;
-
         // fold at tip-1: with tip = fold+1, size_final excludes the fold
         // (needs tip ≥ fold+5). ValidFirstSpend but not final.
         let fold_height = 100u64;
@@ -1958,8 +1957,6 @@ mod tests {
             "production gate message: {}",
             err.message()
         );
-
-        clear_process_stack_mode_for_test();
     }
 
     #[test]

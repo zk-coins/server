@@ -748,12 +748,11 @@ async fn seed_v11_scan_state_without_marker(pool: &sqlx::PgPool) {
     .expect("seed v11_nflog_entries");
 }
 
-/// Hard separation: v1.1 path must fail against a DB with legacy scan state,
-/// and the reverse must fail too. Assert the failure (not merely observe it).
+/// Hard separation: data without a marker is refused on both sides — no
+/// auto-claim from contents. Failures never set the process claim, so both
+/// sides can be probed in one process.
 #[tokio::test]
-async fn hard_separation_refuses_cross_stack_boot() {
-
-    // --- data without marker: unconditional refusal (no auto-claim) ---
+async fn hard_separation_refuses_data_without_marker() {
     {
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
@@ -798,8 +797,14 @@ async fn hard_separation_refuses_cross_stack_boot() {
             "no claim-from-data; got: {err_v11:#}"
         );
     }
+}
 
-    // --- claimed + same-side data: accepted ---
+/// Hard separation under a Legacy process claim (monotonic; nextest isolates
+/// from V11-claim cases). Same-side data accepted; opposite path refused.
+#[tokio::test]
+async fn hard_separation_legacy_claim_accepts_own_refuses_v11() {
+    // Claimed + same-side data: accepted; opposite refuses at the DB gate
+    // (never reaches set_process_stack_mode for V11).
     {
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
@@ -820,6 +825,30 @@ async fn hard_separation_refuses_cross_stack_boot() {
         );
     }
 
+    // Marker alone blocks the opposite path (empty opposite data).
+    {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        // Re-affirm Legacy (already claimed above) on a fresh DB marker.
+        enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
+            .await
+            .expect("fresh DB claims legacy");
+
+        let err = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+            .await
+            .expect_err("v1.1 must refuse a DB claimed as legacy");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(STACK_SEPARATION_REFUSAL) && msg.contains("claimed as legacy"),
+            "marker mismatch must refuse; got: {msg}"
+        );
+    }
+}
+
+/// Hard separation under a V11 process claim (split from the Legacy case:
+/// process claim is monotonic and un-clearable outside stack-policy).
+#[tokio::test]
+async fn hard_separation_v11_claim_accepts_own_refuses_legacy() {
     {
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
@@ -842,24 +871,6 @@ async fn hard_separation_refuses_cross_stack_boot() {
         assert!(
             format!("{err:#}").contains(STACK_SEPARATION_REFUSAL),
             "got: {err:#}"
-        );
-    }
-
-    // --- marker alone blocks the opposite path (empty opposite data) ---
-    {
-        let scope = setup_pool().await;
-        let pool = scope.pool.clone();
-        enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
-            .await
-            .expect("fresh DB claims legacy");
-
-        let err = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
-            .await
-            .expect_err("v1.1 must refuse a DB claimed as legacy");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains(STACK_SEPARATION_REFUSAL) && msg.contains("claimed as legacy"),
-            "marker mismatch must refuse; got: {msg}"
         );
     }
 

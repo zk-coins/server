@@ -6178,8 +6178,6 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn attest_balance_flag_off_returns_feature_disabled() {
         let _lock = lock_v11_stack_for_test();
-        use crate::v11::clear_process_stack_mode_for_test;
-        clear_process_stack_mode_for_test();
 
         let state = test_state();
         let body = serde_json::json!({
@@ -6222,8 +6220,6 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn attest_balance_flag_off_malformed_body_is_feature_disabled() {
         let _lock = lock_v11_stack_for_test();
-        use crate::v11::clear_process_stack_mode_for_test;
-        clear_process_stack_mode_for_test();
 
         let state = test_state();
 
@@ -6266,13 +6262,12 @@ mod jobs_endpoint_tests {
     async fn attest_balance_route_matches_section_7_5() {
         let _lock = lock_v11_stack_for_test();
         use crate::v11::{
-            clear_process_stack_mode_for_test, parse_u64_decimal, set_process_stack_mode,
-            ScanStackMode, ATTEST_BALANCE_CHALLENGE_DOMAIN,
+            parse_u64_decimal, set_process_stack_mode, ScanStackMode,
+            ATTEST_BALANCE_CHALLENGE_DOMAIN,
         };
         use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
         use shared::spec_v1::{self as host, Address};
 
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let host_name = "node.test";
@@ -6489,7 +6484,6 @@ mod jobs_endpoint_tests {
         assert!(v.get("job_id").and_then(|j| j.as_str()).is_some());
         assert!(v.get("status").is_none(), "§7.5 admit is {{ job_id }} only");
 
-        clear_process_stack_mode_for_test();
     }
 
     /// V1Json extractor: malformed / missing JSON → 400 malformed_request
@@ -6498,10 +6492,9 @@ mod jobs_endpoint_tests {
     async fn attest_balance_malformed_json_returns_malformed_request() {
         let _lock = lock_v11_stack_for_test();
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
 
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
         let state = test_state();
 
@@ -6535,7 +6528,6 @@ mod jobs_endpoint_tests {
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["error"], "malformed_request");
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Root closed map advertises the §7.5 attest surface **only when the
@@ -6544,9 +6536,8 @@ mod jobs_endpoint_tests {
     async fn root_advertises_attest_balance_endpoints_when_flag_on() {
         let _lock = lock_v11_stack_for_test();
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let state = test_state();
@@ -6562,7 +6553,6 @@ mod jobs_endpoint_tests {
             v["endpoints"]["attest_balance"].as_str(),
             Some("POST /v1/attest/balance")
         );
-        clear_process_stack_mode_for_test();
     }
 
     /// Frozen pre-G6 endpoints JSON (raw bytes). Single independent
@@ -6603,8 +6593,6 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn root_flag_off_is_byte_identical_to_pre_attestation_map() {
         let _lock = lock_v11_stack_for_test();
-        use crate::v11::clear_process_stack_mode_for_test;
-        clear_process_stack_mode_for_test();
 
         let state = test_state();
         let req = Request::get("/").body(Body::empty()).unwrap();
