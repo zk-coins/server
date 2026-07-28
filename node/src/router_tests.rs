@@ -3253,11 +3253,10 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn jobs_sign_valid_v11_signature_accepted_through_route() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -3318,17 +3317,15 @@ mod jobs_endpoint_tests {
         // Staged material is kept until the dispatcher finalises.
         assert!(state.pending_sign_map.get(&job_id).is_some());
 
-        clear_process_stack_mode_for_test();
     }
 
     #[tokio::test]
     async fn jobs_sign_malformed_encoding_rejected_at_boundary() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -3373,16 +3370,13 @@ mod jobs_endpoint_tests {
             "message should describe the encoding rule: {resp}"
         );
 
-        clear_process_stack_mode_for_test();
     }
 
     #[tokio::test]
     async fn jobs_sign_flag_off_refuses_and_legacy_commit_still_works() {
-        use crate::v11::clear_process_stack_mode_for_test;
 
         let _stack_guard = lock_v11_stack_for_test();
         // Flag / claim off (default).
-        clear_process_stack_mode_for_test();
 
         let (state, _pool, _c) = jobs_test_state().await;
         let result = state
@@ -3468,11 +3462,10 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn v1_job_poll_and_sign_follow_section_7_5_envelope() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -3555,20 +3548,18 @@ mod jobs_endpoint_tests {
         assert_eq!(v["error"], "job_not_found");
         assert!(v.get("message").is_some());
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Defect 2: an accepted signature drives finalise, not a bare status flip.
     #[tokio::test]
     async fn accepted_signature_drives_finalise_not_status_only() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, FinaliseOutcome,
+            set_process_stack_mode, FinaliseOutcome,
             ScanStackMode,
         };
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let finalise_called = Arc::new(AtomicBool::new(false));
@@ -3690,7 +3681,6 @@ mod jobs_endpoint_tests {
         assert!(v["result"].get("new_account_state_hash").is_some());
         assert!(v["result"].get("signature_accepted").is_none());
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Defect 1: acceptance without a parked dispatcher is failure, not
@@ -3698,11 +3688,10 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn jobs_sign_without_dispatcher_reports_failure_not_acceptance() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -3754,7 +3743,6 @@ mod jobs_endpoint_tests {
             "message should describe the lifecycle failure: {resp}"
         );
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Durable finalisation rehydrate carries a full capability (not a
@@ -3763,12 +3751,11 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn rehydrated_durable_finalisation_is_finalise_ready() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, ensure_completion_ready, ensure_finalise_ready,
+            ensure_completion_ready, ensure_finalise_ready,
             set_process_stack_mode, DurableFinalisationPersist, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (mut entry, submission) =
@@ -3792,20 +3779,18 @@ mod jobs_endpoint_tests {
             "signed-only capability is not completion-ready without completion_result"
         );
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Defect 4/5: success result carries output_coin_ids + publisher_pubkey.
     #[tokio::test]
     async fn completed_result_carries_output_coin_ids_and_publisher_pubkey() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, FinaliseOutcome,
+            set_process_stack_mode, FinaliseOutcome,
             ScanStackMode,
         };
         use shared::spec_v1::{digest_from_bytes, digest_to_bytes, Coin, ZERO_HASH};
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (mut entry, _) =
@@ -3877,18 +3862,16 @@ mod jobs_endpoint_tests {
             hex::encode(publisher)
         );
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Defect 5: malformed JSON and malformed UUID → 400 malformed_request.
     #[tokio::test]
     async fn v1_extractors_map_malformed_json_and_uuid_to_malformed_request() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -3931,7 +3914,6 @@ mod jobs_endpoint_tests {
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["error"], "malformed_request");
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Defect 4: /sign still works after a simulated restart (map empty,
@@ -3939,11 +3921,10 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn jobs_sign_works_after_simulated_restart() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -4011,7 +3992,6 @@ mod jobs_endpoint_tests {
             "rehydrate must re-stage the pending entry"
         );
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Defect 1 (round 5): a job that reaches `awaiting_signature` through
@@ -4020,11 +4000,10 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn dispatcher_staging_path_allows_v1_sign() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (mut state, _pool, _c) = jobs_test_state().await;
@@ -4103,7 +4082,6 @@ mod jobs_endpoint_tests {
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["status"], "signature_accepted");
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Defect 2 (round 5): dispatcher disappearing between clone and wake
@@ -4111,11 +4089,10 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn jobs_sign_rejects_when_dispatcher_handoff_already_timed_out() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -4193,7 +4170,6 @@ mod jobs_endpoint_tests {
             "persist-before-signal: signed capability must be durable even when CAS refuses"
         );
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Defect 1: a job staged through the production registry
@@ -4202,12 +4178,11 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn production_begin_registry_staging_allows_v1_sign() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, register_live_pending_after_begin,
+            register_live_pending_after_begin,
             set_process_stack_mode, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (mut state, _pool, _c) = jobs_test_state().await;
@@ -4279,7 +4254,6 @@ mod jobs_endpoint_tests {
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["status"], "signature_accepted");
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Defect 2: SIGNALED without durable state is unreachable.
@@ -4288,11 +4262,10 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn jobs_sign_persist_before_signal_invariant() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -4344,7 +4317,6 @@ mod jobs_endpoint_tests {
         );
         let _ = row; // status stays awaiting_signature
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Helper: plant a signed durable capability (optionally with completion
@@ -4476,12 +4448,11 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn cold_fresh_appstate_drives_completion_from_durable_capability_alone() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
         use std::time::Duration;
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let scope = crate::test_db::setup_pool().await;
@@ -4520,7 +4491,6 @@ mod jobs_endpoint_tests {
         let result = after.response_body.as_ref().unwrap();
         assert!(result.get("new_account_state_hash").is_some());
 
-        clear_process_stack_mode_for_test();
         drop(scope);
     }
 
@@ -4529,12 +4499,11 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn incomplete_capability_without_completion_fails_resume() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
         use std::time::Duration;
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let scope = crate::test_db::setup_pool().await;
@@ -4595,7 +4564,6 @@ mod jobs_endpoint_tests {
             after.request_body
         );
 
-        clear_process_stack_mode_for_test();
         drop(scope);
     }
 
@@ -4605,14 +4573,13 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn concurrent_resumers_exactly_one_wins_exclusive_claim() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, FinaliseOutcome,
+            set_process_stack_mode, FinaliseOutcome,
             ScanStackMode,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let hook_count = Arc::new(AtomicUsize::new(0));
@@ -4706,7 +4673,6 @@ mod jobs_endpoint_tests {
             "claim after complete must be Lost; got {claim:?}"
         );
 
-        clear_process_stack_mode_for_test();
         drop(pool);
     }
 
@@ -4716,12 +4682,11 @@ mod jobs_endpoint_tests {
     async fn losing_resumer_leaves_winner_notify_map_intact() {
         use crate::job_dispatcher::JobNotifier;
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
         use std::time::Duration;
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -4776,7 +4741,6 @@ mod jobs_endpoint_tests {
         );
         assert_eq!(row.phase, crate::job_store::FINALISE_CLAIM_PHASE);
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Defect 1 (host edge): resume drives exactly to the documented host edge
@@ -4787,12 +4751,11 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn resume_drives_to_documented_host_edge_not_silent_stop() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
         use std::time::Duration;
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let scope = crate::test_db::setup_pool().await;
@@ -4863,7 +4826,6 @@ mod jobs_endpoint_tests {
             "JOB_FINALISE_HOST_EDGE must name the durable engine/members_ready handoff; got: {edge}"
         );
 
-        clear_process_stack_mode_for_test();
         drop(scope);
     }
 
@@ -4873,14 +4835,13 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn crash_at_edge_leaves_durable_job_resume_picks_up() {
         use crate::v11::{
-            claim_stack_scan_mode, clear_process_stack_mode_for_test, set_process_stack_mode,
+            claim_stack_scan_mode, set_process_stack_mode,
             FinaliseOutcome, ScanStackMode,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let scope = crate::test_db::setup_pool().await;
@@ -4977,7 +4938,6 @@ mod jobs_endpoint_tests {
         assert_eq!(pending.status, crate::v11::db_v11::PENDING_PUBLISH_MEMBERS_READY);
         assert_eq!(pending.owner, owner);
 
-        clear_process_stack_mode_for_test();
         drop(scope);
     }
 
@@ -4987,13 +4947,12 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn finalise_hook_stages_pending_publish_for_durable_handoff() {
         use crate::v11::{
-            claim_stack_scan_mode, clear_process_stack_mode_for_test, set_process_stack_mode,
+            claim_stack_scan_mode, set_process_stack_mode,
             FinaliseOutcome, ScanStackMode,
         };
         use std::time::Duration;
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (mut state, pool, _c) = jobs_test_state().await;
@@ -5066,7 +5025,6 @@ mod jobs_endpoint_tests {
             crate::v11::db_v11::PENDING_PUBLISH_MEMBERS_READY
         );
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Resuming finalise twice is harmless: second attempt is claim-lost or
@@ -5074,14 +5032,13 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn resume_finalise_twice_is_harmless() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, FinaliseOutcome,
+            set_process_stack_mode, FinaliseOutcome,
             ScanStackMode,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let finalise_count = Arc::new(AtomicUsize::new(0));
@@ -5123,7 +5080,6 @@ mod jobs_endpoint_tests {
             "second resume must not re-run finalise after complete"
         );
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Status-qualified request_body update fails when the job has moved on.
@@ -5186,12 +5142,11 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn failed_job_envelope_cannot_resurrect_on_resume() {
         use crate::v11::{
-            clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+            set_process_stack_mode, ScanStackMode,
         };
         use std::time::Duration;
 
         let _stack_guard = lock_v11_stack_for_test();
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -5274,7 +5229,6 @@ mod jobs_endpoint_tests {
             "terminal failed job must not be resurrected"
         );
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Defect 4: `/v1/.../stream` emits `event: error` with a closed

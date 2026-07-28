@@ -142,7 +142,7 @@ impl EsploraBroadcastClient {
 mod policy_construction_tests {
     use super::*;
     use stack_policy::{
-        clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        set_process_stack_mode, ScanStackMode,
         STACK_SEPARATION_REFUSAL,
     };
 
@@ -151,7 +151,6 @@ mod policy_construction_tests {
     /// witness.
     #[test]
     fn broadcast_connect_refuses_under_v11_process_claim() {
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
         let err = EsploraBroadcastClient::connect("http://127.0.0.1:1")
             .expect_err("v11 claim must block broadcast construction");
@@ -160,35 +159,31 @@ mod policy_construction_tests {
             msg.contains(STACK_SEPARATION_REFUSAL) || msg.contains("v1.1"),
             "got: {msg}"
         );
-        clear_process_stack_mode_for_test();
     }
 
     /// Policy pass (legacy claim) allows construction; no stack-separation
     /// error is returned. Client build itself only needs a parseable URL.
     #[test]
     fn broadcast_connect_succeeds_under_legacy_process_claim() {
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::Legacy);
         let client = EsploraBroadcastClient::connect("http://127.0.0.1:1")
             .expect("legacy claim must allow broadcast construction");
         // Touch Debug so the private-inner formatting path is covered.
         let _ = format!("{client:?}");
-        clear_process_stack_mode_for_test();
     }
 
     /// Unclaimed process (pre-boot / unit-test default) still allows legacy
     /// broadcast construction — same rule as the policy function.
     #[test]
     fn broadcast_connect_allowed_when_process_unclaimed() {
-        clear_process_stack_mode_for_test();
         EsploraBroadcastClient::connect("http://127.0.0.1:1")
             .expect("unclaimed process allows legacy broadcast construction");
-        clear_process_stack_mode_for_test();
     }
 
     /// Once V11 is claimed, no production public call sequence can obtain a
-    /// broadcast-capable client under a different or absent claim. The
-    /// test-only clear is used solely for fixture isolation.
+    /// broadcast-capable client under a different or absent claim. Withdraw
+    /// is `#[cfg(test)]` of `stack-policy` only — absent on this dependency
+    /// edge — so the claim stays monotonic for the life of the process.
     ///
     /// Conflicting `set_process_stack_mode` panic is covered in
     /// `stack-policy` (`conflicting_set_process_stack_mode_panics`); we
@@ -196,7 +191,6 @@ mod policy_construction_tests {
     /// would break later tests in the same process.
     #[test]
     fn broadcast_client_claim_is_monotonic() {
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         EsploraBroadcastClient::connect("http://127.0.0.1:1")
@@ -213,7 +207,5 @@ mod policy_construction_tests {
             stack_policy::process_stack_mode(),
             Some(ScanStackMode::V11)
         );
-
-        clear_process_stack_mode_for_test();
     }
 }

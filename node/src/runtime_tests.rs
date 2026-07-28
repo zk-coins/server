@@ -41,7 +41,7 @@ use crate::state::State;
 use crate::test_db::setup_pool;
 use crate::username::UsernameStore;
 use crate::v11::{
-    clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+    set_process_stack_mode, ScanStackMode,
 };
 use dashmap::DashMap;
 
@@ -342,7 +342,6 @@ async fn plant_edge_job_with_claim(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn immediate_restart_drives_abandoned_edge_job_forward() {
     let _guard = lock_v11_stack_for_test();
-    clear_process_stack_mode_for_test();
     set_process_stack_mode(ScanStackMode::V11);
 
     let scope = setup_pool().await;
@@ -398,7 +397,6 @@ async fn immediate_restart_drives_abandoned_edge_job_forward() {
         "claim after boot must win"
     );
 
-    clear_process_stack_mode_for_test();
     drop(scope);
 }
 
@@ -407,7 +405,6 @@ async fn immediate_restart_drives_abandoned_edge_job_forward() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_claim_not_enqueued_then_deferred_reclaim_after_expiry() {
     let _guard = lock_v11_stack_for_test();
-    clear_process_stack_mode_for_test();
     set_process_stack_mode(ScanStackMode::V11);
 
     let scope = setup_pool().await;
@@ -472,7 +469,6 @@ async fn live_claim_not_enqueued_then_deferred_reclaim_after_expiry() {
         "claim after deferred reclaim must win"
     );
 
-    clear_process_stack_mode_for_test();
     drop(scope);
 }
 
@@ -528,7 +524,6 @@ fn boot_db_error_disposition_leaves_row_untouched_for_retry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn free_phase_edge_job_enqueued_despite_release_false() {
     let _guard = lock_v11_stack_for_test();
-    clear_process_stack_mode_for_test();
     set_process_stack_mode(ScanStackMode::V11);
 
     let scope = setup_pool().await;
@@ -575,7 +570,6 @@ async fn free_phase_edge_job_enqueued_despite_release_false() {
         .expect("channel open");
     assert_eq!(env.public_id, job_id);
 
-    clear_process_stack_mode_for_test();
     drop(scope);
 }
 
@@ -588,7 +582,6 @@ async fn boot_resume_cannot_fail_job_claimed_since_snapshot() {
     use std::time::Duration as StdDuration;
 
     let _guard = lock_v11_stack_for_test();
-    clear_process_stack_mode_for_test();
     set_process_stack_mode(ScanStackMode::V11);
 
     let scope = setup_pool().await;
@@ -679,6 +672,5 @@ async fn boot_resume_cannot_fail_job_claimed_since_snapshot() {
         "claim fence must remain current after boot"
     );
 
-    clear_process_stack_mode_for_test();
     drop(scope);
 }

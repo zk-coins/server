@@ -19,7 +19,7 @@ use super::mode::{
     network_tag_for, resolve_v11_shadow_mode, validate_v11_boot_pins, V11ShadowMode,
 };
 use super::separation::{
-    claim_stack_scan_mode, clear_process_stack_mode_for_test, enforce_stack_scan_mode,
+    claim_stack_scan_mode, enforce_stack_scan_mode,
     load_stack_scan_mode, set_process_stack_mode, ScanStackMode, STACK_CAPABILITY_REFUSAL,
     STACK_SEPARATION_REFUSAL,
 };
@@ -464,7 +464,6 @@ async fn restart_identity_nflog_and_coinhist_roots() {
     assert_eq!(final_nflog, mid_nflog);
     assert_eq!(final_ch, mid_ch);
     assert_eq!(adapter.tip_hash(), tip_hash);
-    clear_process_stack_mode_for_test();
 }
 
 #[tokio::test]
@@ -615,7 +614,6 @@ async fn tip_hash_survives_persist_reload() {
         42,
         "height alone cannot distinguish the fork"
     );
-    clear_process_stack_mode_for_test();
 }
 
 // ---------------------------------------------------------------------------
@@ -754,7 +752,6 @@ async fn seed_v11_scan_state_without_marker(pool: &sqlx::PgPool) {
 /// and the reverse must fail too. Assert the failure (not merely observe it).
 #[tokio::test]
 async fn hard_separation_refuses_cross_stack_boot() {
-    clear_process_stack_mode_for_test();
 
     // --- data without marker: unconditional refusal (no auto-claim) ---
     {
@@ -778,7 +775,6 @@ async fn hard_separation_refuses_cross_stack_boot() {
             format!("{err_legacy:#}").contains("marker is missing"),
             "same-side data without marker must not auto-claim; got: {err_legacy:#}"
         );
-        clear_process_stack_mode_for_test();
     }
 
     {
@@ -801,7 +797,6 @@ async fn hard_separation_refuses_cross_stack_boot() {
             format!("{err_v11:#}").contains("marker is missing"),
             "no claim-from-data; got: {err_v11:#}"
         );
-        clear_process_stack_mode_for_test();
     }
 
     // --- claimed + same-side data: accepted ---
@@ -812,11 +807,9 @@ async fn hard_separation_refuses_cross_stack_boot() {
             .await
             .expect("fresh DB claims legacy");
         seed_legacy_scan_state(&pool).await;
-        clear_process_stack_mode_for_test();
         enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
             .await
             .expect("legacy re-boot with own marker + data");
-        clear_process_stack_mode_for_test();
 
         let err = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
             .await
@@ -825,7 +818,6 @@ async fn hard_separation_refuses_cross_stack_boot() {
             format!("{err:#}").contains(STACK_SEPARATION_REFUSAL),
             "got: {err:#}"
         );
-        clear_process_stack_mode_for_test();
     }
 
     {
@@ -840,11 +832,9 @@ async fn hard_separation_refuses_cross_stack_boot() {
         db_v11::persist_engine_snapshot(&pool, &snap)
             .await
             .expect("persist under v11 claim");
-        clear_process_stack_mode_for_test();
         enforce_stack_scan_mode(&pool, ScanStackMode::V11)
             .await
             .expect("v1.1 re-boot with own marker + data");
-        clear_process_stack_mode_for_test();
 
         let err = enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
             .await
@@ -853,7 +843,6 @@ async fn hard_separation_refuses_cross_stack_boot() {
             format!("{err:#}").contains(STACK_SEPARATION_REFUSAL),
             "got: {err:#}"
         );
-        clear_process_stack_mode_for_test();
     }
 
     // --- marker alone blocks the opposite path (empty opposite data) ---
@@ -863,7 +852,6 @@ async fn hard_separation_refuses_cross_stack_boot() {
         enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
             .await
             .expect("fresh DB claims legacy");
-        clear_process_stack_mode_for_test();
 
         let err = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
             .await
@@ -873,12 +861,10 @@ async fn hard_separation_refuses_cross_stack_boot() {
             msg.contains(STACK_SEPARATION_REFUSAL) && msg.contains("claimed as legacy"),
             "marker mismatch must refuse; got: {msg}"
         );
-        clear_process_stack_mode_for_test();
     }
 
     // Publisher guards follow the process claim.
     {
-        clear_process_stack_mode_for_test();
         let scope = setup_pool().await;
         enforce_stack_scan_mode(&scope.pool, ScanStackMode::V11)
             .await
@@ -889,7 +875,6 @@ async fn hard_separation_refuses_cross_stack_boot() {
             "legacy publisher must refuse under v11 claim"
         );
         ensure_v11_publisher_allowed().expect("v11 publisher under v11 claim");
-        clear_process_stack_mode_for_test();
     }
 }
 
@@ -897,7 +882,6 @@ async fn hard_separation_refuses_cross_stack_boot() {
 /// marker fails **inside** the transaction — nothing is committed.
 #[tokio::test]
 async fn v11_persist_refuses_under_mismatching_marker_in_transaction() {
-    clear_process_stack_mode_for_test();
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
 
@@ -905,7 +889,6 @@ async fn v11_persist_refuses_under_mismatching_marker_in_transaction() {
     enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
         .await
         .expect("claim legacy");
-    clear_process_stack_mode_for_test();
 
     let engine = StateEngine::new(Network::Regtest, 0);
     let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, [0x42; 32]);
@@ -936,13 +919,11 @@ async fn v11_persist_refuses_under_mismatching_marker_in_transaction() {
             || format!("{err2:#}").contains(STACK_CAPABILITY_REFUSAL),
         "got: {err2:#}"
     );
-    clear_process_stack_mode_for_test();
 }
 
 /// Defect 2: `resume_pending_inscriptions` refuses under a v1.1 process claim.
 #[tokio::test]
 async fn resume_pending_inscriptions_refuses_under_v11_claim() {
-    clear_process_stack_mode_for_test();
     let scope = setup_pool().await;
     enforce_stack_scan_mode(&scope.pool, ScanStackMode::V11)
         .await
@@ -962,7 +943,6 @@ async fn resume_pending_inscriptions_refuses_under_v11_claim() {
         msg.contains(STACK_SEPARATION_REFUSAL) || msg.contains("v1.1"),
         "must name stack separation; got: {msg}"
     );
-    clear_process_stack_mode_for_test();
 }
 
 /// Offline reorg of depth ≤ 5: restart rebuilds NfLog to match an
@@ -970,7 +950,6 @@ async fn resume_pending_inscriptions_refuses_under_v11_claim() {
 /// restart/replace path under test).
 #[tokio::test]
 async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
-    clear_process_stack_mode_for_test();
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     enforce_stack_scan_mode(&pool, ScanStackMode::V11)
@@ -1141,7 +1120,6 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
         "got: {err:#}"
     );
 
-    clear_process_stack_mode_for_test();
 }
 
 /// Defect 1: offline reorg deeper than the recoverable limit (§3.9 ≥6)
@@ -1239,7 +1217,6 @@ fn unresolvable_persisted_tip_refuses() {
 /// (no mmr_root_index) cannot be claimed by v1.1.
 #[tokio::test]
 async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v11_claim() {
-    clear_process_stack_mode_for_test();
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
 
@@ -1296,14 +1273,12 @@ async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v11_claim() {
     // Marker must not have been claimed.
     let marker = load_stack_scan_mode(&pool).await.expect("load marker");
     assert!(marker.is_none(), "failed claim must leave marker unset");
-    clear_process_stack_mode_for_test();
 }
 
 /// Defect 3: both unguarded-looking broadcast entry points refuse under a
 /// v1.1 process claim (structural guard at the Esplora choke point).
 #[tokio::test]
 async fn broadcast_inscription_paths_refuse_under_v11_claim() {
-    clear_process_stack_mode_for_test();
     let scope = setup_pool().await;
     enforce_stack_scan_mode(&scope.pool, ScanStackMode::V11)
         .await
@@ -1347,14 +1322,12 @@ async fn broadcast_inscription_paths_refuse_under_v11_claim() {
         "got: {msg2}"
     );
 
-    clear_process_stack_mode_for_test();
 }
 
 /// Crate-internal `with_engine_mut` refuses without a v1.1 process claim.
 /// (The method is sealed from downstream crates; this covers the runtime gate.)
 #[tokio::test]
 async fn with_engine_mut_refuses_without_v11_claim() {
-    clear_process_stack_mode_for_test();
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     claim_v11_marker(&pool).await;
@@ -1369,7 +1342,6 @@ async fn with_engine_mut_refuses_without_v11_claim() {
         format!("{err:#}").contains("refusing") || format!("{err:#}").contains("claim"),
         "got: {err:#}"
     );
-    clear_process_stack_mode_for_test();
 }
 
 /// Defect 1 (round 4): a legacy write attempted while a v1.1 claim is
@@ -1379,7 +1351,6 @@ async fn with_engine_mut_refuses_without_v11_claim() {
 /// claim.
 #[tokio::test]
 async fn legacy_write_between_emptiness_check_and_v11_claim_cannot_mix_db() {
-    clear_process_stack_mode_for_test();
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
 
@@ -1454,7 +1425,6 @@ async fn legacy_write_between_emptiness_check_and_v11_claim_cannot_mix_db() {
     assert_eq!(legacy_after, 0, "legacy write must not have committed");
     let marker = load_stack_scan_mode(&pool).await.expect("load marker");
     assert_eq!(marker, Some(ScanStackMode::V11));
-    clear_process_stack_mode_for_test();
 }
 
 /// Defect 2 (round 5): exercise the **recovery binary's** stack-claim path
@@ -1463,7 +1433,6 @@ async fn legacy_write_between_emptiness_check_and_v11_claim_cannot_mix_db() {
 /// `LegacyBroadcastClient::connect` refuses before any Esplora I/O.
 #[test]
 fn recover_inscription_binary_path_refuses_under_v11_shadow() {
-    clear_process_stack_mode_for_test();
     // Same pure step the binary runs after reading ZKCOINS_V11_SHADOW=1.
     claim_process_stack_from_shadow_mode(super::mode::V11ShadowMode::On);
     let err = crate::publisher::LegacyBroadcastClient::connect("http://127.0.0.1:1/api")
@@ -1473,7 +1442,6 @@ fn recover_inscription_binary_path_refuses_under_v11_shadow() {
         msg.contains(STACK_SEPARATION_REFUSAL) || msg.contains("v1.1"),
         "got: {msg}"
     );
-    clear_process_stack_mode_for_test();
 }
 
 /// Defect 1 (round 5 + 6): A→B→A defeats any pin based on mutable
@@ -1572,7 +1540,6 @@ fn aba_race_caught_by_immutable_scan_tip_ancestry() {
 /// present without a marker (same invariant as enforce — no auto-claim).
 #[tokio::test]
 async fn claim_stack_scan_mode_refuses_without_emptiness_invariant() {
-    clear_process_stack_mode_for_test();
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
 
@@ -1589,14 +1556,12 @@ async fn claim_stack_scan_mode_refuses_without_emptiness_invariant() {
             || msg.contains("marker is missing"),
         "got: {msg}"
     );
-    clear_process_stack_mode_for_test();
 }
 
 /// Defect 3 (round 5): `reset_proof_dependent_state_tx` refuses without a
 /// legacy stack marker (capability check).
 #[tokio::test]
 async fn reset_proof_dependent_state_tx_refuses_without_legacy_marker() {
-    clear_process_stack_mode_for_test();
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     // No marker at all.
@@ -1625,7 +1590,6 @@ async fn reset_proof_dependent_state_tx_refuses_without_legacy_marker() {
             || msg2.contains("legacy"),
         "got: {msg2}"
     );
-    clear_process_stack_mode_for_test();
 }
 
 /// Defect 3A (round 4): one-block reorg of the activation block has common
@@ -1862,7 +1826,6 @@ fn v11_scan_fold_canonical_order_first_occurrence_wins() {
 /// when process has not claimed v11 (and after an explicit legacy claim).
 #[test]
 fn flag_off_leaves_legacy_publisher_allowed() {
-    clear_process_stack_mode_for_test();
     assert_eq!(
         resolve_v11_shadow_mode(None).expect("unset"),
         V11ShadowMode::Off

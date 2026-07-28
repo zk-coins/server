@@ -1797,7 +1797,7 @@ mod tests {
     use zkcoins_prover::state_engine::{OpSecret, PendingTransition};
 
     use crate::v11::separation::{
-        clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        set_process_stack_mode, ScanStackMode,
     };
 
     // ── V.5 pins from the reference implementation fixture ─────────────────
@@ -2182,21 +2182,15 @@ mod tests {
         assert_eq!(err.check, SignatureCheck::ShadowFlag, "got: {err}");
     }
 
-    /// Defect 1: under a v1.1 process claim the wired path refuses a legacy
-    /// ash‖ocr Commitment, and accepts a v1.1 TransitionSignature against
-    /// the pending transition.
+    /// Flag / Legacy claim: legacy ash‖ocr Commitment path stays open.
+    /// (V11 refusal + accept is a separate process — claim is monotonic.)
     #[test]
-    fn wired_path_rejects_legacy_commitment_under_v11_and_accepts_v11_signature() {
-        clear_process_stack_mode_for_test();
-
-        // Flag / claim off: legacy commitment gate stays open; v1.1 accept
-        // path is still gated by the shadow mode parameter.
+    fn wired_path_allows_legacy_commitment_when_unclaimed_or_legacy() {
         assert!(
             refuse_legacy_commitment_under_v11().is_ok(),
             "unclaimed process must allow residual legacy commit path"
         );
 
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::Legacy);
         assert!(
             refuse_legacy_commitment_under_v11().is_ok(),
@@ -2216,9 +2210,13 @@ mod tests {
                 "legacy Commitment::verify must still accept ash‖ocr under flag-off"
             );
         }
-        clear_process_stack_mode_for_test();
+    }
 
-        // v1.1 claim: refuse legacy commitment loud.
+    /// Defect 1: under a v1.1 process claim the wired path refuses a legacy
+    /// ash‖ocr Commitment, and accepts a v1.1 TransitionSignature against
+    /// the pending transition.
+    #[test]
+    fn wired_path_rejects_legacy_commitment_under_v11_and_accepts_v11_signature() {
         set_process_stack_mode(ScanStackMode::V11);
         let legacy_err =
             refuse_legacy_commitment_under_v11().expect_err("v1.1 claim must refuse legacy");
@@ -2246,8 +2244,6 @@ mod tests {
         )
         .expect("v1.1 signature must be accepted under the v1.1 claim");
         assert_eq!(sig.pk_i, pk);
-
-        clear_process_stack_mode_for_test();
     }
 
     #[test]
@@ -2258,7 +2254,6 @@ mod tests {
         use bitcoin::secp256k1::SecretKey;
         use shared::commitment::Commitment;
 
-        clear_process_stack_mode_for_test();
         let sk = SecretKey::from_slice(&[0x42u8; 32]).expect("secret");
         let mut message = vec![0u8; 64];
         message[..32].fill(0xA1);
@@ -2337,7 +2332,6 @@ mod tests {
 
     #[test]
     fn v11_job_advertises_proof_data_fields_not_ash_ocr() {
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let pd = proof_data_at_0();
@@ -2379,12 +2373,10 @@ mod tests {
             .expect_err("must not fall back to ash/ocr under v1.1");
         assert_eq!(err.check, SignatureCheck::LegacyCommitment);
 
-        clear_process_stack_mode_for_test();
     }
 
     #[test]
     fn flag_off_job_still_advertises_legacy_ash_ocr() {
-        clear_process_stack_mode_for_test();
         let ash = "aa".repeat(32);
         let ocr = "bb".repeat(32);
         let result = select_awaiting_signature_result(&ash, &ocr, None)

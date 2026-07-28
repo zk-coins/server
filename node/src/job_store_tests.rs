@@ -1627,11 +1627,10 @@ async fn stale_fence_cannot_commit_engine_snapshot_or_members_ready() {
         self, EngineSnapshot, PENDING_PUBLISH_MEMBERS_READY,
     };
     use crate::v11::separation::{
-        claim_stack_scan_mode, clear_process_stack_mode_for_test, set_process_stack_mode,
+        claim_stack_scan_mode, set_process_stack_mode,
         ScanStackMode,
     };
 
-    let _ = clear_process_stack_mode_for_test();
     set_process_stack_mode(ScanStackMode::V11);
 
     let scope = setup_pool().await;
@@ -1776,7 +1775,6 @@ async fn stale_fence_cannot_commit_engine_snapshot_or_members_ready() {
         "current fence must persist engine snapshot"
     );
 
-    clear_process_stack_mode_for_test();
     drop(scope);
 }
 

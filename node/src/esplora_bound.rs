@@ -62,7 +62,7 @@ impl LegacyBroadcastClient {
 #[cfg(test)]
 mod boundary_tests {
     use stack_policy::{
-        clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        set_process_stack_mode, ScanStackMode,
         STACK_SEPARATION_REFUSAL,
     };
 
@@ -104,7 +104,6 @@ mod boundary_tests {
     /// a broadcast-capable client without the policy check passing.
     #[test]
     fn node_internal_facade_connect_refuses_under_v11_claim() {
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
         let err = esplora_bound::EsploraBroadcastClient::connect("http://127.0.0.1:1")
             .expect_err("node-internal facade connect must refuse under v11");
@@ -113,18 +112,15 @@ mod boundary_tests {
             msg.contains(STACK_SEPARATION_REFUSAL) || msg.contains("v1.1"),
             "got: {msg}"
         );
-        clear_process_stack_mode_for_test();
     }
 
     /// Wrapper and facade agree: legacy claim allows construction.
     #[test]
     fn node_wrapper_and_facade_allow_under_legacy_claim() {
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::Legacy);
         super::LegacyBroadcastClient::connect("http://127.0.0.1:1")
             .expect("wrapper under legacy");
         esplora_bound::EsploraBroadcastClient::connect("http://127.0.0.1:1")
             .expect("facade under legacy");
-        clear_process_stack_mode_for_test();
     }
 }

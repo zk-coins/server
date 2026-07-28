@@ -5,12 +5,5 @@ edition.workspace = true
 description = "Process-wide scan-stack claim registry and legacy-publisher policy"
 publish = false
 
-[features]
-# Test-only process-claim reset. Production builds leave this off so the
-# claim is monotonic: once set, it cannot be silently withdrawn. Enabled
-# by test targets via `[dev-dependencies]` feature unification (or
-# `cfg(test)` when this crate's own unit tests run).
-test-support = []
-
 [dependencies]
 # Zero production deps: process-local Mutex registry only.

@@ -18,9 +18,11 @@
 //! Production builds export only [`set_process_stack_mode`],
 //! [`process_stack_mode`], and the policy check. Once a mode is claimed, no
 //! public production API can withdraw it or switch to a different mode
-//! (conflicting re-sets panic). The test-only reset lives behind
-//! `feature = "test-support"` (and `cfg(test)` for this crate's unit tests)
-//! so a production binary cannot observe an unclaimed window after boot.
+//! (conflicting re-sets panic). The test-only reset is gated solely on
+//! `#[cfg(test)]` **of this crate** — never a Cargo feature. `cfg(test)` is
+//! not set when this library is compiled as a dependency, so no downstream
+//! crate (dev-dependency, build-dependency, integration target, or
+//! `--all-features`) can reopen the withdraw path.
 
 use std::fmt;
 use std::sync::Mutex;
@@ -116,15 +118,15 @@ pub fn process_stack_mode() -> Option<ScanStackMode> {
         .expect("PROCESS_STACK_MODE mutex poisoned")
 }
 
-/// Drop the process claim so the next test case can re-enforce.
+/// Drop the process claim so the next unit-test case in **this crate** can
+/// re-enforce.
 ///
-/// **Not available in production builds.** Gated on
-/// `cfg(any(test, feature = "test-support"))` so:
-/// - this crate's unit tests can reset between cases (`cfg(test)`);
-/// - dependent test targets enable `features = ["test-support"]` via
-///   `[dev-dependencies]` feature unification;
-/// - a production `node` / `esplora-bound` binary never links the symbol.
-#[cfg(any(test, feature = "test-support"))]
+/// Gated solely on `#[cfg(test)]` of the defining crate. That cfg is never
+/// set when this library is compiled as a dependency — no Cargo feature, no
+/// transitive activation, and no external test target can open this door.
+/// Dependent crates that need isolation rely on process-per-test runners
+/// (nextest) and must not withdraw a claim mid-process.
+#[cfg(test)]
 pub fn clear_process_stack_mode_for_test() {
     // Recover from poison so a `#[should_panic]` conflict test that panics
     // while holding the mutex does not brick later tests in the same
@@ -214,7 +216,7 @@ mod tests {
 
         // No production export returns the registry to unclaimed. The only
         // withdraw path is clear_process_stack_mode_for_test, which is
-        // cfg-gated out of production (see feature = "test-support").
+        // cfg(test) of this crate only — absent from every dependency edge.
         clear_process_stack_mode_for_test();
     }
 

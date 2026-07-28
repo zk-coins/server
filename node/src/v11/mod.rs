@@ -117,7 +117,7 @@ pub use signature::{
 };
 
 #[cfg(test)]
-pub use separation::{claim_stack_scan_mode, clear_process_stack_mode_for_test};
+pub use separation::claim_stack_scan_mode;
 
 #[cfg(test)]
 mod tests;

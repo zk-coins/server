@@ -316,7 +316,7 @@ mod tests {
     use super::*;
     use crate::v11::mode::V11ShadowMode;
     use crate::v11::separation::{
-        claim_process_stack_from_shadow_mode, clear_process_stack_mode_for_test,
+        claim_process_stack_from_shadow_mode,
         set_process_stack_mode, ScanStackMode,
     };
     use plonky2::field::goldilocks_field::GoldilocksField;
@@ -366,11 +366,10 @@ mod tests {
     }
 
     fn with_v11_process_claim<R>(f: impl FnOnce() -> R) -> R {
-        clear_process_stack_mode_for_test();
+        // Process claim is monotonic and un-clearable outside stack-policy's
+        // own cfg(test). Rely on process-per-test isolation (nextest).
         claim_process_stack_from_shadow_mode(V11ShadowMode::On);
-        let out = f();
-        clear_process_stack_mode_for_test();
-        out
+        f()
     }
 
     /// Seeded account with two Admitted coins and a folded predecessor nullifier.
@@ -507,7 +506,6 @@ mod tests {
             npk_rand: [0x73; 32],
         };
 
-        clear_process_stack_mode_for_test();
         let err = begin_v11_send(&engine, req.clone())
             .expect_err("unclaimed process must refuse v1.1 send");
         let msg = format!("{err:#}");
@@ -516,7 +514,6 @@ mod tests {
             "unexpected error: {msg}"
         );
 
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::Legacy);
         let err = begin_v11_send(&engine, req).expect_err("legacy claim must refuse v1.1 send");
         let msg = format!("{err:#}");
@@ -524,7 +521,6 @@ mod tests {
             msg.contains("ZKCOINS_V11_SHADOW is off"),
             "unexpected error: {msg}"
         );
-        clear_process_stack_mode_for_test();
     }
 
     /// v1.1 send establishes spend provenance through CoinHist /
@@ -672,41 +668,36 @@ mod tests {
         );
     }
 
+    /// Unclaimed / Legacy: refuse gate stays open (process claim is monotonic;
+    /// V11 refusal is a separate process — see `refuse_legacy_send_under_v11_claim`).
     #[test]
-    fn refuse_legacy_send_under_v11_claim() {
-        clear_process_stack_mode_for_test();
+    fn refuse_legacy_send_allows_unclaimed_and_legacy() {
         assert!(refuse_legacy_send_under_v11().is_ok());
-
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::Legacy);
         assert!(refuse_legacy_send_under_v11().is_ok());
-        clear_process_stack_mode_for_test();
+    }
 
-        clear_process_stack_mode_for_test();
+    #[test]
+    fn refuse_legacy_send_under_v11_claim() {
         set_process_stack_mode(ScanStackMode::V11);
         let err = refuse_legacy_send_under_v11().expect_err("must refuse");
         assert!(
             err.contains("legacy send refused") || err.contains("InCoinSourceWitness"),
             "unexpected: {err}"
         );
-        clear_process_stack_mode_for_test();
     }
 
     /// Verification item 5: flag-off / unclaimed / Legacy claim leaves the
     /// refuse gate open so legacy `send_coins` stays the default.
     #[test]
     fn flag_off_legacy_send_gate_stays_open() {
-        clear_process_stack_mode_for_test();
         assert!(refuse_legacy_send_under_v11().is_ok());
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::Legacy);
         assert!(refuse_legacy_send_under_v11().is_ok());
-        clear_process_stack_mode_for_test();
     }
 
     #[test]
-    fn ensure_v11_provenance_path_follows_process_claim() {
-        clear_process_stack_mode_for_test();
+    fn ensure_v11_provenance_path_refuses_unclaimed_and_legacy() {
         assert!(
             ensure_v11_provenance_path().is_err(),
             "unclaimed must refuse"
@@ -716,9 +707,11 @@ mod tests {
             ensure_v11_provenance_path().is_err(),
             "legacy must refuse"
         );
-        clear_process_stack_mode_for_test();
+    }
+
+    #[test]
+    fn ensure_v11_provenance_path_allows_v11_claim() {
         set_process_stack_mode(ScanStackMode::V11);
         assert!(ensure_v11_provenance_path().is_ok());
-        clear_process_stack_mode_for_test();
     }
 }

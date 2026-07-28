@@ -69,6 +69,8 @@ esplora-bound = { path = "../esplora-bound" }
 # Process-wide scan-stack claim registry + legacy-publisher policy.
 # Shared with `esplora-bound` so the broadcast facade constructor and
 # node boot / publisher guards consult the same process claim.
+# The test-only claim reset is `#[cfg(test)]` of `stack-policy` only —
+# never a Cargo feature — so dependency builds cannot withdraw a claim.
 stack-policy = { path = "../stack-policy" }
 axum = { version = "0.7.9", features = ["json", "multipart"] }
 # `BodyExt::collect()` for the audit middleware's request/response
@@ -261,10 +263,14 @@ fs2 = "0.4"
 # (`t_<uuid_simple>`); the workspace pulls it from the main
 # `[dependencies]` block above (where the `v4` + `serde` features
 # are already enabled), so no separate dev-dep entry is needed.
-# Compile-fail evidence: raw `esplora_client` unobtainable from `node`
-# (Defect 4). The sealed v1.1 plumbing matrix lives in the
+# Compile-fail evidence for three boundaries: raw `esplora_client` is
+# unobtainable from `node` (facade package), the process-claim reset is
+# unreachable from a production build, and the sealed v1.1 plumbing cannot
+# be reached downstream. The plumbing matrix lives in the
 # `downstream-boundary` package so its trybuild fixture depends on `node`
-# only (trybuild flattens the host package's direct deps into the UI crate).
+# only — trybuild flattens the host package's direct deps into the UI crate,
+# which would otherwise let a probe name the foreign crate for unrelated
+# reasons.
 trybuild = "1.0"
 
 [features]

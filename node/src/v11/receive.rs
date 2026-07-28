@@ -1338,7 +1338,7 @@ fn _network_pin(_n: Network) {}
 mod tests {
     use super::*;
     use crate::v11::separation::{
-        clear_process_stack_mode_for_test, set_process_stack_mode, ScanStackMode,
+        set_process_stack_mode, ScanStackMode,
     };
     use bitcoin::{Amount, ScriptBuf, TxOut, Txid};
     use sha2::{Digest, Sha256};
@@ -1556,26 +1556,23 @@ mod tests {
         }
     }
 
+    /// Unclaimed / Legacy: refuse gate stays open. V11 refusal is a separate
+    /// process (claim is monotonic; no external reset).
     #[test]
-    fn refuse_legacy_receive_under_v11_claim() {
-        // Always clear first — process mode is process-global and other
-        // parallel nextest workers must not leave a conflicting claim.
-        clear_process_stack_mode_for_test();
+    fn refuse_legacy_receive_allows_unclaimed_and_legacy() {
         assert!(refuse_legacy_receive_under_v11().is_ok());
-
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::Legacy);
         assert!(refuse_legacy_receive_under_v11().is_ok());
-        clear_process_stack_mode_for_test();
+    }
 
-        clear_process_stack_mode_for_test();
+    #[test]
+    fn refuse_legacy_receive_under_v11_claim() {
         set_process_stack_mode(ScanStackMode::V11);
         let err = refuse_legacy_receive_under_v11().expect_err("must refuse");
         assert!(
             err.contains("legacy receive refused") || err.contains("v1.1 receive"),
             "unexpected: {err}"
         );
-        clear_process_stack_mode_for_test();
     }
 
     #[test]
@@ -1584,12 +1581,9 @@ mod tests {
         // unclaimed or legacy-claimed, the refuse gate is open. The legacy
         // `receive_coin_into` body is not modified; existing account_node
         // tests exercise its bit-for-bit behaviour.
-        clear_process_stack_mode_for_test();
         assert!(refuse_legacy_receive_under_v11().is_ok());
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::Legacy);
         assert!(refuse_legacy_receive_under_v11().is_ok());
-        clear_process_stack_mode_for_test();
     }
 
     #[test]
@@ -1667,7 +1661,6 @@ mod tests {
             "above-limit must be rejected by length gate"
         );
 
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
         let engine = StateEngine::new(Network::Regtest, 0);
         // Empty slots → fails "at least one" before MAX check.
@@ -1688,7 +1681,6 @@ mod tests {
             format!("{err:#}").contains("at least one"),
             "got: {err:#}"
         );
-        clear_process_stack_mode_for_test();
     }
 
     #[test]
@@ -1966,7 +1958,6 @@ mod tests {
         use crate::v11::separation::claim_stack_scan_mode;
         use crate::v11::EngineAdapter;
 
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let scope = setup_pool().await;
@@ -2066,7 +2057,6 @@ mod tests {
             .expect("row");
         assert_eq!(after.status, db_v11::PENDING_PUBLISH_REVEAL_BROADCAST);
 
-        clear_process_stack_mode_for_test();
         let _ = EngineSnapshot::from_engine_with_tip_hash; // keep type reachable
     }
 
@@ -2078,7 +2068,6 @@ mod tests {
         use crate::v11::separation::claim_stack_scan_mode;
         use crate::v11::EngineAdapter;
 
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let scope = setup_pool().await;
@@ -2201,7 +2190,6 @@ mod tests {
             "got: {msg}"
         );
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Test 2: multi-slot host clause-10 through the real entry point
@@ -2209,7 +2197,6 @@ mod tests {
     /// earlier slots pass host checks so the error names the rejected index.
     #[test]
     fn multi_slot_clause10_rejects_corrupt_slot_2_and_slot_4() {
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let nk: [u8; 32] = Sha256::digest(b"v11-rx/multi/nk").into();
@@ -2328,7 +2315,6 @@ mod tests {
             );
         }
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Test 3: scan reconciliation — chain ordering wins over local
@@ -2340,7 +2326,6 @@ mod tests {
     /// Pure engine fold (same core as `apply_forward_scan`) — no Postgres.
     #[test]
     fn scan_reconciliation_chain_order_wins_over_local_publish_order() {
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let mut engine = StateEngine::new(Network::Regtest, 10);
@@ -2410,7 +2395,6 @@ mod tests {
             other => panic!("pk_a present: {other:?}"),
         }
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Deferred nullifier + publish + scan-fold: account may be credited and
@@ -2422,7 +2406,6 @@ mod tests {
     /// [`production_path_receive_begin_finalise_publish_persist_reload`].
     #[test]
     fn receive_publish_leaves_nflog_to_scanner_at_real_chain_position() {
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let network = Network::Regtest;
@@ -2604,7 +2587,6 @@ mod tests {
         assert_eq!(p.height, 42, "chain height, not local tip 100");
         assert_eq!(p.tx_index, 7, "chain tx_index, not local fold_seq");
 
-        clear_process_stack_mode_for_test();
     }
 
     // -----------------------------------------------------------------------
@@ -3027,7 +3009,6 @@ mod tests {
         use crate::v11::EngineAdapter;
         use zkcoins_prover::state_engine::ScannedNullifier;
 
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let scope = setup_pool().await;
@@ -3121,7 +3102,6 @@ mod tests {
             db_v11::PENDING_PUBLISH_REVEAL_BROADCAST
         );
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Concurrent scanner append lands **after** a successful broadcast.
@@ -3135,7 +3115,6 @@ mod tests {
         use std::sync::Arc;
         use zkcoins_prover::state_engine::ScannedNullifier;
 
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let scope = setup_pool().await;
@@ -3209,7 +3188,6 @@ mod tests {
             assert!(engine.account(&owner).is_some());
         });
 
-        clear_process_stack_mode_for_test();
     }
 
     /// Heavy production path with a **genuine** Plonky2 prove, entered through
@@ -3228,7 +3206,6 @@ mod tests {
         use crate::v11::separation::claim_stack_scan_mode;
         use crate::v11::EngineAdapter;
 
-        clear_process_stack_mode_for_test();
         set_process_stack_mode(ScanStackMode::V11);
 
         let scope = setup_pool().await;
@@ -3304,7 +3281,6 @@ mod tests {
             .expect("pending still durable");
         assert_eq!(row2.status, db_v11::PENDING_PUBLISH_REVEAL_BROADCAST);
 
-        clear_process_stack_mode_for_test();
     }
 
 }

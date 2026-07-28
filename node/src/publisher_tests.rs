@@ -19,15 +19,16 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::test_db::{setup_pool, SchemaScope};
-use crate::v11::clear_process_stack_mode_for_test;
 
-/// Drop any process stack claim left by a concurrent test binary path.
+/// Claim the legacy process stack for publisher unit tests.
 ///
-/// The stack-mode static is process-wide; with `--test-threads>1` a v1.1
-/// claim from another test would otherwise trip the structural broadcast
-/// guard even for pure legacy publisher unit tests.
+/// The claim is monotonic and cannot be withdrawn outside `stack-policy`'s
+/// own `#[cfg(test)]`. Under process-per-test (nextest) the process starts
+/// unclaimed; this re-affirms Legacy so broadcast construction is allowed.
+/// A pre-existing V11 claim panics (fail loud) rather than silently clearing.
 fn ensure_legacy_process_for_publisher_test() {
-    clear_process_stack_mode_for_test();
+    use crate::v11::{set_process_stack_mode, ScanStackMode};
+    set_process_stack_mode(ScanStackMode::Legacy);
 }
 
 /// Test publisher key used to produce deterministic Taproot addresses
