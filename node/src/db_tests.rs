@@ -95,8 +95,9 @@ async fn connect_and_migrate_creates_all_tables() {
     //     legacy vs v1.1 scan-stack claim for Cutover Stage 2).
     //   * After 0021 (v11_pending_publishes): 33 tables + 1 view
     //     (durable AggregateStateNullifierV3 rebroadcast intent).
-    //   * After 0023 (self_heal_reset_meta): 34 tables + 1 view
-    //     (self-heal reset-generation fence for job-advancing writes).
+    //   * After 0022 (finalise claim fence): ALTER-only (no new table).
+    //   * After 0023 (r2 probe v11 columns): ALTER + view recreate
+    //     (no new table names; prover_mode / shape columns on runs).
     assert_eq!(
         names,
         vec![
@@ -121,7 +122,6 @@ async fn connect_and_migrate_creates_all_tables() {
             "r2_probe_runs_summary".to_string(),
             "r2_probe_warm_calls".to_string(),
             "request_log".to_string(),
-            "self_heal_reset_meta".to_string(),
             "smt_state".to_string(),
             "stack_scan_mode".to_string(),
             "state_update_log".to_string(),

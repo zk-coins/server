@@ -20,7 +20,9 @@
 //!   rustc version, allocator, circuit params), and the R2 budgets
 //!   the run was checked against. The budgets are persisted on the
 //!   row so a future budget tweak does NOT retroactively flip the
-//!   pass/fail in [`SummaryRow`].
+//!   pass/fail in [`SummaryRow`]. Migration 0023 adds `prover_mode`
+//!   (`legacy` | `v11`) plus nullable v1.1 shape columns so both
+//!   circuits can coexist without false-red reclassification.
 //! * `r2_probe_warm_calls` — one row per warm call (call_index +
 //!   wall_ms). Lets the operator recompute percentiles or inspect
 //!   outliers later. FK ON DELETE CASCADE so pruning a single run
@@ -29,6 +31,10 @@
 //! [`fetch_recent_summary`] reads from the `r2_probe_runs_summary`
 //! view, which joins host + run and inlines the three budget-pass
 //! booleans the admin endpoint surfaces.
+//!
+//! Budget selection lives in [`crate::r2_budgets`] — legacy constants
+//! stay the flag-off default; v1.1 budgets come only from sealed
+//! measurement samples (never a silent fall-back to the legacy set).
 //!
 //! ## Callers
 //!
@@ -163,9 +169,21 @@ pub struct ProbeRun {
     pub rustc_version: String,
     pub build_profile: String,
     pub allocator: String,
+    /// `"legacy"` or `"v11"` — see [`crate::r2_budgets::ProverMode`].
+    /// Defaults to `"legacy"` at the DB layer so pre-0023 insert paths
+    /// and historical rows stay valid.
+    pub prover_mode: String,
     pub max_in_coins: i32,
     pub max_out_coins: i32,
     pub inner_pad_bits: i32,
+    /// v1.1 shape (`MAX_TX_INPUTS`); `None` on legacy rows.
+    pub max_tx_inputs: Option<i32>,
+    /// v1.1 shape (`MAX_TX_OUTPUTS`); `None` on legacy rows.
+    pub max_tx_outputs: Option<i32>,
+    /// v1.1 shape (`MAX_RX_COINS`); `None` on legacy rows.
+    pub max_rx_coins: Option<i32>,
+    /// v1.1 `ProverBridge::compliance_gate_count`; `None` on legacy.
+    pub compliance_gate_count: Option<i32>,
     pub warm_calls_requested: i32,
     pub circuit_build_wall_ms: i64,
     pub prove_cold_wall_ms: i64,
@@ -196,6 +214,8 @@ pub struct SummaryRow {
     pub git_sha: String,
     pub build_profile: String,
     pub allocator: String,
+    /// `"legacy"` or `"v11"` (migration 0023).
+    pub prover_mode: String,
     pub circuit_build_wall_ms: i64,
     pub prove_cold_wall_ms: i64,
     pub prove_warm_p50_ms: Option<i64>,
@@ -239,18 +259,22 @@ pub async fn insert_run(pool: &PgPool, run: &ProbeRun) -> sqlx::Result<i64> {
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO r2_probe_runs ( \
              host_id, git_sha, binary_version, rustc_version, build_profile, allocator, \
+             prover_mode, \
              max_in_coins, max_out_coins, inner_pad_bits, warm_calls_requested, \
+             max_tx_inputs, max_tx_outputs, max_rx_coins, compliance_gate_count, \
              circuit_build_wall_ms, prove_cold_wall_ms, verify_wall_ms, peak_rss_kb, \
              prove_warm_p50_ms, prove_warm_p90_ms, prove_warm_p99_ms, \
              succeeded, error_message, notes, tags, \
              r2_warm_budget_ms, r2_cold_budget_ms, r2_mem_budget_kb \
          ) VALUES ( \
              $1, $2, $3, $4, $5, $6, \
-             $7, $8, $9, $10, \
-             $11, $12, $13, $14, \
-             $15, $16, $17, \
-             $18, $19, $20, $21, \
-             $22, $23, $24 \
+             $7, \
+             $8, $9, $10, $11, \
+             $12, $13, $14, $15, \
+             $16, $17, $18, $19, \
+             $20, $21, $22, \
+             $23, $24, $25, $26, \
+             $27, $28, $29 \
          ) RETURNING id",
     )
     .bind(run.host_id)
@@ -259,10 +283,15 @@ pub async fn insert_run(pool: &PgPool, run: &ProbeRun) -> sqlx::Result<i64> {
     .bind(&run.rustc_version)
     .bind(&run.build_profile)
     .bind(&run.allocator)
+    .bind(&run.prover_mode)
     .bind(run.max_in_coins)
     .bind(run.max_out_coins)
     .bind(run.inner_pad_bits)
     .bind(run.warm_calls_requested)
+    .bind(run.max_tx_inputs)
+    .bind(run.max_tx_outputs)
+    .bind(run.max_rx_coins)
+    .bind(run.compliance_gate_count)
     .bind(run.circuit_build_wall_ms)
     .bind(run.prove_cold_wall_ms)
     .bind(run.verify_wall_ms)
@@ -319,6 +348,7 @@ pub async fn fetch_recent_summary(pool: &PgPool, limit: i64) -> sqlx::Result<Vec
         "SELECT id, \
                 to_char(ran_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS ran_at, \
                 hostname, cpu_brand, git_sha, build_profile, allocator, \
+                prover_mode, \
                 circuit_build_wall_ms, prove_cold_wall_ms, \
                 prove_warm_p50_ms, prove_warm_p90_ms, prove_warm_p99_ms, \
                 peak_rss_kb, \
@@ -340,6 +370,7 @@ pub async fn fetch_recent_summary(pool: &PgPool, limit: i64) -> sqlx::Result<Vec
             git_sha: r.get("git_sha"),
             build_profile: r.get("build_profile"),
             allocator: r.get("allocator"),
+            prover_mode: r.get("prover_mode"),
             circuit_build_wall_ms: r.get("circuit_build_wall_ms"),
             prove_cold_wall_ms: r.get("prove_cold_wall_ms"),
             prove_warm_p50_ms: r.get("prove_warm_p50_ms"),

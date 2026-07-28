@@ -45,6 +45,7 @@ pub mod job_store;
 pub mod openapi;
 pub mod prover_health;
 pub mod publisher;
+pub mod r2_budgets;
 pub mod r2_probe;
 pub mod router;
 pub mod runtime;
