@@ -98,8 +98,7 @@ pub const FINALISE_CLAIM_PHASE: &str = "finalise_claimed";
 /// fencing token, and a lease.
 pub const FINALISE_CLAIM_BODY_KEY: &str = "finalise_claim";
 
-/// JSON field under [`FINALISE_CLAIM_BODY_KEY`] for the fencing token.
-pub const FINALISE_CLAIM_FENCE_KEY: &str = "fence";
+
 
 /// Default lease for a live finalise owner.
 ///
@@ -256,6 +255,8 @@ impl std::fmt::Debug for Job {
             .field("proof_id", &self.proof_id)
             .field("error", &self.error)
             .field("progress", &self.progress)
+            .field("reset_generation", &self.reset_generation)
+            .field("reset_generation", &self.reset_generation)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .field("completed_at", &self.completed_at)
@@ -388,6 +389,7 @@ impl JobStore {
 
     /// Construct with an explicit process owner (tests that plant a live
     /// claim under a known identity).
+    #[cfg(test)]
     pub fn with_process_owner(pool: PgPool, process_owner: Uuid) -> Self {
         Self {
             pool,
@@ -398,6 +400,7 @@ impl JobStore {
     /// Borrow the underlying pool — needed by callers that thread
     /// existing transactions (idempotent reply body lookups) through
     /// the same connection.
+    #[cfg(test)]
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -513,6 +516,7 @@ impl JobStore {
 
     /// Look up a job by `(account, idempotency_key)`. Used by the
     /// admit handler's pre-INSERT check on the legacy-replay path.
+    #[cfg(test)]
     pub async fn load_by_idem(
         &self,
         account: &[u8; 32],
@@ -664,6 +668,7 @@ impl JobStore {
     /// Used for pre-claim / status-only paths. Once a row is
     /// [`FINALISE_CLAIM_PHASE`], terminal complete must go through
     /// [`Self::complete_if_finalise_owner`] (token + lease fence).
+    #[cfg(test)]
     pub async fn complete_if_status(
         &self,
         public_id: Uuid,
@@ -863,6 +868,7 @@ impl JobStore {
     ///
     /// An update that assumes `from` fails (returns `false`) when the job
     /// has moved on — never silently overwrites a later status.
+    #[cfg(test)]
     pub async fn set_status_if(
         &self,
         public_id: Uuid,
@@ -1303,6 +1309,7 @@ impl JobStore {
     /// to process. `queued + proving` — `awaiting_signature` and
     /// `broadcasting` represent in-flight work the dispatcher is
     /// already attached to, not depth.
+    #[cfg(test)]
     pub async fn queue_depth(&self) -> sqlx::Result<i64> {
         let row = sqlx::query(
             "SELECT COUNT(*)::BIGINT AS depth FROM jobs \

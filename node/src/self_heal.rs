@@ -121,7 +121,7 @@ pub enum ResetDecision {
 /// live circuit; it is only consulted on the no-persisted-digest branch
 /// (when a digest IS persisted, detector 1 is authoritative and far
 /// cheaper). No circuit build, no I/O — exhaustively unit-testable.
-pub fn reset_decision(
+pub(crate) fn reset_decision(
     persisted: Option<&[u8]>,
     live: &[u8],
     canary: CanaryOutcome,
@@ -149,7 +149,7 @@ pub fn reset_decision(
 /// error is returned so the caller can decide — `heal_circuit_digest`
 /// logs and continues, because a stale proof file with a fresh DB is
 /// inert (no row points at it) and must not crash-loop the container.
-pub fn reset_proof_store_dir(proofs_dir: &str) -> std::io::Result<()> {
+pub(crate) fn reset_proof_store_dir(proofs_dir: &str) -> std::io::Result<()> {
     let path = Path::new(proofs_dir);
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),

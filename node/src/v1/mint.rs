@@ -56,7 +56,7 @@ use super::separation::{process_stack_mode, ScanStackMode};
 
 /// Refusal when the shadow flag / process claim is not v1.1 — remint is
 /// not dual-accepted on the legacy stack.
-pub const V1_MINT_SHADOW_OFF: &str = "ZKCOINS_V1_SHADOW is off — refusing v1.1 mint/remint path \
+pub(crate) const V1_MINT_SHADOW_OFF: &str = "ZKCOINS_V1_SHADOW is off — refusing v1.1 mint/remint path \
      (legacy prepare_mint remains the default; remint stays refused there)";
 
 /// Gate the v1.1 mint/remint path on the **process stack claim**.
@@ -70,7 +70,7 @@ pub const V1_MINT_SHADOW_OFF: &str = "ZKCOINS_V1_SHADOW is off — refusing v1.1
 /// | `Some(V1)` | allowed |
 /// | `Some(Legacy)` | refuse ([`V1_MINT_SHADOW_OFF`]) |
 /// | `None` | refuse (unclaimed — no silent fall-through) |
-pub fn ensure_v1_mint_path() -> Result<()> {
+pub(crate) fn ensure_v1_mint_path() -> Result<()> {
     match process_stack_mode() {
         Some(ScanStackMode::V1) => Ok(()),
         Some(ScanStackMode::Legacy) => bail!(V1_MINT_SHADOW_OFF),
@@ -92,6 +92,9 @@ pub fn ensure_v1_mint_path() -> Result<()> {
 /// [`StateEngine::begin_mint`] already admits token-standard-1 re-issuance
 /// into an existing multi-asset account and refuses non-conformant
 /// token-standard-2 requests naming the clause.
+///
+/// Kernel-API (§7.5): gRPC mint / re-mint begin — process-claim gate then
+/// `StateEngine::begin_mint`. The raw engine sink stays module-private.
 pub fn begin_v1_mint(engine: &StateEngine, req: MintRequest) -> Result<PendingTransition> {
     ensure_v1_mint_path()?;
     engine_begin_mint(engine, req)

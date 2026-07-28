@@ -74,85 +74,105 @@
 //! [`begin_v1_send`] (no parameter, no field). See [`provenance`].
 
 mod adapter;
-pub mod attest;
+// Orchestration modules: no public items of their own. External edge
+// reaches only curated re-exports on `node::v1` (and the few modules
+// below that still carry binary/boot types). Compile-fail matrices that
+// name sealed sinks via `node::v1::{mint,provenance}::…` still fail
+// (module is private).
+pub(crate) mod attest;
 pub mod db_v1;
-pub mod mint;
+pub(crate) mod mint;
 pub mod mode;
-pub mod provenance;
+pub(crate) mod provenance;
 pub mod publish;
 pub mod receive;
 pub mod scan;
 pub mod self_heal;
-pub mod separation;
-pub mod signature;
+// Crate-private: external edge names only the curated re-exports below
+// (`ScanStackMode`, `enforce_stack_scan_mode`,
+// `claim_process_stack_from_v1_shadow_env`). Process-control helpers
+// (`set_process_stack_mode`, `process_stack_mode`, …) must not be
+// reachable as `node::v1::separation::…`.
+pub(crate) mod separation;
+pub(crate) mod signature;
 // Stage 3 atomic-switch properties (compile/source + load-path pins).
 #[cfg(test)]
 mod stage3;
 
+// Public re-exports: binary boot / scanner / resume edge only.
+// Crate-internal orchestration (router, hooks) uses `pub(crate) use`.
+// Compile-fail matrices name sealed sinks via module paths; private
+// items fail at the package edge as intended.
+//
+// `pub(crate) use` lists only names referenced as `crate::v1::…` from
+// non-test production code. Test-only convenience re-exports live under
+// `#[cfg(test)]` below so the lib target stays free of unused-import
+// noise. Names that neither production nor tests reach via `crate::v1::`
+// are not re-exported — callers use the defining submodule path.
 pub use adapter::EngineAdapter;
-pub use attest::{
-    accept_attestation_for_network, accept_c_balance_network_binding, authorise_attest_balance,
-    completed_attest_result, encode_c_balance_proof_bytes, ensure_v1_attest_path,
-    issue_attest_challenge, networks_have_distinct_c_balance_pins, parse_u64_decimal,
-    pinned_c_balance_digest, prove_attestation_for_job, public_hosts_from_env,
-    require_completed_anchor, require_resolved_anchor, serialize_balance_attestation,
-    serialize_balance_attestation_v1, unix_now, v1_attest_route_active, AttestBalanceRequest,
-    AttestChallengeMap, AttestChallengeRequest, AttestError, AttestJobBody, U64Decimal,
-    ATTEST_ANCHOR_LOCATOR_EDGE, ATTEST_BALANCE_CHALLENGE_DOMAIN, PINNED_C_BALANCE_DIGEST_MAINNET,
-    PINNED_C_BALANCE_DIGEST_REGTEST, PINNED_C_BALANCE_DIGEST_TESTNET,
+pub(crate) use attest::{
+    authorise_attest_balance, completed_attest_result, issue_attest_challenge,
+    prove_attestation_for_job, public_hosts_from_env, serialize_balance_attestation, unix_now,
+    v1_attest_route_active, AttestBalanceRequest, AttestChallengeMap, AttestChallengeRequest,
+    AttestError, AttestJobBody, U64Decimal, ATTEST_BALANCE_CHALLENGE_DOMAIN,
 };
-pub use mint::{begin_v1_mint, ensure_v1_mint_path, V1_MINT_SHADOW_OFF};
-pub use mode::{
-    parse_network_label, resolve_v1_shadow_mode, v1_shadow_mode_from_env, validate_v1_boot_pins,
-    V1BootPins, V1ShadowMode, V1_BOOT_CONFIG_ERROR,
-};
-pub use provenance::{
-    assert_receive_provenance_is_creating_proof, begin_v1_send, ensure_v1_provenance_path,
-    refuse_legacy_send_under_v1, LEGACY_SEND_REFUSED_UNDER_V1, V1_PROVENANCE_SHADOW_OFF,
-};
+pub use mode::{v1_boot_pins_from_env, v1_shadow_mode_from_env, V1BootPins, V1ShadowMode};
+/// Kernel-API (§7.5): gRPC mint begin — process-claim-gated orchestration.
+pub use mint::begin_v1_mint;
+/// Kernel-API (§7.5): gRPC send begin — CoinHist provenance orchestration.
+pub use provenance::begin_v1_send;
+pub(crate) use provenance::{refuse_legacy_send_under_v1, LEGACY_SEND_REFUSED_UNDER_V1};
 pub use publish::{connect_v1_publisher, v1_publisher_env_from_env, V1Publisher, V1PublisherEnv};
+pub use receive::resume_all_pending_publishes;
+/// Kernel-API (§7.5): gRPC receive orchestration (begin / finalise / commit /
+/// one-shot / single-row resume) and request/outcome types.
 pub use receive::{
-    commit_proved_receive, execute_v1_receive, finalise_publish_persist,
-    refuse_legacy_receive_under_v1, resume_all_pending_publishes, resume_pending_publish,
-    verify_and_begin_receive, verify_clause10_slot, verify_creating_nullifier_binding,
-    ReceivedCoinSlot, V1ReceiveOutcome, V1ReceiveRequest, LEGACY_RECEIVE_REFUSED_UNDER_V1,
+    commit_proved_receive, execute_v1_receive, finalise_publish_persist, resume_pending_publish,
+    verify_and_begin_receive, PublishedBatchSummary, ReceivedCoinSlot, V1ReceiveOutcome,
+    V1ReceiveRequest,
 };
+pub(crate) use receive::refuse_legacy_receive_under_v1;
 pub use scan::{
     apply_canonical_survivors, apply_forward_scan, first_boot_requires_full_replace,
-    folded_keys_from_nflog_mirror, members_to_published, observation_tip_still_live,
-    reconcile_persisted_tip, sort_canonical, FoldStats, MAX_RECOVERABLE_REORG_DEPTH,
-    PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome,
+    folded_keys_from_nflog_mirror, observation_tip_still_live, reconcile_persisted_tip,
+    FoldStats, PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome,
 };
-pub use self_heal::{
-    boot_canary, decode_v1_live_digest, encode_v1_live_digest, evaluate_v1_slow_canary,
-    evaluate_v1_structural_canary, resolve_v1_live_digest,
-    slow_canary_env_enabled, slow_canary_verify_transition, v1_canary_for_heal,
-    V1CanaryNflogView, V1CanarySample, V1StructuralInputs, V1_DIGEST_TAG, V1_LIVE_DIGEST_LEN,
-};
+pub use self_heal::{resolve_v1_live_digest, v1_canary_for_heal};
 pub use separation::{
-    claim_process_stack_from_shadow_mode, claim_process_stack_from_v1_shadow_env,
-    enforce_stack_scan_mode, ensure_legacy_publisher_allowed, ensure_v1_publisher_allowed,
-    legacy_scan_state_present, load_stack_scan_mode, process_stack_mode,
-    require_stack_mode_for_update, require_v1_process_for_nflog_write, set_process_stack_mode,
-    v1_scan_state_present, ScanStackMode, STACK_CAPABILITY_REFUSAL, STACK_SEPARATION_REFUSAL,
+    claim_process_stack_from_v1_shadow_env, enforce_stack_scan_mode, ScanStackMode,
 };
+pub(crate) use separation::{
+    ensure_legacy_publisher_allowed, process_stack_mode, require_stack_mode_for_update,
+};
+/// Kernel-API (§7.5): gRPC sign / finalise surface after wallet authorisation.
 pub use signature::{
-    accept_wallet_transition_signature, awaiting_signature_result_json, decode_job_error,
-    durable_finalisation_with_signature, encode_job_error, ensure_completion_ready,
-    ensure_finalise_ready, ensure_v1_signature_path, finalise_accepted_prove_outside_lock,
-    finalise_accepted_prove_persist_and_stage, finalise_with_accepted_signature,
-    legacy_awaiting_signature_result_json,
-    publisher_pubkey_from_request_body, refuse_legacy_commitment_under_v1,
-    register_live_pending_after_begin, rehydrate_pending_sign, select_awaiting_signature_result,
-    sign_rejection, stage_pending_sign, strip_pending_sign_from_body,
-    take_live_pending_after_begin, v1_sign_route_active, verify_transition_signature_material,
-    DurableFinalisationPersist, FinaliseOutcome, PendingSignEntry, PendingSignMap, SignatureCheck,
-    StagedSignPersist, TransitionSignatureError, WalletSignSubmission, WalletSignSubmissionWire,
-    FINALISATION_BODY_KEY, LEGACY_COMMITMENT_REFUSED_UNDER_V1, PENDING_SIGN_BODY_KEY,
+    durable_finalisation_with_signature, finalise_accepted_prove_outside_lock,
+    finalise_with_accepted_signature, register_live_pending_after_begin, FinaliseOutcome,
+    PendingSignEntry, PendingSignMap, SignatureCheck, TransitionSignatureError,
+    WalletSignSubmission,
+};
+pub(crate) use signature::{
+    accept_wallet_transition_signature, decode_job_error, encode_job_error,
+    ensure_completion_ready, ensure_finalise_ready, finalise_accepted_prove_persist_and_stage,
+    publisher_pubkey_from_request_body, refuse_legacy_commitment_under_v1, rehydrate_pending_sign,
+    select_awaiting_signature_result, sign_rejection, stage_pending_sign,
+    strip_pending_sign_from_body, take_live_pending_after_begin, v1_sign_route_active,
+    DurableFinalisationPersist, WalletSignSubmissionWire, FINALISATION_BODY_KEY, PENDING_SIGN_BODY_KEY,
 };
 
+// Test-only re-exports: unit tests reach these as `crate::v1::…` without
+// forcing them into the non-test lib re-export surface.
 #[cfg(test)]
-pub use separation::claim_stack_scan_mode;
+pub(crate) use attest::{
+    accept_c_balance_network_binding, networks_have_distinct_c_balance_pins, parse_u64_decimal,
+    pinned_c_balance_digest, PINNED_C_BALANCE_DIGEST_MAINNET, PINNED_C_BALANCE_DIGEST_TESTNET,
+};
+#[cfg(test)]
+pub(crate) use self_heal::encode_v1_live_digest;
+#[cfg(test)]
+pub(crate) use separation::{claim_stack_scan_mode, set_process_stack_mode};
+#[cfg(test)]
+pub(crate) use signature::awaiting_signature_result_json;
 
 #[cfg(test)]
 mod tests;

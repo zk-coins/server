@@ -1,15 +1,22 @@
+#[cfg(test)]
 use bitcoin::bip32::{ChildNumber, Xpriv, Xpub};
 use bitcoin::hashes::Hash;
+#[cfg(test)]
 use bitcoin::secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 use shared::commitment::Commitment;
+#[cfg(test)]
 use shared::SECP256K1;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN;
 use zkcoins_program::hash::{digest_from_bytes, hash_concat, HashDigest, ZERO_HASH};
-use zkcoins_program::merkle::merkle_mountain_range::{MMRProof, MerkleMountainRange};
-use zkcoins_program::merkle::sparse_merkle_tree::{InclusionProof, SparseMerkleTree};
+use zkcoins_program::merkle::merkle_mountain_range::MerkleMountainRange;
+#[cfg(test)]
+use zkcoins_program::merkle::merkle_mountain_range::MMRProof;
+use zkcoins_program::merkle::sparse_merkle_tree::SparseMerkleTree;
+#[cfg(test)]
+use zkcoins_program::merkle::sparse_merkle_tree::InclusionProof;
 
 use crate::db;
 
@@ -24,6 +31,7 @@ use crate::db;
 /// shadows another wallet's branch. Panic rather than return a poisoned
 /// `u32`: the safe response to a state we cannot reason about is to
 /// stop, not to keep minting.
+#[cfg(test)]
 const DERIVE_NUM_PUBKEYS_LOOP_BOUND: u32 = 1_000_000;
 
 /// Derive the minting account's `num_pubkeys` from SMT membership.
@@ -51,7 +59,8 @@ const DERIVE_NUM_PUBKEYS_LOOP_BOUND: u32 = 1_000_000;
 ///
 /// **Loop bound.** Capped at [`DERIVE_NUM_PUBKEYS_LOOP_BOUND`]; an
 /// overrun panics. See the constant's docs for the rationale.
-pub fn derive_num_pubkeys_from_smt(xpriv: &Xpriv, smt: &SparseMerkleTree) -> u32 {
+#[cfg(test)]
+pub(crate) fn derive_num_pubkeys_from_smt(xpriv: &Xpriv, smt: &SparseMerkleTree) -> u32 {
     derive_num_pubkeys_from_smt_with_bound(xpriv, smt, DERIVE_NUM_PUBKEYS_LOOP_BOUND)
 }
 
@@ -62,6 +71,7 @@ pub fn derive_num_pubkeys_from_smt(xpriv: &Xpriv, smt: &SparseMerkleTree) -> u32
 /// derivations + Poseidon SMT inserts is several minutes of wall time;
 /// the bound branch is the same regardless of the constant). Production
 /// callers MUST use the wrapper above with [`DERIVE_NUM_PUBKEYS_LOOP_BOUND`].
+#[cfg(test)]
 pub(crate) fn derive_num_pubkeys_from_smt_with_bound(
     xpriv: &Xpriv,
     smt: &SparseMerkleTree,
@@ -94,13 +104,13 @@ pub(crate) fn derive_num_pubkeys_from_smt_with_bound(
 #[derive(Debug, Serialize, Deserialize)]
 pub struct State {
     /// The Sparse Merkle Tree to store individual commitments
-    pub smt: SparseMerkleTree,
+    pub(crate) smt: SparseMerkleTree,
     /// The Merkle Mountain Range to accumulate SMT roots
-    pub mmr: MerkleMountainRange,
+    pub(crate) mmr: MerkleMountainRange,
     /// Maps previous MMR roots to (SMT root, leaf index) pairs
-    pub root_indices: HashMap<HashDigest, (HashDigest, usize)>,
+    pub(crate) root_indices: HashMap<HashDigest, (HashDigest, usize)>,
     /// The previous MMR root
-    pub prev_mmr_root: HashDigest,
+    pub(crate) prev_mmr_root: HashDigest,
 }
 
 /// Error type for `State::load_from_pg`. Distinguishes database errors
@@ -147,7 +157,7 @@ impl From<bincode::Error> for LoadStateError {
 
 impl State {
     /// Creates a new state with an empty SMT of the default depth and an empty MMR.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         State {
             smt: SparseMerkleTree::new(),
             mmr: MerkleMountainRange::new(),
@@ -171,7 +181,7 @@ impl State {
     /// (Phase C: `db::insert_root_index`) read it back from `self`
     /// rather than threading a pool into this synchronous method, which
     /// would force every test caller to grow a Postgres dependency.
-    pub fn update(&mut self, commitments: &[Commitment]) -> Result<HashDigest, &'static str> {
+    pub(crate) fn update(&mut self, commitments: &[Commitment]) -> Result<HashDigest, &'static str> {
         // 1. Insert all commitments into the SMT
         for commitment in commitments {
             // Use the public key as the key for the tree (hashed)
@@ -275,7 +285,8 @@ impl State {
     }
 
     /// Gets an inclusion proof for a leaf in the MMR that was created with the given previous MMR root.
-    pub fn get_mmr_inclusion_proof(
+    #[cfg(test)]
+    pub(crate) fn get_mmr_inclusion_proof(
         &self,
         prev_mmr_root: HashDigest,
     ) -> Result<(HashDigest, MMRProof), &'static str> {
@@ -287,7 +298,8 @@ impl State {
 
     /// Gets an inclusion proof for a specific commitment in the SMT,
     /// along with an inclusion proof of the current SMT root in the MMR.
-    pub fn get_commitment_proof(
+    #[cfg(test)]
+    pub(crate) fn get_commitment_proof(
         &self,
         public_key: &PublicKey,
     ) -> Result<(HashDigest, InclusionProof, HashDigest, MMRProof), &'static str> {
@@ -385,7 +397,7 @@ impl State {
     /// `.await` while still letting `update` and `serialize_for_persist`
     /// observe a consistent snapshot.
     #[allow(clippy::type_complexity)]
-    pub fn update_and_snapshot_for_persist(
+    pub(crate) fn update_and_snapshot_for_persist(
         &mut self,
         commitments: &[Commitment],
     ) -> Result<
@@ -420,7 +432,7 @@ impl State {
     /// but the error path is propagated as a `bincode::Error` rather
     /// than panicked over so a future schema change that introduces a
     /// fallible branch surfaces as a recoverable error.
-    pub fn serialize_for_persist(&self) -> Result<(Vec<u8>, Vec<u8>), bincode::Error> {
+    pub(crate) fn serialize_for_persist(&self) -> Result<(Vec<u8>, Vec<u8>), bincode::Error> {
         let smt_bytes = bincode::serialize(&self.smt)?;
         let mmr_bytes = bincode::serialize(&self.mmr)?;
         Ok((smt_bytes, mmr_bytes))

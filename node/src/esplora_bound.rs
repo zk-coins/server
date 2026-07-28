@@ -15,7 +15,8 @@
 //! I/O — including when `node` code calls the facade directly.
 
 // Read path: no stack gate (reads are not a publish path).
-pub use esplora_bound::{AddressUtxo, BlockStatusView, EsploraReadClient};
+// Crate-private re-exports — not part of the node public surface.
+pub(crate) use esplora_bound::EsploraReadClient;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 

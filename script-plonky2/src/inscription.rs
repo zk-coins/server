@@ -12,7 +12,7 @@ use bitcoin::blockdata::constants::MAX_SCRIPT_ELEMENT_SIZE;
 use bitcoin::opcodes;
 use bitcoin::script::{Builder, PushBytesBuf};
 use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
-use bitcoin::taproot::{ControlBlock, LeafVersion, TaprootBuilder, TaprootSpendInfo};
+use bitcoin::taproot::{ControlBlock, LeafVersion, TaprootBuilder};
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
@@ -45,17 +45,17 @@ pub struct InscriptionRequest {
     pub reveal_fee: Amount,
 }
 
-/// In-memory commit/reveal transactions and their script-path commitment.
+/// In-memory commit/reveal transactions for a script-path commitment.
 ///
 /// `commit_tx` has an empty funding witness and must be signed by its caller.
 /// `reveal_tx` is complete for this signature-free leaf: its first witness
 /// element is a truthy stack value followed by the Tapscript and control block.
+/// The leaf script and control block live only in `reveal_tx`'s witness —
+/// intermediate Taproot builder state is not retained after construction.
 #[derive(Clone, Debug)]
 pub struct Inscription {
     pub commit_tx: Transaction,
     pub reveal_tx: Transaction,
-    pub spend_info: TaprootSpendInfo,
-    pub leaf_script: ScriptBuf,
 }
 
 /// Build the exact §3.5 envelope leaf.
@@ -164,8 +164,6 @@ pub fn build_inscription(payload: &[u8], request: InscriptionRequest) -> Result<
     Ok(Inscription {
         commit_tx,
         reveal_tx,
-        spend_info,
-        leaf_script,
     })
 }
 
@@ -542,18 +540,21 @@ mod tests {
         let witness = inscription.reveal_tx.input[0].witness.to_vec();
         assert_eq!(witness.len(), 3);
         assert_eq!(witness[0], [0x01]);
-        assert_eq!(witness[1], inscription.leaf_script.as_bytes());
+        let leaf_script = ScriptBuf::from_bytes(witness[1].clone());
         let control = ControlBlock::decode(&witness[2]).expect("control block decodes");
         assert_eq!(control.leaf_version, LeafVersion::TapScript);
+        // p2tr scriptPubKey: OP_1 (0x51) || OP_PUSHBYTES_32 (0x20) || x-only key
+        let spk = commit_prevout.script_pubkey.as_bytes();
+        assert_eq!(spk.len(), 34);
+        assert_eq!(spk[0], 0x51);
+        assert_eq!(spk[1], 0x20);
+        let output_key =
+            bitcoin::XOnlyPublicKey::from_slice(&spk[2..34]).expect("p2tr x-only key");
         assert!(control.verify_taproot_commitment(
             &Secp256k1::verification_only(),
-            inscription.spend_info.output_key().to_x_only_public_key(),
-            &inscription.leaf_script,
+            output_key,
+            &leaf_script,
         ));
-        assert_eq!(
-            commit_prevout.script_pubkey,
-            ScriptBuf::new_p2tr_tweaked(inscription.spend_info.output_key())
-        );
         assert_eq!(
             inscription.reveal_tx.input[0].previous_output,
             OutPoint::new(inscription.commit_tx.compute_txid(), 0)
@@ -584,7 +585,8 @@ mod tests {
             .expect("marker payload");
         assert_eq!(extracted, payload);
 
-        let parsed = parse_instructions(inscription.leaf_script.as_bytes()).expect("script parses");
+        let leaf_bytes = inscription.reveal_tx.input[0].witness.to_vec()[1].clone();
+        let parsed = parse_instructions(&leaf_bytes).expect("script parses");
         let pushes: Vec<_> = parsed[2..parsed.len() - 1]
             .iter()
             .map(|instruction| {

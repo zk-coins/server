@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use crate::db;
 use crate::state::State;
@@ -9,14 +9,10 @@ use shared::commitment::Commitment;
 use shared::{Address, Invoice};
 use sqlx::PgPool;
 use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, HashDigest, ZERO_HASH};
-use zkcoins_program::inputs::CommitmentMerkleProofs;
-use zkcoins_program::merkle::merkle_mountain_range::MMR_MAX_DEPTH;
 use zkcoins_program::merkle::sparse_merkle_tree::{
-    InclusionProof, NonInclusionProof, SparseMerkleTree, DEFAULT_HASHES, TREE_DEPTH,
+    InclusionProof, SparseMerkleTree,
 };
-use zkcoins_program::types::{
-    calculate_coin_identifier, AccountState, Amount, AssetId, Coin, CoinTemplate, ProofData,
-};
+use zkcoins_program::types::{Amount, AssetId, Coin, ProofData};
 use zkcoins_prover::Proof;
 
 /// Composite account key for the neutral, permissionless multi-asset
@@ -26,11 +22,7 @@ use zkcoins_prover::Proof;
 /// `account.asset_id == transition.asset_id`, so an account can only
 /// ever hold its own asset, and an owner's holdings of different
 /// assets never share balance.
-pub type AccountKey = (Address, AssetId);
-
-/// Fixed in-circuit MMR proof depth. Must match
-/// [`zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN`].
-const MMR_PROOF_PATH_LEN: usize = MMR_MAX_DEPTH - 1;
+pub(crate) type AccountKey = (Address, AssetId);
 
 /// Outcome of [`AccountNode::canary_recursion`], the boot-time self-heal
 /// staleness probe.
@@ -56,7 +48,7 @@ pub struct CoinProof {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct Account {
+pub(crate) struct Account {
     pub proof: Option<Proof>,
     pub coin_queue: Vec<CoinProof>,
     pub coin_history: SparseMerkleTree,
@@ -137,81 +129,16 @@ fn zero_asset_id() -> AssetId {
 }
 
 impl Account {
-    /// Deep-clone an `Account` via bincode round-trip.
-    ///
-    /// `SparseMerkleTree` is not `Clone` (the upstream type in
-    /// `program-plonky2` deliberately keeps the API minimal), so we go
-    /// through the serialisation boundary the rest of this module
-    /// already exercises for persistence. The serialiser is the same
-    /// one [`AccountNode::serialize_account`] uses, so any future
-    /// change to the on-disk shape continues to be a single point of
-    /// truth.
-    ///
-    /// Returns the deserialised twin or a `bincode::Error` from the
-    /// round-trip. Both fallible arms are propagated up to the caller
-    /// (`AccountNode::prepare_mint`) which surfaces them as the
-    /// caller-facing "Failed to snapshot minting account" error.
-    ///
-    /// `coverage(off)`: only ever called from `AccountNode::prepare_mint`
-    /// (in `account_node.rs`) and from `flow::mint_flow` (which is in
-    /// the CI `--ignore-filename-regex`). The legacy `mint_handler`
-    /// integration tests exercised the happy path transitively; PR-#161
-    /// removed those handlers in favour of the Job-API and the
-    /// remaining caller chain is fully `coverage(off)`. Marked here so
-    /// the 100% gate does not flag the helper.
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    pub(crate) fn try_deep_clone(&self) -> Result<Self, bincode::Error> {
-        let bytes = bincode::serialize(self)?;
-        bincode::deserialize(&bytes)
-    }
-}
-
-/// Result of [`AccountNode::prepare_mint`]: the issuer-mint proof and
-/// the tentative mutated creator account (clone — not yet swapped into
-/// `self.accounts`).
-///
-/// Neutral, permissionless model: a mint is an issuer-signed Initial
-/// (or AccountUpdate) transition on the CREATOR's own
-/// `(owner, asset_id)` account that credits `amount` to the creator's
-/// OWN balance. There is no privileged minting account and no recipient
-/// coin — the supply lands in the creator's account. The two-phase
-/// flow returns the proof's `account_state_hash` / `output_coins_root`
-/// to the wallet (which signs them as a `Commitment`), then the
-/// commit leg enforces `commitment.public_key == creator_pubkey` (the
-/// off-circuit creator binding) and registers the asset_id ->
-/// creator_pubkey row before swapping the mutated account in.
-#[derive(Debug)]
-pub struct MintingPrepared {
-    /// The creator's `(owner, asset_id)` account after the mint, NOT
-    /// yet committed into `self.accounts`. Its `proof` is the new
-    /// issuer-mint proof; `commitment_public_key` stays `None` until
-    /// the wallet-signed commit leg lands.
-    pub mutated_account: Account,
-    /// The owner address (`H(creator_pubkey)`) of the creator account.
-    pub owner: Address,
-    /// The derived `asset_id` of the asset being minted.
-    pub asset_id: AssetId,
-    /// The issuer-mint proof. The wallet signs its
-    /// `account_state_hash || output_coins_root`; the commit leg
-    /// re-derives those from `proof` and verifies the creator's
-    /// signature against `account.public_key`.
-    pub proof: Proof,
-    /// The asset creator's compressed pubkey (`[u8; 33]`). The commit
-    /// leg checks the wallet-signed `commitment.public_key` equals this
-    /// (off-circuit creator binding) and registers it in the node-side
-    /// `asset_creators` table.
-    pub creator_pubkey: zkcoins_program::types::PublicKey,
-}
-
-impl Account {
-    pub fn new() -> Self {
+    #[cfg(test)]
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
         Self::new_for_asset(ZERO_HASH)
     }
 
     /// Create a fresh account scoped to a concrete `asset_id` (Model B).
     /// Display metadata (`name` / `decimals`) starts empty and is
     /// learned at mint time.
-    pub fn new_for_asset(asset_id: AssetId) -> Self {
+    pub(crate) fn new_for_asset(asset_id: AssetId) -> Self {
         Account {
             proof: None,
             coin_queue: vec![],
@@ -230,47 +157,9 @@ impl Account {
     /// Total: caller (`send_coins`) is responsible for upstream balance + slot-count validation;
     /// once that is done this function cannot fail. Returns `Vec<Coin>` directly so the call site
     /// has no dead `?` propagation path.
-    pub fn create_coins(
-        &self,
-        address: HashDigest,
-        next_public_key: PublicKey,
-        public_key: zkcoins_program::types::PublicKey,
-        coin_templates: Vec<CoinTemplate>,
-    ) -> Vec<Coin> {
-        let mut next_account_state = AccountState {
-            owner: address,
-            balance: self.get_balance(),
-            public_key,
-            asset_id: self.asset_id,
-        };
-        for coin_template in &coin_templates {
-            // Caller (send_coins) already validated balance >= total
-            // invoiced amount before reaching this function. The expect
-            // here is documentation of that invariant.
-            next_account_state.balance = next_account_state
-                .balance
-                .checked_sub(coin_template.amount)
-                .expect("balance was validated by send_coins");
-        }
 
-        let next_account_state_hash = next_account_state.hash();
-        let coins = coin_templates.into_iter().enumerate().map(|(i, template)| {
-            let id =
-                calculate_coin_identifier(next_account_state_hash, template.asset_id, i as u32);
-            Coin::new(template, id)
-        });
-        // Set the next public key.
-        let _ = next_public_key.serialize();
-        // next_account_state.public_key is intentionally not updated
-        // here because the caller (send_coins) sources `next_public_key`
-        // separately for the Prover witness — once Stage 5d-next-5
-        // Prover-API integration lands, this update + return will be
-        // wired through.
-        let _ = next_account_state;
-        coins.collect()
-    }
-
-    pub fn get_balance(&self) -> Amount {
+    #[cfg(test)]
+    pub(crate) fn get_balance(&self) -> Amount {
         self.coin_queue
             .iter()
             .fold(self.balance, |acc, x| acc + x.coin.amount)
@@ -293,7 +182,7 @@ pub struct AccountNode {
 /// [`AccountNode::assets_for_owner`] and the `GET /api/balance/:address`
 /// aggregation endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnedAsset {
+pub(crate) struct OwnedAsset {
     pub asset_id: AssetId,
     pub name: Option<String>,
     pub decimals: Option<u8>,
@@ -311,14 +200,14 @@ impl AccountNode {
     /// because every test in `account_node_tests.rs`,
     /// `router_tests.rs`, and `runtime_tests.rs` uses it to
     /// build a known-empty node before importing fixture accounts.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn new(state: Arc<Mutex<State>>) -> Self {
+        #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(state: Arc<Mutex<State>>) -> Self {
         Self::new_without_legacy_prover(state)
     }
 
     /// Production Stage-3 constructor: ledger + shared SMT/MMR state.
     /// Legacy `Prover` is deleted — residual mint/send prove methods refuse.
-    pub fn new_without_legacy_prover(state: Arc<Mutex<State>>) -> Self {
+    pub(crate) fn new_without_legacy_prover(state: Arc<Mutex<State>>) -> Self {
         AccountNode {
             accounts: HashMap::new(),
             state,
@@ -332,7 +221,7 @@ impl AccountNode {
     /// **Visibility (Stage 3 Runde 6):** `pub(crate)` — not on the public
     /// positive list. Downstream must not install arbitrary legacy ledger
     /// rows; production rehydrates only via [`Self::load_ledger_from_pg`].
-    pub(crate) fn import_account(&mut self, address: HashDigest, account: Account) {
+        pub(crate) fn import_account(&mut self, address: HashDigest, account: Account) {
         let key = (address, account.asset_id);
         self.accounts.insert(key, account);
     }
@@ -341,7 +230,7 @@ impl AccountNode {
     /// is always scoped to a single asset.
     // TODO: User needs to provide a signature and the salt and the secret information for the
     // address to authenticate.
-    pub fn get_account_balance(
+        pub(crate) fn get_account_balance(
         &self,
         account_address: &Address,
         asset_id: &AssetId,
@@ -356,7 +245,7 @@ impl AccountNode {
     }
 
     /// Every distinct owner address that holds at least one asset.
-    pub fn get_addresses(&self) -> Vec<Address> {
+        pub(crate) fn get_addresses(&self) -> Vec<Address> {
         let mut owners: Vec<Address> = self.accounts.keys().map(|(owner, _)| *owner).collect();
         // `HashDigest` (= `HashOut<F>`) is not `Ord`; sort by its
         // canonical 32-byte serialisation so the list is deterministic
@@ -369,17 +258,20 @@ impl AccountNode {
     /// Aggregate every asset an owner holds into a per-asset balance
     /// list. Backs the `GET /api/balance/:address` endpoint. Returns
     /// an empty vec for an owner with no accounts.
-    pub fn assets_for_owner(&self, owner: &Address) -> Vec<OwnedAsset> {
+        pub(crate) fn assets_for_owner(&self, owner: &Address) -> Vec<OwnedAsset> {
         let mut out: Vec<OwnedAsset> = self
             .accounts
             .iter()
             .filter(|((o, _), _)| o == owner)
-            .map(|((_, asset_id), account)| OwnedAsset {
-                asset_id: *asset_id,
-                name: account.name.clone(),
-                decimals: account.decimals,
-                balance: account.get_balance(),
-                num_sends: account.num_sends,
+            .filter_map(|((owner, asset_id), account)| {
+                let balance = self.get_account_balance(owner, asset_id).ok()?;
+                Some(OwnedAsset {
+                    asset_id: *asset_id,
+                    name: account.name.clone(),
+                    decimals: account.decimals,
+                    balance,
+                    num_sends: account.num_sends,
+                })
             })
             .collect();
         // Deterministic order so the wire response is stable across
@@ -396,7 +288,7 @@ impl AccountNode {
     /// bookkeeping path is **refused** — a receive must go through the
     /// v1.1 transition (`crate::v1::receive`). Silent fall-back would
     /// credit a coin no compliance proof can justify.
-    pub fn receive_coin(&mut self, coin_proof: CoinProof) -> Result<(), &'static str> {
+    pub(crate) fn receive_coin(&mut self, coin_proof: CoinProof) -> Result<(), &'static str> {
         crate::v1::refuse_legacy_receive_under_v1()?;
         let recipient = coin_proof.coin.recipient;
         let asset_id = coin_proof.coin.asset_id;
@@ -476,77 +368,7 @@ impl AccountNode {
         Ok(())
     }
 
-    /// Get all required merkle proofs from the state for the public key and the previous proof.
-    /// Static method: does not access self.accounts, only the state guard.
-    ///
-    /// The returned bundle is shaped for in-circuit consumption: MMR
-    /// proofs are pre-extended to [`MMR_PROOF_PATH_LEN`] siblings and
-    /// the SMT inclusion proof carries the full [`TREE_DEPTH`]
-    /// siblings (the off-circuit SMT produces this length by
-    /// construction).
-    fn get_merkle_proofs(
-        previous_proof: Proof,
-        public_key: PublicKey,
-        state: &MutexGuard<'_, State>,
-    ) -> Result<CommitmentMerkleProofs, &'static str> {
-        let account_merkle_proofs = state
-            .get_commitment_proof(&public_key)
-            .or(Err("Unable to get merkle proofs for provided public key"))?;
-
-        // PLONKY2 MIGRATION (Step 7): see `receive_coin` for the
-        // bridge from SP1's `public_values` to Plonky2's `public_inputs`.
-        let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
-            previous_proof.public_inputs
-                [..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
-                .try_into()
-                .map_err(|_| "Proof public_inputs too short")?;
-        let proof_data = ProofData::from_field_elements(&pis);
-        let _ = previous_proof; // silence unused-mut warning
-        let previous_root = proof_data.commitment_history_root;
-        let previous_root_proof = state.get_mmr_inclusion_proof(previous_root).or(Err(
-            "Unable to get mmr inclusion proof for the previous root",
-        ))?;
-
-        let proofs = CommitmentMerkleProofs {
-            commitment_root: account_merkle_proofs.2,
-            commitment_proof: account_merkle_proofs.1,
-            // Pad MMR proofs to the fixed depth the in-circuit gadget
-            // expects (`MMR_PROOF_PATH_LEN`). Off-circuit MMR proofs
-            // have variable depth equal to log2(capacity).
-            commitment_root_history_proof: account_merkle_proofs.3.extend_to(MMR_PROOF_PATH_LEN),
-            commitment_root_mmr_sibling: state.prev_mmr_root,
-            previous_root_history_proof: (
-                previous_root_proof.0,
-                previous_root_proof.1.extend_to(MMR_PROOF_PATH_LEN),
-            ),
-            commitment_account_state_hash: proof_data.account_state_hash,
-            commitment_out_coins_root: proof_data.output_coins_root,
-        };
-
-        Ok(proofs)
-    }
-
-    /// Build a syntactically-valid but semantically-empty
-    /// `NonInclusionProof` for inactive in-coin / out-coin slots.
-    /// The slot's `active = false` bit masks the in-circuit check.
-    fn dummy_nip() -> NonInclusionProof {
-        NonInclusionProof {
-            key: [0u8; 32],
-            root: ZERO_HASH,
-            siblings: vec![ZERO_HASH; TREE_DEPTH],
-        }
-    }
-
-    fn dummy_coin() -> Coin {
-        Coin {
-            identifier: ZERO_HASH,
-            recipient: ZERO_HASH,
-            amount: 0,
-            asset_id: ZERO_HASH,
-        }
-    }
-
-    pub fn send_coins(
+    pub(crate) fn send_coins(
         &mut self,
         invoices: Vec<Invoice>,
         account_address: Address,
@@ -615,14 +437,14 @@ impl AccountNode {
     /// by the `router_tests` mint integration suite.
     #[cfg_attr(coverage_nightly, coverage(off))]
     #[allow(clippy::too_many_arguments)]
-    pub fn prepare_mint(
+    pub(crate) fn prepare_mint(
         &self,
         creator_pubkey: &zkcoins_program::types::PublicKey,
         name: &str,
         decimals: u8,
         amount: u64,
         next_public_key: &zkcoins_program::types::PublicKey,
-    ) -> Result<MintingPrepared, &'static str> {
+    ) -> Result<(), &'static str> {
         let _ = (creator_pubkey, name, decimals, amount, next_public_key, self);
         Err(
             "legacy prepare_mint deleted (Stage 3): circuit::main builders and Prover are gone; use begin_v1_mint / StateEngine",
@@ -696,148 +518,9 @@ impl AccountNode {
     /// reference implementation that produced the numbers above; keep
     /// the witness shape (fresh `AccountState::new(_)` + `ZERO_HASH`) in
     /// sync if either side changes.
-    pub fn warmup_prover(&self) -> anyhow::Result<()> {
+    pub(crate) fn warmup_prover(&self) -> anyhow::Result<()> {
         // Stage 3: legacy Prover deleted. v1 proves warm via ProverBridge.
         Ok(())
-    }
-
-
-    /// Boot-time self-heal canary: does a persisted proof still recurse
-    /// through the CURRENT circuit's AccountUpdate (cyclic) branch?
-    ///
-    /// This is the RELIABLE staleness detector. A breaking circuit
-    /// change invalidates every persisted proof: the next `/api/mint` or
-    /// `/api/send` feeds the stale proof as the recursive inner proof and
-    /// the new circuit's witness generator aborts with a copy-constraint
-    /// conflict ("Partition … was set twice with different values"),
-    /// surfaced to the wallet as "prove failed". Crucially this can
-    /// happen while the verifier-key `circuit_digest` is UNCHANGED (so
-    /// [`Prover::verify`] and a raw digest comparison both pass) — the
-    /// only thing that reliably reproduces it is running the actual
-    /// recursive prove, which is what this does.
-    ///
-    /// It mirrors the production prove path in [`Self::send_coins_inner`]
-    /// for the AccountUpdate branch with all coin slots inactive: it
-    /// reuses the persisted `account.proof` as the inner proof and the
-    /// REAL [`CommitmentMerkleProofs`] derived from the loaded SMT/MMR
-    /// via [`Self::get_merkle_proofs`] — the same witnesses the next user
-    /// transition would build — so a circuit-compatible proof recurses
-    /// cleanly (the canary does NOT false-positive) and only a genuinely
-    /// stale proof fails.
-    ///
-    /// Surrounding `AccountState`: the REAL persisted account state is
-    /// rebuilt exactly as the production prove path does in
-    /// [`Self::send_coins_inner`] (`account_state_for_prove`): `owner` =
-    /// the account address (the `self.accounts` map key), `balance` =
-    /// `account.balance`, `public_key` = the account's CURRENT key — the
-    /// key the NEXT transition would witness as its `public_key`, supplied
-    /// by the `current_pubkey_for` resolver (handed the already-held SMT;
-    /// for the minting account it returns
-    /// `generate_public_key(derive_num_pubkeys_from_smt(.., smt))`, exactly
-    /// what `mint_flow` passes). This is deliberately NOT the persisted
-    /// `commitment_public_key`: the AccountUpdate branch enforces two
-    /// arithmetic equality constraints on a circuit-compatible recursion
-    /// (see `program-plonky2/src/circuit/main.rs`): SPEC §8(b)
-    /// `account_state_hash == prev_account_state_hash` (the inner proof's
-    /// committed state-hash PI) and SPEC §8(c) `account_state_hash ==
-    /// cmp.commitment_account_state_hash` (read back from that same inner
-    /// proof's PI by [`Self::get_merkle_proofs`], which sets
-    /// `commitment_account_state_hash: proof_data.account_state_hash`).
-    /// Both reference `account.proof`'s state-hash PI, which the circuit
-    /// computes as `final_account_state_hash` using the producing
-    /// transition's `next_public_key` (the key it rotated TO) — NOT the
-    /// key it started from. The producing transition's `next_public_key`
-    /// equals the next transition's `public_key` (the rotation chain), so
-    /// the resolver's current key is precisely the preimage whose hash
-    /// matches that PI. `commitment_public_key` (the producing
-    /// transition's FROM-key) is still used — but only to look the
-    /// COMMITMENT up in the SMT via `get_merkle_proofs`, mirroring how
-    /// `send_coins_inner` resolves `prev_cmp`. Feeding the correct current
-    /// key makes BOTH §8(b)/(c) satisfiable, so for a circuit-compatible
-    /// proof the ONLY remaining prove-time failure path is the recursion
-    /// copy-constraint that `set_proof_with_pis` imposes on the inner
-    /// proof — which is exactly what a breaking circuit change violates.
-    /// The previous implementation used a synthetic `{ owner: ZERO_HASH,
-    /// balance: 0 }` state, which violated §8(b)/(c); that it still proved
-    /// `Ok` relied on the fragile Plonky2 invariant that arithmetic gate
-    /// constraints are not checked at witness/prove time (only copy
-    /// constraints are). Using the real state removes that dependency:
-    /// `Err ⇒ Stale` now hangs solely on the recursion copy-constraint,
-    /// not on which constraints Plonky2 happens to evaluate at prove time.
-    /// An earlier draft of this fix used `commitment_public_key` for the
-    /// account-state pubkey and false-positived (`Stale`) on a genuinely
-    /// compatible digest-less DB — the live positive control (Schritt 3b)
-    /// caught it; the rotation analysis above is why the current key is
-    /// correct. The produced proof is discarded — no state is mutated and
-    /// nothing is broadcast.
-    ///
-    /// The POSITIVE direction (a genuinely circuit-COMPATIBLE but
-    /// digest-less DB ⇒ [`CanaryOutcome::Compatible`], NOT a
-    /// false-positive `Stale` that would wipe a healthy production node on
-    /// its first boot after adopting this fix) is proven empirically by
-    /// the live boot-gate positive control documented in the PR: boot a
-    /// node, mint/send to produce a recursable proof, `DELETE FROM
-    /// circuit_digest_meta`, reboot the SAME build — the canary returns
-    /// `Compatible`, the digest is baselined and accounts are preserved.
-    ///
-    /// Accounts whose commitment cannot be resolved in the loaded SMT
-    /// (e.g. a pubkey not yet indexed) are skipped — that is a
-    /// state-derivation gap, not circuit staleness — and the next
-    /// proof-carrying account is tried. The first account whose proof
-    /// recurses cleanly returns [`CanaryOutcome::Compatible`]; the first
-    /// whose recursion fails returns [`CanaryOutcome::Stale`]; if no
-    /// account yields a usable sample (fresh DB, or no resolvable
-    /// commitment) it returns [`CanaryOutcome::NoSample`].
-    ///
-    /// Staleness-detection invariant (append-only PI slots): the canary
-    /// recurses every persisted proof through [`Self::get_merkle_proofs`],
-    /// which reads `previous_proof.public_inputs[..N_PROOF_DATA_PUBLIC_INPUTS]`.
-    /// This assumes the first `N_PROOF_DATA_PUBLIC_INPUTS` proof-data PI
-    /// slots stay APPEND-ONLY across circuit changes. A future circuit
-    /// change that REORDERS those low slots (e.g. moves slots 0..16) would
-    /// make `get_merkle_proofs` `Err` for every sample ⇒ every account
-    /// skipped ⇒ `NoSample` ⇒ `Baseline` ⇒ no reset despite genuine
-    /// staleness (a False Negative). Any such reordering MUST update the
-    /// canary in lockstep. We deliberately do NOT map `NoSample` ⇒
-    /// `Stale`: a `NoSample` from a benign state-derivation gap on an
-    /// otherwise-healthy node must NOT trigger a full genesis wipe, so the
-    /// data-loss-safe direction is `NoSample` ⇒ `Baseline` (no reset).
-    /// When proof-carrying accounts exist but ALL were skipped via a
-    /// `get_merkle_proofs` `Err`, a `tracing::warn!` is emitted so the
-    /// operator can see the canary produced no sample on a non-empty DB.
-    ///
-    /// `coverage(off)`: called only from the boot path in `main.rs`
-    /// (which is in the CI `--ignore-filename-regex`), and it runs a
-    /// real ~5 s recursive prove against a recursable persisted proof +
-    /// the loaded SMT/MMR — neither cheap nor reconstructible in a unit
-    /// test. Both directions are validated by the live boot-gate repro
-    /// (negative: DEV dump ⇒ `Stale`; positive: digest-less compatible DB
-    /// ⇒ `Compatible`), documented in the PR. The pure decision logic it
-    /// feeds ([`crate::self_heal::reset_decision`]) is covered exhaustively.
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    pub fn canary_recursion(
-        &self,
-        current_pubkey_for: &dyn Fn(&Address, &SparseMerkleTree) -> Option<PublicKey>,
-    ) -> CanaryOutcome {
-        let _ = current_pubkey_for;
-        tracing::warn!(
-            "self-heal canary: legacy Prover deleted (Stage 3); returning NoSample — use v1::v1_canary_for_heal on the production boot"
-        );
-        CanaryOutcome::NoSample
-    }
-
-
-    /// Consume this `AccountNode`, returning its optional pre-built
-    /// legacy [`Prover`].
-    ///
-    /// Stage 3 production boot carries `None` (no `Prover::new`). Legacy
-    /// self-heal reload paths that still inject a prover recover it here.
-    ///
-    /// `coverage(off)`: only residual legacy boot / test reload paths.
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    pub fn take_prover(self) -> Option<()> {
-        let _ = self;
-        None
     }
 
     /// Shared SMT/MMR handle for crate-internal residual paths.
@@ -854,7 +537,7 @@ impl AccountNode {
     /// Borrow a single `(owner, asset_id)` account. Returned for
     /// read-only inspection (e.g. snapshotting a freshly mutated
     /// `Account` for persistence outside the lock).
-    pub fn get_account(&self, address: &Address, asset_id: &AssetId) -> Option<&Account> {
+    pub(crate) fn get_account(&self, address: &Address, asset_id: &AssetId) -> Option<&Account> {
         self.accounts.get(&(*address, *asset_id))
     }
 
@@ -874,7 +557,7 @@ impl AccountNode {
     /// path; if a future field gains a fallible serializer, switch
     /// this back to `Result` and propagate through the existing
     /// `PersistAccountError::Serialize` variant.
-    pub fn serialize_account(account: &Account) -> Vec<u8> {
+    pub(crate) fn serialize_account(account: &Account) -> Vec<u8> {
         bincode::serialize(account)
             .expect("bincode::serialize cannot fail for the current Account shape")
     }
@@ -891,13 +574,13 @@ impl AccountNode {
     /// absent minting row. Returning the rebuilt map here keeps this
     /// constructor a pure "rehydrate everything that was persisted"
     /// call with no side effects.
-    pub async fn load_from_pg(
+    pub(crate) async fn load_from_pg(
         state: Arc<Mutex<State>>,
         pool: &PgPool,
         _prover: Option<()>,
     ) -> Result<Self, LoadAccountNodeError> {
         let rows = db::load_all_accounts(pool).await?;
-        let mut accounts: HashMap<AccountKey, Account> = HashMap::with_capacity(rows.len());
+        let mut node = AccountNode::new_without_legacy_prover(state);
         for (key_bytes, data_bytes) in rows {
             // The persisted `accounts.address` column now stores the
             // 64-byte composite key `owner(32) || asset_id(32)` (Model
@@ -914,12 +597,24 @@ impl AccountNode {
             let owner = digest_from_bytes(&owner_arr);
             let asset_id = digest_from_bytes(&asset_arr);
             let account: Account = bincode::deserialize(&data_bytes)?;
-            accounts.insert((owner, asset_id), account);
+            // Route through import_account so the sealed ledger write
+            // surface stays a single function (boot rehydrate + tests).
+            let _ = asset_id; // key is account.asset_id inside import_account
+            node.import_account(owner, account);
         }
-        Ok(AccountNode {
-            accounts,
-            state,
-        })
+        // Boot observability: owner cardinality from the sealed read surface.
+        let owners = node.get_addresses();
+        let sample_assets = owners
+            .first()
+            .map(|o| node.assets_for_owner(o).len())
+            .unwrap_or(0);
+        tracing::info!(
+            owners = owners.len(),
+            accounts = node.accounts.len(),
+            sample_owner_assets = sample_assets,
+            "AccountNode ledger rehydrated from Postgres"
+        );
+        Ok(node)
     }
 
     /// Stage-3 production load: ledger only, **no** legacy [`Prover`].
@@ -1005,6 +700,13 @@ impl From<bincode::Error> for LoadAccountNodeError {
 /// positive list. External crates must not write the legacy `accounts`
 /// table. The SQL sink is additionally gated by
 /// `require_legacy_stack_mode_in_tx`.
+///
+/// Residual Stage-4 sink: production boot rehydrates via
+/// [`AccountNode::load_ledger_from_pg`]; live mutators go through
+/// `upsert_account_with_source`. Kept `pub(crate)` so the compile-fail
+/// matrix can name the sealed free function (same posture as
+/// [`AccountNode::new`]).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn persist_account(
     pool: &PgPool,
     address: &Address,
@@ -1012,7 +714,7 @@ pub(crate) async fn persist_account(
 ) -> Result<usize, PersistAccountError> {
     let bytes = AccountNode::serialize_account(account);
     let key_bytes = account_key_bytes(address, &account.asset_id);
-    db::upsert_account(pool, &key_bytes, &bytes).await?;
+    db::upsert_account_with_source(pool, &key_bytes, &bytes, "scanner").await?;
     Ok(bytes.len())
 }
 
@@ -1021,7 +723,7 @@ pub(crate) async fn persist_account(
 /// stores under Model B. The single canonical encoding shared by every
 /// persistence call site (`persist_account`, the send/receive upserts
 /// in `flow.rs`, and the mint commit bundle).
-pub fn account_key_bytes(owner: &Address, asset_id: &AssetId) -> [u8; 64] {
+pub(crate) fn account_key_bytes(owner: &Address, asset_id: &AssetId) -> [u8; 64] {
     let mut out = [0u8; 64];
     out[..32].copy_from_slice(&digest_to_bytes(owner));
     out[32..].copy_from_slice(&digest_to_bytes(asset_id));
@@ -1034,7 +736,8 @@ pub fn account_key_bytes(owner: &Address, asset_id: &AssetId) -> [u8; 64] {
 /// is therefore unwrapped inside `serialize_account` rather than
 /// propagated here.
 #[derive(Debug)]
-pub enum PersistAccountError {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum PersistAccountError {
     /// The Postgres upsert failed (connect, transaction, decode).
     Db(sqlx::Error),
 }

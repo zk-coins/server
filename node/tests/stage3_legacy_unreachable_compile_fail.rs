@@ -2,7 +2,8 @@
 //!
 //! 1. `LegacyCommitmentScanCap` cannot be obtained (private field / test mint).
 //! 2. Legacy `Prover` type is **deleted** (not sealed).
-//! 3. Public free builders `build_circuit` / `prove_*` / `verify` are gone.
+//! 3. Public free builders `build_circuit` / `prove_*` / `verify` are **deleted**
+//!    (Stage 4) — no trybuild seal for a symbol that no longer exists.
 //!
 //! **One UI file, one expected error** (B3) — partial weakenings cannot mask.
 //! trybuild flattens this host package's direct deps into the UI crate.
@@ -23,30 +24,6 @@ fn legacy_commitment_scan_cap_mint_unobtainable() {
 fn prover_type_is_deleted() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/prover_type_unobtainable.rs");
-}
-
-#[test]
-fn legacy_build_circuit_is_unobtainable() {
-    let t = trybuild::TestCases::new();
-    t.compile_fail("tests/ui/legacy_build_circuit_unobtainable.rs");
-}
-
-#[test]
-fn legacy_prove_initial_is_unobtainable() {
-    let t = trybuild::TestCases::new();
-    t.compile_fail("tests/ui/legacy_prove_initial_unobtainable.rs");
-}
-
-#[test]
-fn legacy_prove_account_update_is_unobtainable() {
-    let t = trybuild::TestCases::new();
-    t.compile_fail("tests/ui/legacy_prove_account_update_unobtainable.rs");
-}
-
-#[test]
-fn legacy_verify_is_unobtainable() {
-    let t = trybuild::TestCases::new();
-    t.compile_fail("tests/ui/legacy_verify_unobtainable.rs");
 }
 
 #[test]

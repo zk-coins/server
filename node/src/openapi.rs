@@ -43,10 +43,9 @@ use crate::db::{InscriptionKind, InscriptionSummary};
 use crate::job_store::JobStatus;
 use crate::router::{
     BalanceResponse, BitcoinNetwork, Capabilities, CommitRequest, HistoryErrorResponse,
-    HistoryItem, HistoryResponse, InfoResponse, JobErrorResponse, JobStatusResponse,
-    LnurlErrorResponse, MintRequest, PublisherHealthErrorResponse, PublisherHealthResponse,
-    ReadyResponse, RootEndpoints, RootResponse, SendCoinRequest, SendCoinResponse, TxDetail,
-    UsernameResponse,
+    InfoResponse, JobErrorResponse, JobStatusResponse, LnurlErrorResponse, MintRequest,
+    PublisherHealthErrorResponse, PublisherHealthResponse, ReadyResponse, RootEndpoints,
+    RootResponse, SendCoinRequest, SendCoinResponse, UsernameResponse,
 };
 
 #[cfg(feature = "address-list")]
@@ -137,10 +136,7 @@ pub const DOCS_HTML: &str = concat!(
         BitcoinNetwork,
         Capabilities,
         BalanceResponse,
-        HistoryResponse,
-        HistoryItem,
         HistoryErrorResponse,
-        TxDetail,
         SendCoinRequest,
         SendCoinResponse,
         MintRequest,
@@ -154,7 +150,7 @@ pub const DOCS_HTML: &str = concat!(
         InscriptionKind,
     )),
 )]
-pub struct ApiDoc;
+pub(crate) struct ApiDoc;
 
 /// Feature-gated path additions and schema registrations. Implemented
 /// as a thin compile-time-conditional extension of [`ApiDoc`] so the
@@ -187,7 +183,7 @@ struct LnurlDoc;
 
 /// Build the complete OpenAPI document for this binary, merging in
 /// every feature-gated sub-doc that the build enables.
-pub fn build_openapi() -> utoipa::openapi::OpenApi {
+pub(crate) fn build_openapi() -> utoipa::openapi::OpenApi {
     #[allow(unused_mut)]
     let mut doc = ApiDoc::openapi();
     #[cfg(feature = "address-list")]
@@ -218,7 +214,7 @@ pub fn openapi_json() -> &'static str {
 }
 
 /// `GET /openapi.json` — return the cached OpenAPI 3.x document.
-pub async fn openapi_json_handler() -> impl IntoResponse {
+pub(crate) async fn openapi_json_handler() -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -227,7 +223,7 @@ pub async fn openapi_json_handler() -> impl IntoResponse {
 }
 
 /// `GET /docs` — return the static Swagger UI page.
-pub async fn docs_handler() -> impl IntoResponse {
+pub(crate) async fn docs_handler() -> impl IntoResponse {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -260,7 +256,7 @@ pub(crate) fn swagger_ui_config() -> Arc<Config<'static>> {
 /// therefore correct here: a panic would only fire if either
 /// invariant were violated by a future upstream change, and the
 /// readiness probe would surface that within minutes.
-pub async fn swagger_asset_handler(Path(file): Path<String>) -> Response {
+pub(crate) async fn swagger_asset_handler(Path(file): Path<String>) -> Response {
     match utoipa_swagger_ui::serve(&file, swagger_ui_config())
         .expect("utoipa-swagger-ui::serve cannot error for our bundled, no-oauth config")
     {

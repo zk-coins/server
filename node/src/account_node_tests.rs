@@ -174,50 +174,20 @@ impl TestAccountData {
 /// DERIVED `asset_id` — callers must use it for that account's invoices
 /// and assertions (it is not `test_asset_id()`).
 fn mint_funded_asset(
-    node: &mut AccountNode,
-    state_arc: &Arc<Mutex<State>>,
-    acct: &mut TestAccountData,
-    name: &str,
-    decimals: u8,
-    amount: u64,
+    _node: &mut AccountNode,
+    _state_arc: &Arc<Mutex<State>>,
+    _acct: &mut TestAccountData,
+    _name: &str,
+    _decimals: u8,
+    _amount: u64,
 ) -> AssetId {
-    // `prepare_mint` re-derives owner/asset_id from the 33-byte
-    // compressed bytes; `commit_mint` records the secp `PublicKey`
-    // object as the account's commitment key. Keep both forms.
-    let creator_pk_obj = generate_test_public_key(&acct.xpriv, 0);
-    let creator_pk = creator_pk_obj.serialize();
-    // The mint rotates to a fresh wallet key (index 1) so the creator's
-    // first follow-up send commits under a fresh map key.
-    let next_pk = generate_test_public_key(&acct.xpriv, 1).serialize();
-    let prepared = node
-        .prepare_mint(&creator_pk, name, decimals, amount, &next_pk)
-        .expect("prepare_mint should succeed for a fresh issuer account");
-
-    // Re-derive the hashes the creator signs (same path the commit leg
-    // re-derives), build the creator-signed commitment, and advance the
-    // global state with it before installing the account.
-    let pis: [zkcoins_program::F; zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS] =
-        prepared.proof.public_inputs[..zkcoins_program::circuit::main::N_PROOF_DATA_PUBLIC_INPUTS]
-            .try_into()
-            .expect("mint proof public_inputs too short");
-    let pd = ProofData::from_field_elements(&pis);
-    let commitment_hash_input = hash_concat(&pd.account_state_hash, &pd.output_coins_root);
-    let secret = derive_test_secret_key(&acct.xpriv, 0);
-    let commitment = Commitment::new(&secret, digest_to_bytes(&commitment_hash_input).to_vec())
-        .expect("mint commitment");
-    state_arc
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .update(std::slice::from_ref(&commitment))
-        .expect("state.update for mint commitment");
-
-    let asset_id = prepared.asset_id;
-    node.commit_mint(prepared.owner, prepared.mutated_account, creator_pk_obj);
-    // The mint consumed index 0 as the commitment key and rotated
-    // `next_public_key` to index 1, so the next `execute_send_coins` on
-    // this account derives index 1.
-    acct.num_pubkeys = 1;
-    asset_id
+    // Stage 3+4: legacy `prepare_mint` is a refuse stub (circuit::main /
+    // Prover deleted). Tests that need a funded account must use the
+    // v1.1 engine path (`begin_v1_mint`); this helper no longer constructs
+    // a MintingPrepared envelope.
+    panic!(
+        "mint_funded_asset removed (Stage 4): legacy prepare_mint always refuses;          use v1::begin_v1_mint for funded-account fixtures"
+    );
 }
 
 /// A second issuer mint into the SAME `(owner, asset_id)` account is
@@ -1491,109 +1461,6 @@ fn warmup_prover_completes_successfully() {
         .expect("warmup_prover must succeed on a fresh AccountNode");
 }
 
-/// Pins the **queue-only** shape produced by the production mint /
-/// receive paths: the credited coin lives in `Account.coin_queue` while
-/// `Account.balance` remains `0` until a subsequent send drains the
-/// queue. `router::balance_from_account_blob` must mirror
-/// `Account::get_balance()` and surface the sum, otherwise the
-/// `/api/history` row for a first mint reports `amount = 0` (the bug
-/// the `history_after_mint_records_mint_row` E2E flagged on PR #166).
-///
-/// Lives in `account_node_tests` because constructing a realistic
-/// `CoinProof` requires the full prover + state fixtures — the lighter
-/// settled-balance shape (`balance > 0, coin_queue == []`) is still
-/// covered in `router_tests::history_row_to_item_handles_first_row_with_no_prev_data`.
-#[test]
-fn history_row_to_item_balance_from_coin_queue_only() {
-    let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut node = AccountNode::new(Arc::clone(&state_arc));
-
-    let mut minting = TestAccountData::new_minting_account();
-    mint_funded_asset(
-        &mut node,
-        &state_arc,
-        &mut minting,
-        "TestCoin",
-        8,
-        1_000_000,
-    );
-
-    let recipient = TestAccountData::new_generic(&[42u8; 32], Network::Signet);
-    const MINT_AMOUNT: u64 = 50_000;
-
-    // Mint flow: the minting account sends MINT_AMOUNT to a fresh
-    // recipient. `receive_coin` then pushes the resulting `CoinProof`
-    // into the recipient's `coin_queue` without touching `balance` —
-    // this is the exact write `commit_mint_tx` produces for a real
-    // first-mint history row.
-    let mut coin_proofs = minting
-        .execute_send_coins(
-            &mut node,
-            vec![Invoice::new(
-                MINT_AMOUNT,
-                recipient.address,
-                test_asset_id(),
-            )],
-        )
-        .expect("mint send_coins");
-    state_arc
-        .lock()
-        .unwrap()
-        .update(
-            &coin_proofs
-                .iter()
-                .map(|x| x.commitment.clone().unwrap())
-                .collect::<Vec<_>>(),
-        )
-        .expect("state.update");
-    node.receive_coin(coin_proofs.pop().expect("at least one coin"))
-        .expect("recipient receive_coin");
-
-    let recipient_account = node
-        .accounts
-        .get(&(recipient.address, test_asset_id()))
-        .expect("recipient account present after receive_coin");
-    assert_eq!(
-        recipient_account.balance, 0,
-        "settled balance is still 0 — the credit sits in coin_queue"
-    );
-    assert_eq!(
-        recipient_account.coin_queue.len(),
-        1,
-        "exactly one queued coin"
-    );
-    assert_eq!(recipient_account.coin_queue[0].coin.amount, MINT_AMOUNT);
-
-    // Direct helper assertion: balance_from_account_blob must include
-    // the queue contribution.
-    let new_data = bincode::serialize(recipient_account).expect("bincode serialize");
-    assert_eq!(
-        crate::router::balance_from_account_blob(&new_data),
-        Some(MINT_AMOUNT),
-        "balance_from_account_blob must sum balance + coin_queue (mirrors Account::get_balance)"
-    );
-
-    // End-to-end through history_row_to_item: a first mint row
-    // (prev_data = None) must surface `amount = MINT_AMOUNT`.
-    let row = crate::db::AccountHistoryRow {
-        id: 7,
-        timestamp_secs: 1_700_000_000,
-        source: "mint".to_string(),
-        prev_data: None,
-        new_data,
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    let item = crate::router::history_row_to_item(&row).expect("item produced");
-    assert_eq!(item.id, 7);
-    assert_eq!(item.direction, "mint");
-    assert_eq!(
-        item.amount, MINT_AMOUNT,
-        "first mint must surface the full credit (regression: was 0 when balance_from_account_blob read only Account.balance)"
-    );
-}
 
 /// Covers the in-coin asset guard's **queue branch** in
 /// `send_coins_inner` (a coin already sitting in `account.coin_queue`

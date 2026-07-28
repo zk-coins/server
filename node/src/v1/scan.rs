@@ -72,7 +72,7 @@
 //! state.
 
 use anyhow::{bail, Context, Result};
-use shared::spec_v1::{ChainPosition, FoldOutcome, PublishedNullifier};
+use shared::spec_v1::{ChainPosition, PublishedNullifier};
 use zkcoins_prover::state_engine::StateEngine;
 
 use super::adapter::EngineAdapter;
@@ -88,7 +88,7 @@ pub struct FoldStats {
 
 /// Sort key = declaration order of [`ChainPosition`]:
 /// `(height, tx_index, vin_index, member_index)`.
-pub fn sort_canonical(survivors: &mut [PublishedNullifier]) {
+pub(crate) fn sort_canonical(survivors: &mut [PublishedNullifier]) {
     survivors.sort_by_key(|n| n.chain_pos);
 }
 
@@ -176,7 +176,7 @@ pub(crate) fn fold_survivors_into_engine(
 ///
 /// Used by the reorg path so the engine can be reconstructed via
 /// [`super::db_v1::EngineSnapshot`] (accounts stay byte-identical).
-pub fn first_occurrence_nflog_pairs(
+pub(crate) fn first_occurrence_nflog_pairs(
     activation_height: u64,
     survivors: &[PublishedNullifier],
 ) -> Result<(Vec<(ChainPosition, shared::spec_v1::NfLogEntry)>, FoldStats)> {
@@ -357,7 +357,7 @@ pub async fn apply_canonical_survivors(
 
 /// §3.9: reorgs of **up to 5 blocks** are tolerated (non-final only).
 /// Depth ≥ 6 is outside v1's recovery guarantee (finality = 6 confirmations).
-pub const MAX_RECOVERABLE_REORG_DEPTH: u64 = 5;
+pub(crate) const MAX_RECOVERABLE_REORG_DEPTH: u64 = 5;
 
 /// A block resolved by hash from bitcoind (or a test double).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -800,7 +800,7 @@ pub fn reconcile_persisted_tip(
 
 /// Fold-key type used by the v1.1 scan loop to skip already-applied
 /// survivors after a still-canonical restart.
-pub type FoldedSurvivorKey = (u64, u32, u32, u32, [u8; 32]);
+pub(crate) type FoldedSurvivorKey = (u64, u32, u32, u32, [u8; 32]);
 
 /// Seed the in-process folded-key set from a persisted NfLog mirror so a
 /// still-canonical restart does not re-append first-occurrence winners.
@@ -823,7 +823,8 @@ pub fn folded_keys_from_nflog_mirror(
 
 /// Build [`PublishedNullifier`] rows for one multi-member inscription at a
 /// fixed chain position (member_index = 0..n-1). Test and synthetic helper.
-pub fn members_to_published(
+#[cfg(test)]
+pub(crate) fn members_to_published(
     height: u64,
     tx_index: u32,
     vin_index: u32,
@@ -846,25 +847,12 @@ pub fn members_to_published(
     Ok(out)
 }
 
-/// Drain one `scan_to_tip` report into the adapter (forward-only helper).
-///
-/// Full reorg detection is owned by `zkcoins_prover::scanner::Scanner`;
-/// when its report carries a reorg outcome the caller must invoke
-/// [`apply_canonical_survivors`] with the complete post-reorg survivor
-/// list instead of this forward-only path.
-pub fn fold_outcome_label(outcome: FoldOutcome) -> &'static str {
-    match outcome {
-        FoldOutcome::Appended(_) => "appended",
-        FoldOutcome::DuplicateIgnored => "duplicate_ignored",
-        FoldOutcome::BelowActivationHeight => "below_activation",
-    }
-}
 
 /// Env keys required to connect the script-plonky2 bitcoind scanner.
 /// Missing any of them fails loud under v1.1 mode — never fall back to
 /// the Esplora commitment scanner.
-pub const V1_SCANNER_RPC_URL_ENV: &str = "ZKCOINS_V1_BITCOIND_RPC_URL";
-pub const V1_SCANNER_COOKIE_ENV: &str = "ZKCOINS_V1_BITCOIND_COOKIE_PATH";
+pub(crate) const V1_SCANNER_RPC_URL_ENV: &str = "ZKCOINS_V1_BITCOIND_RPC_URL";
+pub(crate) const V1_SCANNER_COOKIE_ENV: &str = "ZKCOINS_V1_BITCOIND_COOKIE_PATH";
 
 /// Resolve bitcoind scanner config from env (no silent defaults).
 pub fn v1_bitcoind_rpc_from_env() -> Result<(String, std::path::PathBuf)> {

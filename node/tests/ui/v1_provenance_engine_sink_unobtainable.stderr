@@ -1,11 +1,13 @@
-error[E0603]: function `engine_begin_send` is private
- --> tests/ui/v1_provenance_engine_sink_unobtainable.rs:8:36
+error[E0603]: module `provenance` is private
+ --> tests/ui/v1_provenance_engine_sink_unobtainable.rs:8:23
   |
 8 |     let _ = node::v1::provenance::engine_begin_send;
-  |                                    ^^^^^^^^^^^^^^^^^ private function
+  |                       ^^^^^^^^^^  ----------------- function `engine_begin_send` is not publicly re-exported
+  |                       |
+  |                       private module
   |
-note: the function `engine_begin_send` is defined here
- --> src/v1/provenance.rs
+note: the module `provenance` is defined here
+ --> src/v1/mod.rs
   |
-  | fn engine_begin_send(engine: &StateEngine, req: SendRequest) -> Result<PendingTransition> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  | pub(crate) mod provenance;
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^

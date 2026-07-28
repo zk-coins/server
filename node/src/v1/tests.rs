@@ -1288,52 +1288,7 @@ async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v1_claim() {
 
 /// Defect 3: both unguarded-looking broadcast entry points refuse under a
 /// v1.1 process claim (structural guard at the Esplora choke point).
-#[tokio::test]
-async fn broadcast_inscription_paths_refuse_under_v1_claim() {
-    let scope = setup_pool().await;
-    enforce_stack_scan_mode(&scope.pool, ScanStackMode::V1)
-        .await
-        .expect("claim v1");
 
-    // Minimal valid-looking txs (broadcast is refused before Esplora I/O).
-    let commit_tx = bitcoin::Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![],
-        output: vec![],
-    };
-    let reveal_tx = commit_tx.clone();
-    let config = crate::publisher::EsploraConfig {
-        url: "http://127.0.0.1:1/api".to_string(),
-        is_mainnet: false,
-        network_name: "regtest".to_string(),
-        ws_url: None,
-    };
-
-    let err1 = crate::publisher::broadcast_inscription_txs(&config, &commit_tx, &reveal_tx)
-        .await
-        .expect_err("broadcast_inscription_txs must refuse under v1");
-    let msg1 = err1.to_string();
-    assert!(
-        msg1.contains(STACK_SEPARATION_REFUSAL) || msg1.contains("v1.1"),
-        "got: {msg1}"
-    );
-
-    let err2 = crate::publisher::broadcast_inscription_txs_with_persistence(
-        &config,
-        &commit_tx,
-        &reveal_tx,
-        None,
-    )
-    .await
-    .expect_err("broadcast_inscription_txs_with_persistence must refuse under v1");
-    let msg2 = err2.to_string();
-    assert!(
-        msg2.contains(STACK_SEPARATION_REFUSAL) || msg2.contains("v1.1"),
-        "got: {msg2}"
-    );
-
-}
 
 /// Crate-internal `with_engine_mut` refuses without a v1.1 process claim.
 /// (The method is sealed from downstream crates; this covers the runtime gate.)

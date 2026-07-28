@@ -181,15 +181,7 @@ impl EngineAdapter {
         ProverBridge::new(self.network)
     }
 
-    /// §1.7.1 digests for `C` and `C_balance` (both pinned per network).
-    pub fn circuit_digests(&self) -> ([u8; 32], [u8; 32]) {
-        let bridge = self.bridge();
-        (
-            bridge.circuit_digest_bytes(),
-            bridge.balance_circuit_digest_bytes(),
-        )
-    }
-
+    /// Borrow the live engine under the adapter mutex (read-only).
     pub fn with_engine<R>(&self, f: impl FnOnce(&StateEngine) -> R) -> R {
         let guard = self.live.lock().expect("EngineAdapter mutex poisoned");
         f(&guard.engine)
@@ -320,7 +312,8 @@ impl EngineAdapter {
 
     /// Identity fingerprints used by restart-identity tests:
     /// `(nflog_nav_root_bytes, sorted (owner, coinhist_root_bytes))`.
-    pub fn identity_roots(&self) -> ([u8; 32], Vec<([u8; 32], [u8; 32])>) {
+    #[cfg(test)]
+    pub(crate) fn identity_roots(&self) -> ([u8; 32], Vec<([u8; 32], [u8; 32])>) {
         self.with_engine(|engine| {
             let nav = engine.nflog().nav();
             let nflog_root = shared::spec_v1::digest_to_bytes(&nav.root());

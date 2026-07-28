@@ -56,7 +56,7 @@ impl std::error::Error for V1ShadowModeError {}
 /// | anything else | `Err` (fail loud) |
 ///
 /// Case-sensitive, no whitespace trim: `"1 "` / `"ON"` / `"true"` all fail.
-pub fn resolve_v1_shadow_mode(raw: Option<&str>) -> Result<V1ShadowMode, V1ShadowModeError> {
+pub(crate) fn resolve_v1_shadow_mode(raw: Option<&str>) -> Result<V1ShadowMode, V1ShadowModeError> {
     match raw {
         None => Ok(V1ShadowMode::Off),
         Some(s) if s.is_empty() || s == "off" => Ok(V1ShadowMode::Off),
@@ -79,7 +79,7 @@ pub fn v1_shadow_mode_from_env() -> Result<V1ShadowMode, V1ShadowModeError> {
 }
 
 /// Closed network vocabulary for `ZKCOINS_NETWORK`.
-pub fn parse_network_label(s: &str) -> Result<Network, String> {
+pub(crate) fn parse_network_label(s: &str) -> Result<Network, String> {
     match s {
         "mainnet" => Ok(Network::Mainnet),
         "testnet" => Ok(Network::Testnet),
@@ -91,7 +91,7 @@ pub fn parse_network_label(s: &str) -> Result<Network, String> {
     }
 }
 
-pub fn network_label(network: Network) -> &'static str {
+pub(crate) fn network_label(network: Network) -> &'static str {
     match network {
         Network::Mainnet => "mainnet",
         Network::Testnet => "testnet",
@@ -100,7 +100,7 @@ pub fn network_label(network: Network) -> &'static str {
 }
 
 /// Canonical §3.6 network tag string for a [`Network`] configuration value.
-pub fn network_tag_for(network: Network) -> Result<&'static str, String> {
+pub(crate) fn network_tag_for(network: Network) -> Result<&'static str, String> {
     let bytes = match network {
         Network::Mainnet => NETWORK_TAG_MAINNET,
         Network::Testnet => NETWORK_TAG_TESTNET,
@@ -112,7 +112,7 @@ pub fn network_tag_for(network: Network) -> Result<&'static str, String> {
 }
 
 /// Human-readable boot-config error for the v1.1 shadow path.
-pub const V1_BOOT_CONFIG_ERROR: &str = "\
+pub(crate) const V1_BOOT_CONFIG_ERROR: &str = "\
 ZKCOINS_V1_SHADOW=1 requires ZKCOINS_NETWORK (mainnet|testnet|regtest), \
 ZKCOINS_ACTIVATION_HEIGHT (non-negative integer), ZKCOINS_EXPECTED_PARAMS_IDENTIFIER \
 (64 lowercase hex chars — the published network-params.json SHA-256), and the \
@@ -144,7 +144,7 @@ pub struct V1BootPins {
 /// 2. `network_params.network_tag()` matches the §3.6 tag for `network`
 /// 3. regtest pin: `network_params.activation_height() == 0`
 /// 4. `activation_height == network_params.activation_height()`
-pub fn validate_v1_boot_pins(
+pub(crate) fn validate_v1_boot_pins(
     network: Network,
     activation_height: u64,
     network_params: &NetworkParams,

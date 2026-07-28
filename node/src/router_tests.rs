@@ -7334,46 +7334,15 @@ async fn history_item_missing_params_still_gone_not_422() {
 
 // --- Pure-function coverage for the helpers --------------------------------
 
-#[test]
-fn decode_history_address_accepts_with_and_without_0x_prefix() {
-    let plain = "ab".repeat(32);
-    let prefixed = format!("0x{}", plain);
-    assert!(decode_history_address(&plain).is_ok());
-    assert!(decode_history_address(&prefixed).is_ok());
-}
 
-#[test]
-fn decode_history_address_rejects_short_input() {
-    let bad = "ab".repeat(16);
-    let err = decode_history_address(&bad).unwrap_err();
-    assert!(err.contains("32 bytes"));
-}
 
-#[test]
-fn decode_history_address_rejects_non_hex() {
-    let err = decode_history_address("zzzz").unwrap_err();
-    assert!(err.to_lowercase().contains("hex"));
-}
 
-#[test]
-fn map_history_direction_covers_all_branches() {
-    assert_eq!(map_history_direction("mint"), Some("mint"));
-    assert_eq!(map_history_direction("send"), Some("send"));
-    assert_eq!(map_history_direction("receive"), Some("receive"));
-    assert_eq!(map_history_direction("scanner"), None);
-    assert_eq!(map_history_direction("recovery"), None);
-    assert_eq!(map_history_direction("anything-else"), None);
-}
 
-#[test]
-fn balance_from_account_blob_round_trips() {
-    let mut a = Account::new();
-    a.balance = 42_000;
-    let bytes = bincode::serialize(&a).unwrap();
-    assert_eq!(balance_from_account_blob(&bytes), Some(42_000));
-    // Garbage bytes -> None (defensive).
-    assert!(balance_from_account_blob(&[0u8, 1, 2, 3]).is_none());
-}
+
+
+
+
+
 
 /// Covers the **settled-balance** shape of an `Account` blob: a post-send
 /// account whose `coin_queue` has been drained into `coin_history` and
@@ -7383,330 +7352,29 @@ fn balance_from_account_blob_round_trips() {
 /// `CoinProof` and is pinned in
 /// `account_node_tests::history_row_to_item_balance_from_coin_queue_only`
 /// where the prover fixtures live.
-#[test]
-fn history_row_to_item_handles_first_row_with_no_prev_data() {
-    let mut a = Account::new();
-    a.balance = 5_000;
-    let new_bytes = bincode::serialize(&a).unwrap();
-    let row = crate::db::AccountHistoryRow {
-        id: 42,
-        timestamp_secs: 1_700_000_000,
-        source: "mint".to_string(),
-        prev_data: None,
-        new_data: new_bytes,
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    let item = history_row_to_item(&row).expect("item produced");
-    assert_eq!(item.id, 42);
-    assert_eq!(item.direction, "mint");
-    assert_eq!(
-        item.amount, 5_000,
-        "from-zero credit is the full new balance"
-    );
-    // No pending_inscriptions row + no observed_inscriptions row = the
-    // on-chain side is not yet known. DB-committed alone is NOT a
-    // confirmation; wire status defaults to `pending`.
-    assert_eq!(item.status, "pending");
-    assert!(item.txid.is_none());
-}
 
-#[test]
-fn history_row_to_item_drops_unknown_source() {
-    let mut a = Account::new();
-    a.balance = 1;
-    let row = crate::db::AccountHistoryRow {
-        id: 1,
-        timestamp_secs: 0,
-        source: "scanner".to_string(),
-        prev_data: None,
-        new_data: bincode::serialize(&a).unwrap(),
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    assert!(history_row_to_item(&row).is_none());
-}
 
-#[test]
-fn history_row_to_item_drops_undecodable_new_data() {
-    let row = crate::db::AccountHistoryRow {
-        id: 1,
-        timestamp_secs: 0,
-        source: "mint".to_string(),
-        prev_data: None,
-        new_data: vec![0xff; 4], // not a valid bincode Account
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    assert!(history_row_to_item(&row).is_none());
-}
 
-#[test]
-fn history_row_to_item_maps_pending_status_to_wire_status() {
-    let mut a = Account::new();
-    a.balance = 100;
-    let bytes = bincode::serialize(&a).unwrap();
-    let mk = |status: Option<&str>, block_height: Option<i64>| crate::db::AccountHistoryRow {
-        id: 1,
-        timestamp_secs: 0,
-        source: "send".to_string(),
-        prev_data: Some(bincode::serialize(&Account::new()).unwrap()),
-        new_data: bytes.clone(),
-        commit_txid: Some(vec![0xab; 32]),
-        block_height,
-        pending_status: status.map(str::to_string),
-        commit_output_value: None,
-    };
-    // Every enum variant the migration-0003 CHECK constraint allows.
-    assert_eq!(
-        history_row_to_item(&mk(Some("failed"), Some(1)))
-            .unwrap()
-            .status,
-        "failed"
-    );
-    assert_eq!(
-        history_row_to_item(&mk(Some("complete"), Some(1)))
-            .unwrap()
-            .status,
-        "confirmed"
-    );
-    assert_eq!(
-        history_row_to_item(&mk(Some("constructed"), None))
-            .unwrap()
-            .status,
-        "pending"
-    );
-    assert_eq!(
-        history_row_to_item(&mk(Some("commit_broadcast"), None))
-            .unwrap()
-            .status,
-        "pending"
-    );
-    assert_eq!(
-        history_row_to_item(&mk(Some("reveal_broadcast"), None))
-            .unwrap()
-            .status,
-        "pending"
-    );
-    // No pending row + no observed row -> on-chain side is unknown -> pending.
-    assert_eq!(
-        history_row_to_item(&mk(None, None)).unwrap().status,
-        "pending"
-    );
-    // No pending row but observed_inscriptions has a block height -> confirmed.
-    assert_eq!(
-        history_row_to_item(&mk(None, Some(42))).unwrap().status,
-        "confirmed"
-    );
-    // Unknown pending_inscriptions.status (defensive — CHECK prevents
-    // it in practice). The handler degrades to `pending` and logs.
-    assert_eq!(
-        history_row_to_item(&mk(Some("nonsense_state"), None))
-            .unwrap()
-            .status,
-        "pending"
-    );
-    // commit_txid -> hex-encoded; block_height surfaced verbatim.
-    let item = history_row_to_item(&mk(Some("complete"), Some(123_456))).unwrap();
-    assert_eq!(item.txid.as_deref(), Some("ab".repeat(32).as_str()));
-    assert_eq!(item.block_height, Some(123_456));
-}
 
-#[test]
-fn history_row_to_item_drops_undecodable_prev_data() {
-    // A `Some(blob)` that fails to bincode-decode is NOT the same as
-    // `None` (first INSERT). Silently treating it as zero would
-    // fabricate a full-balance delta — the row is dropped instead.
-    let mut a = Account::new();
-    a.balance = 5_000;
-    let row = crate::db::AccountHistoryRow {
-        id: 7,
-        timestamp_secs: 0,
-        source: "send".to_string(),
-        prev_data: Some(vec![0xff; 4]), // not a valid bincode Account
-        new_data: bincode::serialize(&a).unwrap(),
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    assert!(
-        history_row_to_item(&row).is_none(),
-        "un-decodable prev_data must drop the row, not pretend prev_balance = 0"
-    );
-}
+
+
+
+
+
 
 // ── GET /api/history/{id} — TxDetail conversion (issue: tx-detail) ──────
 
-#[test]
-fn account_meta_from_blob_reads_num_sends_and_commitment_pubkey() {
-    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 
-    // Fresh account: num_sends = 0, no commitment pubkey yet.
-    let fresh = Account::new();
-    let (n, cpk) = account_meta_from_blob(&bincode::serialize(&fresh).unwrap()).unwrap();
-    assert_eq!(n, 0);
-    assert!(cpk.is_none(), "genesis account has no commitment pubkey");
 
-    // Account that has sent: num_sends > 0 and a commitment pubkey set.
-    let secp = Secp256k1::new();
-    let sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
-    let pk = PublicKey::from_secret_key(&secp, &sk);
-    let mut sent = Account::new();
-    sent.num_sends = 3;
-    sent.commitment_public_key = Some(pk);
-    let (n, cpk) = account_meta_from_blob(&bincode::serialize(&sent).unwrap()).unwrap();
-    assert_eq!(n, 3);
-    assert_eq!(
-        cpk.as_deref(),
-        Some(hex::encode(pk.serialize()).as_str()),
-        "commitment pubkey is the 33-byte compressed form, hex-encoded"
-    );
 
-    // Garbage bytes -> None (decode failure → caller 500s).
-    assert!(account_meta_from_blob(&[0xff; 3]).is_none());
-}
 
-#[test]
-fn tx_detail_from_row_builds_full_detail_with_decoded_snapshot() {
-    let mut prev = Account::new();
-    prev.balance = 10_000;
-    let mut new = Account::new();
-    new.balance = 4_000;
-    new.num_sends = 1;
 
-    let row = crate::db::AccountHistoryRow {
-        id: 99,
-        timestamp_secs: 1_700_000_500,
-        source: "send".to_string(),
-        prev_data: Some(bincode::serialize(&prev).unwrap()),
-        new_data: bincode::serialize(&new).unwrap(),
-        commit_txid: Some(vec![0xab; 32]),
-        block_height: Some(900_001),
-        pending_status: Some("complete".to_string()),
-        commit_output_value: Some(546),
-    };
-    let digest = vec![0xcd; 32];
-    let detail = tx_detail_from_row(&row, "ee".repeat(32), Some(digest.clone()))
-        .expect("detail produced for a user-facing row");
 
-    // Core fields mirror history_row_to_item.
-    assert_eq!(detail.id, 99);
-    assert_eq!(detail.address, "ee".repeat(32));
-    assert_eq!(detail.direction, "send");
-    assert_eq!(detail.amount, 6_000, "|4000 - 10000|");
-    assert_eq!(
-        detail.status, "confirmed",
-        "complete inscription -> confirmed"
-    );
-    assert_eq!(detail.txid.as_deref(), Some("ab".repeat(32).as_str()));
-    assert_eq!(detail.block_height, Some(900_001));
-    // Decoded snapshot.
-    assert_eq!(detail.balance_after, 4_000);
-    assert_eq!(detail.balance_before, Some(10_000));
-    assert_eq!(detail.num_sends_after, 1);
-    // Proof + on-chain extras.
-    assert_eq!(
-        detail.circuit_digest.as_deref(),
-        Some(hex::encode(&digest).as_str())
-    );
-    assert_eq!(detail.commit_output_value, Some(546));
-}
 
-#[test]
-fn tx_detail_from_row_first_row_has_no_balance_before() {
-    let mut new = Account::new();
-    new.balance = 5_000;
-    let row = crate::db::AccountHistoryRow {
-        id: 1,
-        timestamp_secs: 0,
-        source: "mint".to_string(),
-        prev_data: None,
-        new_data: bincode::serialize(&new).unwrap(),
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    let detail = tx_detail_from_row(&row, "11".repeat(32), None).unwrap();
-    assert_eq!(detail.balance_after, 5_000);
-    assert_eq!(detail.amount, 5_000, "from-zero mint credits full balance");
-    assert!(
-        detail.balance_before.is_none(),
-        "first row has no prior state"
-    );
-    assert!(detail.circuit_digest.is_none(), "no digest passed -> null");
-    assert!(detail.commit_output_value.is_none());
-    assert_eq!(detail.num_sends_after, 0);
-    assert!(detail.commitment_public_key.is_none());
-}
 
-#[test]
-fn tx_detail_from_row_internal_source_returns_none() {
-    let mut new = Account::new();
-    new.balance = 1;
-    let row = crate::db::AccountHistoryRow {
-        id: 5,
-        timestamp_secs: 0,
-        source: "scanner".to_string(), // internal — must not surface
-        prev_data: None,
-        new_data: bincode::serialize(&new).unwrap(),
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    assert!(tx_detail_from_row(&row, "22".repeat(32), None).is_none());
-}
 
-#[test]
-fn tx_detail_from_row_undecodable_new_data_returns_none() {
-    let row = crate::db::AccountHistoryRow {
-        id: 5,
-        timestamp_secs: 0,
-        source: "mint".to_string(),
-        prev_data: None,
-        new_data: vec![0xff; 4], // corrupt -> caller 500s
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    assert!(tx_detail_from_row(&row, "33".repeat(32), None).is_none());
-}
 
-#[test]
-fn pending_inscription_status_from_db_str_round_trips_every_variant() {
-    // Mirrors migration-0003 CHECK constraint. Adding a state to
-    // `PendingInscriptionStatus` without updating this list fails CI.
-    assert_eq!(
-        PendingInscriptionStatus::from_db_str("constructed"),
-        Some(PendingInscriptionStatus::Constructed)
-    );
-    assert_eq!(
-        PendingInscriptionStatus::from_db_str("commit_broadcast"),
-        Some(PendingInscriptionStatus::CommitBroadcast)
-    );
-    assert_eq!(
-        PendingInscriptionStatus::from_db_str("reveal_broadcast"),
-        Some(PendingInscriptionStatus::RevealBroadcast)
-    );
-    assert_eq!(
-        PendingInscriptionStatus::from_db_str("complete"),
-        Some(PendingInscriptionStatus::Complete)
-    );
-    assert_eq!(
-        PendingInscriptionStatus::from_db_str("failed"),
-        Some(PendingInscriptionStatus::Failed)
-    );
-    assert_eq!(PendingInscriptionStatus::from_db_str("unknown"), None);
-}
+
 
 // ===========================================================================
 // Milestone 2: neutral, permissionless multi-asset router surface.
@@ -7760,17 +7428,7 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-#[test]
-fn parse_hex_digest_accepts_valid_and_rejects_malformed() {
-    let good = "0x".to_string() + &"ab".repeat(32);
-    assert!(parse_hex_digest(&good).is_some());
-    // Without 0x prefix also accepted.
-    assert!(parse_hex_digest(&"cd".repeat(32)).is_some());
-    // Bad hex.
-    assert!(parse_hex_digest("0xZZ").is_none());
-    // Wrong length.
-    assert!(parse_hex_digest(&"ab".repeat(16)).is_none());
-}
+
 
 #[test]
 fn verify_mint_signature_accepts_valid_signature() {

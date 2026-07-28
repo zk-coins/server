@@ -28,11 +28,12 @@ use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use utoipa::ToSchema;
 use uuid::Uuid;
-use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
+use zkcoins_program::hash::digest_to_bytes;
+#[cfg(feature = "username-claim")]
+use zkcoins_program::hash::digest_from_bytes;
 use zkcoins_prover::Proof;
 
 use crate::account_node::{AccountNode, CoinProof};
-use crate::db;
 use crate::db::InscriptionSummary;
 use crate::flow;
 use crate::job_dispatcher::{JobEnvelope, JobNotifier, JobNotifyMap, JobPhaseEvent};
@@ -150,7 +151,7 @@ pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 // Define a struct for our application state
 #[derive(Clone)]
-pub struct AppState {
+pub(crate) struct AppState {
     pub(crate) account_node: Arc<Mutex<AccountNode>>,
     pub(crate) proof_store: Arc<ProofStore>,
     /// In-memory staged-mint store for the two-phase, creator-signed
@@ -286,7 +287,7 @@ pub struct AppState {
 /// Production wires this via the shared [`crate::v1::EngineAdapter`] (async:
 /// multi-minute prove on a blocking pool, then atomic fenced persist). Tests
 /// inject a spy that records the call without running the multi-minute prove.
-pub type V1FinaliseHook = Arc<
+pub(crate) type V1FinaliseHook = Arc<
     dyn Fn(
             zkcoins_prover::state_engine::PendingTransition,
             zkcoins_prover::prover_bridge::TransitionSignature,
@@ -306,12 +307,12 @@ pub type V1FinaliseHook = Arc<
 /// [`AppState::v1_live_pending_after_begin`]. Behind `cfg(test)` so it is
 /// not compiled into the production binary (Defect 4).
 #[cfg(test)]
-pub type V1PendingAfterProveHook =
+pub(crate) type V1PendingAfterProveHook =
     Arc<dyn Fn(uuid::Uuid) -> Option<crate::v1::PendingSignEntry> + Send + Sync>;
 
 // Response types for our API
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct BalanceResponse {
+pub(crate) struct BalanceResponse {
     balance: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
@@ -342,24 +343,17 @@ pub struct BalanceResponse {
 
 #[cfg(any(feature = "address-list", feature = "lnurl"))]
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct AddressesResponse {
+pub(crate) struct AddressesResponse {
     addresses: Vec<String>,
 }
 
-// ----- /api/history (issue #153) ------------------------------------------
+// ----- /api/history (Stage 3 closed — 410 only) ---------------------------
+// Legacy list/detail helpers (`list_account_history`, `history_row_to_item`,
+// balance/direction decoders, `TxDetail`, …) deleted in Stage 4. Handlers
+// below stay as loud 410 Gone; OpenAPI documents that shape only.
 
-/// Default page size when `/api/history?limit` is omitted.
-pub(crate) const HISTORY_DEFAULT_LIMIT: i64 = 50;
-/// Hard cap on `/api/history?limit`. Anything outside `[1, MAX]` is a
-/// 400 — clamping silently was rejected as a footgun (callers that pass
-/// `limit=1000` should learn about the cap, not get an unexplained 200
-/// with 200 rows).
-pub(crate) const HISTORY_MAX_LIMIT: i64 = 200;
-
-/// `?address=&limit=&offset=` query for `GET /api/history`. All three
-/// are parsed via the typed `Query` extractor so axum surfaces a 400 on
-/// a non-integer `limit` / `offset` without the handler having to
-/// re-parse.
+/// `?address=&limit=&offset=` still accepted so clients get 410, not a
+/// framework 400 from an unknown query extractor — values are ignored.
 #[derive(Deserialize)]
 pub(crate) struct HistoryQuery {
     pub address: Option<String>,
@@ -367,383 +361,14 @@ pub(crate) struct HistoryQuery {
     pub offset: Option<i64>,
 }
 
-/// One entry in the `/api/history` response. Field names match the
-/// issue #153 contract verbatim; `null`-able fields use `Option<T>`
-/// with `serialize_with = Some` so the wire shape stays
-/// `"field": null` rather than the field being elided.
-///
-/// Memo / counterparty / block_height stay `null` today: the current
-/// schema does not store the recipient address per-mutation
-/// (`account_history` is keyed on the address that changed, not the
-/// counterparty), no memo column exists, and `triggering_commit_txid`
-/// is unset by every Rust caller — see [`db::AccountHistoryRow::commit_txid`]
-/// for the GUC-plumbing story.
+/// Error envelope retained for OpenAPI of the closed history routes.
 #[derive(Serialize, ToSchema)]
-pub struct HistoryItem {
-    /// Server-internal monotonic id. Always set — sourced from
-    /// `account_history.id`.
-    pub id: i64,
-    /// Bitcoin txid (lower-case hex, 64 chars) of the commit inscription
-    /// for this state change, once the publisher has broadcast it.
-    /// `null` while no commit_txid is linked to the row.
-    pub txid: Option<String>,
-    /// Unix epoch in seconds of the state change.
-    pub timestamp: i64,
-    /// `"send"`, `"receive"`, or `"mint"`. `scanner` / `recovery`
-    /// `account_history` rows are filtered out before the handler maps
-    /// to this enum.
-    pub direction: &'static str,
-    /// Absolute balance delta in sats (`|new_balance − prev_balance|`).
-    /// For a `receive` / `mint` this is the amount credited; for a
-    /// `send` this is the amount debited.
-    pub amount: u64,
-    /// Counterparty address (lower-case hex, 64 chars). Always `null`
-    /// in the current schema — see the type-level doc-comment.
-    pub counterparty: Option<String>,
-    /// `"pending"`, `"confirmed"`, or `"failed"`. Every persisted
-    /// `account_history` row reflects a state mutation that committed
-    /// in Postgres, so the default is `"confirmed"`; the alternative
-    /// values surface once the `pending_inscriptions` join lights up.
-    pub status: &'static str,
-    /// Bitcoin block height that contains the commit inscription, or
-    /// `null` while the scanner has not integrated it (and while the
-    /// `commit_txid` link is missing).
-    pub block_height: Option<i64>,
-    /// Free-text memo attached to the operation. Always `null` — no
-    /// memo column exists in the current schema.
-    pub memo: Option<String>,
-}
-
-/// Paginated wrapper around [`HistoryItem`]. `total` is the unfiltered
-/// count for the queried address (not the count of returned `items`)
-/// so the caller can drive pagination without a separate query.
-#[derive(Serialize, ToSchema)]
-pub struct HistoryResponse {
-    pub items: Vec<HistoryItem>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// JSON envelope returned by the validation-failure branches of
-/// `get_history_handler`. Distinct from the existing `SendCoinResponse`
-/// shape because `/api/history` is a read endpoint with no `success` /
-/// `proof_id` machinery — a flat `{ "error": "..." }` is the contract
-/// the issue documents.
-#[derive(Serialize, ToSchema)]
-pub struct HistoryErrorResponse {
+pub(crate) struct HistoryErrorResponse {
     pub error: &'static str,
 }
 
-/// Per-transaction detail returned by `GET /api/history/{id}`.
-///
-/// Extends the [`HistoryItem`] list shape with everything else the node
-/// can derive for one `account_history` row **without a schema change**:
-/// the decoded account-state snapshot the mutation produced (usable
-/// balance before/after, the post-mutation send counter and commitment
-/// public key), the verifier circuit digest every proof on this node is
-/// checked against, and the on-chain commit output value when a
-/// publisher inscription exists. Fields the current schema cannot
-/// populate stay `null` — the same honesty contract as [`HistoryItem`]
-/// (`txid` / `block_height` / `commit_output_value` light up only once
-/// the publisher threads `triggering_commit_txid`).
-#[derive(Serialize, ToSchema)]
-pub struct TxDetail {
-    // --- identity / core (mirrors HistoryItem) ---
-    /// Server-internal monotonic id (`account_history.id`).
-    pub id: i64,
-    /// The queried address, echoed as lower-case hex (32 bytes, no `0x`).
-    pub address: String,
-    /// Commit-inscription txid (lower-case hex), or `null` while unlinked.
-    pub txid: Option<String>,
-    /// Unix epoch in seconds of the state change.
-    pub timestamp: i64,
-    /// `"send"`, `"receive"`, or `"mint"`.
-    pub direction: &'static str,
-    /// Absolute balance delta in sats (`|balance_after − balance_before|`).
-    pub amount: u64,
-    /// Counterparty address — always `null` in the current schema.
-    pub counterparty: Option<String>,
-    /// `"pending"`, `"confirmed"`, or `"failed"`.
-    pub status: &'static str,
-    /// Bitcoin block height of the commit, or `null` while unconfirmed.
-    pub block_height: Option<i64>,
-    /// Free-text memo — always `null` (no memo column exists).
-    pub memo: Option<String>,
-    // --- decoded account-state snapshot for this mutation ---
-    /// Usable balance (settled + queued) AFTER this mutation, in sats.
-    pub balance_after: u64,
-    /// Usable balance BEFORE this mutation; `null` for the first row of
-    /// an address (no prior state to decode).
-    pub balance_before: Option<u64>,
-    /// The account's own-send counter after this mutation — the wallet's
-    /// authoritative BIP-32 child index (see `BalanceResponse.num_sends`).
-    pub num_sends_after: u32,
-    /// The account's commitment public key after this mutation
-    /// (compressed secp256k1, 33-byte lower-case hex); `null` before the
-    /// account has ever sent (genesis / mint-only state).
-    pub commitment_public_key: Option<String>,
-    // --- proof / verification ---
-    /// The verifier circuit digest (lower-case hex) every proof on this
-    /// node is checked against — the proof-system identity. `null` only
-    /// before the node has stored its digest (pre-first-proof boot).
-    pub circuit_digest: Option<String>,
-    // --- on-chain ---
-    /// Value (sats) locked in the commit inscription's output, when a
-    /// publisher inscription row exists for this mutation; `null`
-    /// otherwise (e.g. a faucet mint before broadcast).
-    pub commit_output_value: Option<i64>,
-}
-
-/// Decode the 64-char (or 64 char + 0x prefix) hex `address` argument
-/// into the raw 32-byte form `account_history.address` is keyed on.
-/// Reuses the exact decode + length rules `get_balance_handler` applies
-/// — `Err` on non-hex characters or a length that does not unpack to
-/// 32 bytes.
-pub(crate) fn decode_history_address(raw: &str) -> Result<[u8; 32], &'static str> {
-    let bytes = hex::decode(raw.trim_start_matches("0x")).map_err(|_| "Invalid address hex")?;
-    if bytes.len() != 32 {
-        return Err("Address must be 32 bytes (64 hex chars)");
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-/// Map an `account_history.source` string into the user-facing
-/// `direction` enum. Returns `None` for the `scanner` and `recovery`
-/// sources, which are internal mutations the user did not initiate and
-/// the handler filters out before serialising.
-pub(crate) fn map_history_direction(source: &str) -> Option<&'static str> {
-    match source {
-        "mint" => Some("mint"),
-        "send" => Some("send"),
-        "receive" => Some("receive"),
-        // `scanner` and `recovery` are internal replays / operator-only
-        // mutations. Surface a `None` so the handler skips them.
-        _ => None,
-    }
-}
-
-/// Recover the usable balance out of a bincode-serialised
-/// [`crate::account_node::Account`] blob. Returns `None` if the bytes
-/// fail to round-trip — defensive, the handler treats a decode failure
-/// as a missing prior balance (so the delta collapses to the absolute
-/// new balance instead of producing a fabricated number).
-///
-/// Mirrors [`crate::account_node::Account::get_balance`]: the settled
-/// `balance` field plus pending receives sitting in `coin_queue`.
-/// Mints and receives push the credited coin into `coin_queue` without
-/// touching `balance` until a subsequent send drains the queue into
-/// `coin_history`; reading only `a.balance` here would report `0` for
-/// the very transactions the history endpoint is meant to surface (the
-/// E2E suite catches this as `amount = 0` on first mint).
-///
-/// `saturating_add` is used because the two summands come out of an
-/// untrusted on-disk blob; in practice overflow is impossible (per-coin
-/// amounts and `Account.balance` are both bounded by the minting
-/// account's supply), but capping at `u64::MAX` is preferable to a
-/// panic on a corrupted row.
-pub(crate) fn balance_from_account_blob(blob: &[u8]) -> Option<u64> {
-    let a = bincode::deserialize::<crate::account_node::Account>(blob).ok()?;
-    let queued: u64 = a
-        .coin_queue
-        .iter()
-        .fold(0u64, |acc, cp| acc.saturating_add(cp.coin.amount));
-    Some(a.balance.saturating_add(queued))
-}
-
-/// Typed mirror of the `pending_inscriptions.status` CHECK constraint
-/// (migration 0003: `constructed`, `commit_broadcast`, `reveal_broadcast`,
-/// `complete`, `failed`). Parsed via [`PendingInscriptionStatus::from_db_str`]
-/// so the `match` in [`history_row_to_item`] can be exhaustive and a
-/// future schema state addition forces compile-time attention — a plain
-/// `match row.pending_status.as_deref()` on a `String` can't enforce
-/// that.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PendingInscriptionStatus {
-    Constructed,
-    CommitBroadcast,
-    RevealBroadcast,
-    Complete,
-    Failed,
-}
-
-impl PendingInscriptionStatus {
-    /// Map a raw `pending_inscriptions.status` string to the enum.
-    /// Returns `None` for an unrecognised value — Postgres's CHECK
-    /// constraint prevents that in practice, but if it ever leaks the
-    /// handler degrades to `pending` rather than crash.
-    pub(crate) fn from_db_str(s: &str) -> Option<Self> {
-        match s {
-            "constructed" => Some(Self::Constructed),
-            "commit_broadcast" => Some(Self::CommitBroadcast),
-            "reveal_broadcast" => Some(Self::RevealBroadcast),
-            "complete" => Some(Self::Complete),
-            "failed" => Some(Self::Failed),
-            _ => None,
-        }
-    }
-}
-
-/// Convert one [`db::AccountHistoryRow`] into a wire [`HistoryItem`].
-/// Returns `None` if the row's source is internal (`scanner` /
-/// `recovery`), if the `new_data` blob fails to decode, or if a
-/// non-null `prev_data` blob fails to decode (treating that as zero
-/// would fabricate a full-balance delta — see the inner `match` for
-/// the warn log).
-pub(crate) fn history_row_to_item(row: &crate::db::AccountHistoryRow) -> Option<HistoryItem> {
-    let direction = map_history_direction(&row.source)?;
-    let new_balance = balance_from_account_blob(&row.new_data)?;
-    // `prev_data` is `None` on the first INSERT for an address — treat
-    // that as a from-zero delta so the very first mint / receive
-    // surfaces the full credit instead of disappearing. A `Some(blob)`
-    // that fails to decode is *not* the same as `None`: silently
-    // collapsing to zero would fabricate the full new balance as the
-    // delta. Drop the row instead and log a warn so an operator can
-    // notice the schema drift.
-    let prev_balance = match row.prev_data.as_deref() {
-        None => 0,
-        Some(blob) => match balance_from_account_blob(blob) {
-            Some(b) => b,
-            None => {
-                let blob_len = blob.len();
-                tracing::warn!(
-                    "history_row_to_item: row id={} address has un-decodable prev_data blob (len={}); dropping row to avoid fabricating a full-balance delta",
-                    row.id,
-                    blob_len,
-                );
-                return None;
-            }
-        },
-    };
-    // Absolute delta — sends are debits (prev > new), mints / receives
-    // are credits (new > prev). The `direction` field already encodes
-    // the sign for the caller.
-    let amount = new_balance.max(prev_balance) - new_balance.min(prev_balance);
-
-    // Wire status derived from `pending_inscriptions.status` (the
-    // authoritative state machine) joined to `observed_inscriptions`
-    // for the post-broadcast on-chain confirmation. A DB-committed
-    // `account_history` row only proves a server-side state change —
-    // *not* an on-chain confirmation — so the default before any
-    // matching inscription row exists is `pending`, not `confirmed`.
-    //
-    // The inner `match pending` is exhaustive over the
-    // [`PendingInscriptionStatus`] enum (which mirrors migration 0003's
-    // CHECK constraint). A future state added to the enum will fail to
-    // compile here — no silent `_ => "pending"` catch-all.
-    //
-    // The unknown-string case is handled separately via
-    // `from_db_str` returning `None`: Postgres's CHECK constraint
-    // already prevents that, but if it ever leaks we warn and degrade
-    // to `pending` rather than crash.
-    let pending_enum = row
-        .pending_status
-        .as_deref()
-        .map(|s| (s, PendingInscriptionStatus::from_db_str(s)));
-    let status = match pending_enum {
-        Some((_, Some(p))) => match p {
-            PendingInscriptionStatus::Complete => "confirmed",
-            PendingInscriptionStatus::Failed => "failed",
-            PendingInscriptionStatus::Constructed
-            | PendingInscriptionStatus::CommitBroadcast
-            | PendingInscriptionStatus::RevealBroadcast => "pending",
-        },
-        Some((raw, None)) => {
-            tracing::warn!(
-                "history_row_to_item: unknown pending_inscriptions.status={:?} (id={}); defaulting to pending",
-                raw,
-                row.id,
-            );
-            "pending"
-        }
-        // No pending_inscriptions row but the scanner has observed the
-        // inscription on-chain — it's confirmed even though we lost the
-        // pending row (the resumer prunes `complete` rows after a
-        // safe-depth threshold).
-        None if row.block_height.is_some() => "confirmed",
-        // Neither pending nor observed — the on-chain side is not yet
-        // known to us; the DB write alone does not warrant `confirmed`.
-        None => "pending",
-    };
-
-    Some(HistoryItem {
-        id: row.id,
-        txid: row.commit_txid.as_deref().map(hex::encode),
-        timestamp: row.timestamp_secs,
-        direction,
-        amount,
-        // TODO(zk-coins/node#160): capture `counterparty_address` per
-        // `account_history` row (schema change) so this stops being
-        // unconditionally null.
-        counterparty: None,
-        status,
-        block_height: row.block_height,
-        memo: None,
-    })
-}
-
-/// Decode the post-mutation `num_sends` + `commitment_public_key` out of
-/// an `accounts.data` bincode blob, for the transaction-detail endpoint.
-/// Returns `None` on a decode failure (the caller maps that to a 500 — a
-/// corrupt blob is a server fault, not a user error). Mirrors
-/// [`balance_from_account_blob`], which handles the balance half.
-pub(crate) fn account_meta_from_blob(blob: &[u8]) -> Option<(u32, Option<String>)> {
-    let a = bincode::deserialize::<crate::account_node::Account>(blob).ok()?;
-    // `commitment_public_key` is a secp256k1 `PublicKey`; serialize to its
-    // 33-byte compressed form before hex-encoding (matches the wire form
-    // the wallet derives and sends in `prev_commitment_pubkey`).
-    let cpk = a
-        .commitment_public_key
-        .as_ref()
-        .map(|pk| hex::encode(pk.serialize()));
-    Some((a.num_sends, cpk))
-}
-
-/// Build a [`TxDetail`] from one history row + the node's circuit digest.
-///
-/// Reuses [`history_row_to_item`] for the shared list fields
-/// (direction / amount / status / txid …) so the two endpoints can never
-/// disagree on the core shape, then layers on the decoded account-state
-/// snapshot. Returns `None` when the row's source is internal or any
-/// state blob fails to decode — both map to a 500 at the call site (the
-/// db query already filtered to user-facing sources, so in practice only
-/// a corrupt blob reaches the `None` arm).
-pub(crate) fn tx_detail_from_row(
-    row: &crate::db::AccountHistoryRow,
-    address_hex: String,
-    circuit_digest: Option<Vec<u8>>,
-) -> Option<TxDetail> {
-    let item = history_row_to_item(row)?;
-    let balance_after = balance_from_account_blob(&row.new_data)?;
-    let balance_before = match row.prev_data.as_deref() {
-        None => None,
-        Some(blob) => Some(balance_from_account_blob(blob)?),
-    };
-    let (num_sends_after, commitment_public_key) = account_meta_from_blob(&row.new_data)?;
-    Some(TxDetail {
-        id: item.id,
-        address: address_hex,
-        txid: item.txid,
-        timestamp: item.timestamp,
-        direction: item.direction,
-        amount: item.amount,
-        counterparty: item.counterparty,
-        status: item.status,
-        block_height: item.block_height,
-        memo: item.memo,
-        balance_after,
-        balance_before,
-        num_sends_after,
-        commitment_public_key,
-        circuit_digest: circuit_digest.map(hex::encode),
-        commit_output_value: row.commit_output_value,
-    })
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
-pub struct SendCoinRequest {
+pub(crate) struct SendCoinRequest {
     /// Sender account address (`0x`-prefixed 32-byte hex).
     pub(crate) account_address: String,
     /// Recipient identifier — `0x`-prefixed 32-byte hex address or a
@@ -783,7 +408,7 @@ pub struct SendCoinRequest {
 /// BIP-340 Schnorr signature over the mint fields, verified against
 /// `creator_pubkey` (see [`verify_mint_signature_pub`]).
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
-pub struct MintRequest {
+pub(crate) struct MintRequest {
     /// Compressed secp256k1 public key (33 bytes) of the asset creator,
     /// hex-encoded. The owner is `H(creator_pubkey)` and the asset_id
     /// is `calculate_asset_id(creator_pubkey, H(name), decimals)`.
@@ -818,7 +443,7 @@ pub struct MintRequest {
 // authenticated push endpoint. Mark `dead_code` to silence the lint.
 #[allow(dead_code)]
 #[derive(Deserialize)]
-pub struct ReceiveCoinRequest {
+pub(crate) struct ReceiveCoinRequest {
     coin_proof: Proof,
 }
 
@@ -969,8 +594,13 @@ pub(crate) struct StagedMint {
 /// the prove and commit legs drops the staged mint; the wallet's job
 /// then times out at `awaiting_signature` and the creator re-submits
 /// (same boot-resume semantics as a send).
+/// Staged-mint map for residual legacy `mint_commit_flow`. Stage 3 deleted
+/// the prove-side `add` path (`prepare_mint` always refuses); the map stays
+/// so a commit against an unknown `proof_id` still returns 404 rather than
+/// a type-level hole.
 #[derive(Default)]
 pub(crate) struct MintStore {
+    #[cfg(test)]
     next_id: AtomicU64,
     staged: Mutex<HashMap<u64, StagedMint>>,
 }
@@ -978,14 +608,14 @@ pub(crate) struct MintStore {
 impl MintStore {
     pub(crate) fn new() -> Self {
         MintStore {
-            // Start at 1 so a `proof_id` of 0 is never a valid staged
-            // mint (mirrors `ProofStore`'s 1-based ids).
+            #[cfg(test)]
             next_id: AtomicU64::new(1),
             staged: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Stage a mint, returning its `proof_id`.
+    /// Stage a mint, returning its `proof_id` (test / residual legacy only).
+    #[cfg(test)]
     pub(crate) fn add(&self, staged: StagedMint) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         lock_or_recover(&self.staged).insert(id, staged);
@@ -999,7 +629,7 @@ impl MintStore {
 }
 
 #[derive(Serialize, Deserialize, Default, ToSchema)]
-pub struct SendCoinResponse {
+pub(crate) struct SendCoinResponse {
     pub(crate) success: bool,
     /// Structured error message on failure. `None` on success. Mirrors
     /// the body string returned alongside a 4xx/5xx status code, so
@@ -1129,7 +759,7 @@ pub(crate) fn handler_error_response(
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
-pub struct CommitRequest {
+pub(crate) struct CommitRequest {
     pub(crate) proof_id: u64,
     /// Hex-encoded compressed public key (33 bytes) that signed the commitment.
     #[schema(value_type = String)]
@@ -1151,13 +781,13 @@ pub struct CommitRequest {
 /// foot-gun of matching the free-text string.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum BitcoinNetwork {
+pub(crate) enum BitcoinNetwork {
     Mainnet,
     Mutinynet,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct InfoResponse {
+pub(crate) struct InfoResponse {
     /// Human-readable network label (e.g. `"Mainnet"` / `"Mutinynet"`),
     /// sourced from `NETWORK_CONFIG.network_name`. Operator-overridable
     /// and intended for display only — clients gate behaviour on
@@ -1198,7 +828,7 @@ pub struct Capabilities {
 
 #[cfg(feature = "username-claim")]
 #[derive(Deserialize, ToSchema)]
-pub struct ClaimUsernameRequest {
+pub(crate) struct ClaimUsernameRequest {
     username: String,
     address: String,
     #[schema(value_type = String)]
@@ -1208,14 +838,14 @@ pub struct ClaimUsernameRequest {
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct UsernameResponse {
+pub(crate) struct UsernameResponse {
     username: String,
     address: String,
 }
 
 #[cfg(feature = "lnurl")]
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct LnurlpResponse {
+pub(crate) struct LnurlpResponse {
     tag: String,
     callback: String,
     #[serde(rename = "minSendable")]
@@ -1226,7 +856,7 @@ pub struct LnurlpResponse {
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct LnurlErrorResponse {
+pub(crate) struct LnurlErrorResponse {
     status: String,
     reason: String,
 }
@@ -1266,17 +896,10 @@ pub(crate) async fn get_balance_handler(
     )
 }
 
-/// Parse a `0x`-optional 32-byte hex string into a Poseidon
-/// [`HashDigest`]. Returns `None` on bad hex or wrong length.
-pub(crate) fn parse_hex_digest(s: &str) -> Option<zkcoins_program::hash::HashDigest> {
-    let raw = hex::decode(s.trim_start_matches("0x")).ok()?;
-    let arr: [u8; 32] = raw.as_slice().try_into().ok()?;
-    Some(digest_from_bytes(&arr))
-}
 
 /// One asset entry in the [`OwnerBalanceResponse`] list.
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct AssetBalance {
+pub(crate) struct AssetBalance {
     /// Asset identifier, 32-byte digest as 64 lowercase hex chars.
     pub asset_id: String,
     /// Human-facing asset name, if the node learned it at mint time.
@@ -1293,7 +916,7 @@ pub struct AssetBalance {
 
 /// Aggregated per-asset balance list for `GET /api/balance/:address`.
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct OwnerBalanceResponse {
+pub(crate) struct OwnerBalanceResponse {
     /// Owner address echoed back, 64 lowercase hex chars.
     pub address: String,
     /// Username bound to the owner, if any.
@@ -1340,21 +963,8 @@ pub(crate) async fn get_owner_balance_handler(
     get,
     path = "/api/history",
     tag = "Accounts",
-    params(
-        ("address" = String, Query,
-            description = "Account address (32-byte hex, with or without `0x` prefix)."),
-        ("limit" = Option<i64>, Query,
-            description = "Page size in `[1, 200]`. Defaults to 50."),
-        ("offset" = Option<i64>, Query,
-            description = "Non-negative pagination offset. Defaults to 0."),
-    ),
     responses(
-        (status = 200, description = "Paginated newest-first history page.",
-            body = HistoryResponse),
-        (status = 422, description = "Missing/malformed `address`, `limit` outside `[1, 200]`, \
-            or negative `offset`.",
-            body = HistoryErrorResponse),
-        (status = 500, description = "Database error while reading history.",
+        (status = 410, description = "Closed (Stage 3): unauthenticated legacy account history removed.",
             body = HistoryErrorResponse),
     ),
 )]
@@ -1368,7 +978,8 @@ pub(crate) async fn get_history_handler(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<HistoryQuery>,
 ) -> impl IntoResponse {
-    let _ = (state, query);
+    // Touch fields so Deserialize stays intentional; values ignored (410).
+    let _ = (state, &query.address, query.limit, query.offset);
     (
         StatusCode::GONE,
         Json(serde_json::json!({
@@ -1381,19 +992,8 @@ pub(crate) async fn get_history_handler(
     get,
     path = "/api/history/{id}",
     tag = "Accounts",
-    params(
-        ("id" = i64, Path,
-            description = "Server-internal `account_history.id` of the row (from a `HistoryItem.id`)."),
-        ("address" = String, Query,
-            description = "Account address (32-byte hex, with or without `0x` prefix) the row must belong to."),
-    ),
     responses(
-        (status = 200, description = "Full per-transaction detail.", body = TxDetail),
-        (status = 404, description = "No user-facing row with that id for the address.",
-            body = HistoryErrorResponse),
-        (status = 422, description = "Missing/malformed `address` or non-integer `id`.",
-            body = HistoryErrorResponse),
-        (status = 500, description = "Database error / undecodable state blob.",
+        (status = 410, description = "Closed (Stage 3): unauthenticated legacy account history detail removed.",
             body = HistoryErrorResponse),
     ),
 )]
@@ -1576,13 +1176,13 @@ fn read_idempotency_key(
 /// `SendCoinResponse` so a wallet client can branch on the shape
 /// (`{error: "..."}` vs. the legacy `{success: false, error: "..."}`).
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct JobErrorResponse {
+pub(crate) struct JobErrorResponse {
     pub(crate) error: String,
 }
 
 /// Body returned by the admit handlers on a fresh enqueue.
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct JobAcceptedResponse {
+pub(crate) struct JobAcceptedResponse {
     #[schema(value_type = String, example = "00000000-0000-0000-0000-000000000000")]
     pub(crate) job_id: Uuid,
     pub(crate) status: &'static str,
@@ -1591,7 +1191,7 @@ pub struct JobAcceptedResponse {
 /// Body returned by `GET /api/jobs/:id`. Optional fields are emitted
 /// only when populated so the wire shape mirrors the row state.
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct JobStatusResponse {
+pub(crate) struct JobStatusResponse {
     #[schema(value_type = String, example = "00000000-0000-0000-0000-000000000000")]
     pub(crate) job_id: Uuid,
     pub(crate) kind: String,
@@ -3481,7 +3081,7 @@ async fn r2_probe_history_handler(
 /// 503 so a load balancer keeps holding traffic on the previous-gen
 /// pod. `/health` (liveness) is unaffected.
 #[derive(Serialize, ToSchema)]
-pub struct ReadyResponse {
+pub(crate) struct ReadyResponse {
     ready: bool,
     failures: Vec<&'static str>,
     /// Lifecycle tag. `"starting"` while any failure is present,
@@ -3628,7 +3228,7 @@ async fn check_esplora(
 /// Esplora directly. `address` is the publisher's Taproot bech32 — log-
 /// only, NOT a secret (the matching key lives in `PUBLISHER_KEY`).
 #[derive(Serialize, ToSchema)]
-pub struct PublisherHealthResponse {
+pub(crate) struct PublisherHealthResponse {
     address: String,
     utxo_count: u64,
     total_sats: u64,
@@ -3641,7 +3241,7 @@ pub struct PublisherHealthResponse {
 /// HTTP status separately. `address` is echoed back so the failure
 /// log still identifies which wallet the operator should top up.
 #[derive(Serialize, ToSchema)]
-pub struct PublisherHealthErrorResponse {
+pub(crate) struct PublisherHealthErrorResponse {
     error: &'static str,
     detail: String,
     address: String,
@@ -3764,7 +3364,7 @@ pub(crate) async fn info_handler() -> impl IntoResponse {
 }
 
 #[derive(Serialize, ToSchema)]
-pub struct RootResponse {
+pub(crate) struct RootResponse {
     service: &'static str,
     version: &'static str,
     network: String,
@@ -3790,7 +3390,7 @@ pub struct RootResponse {
 /// through `serde_json::Value` (without `preserve_order`, `Value::Object`
 /// is a sorted map and reorders keys).
 #[derive(Serialize, ToSchema, Clone, Copy)]
-pub struct RootEndpoints {
+pub(crate) struct RootEndpoints {
     info: &'static str,
     balance: &'static str,
     history: &'static str,
@@ -3854,7 +3454,7 @@ struct RootResponseWithAttest {
 /// Canonical always-on endpoint map (pre-G6 / flag-off). Derived from
 /// [`RootEndpoints`] so the handler, the OpenAPI component, and the
 /// byte-identity tests share one type — not a hand-written second list.
-pub fn root_endpoints_always_on() -> RootEndpoints {
+pub(crate) fn root_endpoints_always_on() -> RootEndpoints {
     RootEndpoints {
         info: "GET  /api/info",
         balance: "GET  /api/balance?address={hex}",
@@ -4407,7 +4007,10 @@ pub(crate) fn create_router(state: AppState) -> Router {
         // Operator-facing R2 probe trend (see `r2_probe_history_handler`
         // doc-comment). Grouped under `/api/admin/` so it is visibly
         // separate from the user-facing surface.
-        .route("/api/admin/r2-probe/history", get(r2_probe_history_handler));
+        .route("/api/admin/r2-probe/history", get(r2_probe_history_handler))
+        .route("/openapi.json", get(crate::openapi::openapi_json_handler))
+        .route("/docs", get(crate::openapi::docs_handler))
+        .route("/docs/:file", get(crate::openapi::swagger_asset_handler));
 
     // Gated routes — only compiled in when their Cargo feature is enabled.
     // With a feature off, the handler does not exist in the binary and the

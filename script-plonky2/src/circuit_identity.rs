@@ -72,7 +72,7 @@ pub fn require_live_digests_match_pins(
 ///
 /// Used when `C` and `C_balance` are constructed separately (each
 /// `OnceLock` init): fail as soon as either diverges.
-pub fn require_one_live_digest_matches_pin(
+pub(crate) fn require_one_live_digest_matches_pin(
     which: &str,
     built: &[u8; 32],
     pin: &[u8; 32],

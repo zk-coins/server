@@ -69,6 +69,7 @@ use zkcoins_prover::prover_bridge::{
 
 use super::adapter::EngineAdapter;
 use super::db_v1;
+#[cfg(test)]
 use super::mode::V1ShadowMode;
 use super::separation::{process_stack_mode, ScanStackMode};
 
@@ -77,14 +78,14 @@ use super::separation::{process_stack_mode, ScanStackMode};
 // ---------------------------------------------------------------------------
 
 /// Challenge domain for `POST /v1/attest/balance/challenge`.
-pub const ATTEST_BALANCE_CHALLENGE_DOMAIN: &str = "zkCoins/v1/AttestBalanceChallenge";
+pub(crate) const ATTEST_BALANCE_CHALLENGE_DOMAIN: &str = "zkCoins/v1/AttestBalanceChallenge";
 /// Request-hash tag for `POST /v1/attest/balance`.
-pub const ATTEST_BALANCE_REQUEST_TAG: &str = "zkCoins/v1/AttestBalance";
+pub(crate) const ATTEST_BALANCE_REQUEST_TAG: &str = "zkCoins/v1/AttestBalance";
 /// `chan_bind` host domain (§5.1).
-pub const PULL_HOST_DOMAIN: &str = "zkCoins/v1/PullHost";
+pub(crate) const PULL_HOST_DOMAIN: &str = "zkCoins/v1/PullHost";
 
 /// Machine-readable edge when Bitcoin anchor locator is unavailable.
-pub const ATTEST_ANCHOR_LOCATOR_EDGE: &str =
+pub(crate) const ATTEST_ANCHOR_LOCATOR_EDGE: &str =
     "ATTEST_ANCHOR_LOCATOR_EDGE: NfLog retains ChainPosition but not \
      reveal txid/block_hash; no durable pk→(txid,block_hash) index and no \
      live v1_pending_publishes.reveal_txid for this nullifier — cannot \
@@ -92,7 +93,7 @@ pub const ATTEST_ANCHOR_LOCATOR_EDGE: &str =
      wiring). Refusing rather than fabricating zeros.";
 
 /// Recommended challenge TTL (§5.1): 60 seconds.
-pub const ATTEST_CHALLENGE_TTL_SECS: u64 = 60;
+pub(crate) const ATTEST_CHALLENGE_TTL_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
 // Pinned C_balance digests (§1.7.1 / generated_circuit_digests.txt)
@@ -103,23 +104,23 @@ pub const ATTEST_CHALLENGE_TTL_SECS: u64 = 60;
 // circuit when the digests diverge from the published pins.
 
 /// §1.7.1 `C_balance` digest for mainnet (from `generated_circuit_digests.txt`).
-pub const PINNED_C_BALANCE_DIGEST_MAINNET: [u8; 32] = [
+pub(crate) const PINNED_C_BALANCE_DIGEST_MAINNET: [u8; 32] = [
     0x0a, 0x42, 0x02, 0xfc, 0x77, 0x22, 0x95, 0xd6, 0xdb, 0x4e, 0xb9, 0xc5, 0xbd, 0x2b, 0xbb, 0x7a,
     0x59, 0xd4, 0x5c, 0xff, 0x16, 0x53, 0x64, 0x8d, 0xff, 0x46, 0x81, 0xf4, 0xba, 0x55, 0xd6, 0x06,
 ];
 /// §1.7.1 `C_balance` digest for testnet.
-pub const PINNED_C_BALANCE_DIGEST_TESTNET: [u8; 32] = [
+pub(crate) const PINNED_C_BALANCE_DIGEST_TESTNET: [u8; 32] = [
     0xcb, 0xb8, 0xf2, 0x84, 0xfa, 0xb6, 0xf8, 0x1a, 0xa3, 0x61, 0x6f, 0x55, 0xda, 0x76, 0x94, 0x2c,
     0x12, 0x59, 0x84, 0x5e, 0x0b, 0x91, 0x35, 0xf9, 0xc8, 0xfe, 0x93, 0x85, 0xd3, 0xf7, 0xfe, 0x87,
 ];
 /// §1.7.1 `C_balance` digest for regtest.
-pub const PINNED_C_BALANCE_DIGEST_REGTEST: [u8; 32] = [
+pub(crate) const PINNED_C_BALANCE_DIGEST_REGTEST: [u8; 32] = [
     0xbd, 0x69, 0x60, 0x87, 0xe0, 0xe0, 0xf4, 0x7b, 0x55, 0x6a, 0x68, 0x03, 0xef, 0x4f, 0xb5, 0xb9,
     0xeb, 0xae, 0x23, 0x27, 0xe0, 0x43, 0x8d, 0xd4, 0x05, 0xf3, 0x37, 0x52, 0xdc, 0x90, 0x77, 0x2d,
 ];
 
 /// Pinned `C_balance` digest for `network`, or `None` if unknown.
-pub fn pinned_c_balance_digest(network: Network) -> [u8; 32] {
+pub(crate) fn pinned_c_balance_digest(network: Network) -> [u8; 32] {
     match network {
         Network::Mainnet => PINNED_C_BALANCE_DIGEST_MAINNET,
         Network::Testnet => PINNED_C_BALANCE_DIGEST_TESTNET,
@@ -133,7 +134,7 @@ pub fn pinned_c_balance_digest(network: Network) -> [u8; 32] {
 
 /// Server-side state for one issued `AttestBalanceChallenge`.
 #[derive(Clone, Debug)]
-pub struct AttestChallengeRecord {
+pub(crate) struct AttestChallengeRecord {
     pub subject: Address,
     pub expiry: u64,
     /// Action label; always `attest_balance` for this store.
@@ -141,7 +142,7 @@ pub struct AttestChallengeRecord {
 }
 
 /// Process-local single-use challenge map: `nonce → record`.
-pub type AttestChallengeMap = Arc<DashMap<[u8; 32], AttestChallengeRecord>>;
+pub(crate) type AttestChallengeMap = Arc<DashMap<[u8; 32], AttestChallengeRecord>>;
 
 // ---------------------------------------------------------------------------
 // Wire types (§7.5 / §7.1)
@@ -151,10 +152,10 @@ pub type AttestChallengeMap = Arc<DashMap<[u8; 32], AttestChallengeRecord>>;
 /// `0|[1-9][0-9]*` (no JSON number — values may exceed the 2⁵³ float
 /// mantissa). Used for `expiry` and `size_ceiling`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct U64Decimal(pub u64);
+pub(crate) struct U64Decimal(pub u64);
 
 impl U64Decimal {
-    pub fn format(n: u64) -> String {
+    pub(crate) fn format(n: u64) -> String {
         n.to_string()
     }
 }
@@ -208,7 +209,7 @@ impl<'de> Deserialize<'de> for U64Decimal {
 }
 
 /// Parse a §7.1 canonical decimal-string u64 (`0|[1-9][0-9]*`).
-pub fn parse_u64_decimal(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_u64_decimal(s: &str) -> Result<u64, String> {
     if s.is_empty() {
         return Err("empty decimal string".into());
     }
@@ -226,12 +227,12 @@ pub fn parse_u64_decimal(s: &str) -> Result<u64, String> {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct AttestChallengeRequest {
+pub(crate) struct AttestChallengeRequest {
     pub subject: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct OwnershipProofJson {
+pub(crate) struct OwnershipProofJson {
     #[serde(rename = "type")]
     pub proof_type: String,
     pub subject: String,
@@ -241,7 +242,7 @@ pub struct OwnershipProofJson {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct AttestChallengeNonce {
+pub(crate) struct AttestChallengeNonce {
     pub nonce: String,
 }
 
@@ -249,7 +250,7 @@ pub struct AttestChallengeNonce {
 ///
 /// `size_ceiling` is a §7.1 decimal-string u64 (never a JSON number).
 #[derive(Clone, Debug, Deserialize)]
-pub struct AttestBalanceRequest {
+pub(crate) struct AttestBalanceRequest {
     pub subject: String,
     pub asset_id: String,
     pub nav_ceiling: Option<String>,
@@ -260,7 +261,7 @@ pub struct AttestBalanceRequest {
 
 /// Authorised job payload stored after the route gate passes.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct AttestJobBody {
+pub(crate) struct AttestJobBody {
     pub subject: [u8; 32],
     pub asset_id: [u8; 32],
     /// `None` = use node's current `size_final` ceiling.
@@ -273,7 +274,7 @@ pub struct AttestJobBody {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AttestError {
+pub(crate) enum AttestError {
     FeatureDisabled,
     Malformed(String),
     Unauthorized(String),
@@ -286,7 +287,7 @@ pub enum AttestError {
 
 impl AttestError {
     /// HTTP status + closed machine code for admit-time responses.
-    pub fn http_status_and_code(&self) -> (u16, &'static str) {
+    pub(crate) fn http_status_and_code(&self) -> (u16, &'static str) {
         match self {
             AttestError::FeatureDisabled => (404, "feature_disabled"),
             AttestError::Malformed(_) => (400, "malformed_request"),
@@ -299,7 +300,7 @@ impl AttestError {
         }
     }
 
-    pub fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         match self {
             AttestError::FeatureDisabled => {
                 "POST /v1/attest/balance requires ZKCOINS_V1_SHADOW=1 / ScanStackMode::V1"
@@ -319,11 +320,12 @@ impl AttestError {
 // ---------------------------------------------------------------------------
 
 /// True when the process claim is v1.1 (flag on and stack claimed).
-pub fn v1_attest_route_active() -> bool {
+pub(crate) fn v1_attest_route_active() -> bool {
     matches!(process_stack_mode(), Some(ScanStackMode::V1))
 }
 
-pub fn ensure_v1_attest_path(mode: V1ShadowMode) -> Result<(), AttestError> {
+#[cfg(test)]
+pub(crate) fn ensure_v1_attest_path(mode: V1ShadowMode) -> Result<(), AttestError> {
     match mode {
         V1ShadowMode::On if v1_attest_route_active() => Ok(()),
         V1ShadowMode::On => Err(AttestError::FeatureDisabled),
@@ -340,7 +342,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 }
 
 /// `chan_bind = H("zkCoins/v1/PullHost" ‖ host)` for clearnet (§5.1).
-pub fn chan_bind_for_host(host: &str) -> [u8; 32] {
+pub(crate) fn chan_bind_for_host(host: &str) -> [u8; 32] {
     let mut pre = Vec::with_capacity(PULL_HOST_DOMAIN.len() + host.len());
     pre.extend_from_slice(PULL_HOST_DOMAIN.as_bytes());
     pre.extend_from_slice(host.as_bytes());
@@ -351,7 +353,7 @@ pub fn chan_bind_for_host(host: &str) -> [u8; 32] {
 /// - both omitted → single byte `0x00`
 /// - both present → `0x01 ‖ nav_ceiling (32B) ‖ u64-be(size_ceiling)`
 /// - any other combination → error
-pub fn ceiling_encoding(
+pub(crate) fn ceiling_encoding(
     nav_ceiling: Option<&[u8; 32]>,
     size_ceiling: Option<u64>,
 ) -> Result<Vec<u8>, AttestError> {
@@ -371,7 +373,7 @@ pub fn ceiling_encoding(
 }
 
 /// `request_hash = H("zkCoins/v1/AttestBalance" ‖ subject ‖ asset_id ‖ ceiling_encoding)`.
-pub fn attest_request_hash(
+pub(crate) fn attest_request_hash(
     subject: &[u8; 32],
     asset_id: &[u8; 32],
     ceiling_enc: &[u8],
@@ -385,7 +387,7 @@ pub fn attest_request_hash(
 }
 
 /// `chal = H(domain ‖ nonce ‖ chan_bind ‖ subject ‖ expiry ‖ request_hash)`.
-pub fn attest_challenge_message(
+pub(crate) fn attest_challenge_message(
     nonce: &[u8; 32],
     chan_bind: &[u8; 32],
     subject: &[u8; 32],
@@ -439,7 +441,7 @@ fn parse_hex64(s: &str, field: &str) -> Result<[u8; 64], AttestError> {
 // ---------------------------------------------------------------------------
 
 /// Issue a fresh `AttestBalanceChallenge` for `subject` (Bech32m `zk` address).
-pub fn issue_attest_challenge(
+pub(crate) fn issue_attest_challenge(
     store: &AttestChallengeMap,
     subject_bech32: &str,
     now: u64,
@@ -473,7 +475,7 @@ pub fn issue_attest_challenge(
 /// Verify the action-bound OwnershipProof and consume the nonce.
 ///
 /// Returns the authorised [`AttestJobBody`] on success.
-pub fn authorise_attest_balance(
+pub(crate) fn authorise_attest_balance(
     store: &AttestChallengeMap,
     public_hosts: &[String],
     req: &AttestBalanceRequest,
@@ -609,7 +611,7 @@ pub fn authorise_attest_balance(
 /// (public inputs as 8-byte-LE field elements + proof body). **Not**
 /// `bincode` / serde — that is an internal comparison encoding only and a
 /// verifier following the spec cannot read it.
-pub fn encode_c_balance_proof_bytes(proof: &BalanceProof) -> Vec<u8> {
+pub(crate) fn encode_c_balance_proof_bytes(proof: &BalanceProof) -> Vec<u8> {
     proof.to_bytes()
 }
 
@@ -619,7 +621,7 @@ pub fn encode_c_balance_proof_bytes(proof: &BalanceProof) -> Vec<u8> {
 /// `subject(32) ‖ asset_id(32) ‖ balance(u128-be16) ‖ nav_ceiling(32) ‖
 ///  size_ceiling(u64-be8) ‖ txid(32) ‖ block_hash(32) ‖ height(u64-be8) ‖
 ///  Pk_anchor(32) ‖ R_anchor(32) ‖ network_id(32) ‖ u32-be len(proof) ‖ proof`
-pub fn serialize_balance_attestation(
+pub(crate) fn serialize_balance_attestation(
     statement: &BalanceAttestationStatement,
     network: Network,
     proof: &BalanceProof,
@@ -632,7 +634,7 @@ pub fn serialize_balance_attestation(
 ///
 /// Production callers use [`serialize_balance_attestation`]; tests inject
 /// fixed proof bytes so the layout is exercised without a circuit prove.
-pub fn serialize_balance_attestation_v1(
+pub(crate) fn serialize_balance_attestation_v1(
     statement: &BalanceAttestationStatement,
     network: Network,
     proof_bytes: &[u8],
@@ -666,7 +668,7 @@ pub fn serialize_balance_attestation_v1(
 }
 
 /// §7.5 completed-job `result` for `attest_balance`: only `attestation`.
-pub fn completed_attest_result(attestation_bytes: &[u8]) -> serde_json::Value {
+pub(crate) fn completed_attest_result(attestation_bytes: &[u8]) -> serde_json::Value {
     serde_json::json!({
         "attestation": hex::encode(attestation_bytes),
     })
@@ -674,7 +676,7 @@ pub fn completed_attest_result(attestation_bytes: &[u8]) -> serde_json::Value {
 
 /// Require a fully resolved Bitcoin inscription locator, or fail with the
 /// named [`ATTEST_ANCHOR_LOCATOR_EDGE`] (never fabricate zero txid/hash).
-pub fn require_resolved_anchor(
+pub(crate) fn require_resolved_anchor(
     txid: Option<[u8; 32]>,
     block_hash: Option<[u8; 32]>,
 ) -> Result<([u8; 32], [u8; 32]), AttestError> {
@@ -697,7 +699,7 @@ pub fn require_resolved_anchor(
 ///
 /// Called from [`collect_materials`]; tests **must** call this function
 /// — asserting locator non-zeros alone does not establish the property.
-pub fn require_completed_anchor(
+pub(crate) fn require_completed_anchor(
     nullifier_pos: u64,
     size_final: u64,
     classification: SpendClassification,
@@ -721,7 +723,8 @@ pub fn require_completed_anchor(
 ///
 /// Offset: subject(32)+asset(32)+balance(16)+nav_ceiling(32)+size(8)+txid(32)
 /// +block_hash(32)+height(8)+Pk(32)+R(32) = 256 → network_id at [256..288].
-pub fn network_id_from_attestation_bytes(bytes: &[u8]) -> Result<[u8; 32], AttestError> {
+#[cfg(test)]
+pub(crate) fn network_id_from_attestation_bytes(bytes: &[u8]) -> Result<[u8; 32], AttestError> {
     const OFFSET: usize = 32 + 32 + 16 + 32 + 8 + 32 + 32 + 8 + 32 + 32;
     if bytes.len() < OFFSET + 32 + 4 {
         return Err(AttestError::Malformed(
@@ -753,7 +756,7 @@ fn network_id_for(n: Network) -> HashDigest {
 /// [`prove_attestation_for_job`]. Tests **must** call this (or the
 /// thin wrappers below) — comparing pin constants alone does not
 /// exercise the gate, and removing it must turn those tests red.
-pub fn accept_c_balance_network_binding(
+pub(crate) fn accept_c_balance_network_binding(
     attestation_network_id: &HashDigest,
     live_c_balance_digest: &[u8],
     network: Network,
@@ -782,7 +785,7 @@ pub fn accept_c_balance_network_binding(
 /// Cross-network reject: a proof whose `network_id` is for network B is
 /// refused on a node running network A **before** Plonky2 verify — and
 /// `ProverBridge::verify_attestation` on the wrong circuit would fail too.
-pub fn accept_attestation_for_network(
+pub(crate) fn accept_attestation_for_network(
     proved: &ProvedAttestation,
     network: Network,
 ) -> Result<(), AttestError> {
@@ -797,7 +800,8 @@ pub fn accept_attestation_for_network(
 
 /// Compare two networks' pinned digests and `network_id`s — they **must**
 /// differ. Used by tests that the network pin is a real boundary.
-pub fn networks_have_distinct_c_balance_pins(a: Network, b: Network) -> bool {
+#[cfg(test)]
+pub(crate) fn networks_have_distinct_c_balance_pins(a: Network, b: Network) -> bool {
     if a == b {
         return false;
     }
@@ -982,7 +986,7 @@ pub(crate) fn collect_materials(
 ///
 /// Returns `None` when no trustworthy non-zero hash is available — the
 /// caller must surface [`ATTEST_ANCHOR_LOCATOR_EDGE`], never fabricate.
-pub fn block_hash_for_anchor_height(
+pub(crate) fn block_hash_for_anchor_height(
     nullifier_height: u64,
     tip_height: u64,
     tip_hash: [u8; 32],
@@ -1045,7 +1049,7 @@ pub(crate) async fn resolve_anchor_locator(
 /// Build the witness and run `ProverBridge::prove_attestation`.
 ///
 /// Fails loud on the locator edge or any missing material.
-pub async fn prove_attestation_for_job(
+pub(crate) async fn prove_attestation_for_job(
     adapter: &EngineAdapter,
     body: &AttestJobBody,
 ) -> Result<ProvedAttestation, AttestError> {
@@ -1150,7 +1154,7 @@ pub async fn prove_attestation_for_job(
 }
 
 /// Unix seconds for challenge expiry.
-pub fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1161,7 +1165,7 @@ pub fn unix_now() -> u64 {
 ///
 /// Canonicalisation: lowercase, strip trailing dot. Empty → empty list
 /// (auth then fails loud — no silent localhost default).
-pub fn public_hosts_from_env() -> Vec<String> {
+pub(crate) fn public_hosts_from_env() -> Vec<String> {
     match std::env::var("ZKCOINS_PUBLIC_HOST") {
         Ok(v) => v
             .split(',')

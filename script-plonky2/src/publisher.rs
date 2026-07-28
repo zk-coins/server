@@ -102,19 +102,19 @@ use crate::inscription::{build_inscription, extract_payloads_from_reveal, Inscri
 /// bitcoind rejects after the commit has already been broadcast permanently
 /// burns the commit value. The pre-broadcast standardness weight check is
 /// therefore mandatory — there is no key-path recovery hatch.
-pub const NUMS_INTERNAL_KEY_BYTES: [u8; 32] = [
+pub(crate) const NUMS_INTERNAL_KEY_BYTES: [u8; 32] = [
     0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
     0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
 ];
 
 /// Bitcoin Core standardness policy limit on a single transaction's weight
 /// (`MAX_STANDARD_TX_WEIGHT` = 400 000 weight units).
-pub const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
+pub(crate) const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 
 /// §3.5 maximum gap between `block_anchor.height` and inclusion height.
 ///
 /// Scanner consensus bound: `inclusion_height − block_anchor.height ≤ 100`.
-pub const BLOCK_ANCHOR_MAX_GAP: u32 = 100;
+pub(crate) const BLOCK_ANCHOR_MAX_GAP: u32 = 100;
 
 /// Recommended inclusion-delay margin (blocks of tip advance reserved so the
 /// reveal can still land inside [`BLOCK_ANCHOR_MAX_GAP`]).
@@ -137,7 +137,8 @@ pub const BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN: u32 = 6;
 /// Prefer computing `BLOCK_ANCHOR_MAX_GAP − config.inclusion_delay_margin` at
 /// runtime (see [`publish_max_gap`]). This constant documents the recommended
 /// effective bound only.
-pub const BLOCK_ANCHOR_PUBLISH_MAX_GAP: u32 =
+#[cfg(test)]
+pub(crate) const BLOCK_ANCHOR_PUBLISH_MAX_GAP: u32 =
     BLOCK_ANCHOR_MAX_GAP - BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN;
 
 /// Cap on fee/topology fixed-point rounds before failing loudly.
@@ -1488,7 +1489,7 @@ struct ConvergedInscription {
 /// - legacy / P2SH-wrapped segwit — scriptSig is part of the txid, so signing
 ///   would invalidate a pre-built reveal
 /// - any other witness version / program length
-pub fn ensure_deterministic_funding(script_pubkey: &Script) -> Result<()> {
+pub(crate) fn ensure_deterministic_funding(script_pubkey: &Script) -> Result<()> {
     ensure!(
         script_pubkey.is_witness_program(),
         "funding scriptPubKey is not a segwit witness program (v0 or v1); \
@@ -1522,7 +1523,8 @@ pub fn ensure_deterministic_funding(script_pubkey: &Script) -> Result<()> {
 
 /// Back-compat name: deterministic segwit funding only (see
 /// [`ensure_deterministic_funding`]).
-pub fn ensure_segwit_funding(script_pubkey: &Script) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn ensure_segwit_funding(script_pubkey: &Script) -> Result<()> {
     ensure_deterministic_funding(script_pubkey)
 }
 
@@ -1530,7 +1532,7 @@ pub fn ensure_segwit_funding(script_pubkey: &Script) -> Result<()> {
 ///
 /// Uses a dummy funding outpoint and a P2TR reveal output; only the reveal
 /// side is meaningful for the standardness bound (the envelope leaf dominates).
-pub fn measure_reveal_weight(payload: &[u8]) -> Result<u64> {
+pub(crate) fn measure_reveal_weight(payload: &[u8]) -> Result<u64> {
     let inscription = sizing_inscription(payload)?;
     Ok(inscription.reveal_tx.weight().to_wu())
 }
@@ -1544,7 +1546,8 @@ pub fn measure_reveal_weight(payload: &[u8]) -> Result<u64> {
 /// **Does not auto-split batches.** Batch composition (which nullifiers share
 /// an inscription) is a policy decision with first-occurrence consequences;
 /// callers that exceed this bound must split themselves and re-submit.
-pub fn max_half_agg_members_for_standard_reveal() -> Result<usize> {
+#[cfg(test)]
+pub(crate) fn max_half_agg_members_for_standard_reveal() -> Result<usize> {
     // Structure/length is all that matters for weight. Build raw half-agg
     // payload bytes without per-member curve validation (that would dominate
     // the binary search at thousands of members).
@@ -1609,7 +1612,7 @@ pub fn max_half_agg_members_for_standard_reveal() -> Result<usize> {
 }
 
 /// Fail loudly if `weight_wu` exceeds [`MAX_STANDARD_TX_WEIGHT`].
-pub fn ensure_tx_within_standard_weight(
+pub(crate) fn ensure_tx_within_standard_weight(
     which: &str,
     weight_wu: u64,
     member_count: usize,
@@ -1689,7 +1692,7 @@ fn sizing_inscription(payload: &[u8]) -> Result<crate::inscription::Inscription>
 }
 
 /// `vsize * fee_rate_sat_per_vb`, failing loudly on overflow.
-pub fn fee_for_vsize(vsize: usize, fee_rate_sat_per_vb: u64) -> Result<Amount> {
+pub(crate) fn fee_for_vsize(vsize: usize, fee_rate_sat_per_vb: u64) -> Result<Amount> {
     ensure!(fee_rate_sat_per_vb > 0, "fee_rate_sat_per_vb must be > 0");
     let vsize_u64 = u64::try_from(vsize).context("vsize does not fit in u64")?;
     let fee_sats = vsize_u64
@@ -1701,7 +1704,7 @@ pub fn fee_for_vsize(vsize: usize, fee_rate_sat_per_vb: u64) -> Result<Amount> {
 }
 
 /// Fail if `value` is strictly below the dust limit of `script_pubkey`.
-pub fn ensure_above_dust(value: Amount, script_pubkey: &Script) -> Result<()> {
+pub(crate) fn ensure_above_dust(value: Amount, script_pubkey: &Script) -> Result<()> {
     let dust = script_pubkey.minimal_non_dust();
     ensure!(
         value >= dust,
@@ -1713,7 +1716,7 @@ pub fn ensure_above_dust(value: Amount, script_pubkey: &Script) -> Result<()> {
 }
 
 /// Parse the BIP-341 NUMS internal key.
-pub fn nums_internal_key() -> Result<XOnlyPublicKey> {
+pub(crate) fn nums_internal_key() -> Result<XOnlyPublicKey> {
     XOnlyPublicKey::from_slice(&NUMS_INTERNAL_KEY_BYTES)
         .context("NUMS_INTERNAL_KEY_BYTES is not a valid x-only public key")
 }
@@ -1725,19 +1728,19 @@ pub fn nums_internal_key() -> Result<XOnlyPublicKey> {
 /// - [`Network::Testnet`] ↔ [`BitcoinNetwork::Signet`] only
 ///   (normative testnet is Signet per §3.6; Testnet3/Testnet4 are rejected)
 /// - [`Network::Regtest`] ↔ [`BitcoinNetwork::Regtest`]
-pub fn chain_matches_config(chain: BitcoinNetwork, config_network: Network) -> bool {
-    match (config_network, chain) {
-        (Network::Mainnet, BitcoinNetwork::Bitcoin) => true,
-        (Network::Testnet, BitcoinNetwork::Signet) => true,
-        (Network::Regtest, BitcoinNetwork::Regtest) => true,
-        _ => false,
-    }
+pub(crate) fn chain_matches_config(chain: BitcoinNetwork, config_network: Network) -> bool {
+    matches!(
+        (config_network, chain),
+        (Network::Mainnet, BitcoinNetwork::Bitcoin)
+            | (Network::Testnet, BitcoinNetwork::Signet)
+            | (Network::Regtest, BitcoinNetwork::Regtest)
+    )
 }
 
 /// Fail if bitcoind's chain and [`PublisherConfig::network`] disagree.
 ///
 /// Error names both the configured network and the chain bitcoind reported.
-pub fn ensure_chain_matches_config(chain: BitcoinNetwork, config_network: Network) -> Result<()> {
+pub(crate) fn ensure_chain_matches_config(chain: BitcoinNetwork, config_network: Network) -> Result<()> {
     ensure!(
         chain_matches_config(chain, config_network),
         "bitcoind chain {chain:?} does not match PublisherConfig.network {config_network:?} \
@@ -1752,7 +1755,7 @@ pub fn ensure_chain_matches_config(chain: BitcoinNetwork, config_network: Networ
 ///
 /// Fails loudly when `inclusion_delay_margin >= BLOCK_ANCHOR_MAX_GAP` (no
 /// silent clamp, no default).
-pub fn publish_max_gap(inclusion_delay_margin: u32) -> Result<u32> {
+pub(crate) fn publish_max_gap(inclusion_delay_margin: u32) -> Result<u32> {
     ensure!(
         inclusion_delay_margin < BLOCK_ANCHOR_MAX_GAP,
         "inclusion_delay_margin {inclusion_delay_margin} must be < \
@@ -1763,7 +1766,7 @@ pub fn publish_max_gap(inclusion_delay_margin: u32) -> Result<u32> {
 
 /// Minimum inclusion gap if the reveal is mined in the next block:
 /// `(node_tip.height + 1) − anchor.height`.
-pub fn publish_inclusion_gap(anchor: BlockAnchor, node_tip: BlockAnchor) -> Result<u32> {
+pub(crate) fn publish_inclusion_gap(anchor: BlockAnchor, node_tip: BlockAnchor) -> Result<u32> {
     ensure!(
         anchor.height <= node_tip.height,
         "anchor height {} is above node tip {}",
@@ -1785,7 +1788,7 @@ pub fn publish_inclusion_gap(anchor: BlockAnchor, node_tip: BlockAnchor) -> Resu
 /// (see [`publish_max_gap`]). On failure the message is
 /// `"members too stale, re-prove"` and includes the actual gap and the
 /// effective publish bound (not the consensus [`BLOCK_ANCHOR_MAX_GAP`] alone).
-pub fn ensure_publish_gap_ok(
+pub(crate) fn ensure_publish_gap_ok(
     anchor: BlockAnchor,
     node_tip: BlockAnchor,
     inclusion_delay_margin: u32,
@@ -1810,7 +1813,7 @@ pub fn ensure_publish_gap_ok(
 ///
 /// Used only as a pre-filter to skip hopeless UTXOs without signing. Admission
 /// still requires measured fees after construction.
-pub fn theoretical_min_funding_required(
+pub(crate) fn theoretical_min_funding_required(
     reveal_output: Amount,
     reveal_vsize: usize,
     fee_rate_sat_per_vb: u64,
@@ -1827,7 +1830,7 @@ pub fn theoretical_min_funding_required(
 /// subsequent measured-fee check reports the shortfall). When the sum of
 /// seeds exceeds `funding − reveal_output`, fees are reduced (preferring to
 /// keep the reveal seed) so `build_inscription` can construct a transaction.
-pub fn clamp_seed_fees(
+pub(crate) fn clamp_seed_fees(
     funding: Amount,
     reveal_output: Amount,
     commit_fee: Amount,
@@ -1854,7 +1857,7 @@ pub fn clamp_seed_fees(
 ///
 /// Returns an error if this pair was already seen in the current phase
 /// (period-≥2 fee oscillation that the previous single-prev detector missed).
-pub fn note_fee_state(
+pub(crate) fn note_fee_state(
     seen: &mut HashSet<(u64, u64)>,
     commit_fee: Amount,
     reveal_fee: Amount,

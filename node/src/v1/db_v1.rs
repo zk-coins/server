@@ -19,12 +19,30 @@ use zkcoins_prover::state_engine::{AccountRecord, OpSecret, StateEngine, Tracked
 use super::mode::{network_label, parse_network_label};
 use super::separation::{require_stack_mode_for_update, ScanStackMode};
 
+/// sqlx row shape for `v1_nflog_entries` (position + chain pos + pk/r).
+type NfLogRow = (i64, i64, i64, i64, i64, Vec<u8>, Vec<u8>);
+/// sqlx row shape for `v1_accounts` SELECT columns used by engine load.
+type AccountRow = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Vec<u8>,
+);
+/// sqlx row shape for `v1_spendable_coins` (coin_id, coin, ash, index).
+type SpendableRow = (Vec<u8>, Vec<u8>, Vec<u8>, i32);
+
 /// Serializable snapshot of one account for the DB layer.
 ///
 /// `op_secret` is redacted in Debug (via [`OpSecret`]); it must never appear
 /// in logs or response bodies.
 #[derive(Clone, Debug)]
-pub struct AccountSnapshot {
+pub(crate) struct AccountSnapshot {
     pub owner: Address,
     pub state: AccountState,
     pub nk: [u8; 32],
@@ -41,7 +59,7 @@ pub struct AccountSnapshot {
 
 /// Full engine snapshot as read from / written to Postgres.
 #[derive(Clone, Debug)]
-pub struct EngineSnapshot {
+pub(crate) struct EngineSnapshot {
     pub network: Network,
     pub activation_height: u64,
     pub tip_height: u64,
@@ -59,7 +77,7 @@ impl EngineSnapshot {
     ///
     /// Stage 1: the hash is not yet on [`StateEngine`]; callers that persist
     /// after a load must pass the reloaded hash so it is not zeroed.
-    pub fn from_engine_with_tip_hash(engine: &StateEngine, tip_hash: [u8; 32]) -> Self {
+    pub(crate) fn from_engine_with_tip_hash(engine: &StateEngine, tip_hash: [u8; 32]) -> Self {
         let accounts = engine
             .accounts()
             .map(|(owner, record)| AccountSnapshot {
@@ -91,7 +109,7 @@ impl EngineSnapshot {
         }
     }
 
-    pub fn into_engine(self) -> Result<StateEngine> {
+    pub(crate) fn into_engine(self) -> Result<StateEngine> {
         let mut records = Vec::with_capacity(self.accounts.len());
         for snap in self.accounts {
             records.push((snap.owner, snap.into_record()?));
@@ -258,7 +276,7 @@ async fn count_any_v1_rows(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
 /// - No meta row **and** no other v1 rows → `Ok(None)` (genuinely empty).
 /// - No meta row **but** other v1 data exists → `Err` (inconsistent DB).
 /// - Meta present → load the full snapshot (data tables may be empty).
-pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot>> {
+pub(crate) async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot>> {
     let mut tx = pool.begin().await.context("begin v1 load tx")?;
     // REPEATABLE READ = snapshot isolation in Postgres: one MVCC snapshot for
     // the whole transaction. Must be the first statement after BEGIN.
@@ -298,7 +316,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
     let tip_hash = fixed_32(&tip_hash_b, "tip_hash")?;
     let fold_seq = u32_from_i64(fold_seq, "fold_seq")?;
 
-    let nflog_rows: Vec<(i64, i64, i64, i64, i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    let nflog_rows: Vec<NfLogRow> = sqlx::query_as(
         "SELECT position, height, tx_index, vin_index, member_index, pk, r \
          FROM v1_nflog_entries ORDER BY position ASC",
     )
@@ -370,18 +388,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
         }
     }
 
-    let account_rows: Vec<(
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Option<Vec<u8>>,
-        Vec<u8>,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<i64>,
-        Vec<u8>,
-    )> = sqlx::query_as(
+    let account_rows: Vec<AccountRow> = sqlx::query_as(
         "SELECT owner, account_state, nk, op_secret, genesis_pubkey, last_proof, \
                 last_nav_opening, last_nullifier, last_nullifier_pos, coin_history_root \
          FROM v1_accounts ORDER BY owner",
@@ -423,7 +430,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
             );
         }
 
-        let spendable_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, i32)> = sqlx::query_as(
+        let spendable_rows: Vec<SpendableRow> = sqlx::query_as(
             "SELECT coin_id, coin, creating_prev_ash, coin_index \
              FROM v1_spendable_coins WHERE owner = $1 ORDER BY coin_id",
         )
@@ -576,6 +583,9 @@ pub(crate) async fn persist_engine_snapshot(
 /// path **must** use
 /// [`persist_engine_with_pending_members_ready_if_finalise_fence`] so a stale
 /// claim epoch cannot advance the engine after reclaim.
+// Clippy too_many_arguments: durable engine+members_ready write; packing
+// Schnorr/tip fields would change a crash-window-sensitive sink signature.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_engine_with_pending_members_ready(
     pool: &PgPool,
     snap: &EngineSnapshot,
@@ -625,6 +635,9 @@ pub(crate) async fn persist_engine_with_pending_members_ready(
 ///
 /// The fence check and the engine write share one transaction so a reclaim
 /// between check and commit cannot race the durable stage in.
+// Clippy too_many_arguments: fenced durable engine write; signature stays
+// explicit so fence/lease args cannot be silently regrouped.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_engine_with_pending_members_ready_if_finalise_fence(
     pool: &PgPool,
     snap: &EngineSnapshot,
@@ -697,6 +710,9 @@ pub(crate) async fn persist_engine_with_pending_members_ready_if_finalise_fence(
     Ok(true)
 }
 
+// Clippy too_many_arguments: internal durable INSERT of members_ready
+// fields kept flat to match the pending_publishes row layout.
+#[allow(clippy::too_many_arguments)]
 async fn insert_members_ready_row(
     tx: &mut Transaction<'_, Postgres>,
     owner: Address,
@@ -891,12 +907,12 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
 // ---------------------------------------------------------------------------
 
 /// Status labels for [`v1_pending_publishes`] (CHECK-constrained).
-pub const PENDING_PUBLISH_MEMBERS_READY: &str = "members_ready";
-pub const PENDING_PUBLISH_CONSTRUCTED: &str = "constructed";
-pub const PENDING_PUBLISH_COMMIT_BROADCAST: &str = "commit_broadcast";
-pub const PENDING_PUBLISH_REVEAL_BROADCAST: &str = "reveal_broadcast";
-pub const PENDING_PUBLISH_COMPLETE: &str = "complete";
-pub const PENDING_PUBLISH_FAILED: &str = "failed";
+pub(crate) const PENDING_PUBLISH_MEMBERS_READY: &str = "members_ready";
+pub(crate) const PENDING_PUBLISH_CONSTRUCTED: &str = "constructed";
+pub(crate) const PENDING_PUBLISH_COMMIT_BROADCAST: &str = "commit_broadcast";
+pub(crate) const PENDING_PUBLISH_REVEAL_BROADCAST: &str = "reveal_broadcast";
+pub(crate) const PENDING_PUBLISH_COMPLETE: &str = "complete";
+pub(crate) const PENDING_PUBLISH_FAILED: &str = "failed";
 
 /// Durable rebroadcast intent for one account-state nullifier.
 #[derive(Clone, Debug)]
@@ -921,7 +937,10 @@ pub struct PendingPublishRow {
 /// **Crate-private durable-write sink.** Production receive uses the atomic
 /// [`persist_engine_with_pending_members_ready`]; this insert remains for
 /// crash-window fixtures that stage a row without rewriting the engine.
+// Clippy too_many_arguments: durable members_ready staging sink; keep the
+// flat Schnorr/tip args aligned with the SQL row and sibling insert path.
 #[allow(dead_code)] // crate-test staging path
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_pending_publish_members_ready(
     pool: &PgPool,
     owner: Address,
@@ -1061,7 +1080,7 @@ pub(crate) async fn mark_pending_publish_status(
 }
 
 /// Load one pending publish by Pk, or `None` if absent.
-pub async fn load_pending_publish(pool: &PgPool, pk: [u8; 32]) -> Result<Option<PendingPublishRow>> {
+pub(crate) async fn load_pending_publish(pool: &PgPool, pk: [u8; 32]) -> Result<Option<PendingPublishRow>> {
     let row = sqlx::query(
         "SELECT pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
                 commit_tx, reveal_tx, commit_txid, reveal_txid, status \

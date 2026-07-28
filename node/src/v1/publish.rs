@@ -44,9 +44,9 @@ pub struct V1PublisherEnv {
 }
 
 /// Env keys for the v1.1 bitcoind publisher wallet.
-pub const V1_PUBLISHER_WALLET_ENV: &str = "ZKCOINS_V1_BITCOIND_WALLET";
-pub const V1_PUBLISHER_FEE_RATE_ENV: &str = "ZKCOINS_V1_FEE_RATE_SAT_PER_VB";
-pub const V1_PUBLISHER_REVEAL_VALUE_ENV: &str = "ZKCOINS_V1_REVEAL_OUTPUT_SATS";
+pub(crate) const V1_PUBLISHER_WALLET_ENV: &str = "ZKCOINS_V1_BITCOIND_WALLET";
+pub(crate) const V1_PUBLISHER_FEE_RATE_ENV: &str = "ZKCOINS_V1_FEE_RATE_SAT_PER_VB";
+pub(crate) const V1_PUBLISHER_REVEAL_VALUE_ENV: &str = "ZKCOINS_V1_REVEAL_OUTPUT_SATS";
 
 /// Load publisher config from env. Fails loud on any missing piece.
 pub fn v1_publisher_env_from_env(network: Network) -> Result<V1PublisherEnv> {

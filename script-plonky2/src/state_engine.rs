@@ -418,17 +418,6 @@ impl FinalisationCapability {
         &self.pending
     }
 
-    /// Mutable access for crate-internal finalise wiring only.
-    ///
-    /// **Visibility (Stage 3 Runde 6):** `pub(crate)`. A public
-    /// `pending_mut` would let downstream replace `witness_wip.prev_proof`
-    /// with an unbound proof after durable load — reopening the load gate
-    /// that [`TransitionWitness::decode_bound`] / `from_durable_bytes`
-    /// enforce. External crates get read-only [`Self::pending`].
-    pub(crate) fn pending_mut(&mut self) -> &mut PendingTransition {
-        &mut self.pending
-    }
-
     pub fn signature(&self) -> Option<&TransitionSignature> {
         self.signature.as_ref()
     }
@@ -621,6 +610,18 @@ pub struct StateEngine {
     /// Strictly-increasing fold ordinal at the current tip (as `tx_index`).
     fold_seq: u32,
 }
+
+
+/// Shared begin_* setup: mode, prev state, recursion material, coinhist leaves.
+type AccountTransitionContext = (
+    TransitionMode,
+    AccountState,
+    Option<ComplianceProof>,
+    Option<NavOpening>,
+    Option<PredecessorNullifier>,
+    Vec<HashDigest>,
+    BTreeMap<[u8; 32], host::CoinHistState>,
+);
 
 impl StateEngine {
     /// Construct an empty engine for `network` with NfLog activation height.
@@ -1012,13 +1013,10 @@ impl StateEngine {
         };
         let proof_data = compute_proof_data(
             &new_account_state,
-            &[output_coin.clone()],
+            std::slice::from_ref(&output_coin),
             &[],
             &req.nk,
-            nav,
-            &nav_rand,
-            &req.next_pubkey,
-            &req.npk_rand,
+        (    nav,     &nav_rand,     &req.next_pubkey,     &req.npk_rand),
         )?;
         let proof_data_hash = host::hash_proof_data(&host::serialize_proof_data(&proof_data));
 
@@ -1299,10 +1297,7 @@ impl StateEngine {
             &output_coins,
             &input_coins,
             &record.nk,
-            nav,
-            &nav_rand,
-            &req.next_pubkey,
-            &req.npk_rand,
+        (    nav,     &nav_rand,     &req.next_pubkey,     &req.npk_rand),
         )?;
         let proof_data_hash = host::hash_proof_data(&host::serialize_proof_data(&proof_data));
 
@@ -1419,7 +1414,7 @@ impl StateEngine {
         // before constructing the next receipt's path.
         let mut hist_for_proofs = rebuild_coinhist(&hist_leaves)?;
         let mut auth_with_history = Vec::with_capacity(req.received_auth.len());
-        for (coin, mut auth) in req.received_coins.iter().zip(req.received_auth.into_iter()) {
+        for (coin, mut auth) in req.received_coins.iter().zip(req.received_auth) {
             let id = host::digest_to_bytes(&coin.identifier);
             let proof = hist_for_proofs
                 .non_inclusion(id)
@@ -1471,10 +1466,7 @@ impl StateEngine {
             &[],
             &[],
             &req.nk,
-            nav,
-            &nav_rand,
-            &req.next_pubkey,
-            &req.npk_rand,
+        (    nav,     &nav_rand,     &req.next_pubkey,     &req.npk_rand),
         )?;
         let proof_data_hash = host::hash_proof_data(&host::serialize_proof_data(&proof_data));
 
@@ -2093,15 +2085,7 @@ impl StateEngine {
         owner: &Address,
         nk: &[u8; 32],
         current_pubkey: [u8; 32],
-    ) -> Result<(
-        TransitionMode,
-        AccountState,
-        Option<ComplianceProof>,
-        Option<NavOpening>,
-        Option<PredecessorNullifier>,
-        Vec<HashDigest>,
-        BTreeMap<[u8; 32], host::CoinHistState>,
-    )> {
+    ) -> Result<AccountTransitionContext> {
         let nav = self.size_final_nav()?;
 
         if let Some(record) = self.accounts.get(owner) {
@@ -2258,11 +2242,9 @@ fn compute_proof_data(
     output_coins: &[Coin],
     input_coins: &[Coin],
     nk: &[u8; 32],
-    nav: Nav,
-    nav_rand: &[u8; 32],
-    next_pubkey: &[u8; 32],
-    npk_rand: &[u8; 32],
+    nav_and_keys: (Nav, &[u8; 32], &[u8; 32], &[u8; 32]),
 ) -> Result<ProofData> {
+    let (nav, nav_rand, next_pubkey, npk_rand) = nav_and_keys;
     let output_ids: Vec<HashDigest> = output_coins.iter().map(|c| c.identifier).collect();
     let nullifiers: Vec<HashDigest> = input_coins
         .iter()
@@ -3460,10 +3442,7 @@ mod tests {
             &pending.witness_wip.output_coins,
             &pending.witness_wip.input_coins,
             &fixture.nk,
-            pending.nav_opening.nav,
-            &pending.nav_opening.nav_rand,
-            &fixture.next_pubkey,
-            &pending.witness_wip.npk_rand,
+        (    pending.nav_opening.nav,     &pending.nav_opening.nav_rand,     &fixture.next_pubkey,     &pending.witness_wip.npk_rand),
         )
         .unwrap();
         assert_eq!(pending.proof_data, expected_pd);

@@ -108,7 +108,7 @@ const ANCESTOR_WALK_CACHE_CAPACITY: usize = 16;
 /// block, so each deeper gap costs one additional RPC rather than re-walking
 /// the prefix. Without resume the same pattern would be
 /// `Θ(MAX_ANCHOR_GAP²)` (`1+2+…+(MAX_ANCHOR_GAP-1)`).
-
+///
 /// OP_FALSE (`0x00`) followed by OP_IF (`0x63`) — the §3.5 envelope opener.
 const ENVELOPE_OPENER: [u8; 2] = [0x00, 0x63];
 
@@ -420,6 +420,10 @@ pub struct Scanner {
     ancestor_walk_rpc_count: usize,
 }
 
+
+/// Outcome of [`Scanner::fold_verified_nullifiers`].
+type FoldVerifiedNullifiersOutcome = (Vec<(ChainPosition, u64)>, usize, Vec<DuplicateNullifier>);
+
 impl Scanner {
     /// Connect to bitcoind with cookie auth and verify the chain matches
     /// [`ScannerConfig::network`].
@@ -599,10 +603,7 @@ impl Scanner {
                 acc.push_block(result)?;
             }
 
-            let tip_height = match self.rpc_get_block_count_post_commit(&acc, "getblockcount") {
-                Ok(h) => h,
-                Err(e) => return Err(e),
-            };
+            let tip_height = self.rpc_get_block_count_post_commit(&acc, "getblockcount")?;
 
             let start = match self.scanned_through {
                 Some((h, _)) => h
@@ -641,14 +642,11 @@ impl Scanner {
                 // link break is an inconsistent tip view — fail loud rather
                 // than spin forever.
                 if let Some((scanned_h, scanned_hash)) = self.scanned_through {
-                    let live = match self.rpc_get_block_hash_post_commit(
+                    let live = self.rpc_get_block_hash_post_commit(
                         &acc,
                         scanned_h,
                         &format!("getblockhash({scanned_h}) after chain break at {broke_height}"),
-                    ) {
-                        Ok(h) => h,
-                        Err(e) => return Err(e),
-                    };
+                    )?;
                     if live == scanned_hash {
                         return Err(acc.fail_msg(
                             format!(
@@ -666,25 +664,18 @@ impl Scanner {
 
             // Tip must match the accumulator: never report a live tip the
             // scanner has not fully reflected.
-            let live_tip = match self
-                .rpc_get_block_count_post_commit(&acc, "getblockcount (post-scan tip re-read)")
-            {
-                Ok(h) => h,
-                Err(e) => return Err(e),
-            };
+            let live_tip =
+                self.rpc_get_block_count_post_commit(&acc, "getblockcount (post-scan tip re-read)")?;
             if let Some((scanned_h, _)) = self.scanned_through {
                 if scanned_h < live_tip {
                     // New blocks appeared after the forward pass — continue.
                     continue;
                 }
-                let live_hash = match self.rpc_get_block_hash_post_commit(
+                let live_hash = self.rpc_get_block_hash_post_commit(
                     &acc,
                     scanned_h,
                     &format!("getblockhash({scanned_h}) post-scan tip check"),
-                ) {
-                    Ok(h) => h,
-                    Err(e) => return Err(e),
-                };
+                )?;
                 let scanned_hash = self.scanned_through.map(|(_, h)| h).ok_or_else(|| {
                     anyhow!(
                         "internal: scanned_through became None during post-scan tip check \
@@ -700,14 +691,11 @@ impl Scanner {
             let (report_tip_height, report_tip_hash) = match self.scanned_through {
                 Some((h, hash)) => (h, hash),
                 None => {
-                    let tip_hash = match self.rpc_get_block_hash_post_commit(
+                    let tip_hash = self.rpc_get_block_hash_post_commit(
                         &acc,
                         live_tip,
                         &format!("getblockhash({live_tip})"),
-                    ) {
-                        Ok(h) => h,
-                        Err(e) => return Err(e),
-                    };
+                    )?;
                     (live_tip, tip_hash)
                 }
             };
@@ -760,56 +748,56 @@ impl Scanner {
     /// Test seam: after committing ≥1 block this call, the next post-commit
     /// tip RPC fails with a partial report (one-shot).
     #[cfg(test)]
-    pub fn inject_post_commit_rpc_failure(&mut self) {
+    pub(crate) fn inject_post_commit_rpc_failure(&mut self) {
         self.inject_post_commit_rpc_failure = true;
     }
 
     /// Test observation: O(1) winner-index lookups this scan run.
     #[cfg(test)]
-    pub fn winner_index_lookups(&self) -> usize {
+    pub(crate) fn winner_index_lookups(&self) -> usize {
         self.winner_index_lookups
     }
 
     /// Test observation: ancestry-walk `getblock` RPCs this scan run.
     #[cfg(test)]
-    pub fn ancestor_walk_rpc_count(&self) -> usize {
+    pub(crate) fn ancestor_walk_rpc_count(&self) -> usize {
         self.ancestor_walk_rpc_count
     }
 
     /// Test observation: number of inclusion-block maps in the walk cache.
     #[cfg(test)]
-    pub fn ancestor_walk_cache_len(&self) -> usize {
+    pub(crate) fn ancestor_walk_cache_len(&self) -> usize {
         self.ancestor_walk_cache.len()
     }
 
     /// Test observation: verified-chain history length.
     #[cfg(test)]
-    pub fn verified_chain_len(&self) -> usize {
+    pub(crate) fn verified_chain_len(&self) -> usize {
         self.verified_chain.len()
     }
 
     /// Test seam: drop verified-chain history so ancestry walks must use RPC
     /// (and the walk cache / resume path) rather than the in-memory window.
     #[cfg(test)]
-    pub fn clear_verified_chain_for_test(&mut self) {
+    pub(crate) fn clear_verified_chain_for_test(&mut self) {
         self.verified_chain.clear();
     }
 
     /// Test observation: winner index size.
     #[cfg(test)]
-    pub fn winner_index_len(&self) -> usize {
+    pub(crate) fn winner_index_len(&self) -> usize {
         self.winner_by_pk.len()
     }
 
     /// Test observation: prevout output-cache hits this scan run.
     #[cfg(test)]
-    pub fn prevout_cache_hits(&self) -> usize {
+    pub(crate) fn prevout_cache_hits(&self) -> usize {
         self.prevout_cache_hits
     }
 
     /// Test seam: prime the parent-output cache without RPC (unit tests).
     #[cfg(test)]
-    pub fn inject_parent_outputs_for_test(&mut self, txid: Txid, outputs: Vec<TxOut>) {
+    pub(crate) fn inject_parent_outputs_for_test(&mut self, txid: Txid, outputs: Vec<TxOut>) {
         self.parent_output_cache.insert(txid, outputs);
     }
 
@@ -836,32 +824,32 @@ impl Scanner {
 
     /// Test seam: next prevout fetch aborts as infrastructure failure.
     #[cfg(test)]
-    pub fn inject_next_prevout_infra_failure(&mut self) {
+    pub(crate) fn inject_next_prevout_infra_failure(&mut self) {
         self.inject_prevout_infra_failure = true;
     }
 
     /// Test seam: fetching/collecting the block at `height` aborts as infrastructure.
     #[cfg(test)]
-    pub fn inject_infra_fail_at_height(&mut self, height: u64) {
+    pub(crate) fn inject_infra_fail_at_height(&mut self, height: u64) {
         self.inject_infra_fail_at_height = Some(height);
     }
 
     /// Test seam: force a chain-link break at `height` (one-shot) during linked fetch.
     #[cfg(test)]
-    pub fn inject_broken_link_at_height(&mut self, height: u64) {
+    pub(crate) fn inject_broken_link_at_height(&mut self, height: u64) {
         self.inject_broken_link_at_height = Some(height);
     }
 
     /// Test seam: after committing the forward block at `height`, invalidate it
     /// and mine an empty replacement (one-shot).
     #[cfg(test)]
-    pub fn inject_reorg_after_commit_height(&mut self, height: u64) {
+    pub(crate) fn inject_reorg_after_commit_height(&mut self, height: u64) {
         self.inject_reorg_after_commit_height = Some(height);
     }
 
     /// Test observation: `getrawtransaction` RPC count for the current/last scan run.
     #[cfg(test)]
-    pub fn prevout_rpc_count(&self) -> usize {
+    pub(crate) fn prevout_rpc_count(&self) -> usize {
         self.prevout_rpc_count
     }
 
@@ -1032,7 +1020,7 @@ impl ScanCallAccumulator {
 ///
 /// Returns `Some(ReorgOutcome{...})` in `acc` after the first merge; subsequent
 /// calls update that value in place.
-pub fn merge_reorg_outcome(acc: &mut Option<ReorgOutcome>, next: ReorgOutcome) {
+pub(crate) fn merge_reorg_outcome(acc: &mut Option<ReorgOutcome>, next: ReorgOutcome) {
     match acc {
         None => *acc = Some(next),
         Some(existing) => {
@@ -1059,7 +1047,8 @@ const MAX_REORG_COLLECTION_RESTARTS: u32 = 16;
 /// activation-height pin is consensus-critical for the scanner gate. Mainnet
 /// and testnet must be constructed by the deployer from the published
 /// `network-params.json`; they are never invented here.
-pub fn regtest_network_params() -> Result<NetworkParams> {
+#[cfg(test)]
+pub(crate) fn regtest_network_params() -> Result<NetworkParams> {
     let tag = std::str::from_utf8(NETWORK_TAG_REGTEST)
         .context("NETWORK_TAG_REGTEST is not valid UTF-8")?
         .to_string();
@@ -1071,7 +1060,7 @@ pub fn regtest_network_params() -> Result<NetworkParams> {
 }
 
 /// Canonical §3.6 network tag string for a [`Network`] configuration value.
-pub fn network_tag_for(network: Network) -> Result<&'static str> {
+pub(crate) fn network_tag_for(network: Network) -> Result<&'static str> {
     let bytes = match network {
         Network::Mainnet => NETWORK_TAG_MAINNET,
         Network::Testnet => NETWORK_TAG_TESTNET,
@@ -1093,7 +1082,8 @@ fn bytes_to_hex(bytes: &[u8; 32]) -> String {
 
 /// Activation height from supplied [`NetworkParams`], with the §3.6 regtest pin
 /// check. Mainnet/testnet use the parameter set as-is — no compile-time constant.
-pub fn pinned_activation_height(network: Network, params: &NetworkParams) -> Result<u64> {
+#[cfg(test)]
+pub(crate) fn pinned_activation_height(network: Network, params: &NetworkParams) -> Result<u64> {
     let h = params.activation_height();
     match network {
         Network::Regtest => {
@@ -1111,7 +1101,7 @@ pub fn pinned_activation_height(network: Network, params: &NetworkParams) -> Res
 ///
 /// A scanner that cannot resolve prevouts cannot produce a correct accumulator,
 /// so it must refuse to start rather than produce a wrong one.
-pub fn ensure_txindex_ready(index_info: &GetIndexInfoResult) -> Result<()> {
+pub(crate) fn ensure_txindex_ready(index_info: &GetIndexInfoResult) -> Result<()> {
     match &index_info.txindex {
         None => bail!(
             "txindex is not enabled (getindexinfo.txindex is absent); \
@@ -1148,7 +1138,7 @@ pub fn ensure_txindex_ready(index_info: &GetIndexInfoResult) -> Result<()> {
 /// negative would require a valid envelope **without** `OP_FALSE OP_IF`, which
 /// is not a zkCoins envelope under §3.5. Key-path spends (single-element
 /// witness) are correctly excluded — scanners evaluate only script-path leaves.
-pub fn may_contain_zkcoins_envelope(input: &TxIn) -> bool {
+pub(crate) fn may_contain_zkcoins_envelope(input: &TxIn) -> bool {
     let witness = input.witness.to_vec();
     let mut end = witness.len();
     if witness
@@ -1177,7 +1167,7 @@ pub fn may_contain_zkcoins_envelope(input: &TxIn) -> bool {
 /// 2. `inclusion_height - anchor.height > MAX_ANCHOR_GAP`;
 /// 3. `anchor.block_hash != ancestor_hash_at_anchor` (not an ancestor of the
 ///    inclusion block).
-pub fn evaluate_anchor_bound(
+pub(crate) fn evaluate_anchor_bound(
     anchor: &BlockAnchor,
     inclusion_height: u64,
     ancestor_hash_at_anchor: [u8; 32],
@@ -1538,7 +1528,7 @@ impl Scanner {
     fn fold_verified_nullifiers(
         &mut self,
         verified: &[PublishedNullifier],
-    ) -> Result<(Vec<(ChainPosition, u64)>, usize, Vec<DuplicateNullifier>)> {
+    ) -> Result<FoldVerifiedNullifiersOutcome> {
         let mut admitted = Vec::new();
         let mut duplicates = 0usize;
         let mut duplicate_details = Vec::new();

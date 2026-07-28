@@ -32,20 +32,20 @@ use std::fmt;
 /// may be treated as a budget basis. One sample is never enough: it
 /// cannot show spread and would bake a one-off spike or stall into the
 /// operator alert threshold.
-pub const MIN_SAMPLES_FOR_BUDGET: usize = 2;
+pub(crate) const MIN_SAMPLES_FOR_BUDGET: usize = 2;
 
 /// Headroom applied on top of `max(samples)` when sealing a budget.
 /// 25 % absorbs ordinary host noise without letting a single cold
 /// outlier dominate; the raw samples stay visible in
 /// [`V1_CALIBRATION`] so operators can re-derive.
-pub const BUDGET_HEADROOM_PERCENT: u32 = 25;
+pub(crate) const BUDGET_HEADROOM_PERCENT: u32 = 25;
 
 /// ROADMAP step 9 warm-prove budget (legacy Poseidon circuit), ms.
-pub const LEGACY_BUDGET_WARM_PROVE_MS: i64 = 5_000;
+pub(crate) const LEGACY_BUDGET_WARM_PROVE_MS: i64 = 5_000;
 /// ROADMAP step 9 cold-start budget (legacy: build + first prove), ms.
-pub const LEGACY_BUDGET_COLD_START_MS: i64 = 30_000;
+pub(crate) const LEGACY_BUDGET_COLD_START_MS: i64 = 30_000;
 /// ROADMAP step 9 peak-RSS budget (legacy), KB.
-pub const LEGACY_BUDGET_PEAK_RSS_KB: i64 = 64 * 1024 * 1024; // 64 GiB
+pub(crate) const LEGACY_BUDGET_PEAK_RSS_KB: i64 = 64 * 1024 * 1024; // 64 GiB
 
 /// Which prover the probe measures and whose budgets apply.
 ///
@@ -150,7 +150,7 @@ impl std::error::Error for BudgetUnavailable {}
 /// Evidence backing a sealed v1.1 budget set. Every number the operator
 /// alert uses must be traceable to these samples.
 #[derive(Clone, Copy, Debug)]
-pub struct V1CalibrationEvidence {
+pub(crate) struct V1CalibrationEvidence {
     /// Host / date / notes for the measurement campaign.
     pub note: &'static str,
     /// Warm `prove_transition` (AccountUpdate) wall samples, ms.
@@ -183,7 +183,7 @@ pub struct V1CalibrationEvidence {
 /// Arrays start empty until a measurement campaign seals them. An empty
 /// array is an explicit "not yet measured" state — **not** a zero-ms
 /// budget and **not** a fall-back to legacy.
-pub const V1_CALIBRATION: V1CalibrationEvidence = V1CalibrationEvidence {
+pub(crate) const V1_CALIBRATION: V1CalibrationEvidence = V1CalibrationEvidence {
     note: "v1.1 ProverBridge prove_transition calibration — see V1_*_SAMPLES arrays",
     warm_prove_ms: V1_WARM_SAMPLES_MS,
     cold_start_ms: V1_COLD_SAMPLES_MS,
@@ -213,7 +213,7 @@ const V1_RSS_SAMPLES_KB: &[i64] = &[];
 /// * Refuses when any sample is negative (clock / unit bug).
 /// * Budget = `ceil_div(max * (100 + headroom_percent), 100)` via
 ///   integer arithmetic (`max * (100 + h) / 100`).
-pub fn derive_budget_from_samples(
+pub(crate) fn derive_budget_from_samples(
     samples: &[i64],
     headroom_percent: u32,
     metric: &'static str,
@@ -247,15 +247,17 @@ pub fn derive_budget_from_samples(
 
 /// Sample-count / min / max / mean helper for operator reports and tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SampleSpread {
+#[cfg(test)]
+pub(crate) struct SampleSpread {
     pub count: usize,
     pub min_ms: i64,
     pub max_ms: i64,
     pub mean_ms: i64,
 }
 
+#[cfg(test)]
 impl SampleSpread {
-    pub fn from_samples(samples: &[i64]) -> Option<Self> {
+    pub(crate) fn from_samples(samples: &[i64]) -> Option<Self> {
         if samples.is_empty() {
             return None;
         }
@@ -290,24 +292,38 @@ pub fn budgets_for_mode(mode: ProverMode) -> Result<R2BudgetSet, BudgetUnavailab
         }),
         ProverMode::V1 => {
             let cal = V1_CALIBRATION;
+            // `note` identifies the sealed campaign; surface it in refuse
+            // paths so an empty calibration is attributable.
             let warm = derive_budget_from_samples(
                 cal.warm_prove_ms,
                 cal.headroom_percent,
                 "warm_prove_ms",
                 ProverMode::V1,
-            )?;
+            )
+            .map_err(|e| BudgetUnavailable {
+                detail: format!("{} (campaign: {})", e.detail, cal.note),
+                ..e
+            })?;
             let cold = derive_budget_from_samples(
                 cal.cold_start_ms,
                 cal.headroom_percent,
                 "cold_start_ms",
                 ProverMode::V1,
-            )?;
+            )
+            .map_err(|e| BudgetUnavailable {
+                detail: format!("{} (campaign: {})", e.detail, cal.note),
+                ..e
+            })?;
             let rss = derive_budget_from_samples(
                 cal.peak_rss_kb,
                 cal.headroom_percent,
                 "peak_rss_kb",
                 ProverMode::V1,
-            )?;
+            )
+            .map_err(|e| BudgetUnavailable {
+                detail: format!("{} (campaign: {})", e.detail, cal.note),
+                ..e
+            })?;
             Ok(R2BudgetSet {
                 warm_prove_ms: warm,
                 cold_start_ms: cold,
@@ -317,53 +333,6 @@ pub fn budgets_for_mode(mode: ProverMode) -> Result<R2BudgetSet, BudgetUnavailab
     }
 }
 
-/// Human-readable calibration summary for the console / JSON report.
-/// Returns `Err` with the same refuse-loud contract when samples are
-/// insufficient (so a "report calibration" path cannot paper over a
-/// missing measurement).
-pub fn v1_calibration_summary() -> Result<String, BudgetUnavailable> {
-    let cal = V1_CALIBRATION;
-    let warm = SampleSpread::from_samples(cal.warm_prove_ms).ok_or_else(|| BudgetUnavailable {
-        mode: ProverMode::V1,
-        metric: "warm_prove_ms",
-        detail: "no warm samples sealed in V1_CALIBRATION".into(),
-    })?;
-    let cold = SampleSpread::from_samples(cal.cold_start_ms).ok_or_else(|| BudgetUnavailable {
-        mode: ProverMode::V1,
-        metric: "cold_start_ms",
-        detail: "no cold-start samples sealed in V1_CALIBRATION".into(),
-    })?;
-    let rss = SampleSpread::from_samples(cal.peak_rss_kb).ok_or_else(|| BudgetUnavailable {
-        mode: ProverMode::V1,
-        metric: "peak_rss_kb",
-        detail: "no peak-RSS samples sealed in V1_CALIBRATION".into(),
-    })?;
-    // Touch the derivation so a summary claim always matches the budget.
-    let budgets = budgets_for_mode(ProverMode::V1)?;
-    Ok(format!(
-        "v1 calibration ({note}): warm n={wn} min={wmin} max={wmax} mean={wmean} → budget {wb} ms; \
-         cold n={cn} min={cmin} max={cmax} mean={cmean} → budget {cb} ms; \
-         rss n={rn} min={rmin} max={rmax} mean={rmean} → budget {rb} KB; \
-         headroom={h}%",
-        note = cal.note,
-        wn = warm.count,
-        wmin = warm.min_ms,
-        wmax = warm.max_ms,
-        wmean = warm.mean_ms,
-        wb = budgets.warm_prove_ms,
-        cn = cold.count,
-        cmin = cold.min_ms,
-        cmax = cold.max_ms,
-        cmean = cold.mean_ms,
-        cb = budgets.cold_start_ms,
-        rn = rss.count,
-        rmin = rss.min_ms,
-        rmax = rss.max_ms,
-        rmean = rss.mean_ms,
-        rb = budgets.peak_rss_kb,
-        h = cal.headroom_percent,
-    ))
-}
 
 #[cfg(test)]
 mod tests {

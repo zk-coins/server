@@ -87,12 +87,14 @@
 //!
 //! Full prove/finalise of a send (Plonky2) remains the heavy engine path
 //! shared with G3 (`#[ignore]` e2e). Host `begin_send` witness construction
-//! + CoinHist sequential paths are the G9 unit under test. Stage 3 swaps
+//! and CoinHist sequential paths are the G9 unit under test. Stage 3 swaps
 //! the production REST call-site onto this path.
 
 use anyhow::{bail, ensure, Context, Result};
 use shared::spec_v1::{self as host, CoinHistState};
-use zkcoins_prover::prover_bridge::{InputAuthorization, ReceivedAuthorization};
+use zkcoins_prover::prover_bridge::InputAuthorization;
+#[cfg(test)]
+use zkcoins_prover::prover_bridge::ReceivedAuthorization;
 use zkcoins_prover::state_engine::{PendingTransition, SendRequest, StateEngine};
 
 use super::separation::{process_stack_mode, ScanStackMode};
@@ -268,7 +270,8 @@ fn assert_input_authorization_shape(
 /// dual of [`assert_spend_provenance_is_coinhist`]; the G3 receive path
 /// already constructs [`ReceivedAuthorization`] without a source-witness
 /// seam — this pins that property by type and value.
-pub fn assert_receive_provenance_is_creating_proof(
+#[cfg(test)]
+pub(crate) fn assert_receive_provenance_is_creating_proof(
     received_coins: &[host::Coin],
     received_auth: &[ReceivedAuthorization],
 ) -> Result<()> {

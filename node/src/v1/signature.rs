@@ -100,7 +100,7 @@ use super::mode::V1ShadowMode;
 use super::separation::{process_stack_mode, ScanStackMode};
 
 /// Canonical message when a legacy ash‖ocr Commitment hits a v1.1 process.
-pub const LEGACY_COMMITMENT_REFUSED_UNDER_V1: &str =
+pub(crate) const LEGACY_COMMITMENT_REFUSED_UNDER_V1: &str =
     "legacy ash‖ocr Commitment refused under v1.1 process claim; \
      submit a §3.2 TransitionSignature bound to the pending transition \
      (ZKCOINS_V1_SHADOW=1 / ScanStackMode::V1 — no dual-accept)";
@@ -164,7 +164,7 @@ impl TransitionSignatureError {
 /// [`SignatureCheck::Encoding`] → outward `malformed_request`, never as a
 /// generic JSON-shape error or an invented machine code.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct WalletSignSubmissionWire {
+pub(crate) struct WalletSignSubmissionWire {
     pub signature: String,
     pub s2c_nonce: String,
 }
@@ -192,7 +192,7 @@ impl WalletSignSubmission {
     /// Uppercase, wrong length, whitespace, or a `0x`/`0X` prefix all fail
     /// at [`SignatureCheck::Encoding`]. There is no silent case-fold or
     /// prefix strip.
-    pub fn from_hex(
+    pub(crate) fn from_hex(
         signature_hex: &str,
         s2c_nonce_hex: &str,
     ) -> Result<Self, TransitionSignatureError> {
@@ -202,12 +202,14 @@ impl WalletSignSubmission {
         })
     }
 
+    /// Kernel-API (§7.5): BIP-340 R half of the wallet submission.
     pub fn signature_r(&self) -> [u8; 32] {
         self.signature[..32]
             .try_into()
             .expect("64-byte signature has a 32-byte R")
     }
 
+    /// Kernel-API (§7.5): BIP-340 s half of the wallet submission.
     pub fn signature_s(&self) -> [u8; 32] {
         self.signature[32..]
             .try_into()
@@ -279,6 +281,8 @@ impl PendingSignEntry {
     /// Stage a pending transition (complete witness from `begin_*`).
     /// `send_counter` is derived from the pending envelope — never accepted
     /// as input.
+    /// Kernel-API (§7.5): construct a staged sign entry after `begin_*`
+    /// for [`register_live_pending_after_begin`].
     pub fn new(pending: PendingTransition, network: Network) -> Self {
         Self {
             pending,
@@ -291,19 +295,19 @@ impl PendingSignEntry {
     }
 
     /// Attach a caller-supplied publisher pubkey for the §7.5 result.
-    pub fn with_publisher_pubkey(mut self, pk: Option<[u8; 32]>) -> Self {
+    pub(crate) fn with_publisher_pubkey(mut self, pk: Option<[u8; 32]>) -> Self {
         self.publisher_pubkey = pk;
         self
     }
 
     /// Entry counter `i` of this transition (`skᵢ = A/0'/i'`, §1.2 / §7.5).
     /// Derived from the pending account state — not stored separately.
-    pub fn send_counter(&self) -> u64 {
+    pub(crate) fn send_counter(&self) -> u64 {
         self.pending.witness_wip.prev_account_state.send_counter
     }
 
     /// Engine-owned capability for this entry (pending + optional signature).
-    pub fn capability(&self) -> FinalisationCapability {
+    pub(crate) fn capability(&self) -> FinalisationCapability {
         let mut cap = FinalisationCapability::stage(self.pending.clone());
         if let Some(sig) = self.signature.clone() {
             // Already verified at install time; pk match is re-checked.
@@ -314,7 +318,7 @@ impl PendingSignEntry {
     }
 
     /// Install an accepted wallet signature on the in-memory entry.
-    pub fn install_signature(
+    pub(crate) fn install_signature(
         &mut self,
         sig: TransitionSignature,
     ) -> Result<(), TransitionSignatureError> {
@@ -332,7 +336,7 @@ impl PendingSignEntry {
     ///
     /// Both fields are required together — never store a result without its
     /// status or invent a default status.
-    pub fn install_completion(
+    pub(crate) fn install_completion(
         &mut self,
         result: serde_json::Value,
         status: i16,
@@ -354,7 +358,7 @@ impl PendingSignEntry {
 
     /// True when prove+apply has already produced a durable completion
     /// surface — resume may publish/complete without re-running the hook.
-    pub fn has_completion(&self) -> bool {
+    pub(crate) fn has_completion(&self) -> bool {
         self.completion_result.is_some() && self.completion_status.is_some()
     }
 }
@@ -365,7 +369,7 @@ impl PendingSignEntry {
 /// [`PendingSignEntry::has_completion`] (or a live finalise driver to produce
 /// it). Kept as a named check so call sites stay explicit — never a silent
 /// "always Ok".
-pub fn ensure_finalise_ready(entry: &PendingSignEntry) -> Result<(), String> {
+pub(crate) fn ensure_finalise_ready(entry: &PendingSignEntry) -> Result<(), String> {
     if entry.signature.is_none() {
         return Err(
             "finalise readiness: durable capability has no installed signature \
@@ -389,7 +393,7 @@ pub fn ensure_finalise_ready(entry: &PendingSignEntry) -> Result<(), String> {
 /// | `network` | BIP-340 re-verify / process identity |
 /// | `completion_result` + `completion_status` | publish §7.5 result + job complete |
 /// | `publisher_pubkey` | optional — only when the original request carried one |
-pub fn ensure_completion_ready(entry: &PendingSignEntry) -> Result<(), String> {
+pub(crate) fn ensure_completion_ready(entry: &PendingSignEntry) -> Result<(), String> {
     ensure_finalise_ready(entry)?;
     match (&entry.completion_result, entry.completion_status) {
         (Some(result), Some(status)) => {
@@ -451,10 +455,10 @@ pub type PendingSignMap = Arc<DashMap<Uuid, PendingSignEntry>>;
 ///
 /// Replaces the old split (`pending_sign` + `sign`). Terminal status flips
 /// strip this key (and the legacy keys for rows written by older builds).
-pub const FINALISATION_BODY_KEY: &str = "finalisation";
+pub(crate) const FINALISATION_BODY_KEY: &str = "finalisation";
 
 /// Legacy key kept only so terminal strip / cleanup still erase old rows.
-pub const PENDING_SIGN_BODY_KEY: &str = "pending_sign";
+pub(crate) const PENDING_SIGN_BODY_KEY: &str = "pending_sign";
 
 /// Durable job-row envelope: one record containing everything needed to
 /// resume the **whole path to completion** after a true process restart.
@@ -491,7 +495,7 @@ pub const PENDING_SIGN_BODY_KEY: &str = "pending_sign";
 /// leak the key that keys every `nav_rand` for the account. (The hex itself
 /// remains in storage JSON — that residual is named, not implied.)
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct DurableFinalisationPersist {
+pub(crate) struct DurableFinalisationPersist {
     pub network: String,
     /// Lowercase hex of [`FinalisationCapability::to_durable_bytes`].
     pub capability_bincode_hex: String,
@@ -518,7 +522,7 @@ impl std::fmt::Debug for DurableFinalisationPersist {
 }
 
 impl DurableFinalisationPersist {
-    pub fn from_entry(entry: &PendingSignEntry) -> Result<Self, String> {
+    pub(crate) fn from_entry(entry: &PendingSignEntry) -> Result<Self, String> {
         // Fail closed on split completion fields before persisting.
         match (&entry.completion_result, entry.completion_status) {
             (None, None) => {}
@@ -558,7 +562,7 @@ impl DurableFinalisationPersist {
         })
     }
 
-    pub fn into_entry(self) -> Result<PendingSignEntry, TransitionSignatureError> {
+    pub(crate) fn into_entry(self) -> Result<PendingSignEntry, TransitionSignatureError> {
         let network = parse_network_label(&self.network).ok_or_else(|| {
             TransitionSignatureError::new(
                 SignatureCheck::PendingEnvelope,
@@ -579,7 +583,7 @@ impl DurableFinalisationPersist {
             .capability_bincode_hex
             .bytes()
             .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
-            || self.capability_bincode_hex.len() % 2 != 0
+            || !self.capability_bincode_hex.len().is_multiple_of(2)
         {
             return Err(TransitionSignatureError::new(
                 SignatureCheck::PendingEnvelope,
@@ -679,11 +683,10 @@ impl DurableFinalisationPersist {
 }
 
 /// Backward-compatible alias used by older tests/docs.
-pub type StagedSignPersist = DurableFinalisationPersist;
-
+///
 /// Remove durable finalisation material from a job's `request_body`
 /// (in-memory JSON). Also strips legacy `pending_sign` / `sign` keys.
-pub fn strip_pending_sign_from_body(request_body: &mut serde_json::Value) -> bool {
+pub(crate) fn strip_pending_sign_from_body(request_body: &mut serde_json::Value) -> bool {
     request_body
         .as_object_mut()
         .map(|obj| {
@@ -715,7 +718,7 @@ fn parse_network_label(s: &str) -> Option<Network> {
 /// Stage a pending entry in the in-memory map **and** return the JSON
 /// blob to merge into `jobs.request_body` under [`FINALISATION_BODY_KEY`]
 /// so a restart can rehydrate the map and finalise.
-pub fn stage_pending_sign(
+pub(crate) fn stage_pending_sign(
     map: &PendingSignMap,
     job_id: Uuid,
     entry: PendingSignEntry,
@@ -731,7 +734,7 @@ pub fn stage_pending_sign(
 /// Prefers [`FINALISATION_BODY_KEY`]. A legacy `pending_sign` key alone is
 /// **not** rehydrated into a finalisable entry (old verification-grade
 /// shape) — fail closed rather than pretend a partial record is complete.
-pub fn rehydrate_pending_sign(
+pub(crate) fn rehydrate_pending_sign(
     request_body: &serde_json::Value,
 ) -> Result<Option<PendingSignEntry>, TransitionSignatureError> {
     if let Some(raw) = request_body.get(FINALISATION_BODY_KEY) {
@@ -758,6 +761,9 @@ pub fn rehydrate_pending_sign(
 /// Attach an accepted signature to the durable finalisation record in
 /// `request_body`, returning the updated JSON object value for the
 /// `finalisation` key. Fails loud if no durable capability is present.
+///
+/// Kernel-API (§7.5): gRPC sign-path write — folds an accepted wallet
+/// signature into the durable finalisation envelope on the job row.
 pub fn durable_finalisation_with_signature(
     request_body: &serde_json::Value,
     signature: &TransitionSignature,
@@ -808,6 +814,8 @@ impl FinaliseOutcome {
             .collect()
     }
 
+    /// Kernel-API (§7.5): build the completed job `result` from an applied
+    /// transition after gRPC finalise.
     pub fn from_applied(
         applied: &zkcoins_prover::state_engine::AppliedTransition,
         pending: &PendingTransition,
@@ -826,6 +834,9 @@ impl FinaliseOutcome {
     /// Build an outcome from the pending's ProofData + output coins
     /// (test drivers that do not run the full prove; production hook
     /// doubles that return the pending surface).
+    ///
+    /// Kernel-API (§7.5): crash-resume surface when `members_ready` is
+    /// already durable and re-prove is skipped.
     pub fn from_pending_proof_data(pending: &PendingTransition) -> Self {
         Self::from_pending_proof_data_with_publisher(pending, None)
     }
@@ -844,6 +855,7 @@ impl FinaliseOutcome {
         }
     }
 
+    /// Kernel-API (§7.5): encode the completed job `result` JSON object.
     pub fn to_result_json(&self) -> serde_json::Value {
         let mut obj = serde_json::json!({
             "new_account_state_hash": hex_lower(&self.new_account_state_hash),
@@ -876,6 +888,10 @@ impl FinaliseOutcome {
 ///
 /// `publisher_pubkey` is the §7.5 optional result field (echo of the
 /// transition's external publisher target, when present).
+///
+/// Kernel-API (§7.5): gRPC finalise holding the engine mutex (tooling /
+/// short proves). Prefer [`finalise_accepted_prove_outside_lock`] on the
+/// job path.
 pub fn finalise_with_accepted_signature(
     engine: &mut zkcoins_prover::state_engine::StateEngine,
     pending: PendingTransition,
@@ -904,6 +920,9 @@ pub fn finalise_with_accepted_signature(
 /// the applied engine and `v1_pending_publishes` intent are durable before
 /// the host edge. This sync helper remains for call sites that only need
 /// the in-memory apply (tests / tooling).
+///
+/// Kernel-API (§7.5): gRPC finalise with prove outside the engine lock and
+/// live re-validation on apply (no durable stage — caller stages separately).
 pub fn finalise_accepted_prove_outside_lock(
     adapter: &crate::v1::EngineAdapter,
     pending: PendingTransition,
@@ -964,7 +983,7 @@ pub fn finalise_accepted_prove_outside_lock(
 ///
 /// The multi-minute prove runs on `spawn_blocking` so the caller's async
 /// lease-renewal heartbeat can keep firing on the runtime.
-pub async fn finalise_accepted_prove_persist_and_stage(
+pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     adapter: &crate::v1::EngineAdapter,
     pending: PendingTransition,
     signature: TransitionSignature,
@@ -977,36 +996,33 @@ pub async fn finalise_accepted_prove_persist_and_stage(
     // Already durable from a prior attempt that crashed after stage.
     // Still require a live fence: a stale epoch must not re-enter host-edge
     // completion after another claim reclaimed the job.
-    match db_v1::load_pending_publish(adapter.pool(), signature.pk_i)
+    if let Some(row) = db_v1::load_pending_publish(adapter.pool(), signature.pk_i)
         .await
         .map_err(|e| format!("load_pending_publish before finalise: {e:#}"))?
     {
-        Some(row) => {
-            if row.owner.0 != pending.owner.0 {
-                return Err(format!(
-                    "v1.1 finalise: pending publish for pk={} has owner {}, \
-                     pending.owner is {} — refusing silent mismatch",
-                    hex_lower(&signature.pk_i),
-                    hex_lower(&row.owner.0),
-                    hex_lower(&pending.owner.0),
-                ));
-            }
-            if !claim_fence_still_holds(adapter.pool(), fence).await? {
-                return Err(FINALISE_FENCE_LOST.to_string());
-            }
-            tracing::info!(
-                pk = %hex_lower(&signature.pk_i),
-                status = %row.status,
-                fence = fence.fence,
-                "v1.1 finalise: pending publish already durable; \
-                 skipping re-prove/re-apply (crash-resume after stage)"
-            );
-            return Ok(FinaliseOutcome::from_pending_proof_data_with_publisher(
-                &pending,
-                publisher_pubkey,
+        if row.owner.0 != pending.owner.0 {
+            return Err(format!(
+                "v1.1 finalise: pending publish for pk={} has owner {}, \
+                 pending.owner is {} — refusing silent mismatch",
+                hex_lower(&signature.pk_i),
+                hex_lower(&row.owner.0),
+                hex_lower(&pending.owner.0),
             ));
         }
-        None => {}
+        if !claim_fence_still_holds(adapter.pool(), fence).await? {
+            return Err(FINALISE_FENCE_LOST.to_string());
+        }
+        tracing::info!(
+            pk = %hex_lower(&signature.pk_i),
+            status = %row.status,
+            fence = fence.fence,
+            "v1.1 finalise: pending publish already durable; \
+             skipping re-prove/re-apply (crash-resume after stage)"
+        );
+        return Ok(FinaliseOutcome::from_pending_proof_data_with_publisher(
+            &pending,
+            publisher_pubkey,
+        ));
     }
 
     let output_coin_ids = FinaliseOutcome::output_coin_ids_from_pending(&pending);
@@ -1042,15 +1058,15 @@ pub async fn finalise_accepted_prove_persist_and_stage(
     let (pk, r) = applied.nullifier();
     if signature.pk_i != pk {
         let _ = adapter.restore_live(pre);
-        return Err(format!(
-            "v1.1 finalise: signature.pk_i does not match applied nullifier Pk"
-        ));
+        return Err(
+            "v1.1 finalise: signature.pk_i does not match applied nullifier Pk".to_string(),
+        );
     }
     if signature.signature_r() != r {
         let _ = adapter.restore_live(pre);
-        return Err(format!(
-            "v1.1 finalise: signature R does not match applied nullifier R"
-        ));
+        return Err(
+            "v1.1 finalise: signature R does not match applied nullifier R".to_string(),
+        );
     }
 
     let tip_hash = adapter.tip_hash();
@@ -1142,6 +1158,9 @@ async fn claim_fence_still_holds(
 ///
 /// Production write site for the post-begin registry. The dispatcher
 /// consumes the entry once via [`take_live_pending_after_begin`].
+///
+/// Kernel-API (§7.5): gRPC / job begin hands the staged
+/// [`PendingSignEntry`] to the dispatcher via this registry.
 pub fn register_live_pending_after_begin(
     map: &PendingSignMap,
     job_id: Uuid,
@@ -1151,7 +1170,7 @@ pub fn register_live_pending_after_begin(
 }
 
 /// Take (consume) a live pending registered by [`register_live_pending_after_begin`].
-pub fn take_live_pending_after_begin(
+pub(crate) fn take_live_pending_after_begin(
     map: &PendingSignMap,
     job_id: Uuid,
 ) -> Option<PendingSignEntry> {
@@ -1167,7 +1186,7 @@ pub fn take_live_pending_after_begin(
 /// - Field **present but malformed** (wrong type, wrong length, uppercase,
 ///   non-hex) → `Err` — never silently drops a bad publisher (no silent
 ///   fallback to "absent").
-pub fn publisher_pubkey_from_request_body(
+pub(crate) fn publisher_pubkey_from_request_body(
     request_body: &serde_json::Value,
 ) -> Result<Option<[u8; 32]>, String> {
     let Some(value) = request_body.get("publisher_pubkey") else {
@@ -1204,7 +1223,7 @@ pub fn publisher_pubkey_from_request_body(
 ///
 /// This is what a v1.1 wallet must recompute and sign — **not** legacy
 /// `account_state_hash` / `output_coins_root`.
-pub fn awaiting_signature_result_json(entry: &PendingSignEntry) -> serde_json::Value {
+pub(crate) fn awaiting_signature_result_json(entry: &PendingSignEntry) -> serde_json::Value {
     let pd = &entry.pending.proof_data;
     let txn_pubkey = entry.pending.witness_wip.prev_account_state.current_pubkey;
     serde_json::json!({
@@ -1221,7 +1240,7 @@ pub fn awaiting_signature_result_json(entry: &PendingSignEntry) -> serde_json::V
 }
 
 /// Legacy ash‖ocr surface (flag off only).
-pub fn legacy_awaiting_signature_result_json(
+pub(crate) fn legacy_awaiting_signature_result_json(
     account_state_hash: &str,
     output_coins_root: &str,
 ) -> serde_json::Value {
@@ -1237,7 +1256,7 @@ pub fn legacy_awaiting_signature_result_json(
 /// - **v1.1 claim** → §7.5 surface from staged pending. If no pending is
 ///   staged, returns `Err` — never silently falls back to ash‖ocr (a
 ///   wallet that signed those would then be rejected at `/sign`).
-pub fn select_awaiting_signature_result(
+pub(crate) fn select_awaiting_signature_result(
     legacy_ash: &str,
     legacy_ocr: &str,
     pending: Option<&PendingSignEntry>,
@@ -1273,7 +1292,7 @@ pub fn select_awaiting_signature_result(
 /// - job status ≠ `awaiting_signature` → `wrong_phase` (409)
 /// - missing staged pending while status is correct → `internal_error` (500)
 /// - dispatcher notifier absent after accept → `internal_error` (500)
-pub fn sign_rejection(err: &TransitionSignatureError) -> (u16, &'static str) {
+pub(crate) fn sign_rejection(err: &TransitionSignatureError) -> (u16, &'static str) {
     match err.check {
         SignatureCheck::Encoding => (400, "malformed_request"),
         SignatureCheck::S2cOpening => (409, "stale_message"),
@@ -1291,7 +1310,7 @@ pub fn sign_rejection(err: &TransitionSignatureError) -> (u16, &'static str) {
 /// Encode a terminal job `error` column as the §7.5 `{error, message}`
 /// object (JSON text). Prefer this over free-form strings so poll can
 /// surface the closed machine code without inventing one.
-pub fn encode_job_error(code: &str, message: impl Into<String>) -> String {
+pub(crate) fn encode_job_error(code: &str, message: impl Into<String>) -> String {
     serde_json::json!({
         "error": code,
         "message": message.into(),
@@ -1345,7 +1364,7 @@ fn is_closed_outward_error_code(code: &str) -> bool {
 /// into the closed enumeration: default `proving_failed` for failed jobs,
 /// `internal_error` for cancelled / unclassifiable. Empty stored error still
 /// yields a body so the poll envelope never omits `error` on failed/cancelled.
-pub fn decode_job_error(raw: Option<&str>, status: crate::job_store::JobStatus) -> serde_json::Value {
+pub(crate) fn decode_job_error(raw: Option<&str>, status: crate::job_store::JobStatus) -> serde_json::Value {
     if let Some(s) = raw {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
             if let Some(code) = v.get("error").and_then(|e| e.as_str()) {
@@ -1424,7 +1443,7 @@ fn classify_stored_failure(msg: &str, status: crate::job_store::JobStatus) -> &'
 }
 
 /// True when the process claim is v1.1 (flag on and stack claimed).
-pub fn v1_sign_route_active() -> bool {
+pub(crate) fn v1_sign_route_active() -> bool {
     matches!(process_stack_mode(), Some(ScanStackMode::V1))
 }
 
@@ -1432,7 +1451,7 @@ pub fn v1_sign_route_active() -> bool {
 ///
 /// Legacy ash‖ocr commitments remain the only authorised signing protocol
 /// under [`V1ShadowMode::Off`]. There is no silent dual-accept.
-pub fn ensure_v1_signature_path(mode: V1ShadowMode) -> Result<(), TransitionSignatureError> {
+pub(crate) fn ensure_v1_signature_path(mode: V1ShadowMode) -> Result<(), TransitionSignatureError> {
     match mode {
         V1ShadowMode::On => Ok(()),
         V1ShadowMode::Off => Err(TransitionSignatureError::new(
@@ -1451,7 +1470,7 @@ pub fn ensure_v1_signature_path(mode: V1ShadowMode) -> Result<(), TransitionSign
 ///
 /// Wired into `commit_flow` / `mint_commit_flow` and the jobs commit
 /// handler so a v1.1 boot cannot finalise via `CommitRequest`.
-pub fn refuse_legacy_commitment_under_v1() -> Result<(), TransitionSignatureError> {
+pub(crate) fn refuse_legacy_commitment_under_v1() -> Result<(), TransitionSignatureError> {
     match process_stack_mode() {
         Some(ScanStackMode::V1) => Err(TransitionSignatureError::new(
             SignatureCheck::LegacyCommitment,
@@ -1474,7 +1493,7 @@ pub fn refuse_legacy_commitment_under_v1() -> Result<(), TransitionSignatureErro
 /// foreign `ProofData` while finalising a different pending transition is
 /// not expressible — the only material used is `pending.proof_data` and
 /// `pending.witness_wip.prev_account_state.current_pubkey`.
-pub fn accept_wallet_transition_signature(
+pub(crate) fn accept_wallet_transition_signature(
     mode: V1ShadowMode,
     network: Network,
     pending: &PendingTransition,
@@ -1516,7 +1535,7 @@ pub fn accept_wallet_transition_signature(
 /// exists for preflight/tooling when no pending transition exists yet; it
 /// is **not** reachable from the finalise path (nothing on that path
 /// calls it with caller-supplied pairs).
-pub fn verify_transition_signature_material(
+pub(crate) fn verify_transition_signature_material(
     network: Network,
     expected_pk_i: &[u8; 32],
     proof_data: &ProofData,
@@ -1769,7 +1788,7 @@ pub mod test_fixtures {
     }
 
     /// V.5 mainnet fixture: staged pending + the matching wire submission.
-    pub fn v5_mainnet_entry_and_submission() -> (PendingSignEntry, WalletSignSubmission) {
+    pub(crate) fn v5_mainnet_entry_and_submission() -> (PendingSignEntry, WalletSignSubmission) {
         let pk = hex32(V2EXT_PK0);
         let submission = WalletSignSubmission {
             signature: hex64(V5_SIG_MAINNET),

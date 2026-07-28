@@ -100,7 +100,7 @@ use shared::spec_v1::{
     self as host, Address, Coin, HashDigest, LookupResult, Nav, NfLogEntry, ProofData,
     SpendClassification, TreeKind,
 };
-use zkcoins_program::circuit::compliance::{Network, MAX_OUTPUT_MERKLE_DEPTH, MAX_RX_COINS};
+use zkcoins_program::circuit::compliance::{MAX_OUTPUT_MERKLE_DEPTH, MAX_RX_COINS};
 use zkcoins_prover::half_agg::{comm_verify, BlockAnchor, NullifierSig};
 use zkcoins_prover::prover_bridge::{
     ComplianceProof, NavOpening, NullifierOpening, OutputInclusionProof, ReceivedAuthorization,
@@ -121,7 +121,7 @@ use super::separation::{process_stack_mode, require_v1_process_for_nflog_write, 
 
 /// Error prefix when the legacy bookkeeping receive is attempted under the
 /// v1.1 process claim. Surfaces in residual legacy entry points.
-pub const LEGACY_RECEIVE_REFUSED_UNDER_V1: &str =
+pub(crate) const LEGACY_RECEIVE_REFUSED_UNDER_V1: &str =
     "legacy receive refused under ZKCOINS_V1_SHADOW=1; use the v1.1 receive transition \
      (begin_receive → compliance proof → AggregateStateNullifierV3). Silent fall-back to \
      bookkeeping is forbidden";
@@ -281,7 +281,7 @@ impl NullifierBatchPublisher for V1Publisher {
 ///
 /// Returns `Ok(())` when the process is **not** on the v1.1 claim (legacy
 /// / unclaimed). Fail-loud under v1.1 — never a silent allow.
-pub fn refuse_legacy_receive_under_v1() -> Result<(), &'static str> {
+pub(crate) fn refuse_legacy_receive_under_v1() -> Result<(), &'static str> {
     match process_stack_mode() {
         Some(ScanStackMode::V1) => Err(LEGACY_RECEIVE_REFUSED_UNDER_V1),
         Some(ScanStackMode::Legacy) | None => Ok(()),
@@ -293,6 +293,9 @@ pub fn refuse_legacy_receive_under_v1() -> Result<(), &'static str> {
 ///
 /// Does **not** mutate the engine. The wallet must sign
 /// `pending.proof_data` (G4) and call [`finalise_publish_persist`].
+///
+/// Kernel-API (§7.5): gRPC receive begin — host clause-10 then
+/// `StateEngine::begin_receive` without applying.
 pub fn verify_and_begin_receive(
     engine: &StateEngine,
     req: V1ReceiveRequest,
@@ -359,6 +362,9 @@ pub fn verify_and_begin_receive(
 ///
 /// The own nullifier enters the canonical NfLog only when the scanner folds
 /// the confirmed on-chain survivor at its real §3.6 position.
+///
+/// Kernel-API (§7.5): gRPC receive finalise after wallet signature —
+/// prove, apply account, durable publish intent, broadcast.
 pub async fn finalise_publish_persist(
     adapter: &EngineAdapter,
     pending: PendingTransition,
@@ -424,6 +430,9 @@ pub(crate) async fn finalise_publish_persist_with(
 /// | `build_tip` (→ `BatchMember` + `v1_pending_publishes`) | **caller** | equals pre-apply snapshot `(tip_height, tip_hash)` |
 /// | commit `signature` (→ member `s` + `r_prime`) | **caller** | byte-equal to the proved envelope signature |
 /// | outcome `admitted_coin_ids` / `new_send_counter` | this transition | taken from the proved witness, not a post-gate live re-read |
+///
+/// Kernel-API (§7.5): gRPC receive commit after detached prove — write-gate
+/// apply, durable members_ready, publish.
 pub async fn commit_proved_receive(
     adapter: &EngineAdapter,
     proved_pending: zkcoins_prover::state_engine::ProvedPendingTransition,
@@ -469,14 +478,12 @@ pub(crate) async fn commit_proved_receive_with(
         let pre = adapter.snapshot_live();
 
         // Caller-supplied durable fields: revalidate before any mutation.
-        if let Err(err) = revalidate_caller_supplied_commit_deps(
+        revalidate_caller_supplied_commit_deps(
             &pre,
             &build_tip,
             &signature,
             &proved_signature,
-        ) {
-            return Err(err);
-        }
+        )?;
 
         // Measure NfLog size *inside* the gate, immediately before apply —
         // never against a pre-prove snapshot a concurrent scan can move.
@@ -833,6 +840,9 @@ fn prepared_batch_from_pending_row(
 ///
 /// Rebroadcast is **idempotent**: chain replies that the tx is already known,
 /// already in the mempool, or already spent are success signals, not errors.
+///
+/// Kernel-API (§7.5): gRPC / boot rebroadcast of one durable
+/// `v1_pending_publishes` row after crash or publisher recovery.
 pub async fn resume_pending_publish(
     adapter: &EngineAdapter,
     publisher: &V1Publisher,
@@ -982,6 +992,9 @@ pub(crate) async fn resume_all_pending_publishes_with(
 
 /// Full production path: host clause-10 → begin → prove/apply (no NfLog) →
 /// persist intent → publish. Scanner folds the nullifier on inclusion.
+///
+/// Kernel-API (§7.5): gRPC receive one-shot when the wallet already
+/// supplies the transition signature with the intent.
 pub async fn execute_v1_receive(
     adapter: &EngineAdapter,
     req: V1ReceiveRequest,
@@ -1021,7 +1034,7 @@ pub(crate) async fn execute_v1_receive_with(
 /// `prove_transition` / `finalise`. This function enforces every binding
 /// that must hold **before** we assemble a pending transition, so a bad
 /// creating-proof binding fails before any engine mutation.
-pub fn verify_clause10_slot(
+pub(crate) fn verify_clause10_slot(
     engine: &StateEngine,
     slot: &ReceivedCoinSlot,
     receiver_nav: Nav,
@@ -1080,7 +1093,7 @@ pub fn verify_clause10_slot(
 }
 
 /// Clause 10(d) S2C + consumed-key binding. Public for focused unit tests.
-pub fn verify_creating_nullifier_binding(
+pub(crate) fn verify_creating_nullifier_binding(
     creating_nullifier: &NullifierOpening,
     creating_pd: &ProofData,
     consumed_pubkey: &[u8; 32],
@@ -1214,7 +1227,7 @@ fn verify_creating_nav_prefix(
 }
 
 /// `size_final` NAV at the engine tip (§2.3.2 step 5 / §2.3.3).
-pub fn size_final_nav(engine: &StateEngine) -> Result<Nav> {
+pub(crate) fn size_final_nav(engine: &StateEngine) -> Result<Nav> {
     let size = engine.nflog().size_final(engine.tip_height());
     let mth = if size == 0 {
         host::nflog_empty()
@@ -1236,7 +1249,7 @@ pub fn size_final_nav(engine: &StateEngine) -> Result<Nav> {
 }
 
 /// Host output-tree inclusion (§1.7.5 CoinsRoot, variable depth).
-pub fn verify_output_inclusion(
+pub(crate) fn verify_output_inclusion(
     identifier: HashDigest,
     inclusion: &OutputInclusionProof,
     output_coins_root: HashDigest,
@@ -1276,7 +1289,7 @@ pub fn verify_output_inclusion(
 /// Re-extract compliance public inputs from a proof (host-only; no circuit).
 ///
 /// Layout matches `prover_bridge::extract_transition_public_inputs`.
-pub fn extract_compliance_public_inputs(
+pub(crate) fn extract_compliance_public_inputs(
     proof: &ComplianceProof,
 ) -> Result<(ProofData, [u8; 32], HashDigest)> {
     ensure!(
@@ -1326,10 +1339,6 @@ fn summarize_published(batch: &PublishedBatch) -> PublishedBatchSummary {
     }
 }
 
-// Silence unused import when Network is only used by callers.
-#[allow(dead_code)]
-fn _network_pin(_n: Network) {}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1343,6 +1352,7 @@ mod tests {
     use bitcoin::{Amount, ScriptBuf, TxOut, Txid};
     use sha2::{Digest, Sha256};
     use std::sync::Mutex;
+    use zkcoins_program::circuit::compliance::Network;
     use zkcoins_prover::half_agg::AggregateStateNullifierV3;
     use zkcoins_prover::state_engine::{AccountRecord, OpSecret, TrackedCoin};
 

@@ -24,8 +24,10 @@ use crate::esplora_bound::EsploraReadClient;
 pub use crate::esplora_bound::LegacyBroadcastClient;
 
 // Define a configuration struct for Esplora
+// Crate-private: only the binary/runtime edge consumes this via
+// `NETWORK_CONFIG`; external binaries assemble their own Esplora URL.
 #[derive(Clone, Debug)]
-pub struct EsploraConfig {
+pub(crate) struct EsploraConfig {
     pub url: String,
     pub is_mainnet: bool,
     pub network_name: String,
@@ -44,7 +46,7 @@ pub struct EsploraConfig {
 }
 
 impl EsploraConfig {
-    pub fn network(&self) -> Network {
+    pub(crate) fn network(&self) -> Network {
         if self.is_mainnet {
             Network::Bitcoin
         } else {
@@ -54,7 +56,7 @@ impl EsploraConfig {
 }
 
 // Define constants for transaction identification
-pub const INSCRIPTION_MARKER_PREFIX: &str = "4242";
+pub(crate) const INSCRIPTION_MARKER_PREFIX: &str = "4242";
 
 const MAX_CHUNK_SIZE: usize = 520;
 const MAX_MINING_ATTEMPTS: u32 = 400000;
@@ -80,7 +82,7 @@ fn min_fee(tx: &Transaction, witness_weight: Option<Weight>) -> u64 {
 /// persist a row to `tx_mining_log` for forensics — answering "did the
 /// mining stall?" / "how much CPU did this Send cost?" from SQL.
 #[derive(Debug, Clone)]
-pub struct MiningStats {
+pub(crate) struct MiningStats {
     pub target_prefix: String,
     pub nonces_tried: i64,
     pub duration_us: i64,
@@ -88,7 +90,7 @@ pub struct MiningStats {
     pub final_txid: bitcoin::Txid,
 }
 
-pub fn inscription_txs(
+pub(crate) fn inscription_txs(
     commitment_data: &[u8],
     publisher_address: &Address,
     outpoints_with_sats: Vec<(OutPoint, u64)>,
@@ -400,58 +402,6 @@ fn build_reveal_only_inner(
     (reveal_tx, stats)
 }
 
-/// Broadcasts the commit and reveal transactions to the Bitcoin
-/// network via the Esplora REST API as a sequential pair.
-///
-/// Implementation: a plain
-/// `client.broadcast(commit_tx).await?; client.broadcast(reveal_tx).await?;`
-/// sequence. No WebSocket subscription, no inter-tx sleep, no
-/// propagation watchdog — the two REST POSTs run back to back.
-///
-/// Why this is race-free on our deployment topology: the node, the
-/// `electrs` REST endpoint, and `bitcoind` share a single Docker
-/// `bitcoin` network. `bitcoind::sendrawtransaction` only returns
-/// after the tx has been accepted into the local mempool, so by the
-/// time the commit POST resolves the commit UTXO is visible to the
-/// same `bitcoind`'s mempool — which is the same mempool the reveal
-/// POST hits a moment later via the same `electrs`. There is no
-/// cross-host propagation window to bridge.
-///
-/// Why we used to wait: issue #84 replaced a fixed 5 s
-/// `PROPAGATION_WAIT_SECS` sleep with a `{"action":"track-tx",...}`
-/// WS subscription against the upstream Esplora WS. That made sense
-/// when the upstream was the public mutinynet endpoint with real
-/// cross-host propagation latency. After self-hosting our own
-/// `mempool/backend:v3.3.1` we observed empirically that the backend
-/// version does NOT emit any frame for `track-tx`; the WS wait always
-/// timed out and the single-shot REST fallback (`GET /tx/{commit}`)
-/// always confirmed the tx as already on-chain (DEV `request_log`:
-/// `/api/mint` p50 ≈ 40 s of which ~30 s was watchdog; 16/16 REST
-/// fallbacks in 72 h succeeded, 0 not-found, 0 errors). The wait was
-/// pure latency tax for an in-cluster scenario it was never designed
-/// for. Removing the subscribe + REST fallback brings `/api/mint`
-/// from p50 ~40 s to ~11 s and `/api/send + /api/commit` from ~42 s
-/// to ~13 s.
-///
-/// "Events only" invariant from CONTRIBUTING.md is preserved: a
-/// straight sequential broadcast is neither a poll loop nor a timed
-/// sleep, so the CI "Forbid polling patterns" grep (see
-/// CONTRIBUTING.md § "No polling — events only") keeps passing —
-/// this PR strictly REMOVES sleeps from `publisher.rs`.
-pub async fn broadcast_inscription_txs(
-    config: &EsploraConfig,
-    commit_tx: &Transaction,
-    reveal_tx: &Transaction,
-) -> Result<(Txid, Txid), Box<dyn std::error::Error + Send + Sync>> {
-    // Guard is inside `LegacyBroadcastClient::connect` — not a per-call check
-    // that a new path could forget.
-    let client = LegacyBroadcastClient::connect(&config.url)?;
-
-    let commit_txid = broadcast_raw_tx(&client, commit_tx, "Commit").await?;
-    let reveal_txid = broadcast_raw_tx(&client, reveal_tx, "Reveal").await?;
-
-    Ok((commit_txid, reveal_txid))
-}
 
 /// Broadcast helper for a client that was already stack-checked at connect.
 async fn broadcast_raw_tx(
@@ -466,7 +416,7 @@ async fn broadcast_raw_tx(
 }
 
 /// Fetches available UTXOs for the publisher address
-pub async fn get_publisher_utxo(
+pub(crate) async fn get_publisher_utxo(
     publisher_address: &Address,
     config: &EsploraConfig,
     min_amount: Option<u64>,
@@ -505,7 +455,7 @@ pub async fn get_publisher_utxo(
 /// When `pool` is `None` (out-of-band callers / unit tests that don't
 /// need persistence), the function behaves exactly like the
 /// pre-Phase-B version — no DB writes, no resume hooks.
-pub async fn create_and_broadcast_inscription(
+pub(crate) async fn create_and_broadcast_inscription(
     commitment_data: &[u8],
     kind: db::InscriptionKind,
     config: &EsploraConfig,
@@ -515,8 +465,7 @@ pub async fn create_and_broadcast_inscription(
     // scan stack must never inscribe bincode Commitments — that would mix
     // SMT first-write objects into a database claimed for NfLog.
     crate::v1::ensure_legacy_publisher_allowed().map_err(|e| {
-        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            as Box<dyn std::error::Error + Send + Sync>
+        Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>
     })?;
 
     // Generate publisher address
@@ -710,7 +659,7 @@ fn is_inputs_missingorspent_error(err: &dyn std::error::Error) -> bool {
 /// confirms a step. Keeping the two functions separate (rather than
 /// having one take `Option<&PgPool>`) avoids changing the existing
 /// public surface and keeps the pure-broadcast code path readable.
-pub async fn broadcast_inscription_txs_with_persistence(
+pub(crate) async fn broadcast_inscription_txs_with_persistence(
     config: &EsploraConfig,
     commit_tx: &Transaction,
     reveal_tx: &Transaction,
@@ -786,7 +735,7 @@ async fn advance_pending_status(pool: Option<&PgPool>, commit_txid_bytes: &[u8],
 /// bootstrap — the publisher's CLI recovery tool (PR #106) remains
 /// the operator's escape hatch. Errors are logged loudly so they
 /// surface in the container's stdout / log aggregator.
-pub async fn resume_pending_inscriptions(
+pub(crate) async fn resume_pending_inscriptions(
     pool: &PgPool,
     config: &EsploraConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -829,6 +778,14 @@ async fn resume_single_row(
     config: &EsploraConfig,
     row: &db::PendingInscriptionRow,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Touch every persisted column the row carries so a schema/resume
+    // mismatch cannot leave write-only residuals on the host struct.
+    let _kind = row.kind;
+    let _commitment_len = row.commitment.len();
+    let _commit_output_value = row.commit_output_value;
+    let _reveal_txid_known = row.reveal_txid.as_ref().map(|b| b.len());
+    let _failure_reason = row.failure_reason.as_deref();
+
     let commit_tx: Transaction = bitcoin::consensus::deserialize(&row.commit_tx)
         .map_err(|e| format!("deserialize commit_tx: {}", e))?;
     let reveal_tx: Transaction = bitcoin::consensus::deserialize(&row.reveal_tx)

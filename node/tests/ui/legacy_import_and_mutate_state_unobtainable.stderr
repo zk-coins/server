@@ -1,3 +1,38 @@
+error[E0425]: cannot find value `upsert_account` in module `node::db`
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:19:23
+   |
+19 |     let _ = node::db::upsert_account;
+   |                       ^^^^^^^^^^^^^^ not found in `node::db`
+   |
+note: found an item that was configured out
+  --> src/db.rs
+   |
+   | #[cfg(test)]
+   |       ---- the item is gated here
+   | pub(crate) async fn upsert_account(
+   |                     ^^^^^^^^^^^^^^
+
+error[E0425]: cannot find value `insert_account_history` in module `node::db`
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:21:23
+   |
+21 |     let _ = node::db::insert_account_history;
+   |                       ^^^^^^^^^^^^^^^^^^^^^^ not found in `node::db`
+
+error[E0425]: cannot find value `commit_mint_tx` in module `node::db`
+  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:22:23
+   |
+22 |     let _ = node::db::commit_mint_tx;
+   |                       ^^^^^^^^^^^^^^ not found in `node::db`
+   |
+note: found an item that was configured out
+  --> src/db.rs
+   |
+   | #[cfg(test)]
+   |       ---- the item is gated here
+...
+   | pub(crate) async fn commit_mint_tx(
+   |                     ^^^^^^^^^^^^^^
+
 error[E0603]: function `persist_account` is private
   --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:16:33
    |
@@ -14,22 +49,6 @@ note: the function `persist_account` is defined here
    | | ) -> Result<usize, PersistAccountError> {
    | |_______________________________________^
 
-error[E0603]: function `upsert_account` is private
-  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:19:23
-   |
-19 |     let _ = node::db::upsert_account;
-   |                       ^^^^^^^^^^^^^^ private function
-   |
-note: the function `upsert_account` is defined here
-  --> src/db.rs
-   |
-   | / pub(crate) async fn upsert_account(
-   | |     pool: &PgPool,
-   | |     address: &[u8],
-   | |     data: &[u8],
-   | | ) -> Result<(), sqlx::Error> {
-   | |____________________________^
-
 error[E0603]: function `upsert_account_with_source` is private
   --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:20:23
    |
@@ -44,36 +63,6 @@ note: the function `upsert_account_with_source` is defined here
    | |     address: &[u8],
    | |     data: &[u8],
    | |     source: &str,
-   | | ) -> Result<(), sqlx::Error> {
-   | |____________________________^
-
-error[E0603]: function `insert_account_history` is private
-  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:21:23
-   |
-21 |     let _ = node::db::insert_account_history;
-   |                       ^^^^^^^^^^^^^^^^^^^^^^ private function
-   |
-note: the function `insert_account_history` is defined here
-  --> src/db.rs
-   |
-   | / pub(crate) async fn insert_account_history(
-   | |     pool: &PgPool,
-   | |     entry: &AccountHistoryEntry,
-   | | ) -> Result<(), sqlx::Error> {
-   | |____________________________^
-
-error[E0603]: function `commit_mint_tx` is private
-  --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:22:23
-   |
-22 |     let _ = node::db::commit_mint_tx;
-   |                       ^^^^^^^^^^^^^^ private function
-   |
-note: the function `commit_mint_tx` is defined here
-  --> src/db.rs
-   |
-   | / pub(crate) async fn commit_mint_tx(
-   | |     pool: &PgPool,
-   | |     accounts: &[(&[u8], &[u8])],
    | | ) -> Result<(), sqlx::Error> {
    | |____________________________^
 
@@ -151,8 +140,8 @@ error[E0624]: method `import_account` is private
    |
   ::: src/account_node.rs
    |
-   |     pub(crate) fn import_account(&mut self, address: HashDigest, account: Account) {
-   |     ------------------------------------------------------------------------------ private method defined here
+   |         pub(crate) fn import_account(&mut self, address: HashDigest, account: Account) {
+   |         ------------------------------------------------------------------------------ private method defined here
 
 error[E0624]: method `state` is private
   --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:13:46

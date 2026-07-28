@@ -273,38 +273,28 @@ pub(crate) async fn mint_flow(
         ));
     }
 
+    // Stage 3+: `prepare_mint` is a refuse stub (circuit::main / Prover gone).
+    // Keep the call so any residual legacy admit path still fails loud at the
+    // engine boundary rather than inventing a success envelope.
     let account_node_clone = state.account_node.clone();
-    let prepared = tokio::task::spawn_blocking(
-        move || -> Result<crate::account_node::MintingPrepared, FlowError> {
-            let guard = lock_or_recover(&account_node_clone);
-            guard
-                .prepare_mint(&creator_pubkey, &name, decimals, amount, &next_public_key)
-                .map_err(flow_err_from_send_coins)
-        },
-    )
+    let refuse = tokio::task::spawn_blocking(move || {
+        let guard = lock_or_recover(&account_node_clone);
+        guard.prepare_mint(&creator_pubkey, &name, decimals, amount, &next_public_key)
+    })
     .await
     .map_err(|e| {
         FlowError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("spawn_blocking join error: {}", e),
         )
-    })??;
-    tracing::info!("Mint prove: ok");
-
-    // Derive the commit hashes the wallet must sign, from the same
-    // public-input path the commit leg re-derives.
-    let commit_hashes = mint_proof_commit_hashes(&prepared.proof);
-
-    // Stage the mint for the wallet-signed commit leg.
-    let proof_id = state.mint_store.add(crate::router::StagedMint {
-        proof: prepared.proof,
-        owner: prepared.owner,
-        asset_id: prepared.asset_id,
-        mutated_account: prepared.mutated_account,
-        creator_pubkey: request.creator_pubkey,
-    });
-
-    Ok((proof_id, commit_hashes))
+    })?;
+    match refuse {
+        Ok(()) => Err(FlowError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy prepare_mint returned Ok after Stage-3 deletion — refusing silent success",
+        )),
+        Err(msg) => Err(flow_err_from_send_coins(msg)),
+    }
 }
 
 /// Extract the `account_state_hash` / `output_coins_root` a mint proof

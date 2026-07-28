@@ -37,13 +37,19 @@ use sqlx::{PgPool, Postgres, Transaction};
 // Production surface only — the test-only reset is `#[cfg(test)]` of
 // `stack-policy` itself and is intentionally **not** re-exported here.
 // Dependency builds never see that symbol (no Cargo feature seam).
-pub use stack_policy::{
-    ensure_legacy_publisher_allowed, process_stack_mode, set_process_stack_mode, ScanStackMode,
+//
+// `ScanStackMode` is the only stack-policy symbol on the external edge
+// (binary boot + recover path name it via `node::v1`). Process-control
+// helpers stay crate-private so `downstream-boundary` cannot mint or
+// withdraw a claim by naming this module path.
+pub use stack_policy::ScanStackMode;
+pub(crate) use stack_policy::{
+    ensure_legacy_publisher_allowed, process_stack_mode, set_process_stack_mode,
     STACK_SEPARATION_REFUSAL,
 };
 
 /// Canonical error prefix when a writer finds no matching marker in-tx.
-pub const STACK_CAPABILITY_REFUSAL: &str = "stack separation: refusing write";
+pub(crate) const STACK_CAPABILITY_REFUSAL: &str = "stack separation: refusing write";
 
 /// SQL: any durable legacy scan-stack row across **all** legacy tables.
 ///
@@ -65,31 +71,11 @@ const V1_SCAN_STATE_COUNT_SQL: &str = "SELECT \
   + (SELECT COUNT(*) FROM v1_spendable_coins) \
   + (SELECT COUNT(*) FROM v1_spent_coins)";
 
-/// True when any durable legacy scan-stack table has rows
-/// (`mmr_root_index`, `smt_state`, `mmr_state`, `latest_block`).
-pub async fn legacy_scan_state_present(pool: &PgPool) -> Result<bool> {
-    let (n,): (i64,) = sqlx::query_as(LEGACY_SCAN_STATE_COUNT_SQL)
-        .fetch_one(pool)
-        .await
-        .context("count legacy scan tables for stack separation")?;
-    Ok(n > 0)
-}
 
-/// True when any v1.1 stack table has rows (meta, NfLog, index, accounts,
-/// coins). Meta alone is enough: [`crate::v1::adapter::EngineAdapter::
-/// load_or_create`] persists an empty genesis snapshot into
-/// `v1_engine_meta`, and that must bind the database to v1.1 just as
-/// strongly as a non-empty NfLog.
-pub async fn v1_scan_state_present(pool: &PgPool) -> Result<bool> {
-    let (n,): (i64,) = sqlx::query_as(V1_SCAN_STATE_COUNT_SQL)
-        .fetch_one(pool)
-        .await
-        .context("count v1 tables for stack separation")?;
-    Ok(n > 0)
-}
 
 /// Load the claimed mode, if any.
-pub async fn load_stack_scan_mode(pool: &PgPool) -> Result<Option<ScanStackMode>> {
+#[cfg(test)]
+pub(crate) async fn load_stack_scan_mode(pool: &PgPool) -> Result<Option<ScanStackMode>> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT mode FROM stack_scan_mode WHERE id = 1")
             .fetch_optional(pool)
@@ -111,7 +97,7 @@ pub async fn load_stack_scan_mode(pool: &PgPool) -> Result<Option<ScanStackMode>
 /// Does **not** set process mode (tests that need a process claim call
 /// [`set_process_stack_mode`] explicitly).
 #[cfg(test)]
-pub async fn claim_stack_scan_mode(pool: &PgPool, mode: ScanStackMode) -> Result<()> {
+pub(crate) async fn claim_stack_scan_mode(pool: &PgPool, mode: ScanStackMode) -> Result<()> {
     let mut tx = pool.begin().await.context("begin claim_stack_scan_mode tx")?;
 
     let marker_row: Option<(String,)> =
@@ -237,7 +223,7 @@ async fn claim_stack_scan_mode_in_tx(
 /// A missing marker is an unconditional refusal — writers never invent a
 /// claim. Only [`enforce_stack_scan_mode`] on a genuinely empty database
 /// may insert the row.
-pub async fn require_stack_mode_for_update(
+pub(crate) async fn require_stack_mode_for_update(
     tx: &mut Transaction<'_, Postgres>,
     required: ScanStackMode,
 ) -> Result<()> {
@@ -398,7 +384,7 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
 /// under `ZKCOINS_V1_SHADOW=1` before any broadcast client is built.
 /// Tests call this with a pure mode value instead of hand-setting
 /// [`set_process_stack_mode`] directly (which would skip the binary path).
-pub fn claim_process_stack_from_shadow_mode(mode: super::mode::V1ShadowMode) {
+pub(crate) fn claim_process_stack_from_shadow_mode(mode: super::mode::V1ShadowMode) {
     match mode {
         super::mode::V1ShadowMode::On => set_process_stack_mode(ScanStackMode::V1),
         super::mode::V1ShadowMode::Off => set_process_stack_mode(ScanStackMode::Legacy),
@@ -414,7 +400,7 @@ pub fn claim_process_stack_from_v1_shadow_env() -> Result<()> {
 }
 
 /// Refuse the v1.1 publisher unless this process claimed v1.1.
-pub fn ensure_v1_publisher_allowed() -> Result<()> {
+pub(crate) fn ensure_v1_publisher_allowed() -> Result<()> {
     match process_stack_mode() {
         Some(ScanStackMode::V1) => Ok(()),
         Some(ScanStackMode::Legacy) => bail!(
@@ -434,7 +420,7 @@ pub fn ensure_v1_publisher_allowed() -> Result<()> {
 /// Unset process mode is **not** permitted: an unset mode previously
 /// allowed writes that later left v1.1 data under a legacy marker.
 /// Shared by scan apply paths and [`super::adapter::EngineAdapter::with_engine_mut`].
-pub fn require_v1_process_for_nflog_write() -> Result<()> {
+pub(crate) fn require_v1_process_for_nflog_write() -> Result<()> {
     match process_stack_mode() {
         Some(ScanStackMode::V1) => Ok(()),
         Some(ScanStackMode::Legacy) => bail!(

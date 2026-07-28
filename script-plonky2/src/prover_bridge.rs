@@ -324,9 +324,9 @@ impl TransitionWitness {
                 .collect(),
             asset_issuance: self.asset_issuance.clone(),
             nk: self.nk,
-            nav: self.nav.clone(),
+            nav: self.nav,
             nav_rand: self.nav_rand,
-            prev_nav_opening: self.prev_nav_opening.clone(),
+            prev_nav_opening: self.prev_nav_opening,
             nav_consistency: self.nav_consistency.clone(),
             next_pubkey: self.next_pubkey,
             npk_rand: self.npk_rand,
@@ -418,7 +418,7 @@ impl ReceivedAuthorization {
             creating_nullifier: self.creating_nullifier.clone(),
             creating_nav_inclusion: self.creating_nav_inclusion.clone(),
             pos_create: self.pos_create,
-            creating_nav_opening: self.creating_nav_opening.clone(),
+            creating_nav_opening: self.creating_nav_opening,
             creating_nav_consistency: self.creating_nav_consistency.clone(),
             history_proof: self.history_proof.clone(),
         }
@@ -950,7 +950,6 @@ fn balance_circuit(network: Network) -> Result<&'static BalanceCircuit> {
     // C must exist first (and have passed its pin check when pins are set).
     let compliance = compliance_circuit(network)?;
     let slot = cache.get_or_init(|| {
-        let compliance = compliance; // 'static ref is Copy via reborrow below
         std::thread::Builder::new()
             .name("zkcoins-balance-cache".to_owned())
             .stack_size(64 * 1024 * 1024)
@@ -1249,10 +1248,7 @@ fn validate_attestation(w: &AttestationWitness) -> Result<()> {
         w.statement.nav_ceiling.size,
         "attestation NAV",
     )?;
-    ensure!(
-        w.statement.anchor.height <= u64::MAX,
-        "anchor height is not a u64"
-    );
+    // `anchor.height` is already `u64`; no range check is expressible here.
     canonical_x_point(&w.statement.anchor.public_key, "attestation anchor key")?;
     canonical_base(&w.statement.anchor.signature_r, "attestation anchor R")?;
     canonical_x_point(&w.r_prime, "attestation R'")?;

@@ -77,7 +77,7 @@ use shared::spec_v1::accumulator::LookupResult;
 use shared::spec_v1::Nav;
 use tracing::{info, warn};
 use zkcoins_program::circuit::compliance::Network;
-use zkcoins_prover::prover_bridge::{ComplianceProof, NavOpening, NullifierOpening, ProverBridge};
+use zkcoins_prover::prover_bridge::{NavOpening, NullifierOpening, ProverBridge};
 
 use crate::account_node::CanaryOutcome;
 
@@ -88,10 +88,10 @@ use super::adapter::EngineAdapter;
 ///
 /// Four bytes (`V1\0\0`): the historical `V11\0` tag was renamed with the
 /// stack; length stays fixed so the layout remains `tag || C || C_balance`.
-pub const V1_DIGEST_TAG: &[u8; 4] = b"V1\0\0";
+pub(crate) const V1_DIGEST_TAG: &[u8; 4] = b"V1\0\0";
 
 /// Total length of [`encode_v1_live_digest`]: tag + C + C_balance.
-pub const V1_LIVE_DIGEST_LEN: usize = 4 + 32 + 32;
+pub(crate) const V1_LIVE_DIGEST_LEN: usize = 4 + 32 + 32;
 
 /// Encode the live v1 self-heal baseline: `V1\0\0 || C || C_balance`.
 ///
@@ -100,7 +100,7 @@ pub const V1_LIVE_DIGEST_LEN: usize = 4 + 32 + 32;
 /// and the §3.6 boot pins). Production boot obtains these from the
 /// **just-built** circuits via [`resolve_v1_live_digest`], not by
 /// re-reading the pins alone or an embedded text file.
-pub fn encode_v1_live_digest(c: &[u8; 32], c_balance: &[u8; 32]) -> Vec<u8> {
+pub(crate) fn encode_v1_live_digest(c: &[u8; 32], c_balance: &[u8; 32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(V1_LIVE_DIGEST_LEN);
     out.extend_from_slice(V1_DIGEST_TAG);
     out.extend_from_slice(c);
@@ -217,7 +217,8 @@ pub(crate) fn set_test_built_digests_override(built: Option<([u8; 32], [u8; 32])
 /// Returns `None` when the tag or length is wrong — callers that expect a
 /// v1.1 baseline must treat `None` as "not a v1.1 digest" (which a live
 /// pin encoding will not match → Reset). Never invents defaults.
-pub fn decode_v1_live_digest(blob: &[u8]) -> Option<([u8; 32], [u8; 32])> {
+#[cfg(test)]
+pub(crate) fn decode_v1_live_digest(blob: &[u8]) -> Option<([u8; 32], [u8; 32])> {
     if blob.len() != V1_LIVE_DIGEST_LEN {
         return None;
     }
@@ -235,23 +236,15 @@ pub fn decode_v1_live_digest(blob: &[u8]) -> Option<([u8; 32], [u8; 32])> {
 /// persisted account (predecessor nullifier + NAV). Independent of the
 /// proof blob so pure unit tests do not need a Plonky2 proof fixture.
 #[derive(Clone, Debug)]
-pub struct V1StructuralInputs<'a> {
+pub(crate) struct V1StructuralInputs<'a> {
     pub last_nullifier: Option<&'a NullifierOpening>,
     pub last_nullifier_pos: Option<u64>,
     pub last_nav_opening: Option<&'a NavOpening>,
 }
 
-/// Full canary sample: structural inputs plus the persisted proof (used
-/// by the slow verify path).
-#[derive(Clone, Debug)]
-pub struct V1CanarySample<'a> {
-    pub last_proof: &'a ComplianceProof,
-    pub structural: V1StructuralInputs<'a>,
-}
-
 /// Live NfLog facts the structural canary needs (injected for pure tests).
 #[derive(Clone, Debug)]
-pub struct V1CanaryNflogView {
+pub(crate) struct V1CanaryNflogView {
     pub nav: Nav,
     /// `(pos, r)` for a looked-up predecessor Pk, or `None` if absent.
     pub predecessor: Option<(u64, [u8; 32])>,
@@ -267,7 +260,7 @@ pub struct V1CanaryNflogView {
 ///
 /// Does **not** call Plonky2. Crypto acceptance of the proof is the slow
 /// path ([`evaluate_v1_slow_canary`]).
-pub fn evaluate_v1_structural_canary(
+pub(crate) fn evaluate_v1_structural_canary(
     inputs: &V1StructuralInputs<'_>,
     nflog: &V1CanaryNflogView,
 ) -> CanaryOutcome {
@@ -327,7 +320,7 @@ pub fn evaluate_v1_structural_canary(
 ///
 /// A test that would go red under a wrong change: flip `verify_ok` to
 /// `true` while claiming Stale, or the reverse — the matrix is exhaustive.
-pub fn evaluate_v1_slow_canary(
+pub(crate) fn evaluate_v1_slow_canary(
     inputs: &V1StructuralInputs<'_>,
     nflog: &V1CanaryNflogView,
     verify_ok: bool,
@@ -352,7 +345,7 @@ pub fn evaluate_v1_slow_canary(
 /// Boot-time structural canary over the live [`EngineAdapter`].
 ///
 /// See module docs for the edge vs. full re-prove.
-pub fn boot_canary(adapter: &EngineAdapter) -> CanaryOutcome {
+pub(crate) fn boot_canary(adapter: &EngineAdapter) -> CanaryOutcome {
     adapter.with_engine(|engine| {
         for (_owner, record) in engine.accounts() {
             if record.last_proof.is_none() {
@@ -390,7 +383,7 @@ pub fn boot_canary(adapter: &EngineAdapter) -> CanaryOutcome {
 /// (including the cyclic verifier-data pin). Does **not** re-prove a
 /// successor AccountUpdate — that remains a manual/ops procedure when
 /// wall-time budgets allow (multi-minute cold prove).
-pub fn slow_canary_verify_transition(adapter: &EngineAdapter) -> CanaryOutcome {
+pub(crate) fn slow_canary_verify_transition(adapter: &EngineAdapter) -> CanaryOutcome {
     let bridge = adapter.bridge();
     adapter.with_engine(|engine| {
         for (_owner, record) in engine.accounts() {
@@ -420,7 +413,7 @@ pub fn slow_canary_verify_transition(adapter: &EngineAdapter) -> CanaryOutcome {
 }
 
 /// Whether the operator requested the slow verify canary this boot.
-pub fn slow_canary_env_enabled() -> bool {
+pub(crate) fn slow_canary_env_enabled() -> bool {
     matches!(std::env::var("ZKCOINS_V1_SLOW_CANARY"), Ok(v) if v == "1")
 }
 

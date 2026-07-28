@@ -1868,6 +1868,9 @@ impl std::fmt::Display for FinaliseLeaseLivenessLost {
 /// `work` must yield to the async runtime (await points / `spawn_blocking`
 /// for CPU-bound prove) so the heartbeat task can run. Production covers
 /// prove **and** host-edge completion writes under this heartbeat.
+// Clippy too_many_arguments: packing lease/renew/fence into a struct would
+// reshuffle a durable finalise-claim call surface without safety gain.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn with_finalise_lease_heartbeat<F, T>(
     job_store: &JobStore,
     public_id: Uuid,
@@ -1987,8 +1990,10 @@ where
     tokio::select! {
         biased;
         lost = &mut lost_rx => {
-            // Liveness can no longer be demonstrated: drop `work`, discard result.
-            drop(work);
+            // Liveness can no longer be demonstrated: discard `work` (and its
+            // result) by letting the pinned future go out of scope. `work` is
+            // a plain future and does not implement `Drop`; an explicit
+            // `drop(work)` would only extend lifetimes without side effects.
             let _ = heartbeat.await;
             match lost {
                 Ok(reason) => Err(reason),
@@ -2167,6 +2172,9 @@ async fn drive_v1_finalise(
     // Post-claim fail: fence-qualified so a lost/stale worker cannot fail a
     // job another epoch holds (including same-owner reclaim). `Ok(false)` is
     // quiet loss — leave notify.
+    // Clippy too_many_arguments: args identify the fenced durable job-fail
+    // write; bundling would change a lease-sensitive call surface.
+    #[allow(clippy::too_many_arguments)]
     async fn fail_v1_as_owner(
         job_store: &JobStore,
         app_state: &AppState,

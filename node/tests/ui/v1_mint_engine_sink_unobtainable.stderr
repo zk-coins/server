@@ -1,11 +1,13 @@
-error[E0603]: function `engine_begin_mint` is private
- --> tests/ui/v1_mint_engine_sink_unobtainable.rs:7:30
+error[E0603]: module `mint` is private
+ --> tests/ui/v1_mint_engine_sink_unobtainable.rs:7:23
   |
 7 |     let _ = node::v1::mint::engine_begin_mint;
-  |                              ^^^^^^^^^^^^^^^^^ private function
+  |                       ^^^^  ----------------- function `engine_begin_mint` is not publicly re-exported
+  |                       |
+  |                       private module
   |
-note: the function `engine_begin_mint` is defined here
- --> src/v1/mint.rs
+note: the module `mint` is defined here
+ --> src/v1/mod.rs
   |
-  | fn engine_begin_mint(engine: &StateEngine, req: MintRequest) -> Result<PendingTransition> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  | pub(crate) mod mint;
+  | ^^^^^^^^^^^^^^^^^^^
