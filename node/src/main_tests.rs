@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::test_db::setup_pool;
-use crate::v11::{claim_stack_scan_mode, ScanStackMode};
+use crate::v1::{claim_stack_scan_mode, ScanStackMode};
 
 // --- build_network_config_from_env -------------------------------
 //

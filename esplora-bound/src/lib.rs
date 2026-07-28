@@ -150,10 +150,10 @@ mod policy_construction_tests {
     /// claim — the policy check is inside `connect`, not a caller-side
     /// witness.
     #[test]
-    fn broadcast_connect_refuses_under_v11_process_claim() {
-        set_process_stack_mode(ScanStackMode::V11);
+    fn broadcast_connect_refuses_under_v1_process_claim() {
+        set_process_stack_mode(ScanStackMode::V1);
         let err = EsploraBroadcastClient::connect("http://127.0.0.1:1")
-            .expect_err("v11 claim must block broadcast construction");
+            .expect_err("v1 claim must block broadcast construction");
         let msg = err.to_string();
         assert!(
             msg.contains(STACK_SEPARATION_REFUSAL) || msg.contains("v1.1"),
@@ -180,7 +180,7 @@ mod policy_construction_tests {
             .expect("unclaimed process allows legacy broadcast construction");
     }
 
-    /// Once V11 is claimed, no production public call sequence can obtain a
+    /// Once V1 is claimed, no production public call sequence can obtain a
     /// broadcast-capable client under a different or absent claim. Withdraw
     /// is `#[cfg(test)]` of `stack-policy` only — absent on this dependency
     /// edge — so the claim stays monotonic for the life of the process.
@@ -191,21 +191,21 @@ mod policy_construction_tests {
     /// would break later tests in the same process.
     #[test]
     fn broadcast_client_claim_is_monotonic() {
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
 
         EsploraBroadcastClient::connect("http://127.0.0.1:1")
-            .expect_err("v11 claim blocks broadcast construction");
+            .expect_err("v1 claim blocks broadcast construction");
 
         // Re-affirm does not open an unclaimed window.
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
         EsploraBroadcastClient::connect("http://127.0.0.1:1")
             .expect_err("re-affirm still blocks");
 
-        // process_stack_mode still reports V11 — no public production path
+        // process_stack_mode still reports V1 — no public production path
         // withdrew the claim.
         assert_eq!(
             stack_policy::process_stack_mode(),
-            Some(ScanStackMode::V11)
+            Some(ScanStackMode::V1)
         );
     }
 }

@@ -28,17 +28,17 @@
 //! ## Flag gate (process claim is the capability)
 //!
 //! Re-mint via the v1.1 engine is available only when this process has
-//! claimed [`ScanStackMode::V11`] at boot from `ZKCOINS_V11_SHADOW=1`
+//! claimed [`ScanStackMode::V1`] at boot from `ZKCOINS_V1_SHADOW=1`
 //! (same registry [`stack_policy`] / [`super::separation`] use for
 //! publisher and NfLog writes). A freely constructible mode enum is **not**
-//! a capability — [`begin_v11_mint`] does not take one; it consults the
+//! a capability — [`begin_v1_mint`] does not take one; it consults the
 //! process claim. With the flag off the process claims Legacy and the
 //! legacy [`crate::account_node::AccountNode::prepare_mint`] refusal
 //! ("Re-mint into an existing asset account is not supported") stays the
 //! default and is byte-identical. There is no dual-accept.
 //!
 //! The raw engine sink is module-private ([`engine_begin_mint`]); the only
-//! orchestration entry is [`begin_v11_mint`].
+//! orchestration entry is [`begin_v1_mint`].
 //!
 //! ## Block edge
 //!
@@ -56,27 +56,27 @@ use super::separation::{process_stack_mode, ScanStackMode};
 
 /// Refusal when the shadow flag / process claim is not v1.1 — remint is
 /// not dual-accepted on the legacy stack.
-pub const V11_MINT_SHADOW_OFF: &str = "ZKCOINS_V11_SHADOW is off — refusing v1.1 mint/remint path \
+pub const V1_MINT_SHADOW_OFF: &str = "ZKCOINS_V1_SHADOW is off — refusing v1.1 mint/remint path \
      (legacy prepare_mint remains the default; remint stays refused there)";
 
 /// Gate the v1.1 mint/remint path on the **process stack claim**.
 ///
-/// Same shape as [`super::separation::ensure_v11_publisher_allowed`]: the
-/// capability is possession of a boot-time [`ScanStackMode::V11`] claim
-/// (derived from `ZKCOINS_V11_SHADOW=1`), not a caller-selected label.
+/// Same shape as [`super::separation::ensure_v1_publisher_allowed`]: the
+/// capability is possession of a boot-time [`ScanStackMode::V1`] claim
+/// (derived from `ZKCOINS_V1_SHADOW=1`), not a caller-selected label.
 ///
 /// | process claim | result |
 /// |---|---|
-/// | `Some(V11)` | allowed |
-/// | `Some(Legacy)` | refuse ([`V11_MINT_SHADOW_OFF`]) |
+/// | `Some(V1)` | allowed |
+/// | `Some(Legacy)` | refuse ([`V1_MINT_SHADOW_OFF`]) |
 /// | `None` | refuse (unclaimed — no silent fall-through) |
-pub fn ensure_v11_mint_path() -> Result<()> {
+pub fn ensure_v1_mint_path() -> Result<()> {
     match process_stack_mode() {
-        Some(ScanStackMode::V11) => Ok(()),
-        Some(ScanStackMode::Legacy) => bail!(V11_MINT_SHADOW_OFF),
+        Some(ScanStackMode::V1) => Ok(()),
+        Some(ScanStackMode::Legacy) => bail!(V1_MINT_SHADOW_OFF),
         None => bail!(
-            "v1.1 mint/remint requires a process that claimed ScanStackMode::V11 at boot \
-             (ZKCOINS_V11_SHADOW=1). Process claim is unset — refusing (no silent \
+            "v1.1 mint/remint requires a process that claimed ScanStackMode::V1 at boot \
+             (ZKCOINS_V1_SHADOW=1). Process claim is unset — refusing (no silent \
              fall-through to legacy prepare_mint dual-accept)"
         ),
     }
@@ -84,7 +84,7 @@ pub fn ensure_v11_mint_path() -> Result<()> {
 
 /// Begin a mint or re-mint through the v1.1 [`StateEngine`].
 ///
-/// Requires a process claim of [`ScanStackMode::V11`]. The mode is **not**
+/// Requires a process claim of [`ScanStackMode::V1`]. The mode is **not**
 /// a parameter — callers cannot hand in `On` while the flag is off. Delegates
 /// to the module-private engine sink after the claim check; that sink is the
 /// only place this module calls [`StateEngine::begin_mint`].
@@ -92,15 +92,15 @@ pub fn ensure_v11_mint_path() -> Result<()> {
 /// [`StateEngine::begin_mint`] already admits token-standard-1 re-issuance
 /// into an existing multi-asset account and refuses non-conformant
 /// token-standard-2 requests naming the clause.
-pub fn begin_v11_mint(engine: &StateEngine, req: MintRequest) -> Result<PendingTransition> {
-    ensure_v11_mint_path()?;
+pub fn begin_v1_mint(engine: &StateEngine, req: MintRequest) -> Result<PendingTransition> {
+    ensure_v1_mint_path()?;
     engine_begin_mint(engine, req)
 }
 
 /// Raw `StateEngine::begin_mint` sink.
 ///
 /// **Module-private.** Possession of a path to this function is not exposed
-/// outside `mint` — the public orchestration entry is [`begin_v11_mint`],
+/// outside `mint` — the public orchestration entry is [`begin_v1_mint`],
 /// which obtains the process-stack capability first. A compile-fail UI test
 /// pins that this symbol is unreachable from outside the module.
 fn engine_begin_mint(engine: &StateEngine, req: MintRequest) -> Result<PendingTransition> {
@@ -110,8 +110,8 @@ fn engine_begin_mint(engine: &StateEngine, req: MintRequest) -> Result<PendingTr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v11::mode::V11ShadowMode;
-    use crate::v11::separation::{
+    use crate::v1::mode::V1ShadowMode;
+    use crate::v1::separation::{
         claim_process_stack_from_shadow_mode, set_process_stack_mode, ScanStackMode,
     };
     use plonky2::field::goldilocks_field::GoldilocksField;
@@ -196,47 +196,47 @@ mod tests {
         }
     }
 
-    /// Claim V11 the same way the binary does after reading
-    /// `ZKCOINS_V11_SHADOW=1`. Process claim is monotonic and un-clearable
+    /// Claim V1 the same way the binary does after reading
+    /// `ZKCOINS_V1_SHADOW=1`. Process claim is monotonic and un-clearable
     /// outside stack-policy's own `cfg(test)` — rely on process-per-test
     /// isolation (nextest).
-    fn with_v11_process_claim<R>(f: impl FnOnce() -> R) -> R {
-        claim_process_stack_from_shadow_mode(V11ShadowMode::On);
+    fn with_v1_process_claim<R>(f: impl FnOnce() -> R) -> R {
+        claim_process_stack_from_shadow_mode(V1ShadowMode::On);
         f()
     }
 
-    /// Flag genuinely unset / process not on V11: v1.1 mint path is
+    /// Flag genuinely unset / process not on V1: v1.1 mint path is
     /// refused (no dual-accept with legacy).
     ///
     /// Complements `prepare_mint_rejects_remint_into_existing_asset_account`
     /// in `account_node_tests`: that pins the legacy refusal string; this
-    /// pins that the engine remint entry is unreachable without a V11
-    /// process claim. The caller cannot hand in `V11ShadowMode::On` —
-    /// [`begin_v11_mint`] takes no mode parameter; the claim is read from
+    /// pins that the engine remint entry is unreachable without a V1
+    /// process claim. The caller cannot hand in `V1ShadowMode::On` —
+    /// [`begin_v1_mint`] takes no mode parameter; the claim is read from
     /// the process registry (stack-policy).
     ///
     /// Unclaimed then Legacy in one process is fine: claim is monotonic
-    /// (None → Legacy). Separate from V11-claim tests (nextest isolation).
+    /// (None → Legacy). Separate from V1-claim tests (nextest isolation).
     #[test]
-    fn begin_v11_mint_refuses_when_shadow_flag_off() {
+    fn begin_v1_mint_refuses_when_shadow_flag_off() {
         let engine = StateEngine::new(Network::Testnet, 0);
 
         // Unclaimed process (flag never observed / boot not run).
-        let err = begin_v11_mint(&engine, std1_request())
+        let err = begin_v1_mint(&engine, std1_request())
             .expect_err("unclaimed process must refuse v1.1 mint");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("ZKCOINS_V11_SHADOW") || msg.contains("ScanStackMode::V11"),
+            msg.contains("ZKCOINS_V1_SHADOW") || msg.contains("ScanStackMode::V1"),
             "unexpected error: {msg}"
         );
 
         // Flag-off boot claims Legacy — same refusal surface.
         set_process_stack_mode(ScanStackMode::Legacy);
-        let err = begin_v11_mint(&engine, std1_request())
+        let err = begin_v1_mint(&engine, std1_request())
             .expect_err("legacy claim must refuse v1.1 mint");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("ZKCOINS_V11_SHADOW is off"),
+            msg.contains("ZKCOINS_V1_SHADOW is off"),
             "unexpected error: {msg}"
         );
     }
@@ -244,8 +244,8 @@ mod tests {
     /// Flag-on conformant token-standard-1 re-mint: AccountUpdateProof,
     /// `asset_issuance` present, supply = prior + amount.
     #[test]
-    fn v11_std1_remint_succeeds_and_updates_supply() {
-        with_v11_process_claim(|| {
+    fn v1_std1_remint_succeeds_and_updates_supply() {
+        with_v1_process_claim(|| {
             let mut engine = StateEngine::new(Network::Testnet, 0);
             let first = std1_request();
             let nk_commit = host::nk_commit(&first.nk);
@@ -376,7 +376,7 @@ mod tests {
             };
 
             let pending =
-                begin_v11_mint(&engine, remint).expect("flag-on std1 remint must succeed");
+                begin_v1_mint(&engine, remint).expect("flag-on std1 remint must succeed");
 
             assert_eq!(pending.mode, TransitionMode::AccountUpdateProof);
             let issuance = pending
@@ -401,8 +401,8 @@ mod tests {
 
     /// Token-standard-2 amount over cap: refused naming §6.5 clause (e).
     #[test]
-    fn v11_std2_remint_over_cap_refused_naming_clause_e() {
-        with_v11_process_claim(|| {
+    fn v1_std2_remint_over_cap_refused_naming_clause_e() {
+        with_v1_process_claim(|| {
             let engine = StateEngine::new(Network::Testnet, 0);
             let mut req = std1_request();
             req.issuance_version = 2;
@@ -410,7 +410,7 @@ mod tests {
             req.cap_total = 100;
             req.terms_salt = [0x44; 32];
 
-            let err = begin_v11_mint(&engine, req).expect_err("over-cap v2 mint must fail");
+            let err = begin_v1_mint(&engine, req).expect_err("over-cap v2 mint must fail");
             let msg = format!("{err:#}");
             assert!(
                 msg.contains("amount exceeds cap_total") && msg.contains("§6.5 clause (e)"),
@@ -425,8 +425,8 @@ mod tests {
     /// Host preflight only: clause (f) fires before `account_transition_context`,
     /// so `last_proof` is intentionally `None` (no circuit build).
     #[test]
-    fn v11_std2_remint_non_genesis_refused_naming_clause_f() {
-        with_v11_process_claim(|| {
+    fn v1_std2_remint_non_genesis_refused_naming_clause_f() {
+        with_v1_process_claim(|| {
             let mut engine = StateEngine::new(Network::Testnet, 0);
             let base = std1_request();
             let nk_commit = host::nk_commit(&base.nk);
@@ -467,7 +467,7 @@ mod tests {
             req.cap_total = 100;
             req.terms_salt = [0x44; 32];
 
-            let err = begin_v11_mint(&engine, req).expect_err("v2 remint must fail at genesis binding");
+            let err = begin_v1_mint(&engine, req).expect_err("v2 remint must fail at genesis binding");
             let msg = format!("{err:#}");
             assert!(
                 msg.contains("non-genesis account") && msg.contains("§6.5 clause (f)"),
@@ -480,26 +480,26 @@ mod tests {
         });
     }
 
-    /// `ensure_v11_mint_path` refuses unclaimed and Legacy (process-claim-only).
-    /// Split from the V11-allow case: claim is monotonic, no mid-process reset.
+    /// `ensure_v1_mint_path` refuses unclaimed and Legacy (process-claim-only).
+    /// Split from the V1-allow case: claim is monotonic, no mid-process reset.
     #[test]
-    fn ensure_v11_mint_path_refuses_unclaimed_and_legacy() {
+    fn ensure_v1_mint_path_refuses_unclaimed_and_legacy() {
         assert!(
-            ensure_v11_mint_path().is_err(),
+            ensure_v1_mint_path().is_err(),
             "unclaimed must refuse"
         );
 
         set_process_stack_mode(ScanStackMode::Legacy);
         assert!(
-            ensure_v11_mint_path().is_err(),
+            ensure_v1_mint_path().is_err(),
             "legacy claim must refuse"
         );
     }
 
-    /// `ensure_v11_mint_path` allows a V11 process claim.
+    /// `ensure_v1_mint_path` allows a V1 process claim.
     #[test]
-    fn ensure_v11_mint_path_allows_v11_claim() {
-        set_process_stack_mode(ScanStackMode::V11);
-        ensure_v11_mint_path().expect("v11 claim must allow");
+    fn ensure_v1_mint_path_allows_v1_claim() {
+        set_process_stack_mode(ScanStackMode::V1);
+        ensure_v1_mint_path().expect("v1 claim must allow");
     }
 }

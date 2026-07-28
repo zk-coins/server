@@ -224,49 +224,49 @@ pub struct AppState {
     /// [`stream_job_handler`] for the subscriber-side wiring.
     pub(crate) job_notify_map: JobNotifyMap,
     /// When `Some`, the v1.1 NfLog scanner has completed at least one
-    /// successful catch-up apply. Under `ZKCOINS_V11_SHADOW=1` readiness
+    /// successful catch-up apply. Under `ZKCOINS_V1_SHADOW=1` readiness
     /// requires this flag so the node does not report ready while its
     /// v1.1 view is still empty / behind tip. `None` = legacy stack
     /// (readiness does not wait on NfLog catch-up).
-    pub(crate) v11_scan_caught_up: Option<Arc<AtomicBool>>,
+    pub(crate) v1_scan_caught_up: Option<Arc<AtomicBool>>,
     /// When `Some`, set to `false` if the scanner reports
     /// `ReorgOutcome::finality_broken`. Readiness then fails with
     /// `"deep_reorg"` and callers must stop crediting. `None` = legacy.
-    pub(crate) v11_finality_ok: Option<Arc<AtomicBool>>,
-    /// Staged v1.1 [`PendingSignEntry`](crate::v11::PendingSignEntry)
+    pub(crate) v1_finality_ok: Option<Arc<AtomicBool>>,
+    /// Staged v1.1 [`PendingSignEntry`](crate::v1::PendingSignEntry)
     /// material keyed by job id. Populated when a job reaches
     /// `awaiting_signature` under a v1.1 claim; consumed by
     /// [`jobs_sign_handler`] and the dispatcher finalise path. Empty /
     /// unused under the legacy stack. Restart-safe: also persisted under
     /// In-memory staging of the durable finalisation capability; also
     /// persisted under `request_body.finalisation` and rehydrated on boot.
-    pub(crate) pending_sign_map: crate::v11::PendingSignMap,
+    pub(crate) pending_sign_map: crate::v1::PendingSignMap,
     /// Optional v1.1 finalise driver. Under a v1.1 claim an accepted
     /// `/sign` **must** go through this (install signature → prove
     /// outside the engine lock → apply with live re-validation, or a
     /// test double) rather than completing the job with the signature
     /// material alone. `None` under the legacy stack; under v1.1 a
     /// missing driver fails the job loud.
-    pub(crate) v11_finalise: Option<V11FinaliseHook>,
+    pub(crate) v1_finalise: Option<V1FinaliseHook>,
     /// Production registry of live [`PendingSignEntry`] values produced
     /// by `StateEngine::begin_*`. Keyed by job id; the dispatcher takes
     /// the entry once when entering `awaiting_signature` and stages it
-    /// via [`crate::v11::stage_pending_sign`]. Empty under the legacy
-    /// stack. Writers: [`crate::v11::register_live_pending_after_begin`].
-    pub(crate) v11_live_pending_after_begin: crate::v11::PendingSignMap,
+    /// via [`crate::v1::stage_pending_sign`]. Empty under the legacy
+    /// stack. Writers: [`crate::v1::register_live_pending_after_begin`].
+    pub(crate) v1_live_pending_after_begin: crate::v1::PendingSignMap,
     /// Test-only extra source of a live pending after the prove leg
     /// (fixtures without a multi-minute prove). Production never
     /// installs this — the live path is
-    /// [`Self::v11_live_pending_after_begin`] alone. Kept behind
+    /// [`Self::v1_live_pending_after_begin`] alone. Kept behind
     /// `cfg(test)` so it cannot be mistaken for a production resolver
     /// input (Defect 4).
     #[cfg(test)]
-    pub(crate) v11_pending_after_prove: Option<V11PendingAfterProveHook>,
+    pub(crate) v1_pending_after_prove: Option<V1PendingAfterProveHook>,
     /// Shared v1.1 engine for Gap-G6 balance attestation (and later
     /// Stage-3 prove paths). `None` under the legacy stack.
-    pub(crate) v11_engine: Option<Arc<crate::v11::EngineAdapter>>,
+    pub(crate) v1_engine: Option<Arc<crate::v1::EngineAdapter>>,
     /// Single-use `AttestBalanceChallenge` store (§7.5 / §5.1).
-    pub(crate) attest_challenges: crate::v11::AttestChallengeMap,
+    pub(crate) attest_challenges: crate::v1::AttestChallengeMap,
     /// Authoritative hostnames for `chan_bind` (§5.1). From
     /// `ZKCOINS_PUBLIC_HOST`. Empty → attest auth fails loud (no silent
     /// localhost default).
@@ -274,26 +274,26 @@ pub struct AppState {
 }
 
 /// Hook the dispatcher invokes after a verified `/sign` to drive
-/// prove → apply → **durable** engine + `v11_pending_publishes` stage.
+/// prove → apply → **durable** engine + `v1_pending_publishes` stage.
 ///
 /// The third argument is the exclusive-claim [`crate::job_store::FinaliseFence`]
 /// for this acquisition epoch. Production
-/// [`crate::v11::finalise_accepted_prove_persist_and_stage`] commits the engine
+/// [`crate::v1::finalise_accepted_prove_persist_and_stage`] commits the engine
 /// snapshot and `members_ready` only while that fence + lease still hold —
 /// the same predicate as job-row host-edge writes. A fence that stops at the
 /// job-row boundary is decoration; the engine write is the one that matters.
 ///
-/// Production wires this via the shared [`crate::v11::EngineAdapter`] (async:
+/// Production wires this via the shared [`crate::v1::EngineAdapter`] (async:
 /// multi-minute prove on a blocking pool, then atomic fenced persist). Tests
 /// inject a spy that records the call without running the multi-minute prove.
-pub type V11FinaliseHook = Arc<
+pub type V1FinaliseHook = Arc<
     dyn Fn(
             zkcoins_prover::state_engine::PendingTransition,
             zkcoins_prover::prover_bridge::TransitionSignature,
             crate::job_store::FinaliseFence,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<crate::v11::FinaliseOutcome, String>>
+                dyn std::future::Future<Output = Result<crate::v1::FinaliseOutcome, String>>
                     + Send,
             >,
         >
@@ -303,11 +303,11 @@ pub type V11FinaliseHook = Arc<
 
 /// Test-only hook the dispatcher may consult after the prove leg under a
 /// v1.1 claim. Production uses only
-/// [`AppState::v11_live_pending_after_begin`]. Behind `cfg(test)` so it is
+/// [`AppState::v1_live_pending_after_begin`]. Behind `cfg(test)` so it is
 /// not compiled into the production binary (Defect 4).
 #[cfg(test)]
-pub type V11PendingAfterProveHook =
-    Arc<dyn Fn(uuid::Uuid) -> Option<crate::v11::PendingSignEntry> + Send + Sync>;
+pub type V1PendingAfterProveHook =
+    Arc<dyn Fn(uuid::Uuid) -> Option<crate::v1::PendingSignEntry> + Send + Sync>;
 
 // Response types for our API
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -1088,12 +1088,12 @@ pub(crate) fn map_send_coins_error(err: &str) -> (StatusCode, &'static str) {
             "Too many out-coins for one transition",
         ),
         // Gap G9: residual legacy send under a v1.1 process claim. The
-        // body is the full `LEGACY_SEND_REFUSED_UNDER_V11` string; match
+        // body is the full `LEGACY_SEND_REFUSED_UNDER_V1` string; match
         // by prefix so a wording tweak of the tail does not silently
         // become a 500.
-        s if s.starts_with("legacy send refused under ZKCOINS_V11_SHADOW=1") => (
+        s if s.starts_with("legacy send refused under ZKCOINS_V1_SHADOW=1") => (
             StatusCode::UNPROCESSABLE_ENTITY,
-            "legacy send refused under v1.1; use begin_v11_send (CoinHist provenance)",
+            "legacy send refused under v1.1; use begin_v1_send (CoinHist provenance)",
         ),
         s if s.ends_with("failed") => (StatusCode::INTERNAL_SERVER_ERROR, "prove failed"),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
@@ -2236,7 +2236,7 @@ pub(crate) async fn jobs_commit_handler(
     // CommitRequest is the wrong signing protocol. Refuse before
     // persisting or waking the dispatcher so a v1.1 boot cannot
     // finalise via the legacy commit route.
-    if let Err(e) = crate::v11::refuse_legacy_commitment_under_v11() {
+    if let Err(e) = crate::v1::refuse_legacy_commitment_under_v1() {
         return (
             StatusCode::CONFLICT,
             Json(JobErrorResponse {
@@ -2350,7 +2350,7 @@ pub(crate) async fn jobs_commit_handler(
 
 /// §7.5 outward error body: `{ "error": <machine_code>, "message": <human> }`.
 /// No invented fields (`check`, free-form strings outside the enumeration).
-fn v11_error_body(code: &str, message: impl Into<String>) -> serde_json::Value {
+fn v1_error_body(code: &str, message: impl Into<String>) -> serde_json::Value {
     serde_json::json!({
         "error": code,
         "message": message.into(),
@@ -2374,7 +2374,7 @@ where
             Ok(Path(id)) => Ok(V1JobId(id)),
             Err(PathRejection::FailedToDeserializePathParams(err)) => Err((
                 StatusCode::BAD_REQUEST,
-                Json(v11_error_body(
+                Json(v1_error_body(
                     "malformed_request",
                     format!("job_id is not a valid UUID: {err}"),
                 )),
@@ -2382,7 +2382,7 @@ where
                 .into_response()),
             Err(err) => Err((
                 StatusCode::BAD_REQUEST,
-                Json(v11_error_body(
+                Json(v1_error_body(
                     "malformed_request",
                     format!("malformed job_id path parameter: {err}"),
                 )),
@@ -2425,7 +2425,7 @@ where
                 };
                 Err((
                     StatusCode::BAD_REQUEST,
-                    Json(v11_error_body("malformed_request", message)),
+                    Json(v1_error_body("malformed_request", message)),
                 )
                     .into_response())
             }
@@ -2435,14 +2435,14 @@ where
 
 /// `POST /v1/jobs/:id/sign` — §7.5 wallet transition signature (normative path).
 ///
-/// Active only under a v1.1 process claim (`ScanStackMode::V11`). The body is
-/// decoded as [`crate::v11::WalletSignSubmissionWire`] then strictly converted
-/// to [`crate::v11::WalletSignSubmission`] so encoding failures surface as the
+/// Active only under a v1.1 process claim (`ScanStackMode::V1`). The body is
+/// decoded as [`crate::v1::WalletSignSubmissionWire`] then strictly converted
+/// to [`crate::v1::WalletSignSubmission`] so encoding failures surface as the
 /// closed §7.5 code `malformed_request` (HTTP 400), not a generic JSON error
 /// and never an invented `encoding` code.
 ///
-/// Verification uses [`crate::v11::accept_wallet_transition_signature`] against
-/// the staged [`crate::v11::PendingSignEntry`] for this job — provenance is the
+/// Verification uses [`crate::v1::accept_wallet_transition_signature`] against
+/// the staged [`crate::v1::PendingSignEntry`] for this job — provenance is the
 /// pending transition alone. On accept the verified signature is persisted and
 /// the dispatcher is woken to drive `StateEngine::finalise` (not a bare
 /// status flip).
@@ -2471,35 +2471,35 @@ where
 pub(crate) async fn jobs_sign_handler(
     State(state): State<AppState>,
     V1JobId(id): V1JobId,
-    V1Json(wire): V1Json<crate::v11::WalletSignSubmissionWire>,
+    V1Json(wire): V1Json<crate::v1::WalletSignSubmissionWire>,
 ) -> axum::response::Response {
     // Flag gate: refuse the v1.1 path when the process is not on the v1.1 claim.
     // Legacy `/commit` remains the only active authorisation surface.
     // §7.5: this is a disabled surface (`feature_disabled`), not a job
     // phase mismatch (`wrong_phase`).
-    if !crate::v11::v11_sign_route_active() {
-        let err = crate::v11::TransitionSignatureError {
-            check: crate::v11::SignatureCheck::ShadowFlag,
-            message: "POST /v1/jobs/{id}/sign requires ZKCOINS_V11_SHADOW=1 / \
-                      ScanStackMode::V11; legacy ash‖ocr uses POST /api/jobs/{id}/commit"
+    if !crate::v1::v1_sign_route_active() {
+        let err = crate::v1::TransitionSignatureError {
+            check: crate::v1::SignatureCheck::ShadowFlag,
+            message: "POST /v1/jobs/{id}/sign requires ZKCOINS_V1_SHADOW=1 / \
+                      ScanStackMode::V1; legacy ash‖ocr uses POST /api/jobs/{id}/commit"
                 .to_string(),
         };
-        let (status, code) = crate::v11::sign_rejection(&err);
+        let (status, code) = crate::v1::sign_rejection(&err);
         return (
             StatusCode::from_u16(status).unwrap_or(StatusCode::NOT_FOUND),
-            Json(v11_error_body(code, err.message)),
+            Json(v1_error_body(code, err.message)),
         )
             .into_response();
     }
 
     // Boundary: documented encoding is what we enforce. §7.5 closed code.
-    let submission = match crate::v11::WalletSignSubmission::try_from(&wire) {
+    let submission = match crate::v1::WalletSignSubmission::try_from(&wire) {
         Ok(s) => s,
         Err(err) => {
-            let (status, code) = crate::v11::sign_rejection(&err);
+            let (status, code) = crate::v1::sign_rejection(&err);
             return (
                 StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
-                Json(v11_error_body(code, err.message)),
+                Json(v1_error_body(code, err.message)),
             )
                 .into_response();
         }
@@ -2510,7 +2510,7 @@ pub(crate) async fn jobs_sign_handler(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(v11_error_body("job_not_found", "Job not found")),
+                Json(v1_error_body("job_not_found", "Job not found")),
             )
                 .into_response();
         }
@@ -2518,7 +2518,7 @@ pub(crate) async fn jobs_sign_handler(
             tracing::error!("JobStore::load failed: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v11_error_body("internal_error", "Failed to load job")),
+                Json(v1_error_body("internal_error", "Failed to load job")),
             )
                 .into_response();
         }
@@ -2530,7 +2530,7 @@ pub(crate) async fn jobs_sign_handler(
     if job.status != JobStatus::AwaitingSignature {
         return (
             StatusCode::CONFLICT,
-            Json(v11_error_body(
+            Json(v1_error_body(
                 "wrong_phase",
                 format!(
                     "Job is in status `{}`, not `awaiting_signature`",
@@ -2545,7 +2545,7 @@ pub(crate) async fn jobs_sign_handler(
     // persisted envelope under request_body.pending_sign.
     let entry = match state.pending_sign_map.get(&id).map(|e| e.clone()) {
         Some(e) => e,
-        None => match crate::v11::rehydrate_pending_sign(&job.request_body) {
+        None => match crate::v1::rehydrate_pending_sign(&job.request_body) {
             Ok(Some(e)) => {
                 state.pending_sign_map.insert(id, e.clone());
                 e
@@ -2553,7 +2553,7 @@ pub(crate) async fn jobs_sign_handler(
             Ok(None) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(v11_error_body(
+                    Json(v1_error_body(
                         "internal_error",
                         "no PendingTransition staged for this job \
                          (awaiting_signature under v1.1 requires a staged entry)",
@@ -2564,25 +2564,25 @@ pub(crate) async fn jobs_sign_handler(
             Err(err) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(v11_error_body("internal_error", err.message)),
+                    Json(v1_error_body("internal_error", err.message)),
                 )
                     .into_response();
             }
         },
     };
 
-    let accepted = match crate::v11::accept_wallet_transition_signature(
-        crate::v11::V11ShadowMode::On,
+    let accepted = match crate::v1::accept_wallet_transition_signature(
+        crate::v1::V1ShadowMode::On,
         entry.network,
         &entry.pending,
         &submission,
     ) {
         Ok(sig) => sig,
         Err(err) => {
-            let (status, code) = crate::v11::sign_rejection(&err);
+            let (status, code) = crate::v1::sign_rejection(&err);
             return (
                 StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT),
-                Json(v11_error_body(code, err.message)),
+                Json(v1_error_body(code, err.message)),
             )
                 .into_response();
         }
@@ -2601,7 +2601,7 @@ pub(crate) async fn jobs_sign_handler(
     let Some(notifier) = state.job_notify_map.get(&id).map(|e| e.value().clone()) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(v11_error_body(
+            Json(v1_error_body(
                 "internal_error",
                 "signature verified but no dispatcher is waiting to finalise this job; \
                  refusing acceptance so the wallet does not treat the work as done",
@@ -2615,19 +2615,19 @@ pub(crate) async fn jobs_sign_handler(
     if let Err(err) = entry.install_signature(accepted.clone()) {
         return (
             StatusCode::CONFLICT,
-            Json(v11_error_body("invalid_signature", err.message)),
+            Json(v1_error_body("invalid_signature", err.message)),
         )
             .into_response();
     }
     state.pending_sign_map.insert(id, entry.clone());
 
-    let finalisation_value = match crate::v11::DurableFinalisationPersist::from_entry(&entry) {
+    let finalisation_value = match crate::v1::DurableFinalisationPersist::from_entry(&entry) {
         Ok(p) => match serde_json::to_value(p) {
             Ok(v) => v,
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(v11_error_body(
+                    Json(v1_error_body(
                         "internal_error",
                         format!("encode durable finalisation: {e}"),
                     )),
@@ -2638,7 +2638,7 @@ pub(crate) async fn jobs_sign_handler(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v11_error_body(
+                Json(v1_error_body(
                     "internal_error",
                     format!("encode durable finalisation: {e}"),
                 )),
@@ -2652,11 +2652,11 @@ pub(crate) async fn jobs_sign_handler(
         .as_object_mut()
         .expect("jobs.request_body is always a JSON object (admit handlers enforce)");
     obj.insert(
-        crate::v11::FINALISATION_BODY_KEY.to_string(),
+        crate::v1::FINALISATION_BODY_KEY.to_string(),
         finalisation_value,
     );
     // Drop legacy split keys if present.
-    obj.remove(crate::v11::PENDING_SIGN_BODY_KEY);
+    obj.remove(crate::v1::PENDING_SIGN_BODY_KEY);
     obj.remove("sign");
 
     match state
@@ -2669,7 +2669,7 @@ pub(crate) async fn jobs_sign_handler(
             // Status moved (cancel / timeout / concurrent finalise).
             return (
                 StatusCode::CONFLICT,
-                Json(v11_error_body(
+                Json(v1_error_body(
                     "wrong_phase",
                     "signature verified but job is no longer awaiting_signature; \
                      status-qualified persist refused",
@@ -2681,7 +2681,7 @@ pub(crate) async fn jobs_sign_handler(
             tracing::error!("Failed to persist durable finalisation signature: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v11_error_body(
+                Json(v1_error_body(
                     "internal_error",
                     "Failed to persist durable finalisation signature",
                 )),
@@ -2696,7 +2696,7 @@ pub(crate) async fn jobs_sign_handler(
     if !notifier.try_signal_accept() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(v11_error_body(
+            Json(v1_error_body(
                 "internal_error",
                 "signature verified and persisted but the dispatcher is no longer waiting \
                  to finalise this job (timed out or already signaled); refusing acceptance \
@@ -2719,7 +2719,7 @@ pub(crate) async fn jobs_sign_handler(
 }
 
 /// Map legacy job-store status to the §7.5 closed status set.
-fn v11_status_wire(status: JobStatus) -> &'static str {
+fn v1_status_wire(status: JobStatus) -> &'static str {
     match status {
         JobStatus::Queued => "accepted",
         JobStatus::Proving => "proving",
@@ -2732,7 +2732,7 @@ fn v11_status_wire(status: JobStatus) -> &'static str {
 }
 
 /// `progress` as a float in `[0, 1]` (§7.5). The store keeps 0–100.
-fn v11_progress_wire(progress: i16) -> f64 {
+fn v1_progress_wire(progress: i16) -> f64 {
     (progress as f64 / 100.0).clamp(0.0, 1.0)
 }
 
@@ -2740,12 +2740,12 @@ fn v11_progress_wire(progress: i16) -> f64 {
 // §7.5 Gap G6 — balance attestation
 // ---------------------------------------------------------------------------
 
-/// Map an [`crate::v11::AttestError`] to the §7.5 error body + HTTP status.
-fn attest_error_response(err: crate::v11::AttestError) -> axum::response::Response {
+/// Map an [`crate::v1::AttestError`] to the §7.5 error body + HTTP status.
+fn attest_error_response(err: crate::v1::AttestError) -> axum::response::Response {
     let (status, code) = err.http_status_and_code();
     (
         StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        Json(v11_error_body(code, err.message())),
+        Json(v1_error_body(code, err.message())),
     )
         .into_response()
 }
@@ -2768,9 +2768,9 @@ where
         _parts: &mut Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        if !crate::v11::v11_attest_route_active() {
+        if !crate::v1::v1_attest_route_active() {
             return Err(attest_error_response(
-                crate::v11::AttestError::FeatureDisabled,
+                crate::v1::AttestError::FeatureDisabled,
             ));
         }
         Ok(RequireAttestRoute)
@@ -2789,19 +2789,19 @@ where
 pub(crate) async fn attest_balance_challenge_handler(
     State(state): State<AppState>,
     _active: RequireAttestRoute,
-    V1Json(body): V1Json<crate::v11::AttestChallengeRequest>,
+    V1Json(body): V1Json<crate::v1::AttestChallengeRequest>,
 ) -> axum::response::Response {
-    match crate::v11::issue_attest_challenge(
+    match crate::v1::issue_attest_challenge(
         &state.attest_challenges,
         &body.subject,
-        crate::v11::unix_now(),
+        crate::v1::unix_now(),
     ) {
         Ok((nonce, expiry)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "nonce": hex::encode(nonce),
-                "expiry": crate::v11::U64Decimal::format(expiry),
-                "domain": crate::v11::ATTEST_BALANCE_CHALLENGE_DOMAIN,
+                "expiry": crate::v1::U64Decimal::format(expiry),
+                "domain": crate::v1::ATTEST_BALANCE_CHALLENGE_DOMAIN,
             })),
         )
             .into_response(),
@@ -2819,29 +2819,29 @@ pub(crate) async fn attest_balance_challenge_handler(
 pub(crate) async fn attest_balance_handler(
     State(state): State<AppState>,
     _active: RequireAttestRoute,
-    V1Json(body): V1Json<crate::v11::AttestBalanceRequest>,
+    V1Json(body): V1Json<crate::v1::AttestBalanceRequest>,
 ) -> axum::response::Response {
-    let authorised = match crate::v11::authorise_attest_balance(
+    let authorised = match crate::v1::authorise_attest_balance(
         &state.attest_challenges,
         state.public_hosts.as_slice(),
         &body,
-        crate::v11::unix_now(),
+        crate::v1::unix_now(),
     ) {
         Ok(b) => b,
         Err(e) => return attest_error_response(e),
     };
 
     // Engine must be present under a v1.1 claim (wired at boot).
-    if state.v11_engine.is_none() {
-        return attest_error_response(crate::v11::AttestError::Internal(
-            "v11 EngineAdapter not available for attestation".into(),
+    if state.v1_engine.is_none() {
+        return attest_error_response(crate::v1::AttestError::Internal(
+            "v1 EngineAdapter not available for attestation".into(),
         ));
     }
 
     let request_value = match serde_json::to_value(&authorised) {
         Ok(v) => v,
         Err(e) => {
-            return attest_error_response(crate::v11::AttestError::Internal(format!(
+            return attest_error_response(crate::v1::AttestError::Internal(format!(
                 "encode AttestJobBody: {e}"
             )));
         }
@@ -2860,7 +2860,7 @@ pub(crate) async fn attest_balance_handler(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("JobStore::create (attest_balance) failed: {}", e);
-            return attest_error_response(crate::v11::AttestError::Internal(
+            return attest_error_response(crate::v1::AttestError::Internal(
                 "Failed to admit attestation job".into(),
             ));
         }
@@ -2883,13 +2883,13 @@ pub(crate) async fn attest_balance_handler(
             .job_store
             .fail(
                 job.public_id,
-                &crate::v11::encode_job_error(
+                &crate::v1::encode_job_error(
                     "internal_error",
                     format!("enqueue failed: {e}"),
                 ),
             )
             .await;
-        return attest_error_response(crate::v11::AttestError::Internal(
+        return attest_error_response(crate::v1::AttestError::Internal(
             "Failed to enqueue attestation job".into(),
         ));
     }
@@ -2935,7 +2935,7 @@ pub(crate) async fn get_job_v1_handler(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(v11_error_body("job_not_found", "Job not found")),
+                Json(v1_error_body("job_not_found", "Job not found")),
             )
                 .into_response();
         }
@@ -2943,18 +2943,18 @@ pub(crate) async fn get_job_v1_handler(
             tracing::error!("JobStore::load failed: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v11_error_body("internal_error", "Failed to load job")),
+                Json(v1_error_body("internal_error", "Failed to load job")),
             )
                 .into_response();
         }
     };
 
-    let status_wire = v11_status_wire(job.status);
+    let status_wire = v1_status_wire(job.status);
     let mut body = serde_json::json!({
         "job_id": job.public_id,
         "kind": job.kind.as_str(),
         "status": status_wire,
-        "progress": v11_progress_wire(job.progress),
+        "progress": v1_progress_wire(job.progress),
     });
     let obj = body.as_object_mut().expect("object");
 
@@ -2987,7 +2987,7 @@ pub(crate) async fn get_job_v1_handler(
             // the closed enumeration (never invent, never omit).
             obj.insert(
                 "error".to_string(),
-                crate::v11::decode_job_error(job.error.as_deref(), job.status),
+                crate::v1::decode_job_error(job.error.as_deref(), job.status),
             );
         }
         _ => {}
@@ -3106,19 +3106,19 @@ pub(crate) async fn jobs_cancel_v1_handler(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(v11_error_body("job_not_found", "Job not found")),
+                Json(v1_error_body("job_not_found", "Job not found")),
             )
                 .into_response();
         }
         Ok(Some(job)) if !job_is_cancellable(job.status) => {
             return (
                 StatusCode::CONFLICT,
-                Json(v11_error_body(
+                Json(v1_error_body(
                     "wrong_phase",
                     format!(
                         "Job is in status `{}` and is no longer cancellable \
                          (nullifier already published or terminal)",
-                        v11_status_wire(job.status)
+                        v1_status_wire(job.status)
                     ),
                 )),
             )
@@ -3129,7 +3129,7 @@ pub(crate) async fn jobs_cancel_v1_handler(
             tracing::error!("JobStore::load failed in v1 cancel: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v11_error_body("internal_error", "Failed to load job")),
+                Json(v1_error_body("internal_error", "Failed to load job")),
             )
                 .into_response();
         }
@@ -3142,8 +3142,8 @@ pub(crate) async fn jobs_cancel_v1_handler(
             // Envelope strip is atomic with the status flip in
             // `cancel_not_yet_published`. Drop in-memory staging only.
             state.pending_sign_map.remove(&id);
-            state.v11_live_pending_after_begin.remove(&id);
-            let err_body = crate::v11::encode_job_error("internal_error", "cancelled");
+            state.v1_live_pending_after_begin.remove(&id);
+            let err_body = crate::v1::encode_job_error("internal_error", "cancelled");
             crate::job_dispatcher::publish_phase(
                 &state.job_notify_map,
                 id,
@@ -3171,7 +3171,7 @@ pub(crate) async fn jobs_cancel_v1_handler(
             // Lost the race with the dispatcher between load and cancel
             // (e.g. nullifier published into broadcasting).
             StatusCode::CONFLICT,
-            Json(v11_error_body(
+            Json(v1_error_body(
                 "wrong_phase",
                 "Job is no longer in a cancellable state",
             )),
@@ -3181,7 +3181,7 @@ pub(crate) async fn jobs_cancel_v1_handler(
             tracing::error!("JobStore::cancel_not_yet_published failed: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v11_error_body("internal_error", "Failed to cancel job")),
+                Json(v1_error_body("internal_error", "Failed to cancel job")),
             )
                 .into_response()
         }
@@ -3205,7 +3205,7 @@ pub(crate) async fn stream_job_v1_handler(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(v11_error_body("job_not_found", "Job not found")),
+                Json(v1_error_body("job_not_found", "Job not found")),
             )
                 .into_response();
         }
@@ -3213,7 +3213,7 @@ pub(crate) async fn stream_job_v1_handler(
             tracing::error!("JobStore::load failed in v1 stream handler: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v11_error_body("internal_error", "Failed to load job")),
+                Json(v1_error_body("internal_error", "Failed to load job")),
             )
                 .into_response();
         }
@@ -3262,7 +3262,7 @@ fn build_phase_stream_v1(
 
 /// §7.5 initial SSE frame from a job row.
 pub(crate) fn initial_event_from_job_v1(job: &Job) -> Event {
-    let status_wire = v11_status_wire(job.status);
+    let status_wire = v1_status_wire(job.status);
     let (event_name, payload) = match job.status {
         JobStatus::Completed => (
             "complete",
@@ -3278,13 +3278,13 @@ pub(crate) fn initial_event_from_job_v1(job: &Job) -> Event {
             serde_json::json!({
                 "job_id": job.public_id,
                 "status": status_wire,
-                "error": crate::v11::decode_job_error(job.error.as_deref(), job.status),
+                "error": crate::v1::decode_job_error(job.error.as_deref(), job.status),
             }),
         ),
         JobStatus::AwaitingSignature => {
             let mut data = serde_json::json!({
                 "status": status_wire,
-                "progress": v11_progress_wire(job.progress),
+                "progress": v1_progress_wire(job.progress),
             });
             if let Some(surface) = job.response_body.clone() {
                 data.as_object_mut()
@@ -3304,7 +3304,7 @@ pub(crate) fn initial_event_from_job_v1(job: &Job) -> Event {
         _ => {
             let mut data = serde_json::json!({
                 "status": status_wire,
-                "progress": v11_progress_wire(job.progress),
+                "progress": v1_progress_wire(job.progress),
             });
             if !job.phase.is_empty() {
                 data.as_object_mut()
@@ -3325,7 +3325,7 @@ pub(crate) fn initial_event_from_job_v1(job: &Job) -> Event {
 
 /// §7.5 SSE frame from a dispatcher phase event.
 pub(crate) fn event_from_phase_v1(event: &JobPhaseEvent, job_id: Uuid, kind: &str) -> Event {
-    let status_wire = v11_status_wire(event.status);
+    let status_wire = v1_status_wire(event.status);
     let (event_name, payload) = match event.status {
         JobStatus::Completed => (
             "complete",
@@ -3338,8 +3338,8 @@ pub(crate) fn event_from_phase_v1(event: &JobPhaseEvent, job_id: Uuid, kind: &st
         ),
         JobStatus::Failed | JobStatus::Cancelled => {
             let error = match event.error.as_deref() {
-                Some(raw) => crate::v11::decode_job_error(Some(raw), event.status),
-                None => crate::v11::decode_job_error(None, event.status),
+                Some(raw) => crate::v1::decode_job_error(Some(raw), event.status),
+                None => crate::v1::decode_job_error(None, event.status),
             };
             (
                 "error",
@@ -3795,7 +3795,7 @@ async fn r2_probe_history_handler(
 /// JSON body returned by `GET /health/ready`. `failures` is empty on a
 /// fully ready node; each failing dependency contributes one stable
 /// short tag (`"db"`, `"esplora"`, `"prover"`, and under the v1.1 stack
-/// `"v11_scan"` / `"deep_reorg"`) so a Kuma monitor parses the cause
+/// `"v1_scan"` / `"deep_reorg"`) so a Kuma monitor parses the cause
 /// without having to scrape the status code in isolation.
 ///
 /// `prover` is the background-warmup tag (see `AppState::prover_warm`):
@@ -3898,12 +3898,12 @@ pub(crate) async fn ready_handler(State(state): State<AppState>) -> impl IntoRes
     // v1.1 stack readiness: when the process claimed NfLog, do not report
     // ready until the scanner has caught up at least once, and fail hard
     // if finality was broken by a deep reorg (§3.9 contract).
-    if let Some(caught_up) = &state.v11_scan_caught_up {
+    if let Some(caught_up) = &state.v1_scan_caught_up {
         if !caught_up.load(Ordering::SeqCst) {
-            failures.push("v11_scan");
+            failures.push("v1_scan");
         }
     }
-    if let Some(finality_ok) = &state.v11_finality_ok {
+    if let Some(finality_ok) = &state.v1_finality_ok {
         if !finality_ok.load(Ordering::SeqCst) {
             failures.push("deep_reorg");
         }
@@ -4251,7 +4251,7 @@ pub(crate) async fn root_handler() -> axum::response::Response {
     // (`service`/`version` first → alphabetical `docs`/`endpoints` first).
     // Attest keys live only on `RootEndpointsWithAttest` so the OpenAPI
     // `RootEndpoints` component schema stays pre-G6.
-    if crate::v11::v11_attest_route_active() {
+    if crate::v1::v1_attest_route_active() {
         Json(RootResponseWithAttest {
             service: "zkcoins-node",
             version: env!("CARGO_PKG_VERSION"),

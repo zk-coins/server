@@ -16,7 +16,7 @@
 //! Measures: `Prover::new`, `prove_initial`, `prove_account_update`.
 //! Schema columns: `max_in_coins` / `max_out_coins` / `inner_pad_bits`.
 //!
-//! ## v1.1 (`--prover v11` or `ZKCOINS_V11_SHADOW=1`)
+//! ## v1.1 (`--prover v1` or `ZKCOINS_V1_SHADOW=1`)
 //!
 //! Real [`ProverBridge`] construction (eager circuit build via
 //! `compliance_gate_count`) and real `prove_transition` calls against
@@ -42,8 +42,8 @@
 //!
 //! # v1.1 path (ProverBridge):
 //! RUST_LOG=warn ./target/release/probe_r2 \
-//!     --prover v11 --warm-calls 5 \
-//!     --output /tmp/r2-probe-v11-$(date +%s).json
+//!     --prover v1 --warm-calls 5 \
+//!     --output /tmp/r2-probe-v1-$(date +%s).json
 //! ```
 //!
 //! ## Persistence (`--persist`)
@@ -138,7 +138,7 @@ struct CliArgs {
     warm_budget_ms: Option<i64>,
     cold_budget_ms: Option<i64>,
     mem_budget_kb: Option<i64>,
-    /// `None` → resolve from `ZKCOINS_V11_SHADOW` (default legacy).
+    /// `None` → resolve from `ZKCOINS_V1_SHADOW` (default legacy).
     prover: Option<String>,
     /// Network for the v1.1 bridge (default testnet).
     network: Network,
@@ -148,7 +148,7 @@ fn print_usage(program: &str) {
     eprintln!(
         "usage: {program} [--warm-calls N] [--output <path>] [--persist] \
                 [--notes <text>] [--tags a,b,c] \
-                [--prover legacy|v11] [--network mainnet|testnet|regtest] \
+                [--prover legacy|v1] [--network mainnet|testnet|regtest] \
                 [--warm-budget-ms <ms>] [--cold-budget-ms <ms>] [--mem-budget-kb <kb>]
 
   --warm-calls N      number of warm prove calls (default 5)
@@ -156,9 +156,9 @@ fn print_usage(program: &str) {
   --persist           persist results into Postgres (requires DATABASE_URL)
   --notes TEXT        free-form note attached to the persisted run
   --tags A,B,C        comma-separated tags attached to the persisted run
-  --prover MODE       legacy (default) or v11 (ProverBridge). When omitted,
-                      ZKCOINS_V11_SHADOW=1 selects v11; unset/empty/off → legacy.
-  --network NAME      v11 only: mainnet|testnet|regtest (default testnet)
+  --prover MODE       legacy (default) or v1 (ProverBridge). When omitted,
+                      ZKCOINS_V1_SHADOW=1 selects v1; unset/empty/off → legacy.
+  --network NAME      v1 only: mainnet|testnet|regtest (default testnet)
   --warm-budget-ms N  override warm prove budget for this run only
   --cold-budget-ms N  override cold-start budget for this run only
   --mem-budget-kb N   override peak-RSS budget for this run only
@@ -169,7 +169,7 @@ v1.1 numbers. Missing v1.1 calibration refuses rather than falling back.
 
 env:
   DATABASE_URL         required when --persist is set
-  ZKCOINS_V11_SHADOW   selects v11 when --prover is omitted (1 = v11)
+  ZKCOINS_V1_SHADOW   selects v1 when --prover is omitted (1 = v1)
   GIT_SHA              optional override for the recorded git sha
   RUSTC_VERSION        optional override for the recorded rustc version
   RUST_LOG             optional, log level (defaults to off here)
@@ -362,7 +362,7 @@ fn build_commitment_witness(
 
 // ===== Witness construction (v1.1) =====
 
-struct V11GenesisFixture {
+struct V1GenesisFixture {
     witness: TransitionWitness,
     output_coin: Coin,
     asset_id: HashDigest,
@@ -373,7 +373,7 @@ struct V11GenesisFixture {
 /// Host-valid Initial (mint) witness for the probe. Mirrors the
 /// `prover_bridge` / `state_engine` genesis fixtures so the timed path
 /// is a real `prove_transition`, not a hollow shell.
-fn v11_genesis_fixture(network: Network) -> V11GenesisFixture {
+fn v1_genesis_fixture(network: Network) -> V1GenesisFixture {
     let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/compliance-chain/nk").into();
     let nk_commit = host::nk_commit(&nk);
     let (secret, public, current_pubkey) = normalized_key(deterministic_secret(
@@ -448,7 +448,7 @@ fn v11_genesis_fixture(network: Network) -> V11GenesisFixture {
         npk_commit: host::npk_commit(&next_pubkey, &npk_rand),
     };
     let signature = sign_transition(secret, public, &proof_data, network);
-    V11GenesisFixture {
+    V1GenesisFixture {
         witness: TransitionWitness {
             mode: TransitionMode::InitialProof,
             prev_account_state,
@@ -479,8 +479,8 @@ fn v11_genesis_fixture(network: Network) -> V11GenesisFixture {
     }
 }
 
-fn v11_send_witness(
-    genesis: &V11GenesisFixture,
+fn v1_send_witness(
+    genesis: &V1GenesisFixture,
     genesis_proof: &ProvedTransition,
     network: Network,
 ) -> TransitionWitness {
@@ -706,7 +706,7 @@ struct MeasureResult {
     verify_wall_ms: i64,
     prove_warm_wall_ms: Vec<i64>,
     peak_rss_kb: i64,
-    /// Legacy: max_in / max_out / pad. v11: also tx shape + gate count.
+    /// Legacy: max_in / max_out / pad. v1: also tx shape + gate count.
     max_in_coins: i32,
     max_out_coins: i32,
     inner_pad_bits: i32,
@@ -799,9 +799,9 @@ fn measure_legacy(warm_calls: usize) -> Result<MeasureResult, String> {
     })
 }
 
-fn measure_v11(warm_calls: usize, network: Network) -> Result<MeasureResult, String> {
+fn measure_v1(warm_calls: usize, network: Network) -> Result<MeasureResult, String> {
     eprintln!(
-        "[probe_r2] mode=v11 — ProverBridge + prove_transition (network={network:?})"
+        "[probe_r2] mode=v1 — ProverBridge + prove_transition (network={network:?})"
     );
     eprintln!(
         "[probe_r2] shape MAX_TX_INPUTS={MAX_TX_INPUTS} MAX_TX_OUTPUTS={MAX_TX_OUTPUTS} \
@@ -820,7 +820,7 @@ fn measure_v11(warm_calls: usize, network: Network) -> Result<MeasureResult, Str
         "[probe_r2] circuit_build_wall_ms = {circuit_build_wall_ms} (gates={gate_count})"
     );
 
-    let genesis = v11_genesis_fixture(network);
+    let genesis = v1_genesis_fixture(network);
 
     eprintln!("[probe_r2] proving transition Initial (cold) ...");
     let t = Instant::now();
@@ -837,7 +837,7 @@ fn measure_v11(warm_calls: usize, network: Network) -> Result<MeasureResult, Str
     let verify_wall_ms = t.elapsed().as_millis() as i64;
 
     // Build the AccountUpdate witness ONCE and reuse across warm calls.
-    let send = v11_send_witness(&genesis, &proved_genesis, network);
+    let send = v1_send_witness(&genesis, &proved_genesis, network);
 
     let mut prove_warm_wall_ms: Vec<i64> = Vec::with_capacity(warm_calls);
     for i in 0..warm_calls {
@@ -869,7 +869,7 @@ fn measure_v11(warm_calls: usize, network: Network) -> Result<MeasureResult, Str
         max_in_coins: MAX_TX_INPUTS as i32,
         max_out_coins: MAX_TX_OUTPUTS as i32,
         // No pad-bits concept on C; 0 is an explicit "not applicable"
-        // marker, distinguished from legacy 15 by prover_mode='v11'.
+        // marker, distinguished from legacy 15 by prover_mode='v1'.
         inner_pad_bits: 0,
         max_tx_inputs: Some(MAX_TX_INPUTS as i32),
         max_tx_outputs: Some(MAX_TX_OUTPUTS as i32),
@@ -885,7 +885,7 @@ fn measure_v11(warm_calls: usize, network: Network) -> Result<MeasureResult, Str
 ///   operator can collect samples before any v1.1 budget is sealed,
 ///   without the probe refusing on missing calibration.
 /// * Otherwise every unset metric comes from [`budgets_for_mode`],
-///   which refuses for v11 when calibration is missing — never a
+///   which refuses for v1 when calibration is missing — never a
 ///   silent fall-back to the legacy ROADMAP numbers for a partial
 ///   override (that would be the inverted false-red).
 fn resolve_run_budgets(mode: ProverMode, args: &CliArgs) -> Result<R2BudgetSet, String> {
@@ -922,12 +922,12 @@ fn resolve_run_budgets(mode: ProverMode, args: &CliArgs) -> Result<R2BudgetSet, 
 fn run() -> Result<(), String> {
     let args = parse_args(std::env::args().collect())?;
 
-    let shadow_raw = match std::env::var("ZKCOINS_V11_SHADOW") {
+    let shadow_raw = match std::env::var("ZKCOINS_V1_SHADOW") {
         Ok(v) => Some(v),
         Err(std::env::VarError::NotPresent) => None,
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err(
-                "ZKCOINS_V11_SHADOW is not valid UTF-8; refusing to select a prover mode".into(),
+                "ZKCOINS_V1_SHADOW is not valid UTF-8; refusing to select a prover mode".into(),
             )
         }
     };
@@ -950,7 +950,7 @@ fn run() -> Result<(), String> {
 
     let measured = match mode {
         ProverMode::Legacy => measure_legacy(args.warm_calls)?,
-        ProverMode::V11 => measure_v11(args.warm_calls, args.network)?,
+        ProverMode::V1 => measure_v1(args.warm_calls, args.network)?,
     };
 
     // ===== Report =====

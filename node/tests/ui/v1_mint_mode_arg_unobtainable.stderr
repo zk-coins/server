@@ -1,0 +1,16 @@
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+  --> tests/ui/v1_mint_mode_arg_unobtainable.rs:14:17
+   |
+14 |         let _ = node::v1::begin_v1_mint(engine, node::v1::V1ShadowMode::On, req);
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^         ---------------------------- unexpected argument #2 of type `V1ShadowMode`
+   |
+note: function defined here
+  --> src/v1/mint.rs
+   |
+   | pub fn begin_v1_mint(engine: &StateEngine, req: MintRequest) -> Result<PendingTransition> {
+   |        ^^^^^^^^^^^^^^
+help: remove the extra argument
+   |
+14 -         let _ = node::v1::begin_v1_mint(engine, node::v1::V1ShadowMode::On, req);
+14 +         let _ = node::v1::begin_v1_mint(engine, req);
+   |

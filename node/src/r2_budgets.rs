@@ -13,7 +13,7 @@
 //! ## Flag decides which set applies
 //!
 //! [`budgets_for_mode`] returns the legacy constants when the mode is
-//! [`ProverMode::Legacy`] (default; flag off). Under [`ProverMode::V11`]
+//! [`ProverMode::Legacy`] (default; flag off). Under [`ProverMode::V1`]
 //! it returns budgets **derived from stored measurement samples**. There
 //! is no silent fall-back from v1.1 to legacy numbers: a missing or
 //! under-sampled calibration refuses loudly via [`BudgetUnavailable`].
@@ -23,7 +23,7 @@
 //! A single sample is not a budget. [`derive_budget_from_samples`]
 //! requires at least [`MIN_SAMPLES_FOR_BUDGET`] non-negative samples and
 //! returns `max(samples)` inflated by a documented headroom percent.
-//! Operators can re-run `probe_r2 --prover v11` and re-seal the sample
+//! Operators can re-run `probe_r2 --prover v1` and re-seal the sample
 //! arrays below when hardware or the circuit changes.
 
 use std::fmt;
@@ -37,7 +37,7 @@ pub const MIN_SAMPLES_FOR_BUDGET: usize = 2;
 /// Headroom applied on top of `max(samples)` when sealing a budget.
 /// 25 % absorbs ordinary host noise without letting a single cold
 /// outlier dominate; the raw samples stay visible in
-/// [`V11_CALIBRATION`] so operators can re-derive.
+/// [`V1_CALIBRATION`] so operators can re-derive.
 pub const BUDGET_HEADROOM_PERCENT: u32 = 25;
 
 /// ROADMAP step 9 warm-prove budget (legacy Poseidon circuit), ms.
@@ -49,22 +49,22 @@ pub const LEGACY_BUDGET_PEAK_RSS_KB: i64 = 64 * 1024 * 1024; // 64 GiB
 
 /// Which prover the probe measures and whose budgets apply.
 ///
-/// Selected by `probe_r2 --prover legacy|v11` or, when the CLI omits
-/// `--prover`, by `ZKCOINS_V11_SHADOW` (`1` → v11, unset/empty/`off` →
+/// Selected by `probe_r2 --prover legacy|v1` or, when the CLI omits
+/// `--prover`, by `ZKCOINS_V1_SHADOW` (`1` → v1, unset/empty/`off` →
 /// legacy). Unknown values fail loud — no silent default to legacy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProverMode {
     /// Legacy `zkcoins_prover::Prover` (`circuit::main`).
     Legacy,
     /// v1.1 `ProverBridge` (`C` / `prove_transition`).
-    V11,
+    V1,
 }
 
 impl ProverMode {
     pub fn as_str(self) -> &'static str {
         match self {
             ProverMode::Legacy => "legacy",
-            ProverMode::V11 => "v11",
+            ProverMode::V1 => "v1",
         }
     }
 
@@ -72,9 +72,9 @@ impl ProverMode {
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw {
             "legacy" => Ok(ProverMode::Legacy),
-            "v11" => Ok(ProverMode::V11),
+            "v1" => Ok(ProverMode::V1),
             other => Err(format!(
-                "unknown prover mode {other:?}: expected exactly \"legacy\" or \"v11\" \
+                "unknown prover mode {other:?}: expected exactly \"legacy\" or \"v1\" \
                  (no silent default)"
             )),
         }
@@ -88,27 +88,27 @@ impl fmt::Display for ProverMode {
 }
 
 /// Resolve the probe/warmup prover mode from optional CLI override and
-/// the `ZKCOINS_V11_SHADOW` env value (already resolved to a string
+/// the `ZKCOINS_V1_SHADOW` env value (already resolved to a string
 /// snapshot so tests need not mutate process env).
 ///
 /// Precedence:
 /// 1. `cli_prover` if `Some` — explicit `--prover` wins.
-/// 2. `v11_shadow_raw` — `Some("1")` → V11; `None` / `""` / `"off"` → Legacy.
+/// 2. `v1_shadow_raw` — `Some("1")` → V1; `None` / `""` / `"off"` → Legacy.
 /// 3. Anything else in the shadow slot fails loud (same contract as
-///    [`crate::v11::mode::resolve_v11_shadow_mode`]).
+///    [`crate::v1::mode::resolve_v1_shadow_mode`]).
 pub fn resolve_prover_mode(
     cli_prover: Option<&str>,
-    v11_shadow_raw: Option<&str>,
+    v1_shadow_raw: Option<&str>,
 ) -> Result<ProverMode, String> {
     if let Some(raw) = cli_prover {
         return ProverMode::parse(raw);
     }
-    match v11_shadow_raw {
+    match v1_shadow_raw {
         None => Ok(ProverMode::Legacy),
         Some(s) if s.is_empty() || s == "off" => Ok(ProverMode::Legacy),
-        Some("1") => Ok(ProverMode::V11),
+        Some("1") => Ok(ProverMode::V1),
         Some(other) => Err(format!(
-            "ZKCOINS_V11_SHADOW={other:?} is not supported when selecting R2 probe mode — \
+            "ZKCOINS_V1_SHADOW={other:?} is not supported when selecting R2 probe mode — \
              use unset / empty / \"off\" for legacy, or \"1\" for v1.1. Refusing to \
              silently fall back to legacy budgets (that is the false-red this block prevents)"
         )),
@@ -148,7 +148,7 @@ impl std::error::Error for BudgetUnavailable {}
 /// Evidence backing a sealed v1.1 budget set. Every number the operator
 /// alert uses must be traceable to these samples.
 #[derive(Clone, Copy, Debug)]
-pub struct V11CalibrationEvidence {
+pub struct V1CalibrationEvidence {
     /// Host / date / notes for the measurement campaign.
     pub note: &'static str,
     /// Warm `prove_transition` (AccountUpdate) wall samples, ms.
@@ -181,29 +181,29 @@ pub struct V11CalibrationEvidence {
 /// Arrays start empty until a measurement campaign seals them. An empty
 /// array is an explicit "not yet measured" state — **not** a zero-ms
 /// budget and **not** a fall-back to legacy.
-pub const V11_CALIBRATION: V11CalibrationEvidence = V11CalibrationEvidence {
-    note: "v1.1 ProverBridge prove_transition calibration — see V11_*_SAMPLES arrays",
-    warm_prove_ms: V11_WARM_SAMPLES_MS,
-    cold_start_ms: V11_COLD_SAMPLES_MS,
-    peak_rss_kb: V11_RSS_SAMPLES_KB,
+pub const V1_CALIBRATION: V1CalibrationEvidence = V1CalibrationEvidence {
+    note: "v1.1 ProverBridge prove_transition calibration — see V1_*_SAMPLES arrays",
+    warm_prove_ms: V1_WARM_SAMPLES_MS,
+    cold_start_ms: V1_COLD_SAMPLES_MS,
+    peak_rss_kb: V1_RSS_SAMPLES_KB,
     headroom_percent: BUDGET_HEADROOM_PERCENT,
 };
 
 // ---------------------------------------------------------------------------
 // Sealed measurement samples. Replace only after a multi-run campaign on
 // the reference host; never invent scaled guesses from the legacy 5 s /
-// 30 s targets. Empty = not calibrated → budgets_for_mode(V11) errors.
+// 30 s targets. Empty = not calibrated → budgets_for_mode(V1) errors.
 // ---------------------------------------------------------------------------
 
 /// Warm AccountUpdate `prove_transition` walls (ms). Fill from probe runs.
-const V11_WARM_SAMPLES_MS: &[i64] = &[];
+const V1_WARM_SAMPLES_MS: &[i64] = &[];
 
 /// Cold-start walls (circuit build + first Initial prove), ms. One entry
 /// per process run.
-const V11_COLD_SAMPLES_MS: &[i64] = &[];
+const V1_COLD_SAMPLES_MS: &[i64] = &[];
 
 /// Peak RSS (KB) at end of each process run.
-const V11_RSS_SAMPLES_KB: &[i64] = &[];
+const V1_RSS_SAMPLES_KB: &[i64] = &[];
 
 /// Derive a single budget from raw samples.
 ///
@@ -276,7 +276,7 @@ impl SampleSpread {
 /// Legacy budgets are the fixed ROADMAP step-9 constants (historical
 /// contract; flag-off path must stay byte-identical).
 ///
-/// v1.1 budgets are derived from [`V11_CALIBRATION`] samples. Empty or
+/// v1.1 budgets are derived from [`V1_CALIBRATION`] samples. Empty or
 /// single-sample arrays produce [`BudgetUnavailable`] — never the
 /// legacy 5 s / 30 s / 64 GiB numbers.
 pub fn budgets_for_mode(mode: ProverMode) -> Result<R2BudgetSet, BudgetUnavailable> {
@@ -286,25 +286,25 @@ pub fn budgets_for_mode(mode: ProverMode) -> Result<R2BudgetSet, BudgetUnavailab
             cold_start_ms: LEGACY_BUDGET_COLD_START_MS,
             peak_rss_kb: LEGACY_BUDGET_PEAK_RSS_KB,
         }),
-        ProverMode::V11 => {
-            let cal = V11_CALIBRATION;
+        ProverMode::V1 => {
+            let cal = V1_CALIBRATION;
             let warm = derive_budget_from_samples(
                 cal.warm_prove_ms,
                 cal.headroom_percent,
                 "warm_prove_ms",
-                ProverMode::V11,
+                ProverMode::V1,
             )?;
             let cold = derive_budget_from_samples(
                 cal.cold_start_ms,
                 cal.headroom_percent,
                 "cold_start_ms",
-                ProverMode::V11,
+                ProverMode::V1,
             )?;
             let rss = derive_budget_from_samples(
                 cal.peak_rss_kb,
                 cal.headroom_percent,
                 "peak_rss_kb",
-                ProverMode::V11,
+                ProverMode::V1,
             )?;
             Ok(R2BudgetSet {
                 warm_prove_ms: warm,
@@ -319,27 +319,27 @@ pub fn budgets_for_mode(mode: ProverMode) -> Result<R2BudgetSet, BudgetUnavailab
 /// Returns `Err` with the same refuse-loud contract when samples are
 /// insufficient (so a "report calibration" path cannot paper over a
 /// missing measurement).
-pub fn v11_calibration_summary() -> Result<String, BudgetUnavailable> {
-    let cal = V11_CALIBRATION;
+pub fn v1_calibration_summary() -> Result<String, BudgetUnavailable> {
+    let cal = V1_CALIBRATION;
     let warm = SampleSpread::from_samples(cal.warm_prove_ms).ok_or_else(|| BudgetUnavailable {
-        mode: ProverMode::V11,
+        mode: ProverMode::V1,
         metric: "warm_prove_ms",
-        detail: "no warm samples sealed in V11_CALIBRATION".into(),
+        detail: "no warm samples sealed in V1_CALIBRATION".into(),
     })?;
     let cold = SampleSpread::from_samples(cal.cold_start_ms).ok_or_else(|| BudgetUnavailable {
-        mode: ProverMode::V11,
+        mode: ProverMode::V1,
         metric: "cold_start_ms",
-        detail: "no cold-start samples sealed in V11_CALIBRATION".into(),
+        detail: "no cold-start samples sealed in V1_CALIBRATION".into(),
     })?;
     let rss = SampleSpread::from_samples(cal.peak_rss_kb).ok_or_else(|| BudgetUnavailable {
-        mode: ProverMode::V11,
+        mode: ProverMode::V1,
         metric: "peak_rss_kb",
-        detail: "no peak-RSS samples sealed in V11_CALIBRATION".into(),
+        detail: "no peak-RSS samples sealed in V1_CALIBRATION".into(),
     })?;
     // Touch the derivation so a summary claim always matches the budget.
-    let budgets = budgets_for_mode(ProverMode::V11)?;
+    let budgets = budgets_for_mode(ProverMode::V1)?;
     Ok(format!(
-        "v11 calibration ({note}): warm n={wn} min={wmin} max={wmax} mean={wmean} → budget {wb} ms; \
+        "v1 calibration ({note}): warm n={wn} min={wmin} max={wmax} mean={wmean} → budget {wb} ms; \
          cold n={cn} min={cmin} max={cmax} mean={cmean} → budget {cb} ms; \
          rss n={rn} min={rmin} max={rmax} mean={rmean} → budget {rb} KB; \
          headroom={h}%",
@@ -377,16 +377,16 @@ mod tests {
 
     #[test]
     fn derive_refuses_zero_samples() {
-        let err = derive_budget_from_samples(&[], 25, "warm_prove_ms", ProverMode::V11)
+        let err = derive_budget_from_samples(&[], 25, "warm_prove_ms", ProverMode::V1)
             .expect_err("empty must refuse");
         assert!(err.detail.contains("at least"));
-        assert_eq!(err.mode, ProverMode::V11);
+        assert_eq!(err.mode, ProverMode::V1);
         assert_eq!(err.metric, "warm_prove_ms");
     }
 
     #[test]
     fn derive_refuses_single_sample() {
-        let err = derive_budget_from_samples(&[1_000], 25, "warm_prove_ms", ProverMode::V11)
+        let err = derive_budget_from_samples(&[1_000], 25, "warm_prove_ms", ProverMode::V1)
             .expect_err("single sample must refuse");
         assert!(
             err.detail.contains("single sample is not a budget")
@@ -399,30 +399,30 @@ mod tests {
     #[test]
     fn derive_uses_max_plus_headroom() {
         // max=1000, headroom 25 % → 1250
-        let b = derive_budget_from_samples(&[800, 1000, 900], 25, "warm_prove_ms", ProverMode::V11)
+        let b = derive_budget_from_samples(&[800, 1000, 900], 25, "warm_prove_ms", ProverMode::V1)
             .expect("enough samples");
         assert_eq!(b, 1_250);
     }
 
     #[test]
     fn derive_refuses_negative_sample() {
-        let err = derive_budget_from_samples(&[100, -1], 25, "warm_prove_ms", ProverMode::V11)
+        let err = derive_budget_from_samples(&[100, -1], 25, "warm_prove_ms", ProverMode::V1)
             .expect_err("negative must refuse");
         assert!(err.detail.contains("negative"));
     }
 
     #[test]
-    fn v11_budgets_refuse_when_uncalibrated() {
+    fn v1_budgets_refuse_when_uncalibrated() {
         // The sealed arrays start empty (or stay empty until a campaign
         // lands). Either way, under-sampled calibration must not return
         // the legacy 5 s / 30 s numbers.
-        match budgets_for_mode(ProverMode::V11) {
+        match budgets_for_mode(ProverMode::V1) {
             Ok(b) => {
                 // If a campaign has sealed samples, the returned set must
                 // still differ from a silent legacy fall-back *or* be
                 // measurement-backed. Assert the derivation path ran by
                 // checking headroom-consistency with the sealed samples.
-                let warm_spread = SampleSpread::from_samples(V11_CALIBRATION.warm_prove_ms)
+                let warm_spread = SampleSpread::from_samples(V1_CALIBRATION.warm_prove_ms)
                     .expect("Ok branch requires samples");
                 assert!(b.warm_prove_ms >= warm_spread.max_ms);
                 assert_ne!(
@@ -432,11 +432,11 @@ mod tests {
                         LEGACY_BUDGET_COLD_START_MS,
                         LEGACY_BUDGET_PEAK_RSS_KB
                     ),
-                    "v11 budgets must not be a silent copy of legacy ROADMAP numbers"
+                    "v1 budgets must not be a silent copy of legacy ROADMAP numbers"
                 );
             }
             Err(e) => {
-                assert_eq!(e.mode, ProverMode::V11);
+                assert_eq!(e.mode, ProverMode::V1);
                 assert!(
                     e.to_string().contains("refusing silent fall-back")
                         || e.detail.contains("at least")
@@ -455,16 +455,16 @@ mod tests {
             ProverMode::Legacy
         );
         assert_eq!(
-            resolve_prover_mode(Some("v11"), None).unwrap(),
-            ProverMode::V11
+            resolve_prover_mode(Some("v1"), None).unwrap(),
+            ProverMode::V1
         );
     }
 
     #[test]
-    fn resolve_mode_shadow_one_selects_v11() {
+    fn resolve_mode_shadow_one_selects_v1() {
         assert_eq!(
             resolve_prover_mode(None, Some("1")).unwrap(),
-            ProverMode::V11
+            ProverMode::V1
         );
     }
 

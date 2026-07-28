@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
 use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes, HashDigest};
 
-use crate::v11::{require_stack_mode_for_update, ScanStackMode};
+use crate::v1::{require_stack_mode_for_update, ScanStackMode};
 
 /// Lock `stack_scan_mode` and require the legacy claim inside an open
 /// write transaction. Maps separation refusals onto `sqlx::Error` so the
@@ -1181,15 +1181,15 @@ this job cannot complete for a transition that no longer exists";
 /// would wipe scan tables that stack separation already keeps empty). A
 /// circuit-digest change on the v1.1 path invalidates every
 /// `ComplianceProof` / NfLog-bound opening at once — the only consistent
-/// recovery is empty-engine genesis for the v11 tables.
+/// recovery is empty-engine genesis for the v1 tables.
 ///
 /// Tables wiped (derived from migration 0019 / 0021 + legacy leftovers):
 ///
-/// * `v11_pending_publishes` — stale nullifier publish recovery rows
-/// * `v11_spendable_coins` / `v11_spent_coins` — CoinHist leaves
-/// * `v11_accounts` — multi-asset state + last_proof / openings
-/// * `v11_nullifier_index` / `v11_nflog_entries` — NfLog
-/// * `v11_engine_meta` — tip / network pin row
+/// * `v1_pending_publishes` — stale nullifier publish recovery rows
+/// * `v1_spendable_coins` / `v1_spent_coins` — CoinHist leaves
+/// * `v1_accounts` — multi-asset state + last_proof / openings
+/// * `v1_nullifier_index` / `v1_nflog_entries` — NfLog
+/// * `v1_engine_meta` — tip / network pin row
 /// * `accounts` — legacy proof-bearing rows that may still linger
 ///
 /// Jobs reconciled (not deleted — operator retains the row):
@@ -1203,32 +1203,32 @@ this job cannot complete for a transition that no longer exists";
 /// Does **not** require a legacy stack marker (v1.1 process owns this path).
 /// Does **not** DELETE from `smt_state` / `mmr_state` / `mmr_root_index` /
 /// `latest_block` (v1.1 does not use them; leave them intact).
-pub async fn reset_v11_proof_dependent_state_tx(
+pub async fn reset_v1_proof_dependent_state_tx(
     pool: &PgPool,
     new_digest: &[u8],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     // Order: children / dependents first, then parents, then meta.
-    // v11_pending_publishes has no FK to accounts but is proof-dependent.
-    sqlx::query("DELETE FROM v11_pending_publishes")
+    // v1_pending_publishes has no FK to accounts but is proof-dependent.
+    sqlx::query("DELETE FROM v1_pending_publishes")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM v11_spendable_coins")
+    sqlx::query("DELETE FROM v1_spendable_coins")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM v11_spent_coins")
+    sqlx::query("DELETE FROM v1_spent_coins")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM v11_accounts")
+    sqlx::query("DELETE FROM v1_accounts")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM v11_nullifier_index")
+    sqlx::query("DELETE FROM v1_nullifier_index")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM v11_nflog_entries")
+    sqlx::query("DELETE FROM v1_nflog_entries")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM v11_engine_meta")
+    sqlx::query("DELETE FROM v1_engine_meta")
         .execute(&mut *tx)
         .await?;
     // Leftover legacy proof-bearing rows (Stage 1–2 dual surface).

@@ -177,7 +177,7 @@ pub struct ReceiveRequest {
 ///   on the type: callers derive; they do not extract.
 /// - Durable paths that must still touch bytes are **explicit and narrow**:
 ///   - [`OpSecret::to_account_row_bytea`] / [`from_account_row_bytea`] for the
-///     `v11_accounts.op_secret` BYTEA column;
+///     `v1_accounts.op_secret` BYTEA column;
 ///   - [`FinalisationCapability::to_durable_bytes`] /
 ///     [`from_durable_bytes`] (private wire layout; no general-purpose
 ///     `Serialize` on `PendingTransition` / `FinalisationCapability`).
@@ -201,7 +201,7 @@ impl OpSecret {
         host::derive_nav_rand(&self.0, send_counter)
     }
 
-    /// Encode for the `v11_accounts.op_secret` BYTEA column.
+    /// Encode for the `v1_accounts.op_secret` BYTEA column.
     ///
     /// Narrow durable path only — not a general-purpose byte accessor and not
     /// reachable via `Debug`/`Serialize` of containing types.
@@ -209,7 +209,7 @@ impl OpSecret {
         self.0
     }
 
-    /// Decode from the `v11_accounts.op_secret` BYTEA column.
+    /// Decode from the `v1_accounts.op_secret` BYTEA column.
     pub const fn from_account_row_bytea(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -1902,7 +1902,7 @@ impl StateEngine {
     /// durable fields that never touch the engine (e.g. receive-path
     /// `build_tip` vs adapter tip identity, commit signature vs proved
     /// envelope) are revalidated at the node commit boundary — see
-    /// `node::v11::receive::commit_proved_receive`. A pure "what did we
+    /// `node::v1::receive::commit_proved_receive`. A pure "what did we
     /// read?" derivation misses those; the full method is "everything the
     /// durable commit depends on".
     ///
@@ -3884,7 +3884,7 @@ mod tests {
     /// the restored record.
     ///
     /// The DB-backed form (persist → `load_engine_snapshot` → `into_engine`)
-    /// lives in `node::v11::tests` so forcing `op_secret: None` on load
+    /// lives in `node::v1::tests` so forcing `op_secret: None` on load
     /// actually fails the suite.
     #[test]
     fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {

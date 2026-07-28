@@ -57,10 +57,10 @@ pub mod self_heal;
 pub mod state;
 pub mod username;
 /// v1.1 StateEngine adapter, shadow persistence (Stage 1), and exclusive
-/// publisher/scanner dual stack (Stage 2). Behind `ZKCOINS_V11_SHADOW=1`;
+/// publisher/scanner dual stack (Stage 2). Behind `ZKCOINS_V1_SHADOW=1`;
 /// default remains the legacy Commitment/SMT stack. Proving stays legacy
 /// until Stage 3.
-pub mod v11;
+pub mod v1;
 
 use crate::publisher::EsploraConfig;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};

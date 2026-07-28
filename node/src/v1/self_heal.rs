@@ -3,11 +3,11 @@
 //!
 //! # What the boot check compares
 //!
-//! Under `ZKCOINS_V11_SHADOW=1` the **live** digest blob is the tagged
+//! Under `ZKCOINS_V1_SHADOW=1` the **live** digest blob is the tagged
 //! encoding of the circuits the node **just built** through
 //! [`zkcoins_prover::prover_bridge::ProverBridge`] — not pins re-encoded
 //! as themselves, and not an embedded text file that a developer must
-//! remember to regenerate. See [`resolve_v11_live_digest`].
+//! remember to regenerate. See [`resolve_v1_live_digest`].
 //!
 //! Boot then:
 //! 1. Registers the §3.6 env pins on the prover bridge.
@@ -48,7 +48,7 @@
 //!
 //! | Check | When | Cost | Establishes |
 //! |---|---|---|---|
-//! | Just-built `C`/`C_balance` vs §3.6 pins | first construction (boot via [`resolve_v11_live_digest`]) | circuit build | this process's real circuits match the network pins |
+//! | Just-built `C`/`C_balance` vs §3.6 pins | first construction (boot via [`resolve_v1_live_digest`]) | circuit build | this process's real circuits match the network pins |
 //! | Digest compare (just-built) vs DB | every boot after identity | O(1) | persisted state was produced under this circuit identity |
 //! | Structural canary (nullifier / NAV / openings) | no digest only | O(accounts) | recursion inputs still present and consistent |
 //! | [`slow_canary_verify_transition`] | operator opt-in | circuit build + verify | live `C` still **accepts** a persisted proof |
@@ -63,7 +63,7 @@
 //!    cannot later report `completed`), stores the live binary digest,
 //!    and re-inits the in-memory engine. Operator re-funds / re-mints as
 //!    for any genesis wipe.
-//! 2. **Slow verify canary** — set `ZKCOINS_V11_SLOW_CANARY=1` before boot.
+//! 2. **Slow verify canary** — set `ZKCOINS_V1_SLOW_CANARY=1` before boot.
 //!    Runs `ProverBridge::verify_transition` on a persisted proof (pays the
 //!    circuit build). Failure is loud: Stale → Reset.
 //! 3. **Cannot determine** — a proof-bearing account missing nullifier or
@@ -84,22 +84,25 @@ use crate::account_node::CanaryOutcome;
 use super::adapter::EngineAdapter;
 
 /// Magic prefix so a legacy bincode `HashOut` digest can never silently
-/// equal a v1.1 pin encoding (different length and fixed tag).
-pub const V11_DIGEST_TAG: &[u8; 4] = b"V11\0";
+/// equal a v1 pin encoding (different length and fixed tag).
+///
+/// Four bytes (`V1\0\0`): the historical `V11\0` tag was renamed with the
+/// stack; length stays fixed so the layout remains `tag || C || C_balance`.
+pub const V1_DIGEST_TAG: &[u8; 4] = b"V1\0\0";
 
-/// Total length of [`encode_v11_live_digest`]: tag + C + C_balance.
-pub const V11_LIVE_DIGEST_LEN: usize = 4 + 32 + 32;
+/// Total length of [`encode_v1_live_digest`]: tag + C + C_balance.
+pub const V1_LIVE_DIGEST_LEN: usize = 4 + 32 + 32;
 
-/// Encode the live v1.1 self-heal baseline: `V11\0 || C || C_balance`.
+/// Encode the live v1 self-heal baseline: `V1\0\0 || C || C_balance`.
 ///
 /// Both digests are the §1.7.1 32-byte forms (same as
 /// `ProverBridge::circuit_digest_bytes` / `balance_circuit_digest_bytes`
 /// and the §3.6 boot pins). Production boot obtains these from the
-/// **just-built** circuits via [`resolve_v11_live_digest`], not by
+/// **just-built** circuits via [`resolve_v1_live_digest`], not by
 /// re-reading the pins alone or an embedded text file.
-pub fn encode_v11_live_digest(c: &[u8; 32], c_balance: &[u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(V11_LIVE_DIGEST_LEN);
-    out.extend_from_slice(V11_DIGEST_TAG);
+pub fn encode_v1_live_digest(c: &[u8; 32], c_balance: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(V1_LIVE_DIGEST_LEN);
+    out.extend_from_slice(V1_DIGEST_TAG);
     out.extend_from_slice(c);
     out.extend_from_slice(c_balance);
     out
@@ -111,13 +114,13 @@ pub fn encode_v11_live_digest(c: &[u8; 32], c_balance: &[u8; 32]) -> Vec<u8> {
 ///    [`ProverBridge::require_live_identity`], after registering the §3.6
 ///    pins so construction refuses on mismatch).
 /// 2. Cross-checks those digests against the pins again at this boundary.
-/// 3. Returns [`encode_v11_live_digest`] of the **just-built** pair.
+/// 3. Returns [`encode_v1_live_digest`] of the **just-built** pair.
 ///
 /// Returns `Err` when the digests cannot be determined or do not match
 /// the pins. Callers **must abort boot** on `Err` — never treat either
 /// case as "fine".
 ///
-/// This is deliberately **not** `encode_v11_live_digest(pins…)` and not
+/// This is deliberately **not** `encode_v1_live_digest(pins…)` and not
 /// an embedded generator artefact: only the digests of the circuits this
 /// process constructed can establish §1.7.9.
 ///
@@ -127,9 +130,9 @@ pub fn encode_v11_live_digest(c: &[u8; 32], c_balance: &[u8; 32]) -> Vec<u8> {
 /// A test-only override may substitute the **obtain** step with fabricated
 /// digests; it never short-circuits the pin-check / encode tail and is
 /// unreachable from the non-test production binary. Re-introducing
-/// round-1's `return Ok(encode_v11_live_digest(pin_c, pin_c_balance))`
+/// round-1's `return Ok(encode_v1_live_digest(pin_c, pin_c_balance))`
 /// anywhere on this path turns a normal `cargo nextest` run red.
-pub fn resolve_v11_live_digest(
+pub fn resolve_v1_live_digest(
     network: Network,
     pin_c: &[u8; 32],
     pin_c_balance: &[u8; 32],
@@ -144,7 +147,7 @@ pub fn resolve_v11_live_digest(
 /// construction, return live digests). Under `cfg(test)` only, a thread-
 /// local override may stand in for that build so unit tests stay cheap —
 /// the override returns fabricated **built** digests; it does not encode
-/// pins and does not live inside [`resolve_v11_live_digest`]'s control flow
+/// pins and does not live inside [`resolve_v1_live_digest`]'s control flow
 /// as an early `Ok`.
 fn obtain_just_built_digests(
     network: Network,
@@ -165,7 +168,7 @@ fn obtain_just_built_digests(
 
 /// Pin-check + encode the **built** pair (never the pins alone).
 ///
-/// Shared tail of [`resolve_v11_live_digest`]. Encoding pins here under a
+/// Shared tail of [`resolve_v1_live_digest`]. Encoding pins here under a
 /// successful check is observationally equal today, but would green a
 /// caller that never obtained built digests — so the encode arguments
 /// stay the built pair.
@@ -183,14 +186,14 @@ fn live_baseline_from_built_digests(
         pin_c_balance,
         network,
     )?;
-    Ok(encode_v11_live_digest(built_c, built_c_balance))
+    Ok(encode_v1_live_digest(built_c, built_c_balance))
 }
 
 #[cfg(test)]
 thread_local! {
     /// Optional stand-in for ProverBridge's just-built digests.
     /// Only consulted by [`obtain_just_built_digests`] — never by an early
-    /// return in [`resolve_v11_live_digest`].
+    /// return in [`resolve_v1_live_digest`].
     static TEST_BUILT_DIGESTS: std::cell::Cell<Option<([u8; 32], [u8; 32])>> =
         const { std::cell::Cell::new(None) };
 }
@@ -200,7 +203,7 @@ fn test_built_digests_override() -> Option<([u8; 32], [u8; 32])> {
     TEST_BUILT_DIGESTS.with(|c| c.get())
 }
 
-/// Install fabricated just-built digests for [`resolve_v11_live_digest`] tests.
+/// Install fabricated just-built digests for [`resolve_v1_live_digest`] tests.
 ///
 /// Substitutes only the obtain step inside [`obtain_just_built_digests`];
 /// pin-check + encode(built) still run through the production resolve path.
@@ -209,16 +212,16 @@ pub(crate) fn set_test_built_digests_override(built: Option<([u8; 32], [u8; 32])
     TEST_BUILT_DIGESTS.with(|c| c.set(built));
 }
 
-/// Decode a blob previously produced by [`encode_v11_live_digest`].
+/// Decode a blob previously produced by [`encode_v1_live_digest`].
 ///
 /// Returns `None` when the tag or length is wrong — callers that expect a
 /// v1.1 baseline must treat `None` as "not a v1.1 digest" (which a live
 /// pin encoding will not match → Reset). Never invents defaults.
-pub fn decode_v11_live_digest(blob: &[u8]) -> Option<([u8; 32], [u8; 32])> {
-    if blob.len() != V11_LIVE_DIGEST_LEN {
+pub fn decode_v1_live_digest(blob: &[u8]) -> Option<([u8; 32], [u8; 32])> {
+    if blob.len() != V1_LIVE_DIGEST_LEN {
         return None;
     }
-    if &blob[..4] != V11_DIGEST_TAG.as_slice() {
+    if &blob[..4] != V1_DIGEST_TAG.as_slice() {
         return None;
     }
     let mut c = [0u8; 32];
@@ -232,7 +235,7 @@ pub fn decode_v11_live_digest(blob: &[u8]) -> Option<([u8; 32], [u8; 32])> {
 /// persisted account (predecessor nullifier + NAV). Independent of the
 /// proof blob so pure unit tests do not need a Plonky2 proof fixture.
 #[derive(Clone, Debug)]
-pub struct V11StructuralInputs<'a> {
+pub struct V1StructuralInputs<'a> {
     pub last_nullifier: Option<&'a NullifierOpening>,
     pub last_nullifier_pos: Option<u64>,
     pub last_nav_opening: Option<&'a NavOpening>,
@@ -241,14 +244,14 @@ pub struct V11StructuralInputs<'a> {
 /// Full canary sample: structural inputs plus the persisted proof (used
 /// by the slow verify path).
 #[derive(Clone, Debug)]
-pub struct V11CanarySample<'a> {
+pub struct V1CanarySample<'a> {
     pub last_proof: &'a ComplianceProof,
-    pub structural: V11StructuralInputs<'a>,
+    pub structural: V1StructuralInputs<'a>,
 }
 
 /// Live NfLog facts the structural canary needs (injected for pure tests).
 #[derive(Clone, Debug)]
-pub struct V11CanaryNflogView {
+pub struct V1CanaryNflogView {
     pub nav: Nav,
     /// `(pos, r)` for a looked-up predecessor Pk, or `None` if absent.
     pub predecessor: Option<(u64, [u8; 32])>,
@@ -263,10 +266,10 @@ pub struct V11CanaryNflogView {
 /// * All checks pass → [`Compatible`].
 ///
 /// Does **not** call Plonky2. Crypto acceptance of the proof is the slow
-/// path ([`evaluate_v11_slow_canary`]).
-pub fn evaluate_v11_structural_canary(
-    inputs: &V11StructuralInputs<'_>,
-    nflog: &V11CanaryNflogView,
+/// path ([`evaluate_v1_slow_canary`]).
+pub fn evaluate_v1_structural_canary(
+    inputs: &V1StructuralInputs<'_>,
+    nflog: &V1CanaryNflogView,
 ) -> CanaryOutcome {
     let (Some(nf), Some(nav_open)) = (inputs.last_nullifier, inputs.last_nav_opening) else {
         // Proof without the recursion openings the next AccountUpdate needs.
@@ -324,12 +327,12 @@ pub fn evaluate_v11_structural_canary(
 ///
 /// A test that would go red under a wrong change: flip `verify_ok` to
 /// `true` while claiming Stale, or the reverse — the matrix is exhaustive.
-pub fn evaluate_v11_slow_canary(
-    inputs: &V11StructuralInputs<'_>,
-    nflog: &V11CanaryNflogView,
+pub fn evaluate_v1_slow_canary(
+    inputs: &V1StructuralInputs<'_>,
+    nflog: &V1CanaryNflogView,
     verify_ok: bool,
 ) -> CanaryOutcome {
-    match evaluate_v11_structural_canary(inputs, nflog) {
+    match evaluate_v1_structural_canary(inputs, nflog) {
         CanaryOutcome::Stale => CanaryOutcome::Stale,
         CanaryOutcome::NoSample => CanaryOutcome::NoSample,
         CanaryOutcome::Compatible => {
@@ -355,7 +358,7 @@ pub fn boot_canary(adapter: &EngineAdapter) -> CanaryOutcome {
             if record.last_proof.is_none() {
                 continue;
             }
-            let inputs = V11StructuralInputs {
+            let inputs = V1StructuralInputs {
                 last_nullifier: record.last_nullifier.as_ref(),
                 last_nullifier_pos: record.last_nullifier_pos,
                 last_nav_opening: record.last_nav_opening.as_ref(),
@@ -366,12 +369,12 @@ pub fn boot_canary(adapter: &EngineAdapter) -> CanaryOutcome {
                     LookupResult::Absent => None,
                 }
             });
-            let nflog = V11CanaryNflogView {
+            let nflog = V1CanaryNflogView {
                 nav: engine.nflog().nav(),
                 predecessor,
             };
             // First proof-bearing account is decisive (legacy canary discipline).
-            return evaluate_v11_structural_canary(&inputs, &nflog);
+            return evaluate_v1_structural_canary(&inputs, &nflog);
         }
         CanaryOutcome::NoSample
     })
@@ -380,7 +383,7 @@ pub fn boot_canary(adapter: &EngineAdapter) -> CanaryOutcome {
 /// Slow canary: structural checks + `ProverBridge::verify_transition`.
 ///
 /// **Too expensive for default boot** (forces compliance circuit build).
-/// Operator trigger: env `ZKCOINS_V11_SLOW_CANARY=1` (see main boot path)
+/// Operator trigger: env `ZKCOINS_V1_SLOW_CANARY=1` (see main boot path)
 /// or call this after an intentional warmup.
 ///
 /// Establishes: the live `C` still **accepts** a persisted `ComplianceProof`
@@ -394,7 +397,7 @@ pub fn slow_canary_verify_transition(adapter: &EngineAdapter) -> CanaryOutcome {
             let Some(proof) = record.last_proof.as_ref() else {
                 continue;
             };
-            let inputs = V11StructuralInputs {
+            let inputs = V1StructuralInputs {
                 last_nullifier: record.last_nullifier.as_ref(),
                 last_nullifier_pos: record.last_nullifier_pos,
                 last_nav_opening: record.last_nav_opening.as_ref(),
@@ -405,12 +408,12 @@ pub fn slow_canary_verify_transition(adapter: &EngineAdapter) -> CanaryOutcome {
                     LookupResult::Absent => None,
                 }
             });
-            let nflog = V11CanaryNflogView {
+            let nflog = V1CanaryNflogView {
                 nav: engine.nflog().nav(),
                 predecessor,
             };
             let verify_ok = bridge.verify_transition(proof).is_ok();
-            return evaluate_v11_slow_canary(&inputs, &nflog, verify_ok);
+            return evaluate_v1_slow_canary(&inputs, &nflog, verify_ok);
         }
         CanaryOutcome::NoSample
     })
@@ -418,18 +421,18 @@ pub fn slow_canary_verify_transition(adapter: &EngineAdapter) -> CanaryOutcome {
 
 /// Whether the operator requested the slow verify canary this boot.
 pub fn slow_canary_env_enabled() -> bool {
-    matches!(std::env::var("ZKCOINS_V11_SLOW_CANARY"), Ok(v) if v == "1")
+    matches!(std::env::var("ZKCOINS_V1_SLOW_CANARY"), Ok(v) if v == "1")
 }
 
 /// Build the canary closure outcome for the v1.1 heal path.
 ///
 /// * Default: structural [`boot_canary`].
-/// * `ZKCOINS_V11_SLOW_CANARY=1`: [`slow_canary_verify_transition`] instead
+/// * `ZKCOINS_V1_SLOW_CANARY=1`: [`slow_canary_verify_transition`] instead
 ///   (loud about cost via log).
-pub fn v11_canary_for_heal(adapter: &EngineAdapter) -> CanaryOutcome {
+pub fn v1_canary_for_heal(adapter: &EngineAdapter) -> CanaryOutcome {
     if slow_canary_env_enabled() {
         info!(
-            "v1.1 self-heal: ZKCOINS_V11_SLOW_CANARY=1 — running verify_transition \
+            "v1.1 self-heal: ZKCOINS_V1_SLOW_CANARY=1 — running verify_transition \
              canary (compliance circuit build may take minutes on cold start)"
         );
         slow_canary_verify_transition(adapter)
@@ -470,33 +473,33 @@ mod unit_tests {
     fn encode_decode_round_trip() {
         let c = [0x11u8; 32];
         let b = [0x22u8; 32];
-        let blob = encode_v11_live_digest(&c, &b);
-        assert_eq!(blob.len(), V11_LIVE_DIGEST_LEN);
-        assert_eq!(&blob[..4], V11_DIGEST_TAG);
-        let (c2, b2) = decode_v11_live_digest(&blob).expect("decode");
+        let blob = encode_v1_live_digest(&c, &b);
+        assert_eq!(blob.len(), V1_LIVE_DIGEST_LEN);
+        assert_eq!(&blob[..4], V1_DIGEST_TAG);
+        let (c2, b2) = decode_v1_live_digest(&blob).expect("decode");
         assert_eq!(c2, c);
         assert_eq!(b2, b);
     }
 
     #[test]
     fn decode_rejects_legacy_shaped_blob() {
-        assert!(decode_v11_live_digest(b"not-a-v11-digest").is_none());
-        assert!(decode_v11_live_digest(&[0u8; 32]).is_none());
-        assert!(decode_v11_live_digest(&[]).is_none());
+        assert!(decode_v1_live_digest(b"not-a-v1-digest").is_none());
+        assert!(decode_v1_live_digest(&[0u8; 32]).is_none());
+        assert!(decode_v1_live_digest(&[]).is_none());
     }
 
     #[test]
     fn decode_rejects_wrong_tag_same_length() {
-        let mut blob = encode_v11_live_digest(&[1u8; 32], &[2u8; 32]);
+        let mut blob = encode_v1_live_digest(&[1u8; 32], &[2u8; 32]);
         blob[0] = b'X';
-        assert!(decode_v11_live_digest(&blob).is_none());
+        assert!(decode_v1_live_digest(&blob).is_none());
     }
 
     #[test]
     fn encode_differs_when_either_digest_changes() {
-        let base = encode_v11_live_digest(&[1u8; 32], &[2u8; 32]);
-        let c_changed = encode_v11_live_digest(&[9u8; 32], &[2u8; 32]);
-        let b_changed = encode_v11_live_digest(&[1u8; 32], &[9u8; 32]);
+        let base = encode_v1_live_digest(&[1u8; 32], &[2u8; 32]);
+        let c_changed = encode_v1_live_digest(&[9u8; 32], &[2u8; 32]);
+        let b_changed = encode_v1_live_digest(&[1u8; 32], &[9u8; 32]);
         assert_ne!(base, c_changed);
         assert_ne!(base, b_changed);
         assert_ne!(c_changed, b_changed);
@@ -504,13 +507,13 @@ mod unit_tests {
 
     #[test]
     fn structural_missing_openings_is_stale() {
-        let nflog = V11CanaryNflogView {
+        let nflog = V1CanaryNflogView {
             nav: nav_zero(),
             predecessor: Some((0, [1u8; 32])),
         };
         assert_eq!(
-            evaluate_v11_structural_canary(
-                &V11StructuralInputs {
+            evaluate_v1_structural_canary(
+                &V1StructuralInputs {
                     last_nullifier: None,
                     last_nullifier_pos: None,
                     last_nav_opening: None,
@@ -521,8 +524,8 @@ mod unit_tests {
         );
         let nf = nf(1, 2);
         assert_eq!(
-            evaluate_v11_structural_canary(
-                &V11StructuralInputs {
+            evaluate_v1_structural_canary(
+                &V1StructuralInputs {
                     last_nullifier: Some(&nf),
                     last_nullifier_pos: Some(0),
                     last_nav_opening: None,
@@ -537,13 +540,13 @@ mod unit_tests {
     fn structural_absent_predecessor_is_stale() {
         let nf = nf(1, 2);
         let nav = nav_open(nav_zero());
-        let nflog = V11CanaryNflogView {
+        let nflog = V1CanaryNflogView {
             nav: nav_zero(),
             predecessor: None,
         };
         assert_eq!(
-            evaluate_v11_structural_canary(
-                &V11StructuralInputs {
+            evaluate_v1_structural_canary(
+                &V1StructuralInputs {
                     last_nullifier: Some(&nf),
                     last_nullifier_pos: Some(0),
                     last_nav_opening: Some(&nav),
@@ -558,13 +561,13 @@ mod unit_tests {
     fn structural_r_mismatch_is_stale() {
         let nf = nf(1, 2);
         let nav = nav_open(nav_zero());
-        let nflog = V11CanaryNflogView {
+        let nflog = V1CanaryNflogView {
             nav: nav_zero(),
             predecessor: Some((0, [0xFFu8; 32])),
         };
         assert_eq!(
-            evaluate_v11_structural_canary(
-                &V11StructuralInputs {
+            evaluate_v1_structural_canary(
+                &V1StructuralInputs {
                     last_nullifier: Some(&nf),
                     last_nullifier_pos: Some(0),
                     last_nav_opening: Some(&nav),
@@ -579,13 +582,13 @@ mod unit_tests {
     fn structural_position_mismatch_is_stale() {
         let nf = nf(1, 2);
         let nav = nav_open(nav_zero());
-        let nflog = V11CanaryNflogView {
+        let nflog = V1CanaryNflogView {
             nav: nav_zero(),
             predecessor: Some((7, [2u8; 32])),
         };
         assert_eq!(
-            evaluate_v11_structural_canary(
-                &V11StructuralInputs {
+            evaluate_v1_structural_canary(
+                &V1StructuralInputs {
                     last_nullifier: Some(&nf),
                     last_nullifier_pos: Some(0),
                     last_nav_opening: Some(&nav),
@@ -604,13 +607,13 @@ mod unit_tests {
             mth: digest_from_bytes(&[0x55u8; 32]).expect("canonical limbs"),
         };
         let nav = nav_open(nav_zero());
-        let nflog = V11CanaryNflogView {
+        let nflog = V1CanaryNflogView {
             nav: other,
             predecessor: Some((0, [2u8; 32])),
         };
         assert_eq!(
-            evaluate_v11_structural_canary(
-                &V11StructuralInputs {
+            evaluate_v1_structural_canary(
+                &V1StructuralInputs {
                     last_nullifier: Some(&nf),
                     last_nullifier_pos: Some(0),
                     last_nav_opening: Some(&nav),
@@ -625,13 +628,13 @@ mod unit_tests {
     fn structural_consistent_is_compatible() {
         let nf = nf(1, 2);
         let nav = nav_open(nav_zero());
-        let nflog = V11CanaryNflogView {
+        let nflog = V1CanaryNflogView {
             nav: nav_zero(),
             predecessor: Some((0, [2u8; 32])),
         };
         assert_eq!(
-            evaluate_v11_structural_canary(
-                &V11StructuralInputs {
+            evaluate_v1_structural_canary(
+                &V1StructuralInputs {
                     last_nullifier: Some(&nf),
                     last_nullifier_pos: Some(0),
                     last_nav_opening: Some(&nav),
@@ -647,17 +650,17 @@ mod unit_tests {
     fn slow_canary_rejects_when_verify_fails() {
         let nf = nf(1, 2);
         let nav = nav_open(nav_zero());
-        let inputs = V11StructuralInputs {
+        let inputs = V1StructuralInputs {
             last_nullifier: Some(&nf),
             last_nullifier_pos: Some(0),
             last_nav_opening: Some(&nav),
         };
-        let nflog = V11CanaryNflogView {
+        let nflog = V1CanaryNflogView {
             nav: nav_zero(),
             predecessor: Some((0, [2u8; 32])),
         };
         assert_eq!(
-            evaluate_v11_slow_canary(&inputs, &nflog, false),
+            evaluate_v1_slow_canary(&inputs, &nflog, false),
             CanaryOutcome::Stale,
             "circuit rejection must surface as Stale, not Compatible"
         );
@@ -667,17 +670,17 @@ mod unit_tests {
     fn slow_canary_accepts_when_verify_passes() {
         let nf = nf(1, 2);
         let nav = nav_open(nav_zero());
-        let inputs = V11StructuralInputs {
+        let inputs = V1StructuralInputs {
             last_nullifier: Some(&nf),
             last_nullifier_pos: Some(0),
             last_nav_opening: Some(&nav),
         };
-        let nflog = V11CanaryNflogView {
+        let nflog = V1CanaryNflogView {
             nav: nav_zero(),
             predecessor: Some((0, [2u8; 32])),
         };
         assert_eq!(
-            evaluate_v11_slow_canary(&inputs, &nflog, true),
+            evaluate_v1_slow_canary(&inputs, &nflog, true),
             CanaryOutcome::Compatible
         );
     }
@@ -685,69 +688,69 @@ mod unit_tests {
     #[test]
     fn slow_canary_stale_structural_short_circuits_verify() {
         // Even if verify_ok is true, missing openings stay Stale.
-        let inputs = V11StructuralInputs {
+        let inputs = V1StructuralInputs {
             last_nullifier: None,
             last_nullifier_pos: None,
             last_nav_opening: None,
         };
-        let nflog = V11CanaryNflogView {
+        let nflog = V1CanaryNflogView {
             nav: nav_zero(),
             predecessor: None,
         };
         assert_eq!(
-            evaluate_v11_slow_canary(&inputs, &nflog, true),
+            evaluate_v1_slow_canary(&inputs, &nflog, true),
             CanaryOutcome::Stale
         );
     }
 
-    /// Drives the **public** [`resolve_v11_live_digest`] with fabricated
+    /// Drives the **public** [`resolve_v1_live_digest`] with fabricated
     /// just-built digests (override stands in only for
     /// [`obtain_just_built_digests`] / [`ProverBridge::require_live_identity`]).
     ///
     /// The resolve body is a single linear path: obtain → pin-check +
     /// encode(**built**). Round-1's
-    /// `return Ok(encode_v11_live_digest(pin_c, pin_c_balance))` never
+    /// `return Ok(encode_v1_live_digest(pin_c, pin_c_balance))` never
     /// consults built digests and would `Ok` any pin pair — this test
     /// goes **red** under that shortcut because it calls resolve itself
     /// with divergent pins (and the override no longer short-circuits
     /// past the production body).
     #[test]
-    fn resolve_v11_live_digest_refuses_when_pins_differ_from_built() {
+    fn resolve_v1_live_digest_refuses_when_pins_differ_from_built() {
         let built_c = [0xAAu8; 32];
         let built_b = [0xBBu8; 32];
         let mut pin_c = built_c;
         pin_c[0] ^= 0xFF;
         assert_ne!(
-            encode_v11_live_digest(&pin_c, &built_b),
-            encode_v11_live_digest(&built_c, &built_b),
+            encode_v1_live_digest(&pin_c, &built_b),
+            encode_v1_live_digest(&built_c, &built_b),
             "test oracle: pin encoding must differ from built encoding"
         );
         set_test_built_digests_override(Some((built_c, built_b)));
-        let err = resolve_v11_live_digest(Network::Regtest, &pin_c, &built_b)
-            .expect_err("built/pin divergence must refuse through resolve_v11_live_digest");
+        let err = resolve_v1_live_digest(Network::Regtest, &pin_c, &built_b)
+            .expect_err("built/pin divergence must refuse through resolve_v1_live_digest");
         set_test_built_digests_override(None);
         assert!(
             err.contains("do not match") || err.contains("Refusing"),
-            "refusal must be loud via resolve_v11_live_digest: {err}"
+            "refusal must be loud via resolve_v1_live_digest: {err}"
         );
     }
 
-    /// Happy path through [`resolve_v11_live_digest`]: when pins equal the
+    /// Happy path through [`resolve_v1_live_digest`]: when pins equal the
     /// just-built digests, the live baseline is `encode(built)`.
     #[test]
-    fn resolve_v11_live_digest_returns_encoding_of_just_built_circuits() {
+    fn resolve_v1_live_digest_returns_encoding_of_just_built_circuits() {
         let c = [0x11u8; 32];
         let b = [0x22u8; 32];
         set_test_built_digests_override(Some((c, b)));
-        let live = resolve_v11_live_digest(Network::Regtest, &c, &b)
-            .expect("matching pins must accept through resolve_v11_live_digest");
+        let live = resolve_v1_live_digest(Network::Regtest, &c, &b)
+            .expect("matching pins must accept through resolve_v1_live_digest");
         set_test_built_digests_override(None);
         assert_eq!(
             live,
-            encode_v11_live_digest(&c, &b),
+            encode_v1_live_digest(&c, &b),
             "live baseline must be encode(just-built)"
         );
-        let (c2, b2) = decode_v11_live_digest(&live).expect("tagged blob");
+        let (c2, b2) = decode_v1_live_digest(&live).expect("tagged blob");
         assert_eq!(c2, c);
         assert_eq!(b2, b);
     }
@@ -760,8 +763,8 @@ mod unit_tests {
     /// Scans non-comment lines of `self_heal.rs` up to the unit-test module
     /// for the exact round-1 anti-pattern.
     #[test]
-    fn resolve_v11_live_digest_source_forbids_encode_pins_shortcut() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/v11/self_heal.rs");
+    fn resolve_v1_live_digest_source_forbids_encode_pins_shortcut() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/v1/self_heal.rs");
         let src = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read {path}: {e}"));
         let prod = src
@@ -785,9 +788,9 @@ mod unit_tests {
         }
 
         let forbidden = [
-            "encode_v11_live_digest(pin_c, pin_c_balance)",
-            "encode_v11_live_digest(&pin_c, &pin_c_balance)",
-            "encode_v11_live_digest(*pin_c, *pin_c_balance)",
+            "encode_v1_live_digest(pin_c, pin_c_balance)",
+            "encode_v1_live_digest(&pin_c, &pin_c_balance)",
+            "encode_v1_live_digest(*pin_c, *pin_c_balance)",
         ];
         for pat in forbidden {
             assert!(
@@ -805,7 +808,7 @@ mod unit_tests {
             "production resolve path must run the pin-check + encode(built) tail"
         );
         assert!(
-            code.contains("encode_v11_live_digest(built_c, built_c_balance)"),
+            code.contains("encode_v1_live_digest(built_c, built_c_balance)"),
             "production encode must take the just-built pair, not the pins"
         );
     }
@@ -818,7 +821,7 @@ mod unit_tests {
         R: Send + 'static,
     {
         std::thread::Builder::new()
-            .name("v11-digest-resolve".into())
+            .name("v1-digest-resolve".into())
             .stack_size(128 * 1024 * 1024)
             .spawn(f)
             .expect("spawn large-stack thread")
@@ -832,7 +835,7 @@ mod unit_tests {
     /// path + source guard above.
     #[test]
     #[ignore = "multi-minute Plonky2 circuit build via ProverBridge"]
-    fn resolve_v11_live_digest_via_real_prover_bridge_refuses_pin_mismatch() {
+    fn resolve_v1_live_digest_via_real_prover_bridge_refuses_pin_mismatch() {
         on_large_stack(|| {
             // Ensure the override is off so we hit ProverBridge.
             set_test_built_digests_override(None);
@@ -843,7 +846,7 @@ mod unit_tests {
                 .expect("unpinned ProverBridge build");
             let mut pin_c = built_c;
             pin_c[0] ^= 0xFF;
-            let err = resolve_v11_live_digest(network, &pin_c, &built_b)
+            let err = resolve_v1_live_digest(network, &pin_c, &built_b)
                 .expect_err("real ProverBridge path must refuse pin mismatch");
             assert!(
                 err.contains("do not match")

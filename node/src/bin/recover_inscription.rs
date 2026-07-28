@@ -307,11 +307,11 @@ async fn run(validated: ValidatedArgs, publisher_key: String) -> Result<(), Stri
     }
 
     // Claim the process stack the same way the node binary does — from
-    // `ZKCOINS_V11_SHADOW`. Under `=1` the process is v1.1 and the guarded
+    // `ZKCOINS_V1_SHADOW`. Under `=1` the process is v1.1 and the guarded
     // client refuses before any Esplora I/O. Raw `esplora-client` types are
     // not reachable from this binary (confined to `node::esplora_bound`).
-    node::v11::claim_process_stack_from_v11_shadow_env().map_err(|e| {
-        format!("recover_inscription: failed to claim process stack from ZKCOINS_V11_SHADOW: {e}")
+    node::v1::claim_process_stack_from_v1_shadow_env().map_err(|e| {
+        format!("recover_inscription: failed to claim process stack from ZKCOINS_V1_SHADOW: {e}")
     })?;
 
     let client = LegacyBroadcastClient::connect(&validated.esplora_url).map_err(|e| {

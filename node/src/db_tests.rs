@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::test_db::setup_pool;
-use crate::v11::{claim_stack_scan_mode, ScanStackMode};
+use crate::v1::{claim_stack_scan_mode, ScanStackMode};
 use sqlx::Row;
 
 /// Claim the legacy stack marker so `persist_state_tx` / related writers
@@ -89,15 +89,21 @@ async fn connect_and_migrate_creates_all_tables() {
     //   * After 0018 (asset_creators):   25 tables + 1 view (the
     //     off-circuit per-asset creator binding — sorts between
     //     `accounts` and `block_log`.)
-    //   * After 0019 (v1.1 persistence): 31 tables + 1 view (additive
-    //     NfLog / CoinHist / multi-asset account tables; all `v11_*`).
+    //   * After 0019 (v1 persistence): 31 tables + 1 view (additive
+    //     NfLog / CoinHist / multi-asset account tables; created as
+    //     historical `v11_*`, renamed to `v1_*` by 0027).
     //   * After 0020 (stack_scan_mode):  32 tables + 1 view (exclusive
-    //     legacy vs v1.1 scan-stack claim for Cutover Stage 2).
-    //   * After 0021 (v11_pending_publishes): 33 tables + 1 view
+    //     legacy vs v1 scan-stack claim for Cutover Stage 2).
+    //   * After 0021 (pending_publishes): 33 tables + 1 view
     //     (durable AggregateStateNullifierV3 rebroadcast intent).
-    //   * After 0022 (finalise claim fence): ALTER-only (no new table).
-    //   * After 0023 (r2 probe v11 columns): ALTER + view recreate
+    //   * After 0023 (op_secret): ALTER-only.
+    //   * After 0024 (self_heal_reset_meta): 34 tables + 1 view
+    //     (self-heal reset-generation fence for job-advancing writes).
+    //   * After 0025 (jobs kind attest_balance): ALTER-only.
+    //   * After 0026 (r2 probe columns): ALTER + view recreate
     //     (no new table names; prover_mode / shape columns on runs).
+    //   * After 0027 (rename v11_* → v1_*): same count; renames stack
+    //     tables/indexes + stack_scan_mode / prover_mode labels.
     assert_eq!(
         names,
         vec![
@@ -122,19 +128,20 @@ async fn connect_and_migrate_creates_all_tables() {
             "r2_probe_runs_summary".to_string(),
             "r2_probe_warm_calls".to_string(),
             "request_log".to_string(),
+            "self_heal_reset_meta".to_string(),
             "smt_state".to_string(),
             "stack_scan_mode".to_string(),
             "state_update_log".to_string(),
             "tx_mining_log".to_string(),
             "username_claim_log".to_string(),
             "usernames".to_string(),
-            "v11_accounts".to_string(),
-            "v11_engine_meta".to_string(),
-            "v11_nflog_entries".to_string(),
-            "v11_nullifier_index".to_string(),
-            "v11_pending_publishes".to_string(),
-            "v11_spendable_coins".to_string(),
-            "v11_spent_coins".to_string(),
+            "v1_accounts".to_string(),
+            "v1_engine_meta".to_string(),
+            "v1_nflog_entries".to_string(),
+            "v1_nullifier_index".to_string(),
+            "v1_pending_publishes".to_string(),
+            "v1_spendable_coins".to_string(),
+            "v1_spent_coins".to_string(),
         ]
     );
 }

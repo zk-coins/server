@@ -1202,7 +1202,7 @@ impl JobStore {
         fence: i64,
         finalisation: &serde_json::Value,
     ) -> sqlx::Result<bool> {
-        let path = vec![crate::v11::FINALISATION_BODY_KEY.to_string()];
+        let path = vec![crate::v1::FINALISATION_BODY_KEY.to_string()];
         let owner_text = owner.to_string();
         let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(

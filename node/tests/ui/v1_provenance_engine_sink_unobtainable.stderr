@@ -1,11 +1,11 @@
 error[E0603]: function `engine_begin_send` is private
- --> tests/ui/v11_provenance_engine_sink_unobtainable.rs:8:36
+ --> tests/ui/v1_provenance_engine_sink_unobtainable.rs:8:36
   |
-8 |     let _ = node::v11::provenance::engine_begin_send;
+8 |     let _ = node::v1::provenance::engine_begin_send;
   |                                    ^^^^^^^^^^^^^^^^^ private function
   |
 note: the function `engine_begin_send` is defined here
- --> src/v11/provenance.rs
+ --> src/v1/provenance.rs
   |
   | fn engine_begin_send(engine: &StateEngine, req: SendRequest) -> Result<PendingTransition> {
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

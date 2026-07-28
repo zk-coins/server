@@ -227,8 +227,8 @@ fn mint_funded_asset(
 /// non-mint update the issuer gate would not authorise.
 ///
 /// **G7 / flag-off contract:** this refusal is the default and must stay
-/// byte-identical while `ZKCOINS_V11_SHADOW` is off. Spec-conformant
-/// re-mint lives on the v1.1 engine path (`v11::mint::begin_v11_mint`)
+/// byte-identical while `ZKCOINS_V1_SHADOW` is off. Spec-conformant
+/// re-mint lives on the v1.1 engine path (`v1::mint::begin_v1_mint`)
 /// behind the shadow flag — never dual-accepted here.
 ///
 /// Covers the `Some(account_proof)` arm of `prepare_mint` (the happy

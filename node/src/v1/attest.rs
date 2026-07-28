@@ -34,7 +34,7 @@
 //! Resolving a real `(txid, block_hash)` needs either:
 //! - a durable scanner-owned `pk → (txid, block_hash)` index (not in
 //!   this worktree; scanner folds Pk/R only), or
-//! - a still-live `v11_pending_publishes.reveal_txid` for **this
+//! - a still-live `v1_pending_publishes.reveal_txid` for **this
 //!   node's own** publish of that nullifier (partial, until GC), plus
 //!   the inclusion-block hash: live `tip_hash` when the nullifier
 //!   height equals the tip, otherwise the durable `block_log` row at
@@ -68,8 +68,8 @@ use zkcoins_prover::prover_bridge::{
 };
 
 use super::adapter::EngineAdapter;
-use super::db_v11;
-use super::mode::V11ShadowMode;
+use super::db_v1;
+use super::mode::V1ShadowMode;
 use super::separation::{process_stack_mode, ScanStackMode};
 
 // ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ pub const PULL_HOST_DOMAIN: &str = "zkCoins/v1/PullHost";
 pub const ATTEST_ANCHOR_LOCATOR_EDGE: &str =
     "ATTEST_ANCHOR_LOCATOR_EDGE: NfLog retains ChainPosition but not \
      reveal txid/block_hash; no durable pk→(txid,block_hash) index and no \
-     live v11_pending_publishes.reveal_txid for this nullifier — cannot \
+     live v1_pending_publishes.reveal_txid for this nullifier — cannot \
      assemble a host-verifiable §5.7 anchor (scanner-owned index / later \
      wiring). Refusing rather than fabricating zeros.";
 
@@ -302,7 +302,7 @@ impl AttestError {
     pub fn message(&self) -> &str {
         match self {
             AttestError::FeatureDisabled => {
-                "POST /v1/attest/balance requires ZKCOINS_V11_SHADOW=1 / ScanStackMode::V11"
+                "POST /v1/attest/balance requires ZKCOINS_V1_SHADOW=1 / ScanStackMode::V1"
             }
             AttestError::Malformed(m)
             | AttestError::Unauthorized(m)
@@ -319,15 +319,15 @@ impl AttestError {
 // ---------------------------------------------------------------------------
 
 /// True when the process claim is v1.1 (flag on and stack claimed).
-pub fn v11_attest_route_active() -> bool {
-    matches!(process_stack_mode(), Some(ScanStackMode::V11))
+pub fn v1_attest_route_active() -> bool {
+    matches!(process_stack_mode(), Some(ScanStackMode::V1))
 }
 
-pub fn ensure_v11_attest_path(mode: V11ShadowMode) -> Result<(), AttestError> {
+pub fn ensure_v1_attest_path(mode: V1ShadowMode) -> Result<(), AttestError> {
     match mode {
-        V11ShadowMode::On if v11_attest_route_active() => Ok(()),
-        V11ShadowMode::On => Err(AttestError::FeatureDisabled),
-        V11ShadowMode::Off => Err(AttestError::FeatureDisabled),
+        V1ShadowMode::On if v1_attest_route_active() => Ok(()),
+        V1ShadowMode::On => Err(AttestError::FeatureDisabled),
+        V1ShadowMode::Off => Err(AttestError::FeatureDisabled),
     }
 }
 
@@ -1006,7 +1006,7 @@ pub fn block_hash_for_anchor_height(
 /// Resolve Bitcoin locator from still-live pending publishes (partial path).
 ///
 /// Yields `(reveal_txid, inclusion_block_hash)` when both can be resolved:
-/// - `txid` from `v11_pending_publishes.reveal_txid` for this Pk
+/// - `txid` from `v1_pending_publishes.reveal_txid` for this Pk
 /// - `block_hash` via [`block_hash_for_anchor_height`] — tip hash when the
 ///   nullifier sits at the tip, otherwise the `block_log` hash for the
 ///   inclusion height (so a completed anchor at height `h` with tip
@@ -1020,7 +1020,7 @@ pub(crate) async fn resolve_anchor_locator(
     pk: &[u8; 32],
     nullifier_height: u64,
 ) -> Result<(Option<[u8; 32]>, Option<[u8; 32]>), AttestError> {
-    let pending = db_v11::load_pending_publish(adapter.pool(), *pk)
+    let pending = db_v1::load_pending_publish(adapter.pool(), *pk)
         .await
         .map_err(|e| AttestError::Internal(format!("load pending publish: {e}")))?;
     let txid = pending.and_then(|p| p.reveal_txid);
@@ -1408,7 +1408,7 @@ mod tests {
 
     #[test]
     fn feature_disabled_when_flag_off() {
-        let err = ensure_v11_attest_path(V11ShadowMode::Off).unwrap_err();
+        let err = ensure_v1_attest_path(V1ShadowMode::Off).unwrap_err();
         assert_eq!(err.http_status_and_code(), (404, "feature_disabled"));
     }
 
@@ -1756,13 +1756,13 @@ mod tests {
         use crate::test_db::setup_pool;
 
         // Process claim is monotonic; nextest isolates per test. No clear.
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
 
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
-        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
-            .expect("claim v11");
+            .expect("claim v1");
 
         let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
             .await
@@ -1842,7 +1842,7 @@ mod tests {
 
         // Retain reveal_txid for this node's own publish of the nullifier.
         sqlx::query(
-            "INSERT INTO v11_pending_publishes \
+            "INSERT INTO v1_pending_publishes \
              (pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
               commit_tx, reveal_tx, commit_txid, reveal_txid, status, created_at, updated_at) \
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'reveal_broadcast',NOW(),NOW())",

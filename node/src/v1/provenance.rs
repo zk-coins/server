@@ -68,19 +68,19 @@
 //! | `node::account_node::canary_recursion` | all-`None` sources for a circuit-compat probe (not a user transition) |
 //! | `program-plonky2` unit tests / `recursion_shape_probe` | legacy-only tests |
 //!
-//! No symbol under `node::v11` names `InCoinSourceWitness`. The v1.1
+//! No symbol under `node::v1` names `InCoinSourceWitness`. The v1.1
 //! transition surface is [`TransitionWitness`] with `input_auth` /
 //! `received_auth` only — the legacy witness type is **unrepresentable**
 //! there (no field, no parameter, no constructor path).
 //!
 //! ## Boundary (process claim is the capability)
 //!
-//! - [`begin_v11_send`] is the **only** public orchestration entry that
+//! - [`begin_v1_send`] is the **only** public orchestration entry that
 //!   stages a v1.1 spend from the node. It consults the boot-time
-//!   [`ScanStackMode::V11`] claim; the mode is **not** a parameter.
+//!   [`ScanStackMode::V1`] claim; the mode is **not** a parameter.
 //! - The raw engine sink is module-private ([`engine_begin_send`]).
 //! - Under a v1.1 claim, residual legacy [`crate::account_node::AccountNode::send_coins`]
-//!   is refused ([`refuse_legacy_send_under_v11`]) so a process that
+//!   is refused ([`refuse_legacy_send_under_v1`]) so a process that
 //!   claimed v1.1 cannot still feed `InCoinSourceWitness` into a prove.
 //! - Flag off / Legacy claim: refuse gate is open; legacy `send_coins`
 //!   behaviour is byte-identical (this module does not touch its body).
@@ -99,31 +99,31 @@ use super::separation::{process_stack_mode, ScanStackMode};
 
 /// Refusal when the process has claimed the v1.1 stack but a caller still
 /// tries the legacy `send_coins` path (which builds `InCoinSourceWitness`).
-pub const LEGACY_SEND_REFUSED_UNDER_V11: &str =
-    "legacy send refused under ZKCOINS_V11_SHADOW=1; use the v1.1 send transition \
-     (begin_v11_send → InputAuthorization / CoinHist + creating_prev_ash). Silent \
+pub const LEGACY_SEND_REFUSED_UNDER_V1: &str =
+    "legacy send refused under ZKCOINS_V1_SHADOW=1; use the v1.1 send transition \
+     (begin_v1_send → InputAuthorization / CoinHist + creating_prev_ash). Silent \
      fall-back to InCoinSourceWitness / source-aggregator is forbidden";
 
 /// Refusal when the process claim is not v1.1 — the CoinHist provenance
 /// path is not dual-accepted on the legacy stack.
-pub const V11_PROVENANCE_SHADOW_OFF: &str =
-    "ZKCOINS_V11_SHADOW is off — refusing v1.1 CoinHist/creating-proof provenance path \
+pub const V1_PROVENANCE_SHADOW_OFF: &str =
+    "ZKCOINS_V1_SHADOW is off — refusing v1.1 CoinHist/creating-proof provenance path \
      (legacy InCoinSourceWitness send remains the default)";
 
 /// Gate the v1.1 provenance / send path on the **process stack claim**.
 ///
 /// | process claim | result |
 /// |---|---|
-/// | `Some(V11)` | allowed |
-/// | `Some(Legacy)` | refuse ([`V11_PROVENANCE_SHADOW_OFF`]) |
+/// | `Some(V1)` | allowed |
+/// | `Some(Legacy)` | refuse ([`V1_PROVENANCE_SHADOW_OFF`]) |
 /// | `None` | refuse (unclaimed — no silent fall-through) |
-pub fn ensure_v11_provenance_path() -> Result<()> {
+pub fn ensure_v1_provenance_path() -> Result<()> {
     match process_stack_mode() {
-        Some(ScanStackMode::V11) => Ok(()),
-        Some(ScanStackMode::Legacy) => bail!(V11_PROVENANCE_SHADOW_OFF),
+        Some(ScanStackMode::V1) => Ok(()),
+        Some(ScanStackMode::Legacy) => bail!(V1_PROVENANCE_SHADOW_OFF),
         None => bail!(
             "v1.1 CoinHist/creating-proof provenance requires a process that claimed \
-             ScanStackMode::V11 at boot (ZKCOINS_V11_SHADOW=1). Process claim is unset — \
+             ScanStackMode::V1 at boot (ZKCOINS_V1_SHADOW=1). Process claim is unset — \
              refusing (no silent fall-through to InCoinSourceWitness dual-accept)"
         ),
     }
@@ -135,16 +135,16 @@ pub fn ensure_v11_provenance_path() -> Result<()> {
 ///
 /// Returns `Ok(())` when the process is **not** on the v1.1 claim (legacy
 /// / unclaimed). Fail-loud under v1.1 — never a silent allow.
-pub fn refuse_legacy_send_under_v11() -> Result<(), &'static str> {
+pub fn refuse_legacy_send_under_v1() -> Result<(), &'static str> {
     match process_stack_mode() {
-        Some(ScanStackMode::V11) => Err(LEGACY_SEND_REFUSED_UNDER_V11),
+        Some(ScanStackMode::V1) => Err(LEGACY_SEND_REFUSED_UNDER_V1),
         Some(ScanStackMode::Legacy) | None => Ok(()),
     }
 }
 
 /// Begin a §2.3.2 send through the v1.1 [`StateEngine`].
 ///
-/// Requires a process claim of [`ScanStackMode::V11`]. The mode is **not**
+/// Requires a process claim of [`ScanStackMode::V1`]. The mode is **not**
 /// a parameter — callers cannot hand in `On` while the flag is off.
 ///
 /// Provenance for each spent input is **derived** inside the engine from
@@ -156,8 +156,8 @@ pub fn refuse_legacy_send_under_v11() -> Result<(), &'static str> {
 /// After the engine returns, this entry **re-checks** every input's
 /// CoinHist opening so a regression that re-introduces empty/dummy
 /// history proofs fails loud at the host boundary (not only in-circuit).
-pub fn begin_v11_send(engine: &StateEngine, req: SendRequest) -> Result<PendingTransition> {
-    ensure_v11_provenance_path()?;
+pub fn begin_v1_send(engine: &StateEngine, req: SendRequest) -> Result<PendingTransition> {
+    ensure_v1_provenance_path()?;
     let pending = engine_begin_send(engine, req).context("v1.1 begin_send")?;
     assert_spend_provenance_is_coinhist(&pending)
         .context("v1.1 spend provenance boundary (CoinHist / InputAuthorization)")?;
@@ -167,7 +167,7 @@ pub fn begin_v11_send(engine: &StateEngine, req: SendRequest) -> Result<PendingT
 /// Raw `StateEngine::begin_send` sink.
 ///
 /// **Module-private.** Possession of a path to this function is not exposed
-/// outside `provenance` — the public orchestration entry is [`begin_v11_send`],
+/// outside `provenance` — the public orchestration entry is [`begin_v1_send`],
 /// which obtains the process-stack capability first and re-asserts CoinHist
 /// provenance. A compile-fail UI test pins that this symbol is unreachable
 /// from outside the module.
@@ -224,7 +224,7 @@ fn assert_spend_provenance_is_coinhist(pending: &PendingTransition) -> Result<()
     // "send" entry cannot smuggle a half-built receive.
     ensure!(
         w.received_coins.is_empty() && w.received_auth.is_empty(),
-        "begin_v11_send stages a pure send; received_* must be empty (use begin_receive / G3)"
+        "begin_v1_send stages a pure send; received_* must be empty (use begin_receive / G3)"
     );
 
     Ok(())
@@ -314,8 +314,8 @@ pub fn assert_receive_provenance_is_creating_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v11::mode::V11ShadowMode;
-    use crate::v11::separation::{
+    use crate::v1::mode::V1ShadowMode;
+    use crate::v1::separation::{
         claim_process_stack_from_shadow_mode,
         set_process_stack_mode, ScanStackMode,
     };
@@ -365,10 +365,10 @@ mod tests {
         }
     }
 
-    fn with_v11_process_claim<R>(f: impl FnOnce() -> R) -> R {
+    fn with_v1_process_claim<R>(f: impl FnOnce() -> R) -> R {
         // Process claim is monotonic and un-clearable outside stack-policy's
         // own cfg(test). Rely on process-per-test isolation (nextest).
-        claim_process_stack_from_shadow_mode(V11ShadowMode::On);
+        claim_process_stack_from_shadow_mode(V1ShadowMode::On);
         f()
     }
 
@@ -502,7 +502,7 @@ mod tests {
 
     /// Flag-off / unclaimed: v1.1 provenance path is refused (no dual-accept).
     #[test]
-    fn begin_v11_send_refuses_when_shadow_flag_off() {
+    fn begin_v1_send_refuses_when_shadow_flag_off() {
         let (engine, owner, coins, next_pubkey) = seeded_spendable_engine();
         let req = SendRequest {
             owner,
@@ -516,19 +516,19 @@ mod tests {
             npk_rand: [0x73; 32],
         };
 
-        let err = begin_v11_send(&engine, req.clone())
+        let err = begin_v1_send(&engine, req.clone())
             .expect_err("unclaimed process must refuse v1.1 send");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("ZKCOINS_V11_SHADOW") || msg.contains("ScanStackMode::V11"),
+            msg.contains("ZKCOINS_V1_SHADOW") || msg.contains("ScanStackMode::V1"),
             "unexpected error: {msg}"
         );
 
         set_process_stack_mode(ScanStackMode::Legacy);
-        let err = begin_v11_send(&engine, req).expect_err("legacy claim must refuse v1.1 send");
+        let err = begin_v1_send(&engine, req).expect_err("legacy claim must refuse v1.1 send");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("ZKCOINS_V11_SHADOW is off"),
+            msg.contains("ZKCOINS_V1_SHADOW is off"),
             "unexpected error: {msg}"
         );
     }
@@ -537,8 +537,8 @@ mod tests {
     /// `InputAuthorization` (clause 2(b)(c) + sequential clause 8) — not
     /// through `InCoinSourceWitness` / the source aggregator.
     #[test]
-    fn v11_send_establishes_provenance_via_coinhist_input_auth() {
-        with_v11_process_claim(|| {
+    fn v1_send_establishes_provenance_via_coinhist_input_auth() {
+        with_v1_process_claim(|| {
             let (engine, owner, coins, next_pubkey) = seeded_spendable_engine();
             let prior_root = engine
                 .account(&owner)
@@ -546,7 +546,7 @@ mod tests {
                 .state
                 .coin_history_root;
 
-            let pending = begin_v11_send(
+            let pending = begin_v1_send(
                 &engine,
                 SendRequest {
                     owner,
@@ -560,7 +560,7 @@ mod tests {
                     npk_rand: [0x73; 32],
                 },
             )
-            .expect("flag-on begin_v11_send must succeed");
+            .expect("flag-on begin_v1_send must succeed");
 
             assert_eq!(pending.mode, TransitionMode::AccountUpdateProof);
             assert_eq!(pending.witness_wip.input_auth.len(), 2);
@@ -610,7 +610,7 @@ mod tests {
     /// (clause 10) — type-level and value-level. Complements G3's
     /// `ReceivedCoinSlot` (no `Option` around creating_proof).
     #[test]
-    fn v11_receive_provenance_is_creating_proof_not_source_witness() {
+    fn v1_receive_provenance_is_creating_proof_not_source_witness() {
         let owner = Address([0xB0; 32]);
         let asset_id = host::digest_from_bytes(&[0xAA; 32]).unwrap();
         let creating_prev_ash = host::digest_from_bytes(&[0xC1; 32]).unwrap();
@@ -678,18 +678,18 @@ mod tests {
     }
 
     /// Unclaimed / Legacy: refuse gate stays open (process claim is monotonic;
-    /// V11 refusal is a separate process — see `refuse_legacy_send_under_v11_claim`).
+    /// V1 refusal is a separate process — see `refuse_legacy_send_under_v1_claim`).
     #[test]
     fn refuse_legacy_send_allows_unclaimed_and_legacy() {
-        assert!(refuse_legacy_send_under_v11().is_ok());
+        assert!(refuse_legacy_send_under_v1().is_ok());
         set_process_stack_mode(ScanStackMode::Legacy);
-        assert!(refuse_legacy_send_under_v11().is_ok());
+        assert!(refuse_legacy_send_under_v1().is_ok());
     }
 
     #[test]
-    fn refuse_legacy_send_under_v11_claim() {
-        set_process_stack_mode(ScanStackMode::V11);
-        let err = refuse_legacy_send_under_v11().expect_err("must refuse");
+    fn refuse_legacy_send_under_v1_claim() {
+        set_process_stack_mode(ScanStackMode::V1);
+        let err = refuse_legacy_send_under_v1().expect_err("must refuse");
         assert!(
             err.contains("legacy send refused") || err.contains("InCoinSourceWitness"),
             "unexpected: {err}"
@@ -700,27 +700,27 @@ mod tests {
     /// refuse gate open so legacy `send_coins` stays the default.
     #[test]
     fn flag_off_legacy_send_gate_stays_open() {
-        assert!(refuse_legacy_send_under_v11().is_ok());
+        assert!(refuse_legacy_send_under_v1().is_ok());
         set_process_stack_mode(ScanStackMode::Legacy);
-        assert!(refuse_legacy_send_under_v11().is_ok());
+        assert!(refuse_legacy_send_under_v1().is_ok());
     }
 
     #[test]
-    fn ensure_v11_provenance_path_refuses_unclaimed_and_legacy() {
+    fn ensure_v1_provenance_path_refuses_unclaimed_and_legacy() {
         assert!(
-            ensure_v11_provenance_path().is_err(),
+            ensure_v1_provenance_path().is_err(),
             "unclaimed must refuse"
         );
         set_process_stack_mode(ScanStackMode::Legacy);
         assert!(
-            ensure_v11_provenance_path().is_err(),
+            ensure_v1_provenance_path().is_err(),
             "legacy must refuse"
         );
     }
 
     #[test]
-    fn ensure_v11_provenance_path_allows_v11_claim() {
-        set_process_stack_mode(ScanStackMode::V11);
-        assert!(ensure_v11_provenance_path().is_ok());
+    fn ensure_v1_provenance_path_allows_v1_claim() {
+        set_process_stack_mode(ScanStackMode::V1);
+        assert!(ensure_v1_provenance_path().is_ok());
     }
 }

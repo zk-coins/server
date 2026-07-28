@@ -1,9 +1,10 @@
-//! zkCoins protocol foundations — spec v1.1 (`shared::spec_v1`).
+//! zkCoins protocol foundations — protocol version v1, edition spec-v1.2
+//! (`shared::spec_v1`).
 //!
 //! Self-contained namespace for the Poseidon/`Hc` primitive, field encodings,
 //! derivation functions, canonical serializations, and the tree/log/SMT
 //! hashing helpers defined in the normative specification (`docs` repository,
-//! `docs/specification.md` at tag `spec-v1.1`) §§1.1, 1.4–1.7, 2.2,
+//! `docs/specification.md` at tag `spec-v1.2`) §§1.1, 1.4–1.7, 2.2,
 //! 2.5, 6.5. Does **not** replace the old-model types in `shared::` root or
 //! `zkcoins_program::types`.
 

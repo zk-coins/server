@@ -1,6 +1,6 @@
 //! v1.1 receive as a real state transition (Cutover Gap G3).
 //!
-//! Behind `ZKCOINS_V11_SHADOW=1` a receive is no longer bookkeeping into a
+//! Behind `ZKCOINS_V1_SHADOW=1` a receive is no longer bookkeeping into a
 //! legacy `coin_queue`. It is a full §2.3.3 transition:
 //!
 //! 1. **Host clause-10 verification** for every received slot (creating
@@ -30,7 +30,7 @@
 //! Persistence stores more than the compliance proof and `(Pk, R, R′)`:
 //! the Schnorr `s`, the full [`BatchMember`] (incl. build tip), and — once
 //! constructed — the raw commit/reveal transactions, in
-//! `v11_pending_publishes` (migration 0021). Status machine:
+//! `v1_pending_publishes` (migration 0021). Status machine:
 //! `members_ready → constructed → commit_broadcast → reveal_broadcast`.
 //!
 //! Engine snapshot and `members_ready` land in **one transaction**, so the
@@ -112,17 +112,17 @@ use zkcoins_prover::state_engine::{
 };
 
 use super::adapter::EngineAdapter;
-use super::db_v11::{
+use super::db_v1::{
     self, PENDING_PUBLISH_COMMIT_BROADCAST, PENDING_PUBLISH_CONSTRUCTED,
     PENDING_PUBLISH_MEMBERS_READY, PENDING_PUBLISH_REVEAL_BROADCAST,
 };
-use super::publish::V11Publisher;
-use super::separation::{process_stack_mode, require_v11_process_for_nflog_write, ScanStackMode};
+use super::publish::V1Publisher;
+use super::separation::{process_stack_mode, require_v1_process_for_nflog_write, ScanStackMode};
 
 /// Error prefix when the legacy bookkeeping receive is attempted under the
 /// v1.1 process claim. Surfaces in residual legacy entry points.
-pub const LEGACY_RECEIVE_REFUSED_UNDER_V11: &str =
-    "legacy receive refused under ZKCOINS_V11_SHADOW=1; use the v1.1 receive transition \
+pub const LEGACY_RECEIVE_REFUSED_UNDER_V1: &str =
+    "legacy receive refused under ZKCOINS_V1_SHADOW=1; use the v1.1 receive transition \
      (begin_receive → compliance proof → AggregateStateNullifierV3). Silent fall-back to \
      bookkeeping is forbidden";
 
@@ -185,7 +185,7 @@ impl ReceivedCoinSlot {
 /// `op_secret` and the entry `send_counter` of the pending transition (§1.4).
 /// A caller-supplied value is unrepresentable on this type.
 #[derive(Clone, Debug)]
-pub struct V11ReceiveRequest {
+pub struct V1ReceiveRequest {
     pub owner: Address,
     pub nk: [u8; 32],
     /// Nav-rand secret (A/4'; operational bundle). Debug-redacted.
@@ -198,7 +198,7 @@ pub struct V11ReceiveRequest {
 
 /// Outcome of a successful v1.1 receive (prove + apply + publish + persist).
 #[derive(Clone, Debug)]
-pub struct V11ReceiveOutcome {
+pub struct V1ReceiveOutcome {
     /// On-chain nullifier `(Pkᵢ, Rᵢ)` of **this** receive transition.
     pub nullifier: ([u8; 32], [u8; 32]),
     /// Receiver account owner.
@@ -227,7 +227,7 @@ pub struct PublishedBatchSummary {
 ///
 /// Not part of the `node` public surface: a downstream crate that depends only
 /// on `node` cannot name this trait, call it via UFCS, or substitute its own
-/// implementation. Production callers hold a [`V11Publisher`]; tests inside
+/// implementation. Production callers hold a [`V1Publisher`]; tests inside
 /// this crate implement the trait for doubles such as `RecordingPublisher`.
 ///
 /// Durable crash recovery uses [`Self::try_prepare`] when the implementation
@@ -257,21 +257,21 @@ pub(crate) trait NullifierBatchPublisher {
     }
 }
 
-impl NullifierBatchPublisher for V11Publisher {
+impl NullifierBatchPublisher for V1Publisher {
     fn publish_batch(&self, members: &[BatchMember]) -> Result<PublishedBatch> {
-        V11Publisher::publish_batch(self, members)
+        V1Publisher::publish_batch(self, members)
     }
 
     fn try_prepare(&self, members: &[BatchMember]) -> Result<Option<PreparedBatch>> {
-        V11Publisher::try_prepare(self, members)
+        V1Publisher::try_prepare(self, members)
     }
 
     fn broadcast_commit(&self, prepared: &PreparedBatch) -> Result<bitcoin::Txid> {
-        V11Publisher::broadcast_commit(self, prepared)
+        V1Publisher::broadcast_commit(self, prepared)
     }
 
     fn broadcast_reveal(&self, prepared: &PreparedBatch) -> Result<bitcoin::Txid> {
-        V11Publisher::broadcast_reveal(self, prepared)
+        V1Publisher::broadcast_reveal(self, prepared)
     }
 }
 
@@ -281,9 +281,9 @@ impl NullifierBatchPublisher for V11Publisher {
 ///
 /// Returns `Ok(())` when the process is **not** on the v1.1 claim (legacy
 /// / unclaimed). Fail-loud under v1.1 — never a silent allow.
-pub fn refuse_legacy_receive_under_v11() -> Result<(), &'static str> {
+pub fn refuse_legacy_receive_under_v1() -> Result<(), &'static str> {
     match process_stack_mode() {
-        Some(ScanStackMode::V11) => Err(LEGACY_RECEIVE_REFUSED_UNDER_V11),
+        Some(ScanStackMode::V1) => Err(LEGACY_RECEIVE_REFUSED_UNDER_V1),
         Some(ScanStackMode::Legacy) | None => Ok(()),
     }
 }
@@ -295,9 +295,9 @@ pub fn refuse_legacy_receive_under_v11() -> Result<(), &'static str> {
 /// `pending.proof_data` (G4) and call [`finalise_publish_persist`].
 pub fn verify_and_begin_receive(
     engine: &StateEngine,
-    req: V11ReceiveRequest,
+    req: V1ReceiveRequest,
 ) -> Result<PendingTransition> {
-    require_v11_process_for_nflog_write()
+    require_v1_process_for_nflog_write()
         .context("v1.1 receive: exclusive stack claim required (no legacy fall-back)")?;
 
     ensure!(
@@ -352,7 +352,7 @@ pub fn verify_and_begin_receive(
 ///    pending witness is self-contained).
 /// 2. Acquire [`EngineAdapter::lock_writes`] (serialises vs scanner restore).
 /// 3. Apply account (NfLog untouched); full live re-validation after prove.
-/// 4. **Atomic** engine persist + `v11_pending_publishes` `members_ready`.
+/// 4. **Atomic** engine persist + `v1_pending_publishes` `members_ready`.
 /// 5. Release write gate; construct/broadcast outside the gate.
 /// 6. Outcome is decided from **this** transition (applied account +
 ///    successful publish), never from a global NfLog size anyone can move.
@@ -363,14 +363,14 @@ pub async fn finalise_publish_persist(
     adapter: &EngineAdapter,
     pending: PendingTransition,
     signature: TransitionSignature,
-    publisher: &V11Publisher,
+    publisher: &V1Publisher,
     build_tip: BlockAnchor,
-) -> Result<V11ReceiveOutcome> {
+) -> Result<V1ReceiveOutcome> {
     finalise_publish_persist_with(adapter, pending, signature, publisher, build_tip).await
 }
 
 /// Crate-private generic path — production uses [`finalise_publish_persist`]
-/// with [`V11Publisher`]; in-crate tests substitute a
+/// with [`V1Publisher`]; in-crate tests substitute a
 /// [`NullifierBatchPublisher`] double.
 pub(crate) async fn finalise_publish_persist_with(
     adapter: &EngineAdapter,
@@ -378,8 +378,8 @@ pub(crate) async fn finalise_publish_persist_with(
     signature: TransitionSignature,
     publisher: &impl NullifierBatchPublisher,
     build_tip: BlockAnchor,
-) -> Result<V11ReceiveOutcome> {
-    require_v11_process_for_nflog_write()
+) -> Result<V1ReceiveOutcome> {
+    require_v1_process_for_nflog_write()
         .context("v1.1 receive finalise: exclusive stack claim required")?;
 
     // 1. Prove with neither write_gate nor live-engine mutex.
@@ -421,16 +421,16 @@ pub(crate) async fn finalise_publish_persist_with(
 /// |-------------------|--------|----------|
 /// | account / tip→`size_final` / NAV / anchors / CoinHist / own-Pk | live engine | [`StateEngine::apply_proved_transition`] |
 /// | proved envelope (proof + witness) | **capability** (prove path only) | possession is the proof |
-/// | `build_tip` (→ `BatchMember` + `v11_pending_publishes`) | **caller** | equals pre-apply snapshot `(tip_height, tip_hash)` |
+/// | `build_tip` (→ `BatchMember` + `v1_pending_publishes`) | **caller** | equals pre-apply snapshot `(tip_height, tip_hash)` |
 /// | commit `signature` (→ member `s` + `r_prime`) | **caller** | byte-equal to the proved envelope signature |
 /// | outcome `admitted_coin_ids` / `new_send_counter` | this transition | taken from the proved witness, not a post-gate live re-read |
 pub async fn commit_proved_receive(
     adapter: &EngineAdapter,
     proved_pending: zkcoins_prover::state_engine::ProvedPendingTransition,
     signature: TransitionSignature,
-    publisher: &V11Publisher,
+    publisher: &V1Publisher,
     build_tip: BlockAnchor,
-) -> Result<V11ReceiveOutcome> {
+) -> Result<V1ReceiveOutcome> {
     commit_proved_receive_with(adapter, proved_pending, signature, publisher, build_tip).await
 }
 
@@ -441,8 +441,8 @@ pub(crate) async fn commit_proved_receive_with(
     signature: TransitionSignature,
     publisher: &impl NullifierBatchPublisher,
     build_tip: BlockAnchor,
-) -> Result<V11ReceiveOutcome> {
-    require_v11_process_for_nflog_write()
+) -> Result<V1ReceiveOutcome> {
+    require_v1_process_for_nflog_write()
         .context("v1.1 receive commit: exclusive stack claim required")?;
 
     let owner = proved_pending.pending().owner;
@@ -540,7 +540,7 @@ pub(crate) async fn commit_proved_receive_with(
             }
         };
         let snap = adapter.snapshot_live();
-        if let Err(err) = db_v11::persist_engine_with_pending_members_ready(
+        if let Err(err) = db_v1::persist_engine_with_pending_members_ready(
             adapter.pool(),
             &snap,
             owner,
@@ -579,7 +579,7 @@ pub(crate) async fn commit_proved_receive_with(
     // Outcome is what *this* transition did: account credited + nullifier
     // published. A concurrent scanner append after broadcast must not flip
     // success into failure via a global NfLog size comparison.
-    Ok(V11ReceiveOutcome {
+    Ok(V1ReceiveOutcome {
         nullifier: applied.nullifier(),
         owner,
         new_send_counter,
@@ -593,7 +593,7 @@ pub(crate) async fn commit_proved_receive_with(
 /// These never appear in a pure "engine read set" derivation because they
 /// arrive from outside; they still decide what is persisted.
 fn revalidate_caller_supplied_commit_deps(
-    pre: &db_v11::EngineSnapshot,
+    pre: &db_v1::EngineSnapshot,
     build_tip: &BlockAnchor,
     signature: &TransitionSignature,
     proved_signature: &TransitionSignature,
@@ -678,7 +678,7 @@ fn broadcast_commit_idempotent(
         Err(err) if is_rebroadcast_already_done(&err) => {
             let txid = prepared.commit_txid();
             eprintln!(
-                "v11 publish: commit {txid} already known/mempool/spent — treating rebroadcast as success"
+                "v1 publish: commit {txid} already known/mempool/spent — treating rebroadcast as success"
             );
             Ok(txid)
         }
@@ -696,7 +696,7 @@ fn broadcast_reveal_idempotent(
         Err(err) if is_rebroadcast_already_done(&err) => {
             let txid = prepared.reveal_txid();
             eprintln!(
-                "v11 publish: reveal {txid} already known/mempool/spent — treating rebroadcast as success"
+                "v1 publish: reveal {txid} already known/mempool/spent — treating rebroadcast as success"
             );
             Ok(txid)
         }
@@ -718,7 +718,7 @@ async fn durable_publish_nullifier(
             let reveal_tx = serialize(&prepared.reveal_tx);
             let commit_txid = prepared.commit_txid().to_byte_array();
             let reveal_txid = prepared.reveal_txid().to_byte_array();
-            db_v11::mark_pending_publish_constructed(
+            db_v1::mark_pending_publish_constructed(
                 adapter.pool(),
                 member.sig.pk,
                 &commit_tx,
@@ -731,7 +731,7 @@ async fn durable_publish_nullifier(
 
             let commit_txid = broadcast_commit_idempotent(publisher, &prepared)
                 .context("broadcast commit after durable construct")?;
-            db_v11::mark_pending_publish_status(
+            db_v1::mark_pending_publish_status(
                 adapter.pool(),
                 member.sig.pk,
                 PENDING_PUBLISH_CONSTRUCTED,
@@ -746,7 +746,7 @@ async fn durable_publish_nullifier(
                      durable pair remains at commit_broadcast for resume"
                 )
             })?;
-            db_v11::mark_pending_publish_status(
+            db_v1::mark_pending_publish_status(
                 adapter.pool(),
                 member.sig.pk,
                 PENDING_PUBLISH_COMMIT_BROADCAST,
@@ -770,7 +770,7 @@ async fn durable_publish_nullifier(
             let published = publisher
                 .publish_batch(&members)
                 .context("publish_batch after members_ready")?;
-            db_v11::mark_pending_publish_status(
+            db_v1::mark_pending_publish_status(
                 adapter.pool(),
                 member.sig.pk,
                 PENDING_PUBLISH_MEMBERS_READY,
@@ -787,7 +787,7 @@ async fn durable_publish_nullifier(
 }
 
 fn prepared_batch_from_pending_row(
-    row: &db_v11::PendingPublishRow,
+    row: &db_v1::PendingPublishRow,
     member: &BatchMember,
 ) -> Result<PreparedBatch> {
     let commit_tx_bytes = row
@@ -829,13 +829,13 @@ fn prepared_batch_from_pending_row(
 }
 
 /// Resume a durable pending publish after crash. Reconstructs from
-/// `v11_pending_publishes` and finishes or fails loud — never invents txs.
+/// `v1_pending_publishes` and finishes or fails loud — never invents txs.
 ///
 /// Rebroadcast is **idempotent**: chain replies that the tx is already known,
 /// already in the mempool, or already spent are success signals, not errors.
 pub async fn resume_pending_publish(
     adapter: &EngineAdapter,
-    publisher: &V11Publisher,
+    publisher: &V1Publisher,
     pk: [u8; 32],
 ) -> Result<Option<PublishedBatch>> {
     resume_pending_publish_with(adapter, publisher, pk).await
@@ -847,9 +847,9 @@ pub(crate) async fn resume_pending_publish_with(
     publisher: &impl NullifierBatchPublisher,
     pk: [u8; 32],
 ) -> Result<Option<PublishedBatch>> {
-    require_v11_process_for_nflog_write()
+    require_v1_process_for_nflog_write()
         .context("resume_pending_publish: exclusive stack claim required")?;
-    let row = match db_v11::load_pending_publish(adapter.pool(), pk).await? {
+    let row = match db_v1::load_pending_publish(adapter.pool(), pk).await? {
         None => return Ok(None),
         Some(r) => r,
     };
@@ -872,7 +872,7 @@ pub(crate) async fn resume_pending_publish_with(
         "constructed" => {
             let prepared = prepared_batch_from_pending_row(&row, &member)?;
             let commit_txid = broadcast_commit_idempotent(publisher, &prepared)?;
-            db_v11::mark_pending_publish_status(
+            db_v1::mark_pending_publish_status(
                 adapter.pool(),
                 pk,
                 PENDING_PUBLISH_CONSTRUCTED,
@@ -882,7 +882,7 @@ pub(crate) async fn resume_pending_publish_with(
             let reveal_txid = broadcast_reveal_idempotent(publisher, &prepared).with_context(|| {
                 format!("resume reveal failed; commit {commit_txid} already broadcast")
             })?;
-            db_v11::mark_pending_publish_status(
+            db_v1::mark_pending_publish_status(
                 adapter.pool(),
                 pk,
                 PENDING_PUBLISH_COMMIT_BROADCAST,
@@ -904,7 +904,7 @@ pub(crate) async fn resume_pending_publish_with(
             let reveal_txid = broadcast_reveal_idempotent(publisher, &prepared).with_context(|| {
                 format!("resume reveal-only failed; commit was {commit_txid}")
             })?;
-            db_v11::mark_pending_publish_status(
+            db_v1::mark_pending_publish_status(
                 adapter.pool(),
                 pk,
                 PENDING_PUBLISH_COMMIT_BROADCAST,
@@ -942,14 +942,14 @@ pub(crate) async fn resume_pending_publish_with(
     }
 }
 
-/// Boot-time resumer: walk every non-terminal `v11_pending_publishes` row.
+/// Boot-time resumer: walk every non-terminal `v1_pending_publishes` row.
 ///
 /// Called from the v1.1 scan-loop bootstrap so pending publishes are picked
 /// up automatically rather than only by hand. Per-row failures are returned
 /// (fail loud) — operators must not silently drop a half-broadcast nullifier.
 pub async fn resume_all_pending_publishes(
     adapter: &EngineAdapter,
-    publisher: &V11Publisher,
+    publisher: &V1Publisher,
 ) -> Result<usize> {
     resume_all_pending_publishes_with(adapter, publisher).await
 }
@@ -959,9 +959,9 @@ pub(crate) async fn resume_all_pending_publishes_with(
     adapter: &EngineAdapter,
     publisher: &impl NullifierBatchPublisher,
 ) -> Result<usize> {
-    require_v11_process_for_nflog_write()
+    require_v1_process_for_nflog_write()
         .context("resume_all_pending_publishes: exclusive stack claim required")?;
-    let rows = db_v11::list_resumable_pending_publishes(adapter.pool()).await?;
+    let rows = db_v1::list_resumable_pending_publishes(adapter.pool()).await?;
     let mut completed = 0usize;
     for row in rows {
         resume_pending_publish_with(adapter, publisher, row.pk)
@@ -982,24 +982,24 @@ pub(crate) async fn resume_all_pending_publishes_with(
 
 /// Full production path: host clause-10 → begin → prove/apply (no NfLog) →
 /// persist intent → publish. Scanner folds the nullifier on inclusion.
-pub async fn execute_v11_receive(
+pub async fn execute_v1_receive(
     adapter: &EngineAdapter,
-    req: V11ReceiveRequest,
+    req: V1ReceiveRequest,
     signature: TransitionSignature,
-    publisher: &V11Publisher,
+    publisher: &V1Publisher,
     build_tip: BlockAnchor,
-) -> Result<V11ReceiveOutcome> {
-    execute_v11_receive_with(adapter, req, signature, publisher, build_tip).await
+) -> Result<V1ReceiveOutcome> {
+    execute_v1_receive_with(adapter, req, signature, publisher, build_tip).await
 }
 
-/// Crate-private generic path — see [`execute_v11_receive`].
-pub(crate) async fn execute_v11_receive_with(
+/// Crate-private generic path — see [`execute_v1_receive`].
+pub(crate) async fn execute_v1_receive_with(
     adapter: &EngineAdapter,
-    req: V11ReceiveRequest,
+    req: V1ReceiveRequest,
     signature: TransitionSignature,
     publisher: &impl NullifierBatchPublisher,
     build_tip: BlockAnchor,
-) -> Result<V11ReceiveOutcome> {
+) -> Result<V1ReceiveOutcome> {
     let pending = adapter.with_engine(|engine| verify_and_begin_receive(engine, req))?;
     finalise_publish_persist_with(adapter, pending, signature, publisher, build_tip).await
 }
@@ -1337,7 +1337,7 @@ fn _network_pin(_n: Network) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v11::separation::{
+    use crate::v1::separation::{
         set_process_stack_mode, ScanStackMode,
     };
     use bitcoin::{Amount, ScriptBuf, TxOut, Txid};
@@ -1391,7 +1391,7 @@ mod tests {
         }
         fn dummy_prepared(member: &BatchMember) -> PreparedBatch {
             // Distinct lock_time from pk/r so each member has unique txids
-            // (unique index on commit_txid in v11_pending_publishes).
+            // (unique index on commit_txid in v1_pending_publishes).
             let commit_lock = u32::from_le_bytes(member.sig.pk[0..4].try_into().unwrap());
             let reveal_lock = u32::from_le_bytes(member.sig.r[0..4].try_into().unwrap());
             let signed_commit = Transaction {
@@ -1556,19 +1556,19 @@ mod tests {
         }
     }
 
-    /// Unclaimed / Legacy: refuse gate stays open. V11 refusal is a separate
+    /// Unclaimed / Legacy: refuse gate stays open. V1 refusal is a separate
     /// process (claim is monotonic; no external reset).
     #[test]
     fn refuse_legacy_receive_allows_unclaimed_and_legacy() {
-        assert!(refuse_legacy_receive_under_v11().is_ok());
+        assert!(refuse_legacy_receive_under_v1().is_ok());
         set_process_stack_mode(ScanStackMode::Legacy);
-        assert!(refuse_legacy_receive_under_v11().is_ok());
+        assert!(refuse_legacy_receive_under_v1().is_ok());
     }
 
     #[test]
-    fn refuse_legacy_receive_under_v11_claim() {
-        set_process_stack_mode(ScanStackMode::V11);
-        let err = refuse_legacy_receive_under_v11().expect_err("must refuse");
+    fn refuse_legacy_receive_under_v1_claim() {
+        set_process_stack_mode(ScanStackMode::V1);
+        let err = refuse_legacy_receive_under_v1().expect_err("must refuse");
         assert!(
             err.contains("legacy receive refused") || err.contains("v1.1 receive"),
             "unexpected: {err}"
@@ -1581,9 +1581,9 @@ mod tests {
         // unclaimed or legacy-claimed, the refuse gate is open. The legacy
         // `receive_coin_into` body is not modified; existing account_node
         // tests exercise its bit-for-bit behaviour.
-        assert!(refuse_legacy_receive_under_v11().is_ok());
+        assert!(refuse_legacy_receive_under_v1().is_ok());
         set_process_stack_mode(ScanStackMode::Legacy);
-        assert!(refuse_legacy_receive_under_v11().is_ok());
+        assert!(refuse_legacy_receive_under_v1().is_ok());
     }
 
     #[test]
@@ -1606,8 +1606,8 @@ mod tests {
             .expect("normative V.8 S2C opening must verify");
 
         // Same R with a wrong R' (still a valid x-only point) must fail.
-        let (_, wrong_r_prime) = two_xonly(b"v11-rx/wrong-rp-a", b"v11-rx/wrong-rp-b");
-        let (pk, _) = two_xonly(b"v11-rx/pk-a", b"v11-rx/pk-b");
+        let (_, wrong_r_prime) = two_xonly(b"v1-rx/wrong-rp-a", b"v1-rx/wrong-rp-b");
+        let (pk, _) = two_xonly(b"v1-rx/pk-a", b"v1-rx/pk-b");
         let opening = NullifierOpening {
             public_key: pk,
             signature_r: r,
@@ -1628,8 +1628,8 @@ mod tests {
     #[test]
     fn clause10_rejects_pk_mismatch_with_consumed_pubkey() {
         let pd = sample_proof_data(2);
-        let (pk, _) = two_xonly(b"v11-rx/pk-match", b"v11-rx/pk-other");
-        let (r, r_prime) = two_xonly(b"v11-rx/r", b"v11-rx/rp");
+        let (pk, _) = two_xonly(b"v1-rx/pk-match", b"v1-rx/pk-other");
+        let (r, r_prime) = two_xonly(b"v1-rx/r", b"v1-rx/rp");
         let opening = NullifierOpening {
             public_key: pk,
             signature_r: r,
@@ -1661,12 +1661,12 @@ mod tests {
             "above-limit must be rejected by length gate"
         );
 
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
         let engine = StateEngine::new(Network::Regtest, 0);
         // Empty slots → fails "at least one" before MAX check.
         let err = verify_and_begin_receive(
             &engine,
-            V11ReceiveRequest {
+            V1ReceiveRequest {
                 owner: Address([0; 32]),
                 nk: [1; 32],
                 op_secret: OpSecret::new([4; 32]),
@@ -1933,8 +1933,8 @@ mod tests {
 
         let mut engine = StateEngine::new(Network::Regtest, 0);
         engine.set_tip_height(50);
-        let pk = xonly_from_label(b"v11-rx/scan-auth/pk");
-        let r = xonly_from_label(b"v11-rx/scan-auth/r");
+        let pk = xonly_from_label(b"v1-rx/scan-auth/pk");
+        let r = xonly_from_label(b"v1-rx/scan-auth/r");
         // Only via from_survivor (scan-path mint of the capability).
         let scanned = ScannedNullifier::from_survivor(&shared::spec_v1::PublishedNullifier {
             chain_pos: pos(20, 0),
@@ -1948,36 +1948,36 @@ mod tests {
 
     /// Crash window that was previously unrecoverable: account advanced on
     /// disk without durable Schnorr `s`. Atomic
-    /// [`db_v11::persist_engine_with_pending_members_ready`] closes it —
+    /// [`db_v1::persist_engine_with_pending_members_ready`] closes it —
     /// after the transaction both account and `members_ready` are present,
     /// and resume can reconstruct from the pending row alone.
     #[tokio::test]
     async fn crash_window_atomic_engine_and_members_ready_is_recoverable() {
         use crate::test_db::setup_pool;
-        use crate::v11::db_v11::{self, EngineSnapshot};
-        use crate::v11::separation::claim_stack_scan_mode;
-        use crate::v11::EngineAdapter;
+        use crate::v1::db_v1::{self, EngineSnapshot};
+        use crate::v1::separation::claim_stack_scan_mode;
+        use crate::v1::EngineAdapter;
 
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
 
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
-        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
-            .expect("claim v11");
+            .expect("claim v1");
 
         let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
             .await
             .expect("adapter");
 
-        let nk: [u8; 32] = Sha256::digest(b"v11-rx/crash/nk").into();
-        let current_pubkey = xonly_from_label(b"v11-rx/crash/sk0");
-        let next_pubkey = xonly_from_label(b"v11-rx/crash/sk1");
+        let nk: [u8; 32] = Sha256::digest(b"v1-rx/crash/nk").into();
+        let current_pubkey = xonly_from_label(b"v1-rx/crash/sk0");
+        let next_pubkey = xonly_from_label(b"v1-rx/crash/sk1");
         let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
         let pk = current_pubkey;
-        let r = xonly_from_label(b"v11-rx/crash/r");
+        let r = xonly_from_label(b"v1-rx/crash/r");
         let s = [0x5Au8; 32];
-        let r_prime = xonly_from_label(b"v11-rx/crash/rp");
+        let r_prime = xonly_from_label(b"v1-rx/crash/rp");
 
         // Simulate post-apply account (last_nullifier set, pos None).
         adapter
@@ -2013,7 +2013,7 @@ mod tests {
             .expect("mutate");
 
         let snap = adapter.snapshot_live();
-        db_v11::persist_engine_with_pending_members_ready(
+        db_v1::persist_engine_with_pending_members_ready(
             &pool,
             &snap,
             owner,
@@ -2036,11 +2036,11 @@ mod tests {
             assert!(rec.last_nullifier.is_some());
             assert!(rec.last_nullifier_pos.is_none());
         });
-        let pending = db_v11::load_pending_publish(&pool, pk)
+        let pending = db_v1::load_pending_publish(&pool, pk)
             .await
             .expect("load")
             .expect("members_ready row must exist — previously unrecoverable without s");
-        assert_eq!(pending.status, db_v11::PENDING_PUBLISH_MEMBERS_READY);
+        assert_eq!(pending.status, db_v1::PENDING_PUBLISH_MEMBERS_READY);
         assert_eq!(pending.s, s);
         assert_eq!(pending.r, r);
 
@@ -2051,11 +2051,11 @@ mod tests {
             .expect("resume")
             .expect("should produce a batch");
         assert_eq!(published.aggregate.members.len(), 1);
-        let after = db_v11::load_pending_publish(&pool, pk)
+        let after = db_v1::load_pending_publish(&pool, pk)
             .await
             .expect("load")
             .expect("row");
-        assert_eq!(after.status, db_v11::PENDING_PUBLISH_REVEAL_BROADCAST);
+        assert_eq!(after.status, db_v1::PENDING_PUBLISH_REVEAL_BROADCAST);
 
         let _ = EngineSnapshot::from_engine_with_tip_hash; // keep type reachable
     }
@@ -2064,15 +2064,15 @@ mod tests {
     #[tokio::test]
     async fn rebroadcast_already_known_transaction_succeeds() {
         use crate::test_db::setup_pool;
-        use crate::v11::db_v11;
-        use crate::v11::separation::claim_stack_scan_mode;
-        use crate::v11::EngineAdapter;
+        use crate::v1::db_v1;
+        use crate::v1::separation::claim_stack_scan_mode;
+        use crate::v1::EngineAdapter;
 
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
 
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
-        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
             .expect("claim");
         // Seed empty meta so stack checks pass on writes.
@@ -2080,11 +2080,11 @@ mod tests {
             .await
             .expect("adapter");
 
-        let owner = Address(xonly_from_label(b"v11-rx/rebcast/owner"));
-        let pk = xonly_from_label(b"v11-rx/rebcast/pk");
-        let r = xonly_from_label(b"v11-rx/rebcast/r");
+        let owner = Address(xonly_from_label(b"v1-rx/rebcast/owner"));
+        let pk = xonly_from_label(b"v1-rx/rebcast/pk");
+        let r = xonly_from_label(b"v1-rx/rebcast/r");
         let s = [0x77u8; 32];
-        let r_prime = xonly_from_label(b"v11-rx/rebcast/rp");
+        let r_prime = xonly_from_label(b"v1-rx/rebcast/rp");
         let member = BatchMember {
             sig: NullifierSig { pk, r, s },
             build_tip: BlockAnchor {
@@ -2096,7 +2096,7 @@ mod tests {
         let commit_tx = serialize(&prepared.signed_commit);
         let reveal_tx = serialize(&prepared.reveal_tx);
 
-        db_v11::insert_pending_publish_members_ready(
+        db_v1::insert_pending_publish_members_ready(
             &pool,
             owner,
             pk,
@@ -2108,7 +2108,7 @@ mod tests {
         )
         .await
         .expect("members_ready");
-        db_v11::mark_pending_publish_constructed(
+        db_v1::mark_pending_publish_constructed(
             &pool,
             pk,
             &commit_tx,
@@ -2132,23 +2132,23 @@ mod tests {
         assert!(*publisher.commit_calls.lock().unwrap() >= 1);
         assert!(*publisher.reveal_calls.lock().unwrap() >= 1);
 
-        let row = db_v11::load_pending_publish(&pool, pk)
+        let row = db_v1::load_pending_publish(&pool, pk)
             .await
             .expect("load")
             .expect("row");
-        assert_eq!(row.status, db_v11::PENDING_PUBLISH_REVEAL_BROADCAST);
+        assert_eq!(row.status, db_v1::PENDING_PUBLISH_REVEAL_BROADCAST);
 
         // A genuine (non-already-done) error must still fail loud.
-        db_v11::mark_pending_publish_status(
+        db_v1::mark_pending_publish_status(
             &pool,
             pk,
-            db_v11::PENDING_PUBLISH_REVEAL_BROADCAST,
-            db_v11::PENDING_PUBLISH_FAILED,
+            db_v1::PENDING_PUBLISH_REVEAL_BROADCAST,
+            db_v1::PENDING_PUBLISH_FAILED,
         )
         .await
         .ok(); // may fail status machine; re-seed constructed path instead
         // Fresh constructed row under a different pk for the negative case.
-        let pk2 = xonly_from_label(b"v11-rx/rebcast/pk2");
+        let pk2 = xonly_from_label(b"v1-rx/rebcast/pk2");
         let member2 = BatchMember {
             sig: NullifierSig {
                 pk: pk2,
@@ -2158,7 +2158,7 @@ mod tests {
             build_tip: member.build_tip,
         };
         let prepared2 = RecordingPublisher::dummy_prepared(&member2);
-        db_v11::insert_pending_publish_members_ready(
+        db_v1::insert_pending_publish_members_ready(
             &pool,
             owner,
             pk2,
@@ -2170,7 +2170,7 @@ mod tests {
         )
         .await
         .expect("m2");
-        db_v11::mark_pending_publish_constructed(
+        db_v1::mark_pending_publish_constructed(
             &pool,
             pk2,
             &serialize(&prepared2.signed_commit),
@@ -2197,10 +2197,10 @@ mod tests {
     /// earlier slots pass host checks so the error names the rejected index.
     #[test]
     fn multi_slot_clause10_rejects_corrupt_slot_2_and_slot_4() {
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
 
-        let nk: [u8; 32] = Sha256::digest(b"v11-rx/multi/nk").into();
-        let current_pubkey = xonly_from_label(b"v11-rx/multi/sk0");
+        let nk: [u8; 32] = Sha256::digest(b"v1-rx/multi/nk").into();
+        let current_pubkey = xonly_from_label(b"v1-rx/multi/sk0");
         let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
 
         assert_eq!(MAX_RX_COINS, 4);
@@ -2287,13 +2287,13 @@ mod tests {
 
             let err = verify_and_begin_receive(
                 &engine,
-                V11ReceiveRequest {
+                V1ReceiveRequest {
                     owner,
                     nk,
                     op_secret: OpSecret::new([0x41; 32]),
                     current_pubkey,
                     slots,
-                    next_pubkey: xonly_from_label(b"v11-rx/multi/sk1"),
+                    next_pubkey: xonly_from_label(b"v1-rx/multi/sk1"),
                     npk_rand: [0x42; 32],
                 },
             )
@@ -2320,22 +2320,22 @@ mod tests {
     /// Test 3: scan reconciliation — chain ordering wins over local
     /// publication order. Two nullifiers "published" A-then-B locally, but the
     /// survivor stream presents B-then-A on chain; after the production
-    /// [`crate::v11::scan::fold_survivors_into_engine`] the NfLog
+    /// [`crate::v1::scan::fold_survivors_into_engine`] the NfLog
     /// first-occurrence order is B then A.
     ///
     /// Pure engine fold (same core as `apply_forward_scan`) — no Postgres.
     #[test]
     fn scan_reconciliation_chain_order_wins_over_local_publish_order() {
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
 
         let mut engine = StateEngine::new(Network::Regtest, 10);
         engine.set_tip_height(60);
 
         // Local "publication order" would have been A then B (synthetic).
-        let pk_a = xonly_from_label(b"v11-rx/scan/a-pk");
-        let r_a = xonly_from_label(b"v11-rx/scan/a-r");
-        let pk_b = xonly_from_label(b"v11-rx/scan/b-pk");
-        let r_b = xonly_from_label(b"v11-rx/scan/b-r");
+        let pk_a = xonly_from_label(b"v1-rx/scan/a-pk");
+        let r_a = xonly_from_label(b"v1-rx/scan/a-r");
+        let pk_b = xonly_from_label(b"v1-rx/scan/b-pk");
+        let r_b = xonly_from_label(b"v1-rx/scan/b-r");
         assert_ne!(pk_a, pk_b);
 
         // Chain survivor stream deliberately listed in reverse of "local
@@ -2365,7 +2365,7 @@ mod tests {
         ];
 
         assert_eq!(engine.nflog().nav().size, 0, "pre-scan NfLog empty");
-        let stats = crate::v11::scan::fold_survivors_into_engine(&mut engine, &survivors)
+        let stats = crate::v1::scan::fold_survivors_into_engine(&mut engine, &survivors)
             .expect("fold");
         assert_eq!(stats.appended, 2);
         assert_eq!(stats.duplicate_ignored, 0);
@@ -2406,20 +2406,20 @@ mod tests {
     /// [`production_path_receive_begin_finalise_publish_persist_reload`].
     #[test]
     fn receive_publish_leaves_nflog_to_scanner_at_real_chain_position() {
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
 
         let network = Network::Regtest;
         let activation = 10u64;
         let mut engine = StateEngine::new(network, activation);
         engine.set_tip_height(100);
 
-        let nk: [u8; 32] = Sha256::digest(b"v11-rx/ord/nk").into();
-        let current_pubkey = xonly_from_label(b"v11-rx/ord/sk0");
-        let next_pubkey = xonly_from_label(b"v11-rx/ord/sk1");
+        let nk: [u8; 32] = Sha256::digest(b"v1-rx/ord/nk").into();
+        let current_pubkey = xonly_from_label(b"v1-rx/ord/sk0");
+        let next_pubkey = xonly_from_label(b"v1-rx/ord/sk1");
         let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
 
-        let create_pk = xonly_from_label(b"v11-rx/ord/create");
-        let create_r = xonly_from_label(b"v11-rx/ord/create-r");
+        let create_pk = xonly_from_label(b"v1-rx/ord/create");
+        let create_r = xonly_from_label(b"v1-rx/ord/create-r");
         engine
             .append_nullifier(scanned(20, 0, create_pk, create_r))
             .expect("creating nf");
@@ -2435,8 +2435,8 @@ mod tests {
             asset_id,
         };
 
-        let recv_r = xonly_from_label(b"v11-rx/ord/recv-r");
-        let recv_r_prime = xonly_from_label(b"v11-rx/ord/recv-rp");
+        let recv_r = xonly_from_label(b"v1-rx/ord/recv-r");
+        let recv_r_prime = xonly_from_label(b"v1-rx/ord/recv-rp");
         let nflog_before = engine.nflog().nav().size;
         assert_eq!(nflog_before, 1, "only creating nullifier");
 
@@ -2569,7 +2569,7 @@ mod tests {
             pk: current_pubkey,
             r: recv_r,
         }];
-        crate::v11::scan::fold_survivors_into_engine(&mut engine, &survivors).expect("scan fold");
+        crate::v1::scan::fold_survivors_into_engine(&mut engine, &survivors).expect("scan fold");
 
         assert_eq!(engine.nflog().nav().size, nflog_before + 1);
         match engine.nflog().lookup(current_pubkey) {
@@ -2644,7 +2644,7 @@ mod tests {
     /// check against the proved envelope signature **before** any durable write.
     #[test]
     fn altered_commit_signature_rejected_by_caller_revalidation() {
-        let pre = crate::v11::db_v11::EngineSnapshot {
+        let pre = crate::v1::db_v1::EngineSnapshot {
             network: Network::Regtest,
             activation_height: 0,
             tip_height: 40,
@@ -2691,7 +2691,7 @@ mod tests {
     /// tip identity is a commit dependency even though the caller supplies it.
     #[test]
     fn stale_build_tip_rejected_by_caller_revalidation() {
-        let pre = crate::v11::db_v11::EngineSnapshot {
+        let pre = crate::v1::db_v1::EngineSnapshot {
             network: Network::Regtest,
             activation_height: 0,
             tip_height: 40,
@@ -2734,7 +2734,7 @@ mod tests {
     /// Shared genuine mint→send setup yielding a Bob receive pending ready for
     /// prove/commit on the sealed API (crate-internal adapter sinks only).
     async fn genuine_bob_receive_ready(
-        adapter: &crate::v11::EngineAdapter,
+        adapter: &crate::v1::EngineAdapter,
     ) -> (
         PendingTransition,
         TransitionSignature,
@@ -2764,7 +2764,7 @@ mod tests {
                 engine.begin_mint(MintRequest {
                     owner: alice_owner,
                     nk: alice_nk,
-                    op_secret: OpSecret::new(Sha256::digest(b"v11-rx/alice-op_secret").into()),
+                    op_secret: OpSecret::new(Sha256::digest(b"v1-rx/alice-op_secret").into()),
                     current_pubkey: alice_pk0,
                     next_pubkey: alice_pk1,
                     name: b"G3 sealed e2e asset".to_vec(),
@@ -2960,7 +2960,7 @@ mod tests {
             .with_engine(|engine| {
                 verify_and_begin_receive(
                     engine,
-                    V11ReceiveRequest {
+                    V1ReceiveRequest {
                         owner: bob_owner,
                         nk: bob_nk,
                         op_secret: OpSecret::new([0x41; 32]),
@@ -3004,16 +3004,16 @@ mod tests {
     #[ignore = "heavy: real Plonky2 prove + concurrent scan race; run with --ignored --release"]
     async fn concurrent_scanner_append_during_prove_still_commits() {
         use crate::test_db::setup_pool;
-        use crate::v11::db_v11;
-        use crate::v11::separation::claim_stack_scan_mode;
-        use crate::v11::EngineAdapter;
+        use crate::v1::db_v1;
+        use crate::v1::separation::claim_stack_scan_mode;
+        use crate::v1::EngineAdapter;
         use zkcoins_prover::state_engine::ScannedNullifier;
 
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
 
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
-        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
             .expect("claim");
         let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Testnet, 0)
@@ -3033,8 +3033,8 @@ mod tests {
         .expect("real prove");
 
         // Concurrent scanner append during the prove→apply window.
-        let concurrent_pk = xonly_from_label(b"v11-rx/race/concurrent-pk");
-        let concurrent_r = xonly_from_label(b"v11-rx/race/concurrent-r");
+        let concurrent_pk = xonly_from_label(b"v1-rx/race/concurrent-pk");
+        let concurrent_r = xonly_from_label(b"v1-rx/race/concurrent-r");
         adapter
             .with_engine_mut(|engine| {
                 engine
@@ -3093,13 +3093,13 @@ mod tests {
             assert!(rec.last_nullifier_pos.is_none());
         });
 
-        let pending_row = db_v11::load_pending_publish(&pool, current_pubkey)
+        let pending_row = db_v1::load_pending_publish(&pool, current_pubkey)
             .await
             .expect("load")
             .expect("durable intent");
         assert_eq!(
             pending_row.status,
-            db_v11::PENDING_PUBLISH_REVEAL_BROADCAST
+            db_v1::PENDING_PUBLISH_REVEAL_BROADCAST
         );
 
     }
@@ -3110,16 +3110,16 @@ mod tests {
     #[ignore = "heavy: real Plonky2 prove + post-broadcast race; run with --ignored --release"]
     async fn concurrent_append_after_broadcast_still_reported_success() {
         use crate::test_db::setup_pool;
-        use crate::v11::separation::claim_stack_scan_mode;
-        use crate::v11::EngineAdapter;
+        use crate::v1::separation::claim_stack_scan_mode;
+        use crate::v1::EngineAdapter;
         use std::sync::Arc;
         use zkcoins_prover::state_engine::ScannedNullifier;
 
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
 
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
-        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
             .expect("claim");
         let adapter = Arc::new(
@@ -3138,8 +3138,8 @@ mod tests {
         )
         .expect("real prove");
 
-        let concurrent_pk = xonly_from_label(b"v11-rx/race/post-bc-pk");
-        let concurrent_r = xonly_from_label(b"v11-rx/race/post-bc-r");
+        let concurrent_pk = xonly_from_label(b"v1-rx/race/post-bc-pk");
+        let concurrent_r = xonly_from_label(b"v1-rx/race/post-bc-r");
         let adapter_hook = Arc::clone(&adapter);
         let publisher = RecordingPublisher::with_on_commit(move || {
             adapter_hook
@@ -3202,15 +3202,15 @@ mod tests {
     #[ignore = "heavy: real Plonky2 prove for mint+send+receive (minutes); run with --ignored --release"]
     async fn production_path_receive_with_genuine_prove_via_verify_and_begin() {
         use crate::test_db::setup_pool;
-        use crate::v11::db_v11;
-        use crate::v11::separation::claim_stack_scan_mode;
-        use crate::v11::EngineAdapter;
+        use crate::v1::db_v1;
+        use crate::v1::separation::claim_stack_scan_mode;
+        use crate::v1::EngineAdapter;
 
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
 
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
-        claim_stack_scan_mode(&pool, ScanStackMode::V11)
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
             .expect("claim");
         let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Testnet, 0)
@@ -3255,11 +3255,11 @@ mod tests {
                 LookupResult::Absent
             ));
         });
-        let row = db_v11::load_pending_publish(&pool, bob_pk0)
+        let row = db_v1::load_pending_publish(&pool, bob_pk0)
             .await
             .expect("load")
             .expect("pending");
-        assert_eq!(row.status, db_v11::PENDING_PUBLISH_REVEAL_BROADCAST);
+        assert_eq!(row.status, db_v1::PENDING_PUBLISH_REVEAL_BROADCAST);
 
         // Boot reload (hollow fixture previously asserted this path).
         let reloaded = EngineAdapter::load_or_create(pool.clone(), Network::Testnet, 0)
@@ -3275,11 +3275,11 @@ mod tests {
                 LookupResult::Absent
             ));
         });
-        let row2 = db_v11::load_pending_publish(&pool, bob_pk0)
+        let row2 = db_v1::load_pending_publish(&pool, bob_pk0)
             .await
             .expect("load after reload")
             .expect("pending still durable");
-        assert_eq!(row2.status, db_v11::PENDING_PUBLISH_REVEAL_BROADCAST);
+        assert_eq!(row2.status, db_v1::PENDING_PUBLISH_REVEAL_BROADCAST);
 
     }
 

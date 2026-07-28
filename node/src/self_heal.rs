@@ -233,24 +233,24 @@ pub async fn heal_circuit_digest(
             //   * Do NOT wipe SMT/MMR/root-index/latest_block — structures the
             //     v1.1 stack does not use (and that the full legacy wipe would
             //     require a legacy marker to touch).
-            //   * DO wipe all v11 proof-dependent tables (NfLog, accounts,
+            //   * DO wipe all v1 proof-dependent tables (NfLog, accounts,
             //     last_proof/openings, pending publishes) plus leftover
             //     legacy `accounts`, fail non-terminal jobs (strip durable
             //     finalisation / completion_result), and store the live
-            //     binary digest (`encode_v11_live_digest(C, C_balance)` from
+            //     binary digest (`encode_v1_live_digest(C, C_balance)` from
             //     the embed). A digest-only update left stale
             //     ComplianceProofs in place; the next AccountUpdate would
             //     fail to recurse.
             // Legacy (or unclaimed) path keeps the full proof-dependent wipe.
-            match crate::v11::process_stack_mode() {
-                Some(crate::v11::ScanStackMode::V11) => {
+            match crate::v1::process_stack_mode() {
+                Some(crate::v1::ScanStackMode::V1) => {
                     warn!(
                         "Self-heal reset (v1.1) will DESTROY: \
-                         v11_pending_publishes (stale nullifier publish recovery); \
-                         v11_spendable_coins / v11_spent_coins (CoinHist leaves); \
-                         v11_accounts (multi-asset state + last_proof / openings); \
-                         v11_nullifier_index / v11_nflog_entries (NfLog); \
-                         v11_engine_meta (tip / network pin); \
+                         v1_pending_publishes (stale nullifier publish recovery); \
+                         v1_spendable_coins / v1_spent_coins (CoinHist leaves); \
+                         v1_accounts (multi-asset state + last_proof / openings); \
+                         v1_nullifier_index / v1_nflog_entries (NfLog); \
+                         v1_engine_meta (tip / network pin); \
                          leftover legacy accounts rows; \
                          on-disk PROOFS_DIR proof-store files; \
                          and every non-terminal jobs row (queued/proving/\
@@ -261,7 +261,7 @@ pub async fn heal_circuit_digest(
                          latest_block untouched (v1.1 does not use them). \
                          Storing the live binary circuit digest."
                     );
-                    db::reset_v11_proof_dependent_state_tx(pool, live_digest).await?;
+                    db::reset_v1_proof_dependent_state_tx(pool, live_digest).await?;
                 }
                 _ => {
                     warn!(

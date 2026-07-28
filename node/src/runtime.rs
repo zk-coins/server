@@ -20,7 +20,7 @@ use tokio::net::TcpListener;
 use crate::job_dispatcher::{self, JobNotifier, DEFAULT_AWAITING_SIGNATURE_TIMEOUT};
 use crate::job_store::{JobStatus, JobStore};
 use crate::publisher::resume_pending_inscriptions;
-use crate::v11::{process_stack_mode, ScanStackMode};
+use crate::v1::{process_stack_mode, ScanStackMode};
 use crate::NETWORK_CONFIG;
 
 use crate::account_node::AccountNode;
@@ -30,10 +30,10 @@ use crate::username::UsernameStore;
 /// Optional v1.1 readiness handles shared with the exclusive scan loop.
 ///
 /// Under the legacy stack both fields are `None` and readiness ignores
-/// NfLog catch-up / deep-reorg. Under `ZKCOINS_V11_SHADOW=1` main wires
+/// NfLog catch-up / deep-reorg. Under `ZKCOINS_V1_SHADOW=1` main wires
 /// `Some` atomics so `/health/ready` reflects the NfLog view.
 #[derive(Clone, Default)]
-pub struct V11Readiness {
+pub struct V1Readiness {
     pub scan_caught_up: Option<Arc<AtomicBool>>,
     pub finality_ok: Option<Arc<AtomicBool>>,
 }
@@ -44,10 +44,10 @@ pub async fn start_rest_node(
     addr: &str,
     pool: Arc<PgPool>,
     proofs_dir: &str,
-    v11_readiness: V11Readiness,
-    // Shared v1.1 engine (when `ZKCOINS_V11_SHADOW=1`). Used to drive
+    v1_readiness: V1Readiness,
+    // Shared v1.1 engine (when `ZKCOINS_V1_SHADOW=1`). Used to drive
     // `StateEngine::finalise` after an accepted `/v1/jobs/{id}/sign`.
-    v11_engine: Option<Arc<crate::v11::EngineAdapter>>,
+    v1_engine: Option<Arc<crate::v1::EngineAdapter>>,
 ) -> anyhow::Result<()> {
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -106,16 +106,16 @@ pub async fn start_rest_node(
         job_store: Arc::clone(&job_store),
         job_tx: job_tx.clone(),
         job_notify_map: Arc::clone(&job_notify_map),
-        v11_scan_caught_up: v11_readiness.scan_caught_up,
-        v11_finality_ok: v11_readiness.finality_ok,
+        v1_scan_caught_up: v1_readiness.scan_caught_up,
+        v1_finality_ok: v1_readiness.finality_ok,
         pending_sign_map: Arc::new(DashMap::new()),
         // Production finalise: prove outside the engine lock, then apply
         // with live re-validation (receive-path invariant). Under the v1.1
         // claim a missing driver fails the job loud rather than
         // short-circuiting to "signature_accepted" alone.
-        v11_finalise: v11_engine.as_ref().map(|adapter| {
+        v1_finalise: v1_engine.as_ref().map(|adapter| {
             let adapter = Arc::clone(adapter);
-            let hook: crate::router::V11FinaliseHook =
+            let hook: crate::router::V1FinaliseHook =
                 Arc::new(move |pending, signature, fence| {
                     let adapter = Arc::clone(&adapter);
                     // publisher_pubkey is filled by the dispatcher from the job
@@ -123,7 +123,7 @@ pub async fn start_rest_node(
                     // Durable + fenced: prove → apply → engine snapshot +
                     // members_ready only while this claim epoch still holds.
                     Box::pin(async move {
-                        crate::v11::finalise_accepted_prove_persist_and_stage(
+                        crate::v1::finalise_accepted_prove_persist_and_stage(
                             &adapter, pending, signature, None, fence,
                         )
                         .await
@@ -135,13 +135,13 @@ pub async fn start_rest_node(
         // live PendingSignEntry here; the dispatcher takes it when the job
         // enters awaiting_signature and stages via stage_pending_sign.
         // Under the legacy stack the map stays empty and is unused.
-        v11_live_pending_after_begin: Arc::new(DashMap::new()),
+        v1_live_pending_after_begin: Arc::new(DashMap::new()),
         // Test-only injection point (Defect 4): never installed in production.
         #[cfg(test)]
-        v11_pending_after_prove: None,
-        v11_engine: v11_engine.clone(),
+        v1_pending_after_prove: None,
+        v1_engine: v1_engine.clone(),
         attest_challenges: Arc::new(DashMap::new()),
-        public_hosts: Arc::new(crate::v11::public_hosts_from_env()),
+        public_hosts: Arc::new(crate::v1::public_hosts_from_env()),
     };
 
     // No minting-account bootstrap: the neutral model has no
@@ -174,7 +174,7 @@ pub async fn start_rest_node(
     // Failures here are LOGGED and SWALLOWED — the operator's escape
     // hatch is the PR #106 CLI recovery tool, and a transient
     // Esplora outage on boot must not crash-loop the container.
-    if matches!(process_stack_mode(), Some(ScanStackMode::V11)) {
+    if matches!(process_stack_mode(), Some(ScanStackMode::V1)) {
         println!(
             "resume_pending_inscriptions: skipped (process claimed v1.1 scan stack; \
              legacy Commitment recovery is forbidden)"
@@ -351,7 +351,7 @@ pub async fn start_rest_node(
     Ok(())
 }
 
-async fn rearm_and_enqueue_v11_finalise(
+async fn rearm_and_enqueue_v1_finalise(
     public_id: uuid::Uuid,
     job_notify_map: &DashMap<uuid::Uuid, Arc<JobNotifier>>,
     job_tx: &tokio::sync::mpsc::Sender<crate::job_dispatcher::JobEnvelope>,
@@ -431,7 +431,7 @@ fn spawn_deferred_finalise_reclaim(
                     %public_id,
                     "boot_resume_jobs: deferred reclaim — claim free, enqueueing"
                 );
-                rearm_and_enqueue_v11_finalise(public_id, &job_notify_map, &job_tx).await;
+                rearm_and_enqueue_v1_finalise(public_id, &job_notify_map, &job_tx).await;
                 return;
             }
             // Re-load phase after a no-op release (still need free-vs-owned).
@@ -453,7 +453,7 @@ fn spawn_deferred_finalise_reclaim(
                         %public_id,
                         "boot_resume_jobs: deferred reclaim — claim free, enqueueing"
                     );
-                    rearm_and_enqueue_v11_finalise(public_id, &job_notify_map, &job_tx).await;
+                    rearm_and_enqueue_v1_finalise(public_id, &job_notify_map, &job_tx).await;
                     return;
                 }
                 BootFinaliseAction::DeferUntilAbandoned => {
@@ -578,13 +578,13 @@ pub(crate) async fn boot_resume_jobs(
     // re-arm and enqueue instead of failing.
     let interrupted = job_store.list_interrupted_for_resume().await?;
     for job in interrupted {
-        let resumable_v11 = crate::v11::v11_sign_route_active()
+        let resumable_v1 = crate::v1::v1_sign_route_active()
             && job.status == JobStatus::Broadcasting
             && matches!(
-                crate::v11::rehydrate_pending_sign(&job.request_body),
+                crate::v1::rehydrate_pending_sign(&job.request_body),
                 Ok(Some(e)) if e.signature.is_some()
             );
-        if resumable_v11 {
+        if resumable_v1 {
             // Honour release_stale: only enqueue when the claim is free.
             // Ignoring Ok(false) re-enqueued still-owned jobs; the loser
             // then exited and the edge job was stranded forever.
@@ -646,7 +646,7 @@ pub(crate) async fn boot_resume_jobs(
                     // Already logged; continue to next interrupted row.
                 }
                 BootRowDisposition::Act(BootFinaliseAction::EnqueueNow) => {
-                    rearm_and_enqueue_v11_finalise(
+                    rearm_and_enqueue_v1_finalise(
                         job.public_id,
                         job_notify_map,
                         job_tx,

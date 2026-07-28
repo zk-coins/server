@@ -113,7 +113,7 @@ impl AccountSnapshot {
         for (id, tracked) in self.spendable {
             if spendable.insert(id, tracked).is_some() {
                 bail!(
-                    "v11 account {}: duplicate spendable coin_id",
+                    "v1 account {}: duplicate spendable coin_id",
                     hex::encode(self.owner.0)
                 );
             }
@@ -122,7 +122,7 @@ impl AccountSnapshot {
         for id in spendable.keys() {
             if spent_ids.contains(id) {
                 bail!(
-                    "v11 account {}: coin_id is both spendable and spent",
+                    "v1 account {}: coin_id is both spendable and spent",
                     hex::encode(self.owner.0)
                 );
             }
@@ -220,20 +220,20 @@ fn fixed_32(bytes: &[u8], field: &str) -> Result<[u8; 32]> {
 
 /// Count any row across the v1.1 tables (meta + data). Used to distinguish a
 /// genuinely empty database from an inconsistent one that lost its meta row.
-async fn count_any_v11_rows(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
+async fn count_any_v1_rows(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
     let (n,): (i64,) = sqlx::query_as(
         "SELECT \
-            (SELECT COUNT(*) FROM v11_engine_meta) \
-          + (SELECT COUNT(*) FROM v11_nflog_entries) \
-          + (SELECT COUNT(*) FROM v11_nullifier_index) \
-          + (SELECT COUNT(*) FROM v11_accounts) \
-          + (SELECT COUNT(*) FROM v11_spendable_coins) \
-          + (SELECT COUNT(*) FROM v11_spent_coins) \
-          + (SELECT COUNT(*) FROM v11_pending_publishes)",
+            (SELECT COUNT(*) FROM v1_engine_meta) \
+          + (SELECT COUNT(*) FROM v1_nflog_entries) \
+          + (SELECT COUNT(*) FROM v1_nullifier_index) \
+          + (SELECT COUNT(*) FROM v1_accounts) \
+          + (SELECT COUNT(*) FROM v1_spendable_coins) \
+          + (SELECT COUNT(*) FROM v1_spent_coins) \
+          + (SELECT COUNT(*) FROM v1_pending_publishes)",
     )
     .fetch_one(&mut **tx)
     .await
-    .context("count v11 rows for empty/inconsistent check")?;
+    .context("count v1 rows for empty/inconsistent check")?;
     Ok(n)
 }
 
@@ -245,7 +245,7 @@ async fn count_any_v11_rows(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
 /// The load runs inside a single Postgres transaction at **REPEATABLE READ**.
 /// Postgres RR is snapshot isolation: all statements see the database as of
 /// the transaction's first query. That is sufficient here because the write
-/// path replaces every v11 table in one committing transaction — a concurrent
+/// path replaces every v1 table in one committing transaction — a concurrent
 /// reader therefore observes either the complete pre-write state or the
 /// complete post-write state, never a mixture of old meta with new leaves
 /// (or empty tables mid-clear). Read Committed would re-snapshot per
@@ -253,40 +253,40 @@ async fn count_any_v11_rows(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
 ///
 /// ## Empty vs inconsistent
 ///
-/// - No meta row **and** no other v11 rows → `Ok(None)` (genuinely empty).
-/// - No meta row **but** other v11 data exists → `Err` (inconsistent DB).
+/// - No meta row **and** no other v1 rows → `Ok(None)` (genuinely empty).
+/// - No meta row **but** other v1 data exists → `Err` (inconsistent DB).
 /// - Meta present → load the full snapshot (data tables may be empty).
 pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot>> {
-    let mut tx = pool.begin().await.context("begin v11 load tx")?;
+    let mut tx = pool.begin().await.context("begin v1 load tx")?;
     // REPEATABLE READ = snapshot isolation in Postgres: one MVCC snapshot for
     // the whole transaction. Must be the first statement after BEGIN.
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
         .await
-        .context("set v11 load isolation to REPEATABLE READ")?;
+        .context("set v1 load isolation to REPEATABLE READ")?;
 
     let meta: Option<(String, i64, i64, Vec<u8>, i64)> = sqlx::query_as(
         "SELECT network, activation_height, tip_height, tip_hash, fold_seq \
-         FROM v11_engine_meta WHERE id = 1",
+         FROM v1_engine_meta WHERE id = 1",
     )
     .fetch_optional(&mut *tx)
     .await
-    .context("load v11_engine_meta")?;
+    .context("load v1_engine_meta")?;
 
     let Some((network_s, activation_height, tip_height, tip_hash_b, fold_seq)) = meta else {
-        let n = count_any_v11_rows(&mut tx).await?;
+        let n = count_any_v1_rows(&mut tx).await?;
         if n != 0 {
             // Roll back before returning; the transaction is not needed further.
             tx.rollback()
                 .await
-                .context("rollback v11 load tx after inconsistent meta")?;
+                .context("rollback v1 load tx after inconsistent meta")?;
             bail!(
-                "v11_engine_meta is missing but {n} other v11 row(s) exist — \
+                "v1_engine_meta is missing but {n} other v1 row(s) exist — \
                  the database is inconsistent (refusing to load as an empty engine; \
                  no silent fall-back)"
             );
         }
-        tx.commit().await.context("commit empty v11 load tx")?;
+        tx.commit().await.context("commit empty v1 load tx")?;
         return Ok(None);
     };
 
@@ -298,11 +298,11 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
 
     let nflog_rows: Vec<(i64, i64, i64, i64, i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
         "SELECT position, height, tx_index, vin_index, member_index, pk, r \
-         FROM v11_nflog_entries ORDER BY position ASC",
+         FROM v1_nflog_entries ORDER BY position ASC",
     )
     .fetch_all(&mut *tx)
     .await
-    .context("load v11_nflog_entries")?;
+    .context("load v1_nflog_entries")?;
 
     let mut nflog = Vec::with_capacity(nflog_rows.len());
     for (i, (position, height, tx_index, vin_index, member_index, pk, r)) in
@@ -311,7 +311,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
         let position = u64_from_i64(position, "nflog.position")?;
         if position != i as u64 {
             bail!(
-                "v11_nflog_entries is not a dense 0..n sequence: expected position {i}, got {position}"
+                "v1_nflog_entries is not a dense 0..n sequence: expected position {i}, got {position}"
             );
         }
         nflog.push((
@@ -330,10 +330,10 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
 
     // Nullifier index must agree with the first-occurrence fold of the log.
     let index_rows: Vec<(Vec<u8>, i64, Vec<u8>)> =
-        sqlx::query_as("SELECT pk, position, r FROM v11_nullifier_index")
+        sqlx::query_as("SELECT pk, position, r FROM v1_nullifier_index")
             .fetch_all(&mut *tx)
             .await
-            .context("load v11_nullifier_index")?;
+            .context("load v1_nullifier_index")?;
     let mut expected_index: std::collections::BTreeMap<[u8; 32], (u64, [u8; 32])> =
         std::collections::BTreeMap::new();
     for (pos, (_chain_pos, entry)) in nflog.iter().enumerate() {
@@ -344,7 +344,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
     }
     if index_rows.len() != expected_index.len() {
         bail!(
-            "v11_nullifier_index row count {} diverges from first-occurrence set size {}",
+            "v1_nullifier_index row count {} diverges from first-occurrence set size {}",
             index_rows.len(),
             expected_index.len()
         );
@@ -356,13 +356,13 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
         match expected_index.get(&pk) {
             Some(&(epos, er)) if epos == pos && er == r => {}
             Some(&(epos, er)) => bail!(
-                "v11_nullifier_index for pk {} has (pos,r)=({pos},{}) but log first-occurrence is ({epos},{})",
+                "v1_nullifier_index for pk {} has (pos,r)=({pos},{}) but log first-occurrence is ({epos},{})",
                 hex::encode(pk),
                 hex::encode(r),
                 hex::encode(er)
             ),
             None => bail!(
-                "v11_nullifier_index has pk {} which is absent from the NfLog",
+                "v1_nullifier_index has pk {} which is absent from the NfLog",
                 hex::encode(pk)
             ),
         }
@@ -382,11 +382,11 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
     )> = sqlx::query_as(
         "SELECT owner, account_state, nk, op_secret, genesis_pubkey, last_proof, \
                 last_nav_opening, last_nullifier, last_nullifier_pos, coin_history_root \
-         FROM v11_accounts ORDER BY owner",
+         FROM v1_accounts ORDER BY owner",
     )
     .fetch_all(&mut *tx)
     .await
-    .context("load v11_accounts")?;
+    .context("load v1_accounts")?;
 
     let mut accounts = Vec::with_capacity(account_rows.len());
     for (
@@ -409,21 +409,21 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
         })?;
         if state.owner != owner {
             bail!(
-                "AccountState.owner does not match v11_accounts.owner key for {}",
+                "AccountState.owner does not match v1_accounts.owner key for {}",
                 hex::encode(owner_bytes)
             );
         }
         let expected_ch_root = fixed_32(&ch_root_b, "account.coin_history_root")?;
         if digest_bytes(&state.coin_history_root) != expected_ch_root {
             bail!(
-                "v11_accounts.coin_history_root column disagrees with account_state for {}",
+                "v1_accounts.coin_history_root column disagrees with account_state for {}",
                 hex::encode(owner_bytes)
             );
         }
 
         let spendable_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, i32)> = sqlx::query_as(
             "SELECT coin_id, coin, creating_prev_ash, coin_index \
-             FROM v11_spendable_coins WHERE owner = $1 ORDER BY coin_id",
+             FROM v1_spendable_coins WHERE owner = $1 ORDER BY coin_id",
         )
         .bind(&owner_b)
         .fetch_all(&mut *tx)
@@ -457,7 +457,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
         }
 
         let spent_rows: Vec<(Vec<u8>,)> =
-            sqlx::query_as("SELECT coin_id FROM v11_spent_coins WHERE owner = $1 ORDER BY coin_id")
+            sqlx::query_as("SELECT coin_id FROM v1_spent_coins WHERE owner = $1 ORDER BY coin_id")
                 .bind(&owner_b)
                 .fetch_all(&mut *tx)
                 .await
@@ -507,7 +507,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
         });
     }
 
-    tx.commit().await.context("commit v11 load tx")?;
+    tx.commit().await.context("commit v1 load tx")?;
 
     Ok(Some(EngineSnapshot {
         network,
@@ -528,7 +528,7 @@ pub async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineSnapshot
 /// ## Stack capability (transactional)
 ///
 /// The first statement locks `stack_scan_mode` with `SELECT … FOR UPDATE`
-/// and requires mode `v11`. A missing or mismatching marker aborts the
+/// and requires mode `v1`. A missing or mismatching marker aborts the
 /// transaction before any v1.1 table is touched. This is the binding
 /// capability check: a process-local boot pin alone cannot close the
 /// window between an advisory check and a later write.
@@ -538,13 +538,13 @@ pub(crate) async fn persist_engine_snapshot(
     pool: &PgPool,
     snap: &EngineSnapshot,
 ) -> Result<()> {
-    let mut tx = pool.begin().await.context("begin v11 persist tx")?;
-    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+    let mut tx = pool.begin().await.context("begin v1 persist tx")?;
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V1)
         .await
-        .context("v11 persist: stack_scan_mode capability check")?;
+        .context("v1 persist: stack_scan_mode capability check")?;
     clear_all(&mut tx).await?;
     write_all(&mut tx, snap).await?;
-    tx.commit().await.context("commit v11 persist tx")?;
+    tx.commit().await.context("commit v1 persist tx")?;
     Ok(())
 }
 
@@ -575,7 +575,7 @@ pub(crate) async fn persist_engine_with_pending_members_ready(
         .begin()
         .await
         .context("begin engine+members_ready persist tx")?;
-    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V1)
         .await
         .context("engine+members_ready persist: stack_scan_mode capability check")?;
     clear_all(&mut tx).await?;
@@ -627,7 +627,7 @@ pub(crate) async fn persist_engine_with_pending_members_ready_if_finalise_fence(
         .begin()
         .await
         .context("begin fenced engine+members_ready persist tx")?;
-    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V1)
         .await
         .context("fenced engine+members_ready: stack_scan_mode capability check")?;
 
@@ -692,7 +692,7 @@ async fn insert_members_ready_row(
     build_tip_hash: [u8; 32],
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO v11_pending_publishes \
+        "INSERT INTO v1_pending_publishes \
          (pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
           commit_tx, reveal_tx, commit_txid, reveal_txid, status, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, NULL, $8, NOW(), NOW())",
@@ -709,7 +709,7 @@ async fn insert_members_ready_row(
     .await
     .with_context(|| {
         format!(
-            "insert v11_pending_publishes members_ready (atomic with engine) pk={}",
+            "insert v1_pending_publishes members_ready (atomic with engine) pk={}",
             hex::encode(pk)
         )
     })?;
@@ -718,22 +718,22 @@ async fn insert_members_ready_row(
 
 async fn clear_all(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     // Children first (FK), then parents, then meta.
-    sqlx::query("DELETE FROM v11_spendable_coins")
+    sqlx::query("DELETE FROM v1_spendable_coins")
         .execute(&mut **tx)
         .await?;
-    sqlx::query("DELETE FROM v11_spent_coins")
+    sqlx::query("DELETE FROM v1_spent_coins")
         .execute(&mut **tx)
         .await?;
-    sqlx::query("DELETE FROM v11_accounts")
+    sqlx::query("DELETE FROM v1_accounts")
         .execute(&mut **tx)
         .await?;
-    sqlx::query("DELETE FROM v11_nullifier_index")
+    sqlx::query("DELETE FROM v1_nullifier_index")
         .execute(&mut **tx)
         .await?;
-    sqlx::query("DELETE FROM v11_nflog_entries")
+    sqlx::query("DELETE FROM v1_nflog_entries")
         .execute(&mut **tx)
         .await?;
-    sqlx::query("DELETE FROM v11_engine_meta")
+    sqlx::query("DELETE FROM v1_engine_meta")
         .execute(&mut **tx)
         .await?;
     Ok(())
@@ -741,7 +741,7 @@ async fn clear_all(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
 
 async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) -> Result<()> {
     sqlx::query(
-        "INSERT INTO v11_engine_meta \
+        "INSERT INTO v1_engine_meta \
          (id, network, activation_height, tip_height, tip_hash, fold_seq, updated_at) \
          VALUES (1, $1, $2, $3, $4, $5, NOW())",
     )
@@ -752,7 +752,7 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
     .bind(as_i64_u32(snap.fold_seq, "fold_seq")?)
     .execute(&mut **tx)
     .await
-    .context("insert v11_engine_meta")?;
+    .context("insert v1_engine_meta")?;
 
     let mut first_occ: std::collections::BTreeMap<[u8; 32], (u64, [u8; 32])> =
         std::collections::BTreeMap::new();
@@ -760,7 +760,7 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
     for (position, (chain_pos, entry)) in snap.nflog.iter().enumerate() {
         let position = position as u64;
         sqlx::query(
-            "INSERT INTO v11_nflog_entries \
+            "INSERT INTO v1_nflog_entries \
              (position, height, tx_index, vin_index, member_index, pk, r) \
              VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
@@ -773,19 +773,19 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
         .bind(entry.r.as_slice())
         .execute(&mut **tx)
         .await
-        .with_context(|| format!("insert v11_nflog_entries position={position}"))?;
+        .with_context(|| format!("insert v1_nflog_entries position={position}"))?;
 
         first_occ.entry(entry.pk).or_insert((position, entry.r));
     }
 
     for (pk, (position, r)) in &first_occ {
-        sqlx::query("INSERT INTO v11_nullifier_index (pk, position, r) VALUES ($1, $2, $3)")
+        sqlx::query("INSERT INTO v1_nullifier_index (pk, position, r) VALUES ($1, $2, $3)")
             .bind(pk.as_slice())
             .bind(as_i64_u64(*position, "index.position")?)
             .bind(r.as_slice())
             .execute(&mut **tx)
             .await
-            .with_context(|| format!("insert v11_nullifier_index pk={}", hex::encode(pk)))?;
+            .with_context(|| format!("insert v1_nullifier_index pk={}", hex::encode(pk)))?;
     }
 
     for account in &snap.accounts {
@@ -809,7 +809,7 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
 
         let op_secret_bytes = account.op_secret.map(|s| s.to_account_row_bytea());
         sqlx::query(
-            "INSERT INTO v11_accounts \
+            "INSERT INTO v1_accounts \
              (owner, account_state, nk, op_secret, genesis_pubkey, last_proof, last_nav_opening, \
               last_nullifier, last_nullifier_pos, coin_history_root, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())",
@@ -826,12 +826,12 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
         .bind(digest_bytes(&account.state.coin_history_root).as_slice())
         .execute(&mut **tx)
         .await
-        .with_context(|| format!("insert v11_accounts owner={}", hex::encode(account.owner.0)))?;
+        .with_context(|| format!("insert v1_accounts owner={}", hex::encode(account.owner.0)))?;
 
         for (coin_id, tracked) in &account.spendable {
             let coin_bytes = bincode::serialize(&tracked.coin).context("serialize Coin")?;
             sqlx::query(
-                "INSERT INTO v11_spendable_coins \
+                "INSERT INTO v1_spendable_coins \
                  (owner, coin_id, coin, creating_prev_ash, coin_index) \
                  VALUES ($1, $2, $3, $4, $5)",
             )
@@ -852,7 +852,7 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
         }
 
         for coin_id in &account.spent_ids {
-            sqlx::query("INSERT INTO v11_spent_coins (owner, coin_id) VALUES ($1, $2)")
+            sqlx::query("INSERT INTO v1_spent_coins (owner, coin_id) VALUES ($1, $2)")
                 .bind(account.owner.0.as_slice())
                 .bind(coin_id.as_slice())
                 .execute(&mut **tx)
@@ -874,7 +874,7 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
 // Pending nullifier-publish recovery (migration 0021)
 // ---------------------------------------------------------------------------
 
-/// Status labels for [`v11_pending_publishes`] (CHECK-constrained).
+/// Status labels for [`v1_pending_publishes`] (CHECK-constrained).
 pub const PENDING_PUBLISH_MEMBERS_READY: &str = "members_ready";
 pub const PENDING_PUBLISH_CONSTRUCTED: &str = "constructed";
 pub const PENDING_PUBLISH_COMMIT_BROADCAST: &str = "commit_broadcast";
@@ -920,11 +920,11 @@ pub(crate) async fn insert_pending_publish_members_ready(
         .begin()
         .await
         .context("begin insert pending publish members_ready")?;
-    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V1)
         .await
         .context("pending publish insert: stack_scan_mode capability check")?;
     sqlx::query(
-        "INSERT INTO v11_pending_publishes \
+        "INSERT INTO v1_pending_publishes \
          (pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
           commit_tx, reveal_tx, commit_txid, reveal_txid, status, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, NULL, $8, NOW(), NOW())",
@@ -941,7 +941,7 @@ pub(crate) async fn insert_pending_publish_members_ready(
     .await
     .with_context(|| {
         format!(
-            "insert v11_pending_publishes members_ready pk={}",
+            "insert v1_pending_publishes members_ready pk={}",
             hex::encode(pk)
         )
     })?;
@@ -966,11 +966,11 @@ pub(crate) async fn mark_pending_publish_constructed(
         .begin()
         .await
         .context("begin mark pending publish constructed")?;
-    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V1)
         .await
         .context("pending publish constructed: stack_scan_mode capability check")?;
     let result = sqlx::query(
-        "UPDATE v11_pending_publishes \
+        "UPDATE v1_pending_publishes \
          SET commit_tx = $2, reveal_tx = $3, commit_txid = $4, reveal_txid = $5, \
              status = $6, updated_at = NOW() \
          WHERE pk = $1 AND status = $7",
@@ -1019,11 +1019,11 @@ pub(crate) async fn mark_pending_publish_status(
         .begin()
         .await
         .context("begin mark pending publish status")?;
-    require_stack_mode_for_update(&mut tx, ScanStackMode::V11)
+    require_stack_mode_for_update(&mut tx, ScanStackMode::V1)
         .await
         .context("pending publish status: stack_scan_mode capability check")?;
     let result = sqlx::query(
-        "UPDATE v11_pending_publishes \
+        "UPDATE v1_pending_publishes \
          SET status = $2, updated_at = NOW() \
          WHERE pk = $1 AND status = $3",
     )
@@ -1049,7 +1049,7 @@ pub async fn load_pending_publish(pool: &PgPool, pk: [u8; 32]) -> Result<Option<
     let row = sqlx::query(
         "SELECT pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
                 commit_tx, reveal_tx, commit_txid, reveal_txid, status \
-         FROM v11_pending_publishes WHERE pk = $1",
+         FROM v1_pending_publishes WHERE pk = $1",
     )
     .bind(pk.as_slice())
     .fetch_optional(pool)
@@ -1092,7 +1092,7 @@ pub async fn list_resumable_pending_publishes(pool: &PgPool) -> Result<Vec<Pendi
     let rows = sqlx::query(
         "SELECT pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
                 commit_tx, reveal_tx, commit_txid, reveal_txid, status \
-         FROM v11_pending_publishes \
+         FROM v1_pending_publishes \
          WHERE status IN ($1, $2, $3) \
          ORDER BY created_at ASC",
     )

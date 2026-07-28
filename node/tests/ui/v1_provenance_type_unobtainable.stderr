@@ -1,0 +1,17 @@
+error[E0425]: cannot find type `InCoinSourceWitness` in module `node::v1`
+ --> tests/ui/v1_provenance_type_unobtainable.rs:8:46
+  |
+8 |     let _ = std::any::type_name::<node::v1::InCoinSourceWitness>();
+  |                                              ^^^^^^^^^^^^^^^^^^^ not found in `node::v1`
+  |
+help: consider importing one of these structs
+  |
+6 + use zkcoins_program::circuit::main::InCoinSourceWitness;
+  |
+6 + use zkcoins_prover::InCoinSourceWitness;
+  |
+help: if you import `InCoinSourceWitness`, refer to it directly
+  |
+8 -     let _ = std::any::type_name::<node::v1::InCoinSourceWitness>();
+8 +     let _ = std::any::type_name::<InCoinSourceWitness>();
+  |

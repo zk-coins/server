@@ -25,9 +25,9 @@ use crate::test_db::{setup_pool, SchemaScope};
 /// The claim is monotonic and cannot be withdrawn outside `stack-policy`'s
 /// own `#[cfg(test)]`. Under process-per-test (nextest) the process starts
 /// unclaimed; this re-affirms Legacy so broadcast construction is allowed.
-/// A pre-existing V11 claim panics (fail loud) rather than silently clearing.
+/// A pre-existing V1 claim panics (fail loud) rather than silently clearing.
 fn ensure_legacy_process_for_publisher_test() {
-    use crate::v11::{set_process_stack_mode, ScanStackMode};
+    use crate::v1::{set_process_stack_mode, ScanStackMode};
     set_process_stack_mode(ScanStackMode::Legacy);
 }
 

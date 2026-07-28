@@ -103,10 +103,10 @@ mod boundary_tests {
     /// [`LegacyBroadcastClient`] and hits the facade directly cannot obtain
     /// a broadcast-capable client without the policy check passing.
     #[test]
-    fn node_internal_facade_connect_refuses_under_v11_claim() {
-        set_process_stack_mode(ScanStackMode::V11);
+    fn node_internal_facade_connect_refuses_under_v1_claim() {
+        set_process_stack_mode(ScanStackMode::V1);
         let err = esplora_bound::EsploraBroadcastClient::connect("http://127.0.0.1:1")
-            .expect_err("node-internal facade connect must refuse under v11");
+            .expect_err("node-internal facade connect must refuse under v1");
         let msg = err.to_string();
         assert!(
             msg.contains(STACK_SEPARATION_REFUSAL) || msg.contains("v1.1"),

@@ -1,6 +1,6 @@
 //! Gap G4 — v1.1 transition signature on the node (BIP-340 + sign-to-contract).
 //!
-//! Behind `ZKCOINS_V11_SHADOW=1` every state-advancing transition is authorised
+//! Behind `ZKCOINS_V1_SHADOW=1` every state-advancing transition is authorised
 //! by a [`TransitionSignature`] (§3.2), not by a legacy ash‖ocr
 //! [`shared::commitment::Commitment`]. This module is the **host-side** check
 //! the node runs on the wallet's `/sign` response before it installs the
@@ -68,10 +68,10 @@
 //!
 //! ## Live path under a v1.1 claim
 //!
-//! - [`refuse_legacy_commitment_under_v11`] gates residual ash‖ocr
+//! - [`refuse_legacy_commitment_under_v1`] gates residual ash‖ocr
 //!   [`CommitRequest`](crate::router::CommitRequest) entry points
 //!   (`commit_flow` / `mint_commit_flow` / jobs commit). Under
-//!   `ScanStackMode::V11` a legacy commitment is refused loud.
+//!   `ScanStackMode::V1` a legacy commitment is refused loud.
 //! - [`crate::router::jobs_sign_handler`] is the production REST caller:
 //!   flag-gated `POST /v1/jobs/{id}/sign` (§7.5) decodes
 //!   [`WalletSignSubmission`] at the boundary (strict hex →
@@ -96,14 +96,14 @@ use zkcoins_prover::half_agg::{comm_verify, verify_single};
 use zkcoins_prover::prover_bridge::TransitionSignature;
 use zkcoins_prover::state_engine::{FinalisationCapability, PendingTransition};
 
-use super::mode::V11ShadowMode;
+use super::mode::V1ShadowMode;
 use super::separation::{process_stack_mode, ScanStackMode};
 
 /// Canonical message when a legacy ash‖ocr Commitment hits a v1.1 process.
-pub const LEGACY_COMMITMENT_REFUSED_UNDER_V11: &str =
+pub const LEGACY_COMMITMENT_REFUSED_UNDER_V1: &str =
     "legacy ash‖ocr Commitment refused under v1.1 process claim; \
      submit a §3.2 TransitionSignature bound to the pending transition \
-     (ZKCOINS_V11_SHADOW=1 / ScanStackMode::V11 — no dual-accept)";
+     (ZKCOINS_V1_SHADOW=1 / ScanStackMode::V1 — no dual-accept)";
 
 /// Which verification step rejected a wallet signature.
 ///
@@ -111,7 +111,7 @@ pub const LEGACY_COMMITMENT_REFUSED_UNDER_V11: &str =
 /// misreported as an S2C failure and vice versa.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignatureCheck {
-    /// `ZKCOINS_V11_SHADOW` is not on — legacy ash‖ocr path only.
+    /// `ZKCOINS_V1_SHADOW` is not on — legacy ash‖ocr path only.
     ShadowFlag,
     /// Process claimed v1.1; residual legacy Commitment entry is refused.
     LegacyCommitment,
@@ -252,7 +252,7 @@ impl TryFrom<WalletSignSubmissionWire> for WalletSignSubmission {
 /// through to a terminal job status, including after a true cold boot with
 /// an empty in-memory map.
 ///
-/// **Edge:** production finalise stages `v11_pending_publishes`
+/// **Edge:** production finalise stages `v1_pending_publishes`
 /// (`members_ready`) with the engine snapshot; on-chain
 /// AggregateStateNullifierV3 **broadcast** still needs bitcoind. See
 /// [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`].
@@ -471,7 +471,7 @@ pub const PENDING_SIGN_BODY_KEY: &str = "pending_sign";
 ///
 /// Live engine tip / CoinHist / NfLog are **not** stored in this envelope:
 /// apply re-validates them, and production finalise persists the engine
-/// plus `v11_pending_publishes` out-of-band. Once `completion_result` is
+/// plus `v1_pending_publishes` out-of-band. Once `completion_result` is
 /// present, resume skips re-apply and only host-publishes + completes —
 /// so a crash after durable stage cannot strand a job that resume cannot
 /// finish up to [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`]. On-chain
@@ -900,11 +900,11 @@ pub fn finalise_with_accepted_signature(
 /// then re-acquire and apply with live re-validation.
 ///
 /// Prefer [`finalise_accepted_prove_persist_and_stage`] on the job path so
-/// the applied engine and `v11_pending_publishes` intent are durable before
+/// the applied engine and `v1_pending_publishes` intent are durable before
 /// the host edge. This sync helper remains for call sites that only need
 /// the in-memory apply (tests / tooling).
 pub fn finalise_accepted_prove_outside_lock(
-    adapter: &crate::v11::EngineAdapter,
+    adapter: &crate::v1::EngineAdapter,
     pending: PendingTransition,
     signature: TransitionSignature,
     publisher_pubkey: Option<[u8; 32]>,
@@ -933,7 +933,7 @@ pub fn finalise_accepted_prove_outside_lock(
 
 /// Production job-path finalise: prove outside the lock, apply under the
 /// write gate, then **atomically** persist the engine snapshot and stage
-/// `v11_pending_publishes` (`members_ready`) **under the claim fence**.
+/// `v1_pending_publishes` (`members_ready`) **under the claim fence**.
 ///
 /// This is what makes [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`] a
 /// durable handoff: a crash after this function returns leaves the account
@@ -964,19 +964,19 @@ pub fn finalise_accepted_prove_outside_lock(
 /// The multi-minute prove runs on `spawn_blocking` so the caller's async
 /// lease-renewal heartbeat can keep firing on the runtime.
 pub async fn finalise_accepted_prove_persist_and_stage(
-    adapter: &crate::v11::EngineAdapter,
+    adapter: &crate::v1::EngineAdapter,
     pending: PendingTransition,
     signature: TransitionSignature,
     publisher_pubkey: Option<[u8; 32]>,
     fence: crate::job_store::FinaliseFence,
 ) -> Result<FinaliseOutcome, String> {
     use crate::job_store::FINALISE_FENCE_LOST;
-    use crate::v11::db_v11;
+    use crate::v1::db_v1;
 
     // Already durable from a prior attempt that crashed after stage.
     // Still require a live fence: a stale epoch must not re-enter host-edge
     // completion after another claim reclaimed the job.
-    match db_v11::load_pending_publish(adapter.pool(), signature.pk_i)
+    match db_v1::load_pending_publish(adapter.pool(), signature.pk_i)
         .await
         .map_err(|e| format!("load_pending_publish before finalise: {e:#}"))?
     {
@@ -1059,7 +1059,7 @@ pub async fn finalise_accepted_prove_persist_and_stage(
     })?;
 
     let snap = adapter.snapshot_live();
-    match db_v11::persist_engine_with_pending_members_ready_if_finalise_fence(
+    match db_v1::persist_engine_with_pending_members_ready_if_finalise_fence(
         adapter.pool(),
         &snap,
         owner,
@@ -1242,7 +1242,7 @@ pub fn select_awaiting_signature_result(
     pending: Option<&PendingSignEntry>,
 ) -> Result<serde_json::Value, TransitionSignatureError> {
     match process_stack_mode() {
-        Some(ScanStackMode::V11) => match pending {
+        Some(ScanStackMode::V1) => match pending {
             Some(entry) => Ok(awaiting_signature_result_json(entry)),
             None => Err(TransitionSignatureError::new(
                 SignatureCheck::LegacyCommitment,
@@ -1423,20 +1423,20 @@ fn classify_stored_failure(msg: &str, status: crate::job_store::JobStatus) -> &'
 }
 
 /// True when the process claim is v1.1 (flag on and stack claimed).
-pub fn v11_sign_route_active() -> bool {
-    matches!(process_stack_mode(), Some(ScanStackMode::V11))
+pub fn v1_sign_route_active() -> bool {
+    matches!(process_stack_mode(), Some(ScanStackMode::V1))
 }
 
 /// Refuse the v1.1 signature path when the shadow flag is off.
 ///
 /// Legacy ash‖ocr commitments remain the only authorised signing protocol
-/// under [`V11ShadowMode::Off`]. There is no silent dual-accept.
-pub fn ensure_v11_signature_path(mode: V11ShadowMode) -> Result<(), TransitionSignatureError> {
+/// under [`V1ShadowMode::Off`]. There is no silent dual-accept.
+pub fn ensure_v1_signature_path(mode: V1ShadowMode) -> Result<(), TransitionSignatureError> {
     match mode {
-        V11ShadowMode::On => Ok(()),
-        V11ShadowMode::Off => Err(TransitionSignatureError::new(
+        V1ShadowMode::On => Ok(()),
+        V1ShadowMode::Off => Err(TransitionSignatureError::new(
             SignatureCheck::ShadowFlag,
-            "ZKCOINS_V11_SHADOW is off — refusing TransitionSignature path \
+            "ZKCOINS_V1_SHADOW is off — refusing TransitionSignature path \
              (legacy ash‖ocr Commitment remains the default; no dual-accept)",
         )),
     }
@@ -1445,16 +1445,16 @@ pub fn ensure_v11_signature_path(mode: V11ShadowMode) -> Result<(), TransitionSi
 /// Refuse a residual legacy ash‖ocr Commitment under a v1.1 process claim.
 ///
 /// Returns `Ok(())` when the process is **not** on the v1.1 claim (legacy
-/// or unclaimed). Fail-loud under `ScanStackMode::V11` — never a silent
+/// or unclaimed). Fail-loud under `ScanStackMode::V1` — never a silent
 /// allow of the wrong signing protocol.
 ///
 /// Wired into `commit_flow` / `mint_commit_flow` and the jobs commit
 /// handler so a v1.1 boot cannot finalise via `CommitRequest`.
-pub fn refuse_legacy_commitment_under_v11() -> Result<(), TransitionSignatureError> {
+pub fn refuse_legacy_commitment_under_v1() -> Result<(), TransitionSignatureError> {
     match process_stack_mode() {
-        Some(ScanStackMode::V11) => Err(TransitionSignatureError::new(
+        Some(ScanStackMode::V1) => Err(TransitionSignatureError::new(
             SignatureCheck::LegacyCommitment,
-            LEGACY_COMMITMENT_REFUSED_UNDER_V11,
+            LEGACY_COMMITMENT_REFUSED_UNDER_V1,
         )),
         Some(ScanStackMode::Legacy) | None => Ok(()),
     }
@@ -1464,7 +1464,7 @@ pub fn refuse_legacy_commitment_under_v11() -> Result<(), TransitionSignatureErr
 /// `serialize(ProofData)` **from the pending transition**, verify BIP-340
 /// + S2C, and return a [`TransitionSignature`] ready for engine finalise.
 ///
-/// `mode` must be [`V11ShadowMode::On`]; under Off this fails at
+/// `mode` must be [`V1ShadowMode::On`]; under Off this fails at
 /// [`SignatureCheck::ShadowFlag`] so the legacy Commitment path cannot be
 /// bypassed by feeding a TransitionSignature into a half-migrated caller.
 ///
@@ -1474,12 +1474,12 @@ pub fn refuse_legacy_commitment_under_v11() -> Result<(), TransitionSignatureErr
 /// not expressible — the only material used is `pending.proof_data` and
 /// `pending.witness_wip.prev_account_state.current_pubkey`.
 pub fn accept_wallet_transition_signature(
-    mode: V11ShadowMode,
+    mode: V1ShadowMode,
     network: Network,
     pending: &PendingTransition,
     submission: &WalletSignSubmission,
 ) -> Result<TransitionSignature, TransitionSignatureError> {
-    ensure_v11_signature_path(mode)?;
+    ensure_v1_signature_path(mode)?;
 
     let expected_pk_i = &pending.witness_wip.prev_account_state.current_pubkey;
     let proof_data = &pending.proof_data;
@@ -1796,7 +1796,7 @@ mod tests {
     use zkcoins_prover::prover_bridge::{NavOpening, TransitionMode, TransitionWitness};
     use zkcoins_prover::state_engine::{OpSecret, PendingTransition};
 
-    use crate::v11::separation::{
+    use crate::v1::separation::{
         set_process_stack_mode, ScanStackMode,
     };
 
@@ -2007,7 +2007,7 @@ mod tests {
             let (submission, pk) = v5_case(network);
             let pending = pending_for(pk, pd.clone());
             let sig = accept_wallet_transition_signature(
-                V11ShadowMode::On,
+                V1ShadowMode::On,
                 network,
                 &pending,
                 &submission,
@@ -2032,7 +2032,7 @@ mod tests {
         let (submission, pk) = v5_case(Network::Mainnet);
         let pending = pending_for(pk, pd);
         let err = accept_wallet_transition_signature(
-            V11ShadowMode::On,
+            V1ShadowMode::On,
             Network::Testnet,
             &pending,
             &submission,
@@ -2054,7 +2054,7 @@ mod tests {
         submission.s2c_nonce[0] ^= 0x01;
         let pending = pending_for(pk, pd);
         let err = accept_wallet_transition_signature(
-            V11ShadowMode::On,
+            V1ShadowMode::On,
             Network::Regtest,
             &pending,
             &submission,
@@ -2088,7 +2088,7 @@ mod tests {
         // produced over ProofData@0.
         let pending_wrong = pending_for(pk, wrong_pd);
         let err = accept_wallet_transition_signature(
-            V11ShadowMode::On,
+            V1ShadowMode::On,
             Network::Mainnet,
             &pending_wrong,
             &submission,
@@ -2103,7 +2103,7 @@ mod tests {
         // Sanity: the same submission against the *matching* pending works.
         let pending_ok = pending_for(pk, correct_pd);
         accept_wallet_transition_signature(
-            V11ShadowMode::On,
+            V1ShadowMode::On,
             Network::Mainnet,
             &pending_ok,
             &submission,
@@ -2122,7 +2122,7 @@ mod tests {
         let (submission, pk) = v5_case(Network::Regtest);
         let pending = pending_for(pk, pd);
         let sig = accept_wallet_transition_signature(
-            V11ShadowMode::On,
+            V1ShadowMode::On,
             Network::Regtest,
             &pending,
             &submission,
@@ -2158,7 +2158,7 @@ mod tests {
         // Corrupt the cached hash so the envelope disagrees with proof_data.
         pending.proof_data_hash[0] ^= 0xff;
         let err = accept_wallet_transition_signature(
-            V11ShadowMode::On,
+            V1ShadowMode::On,
             Network::Mainnet,
             &pending,
             &submission,
@@ -2173,7 +2173,7 @@ mod tests {
         let (submission, pk) = v5_case(Network::Regtest);
         let pending = pending_for(pk, pd);
         let err = accept_wallet_transition_signature(
-            V11ShadowMode::Off,
+            V1ShadowMode::Off,
             Network::Regtest,
             &pending,
             &submission,
@@ -2183,17 +2183,17 @@ mod tests {
     }
 
     /// Flag / Legacy claim: legacy ash‖ocr Commitment path stays open.
-    /// (V11 refusal + accept is a separate process — claim is monotonic.)
+    /// (V1 refusal + accept is a separate process — claim is monotonic.)
     #[test]
     fn wired_path_allows_legacy_commitment_when_unclaimed_or_legacy() {
         assert!(
-            refuse_legacy_commitment_under_v11().is_ok(),
+            refuse_legacy_commitment_under_v1().is_ok(),
             "unclaimed process must allow residual legacy commit path"
         );
 
         set_process_stack_mode(ScanStackMode::Legacy);
         assert!(
-            refuse_legacy_commitment_under_v11().is_ok(),
+            refuse_legacy_commitment_under_v1().is_ok(),
             "legacy claim must allow ash‖ocr Commitment"
         );
         // Legacy commitment verify itself is untouched.
@@ -2216,10 +2216,10 @@ mod tests {
     /// ash‖ocr Commitment, and accepts a v1.1 TransitionSignature against
     /// the pending transition.
     #[test]
-    fn wired_path_rejects_legacy_commitment_under_v11_and_accepts_v11_signature() {
-        set_process_stack_mode(ScanStackMode::V11);
+    fn wired_path_rejects_legacy_commitment_under_v1_and_accepts_v1_signature() {
+        set_process_stack_mode(ScanStackMode::V1);
         let legacy_err =
-            refuse_legacy_commitment_under_v11().expect_err("v1.1 claim must refuse legacy");
+            refuse_legacy_commitment_under_v1().expect_err("v1.1 claim must refuse legacy");
         assert_eq!(
             legacy_err.check,
             SignatureCheck::LegacyCommitment,
@@ -2237,7 +2237,7 @@ mod tests {
         let (submission, pk) = v5_case(Network::Mainnet);
         let pending = pending_for(pk, pd);
         let sig = accept_wallet_transition_signature(
-            V11ShadowMode::On,
+            V1ShadowMode::On,
             Network::Mainnet,
             &pending,
             &submission,
@@ -2263,9 +2263,9 @@ mod tests {
             commitment.verify(),
             "legacy Commitment::verify must still accept ash‖ocr under flag-off"
         );
-        assert!(ensure_v11_signature_path(V11ShadowMode::Off).is_err());
-        assert!(ensure_v11_signature_path(V11ShadowMode::On).is_ok());
-        assert!(refuse_legacy_commitment_under_v11().is_ok());
+        assert!(ensure_v1_signature_path(V1ShadowMode::Off).is_err());
+        assert!(ensure_v1_signature_path(V1ShadowMode::On).is_ok());
+        assert!(refuse_legacy_commitment_under_v1().is_ok());
     }
 
     /// Defect 4: parser matches the documented SDK wire contract exactly.
@@ -2322,7 +2322,7 @@ mod tests {
         let (submission, pk) = v5_case(Network::Regtest);
         let pending = pending_for(pk, pd);
         accept_wallet_transition_signature(
-            V11ShadowMode::On,
+            V1ShadowMode::On,
             Network::Regtest,
             &pending,
             &submission,
@@ -2331,15 +2331,15 @@ mod tests {
     }
 
     #[test]
-    fn v11_job_advertises_proof_data_fields_not_ash_ocr() {
-        set_process_stack_mode(ScanStackMode::V11);
+    fn v1_job_advertises_proof_data_fields_not_ash_ocr() {
+        set_process_stack_mode(ScanStackMode::V1);
 
         let pd = proof_data_at_0();
         let (_, pk) = v5_case(Network::Mainnet);
         let pending = pending_for(pk, pd);
         let entry = PendingSignEntry::new(pending, Network::Mainnet);
         let result = select_awaiting_signature_result("aa".repeat(32).as_str(), "bb".repeat(32).as_str(), Some(&entry))
-            .expect("v11 with staged pending must advertise");
+            .expect("v1 with staged pending must advertise");
         assert!(
             result.get("account_state_hash").is_none(),
             "v1.1 job must not advertise legacy ash; got {result}"
@@ -2453,7 +2453,7 @@ mod tests {
             entry.pending.witness_wip.output_coins.len()
         );
         accept_wallet_transition_signature(
-            V11ShadowMode::On,
+            V1ShadowMode::On,
             rehydrated.network,
             &rehydrated.pending,
             &submission,
@@ -2470,7 +2470,7 @@ mod tests {
     fn signed_durable_capability_survives_round_trip() {
         let (mut entry, submission) = test_fixtures::v5_mainnet_entry_and_submission();
         let accepted = accept_wallet_transition_signature(
-            V11ShadowMode::On,
+            V1ShadowMode::On,
             entry.network,
             &entry.pending,
             &submission,
@@ -2495,7 +2495,7 @@ mod tests {
     fn completion_surface_round_trips_and_is_completion_ready() {
         let (mut entry, submission) = test_fixtures::v5_mainnet_entry_and_submission();
         let accepted = accept_wallet_transition_signature(
-            V11ShadowMode::On,
+            V1ShadowMode::On,
             entry.network,
             &entry.pending,
             &submission,
@@ -2519,7 +2519,7 @@ mod tests {
     fn incomplete_capability_missing_completion_status_refuses_rehydrate() {
         let (mut entry, submission) = test_fixtures::v5_mainnet_entry_and_submission();
         let accepted = accept_wallet_transition_signature(
-            V11ShadowMode::On,
+            V1ShadowMode::On,
             entry.network,
             &entry.pending,
             &submission,

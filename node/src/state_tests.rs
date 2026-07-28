@@ -1,7 +1,7 @@
 use super::*;
 use crate::db::{insert_root_index, load_root_indices, persist_state_tx};
 use crate::test_db::setup_pool;
-use crate::v11::{claim_stack_scan_mode, ScanStackMode};
+use crate::v1::{claim_stack_scan_mode, ScanStackMode};
 use bitcoin::bip32::{ChildNumber, Xpub};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};

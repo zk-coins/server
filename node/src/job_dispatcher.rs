@@ -394,9 +394,9 @@ async fn process_envelope(
         // Mid-finalise crash: durable signed capability + broadcasting.
         // Resume finalise without re-parking on /sign.
         (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting)
-            if crate::v11::v11_sign_route_active() =>
+            if crate::v1::v1_sign_route_active() =>
         {
-            drive_v11_finalise(job_store, app_state, notify_map, env.public_id, &job).await
+            drive_v1_finalise(job_store, app_state, notify_map, env.public_id, &job).await
         }
         _ => {
             tracing::debug!(
@@ -412,7 +412,7 @@ async fn process_envelope(
 /// Drive an `attest_balance` job: `proving → completed` with
 /// `result.attestation`, or `failed`. No wallet signature phase.
 ///
-/// EDGE: see [`crate::v11::ATTEST_ANCHOR_LOCATOR_EDGE`] when the Bitcoin
+/// EDGE: see [`crate::v1::ATTEST_ANCHOR_LOCATOR_EDGE`] when the Bitcoin
 /// inscription locator cannot be resolved from engine + pending-publish
 /// state. A failed prove never invents an empty attestation.
 async fn process_attest_balance(
@@ -437,10 +437,10 @@ async fn process_attest_balance(
         },
     );
 
-    let body: crate::v11::AttestJobBody = match serde_json::from_value(job.request_body.clone()) {
+    let body: crate::v1::AttestJobBody = match serde_json::from_value(job.request_body.clone()) {
         Ok(b) => b,
         Err(e) => {
-            let msg = crate::v11::encode_job_error(
+            let msg = crate::v1::encode_job_error(
                 "proving_failed",
                 format!("invalid attest job body: {e}"),
             );
@@ -460,12 +460,12 @@ async fn process_attest_balance(
         }
     };
 
-    let adapter = match &app_state.v11_engine {
+    let adapter = match &app_state.v1_engine {
         Some(a) => a,
         None => {
-            let msg = crate::v11::encode_job_error(
+            let msg = crate::v1::encode_job_error(
                 "internal_error",
-                "v11 EngineAdapter missing for attest_balance job",
+                "v1 EngineAdapter missing for attest_balance job",
             );
             job_store.fail(public_id, &msg).await?;
             publish_phase(
@@ -487,19 +487,19 @@ async fn process_attest_balance(
     // runs the multi-minute C_balance prove on the caller's thread. The
     // single-worker dispatcher already serialises proves, so we await it
     // directly rather than nesting a second runtime.
-    let outcome = crate::v11::prove_attestation_for_job(adapter.as_ref(), &body).await;
+    let outcome = crate::v1::prove_attestation_for_job(adapter.as_ref(), &body).await;
 
     match outcome {
         Ok(proved) => {
             note_prove_outcome(app_state, Ok(())).await;
-            let bytes = match crate::v11::serialize_balance_attestation(
+            let bytes = match crate::v1::serialize_balance_attestation(
                 &proved.statement,
                 adapter.network(),
                 &proved.proof,
             ) {
                 Ok(b) => b,
                 Err(e) => {
-                    let msg = crate::v11::encode_job_error("proving_failed", e.message());
+                    let msg = crate::v1::encode_job_error("proving_failed", e.message());
                     job_store.fail(public_id, &msg).await?;
                     publish_phase(
                         notify_map,
@@ -516,7 +516,7 @@ async fn process_attest_balance(
                 }
             };
             // §7.5 result for attest_balance: only `attestation` is present.
-            let result = crate::v11::completed_attest_result(&bytes);
+            let result = crate::v1::completed_attest_result(&bytes);
             job_store.complete(public_id, result.clone(), 200).await?;
             publish_phase(
                 notify_map,
@@ -534,15 +534,15 @@ async fn process_attest_balance(
         }
         Err(e) => {
             let (code, message) = match &e {
-                crate::v11::AttestError::CircuitDigestMismatch(m) => {
+                crate::v1::AttestError::CircuitDigestMismatch(m) => {
                     ("circuit_digest_mismatch", m.clone())
                 }
-                crate::v11::AttestError::ProvingFailed(m) => ("proving_failed", m.clone()),
-                crate::v11::AttestError::Internal(m) => ("internal_error", m.clone()),
+                crate::v1::AttestError::ProvingFailed(m) => ("proving_failed", m.clone()),
+                crate::v1::AttestError::Internal(m) => ("internal_error", m.clone()),
                 other => ("proving_failed", other.message().to_string()),
             };
             note_prove_outcome(app_state, Err("prove failed")).await;
-            let msg = crate::v11::encode_job_error(code, message);
+            let msg = crate::v1::encode_job_error(code, message);
             if let Ok(Some(j)) = job_store.load(public_id).await {
                 if j.status == JobStatus::Cancelled {
                     notify_map.remove(&public_id);
@@ -908,22 +908,22 @@ async fn process_mint_resume(
 async fn persist_pending_sign_on_job(
     job_store: &JobStore,
     public_id: Uuid,
-    entry: &crate::v11::PendingSignEntry,
+    entry: &crate::v1::PendingSignEntry,
 ) -> anyhow::Result<()> {
     let job = job_store
         .load(public_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("job {public_id} missing while staging finalisation"))?;
     let mut body = job.request_body;
-    let persist = crate::v11::DurableFinalisationPersist::from_entry(entry)
+    let persist = crate::v1::DurableFinalisationPersist::from_entry(entry)
         .map_err(|e| anyhow::anyhow!("encode durable finalisation: {e}"))?;
     let value = serde_json::to_value(persist)?;
     let obj = body
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("jobs.request_body is not an object"))?;
-    obj.insert(crate::v11::FINALISATION_BODY_KEY.to_string(), value);
+    obj.insert(crate::v1::FINALISATION_BODY_KEY.to_string(), value);
     // Drop legacy split keys if a previous build left them.
-    obj.remove(crate::v11::PENDING_SIGN_BODY_KEY);
+    obj.remove(crate::v1::PENDING_SIGN_BODY_KEY);
     obj.remove("sign");
     // Prefer proving; fall back to queued (create leaves queued).
     let applied = if job.status == JobStatus::Proving {
@@ -950,8 +950,8 @@ async fn persist_pending_sign_on_job(
 /// Resolve a live pending after the prove / begin leg under a v1.1 claim.
 ///
 /// Production path: consume a [`PendingSignEntry`] that `StateEngine::begin_*`
-/// registered via [`crate::v11::register_live_pending_after_begin`] into
-/// [`crate::router::AppState::v11_live_pending_after_begin`]. The pending is
+/// registered via [`crate::v1::register_live_pending_after_begin`] into
+/// [`crate::router::AppState::v1_live_pending_after_begin`]. The pending is
 /// self-contained (witness + ProofData); finalise re-validates live
 /// dependencies rather than re-reading a snapshot a concurrent scan can move.
 ///
@@ -961,12 +961,12 @@ async fn persist_pending_sign_on_job(
 fn resolve_live_pending_after_prove(
     app_state: &AppState,
     public_id: Uuid,
-) -> Option<crate::v11::PendingSignEntry> {
-    if !crate::v11::v11_sign_route_active() {
+) -> Option<crate::v1::PendingSignEntry> {
+    if !crate::v1::v1_sign_route_active() {
         return None;
     }
-    if let Some(entry) = crate::v11::take_live_pending_after_begin(
-        &app_state.v11_live_pending_after_begin,
+    if let Some(entry) = crate::v1::take_live_pending_after_begin(
+        &app_state.v1_live_pending_after_begin,
         public_id,
     ) {
         return Some(entry);
@@ -974,7 +974,7 @@ fn resolve_live_pending_after_prove(
     #[cfg(test)]
     {
         if let Some(entry) = app_state
-            .v11_pending_after_prove
+            .v1_pending_after_prove
             .as_ref()
             .and_then(|hook| hook(public_id))
         {
@@ -989,14 +989,14 @@ fn resolve_live_pending_after_prove(
 pub(crate) fn resolve_live_pending_after_prove_for_test(
     app_state: &AppState,
     public_id: Uuid,
-) -> Option<crate::v11::PendingSignEntry> {
+) -> Option<crate::v1::PendingSignEntry> {
     resolve_live_pending_after_prove(app_state, public_id)
 }
 
 /// Production staging site for a job entering `awaiting_signature`.
 ///
 /// Under a v1.1 claim this is the **only** path that writes
-/// `pending_sign_map` for a live job: it calls [`crate::v11::stage_pending_sign`],
+/// `pending_sign_map` for a live job: it calls [`crate::v1::stage_pending_sign`],
 /// persists the restart envelope, and builds the §7.5 advertisement.
 /// Flag-off ignores `pending` and returns legacy ash‖ocr.
 ///
@@ -1008,13 +1008,13 @@ pub(crate) async fn stage_and_select_awaiting_signature(
     public_id: Uuid,
     legacy_ash: &str,
     legacy_ocr: &str,
-    pending: Option<crate::v11::PendingSignEntry>,
+    pending: Option<crate::v1::PendingSignEntry>,
 ) -> Result<serde_json::Value, String> {
     let staged_ref = if let Some(mut entry) = pending {
         // Capture caller-supplied publisher_pubkey from the job row so the
         // durable capability carries everything job completion needs.
         if let Ok(Some(job)) = job_store.load(public_id).await {
-            match crate::v11::publisher_pubkey_from_request_body(&job.request_body) {
+            match crate::v1::publisher_pubkey_from_request_body(&job.request_body) {
                 Ok(pk) => entry = entry.with_publisher_pubkey(pk),
                 Err(msg) => {
                     return Err(format!(
@@ -1026,7 +1026,7 @@ pub(crate) async fn stage_and_select_awaiting_signature(
         // Canonical production writer — tests must not insert into the
         // map by hand if they want to exercise this path.
         let _persist_json =
-            crate::v11::stage_pending_sign(&app_state.pending_sign_map, public_id, entry);
+            crate::v1::stage_pending_sign(&app_state.pending_sign_map, public_id, entry);
         let Some(guard) = app_state.pending_sign_map.get(&public_id) else {
             return Err(
                 "stage_pending_sign did not leave a map entry (internal lifecycle bug)"
@@ -1046,7 +1046,7 @@ pub(crate) async fn stage_and_select_awaiting_signature(
         None
     };
 
-    match crate::v11::select_awaiting_signature_result(
+    match crate::v1::select_awaiting_signature_result(
         legacy_ash,
         legacy_ocr,
         staged_ref.as_ref(),
@@ -1063,8 +1063,8 @@ pub(crate) async fn stage_and_select_awaiting_signature(
 /// Job `error` column for a failed transition into awaiting_signature.
 /// Structured JSON under v1.1; plain string under flag-off (legacy).
 fn fail_error_string(message: &str) -> String {
-    if crate::v11::v11_sign_route_active() {
-        crate::v11::encode_job_error("proving_failed", message)
+    if crate::v1::v1_sign_route_active() {
+        crate::v1::encode_job_error("proving_failed", message)
     } else {
         message.to_string()
     }
@@ -1109,7 +1109,7 @@ async fn cleanup_pending_sign(
         return;
     }
     let mut body = job.request_body;
-    if !crate::v11::strip_pending_sign_from_body(&mut body) {
+    if !crate::v1::strip_pending_sign_from_body(&mut body) {
         // Also drop a durable `sign` blob if present without pending_sign.
         if body
             .as_object_mut()
@@ -1152,7 +1152,7 @@ fn rehydrate_pending_sign_into_map(app_state: &AppState, public_id: Uuid, job: &
     if app_state.pending_sign_map.contains_key(&public_id) {
         return;
     }
-    match crate::v11::rehydrate_pending_sign(&job.request_body) {
+    match crate::v1::rehydrate_pending_sign(&job.request_body) {
         Ok(Some(entry)) => {
             tracing::info!(
                 "Job dispatcher: rehydrated pending_sign for job {} after restart \
@@ -1163,7 +1163,7 @@ fn rehydrate_pending_sign_into_map(app_state: &AppState, public_id: Uuid, job: &
             app_state.pending_sign_map.insert(public_id, entry);
         }
         Ok(None) => {
-            if crate::v11::v11_sign_route_active() {
+            if crate::v1::v1_sign_route_active() {
                 tracing::warn!(
                     "Job dispatcher: job {} resumed awaiting_signature under v1.1 \
                      but request_body has no pending_sign envelope — /sign will fail",
@@ -1511,20 +1511,20 @@ async fn wait_for_commit(
     // Signed durable capability already on the row (crash after persist /
     // CAS / notify, or boot resume of a signed job). Drive finalise without
     // waiting for another wallet round-trip.
-    if crate::v11::v11_sign_route_active() {
+    if crate::v1::v1_sign_route_active() {
         if let Ok(Some(job)) = job_store.load(public_id).await {
             if matches!(
                 job.status,
                 JobStatus::AwaitingSignature | JobStatus::Broadcasting
             ) {
-                if let Ok(Some(entry)) = crate::v11::rehydrate_pending_sign(&job.request_body) {
+                if let Ok(Some(entry)) = crate::v1::rehydrate_pending_sign(&job.request_body) {
                     if entry.signature.is_some() {
                         tracing::info!(
                             "Job dispatcher: job {} has signed durable finalisation on resume \
                              — driving finalise",
                             public_id
                         );
-                        return drive_v11_finalise(
+                        return drive_v1_finalise(
                             job_store,
                             app_state,
                             notify_map,
@@ -1564,8 +1564,8 @@ async fn wait_for_commit(
             // Defect 5: flag-off stores the plain legacy string byte-for-byte.
             // v1.1 uses the structured §7.5 {error, message} JSON (no dedicated
             // timeout code → internal_error).
-            let err = if crate::v11::v11_sign_route_active() {
-                crate::v11::encode_job_error("internal_error", "awaiting_signature timeout")
+            let err = if crate::v1::v1_sign_route_active() {
+                crate::v1::encode_job_error("internal_error", "awaiting_signature timeout")
             } else {
                 "awaiting_signature timeout".to_string()
             };
@@ -1635,17 +1635,17 @@ async fn wait_for_commit(
     // v1.1 path: `/v1/jobs/{id}/sign` already verified and installed the
     // signature into the durable FinalisationCapability. Drive finalise —
     // never complete the job with the signature material alone.
-    if crate::v11::v11_sign_route_active() {
-        if let Ok(Some(entry)) = crate::v11::rehydrate_pending_sign(&job.request_body) {
+    if crate::v1::v1_sign_route_active() {
+        if let Ok(Some(entry)) = crate::v1::rehydrate_pending_sign(&job.request_body) {
             if entry.signature.is_some() {
-                return drive_v11_finalise(job_store, app_state, notify_map, public_id, &job)
+                return drive_v1_finalise(job_store, app_state, notify_map, public_id, &job)
                     .await;
             }
         }
         // In-memory map may hold the signature if persist rehydrate raced.
         if let Some(entry) = app_state.pending_sign_map.get(&public_id) {
             if entry.signature.is_some() {
-                return drive_v11_finalise(job_store, app_state, notify_map, public_id, &job)
+                return drive_v1_finalise(job_store, app_state, notify_map, public_id, &job)
                     .await;
             }
         }
@@ -2033,21 +2033,21 @@ where
 ///
 /// ## Where completion ends (and why)
 ///
-/// [`drive_v11_finalise`] drives a job through:
+/// [`drive_v1_finalise`] drives a job through:
 ///
 /// 1. exclusive claim (owner + lease, renewed during long prove)
-/// 2. prove + apply + **durable** engine snapshot + `v11_pending_publishes`
-///    (`members_ready`) via [`crate::router::V11FinaliseHook`] **or** skip
+/// 2. prove + apply + **durable** engine snapshot + `v1_pending_publishes`
+///    (`members_ready`) via [`crate::router::V1FinaliseHook`] **or** skip
 ///    when `completion_result` is already durable (crash after stage)
 /// 3. persist the §7.5 completion surface on the durable capability
 /// 4. [`JobStore::complete_if_finalise_owner`] — §7.5 result published onto the job row
 ///
 /// That is the **host edge**. The production hook
-/// ([`crate::v11::finalise_accepted_prove_persist_and_stage`]) leaves the
+/// ([`crate::v1::finalise_accepted_prove_persist_and_stage`]) leaves the
 /// applied account and a `members_ready` rebroadcast intent on disk so a
 /// restarted node — or later publisher wiring — finds the job exactly at
 /// this edge. On-chain AggregateStateNullifierV3 **broadcast** still needs
-/// a live bitcoind wallet ([`crate::v11::V11Publisher`]); that is outside
+/// a live bitcoind wallet ([`crate::v1::V1Publisher`]); that is outside
 /// the host edge, not a silent skip of durability up to it.
 ///
 /// Resume is covered durably up to this edge so a job can be driven to exactly
@@ -2098,7 +2098,7 @@ pub const JOB_FINALISE_HOST_EDGE: &str =
 /// | [`JobStore::cancel_not_yet_published`] | lock gen; cancellable set + `reset_generation = $2` | **bool** |
 /// | Legacy commit-payload (`router` → [`JobStore::replace_request_body_if_status`]) | same as replace_request_body_if_status | **bool** |
 /// | Self-heal fail non-terminal (`db::fail_non_terminal_jobs_for_self_heal_in_tx`) | `WHERE status IN (non-terminal)` inside reset tx (holds meta lock via bump) | bulk reset path |
-/// | Finalise hook → engine snapshot + `members_ready` | (not a `jobs` row write) | fence via [`crate::v11::finalise_accepted_prove_persist_and_stage`] |
+/// | Finalise hook → engine snapshot + `members_ready` | (not a `jobs` row write) | fence via [`crate::v1::finalise_accepted_prove_persist_and_stage`] |
 ///
 /// After the claim is won, durable transition commits are fenced on the
 /// **acquisition fencing token** plus a still-valid lease — not on owner
@@ -2108,7 +2108,7 @@ pub const JOB_FINALISE_HOST_EDGE: &str =
 /// `broadcasting` is an **exclusive claim**, not a permission: exactly one
 /// resumer wins the CAS; the loser observes [`FinaliseClaim::Lost`] and must
 /// not continue into side effects **and must not mutate shared notify state**.
-async fn drive_v11_finalise(
+async fn drive_v1_finalise(
     job_store: &JobStore,
     app_state: &AppState,
     notify_map: &JobNotifyMap,
@@ -2121,7 +2121,7 @@ async fn drive_v11_finalise(
     // Pre-claim only: status-qualified and **never** touches a claimed row
     // (`fail_if_status` refuses [`FINALISE_CLAIM_PHASE`]). Terminal writes
     // on an owned epoch must use the fence path below.
-    async fn fail_v11(
+    async fn fail_v1(
         job_store: &JobStore,
         app_state: &AppState,
         notify_map: &JobNotifyMap,
@@ -2129,7 +2129,7 @@ async fn drive_v11_finalise(
         code: &str,
         message: String,
     ) -> anyhow::Result<()> {
-        let err = crate::v11::encode_job_error(code, message.clone());
+        let err = crate::v1::encode_job_error(code, message.clone());
         // Unclaimed only: do not terminate a row another epoch owns.
         let failed = job_store
             .fail_if_status(
@@ -2167,7 +2167,7 @@ async fn drive_v11_finalise(
     // Post-claim fail: fence-qualified so a lost/stale worker cannot fail a
     // job another epoch holds (including same-owner reclaim). `Ok(false)` is
     // quiet loss — leave notify.
-    async fn fail_v11_as_owner(
+    async fn fail_v1_as_owner(
         job_store: &JobStore,
         app_state: &AppState,
         notify_map: &JobNotifyMap,
@@ -2177,7 +2177,7 @@ async fn drive_v11_finalise(
         code: &str,
         message: String,
     ) -> anyhow::Result<()> {
-        let err = crate::v11::encode_job_error(code, message.clone());
+        let err = crate::v1::encode_job_error(code, message.clone());
         let failed = job_store
             .fail_if_finalise_owner(public_id, owner, fence, &err)
             .await?;
@@ -2221,12 +2221,12 @@ async fn drive_v11_finalise(
 
     // Prefer durable capability (cold boot). In-memory map is only a warm
     // cache of the same envelope — never a substitute for missing fields.
-    let mut entry = match crate::v11::rehydrate_pending_sign(&job.request_body) {
+    let mut entry = match crate::v1::rehydrate_pending_sign(&job.request_body) {
         Ok(Some(e)) => e,
         Ok(None) => match app_state.pending_sign_map.get(&public_id).map(|e| e.clone()) {
             Some(e) => e,
             None => {
-                return fail_v11(
+                return fail_v1(
                     job_store,
                     app_state,
                     notify_map,
@@ -2240,7 +2240,7 @@ async fn drive_v11_finalise(
             }
         },
         Err(e) => {
-            return fail_v11(
+            return fail_v1(
                 job_store,
                 app_state,
                 notify_map,
@@ -2253,8 +2253,8 @@ async fn drive_v11_finalise(
     };
 
     // Prove+apply readiness (signature). Completion surface may still be absent.
-    if let Err(msg) = crate::v11::ensure_finalise_ready(&entry) {
-        return fail_v11(
+    if let Err(msg) = crate::v1::ensure_finalise_ready(&entry) {
+        return fail_v1(
             job_store,
             app_state,
             notify_map,
@@ -2287,7 +2287,7 @@ async fn drive_v11_finalise(
             if !renewed {
                 // Already claimed then lost before prove — fence if we still
                 // hold this epoch; otherwise quiet exit.
-                return fail_v11_as_owner(
+                return fail_v1_as_owner(
                     job_store,
                     app_state,
                     notify_map,
@@ -2362,8 +2362,8 @@ async fn drive_v11_finalise(
                 .signature
                 .clone()
                 .expect("ensure_finalise_ready checked signature");
-            let Some(hook) = app_state.v11_finalise.as_ref() else {
-                return fail_v11_as_owner(
+            let Some(hook) = app_state.v1_finalise.as_ref() else {
+                return fail_v1_as_owner(
                     job_store,
                     app_state,
                     notify_map,
@@ -2397,7 +2397,7 @@ async fn drive_v11_finalise(
                     }
                     let response_body = outcome.to_result_json();
                     if let Err(e) = entry.install_completion(response_body, 200) {
-                        return fail_v11_as_owner(
+                        return fail_v1_as_owner(
                             job_store,
                             app_state,
                             notify_map,
@@ -2413,11 +2413,11 @@ async fn drive_v11_finalise(
                     // the terminal complete flip so a crash here is resumable.
                     // Fence-qualified jsonb_set: stale epochs cannot commit;
                     // concurrent lease renew is not clobbered.
-                    let persist = match crate::v11::DurableFinalisationPersist::from_entry(&entry)
+                    let persist = match crate::v1::DurableFinalisationPersist::from_entry(&entry)
                     {
                         Ok(p) => p,
                         Err(e) => {
-                            return fail_v11_as_owner(
+                            return fail_v1_as_owner(
                                 job_store,
                                 app_state,
                                 notify_map,
@@ -2433,7 +2433,7 @@ async fn drive_v11_finalise(
                     let persist_val = match serde_json::to_value(&persist) {
                         Ok(v) => v,
                         Err(e) => {
-                            return fail_v11_as_owner(
+                            return fail_v1_as_owner(
                                 job_store,
                                 app_state,
                                 notify_map,
@@ -2481,7 +2481,7 @@ async fn drive_v11_finalise(
                 Err(e) => {
                     let msg = format!("v1.1 finalise failed: {e}");
                     tracing::warn!("Job dispatcher: job {} {}", public_id, msg);
-                    return fail_v11_as_owner(
+                    return fail_v1_as_owner(
                         job_store,
                         app_state,
                         notify_map,
@@ -2499,8 +2499,8 @@ async fn drive_v11_finalise(
         // Host §7.5 job-result publication + terminal complete.
         // This is [`JOB_FINALISE_HOST_EDGE`] — not on-chain AggregateStateNullifierV3.
         // Fence is claim token + unexpired lease, not status or owner alone.
-        if let Err(msg) = crate::v11::ensure_completion_ready(&entry) {
-            return fail_v11_as_owner(
+        if let Err(msg) = crate::v1::ensure_completion_ready(&entry) {
+            return fail_v1_as_owner(
                 job_store,
                 app_state,
                 notify_map,

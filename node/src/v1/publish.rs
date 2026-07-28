@@ -1,6 +1,6 @@
 //! v1.1 publisher dispatch: `AggregateStateNullifierV3` via script-plonky2.
 //!
-//! Behind `ZKCOINS_V11_SHADOW=1` the node publishes half-aggregated
+//! Behind `ZKCOINS_V1_SHADOW=1` the node publishes half-aggregated
 //! nullifier batches through the foreign script-plonky2 publisher
 //! instead of bincode `Commitment` envelopes. The legacy
 //! [`crate::publisher::create_and_broadcast_inscription`] path stays
@@ -12,7 +12,7 @@
 //!
 //! ## Opaque connect surface
 //!
-//! [`connect_v11_publisher`] returns a node-owned [`V11Publisher`] facade.
+//! [`connect_v1_publisher`] returns a node-owned [`V1Publisher`] facade.
 //! The foreign `zkcoins_prover::publisher::Publisher` type never leaves
 //! this module — its inherent methods (`prepare`, `broadcast_commit`,
 //! `broadcast_reveal`, `publish`) are not reachable from a crate that
@@ -27,13 +27,13 @@ use zkcoins_prover::publisher::{
     BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN,
 };
 
-use super::scan::{V11_SCANNER_COOKIE_ENV, V11_SCANNER_RPC_URL_ENV};
-use super::separation::ensure_v11_publisher_allowed;
+use super::scan::{V1_SCANNER_COOKIE_ENV, V1_SCANNER_RPC_URL_ENV};
+use super::separation::ensure_v1_publisher_allowed;
 
 /// Optional fee / reveal-output overrides. Every production field still
-/// comes from env; tests may assemble a [`V11PublisherEnv`] directly.
+/// comes from env; tests may assemble a [`V1PublisherEnv`] directly.
 #[derive(Clone, Debug)]
-pub struct V11PublisherEnv {
+pub struct V1PublisherEnv {
     pub rpc_url: String,
     pub cookie_path: std::path::PathBuf,
     pub wallet_name: String,
@@ -44,76 +44,76 @@ pub struct V11PublisherEnv {
 }
 
 /// Env keys for the v1.1 bitcoind publisher wallet.
-pub const V11_PUBLISHER_WALLET_ENV: &str = "ZKCOINS_V11_BITCOIND_WALLET";
-pub const V11_PUBLISHER_FEE_RATE_ENV: &str = "ZKCOINS_V11_FEE_RATE_SAT_PER_VB";
-pub const V11_PUBLISHER_REVEAL_VALUE_ENV: &str = "ZKCOINS_V11_REVEAL_OUTPUT_SATS";
+pub const V1_PUBLISHER_WALLET_ENV: &str = "ZKCOINS_V1_BITCOIND_WALLET";
+pub const V1_PUBLISHER_FEE_RATE_ENV: &str = "ZKCOINS_V1_FEE_RATE_SAT_PER_VB";
+pub const V1_PUBLISHER_REVEAL_VALUE_ENV: &str = "ZKCOINS_V1_REVEAL_OUTPUT_SATS";
 
 /// Load publisher config from env. Fails loud on any missing piece.
-pub fn v11_publisher_env_from_env(network: Network) -> Result<V11PublisherEnv> {
-    ensure_v11_publisher_allowed()?;
+pub fn v1_publisher_env_from_env(network: Network) -> Result<V1PublisherEnv> {
+    ensure_v1_publisher_allowed()?;
 
-    let rpc_url = std::env::var(V11_SCANNER_RPC_URL_ENV).map_err(|_| {
+    let rpc_url = std::env::var(V1_SCANNER_RPC_URL_ENV).map_err(|_| {
         anyhow::anyhow!(
-            "ZKCOINS_V11_SHADOW=1 requires {V11_SCANNER_RPC_URL_ENV} for the \
+            "ZKCOINS_V1_SHADOW=1 requires {V1_SCANNER_RPC_URL_ENV} for the \
              AggregateStateNullifierV3 publisher. Refusing to fall back to the \
              legacy Esplora commitment publisher"
         )
     })?;
     if rpc_url.trim().is_empty() {
-        bail!("{V11_SCANNER_RPC_URL_ENV} is empty (no silent default)");
+        bail!("{V1_SCANNER_RPC_URL_ENV} is empty (no silent default)");
     }
 
-    let cookie = std::env::var(V11_SCANNER_COOKIE_ENV).map_err(|_| {
+    let cookie = std::env::var(V1_SCANNER_COOKIE_ENV).map_err(|_| {
         anyhow::anyhow!(
-            "ZKCOINS_V11_SHADOW=1 requires {V11_SCANNER_COOKIE_ENV} for the \
+            "ZKCOINS_V1_SHADOW=1 requires {V1_SCANNER_COOKIE_ENV} for the \
              v1.1 publisher cookie auth. Refusing to fall back"
         )
     })?;
     if cookie.trim().is_empty() {
-        bail!("{V11_SCANNER_COOKIE_ENV} is empty (no silent default)");
+        bail!("{V1_SCANNER_COOKIE_ENV} is empty (no silent default)");
     }
 
-    let wallet_name = std::env::var(V11_PUBLISHER_WALLET_ENV).map_err(|_| {
+    let wallet_name = std::env::var(V1_PUBLISHER_WALLET_ENV).map_err(|_| {
         anyhow::anyhow!(
-            "ZKCOINS_V11_SHADOW=1 requires {V11_PUBLISHER_WALLET_ENV} (bitcoind \
+            "ZKCOINS_V1_SHADOW=1 requires {V1_PUBLISHER_WALLET_ENV} (bitcoind \
              wallet name funding AggregateStateNullifierV3 commits)"
         )
     })?;
     if wallet_name.trim().is_empty() {
-        bail!("{V11_PUBLISHER_WALLET_ENV} is empty (no silent default)");
+        bail!("{V1_PUBLISHER_WALLET_ENV} is empty (no silent default)");
     }
 
-    let fee_raw = std::env::var(V11_PUBLISHER_FEE_RATE_ENV).map_err(|_| {
+    let fee_raw = std::env::var(V1_PUBLISHER_FEE_RATE_ENV).map_err(|_| {
         anyhow::anyhow!(
-            "ZKCOINS_V11_SHADOW=1 requires {V11_PUBLISHER_FEE_RATE_ENV} \
+            "ZKCOINS_V1_SHADOW=1 requires {V1_PUBLISHER_FEE_RATE_ENV} \
              (sat/vB; no silent default fee rate)"
         )
     })?;
     let fee_rate_sat_per_vb: u64 = fee_raw.trim().parse().map_err(|_| {
         anyhow::anyhow!(
-            "{V11_PUBLISHER_FEE_RATE_ENV}={fee_raw:?} is not a non-negative integer"
+            "{V1_PUBLISHER_FEE_RATE_ENV}={fee_raw:?} is not a non-negative integer"
         )
     })?;
     if fee_rate_sat_per_vb == 0 {
-        bail!("{V11_PUBLISHER_FEE_RATE_ENV} must be > 0 (no silent default)");
+        bail!("{V1_PUBLISHER_FEE_RATE_ENV} must be > 0 (no silent default)");
     }
 
-    let reveal_raw = std::env::var(V11_PUBLISHER_REVEAL_VALUE_ENV).map_err(|_| {
+    let reveal_raw = std::env::var(V1_PUBLISHER_REVEAL_VALUE_ENV).map_err(|_| {
         anyhow::anyhow!(
-            "ZKCOINS_V11_SHADOW=1 requires {V11_PUBLISHER_REVEAL_VALUE_ENV} \
+            "ZKCOINS_V1_SHADOW=1 requires {V1_PUBLISHER_REVEAL_VALUE_ENV} \
              (reveal output sats; no silent default)"
         )
     })?;
     let reveal_output_value_sats: u64 = reveal_raw.trim().parse().map_err(|_| {
         anyhow::anyhow!(
-            "{V11_PUBLISHER_REVEAL_VALUE_ENV}={reveal_raw:?} is not a non-negative integer"
+            "{V1_PUBLISHER_REVEAL_VALUE_ENV}={reveal_raw:?} is not a non-negative integer"
         )
     })?;
     if reveal_output_value_sats == 0 {
-        bail!("{V11_PUBLISHER_REVEAL_VALUE_ENV} must be > 0 (no silent default)");
+        bail!("{V1_PUBLISHER_REVEAL_VALUE_ENV} must be > 0 (no silent default)");
     }
 
-    Ok(V11PublisherEnv {
+    Ok(V1PublisherEnv {
         rpc_url,
         cookie_path: std::path::PathBuf::from(cookie),
         wallet_name,
@@ -125,7 +125,7 @@ pub fn v11_publisher_env_from_env(network: Network) -> Result<V11PublisherEnv> {
     })
 }
 
-impl V11PublisherEnv {
+impl V1PublisherEnv {
     /// Convert into the foreign publisher config. **Crate-private** — the
     /// foreign `PublisherConfig` type must not appear on the public surface.
     fn into_config(self) -> PublisherConfig {
@@ -149,15 +149,15 @@ impl V11PublisherEnv {
 /// reached only via receive / resume orchestration, which hold the
 /// crate-private [`super::receive::NullifierBatchPublisher`] capability
 /// for production and test doubles alike.
-pub struct V11Publisher {
+pub struct V1Publisher {
     inner: Publisher,
 }
 
-impl V11Publisher {
+impl V1Publisher {
     /// Half-aggregate + inscribe. Crate-private sink used by the
     /// [`super::receive::NullifierBatchPublisher`] impl.
     pub(crate) fn publish_batch(&self, members: &[BatchMember]) -> Result<PublishedBatch> {
-        publish_v11_batch(&self.inner, members)
+        publish_v1_batch(&self.inner, members)
     }
 
     /// Construct a fee-converged commit/reveal pair without broadcasting.
@@ -193,13 +193,13 @@ impl V11Publisher {
 
 /// Connect the script-plonky2 publisher. Fails loud on RPC / chain mismatch.
 ///
-/// Returns a node-owned [`V11Publisher`] — never the raw foreign type.
-pub fn connect_v11_publisher(env: V11PublisherEnv) -> Result<V11Publisher> {
-    ensure_v11_publisher_allowed()?;
+/// Returns a node-owned [`V1Publisher`] — never the raw foreign type.
+pub fn connect_v1_publisher(env: V1PublisherEnv) -> Result<V1Publisher> {
+    ensure_v1_publisher_allowed()?;
     let config = env.into_config();
     let inner = Publisher::connect(config)
         .context("v1.1 Publisher::connect failed (no legacy fall-back)")?;
-    Ok(V11Publisher { inner })
+    Ok(V1Publisher { inner })
 }
 
 /// Half-aggregate and inscribe `members` as `AggregateStateNullifierV3`.
@@ -209,13 +209,13 @@ pub fn connect_v11_publisher(env: V11PublisherEnv) -> Result<V11Publisher> {
 /// **Crate-private sink.** Downstream callers must not drive publish from a
 /// free-standing batch of members; use the receive / resume orchestration
 /// entry points that already carry a capability.
-pub(crate) fn publish_v11_batch(
+pub(crate) fn publish_v1_batch(
     publisher: &Publisher,
     members: &[BatchMember],
 ) -> Result<PublishedBatch> {
-    ensure_v11_publisher_allowed()?;
+    ensure_v1_publisher_allowed()?;
     if members.is_empty() {
-        bail!("publish_v11_batch requires at least one BatchMember (no empty inscription)");
+        bail!("publish_v1_batch requires at least one BatchMember (no empty inscription)");
     }
     publisher
         .publish(members)

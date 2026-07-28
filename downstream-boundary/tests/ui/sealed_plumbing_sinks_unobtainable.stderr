@@ -1,26 +1,26 @@
-error[E0433]: cannot find `NullifierBatchPublisher` in `v11`
+error[E0433]: cannot find `NullifierBatchPublisher` in `v1`
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:83:24
    |
-83 |     let _ = node::v11::NullifierBatchPublisher::publish_batch(&publisher, &[]);
-   |                        ^^^^^^^^^^^^^^^^^^^^^^^ could not find `NullifierBatchPublisher` in `v11`
+83 |     let _ = node::v1::NullifierBatchPublisher::publish_batch(&publisher, &[]);
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^ could not find `NullifierBatchPublisher` in `v1`
 
-error[E0433]: cannot find `NullifierBatchPublisher` in `v11`
+error[E0433]: cannot find `NullifierBatchPublisher` in `v1`
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:84:24
    |
-84 |     let _ = node::v11::NullifierBatchPublisher::try_prepare(&publisher, &[]);
-   |                        ^^^^^^^^^^^^^^^^^^^^^^^ could not find `NullifierBatchPublisher` in `v11`
+84 |     let _ = node::v1::NullifierBatchPublisher::try_prepare(&publisher, &[]);
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^ could not find `NullifierBatchPublisher` in `v1`
 
-error[E0433]: cannot find `NullifierBatchPublisher` in `v11`
+error[E0433]: cannot find `NullifierBatchPublisher` in `v1`
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:85:24
    |
-85 |     let _ = node::v11::NullifierBatchPublisher::broadcast_commit(&publisher, loop {});
-   |                        ^^^^^^^^^^^^^^^^^^^^^^^ could not find `NullifierBatchPublisher` in `v11`
+85 |     let _ = node::v1::NullifierBatchPublisher::broadcast_commit(&publisher, loop {});
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^ could not find `NullifierBatchPublisher` in `v1`
 
-error[E0433]: cannot find `NullifierBatchPublisher` in `v11`
+error[E0433]: cannot find `NullifierBatchPublisher` in `v1`
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:86:24
    |
-86 |     let _ = node::v11::NullifierBatchPublisher::broadcast_reveal(&publisher, loop {});
-   |                        ^^^^^^^^^^^^^^^^^^^^^^^ could not find `NullifierBatchPublisher` in `v11`
+86 |     let _ = node::v1::NullifierBatchPublisher::broadcast_reveal(&publisher, loop {});
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^ could not find `NullifierBatchPublisher` in `v1`
 
 error[E0433]: cannot find `zkcoins_prover` in the crate root
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:119:15
@@ -34,126 +34,126 @@ error[E0433]: cannot find `zkcoins_prover` in the crate root
 123 |     let _ = ::zkcoins_prover::publisher::Publisher::connect(loop {});
     |               ^^^^^^^^^^^^^^ could not find `zkcoins_prover` in the list of imported crates
 
-error[E0425]: cannot find value `publish_applied_nullifier` in module `node::v11`
+error[E0425]: cannot find value `publish_applied_nullifier` in module `node::v1`
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:35:24
    |
-35 |     let _ = node::v11::publish_applied_nullifier;
-   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `node::v11`
+35 |     let _ = node::v1::publish_applied_nullifier;
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `node::v1`
 
-error[E0425]: cannot find value `publish_v11_batch` in module `node::v11`
+error[E0425]: cannot find value `publish_v1_batch` in module `node::v1`
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:36:24
    |
-36 |     let _ = node::v11::publish_v11_batch;
-   |                        ^^^^^^^^^^^^^^^^^ not found in `node::v11`
+36 |     let _ = node::v1::publish_v1_batch;
+   |                        ^^^^^^^^^^^^^^^^^ not found in `node::v1`
 
-error[E0425]: cannot find value `fold_survivors_into_engine` in module `node::v11`
+error[E0425]: cannot find value `fold_survivors_into_engine` in module `node::v1`
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:56:24
    |
-56 |     let _ = node::v11::fold_survivors_into_engine;
-   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `node::v11`
+56 |     let _ = node::v1::fold_survivors_into_engine;
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `node::v1`
 
-error[E0425]: cannot find value `replace_engine_nflog_from_survivors` in module `node::v11`
+error[E0425]: cannot find value `replace_engine_nflog_from_survivors` in module `node::v1`
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:57:24
    |
-57 |     let _ = node::v11::replace_engine_nflog_from_survivors;
-   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `node::v11`
+57 |     let _ = node::v1::replace_engine_nflog_from_survivors;
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `node::v1`
 
-error[E0422]: cannot find struct, variant or union type `BatchMember` in module `node::v11`
+error[E0422]: cannot find struct, variant or union type `BatchMember` in module `node::v1`
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:94:24
    |
-94 |     let _ = node::v11::BatchMember {
-   |                        ^^^^^^^^^^^ not found in `node::v11`
+94 |     let _ = node::v1::BatchMember {
+   |                        ^^^^^^^^^^^ not found in `node::v1`
 
-error[E0422]: cannot find struct, variant or union type `PreparedBatch` in module `node::v11`
+error[E0422]: cannot find struct, variant or union type `PreparedBatch` in module `node::v1`
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:98:24
    |
-98 |     let _ = node::v11::PreparedBatch {
-   |                        ^^^^^^^^^^^^^ not found in `node::v11`
+98 |     let _ = node::v1::PreparedBatch {
+   |                        ^^^^^^^^^^^^^ not found in `node::v1`
 
-error[E0425]: cannot find value `Publisher` in module `node::v11`
+error[E0425]: cannot find value `Publisher` in module `node::v1`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:178:24
     |
-178 |     let _ = node::v11::Publisher;
-    |                        ^^^^^^^^^ not found in `node::v11`
+178 |     let _ = node::v1::Publisher;
+    |                        ^^^^^^^^^ not found in `node::v1`
 
-error[E0423]: expected value, found struct `node::v11::publish::Publisher`
+error[E0423]: expected value, found struct `node::v1::publish::Publisher`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:179:13
     |
-179 |     let _ = node::v11::publish::Publisher;
+179 |     let _ = node::v1::publish::Publisher;
     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     |
    ::: $WORKSPACE/script-plonky2/src/publisher.rs
     |
     | pub struct Publisher {
-    | -------------------- `node::v11::publish::Publisher` defined here
+    | -------------------- `node::v1::publish::Publisher` defined here
 
-error[E0425]: cannot find value `PublisherConfig` in module `node::v11`
+error[E0425]: cannot find value `PublisherConfig` in module `node::v1`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:180:24
     |
-180 |     let _ = node::v11::PublisherConfig;
-    |                        ^^^^^^^^^^^^^^^ not found in `node::v11`
+180 |     let _ = node::v1::PublisherConfig;
+    |                        ^^^^^^^^^^^^^^^ not found in `node::v1`
 
-error[E0423]: expected value, found struct `node::v11::publish::PublisherConfig`
+error[E0423]: expected value, found struct `node::v1::publish::PublisherConfig`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:181:13
     |
-181 |     let _ = node::v11::publish::PublisherConfig;
-    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use struct literal syntax instead: `node::v11::publish::PublisherConfig { rpc_url: val, cookie_path: val, wallet_name: val, fee_rate_sat_per_vb: val, reveal_output_value: val, network: val, inclusion_delay_margin: val }`
+181 |     let _ = node::v1::publish::PublisherConfig;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use struct literal syntax instead: `node::v1::publish::PublisherConfig { rpc_url: val, cookie_path: val, wallet_name: val, fee_rate_sat_per_vb: val, reveal_output_value: val, network: val, inclusion_delay_margin: val }`
     |
    ::: $WORKSPACE/script-plonky2/src/publisher.rs
     |
     | pub struct PublisherConfig {
-    | -------------------------- `node::v11::publish::PublisherConfig` defined here
+    | -------------------------- `node::v1::publish::PublisherConfig` defined here
 
-error[E0425]: cannot find value `PublishedBatch` in module `node::v11`
+error[E0425]: cannot find value `PublishedBatch` in module `node::v1`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:182:24
     |
-182 |     let _ = node::v11::PublishedBatch;
-    |                        ^^^^^^^^^^^^^^ not found in `node::v11`
+182 |     let _ = node::v1::PublishedBatch;
+    |                        ^^^^^^^^^^^^^^ not found in `node::v1`
 
-error[E0423]: expected value, found struct `node::v11::publish::PublishedBatch`
+error[E0423]: expected value, found struct `node::v1::publish::PublishedBatch`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:183:13
     |
-183 |     let _ = node::v11::publish::PublishedBatch;
-    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use struct literal syntax instead: `node::v11::publish::PublishedBatch { aggregate: val, payload: val, commit_txid: val, reveal_txid: val, commit_output: val, block_anchor: val }`
+183 |     let _ = node::v1::publish::PublishedBatch;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use struct literal syntax instead: `node::v1::publish::PublishedBatch { aggregate: val, payload: val, commit_txid: val, reveal_txid: val, commit_output: val, block_anchor: val }`
     |
    ::: $WORKSPACE/script-plonky2/src/publisher.rs
     |
     | pub struct PublishedBatch {
-    | ------------------------- `node::v11::publish::PublishedBatch` defined here
+    | ------------------------- `node::v1::publish::PublishedBatch` defined here
 
-error[E0425]: cannot find value `PreparedBatch` in module `node::v11`
+error[E0425]: cannot find value `PreparedBatch` in module `node::v1`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:184:24
     |
-184 |     let _ = node::v11::PreparedBatch;
-    |                        ^^^^^^^^^^^^^ not found in `node::v11`
+184 |     let _ = node::v1::PreparedBatch;
+    |                        ^^^^^^^^^^^^^ not found in `node::v1`
 
-error[E0423]: expected value, found struct `node::v11::publish::PreparedBatch`
+error[E0423]: expected value, found struct `node::v1::publish::PreparedBatch`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:185:13
     |
-185 |     let _ = node::v11::publish::PreparedBatch;
-    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use struct literal syntax instead: `node::v11::publish::PreparedBatch { aggregate: val, payload: val, signed_commit: val, reveal_tx: val, commit_output: val, block_anchor: val, commit_vsize: val, reveal_vsize: val, commit_fee: val, reveal_fee: val }`
+185 |     let _ = node::v1::publish::PreparedBatch;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use struct literal syntax instead: `node::v1::publish::PreparedBatch { aggregate: val, payload: val, signed_commit: val, reveal_tx: val, commit_output: val, block_anchor: val, commit_vsize: val, reveal_vsize: val, commit_fee: val, reveal_fee: val }`
     |
    ::: $WORKSPACE/script-plonky2/src/publisher.rs
     |
     | pub struct PreparedBatch {
-    | ------------------------ `node::v11::publish::PreparedBatch` defined here
+    | ------------------------ `node::v1::publish::PreparedBatch` defined here
 
-error[E0425]: cannot find value `BatchMember` in module `node::v11`
+error[E0425]: cannot find value `BatchMember` in module `node::v1`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:188:24
     |
-188 |     let _ = node::v11::BatchMember;
-    |                        ^^^^^^^^^^^ not found in `node::v11`
+188 |     let _ = node::v1::BatchMember;
+    |                        ^^^^^^^^^^^ not found in `node::v1`
 
-error[E0423]: expected value, found struct `node::v11::publish::BatchMember`
+error[E0423]: expected value, found struct `node::v1::publish::BatchMember`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:189:13
     |
-189 |     let _ = node::v11::publish::BatchMember;
-    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use struct literal syntax instead: `node::v11::publish::BatchMember { sig: val, build_tip: val }`
+189 |     let _ = node::v1::publish::BatchMember;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use struct literal syntax instead: `node::v1::publish::BatchMember { sig: val, build_tip: val }`
     |
    ::: $WORKSPACE/script-plonky2/src/publisher.rs
     |
     | pub struct BatchMember {
-    | ---------------------- `node::v11::publish::BatchMember` defined here
+    | ---------------------- `node::v1::publish::BatchMember` defined here
 
 error[E0425]: cannot find value `zkcoins_prover` in crate `node`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:192:19
@@ -161,28 +161,28 @@ error[E0425]: cannot find value `zkcoins_prover` in crate `node`
 192 |     let _ = node::zkcoins_prover;
     |                   ^^^^^^^^^^^^^^ not found in `node`
 
-error[E0425]: cannot find value `zkcoins_prover` in module `node::v11`
+error[E0425]: cannot find value `zkcoins_prover` in module `node::v1`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:193:24
     |
-193 |     let _ = node::v11::zkcoins_prover;
-    |                        ^^^^^^^^^^^^^^ not found in `node::v11`
+193 |     let _ = node::v1::zkcoins_prover;
+    |                        ^^^^^^^^^^^^^^ not found in `node::v1`
 
-error[E0425]: cannot find value `zkcoins_prover` in module `node::v11::publish`
+error[E0425]: cannot find value `zkcoins_prover` in module `node::v1::publish`
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:194:33
     |
-194 |     let _ = node::v11::publish::zkcoins_prover;
-    |                                 ^^^^^^^^^^^^^^ not found in `node::v11::publish`
+194 |     let _ = node::v1::publish::zkcoins_prover;
+    |                                 ^^^^^^^^^^^^^^ not found in `node::v1::publish`
 
-error[E0603]: function `publish_v11_batch` is private
+error[E0603]: function `publish_v1_batch` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:37:33
    |
-37 |     let _ = node::v11::publish::publish_v11_batch;
+37 |     let _ = node::v1::publish::publish_v1_batch;
    |                                 ^^^^^^^^^^^^^^^^^ private function
    |
-note: the function `publish_v11_batch` is defined here
-  --> $WORKSPACE/node/src/v11/publish.rs
+note: the function `publish_v1_batch` is defined here
+  --> $WORKSPACE/node/src/v1/publish.rs
    |
-   | / pub(crate) fn publish_v11_batch(
+   | / pub(crate) fn publish_v1_batch(
    | |     publisher: &Publisher,
    | |     members: &[BatchMember],
    | | ) -> Result<PublishedBatch> {
@@ -191,11 +191,11 @@ note: the function `publish_v11_batch` is defined here
 error[E0603]: function `persist_engine_snapshot` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:40:32
    |
-40 |     let _ = node::v11::db_v11::persist_engine_snapshot;
+40 |     let _ = node::v1::db_v1::persist_engine_snapshot;
    |                                ^^^^^^^^^^^^^^^^^^^^^^^ private function
    |
 note: the function `persist_engine_snapshot` is defined here
-  --> $WORKSPACE/node/src/v11/db_v11.rs
+  --> $WORKSPACE/node/src/v1/db_v1.rs
    |
    | / pub(crate) async fn persist_engine_snapshot(
    | |     pool: &PgPool,
@@ -206,11 +206,11 @@ note: the function `persist_engine_snapshot` is defined here
 error[E0603]: function `persist_engine_with_pending_members_ready` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:41:32
    |
-41 |     let _ = node::v11::db_v11::persist_engine_with_pending_members_ready;
+41 |     let _ = node::v1::db_v1::persist_engine_with_pending_members_ready;
    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private function
    |
 note: the function `persist_engine_with_pending_members_ready` is defined here
-  --> $WORKSPACE/node/src/v11/db_v11.rs
+  --> $WORKSPACE/node/src/v1/db_v1.rs
    |
    | / pub(crate) async fn persist_engine_with_pending_members_ready(
    | |     pool: &PgPool,
@@ -224,11 +224,11 @@ note: the function `persist_engine_with_pending_members_ready` is defined here
 error[E0603]: function `insert_pending_publish_members_ready` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:42:32
    |
-42 |     let _ = node::v11::db_v11::insert_pending_publish_members_ready;
+42 |     let _ = node::v1::db_v1::insert_pending_publish_members_ready;
    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private function
    |
 note: the function `insert_pending_publish_members_ready` is defined here
-  --> $WORKSPACE/node/src/v11/db_v11.rs
+  --> $WORKSPACE/node/src/v1/db_v1.rs
    |
    | / pub(crate) async fn insert_pending_publish_members_ready(
    | |     pool: &PgPool,
@@ -242,11 +242,11 @@ note: the function `insert_pending_publish_members_ready` is defined here
 error[E0603]: function `mark_pending_publish_constructed` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:43:32
    |
-43 |     let _ = node::v11::db_v11::mark_pending_publish_constructed;
+43 |     let _ = node::v1::db_v1::mark_pending_publish_constructed;
    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private function
    |
 note: the function `mark_pending_publish_constructed` is defined here
-  --> $WORKSPACE/node/src/v11/db_v11.rs
+  --> $WORKSPACE/node/src/v1/db_v1.rs
    |
    | / pub(crate) async fn mark_pending_publish_constructed(
    | |     pool: &PgPool,
@@ -260,11 +260,11 @@ note: the function `mark_pending_publish_constructed` is defined here
 error[E0603]: function `mark_pending_publish_status` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:44:32
    |
-44 |     let _ = node::v11::db_v11::mark_pending_publish_status;
+44 |     let _ = node::v1::db_v1::mark_pending_publish_status;
    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^ private function
    |
 note: the function `mark_pending_publish_status` is defined here
-  --> $WORKSPACE/node/src/v11/db_v11.rs
+  --> $WORKSPACE/node/src/v1/db_v1.rs
    |
    | / pub(crate) async fn mark_pending_publish_status(
    | |     pool: &PgPool,
@@ -277,11 +277,11 @@ note: the function `mark_pending_publish_status` is defined here
 error[E0603]: function `fold_survivors_into_engine` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:58:30
    |
-58 |     let _ = node::v11::scan::fold_survivors_into_engine;
+58 |     let _ = node::v1::scan::fold_survivors_into_engine;
    |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^ private function
    |
 note: the function `fold_survivors_into_engine` is defined here
-  --> $WORKSPACE/node/src/v11/scan.rs
+  --> $WORKSPACE/node/src/v1/scan.rs
    |
    | / pub(crate) fn fold_survivors_into_engine(
    | |     engine: &mut StateEngine,
@@ -292,11 +292,11 @@ note: the function `fold_survivors_into_engine` is defined here
 error[E0603]: function `replace_engine_nflog_from_survivors` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:59:30
    |
-59 |     let _ = node::v11::scan::replace_engine_nflog_from_survivors;
+59 |     let _ = node::v1::scan::replace_engine_nflog_from_survivors;
    |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private function
    |
 note: the function `replace_engine_nflog_from_survivors` is defined here
-  --> $WORKSPACE/node/src/v11/scan.rs
+  --> $WORKSPACE/node/src/v1/scan.rs
    |
    | / pub(crate) fn replace_engine_nflog_from_survivors(
    | |     engine: &mut StateEngine,
@@ -309,13 +309,13 @@ note: the function `replace_engine_nflog_from_survivors` is defined here
 error[E0603]: trait `NullifierBatchPublisher` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:87:33
    |
-87 |     let _ = node::v11::receive::NullifierBatchPublisher::publish_batch(&publisher, &[]);
+87 |     let _ = node::v1::receive::NullifierBatchPublisher::publish_batch(&publisher, &[]);
    |                                 ^^^^^^^^^^^^^^^^^^^^^^^  ------------- associated function `publish_batch` is not publicly re-exported
    |                                 |
    |                                 private trait
    |
 note: the trait `NullifierBatchPublisher` is defined here
-  --> $WORKSPACE/node/src/v11/receive.rs
+  --> $WORKSPACE/node/src/v1/receive.rs
    |
    | pub(crate) trait NullifierBatchPublisher {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -323,112 +323,112 @@ note: the trait `NullifierBatchPublisher` is defined here
 error[E0603]: struct `BatchMember` is private
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:111:33
     |
-111 |     let _ = node::v11::publish::BatchMember {
+111 |     let _ = node::v1::publish::BatchMember {
     |                                 ^^^^^^^^^^^ private struct
     |
 note: the struct `BatchMember` is defined here
-   --> $WORKSPACE/node/src/v11/publish.rs
+   --> $WORKSPACE/node/src/v1/publish.rs
     |
     |     BatchMember, PreparedBatch, PublishedBatch, Publisher, PublisherConfig,
     |     ^^^^^^^^^^^
 help: import `BatchMember` directly
     |
-111 -     let _ = node::v11::publish::BatchMember {
+111 -     let _ = node::v1::publish::BatchMember {
 111 +     let _ = zkcoins_prover_plonky2::publisher::BatchMember {
     |
 
 error[E0603]: struct `Publisher` is private
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:179:33
     |
-179 |     let _ = node::v11::publish::Publisher;
+179 |     let _ = node::v1::publish::Publisher;
     |                                 ^^^^^^^^^ private struct
     |
 note: the struct `Publisher` is defined here
-   --> $WORKSPACE/node/src/v11/publish.rs
+   --> $WORKSPACE/node/src/v1/publish.rs
     |
     |     BatchMember, PreparedBatch, PublishedBatch, Publisher, PublisherConfig,
     |                                                 ^^^^^^^^^
 help: import `Publisher` directly
     |
-179 -     let _ = node::v11::publish::Publisher;
+179 -     let _ = node::v1::publish::Publisher;
 179 +     let _ = zkcoins_prover_plonky2::publisher::Publisher;
     |
 
 error[E0603]: struct `PublisherConfig` is private
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:181:33
     |
-181 |     let _ = node::v11::publish::PublisherConfig;
+181 |     let _ = node::v1::publish::PublisherConfig;
     |                                 ^^^^^^^^^^^^^^^ private struct
     |
 note: the struct `PublisherConfig` is defined here
-   --> $WORKSPACE/node/src/v11/publish.rs
+   --> $WORKSPACE/node/src/v1/publish.rs
     |
     |     BatchMember, PreparedBatch, PublishedBatch, Publisher, PublisherConfig,
     |                                                            ^^^^^^^^^^^^^^^
 help: import `PublisherConfig` directly
     |
-181 -     let _ = node::v11::publish::PublisherConfig;
+181 -     let _ = node::v1::publish::PublisherConfig;
 181 +     let _ = zkcoins_prover_plonky2::publisher::PublisherConfig;
     |
 
 error[E0603]: struct `PublishedBatch` is private
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:183:33
     |
-183 |     let _ = node::v11::publish::PublishedBatch;
+183 |     let _ = node::v1::publish::PublishedBatch;
     |                                 ^^^^^^^^^^^^^^ private struct
     |
 note: the struct `PublishedBatch` is defined here
-   --> $WORKSPACE/node/src/v11/publish.rs
+   --> $WORKSPACE/node/src/v1/publish.rs
     |
     |     BatchMember, PreparedBatch, PublishedBatch, Publisher, PublisherConfig,
     |                                 ^^^^^^^^^^^^^^
 help: import `PublishedBatch` directly
     |
-183 -     let _ = node::v11::publish::PublishedBatch;
+183 -     let _ = node::v1::publish::PublishedBatch;
 183 +     let _ = zkcoins_prover_plonky2::publisher::PublishedBatch;
     |
 
 error[E0603]: struct `PreparedBatch` is private
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:185:33
     |
-185 |     let _ = node::v11::publish::PreparedBatch;
+185 |     let _ = node::v1::publish::PreparedBatch;
     |                                 ^^^^^^^^^^^^^ private struct
     |
 note: the struct `PreparedBatch` is defined here
-   --> $WORKSPACE/node/src/v11/publish.rs
+   --> $WORKSPACE/node/src/v1/publish.rs
     |
     |     BatchMember, PreparedBatch, PublishedBatch, Publisher, PublisherConfig,
     |                  ^^^^^^^^^^^^^
 help: import `PreparedBatch` directly
     |
-185 -     let _ = node::v11::publish::PreparedBatch;
+185 -     let _ = node::v1::publish::PreparedBatch;
 185 +     let _ = zkcoins_prover_plonky2::publisher::PreparedBatch;
     |
 
 error[E0603]: struct `BatchMember` is private
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:189:33
     |
-189 |     let _ = node::v11::publish::BatchMember;
+189 |     let _ = node::v1::publish::BatchMember;
     |                                 ^^^^^^^^^^^ private struct
     |
 note: the struct `BatchMember` is defined here
-   --> $WORKSPACE/node/src/v11/publish.rs
+   --> $WORKSPACE/node/src/v1/publish.rs
     |
     |     BatchMember, PreparedBatch, PublishedBatch, Publisher, PublisherConfig,
     |     ^^^^^^^^^^^
 help: import `BatchMember` directly
     |
-189 -     let _ = node::v11::publish::BatchMember;
+189 -     let _ = node::v1::publish::BatchMember;
 189 +     let _ = zkcoins_prover_plonky2::publisher::BatchMember;
     |
 
 error[E0624]: method `with_engine_mut` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:47:39
    |
-47 |       let _ = node::v11::EngineAdapter::with_engine_mut;
+47 |       let _ = node::v1::EngineAdapter::with_engine_mut;
    |                                         ^^^^^^^^^^^^^^^ private method
    |
-  ::: $WORKSPACE/node/src/v11/adapter.rs
+  ::: $WORKSPACE/node/src/v1/adapter.rs
    |
    | /     pub(crate) fn with_engine_mut<R>(
    | |         &self,
@@ -439,10 +439,10 @@ error[E0624]: method `with_engine_mut` is private
 error[E0624]: method `restore_live` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:48:39
    |
-48 |     let _ = node::v11::EngineAdapter::restore_live;
+48 |     let _ = node::v1::EngineAdapter::restore_live;
    |                                       ^^^^^^^^^^^^ private method
    |
-  ::: $WORKSPACE/node/src/v11/adapter.rs
+  ::: $WORKSPACE/node/src/v1/adapter.rs
    |
    |     pub(crate) fn restore_live(&self, snap: EngineSnapshot) -> Result<()> {
    |     --------------------------------------------------------------------- private method defined here
@@ -450,10 +450,10 @@ error[E0624]: method `restore_live` is private
 error[E0624]: method `set_tip_hash` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:49:39
    |
-49 |     let _ = node::v11::EngineAdapter::set_tip_hash;
+49 |     let _ = node::v1::EngineAdapter::set_tip_hash;
    |                                       ^^^^^^^^^^^^ private method
    |
-  ::: $WORKSPACE/node/src/v11/adapter.rs
+  ::: $WORKSPACE/node/src/v1/adapter.rs
    |
    |     pub(crate) fn set_tip_hash(&self, tip_hash: [u8; 32]) -> Result<()> {
    |     ------------------------------------------------------------------- private method defined here
@@ -461,10 +461,10 @@ error[E0624]: method `set_tip_hash` is private
 error[E0624]: method `persist` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:50:39
    |
-50 |     let _ = node::v11::EngineAdapter::persist;
+50 |     let _ = node::v1::EngineAdapter::persist;
    |                                       ^^^^^^^ private method
    |
-  ::: $WORKSPACE/node/src/v11/adapter.rs
+  ::: $WORKSPACE/node/src/v1/adapter.rs
    |
    |     pub(crate) async fn persist(&self) -> Result<()> {
    |     ------------------------------------------------ private method defined here
@@ -472,10 +472,10 @@ error[E0624]: method `persist` is private
 error[E0624]: method `reload_from_db` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:51:39
    |
-51 |     let _ = node::v11::EngineAdapter::reload_from_db;
+51 |     let _ = node::v1::EngineAdapter::reload_from_db;
    |                                       ^^^^^^^^^^^^^^ private method
    |
-  ::: $WORKSPACE/node/src/v11/adapter.rs
+  ::: $WORKSPACE/node/src/v1/adapter.rs
    |
    |     pub(crate) async fn reload_from_db(&self) -> Result<()> {
    |     ------------------------------------------------------- private method defined here
@@ -483,10 +483,10 @@ error[E0624]: method `reload_from_db` is private
 error[E0624]: method `lock_writes` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:52:39
    |
-52 |     let _ = node::v11::EngineAdapter::lock_writes;
+52 |     let _ = node::v1::EngineAdapter::lock_writes;
    |                                       ^^^^^^^^^^^ private method
    |
-  ::: $WORKSPACE/node/src/v11/adapter.rs
+  ::: $WORKSPACE/node/src/v1/adapter.rs
    |
    |     pub(crate) async fn lock_writes(&self) -> AsyncMutexGuard<'_, ()> {
    |     ----------------------------------------------------------------- private method defined here
@@ -494,10 +494,10 @@ error[E0624]: method `lock_writes` is private
 error[E0624]: method `snapshot_live` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:53:39
    |
-53 |     let _ = node::v11::EngineAdapter::snapshot_live;
+53 |     let _ = node::v1::EngineAdapter::snapshot_live;
    |                                       ^^^^^^^^^^^^^ private method
    |
-  ::: $WORKSPACE/node/src/v11/adapter.rs
+  ::: $WORKSPACE/node/src/v1/adapter.rs
    |
    |     pub(crate) fn snapshot_live(&self) -> EngineSnapshot {
    |     ---------------------------------------------------- private method defined here
@@ -505,7 +505,7 @@ error[E0624]: method `snapshot_live` is private
 warning: unreachable call
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:25:15
    |
-25 |         match node::v11::connect_v11_publisher(loop {}) {
+25 |         match node::v1::connect_v1_publisher(loop {}) {
    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ------- any code following this expression is unreachable
    |               |
    |               unreachable call
@@ -516,11 +516,11 @@ warning: unreachable call
    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
    = note: this warning originates in the macro `publisher_from_connect` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0599]: no method named `prepare` found for struct `V11Publisher` in the current scope
+error[E0599]: no method named `prepare` found for struct `V1Publisher` in the current scope
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:74:23
    |
 74 |     let _ = publisher.prepare(&[]);
-   |                       ^^^^^^^ method not found in `V11Publisher`
+   |                       ^^^^^^^ method not found in `V1Publisher`
 
 error[E0624]: method `broadcast_commit` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:75:23
@@ -528,7 +528,7 @@ error[E0624]: method `broadcast_commit` is private
 75 |       let _ = publisher.broadcast_commit(loop {});
    |                         ^^^^^^^^^^^^^^^^ private method
    |
-  ::: $WORKSPACE/node/src/v11/publish.rs
+  ::: $WORKSPACE/node/src/v1/publish.rs
    |
    | /     pub(crate) fn broadcast_commit(
    | |         &self,
@@ -550,7 +550,7 @@ error[E0624]: method `broadcast_reveal` is private
 76 |       let _ = publisher.broadcast_reveal(loop {});
    |                         ^^^^^^^^^^^^^^^^ private method
    |
-  ::: $WORKSPACE/node/src/v11/publish.rs
+  ::: $WORKSPACE/node/src/v1/publish.rs
    |
    | /     pub(crate) fn broadcast_reveal(
    | |         &self,
@@ -566,16 +566,16 @@ warning: unreachable call
    |                       |
    |                       unreachable call
 
-error[E0599]: no method named `publish` found for struct `V11Publisher` in the current scope
+error[E0599]: no method named `publish` found for struct `V1Publisher` in the current scope
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:77:23
    |
 77 |     let _ = publisher.publish(&[]);
-   |                       ^^^^^^^ method not found in `V11Publisher`
+   |                       ^^^^^^^ method not found in `V1Publisher`
 
 warning: unreachable call
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:25:15
    |
-25 |         match node::v11::connect_v11_publisher(loop {}) {
+25 |         match node::v1::connect_v1_publisher(loop {}) {
    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ------- any code following this expression is unreachable
    |               |
    |               unreachable call
@@ -588,7 +588,7 @@ warning: unreachable call
 warning: unreachable call
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:85:13
    |
-85 |     let _ = node::v11::NullifierBatchPublisher::broadcast_commit(&publisher, loop {});
+85 |     let _ = node::v1::NullifierBatchPublisher::broadcast_commit(&publisher, loop {});
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^             ------- any code following this expression is unreachable
    |             |
    |             unreachable call
@@ -596,7 +596,7 @@ warning: unreachable call
 warning: unreachable call
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:86:13
    |
-86 |     let _ = node::v11::NullifierBatchPublisher::broadcast_reveal(&publisher, loop {});
+86 |     let _ = node::v1::NullifierBatchPublisher::broadcast_reveal(&publisher, loop {});
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^             ------- any code following this expression is unreachable
    |             |
    |             unreachable call
@@ -644,7 +644,7 @@ warning: unreachable call
 warning: unreachable call
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:25:15
     |
- 25 |         match node::v11::connect_v11_publisher(loop {}) {
+ 25 |         match node::v1::connect_v1_publisher(loop {}) {
     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ------- any code following this expression is unreachable
     |               |
     |               unreachable call
@@ -654,23 +654,23 @@ warning: unreachable call
     |
     = note: this warning originates in the macro `publisher_from_connect` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0599]: no method named `prepare` found for reference `&V11Publisher` in the current scope
+error[E0599]: no method named `prepare` found for reference `&V1Publisher` in the current scope
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:132:26
     |
 132 |     let _ = (&publisher).prepare(&[]);
-    |                          ^^^^^^^ method not found in `&V11Publisher`
+    |                          ^^^^^^^ method not found in `&V1Publisher`
 
-error[E0599]: no method named `publish` found for reference `&V11Publisher` in the current scope
+error[E0599]: no method named `publish` found for reference `&V1Publisher` in the current scope
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:133:26
     |
 133 |     let _ = (&publisher).publish(&[]);
-    |                          ^^^^^^^ method not found in `&V11Publisher`
+    |                          ^^^^^^^ method not found in `&V1Publisher`
 
-error[E0277]: the trait bound `V11Publisher: Deref` is not satisfied
+error[E0277]: the trait bound `V1Publisher: Deref` is not satisfied
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:139:17
     |
 139 |     needs_deref(&publisher);
-    |     ----------- ^^^^^^^^^^ the trait `Deref` is not implemented for `V11Publisher`
+    |     ----------- ^^^^^^^^^^ the trait `Deref` is not implemented for `V1Publisher`
     |     |
     |     required by a bound introduced by this call
     |
@@ -680,30 +680,30 @@ note: required by a bound in `needs_deref`
 138 |     fn needs_deref<T: std::ops::Deref>(_t: &T) {}
     |                       ^^^^^^^^^^^^^^^ required by this bound in `needs_deref`
 
-error[E0599]: no method named `prepare` found for struct `V11Publisher` in the current scope
+error[E0599]: no method named `prepare` found for struct `V1Publisher` in the current scope
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:142:27
     |
 142 |     let _ = (*&publisher).prepare(&[]);
-    |                           ^^^^^^^ method not found in `V11Publisher`
+    |                           ^^^^^^^ method not found in `V1Publisher`
 
-error[E0277]: the trait bound `V11Publisher: Deref` is not satisfied
+error[E0277]: the trait bound `V1Publisher: Deref` is not satisfied
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:143:36
     |
 143 |     let _ = std::ops::Deref::deref(&publisher).prepare(&[]);
-    |             ---------------------- ^^^^^^^^^^ the trait `Deref` is not implemented for `V11Publisher`
+    |             ---------------------- ^^^^^^^^^^ the trait `Deref` is not implemented for `V1Publisher`
     |             |
     |             required by a bound introduced by this call
 
-error[E0277]: the trait bound `V11Publisher: Deref` is not satisfied
+error[E0277]: the trait bound `V1Publisher: Deref` is not satisfied
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:143:13
     |
 143 |     let _ = std::ops::Deref::deref(&publisher).prepare(&[]);
-    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Deref` is not implemented for `V11Publisher`
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Deref` is not implemented for `V1Publisher`
 
 warning: unreachable call
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:25:15
     |
- 25 |         match node::v11::connect_v11_publisher(loop {}) {
+ 25 |         match node::v1::connect_v1_publisher(loop {}) {
     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ------- any code following this expression is unreachable
     |               |
     |               unreachable call
@@ -713,11 +713,11 @@ warning: unreachable call
     |
     = note: this warning originates in the macro `publisher_from_connect` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0277]: the trait bound `V11Publisher: AsRef<_>` is not satisfied
+error[E0277]: the trait bound `V1Publisher: AsRef<_>` is not satisfied
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:153:47
     |
 153 |     let exposed = std::convert::AsRef::as_ref(&publisher);
-    |                   --------------------------- ^^^^^^^^^^ the trait `AsRef<_>` is not implemented for `V11Publisher`
+    |                   --------------------------- ^^^^^^^^^^ the trait `AsRef<_>` is not implemented for `V1Publisher`
     |                   |
     |                   required by a bound introduced by this call
 
@@ -740,7 +740,7 @@ warning: unreachable call
 warning: unreachable call
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:25:15
     |
- 25 |         match node::v11::connect_v11_publisher(loop {}) {
+ 25 |         match node::v1::connect_v1_publisher(loop {}) {
     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ------- any code following this expression is unreachable
     |               |
     |               unreachable call
@@ -750,13 +750,13 @@ warning: unreachable call
     |
     = note: this warning originates in the macro `publisher_from_connect` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-error[E0616]: field `inner` of struct `V11Publisher` is private
+error[E0616]: field `inner` of struct `V1Publisher` is private
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:167:23
     |
 167 |     let _ = publisher.inner;
     |                       ^^^^^ private field
 
-error[E0599]: no method named `into_inner` found for struct `V11Publisher` in the current scope
+error[E0599]: no method named `into_inner` found for struct `V1Publisher` in the current scope
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:170:23
     |
 170 |     let _ = publisher.into_inner();
@@ -768,19 +768,19 @@ help: there is a method `into_either` with a similar name, but with different ar
     |     fn into_either(self, into_left: bool) -> Either<Self, Self> {
     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error[E0599]: no method named `as_inner` found for struct `V11Publisher` in the current scope
+error[E0599]: no method named `as_inner` found for struct `V1Publisher` in the current scope
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:171:23
     |
 171 |     let _ = publisher.as_inner();
-    |                       ^^^^^^^^ method not found in `V11Publisher`
+    |                       ^^^^^^^^ method not found in `V1Publisher`
 
-error[E0599]: no method named `inner` found for struct `V11Publisher` in the current scope
+error[E0599]: no method named `inner` found for struct `V1Publisher` in the current scope
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:172:23
     |
 172 |     let _ = publisher.inner();
     |                       ^^^^^ private field, not a method
 
-error[E0599]: no method named `into_publisher` found for struct `V11Publisher` in the current scope
+error[E0599]: no method named `into_publisher` found for struct `V1Publisher` in the current scope
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:173:23
     |
 173 |     let _ = publisher.into_publisher();
@@ -792,8 +792,8 @@ help: there is a method `into_either` with a similar name, but with different ar
     |     fn into_either(self, into_left: bool) -> Either<Self, Self> {
     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error[E0599]: no method named `as_publisher` found for struct `V11Publisher` in the current scope
+error[E0599]: no method named `as_publisher` found for struct `V1Publisher` in the current scope
    --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:174:23
     |
 174 |     let _ = publisher.as_publisher();
-    |                       ^^^^^^^^^^^^ method not found in `V11Publisher`
+    |                       ^^^^^^^^^^^^ method not found in `V1Publisher`

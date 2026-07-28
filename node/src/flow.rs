@@ -322,9 +322,9 @@ pub(crate) fn mint_proof_commit_hashes(proof: &zkcoins_prover::Proof) -> SendCom
 pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -> FlowResult {
     // Gap G4: under a v1.1 process claim the residual ash‖ocr Commitment
     // path is refused. TransitionSignature authorisation goes through
-    // `POST /api/jobs/{id}/sign` → `v11::accept_wallet_transition_signature`
+    // `POST /api/jobs/{id}/sign` → `v1::accept_wallet_transition_signature`
     // against the staged pending transition.
-    if let Err(e) = crate::v11::refuse_legacy_commitment_under_v11() {
+    if let Err(e) = crate::v1::refuse_legacy_commitment_under_v1() {
         return Err(FlowError::new(StatusCode::CONFLICT, e.to_string()));
     }
 
@@ -625,11 +625,11 @@ pub(crate) async fn send_flow(
 /// Under a v1.1 process claim this entry refuses loud — the residual
 /// ash‖ocr Commitment is the wrong signing protocol. The v1.1 path
 /// authorises via `POST /api/jobs/{id}/sign` →
-/// [`crate::v11::accept_wallet_transition_signature`] against the staged
+/// [`crate::v1::accept_wallet_transition_signature`] against the staged
 /// pending transition.
 pub(crate) async fn commit_flow(state: &AppState, request: CommitRequest) -> FlowResult {
-    // Gap G4: refuse legacy Commitment under ScanStackMode::V11.
-    if let Err(e) = crate::v11::refuse_legacy_commitment_under_v11() {
+    // Gap G4: refuse legacy Commitment under ScanStackMode::V1.
+    if let Err(e) = crate::v1::refuse_legacy_commitment_under_v1() {
         return Err(FlowError::new(StatusCode::CONFLICT, e.to_string()));
     }
 

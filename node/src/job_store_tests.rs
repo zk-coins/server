@@ -1623,20 +1623,20 @@ async fn stale_fence_cannot_commit_engine_snapshot_or_members_ready() {
     use std::time::Duration;
     use shared::spec_v1::Address;
     use zkcoins_program::circuit::compliance::Network;
-    use crate::v11::db_v11::{
+    use crate::v1::db_v1::{
         self, EngineSnapshot, PENDING_PUBLISH_MEMBERS_READY,
     };
-    use crate::v11::separation::{
+    use crate::v1::separation::{
         claim_stack_scan_mode, set_process_stack_mode,
         ScanStackMode,
     };
 
-    set_process_stack_mode(ScanStackMode::V11);
+    set_process_stack_mode(ScanStackMode::V1);
 
     let scope = setup_pool().await;
-    claim_stack_scan_mode(&scope.pool, ScanStackMode::V11)
+    claim_stack_scan_mode(&scope.pool, ScanStackMode::V1)
         .await
-        .expect("claim stack_scan_mode v11");
+        .expect("claim stack_scan_mode v1");
 
     let owner = uuid::Uuid::new_v4();
     let store = JobStore::with_process_owner(scope.pool.clone(), owner);
@@ -1708,7 +1708,7 @@ async fn stale_fence_cannot_commit_engine_snapshot_or_members_ready() {
         fence: old_fence,
     };
     assert!(
-        !db_v11::persist_engine_with_pending_members_ready_if_finalise_fence(
+        !db_v1::persist_engine_with_pending_members_ready_if_finalise_fence(
             store.pool(),
             &snap,
             account_owner,
@@ -1725,14 +1725,14 @@ async fn stale_fence_cannot_commit_engine_snapshot_or_members_ready() {
         "stale fence must not commit engine+members_ready"
     );
     assert!(
-        db_v11::load_pending_publish(store.pool(), pk)
+        db_v1::load_pending_publish(store.pool(), pk)
             .await
             .expect("load pending")
             .is_none(),
         "stale fence must leave no members_ready row"
     );
     assert!(
-        db_v11::load_engine_snapshot(store.pool())
+        db_v1::load_engine_snapshot(store.pool())
             .await
             .expect("load engine")
             .is_none(),
@@ -1746,7 +1746,7 @@ async fn stale_fence_cannot_commit_engine_snapshot_or_members_ready() {
         fence: new_fence,
     };
     assert!(
-        db_v11::persist_engine_with_pending_members_ready_if_finalise_fence(
+        db_v1::persist_engine_with_pending_members_ready_if_finalise_fence(
             store.pool(),
             &snap,
             account_owner,
@@ -1762,13 +1762,13 @@ async fn stale_fence_cannot_commit_engine_snapshot_or_members_ready() {
         .expect("current fenced persist"),
         "current fence must commit engine+members_ready"
     );
-    let pending = db_v11::load_pending_publish(store.pool(), pk)
+    let pending = db_v1::load_pending_publish(store.pool(), pk)
         .await
         .expect("load pending")
         .expect("current fence must stage members_ready");
     assert_eq!(pending.status, PENDING_PUBLISH_MEMBERS_READY);
     assert!(
-        db_v11::load_engine_snapshot(store.pool())
+        db_v1::load_engine_snapshot(store.pool())
             .await
             .expect("load engine")
             .is_some(),

@@ -386,12 +386,12 @@ impl AccountNode {
     /// account (Model B). The recipient's account for that asset is
     /// created on demand if it does not exist yet.
     ///
-    /// Under the v1.1 process claim (`ZKCOINS_V11_SHADOW=1`) this legacy
+    /// Under the v1.1 process claim (`ZKCOINS_V1_SHADOW=1`) this legacy
     /// bookkeeping path is **refused** — a receive must go through the
-    /// v1.1 transition (`crate::v11::receive`). Silent fall-back would
+    /// v1.1 transition (`crate::v1::receive`). Silent fall-back would
     /// credit a coin no compliance proof can justify.
     pub fn receive_coin(&mut self, coin_proof: CoinProof) -> Result<(), &'static str> {
-        crate::v11::refuse_legacy_receive_under_v11()?;
+        crate::v1::refuse_legacy_receive_under_v1()?;
         let recipient = coin_proof.coin.recipient;
         let asset_id = coin_proof.coin.asset_id;
         let key = (recipient, asset_id);
@@ -419,7 +419,7 @@ impl AccountNode {
     /// **Unchanged under the shadow flag.** The v1.1 refuse gate is on
     /// [`Self::receive_coin`] (the foreign-coin REST/job entry). This
     /// helper stays available for the legacy mint prepare path while
-    /// Stage-3 still uses the legacy prover under `ZKCOINS_V11_SHADOW=1`.
+    /// Stage-3 still uses the legacy prover under `ZKCOINS_V1_SHADOW=1`.
     /// Flag-off behaviour is bit-for-bit identical to pre-G3.
     pub fn receive_coin_into(
         account: &mut Account,
@@ -553,9 +553,9 @@ impl AccountNode {
         // Under the v1.1 process claim this legacy path builds
         // `InCoinSourceWitness` + source-aggregator recursion — the wrong
         // provenance mechanism. Refuse so a v1.1 boot cannot stage that
-        // construct; use `crate::v11::begin_v11_send` (CoinHist /
+        // construct; use `crate::v1::begin_v1_send` (CoinHist /
         // InputAuthorization) instead. Flag-off / Legacy claim: open.
-        crate::v11::refuse_legacy_send_under_v11()?;
+        crate::v1::refuse_legacy_send_under_v1()?;
         // A send moves exactly one asset (the in-circuit gate binds
         // `account.asset_id == transition.asset_id`); the asset is the
         // invoices' common asset_id. An empty invoice list has no asset

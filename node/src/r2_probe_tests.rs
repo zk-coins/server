@@ -403,22 +403,22 @@ async fn fetch_recent_summary_returns_desc_with_budget_pass() {
 }
 
 #[tokio::test]
-async fn insert_run_persists_v11_shape_columns() {
+async fn insert_run_persists_v1_shape_columns() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    let host_id = upsert_host(&pool, &sample_host("v11shape"))
+    let host_id = upsert_host(&pool, &sample_host("v1shape"))
         .await
         .expect("host");
     let mut run = sample_run(host_id);
-    run.prover_mode = "v11".to_string();
+    run.prover_mode = "v1".to_string();
     run.max_tx_inputs = Some(8);
     run.max_tx_outputs = Some(8);
     run.max_rx_coins = Some(4);
     run.compliance_gate_count = Some(1_403_783);
-    // v11 budgets are larger; persist what the probe would have checked.
+    // v1 budgets are larger; persist what the probe would have checked.
     run.r2_warm_budget_ms = 600_000;
     run.r2_cold_budget_ms = 900_000;
-    let run_id = insert_run(&pool, &run).await.expect("insert v11 run");
+    let run_id = insert_run(&pool, &run).await.expect("insert v1 run");
 
     let row = sqlx::query(
         "SELECT prover_mode, max_tx_inputs, max_tx_outputs, max_rx_coins, \
@@ -428,9 +428,9 @@ async fn insert_run_persists_v11_shape_columns() {
     .bind(run_id)
     .fetch_one(&pool)
     .await
-    .expect("select v11 run");
+    .expect("select v1 run");
 
-    assert_eq!(row.get::<String, _>("prover_mode"), "v11");
+    assert_eq!(row.get::<String, _>("prover_mode"), "v1");
     assert_eq!(row.get::<Option<i32>, _>("max_tx_inputs"), Some(8));
     assert_eq!(row.get::<Option<i32>, _>("max_tx_outputs"), Some(8));
     assert_eq!(row.get::<Option<i32>, _>("max_rx_coins"), Some(4));
@@ -442,7 +442,7 @@ async fn insert_run_persists_v11_shape_columns() {
 
     let summary = fetch_recent_summary(&pool, 1).await.expect("summary");
     assert_eq!(summary.len(), 1);
-    assert_eq!(summary[0].prover_mode, "v11");
+    assert_eq!(summary[0].prover_mode, "v1");
 }
 
 #[tokio::test]

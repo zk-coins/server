@@ -1,7 +1,7 @@
-// Compile-fail: `begin_v11_mint` no longer accepts a caller-selected
-// `V11ShadowMode`. The capability is the process stack claim, not a
+// Compile-fail: `begin_v1_mint` no longer accepts a caller-selected
+// `V1ShadowMode`. The capability is the process stack claim, not a
 // freely constructible enum value. Driven by trybuild
-// (see `tests/v11_mint_boundary_compile_fail.rs`).
+// (see `tests/v1_mint_boundary_compile_fail.rs`).
 
 fn main() {
     // Intentional: three-argument form (engine, mode, request) must not
@@ -11,7 +11,7 @@ fn main() {
         engine: &zkcoins_prover::state_engine::StateEngine,
         req: zkcoins_prover::state_engine::MintRequest,
     ) {
-        let _ = node::v11::begin_v11_mint(engine, node::v11::V11ShadowMode::On, req);
+        let _ = node::v1::begin_v1_mint(engine, node::v1::V1ShadowMode::On, req);
     }
     let _ = probe;
 }

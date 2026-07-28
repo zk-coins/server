@@ -28,7 +28,7 @@
 //! live in the shared `stack-policy` crate so `esplora-bound` can run the
 //! same check inside its broadcast-client constructor. This module owns
 //! the **database** marker / data checks and re-exports the process-mode
-//! surface for existing `node::v11` call sites.
+//! surface for existing `node::v1` call sites.
 
 use anyhow::{bail, Context, Result};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -57,13 +57,13 @@ const LEGACY_SCAN_STATE_COUNT_SQL: &str = "SELECT \
   + (SELECT COUNT(*) FROM latest_block)";
 
 /// SQL: any durable v1.1 scan-stack row across the six engine tables.
-const V11_SCAN_STATE_COUNT_SQL: &str = "SELECT \
-    (SELECT COUNT(*) FROM v11_engine_meta) \
-  + (SELECT COUNT(*) FROM v11_nflog_entries) \
-  + (SELECT COUNT(*) FROM v11_nullifier_index) \
-  + (SELECT COUNT(*) FROM v11_accounts) \
-  + (SELECT COUNT(*) FROM v11_spendable_coins) \
-  + (SELECT COUNT(*) FROM v11_spent_coins)";
+const V1_SCAN_STATE_COUNT_SQL: &str = "SELECT \
+    (SELECT COUNT(*) FROM v1_engine_meta) \
+  + (SELECT COUNT(*) FROM v1_nflog_entries) \
+  + (SELECT COUNT(*) FROM v1_nullifier_index) \
+  + (SELECT COUNT(*) FROM v1_accounts) \
+  + (SELECT COUNT(*) FROM v1_spendable_coins) \
+  + (SELECT COUNT(*) FROM v1_spent_coins)";
 
 /// True when any durable legacy scan-stack table has rows
 /// (`mmr_root_index`, `smt_state`, `mmr_state`, `latest_block`).
@@ -76,15 +76,15 @@ pub async fn legacy_scan_state_present(pool: &PgPool) -> Result<bool> {
 }
 
 /// True when any v1.1 stack table has rows (meta, NfLog, index, accounts,
-/// coins). Meta alone is enough: [`crate::v11::adapter::EngineAdapter::
+/// coins). Meta alone is enough: [`crate::v1::adapter::EngineAdapter::
 /// load_or_create`] persists an empty genesis snapshot into
-/// `v11_engine_meta`, and that must bind the database to v1.1 just as
+/// `v1_engine_meta`, and that must bind the database to v1.1 just as
 /// strongly as a non-empty NfLog.
-pub async fn v11_scan_state_present(pool: &PgPool) -> Result<bool> {
-    let (n,): (i64,) = sqlx::query_as(V11_SCAN_STATE_COUNT_SQL)
+pub async fn v1_scan_state_present(pool: &PgPool) -> Result<bool> {
+    let (n,): (i64,) = sqlx::query_as(V1_SCAN_STATE_COUNT_SQL)
         .fetch_one(pool)
         .await
-        .context("count v11 tables for stack separation")?;
+        .context("count v1 tables for stack separation")?;
     Ok(n > 0)
 }
 
@@ -130,20 +130,20 @@ pub async fn claim_stack_scan_mode(pool: &PgPool, mode: ScanStackMode) -> Result
         .fetch_one(&mut *tx)
         .await
         .context("count legacy scan tables inside claim_stack_scan_mode")?;
-    let (v11_n,): (i64,) = sqlx::query_as(V11_SCAN_STATE_COUNT_SQL)
+    let (v1_n,): (i64,) = sqlx::query_as(V1_SCAN_STATE_COUNT_SQL)
         .fetch_one(&mut *tx)
         .await
-        .context("count v11 tables inside claim_stack_scan_mode")?;
+        .context("count v1 tables inside claim_stack_scan_mode")?;
     let legacy_data = legacy_n > 0;
-    let v11_data = v11_n > 0;
+    let v1_data = v1_n > 0;
 
-    if legacy_data && v11_data {
+    if legacy_data && v1_data {
         bail!(
             "{STACK_SEPARATION_REFUSAL}: database carries BOTH legacy and v1.1 \
              scan-stack rows — refusing claim_stack_scan_mode"
         );
     }
-    if marker.is_none() && (legacy_data || v11_data) {
+    if marker.is_none() && (legacy_data || v1_data) {
         bail!(
             "{STACK_SEPARATION_REFUSAL} {}: stack_scan_mode marker is missing but \
              stack data already exists — claim_stack_scan_mode refuses to \
@@ -153,29 +153,29 @@ pub async fn claim_stack_scan_mode(pool: &PgPool, mode: ScanStackMode) -> Result
     }
     match mode {
         ScanStackMode::Legacy => {
-            if v11_data {
+            if v1_data {
                 bail!(
                     "{STACK_SEPARATION_REFUSAL} legacy: v1.1 scan state is present; \
                      claim_stack_scan_mode refuses"
                 );
             }
-            if let Some(ScanStackMode::V11) = marker {
+            if let Some(ScanStackMode::V1) = marker {
                 bail!(
-                    "{STACK_SEPARATION_REFUSAL} legacy: already claimed as v11; \
+                    "{STACK_SEPARATION_REFUSAL} legacy: already claimed as v1; \
                      claim_stack_scan_mode refuses"
                 );
             }
         }
-        ScanStackMode::V11 => {
+        ScanStackMode::V1 => {
             if legacy_data {
                 bail!(
-                    "{STACK_SEPARATION_REFUSAL} v11: legacy scan state is present; \
+                    "{STACK_SEPARATION_REFUSAL} v1: legacy scan state is present; \
                      claim_stack_scan_mode refuses"
                 );
             }
             if let Some(ScanStackMode::Legacy) = marker {
                 bail!(
-                    "{STACK_SEPARATION_REFUSAL} v11: already claimed as legacy; \
+                    "{STACK_SEPARATION_REFUSAL} v1: already claimed as legacy; \
                      claim_stack_scan_mode refuses"
                 );
             }
@@ -307,14 +307,14 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
         .fetch_one(&mut *tx)
         .await
         .context("count legacy scan tables inside enforce tx")?;
-    let (v11_n,): (i64,) = sqlx::query_as(V11_SCAN_STATE_COUNT_SQL)
+    let (v1_n,): (i64,) = sqlx::query_as(V1_SCAN_STATE_COUNT_SQL)
         .fetch_one(&mut *tx)
         .await
-        .context("count v11 tables inside enforce tx")?;
+        .context("count v1 tables inside enforce tx")?;
     let legacy_data = legacy_n > 0;
-    let v11_data = v11_n > 0;
+    let v1_data = v1_n > 0;
 
-    if legacy_data && v11_data {
+    if legacy_data && v1_data {
         bail!(
             "{STACK_SEPARATION_REFUSAL}: database carries BOTH legacy \
              scan-stack rows (mmr_root_index/smt_state/mmr_state/latest_block) \
@@ -325,9 +325,9 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
 
     // Missing marker + any stack data is unconditional refusal. Same-side
     // sentinel rows must never auto-claim (EngineAdapter could otherwise
-    // leave v11_engine_meta under a later legacy claim).
-    if marker.is_none() && (legacy_data || v11_data) {
-        let which = match (legacy_data, v11_data) {
+    // leave v1_engine_meta under a later legacy claim).
+    if marker.is_none() && (legacy_data || v1_data) {
+        let which = match (legacy_data, v1_data) {
             (true, false) => {
                 "legacy scan-stack rows (mmr_root_index/smt_state/mmr_state/latest_block)"
             }
@@ -345,23 +345,23 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
 
     match selected {
         ScanStackMode::Legacy => {
-            if v11_data {
+            if v1_data {
                 bail!(
                     "{STACK_SEPARATION_REFUSAL} legacy scan stack: \
-                     v1.1 scan state is present (v11 tables). \
+                     v1.1 scan state is present (v1 tables). \
                      A commitment scanner must never write into a database \
                      that already folds AggregateStateNullifierV3"
                 );
             }
-            if let Some(ScanStackMode::V11) = marker {
+            if let Some(ScanStackMode::V1) = marker {
                 bail!(
                     "{STACK_SEPARATION_REFUSAL} legacy scan stack: \
-                     stack_scan_mode is claimed as v11. Wipe or restore a \
+                     stack_scan_mode is claimed as v1. Wipe or restore a \
                      legacy-only database; never flip the flag on a claimed DB"
                 );
             }
         }
-        ScanStackMode::V11 => {
+        ScanStackMode::V1 => {
             if legacy_data {
                 bail!(
                     "{STACK_SEPARATION_REFUSAL} v1.1 scan stack: \
@@ -392,38 +392,38 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
 
 /// Establish the process stack claim the same way the node binary does
 /// for dual-stack selection — from an already-resolved
-/// [`super::mode::V11ShadowMode`].
+/// [`super::mode::V1ShadowMode`].
 ///
 /// Used by `bin/recover_inscription` so the recovery process claims
-/// under `ZKCOINS_V11_SHADOW=1` before any broadcast client is built.
+/// under `ZKCOINS_V1_SHADOW=1` before any broadcast client is built.
 /// Tests call this with a pure mode value instead of hand-setting
 /// [`set_process_stack_mode`] directly (which would skip the binary path).
-pub fn claim_process_stack_from_shadow_mode(mode: super::mode::V11ShadowMode) {
+pub fn claim_process_stack_from_shadow_mode(mode: super::mode::V1ShadowMode) {
     match mode {
-        super::mode::V11ShadowMode::On => set_process_stack_mode(ScanStackMode::V11),
-        super::mode::V11ShadowMode::Off => set_process_stack_mode(ScanStackMode::Legacy),
+        super::mode::V1ShadowMode::On => set_process_stack_mode(ScanStackMode::V1),
+        super::mode::V1ShadowMode::Off => set_process_stack_mode(ScanStackMode::Legacy),
     }
 }
 
-/// Read `ZKCOINS_V11_SHADOW` and claim the process stack. Entry point for
+/// Read `ZKCOINS_V1_SHADOW` and claim the process stack. Entry point for
 /// `bin/recover_inscription` (and any other out-of-band legacy tool).
-pub fn claim_process_stack_from_v11_shadow_env() -> Result<()> {
-    let mode = super::mode::v11_shadow_mode_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+pub fn claim_process_stack_from_v1_shadow_env() -> Result<()> {
+    let mode = super::mode::v1_shadow_mode_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
     claim_process_stack_from_shadow_mode(mode);
     Ok(())
 }
 
 /// Refuse the v1.1 publisher unless this process claimed v1.1.
-pub fn ensure_v11_publisher_allowed() -> Result<()> {
+pub fn ensure_v1_publisher_allowed() -> Result<()> {
     match process_stack_mode() {
-        Some(ScanStackMode::V11) => Ok(()),
+        Some(ScanStackMode::V1) => Ok(()),
         Some(ScanStackMode::Legacy) => bail!(
             "{STACK_SEPARATION_REFUSAL}: process is running the legacy scan stack; \
              AggregateStateNullifierV3 publish is forbidden (no silent fall-back)"
         ),
         None => bail!(
             "{STACK_SEPARATION_REFUSAL}: v1.1 publisher requires a process that \
-             claimed ScanStackMode::V11 at boot (ZKCOINS_V11_SHADOW=1). \
+             claimed ScanStackMode::V1 at boot (ZKCOINS_V1_SHADOW=1). \
              Refusing to publish without an exclusive stack claim"
         ),
     }
@@ -434,16 +434,16 @@ pub fn ensure_v11_publisher_allowed() -> Result<()> {
 /// Unset process mode is **not** permitted: an unset mode previously
 /// allowed writes that later left v1.1 data under a legacy marker.
 /// Shared by scan apply paths and [`super::adapter::EngineAdapter::with_engine_mut`].
-pub fn require_v11_process_for_nflog_write() -> Result<()> {
+pub fn require_v1_process_for_nflog_write() -> Result<()> {
     match process_stack_mode() {
-        Some(ScanStackMode::V11) => Ok(()),
+        Some(ScanStackMode::V1) => Ok(()),
         Some(ScanStackMode::Legacy) => bail!(
             "stack separation: refusing to fold NfLog while process \
              is claimed as legacy (no silent cross-stack write)"
         ),
         None => bail!(
             "stack separation: refusing to fold NfLog without a process \
-             claim of ScanStackMode::V11 (no silent write under unset mode)"
+             claim of ScanStackMode::V1 (no silent write under unset mode)"
         ),
     }
 }

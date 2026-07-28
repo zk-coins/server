@@ -66,7 +66,7 @@
 //! silently rebuild.
 //!
 //! A mid-apply crash leaves the previous snapshot (persist is
-//! all-or-nothing via [`crate::v11::db_v11::persist_engine_snapshot`]);
+//! all-or-nothing via [`crate::v1::db_v1::persist_engine_snapshot`]);
 //! apply paths restore the in-memory engine from a pre-mutation snapshot
 //! when persist fails so the live adapter never advances past durable
 //! state.
@@ -76,7 +76,7 @@ use shared::spec_v1::{ChainPosition, FoldOutcome, PublishedNullifier};
 use zkcoins_prover::state_engine::StateEngine;
 
 use super::adapter::EngineAdapter;
-use super::separation::{ensure_v11_publisher_allowed, require_v11_process_for_nflog_write};
+use super::separation::{ensure_v1_publisher_allowed, require_v1_process_for_nflog_write};
 
 /// Outcome counters for one fold pass (forward scan or reorg apply).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -175,7 +175,7 @@ pub(crate) fn fold_survivors_into_engine(
 /// Build the first-occurrence NfLog pair list from a survivor stream.
 ///
 /// Used by the reorg path so the engine can be reconstructed via
-/// [`super::db_v11::EngineSnapshot`] (accounts stay byte-identical).
+/// [`super::db_v1::EngineSnapshot`] (accounts stay byte-identical).
 pub fn first_occurrence_nflog_pairs(
     activation_height: u64,
     survivors: &[PublishedNullifier],
@@ -237,7 +237,7 @@ pub(crate) fn replace_engine_nflog_from_survivors(
     tip_hash: [u8; 32],
     survivors: &[PublishedNullifier],
 ) -> Result<FoldStats> {
-    use super::db_v11::EngineSnapshot;
+    use super::db_v1::EngineSnapshot;
 
     let activation_height = engine.activation_height();
     let (nflog_pairs, stats) = first_occurrence_nflog_pairs(activation_height, survivors)?;
@@ -270,7 +270,7 @@ pub async fn apply_forward_scan(
     tip_hash: [u8; 32],
     new_survivors: &[PublishedNullifier],
 ) -> Result<FoldStats> {
-    require_v11_process_for_nflog_write()?;
+    require_v1_process_for_nflog_write()?;
     let _write_gate = adapter.lock_writes().await;
     let backup = adapter.snapshot_live();
 
@@ -324,7 +324,7 @@ pub async fn apply_canonical_survivors(
     tip_hash: [u8; 32],
     survivors: &[PublishedNullifier],
 ) -> Result<FoldStats> {
-    require_v11_process_for_nflog_write()?;
+    require_v1_process_for_nflog_write()?;
     let _write_gate = adapter.lock_writes().await;
     let backup = adapter.snapshot_live();
 
@@ -410,7 +410,7 @@ pub enum TipReconcileOutcome {
     Ready(PersistedTipReconciliation),
     /// RPC tip behind a queried height / height not yet known.
     ///
-    /// Caller must: leave `v11_scan` unready, leave `finality_ok` /
+    /// Caller must: leave `v1_scan` unready, leave `finality_ok` /
     /// `deep_reorg` untouched, back off, and re-run the full verification.
     /// Never assume canonical, never assume reorg.
     RetryableIncompleteView {
@@ -863,17 +863,17 @@ pub fn fold_outcome_label(outcome: FoldOutcome) -> &'static str {
 /// Env keys required to connect the script-plonky2 bitcoind scanner.
 /// Missing any of them fails loud under v1.1 mode — never fall back to
 /// the Esplora commitment scanner.
-pub const V11_SCANNER_RPC_URL_ENV: &str = "ZKCOINS_V11_BITCOIND_RPC_URL";
-pub const V11_SCANNER_COOKIE_ENV: &str = "ZKCOINS_V11_BITCOIND_COOKIE_PATH";
+pub const V1_SCANNER_RPC_URL_ENV: &str = "ZKCOINS_V1_BITCOIND_RPC_URL";
+pub const V1_SCANNER_COOKIE_ENV: &str = "ZKCOINS_V1_BITCOIND_COOKIE_PATH";
 
 /// Resolve bitcoind scanner config from env (no silent defaults).
-pub fn v11_bitcoind_rpc_from_env() -> Result<(String, std::path::PathBuf)> {
+pub fn v1_bitcoind_rpc_from_env() -> Result<(String, std::path::PathBuf)> {
     // v1.1 exclusive claim required — never open bitcoind for NfLog under legacy.
-    ensure_v11_publisher_allowed()?;
+    ensure_v1_publisher_allowed()?;
 
-    let rpc_url = std::env::var(V11_SCANNER_RPC_URL_ENV).map_err(|_| {
+    let rpc_url = std::env::var(V1_SCANNER_RPC_URL_ENV).map_err(|_| {
         anyhow::anyhow!(
-            "ZKCOINS_V11_SHADOW=1 requires {V11_SCANNER_RPC_URL_ENV} for the \
+            "ZKCOINS_V1_SHADOW=1 requires {V1_SCANNER_RPC_URL_ENV} for the \
              AggregateStateNullifierV3 scanner (bitcoind RPC). Refusing to \
              fall back to the legacy Esplora commitment scanner — that would \
              corrupt the NfLog claim with SMT first-write semantics"
@@ -881,19 +881,19 @@ pub fn v11_bitcoind_rpc_from_env() -> Result<(String, std::path::PathBuf)> {
     })?;
     if rpc_url.trim().is_empty() {
         bail!(
-            "{V11_SCANNER_RPC_URL_ENV} is empty; refusing to start the v1.1 scanner \
+            "{V1_SCANNER_RPC_URL_ENV} is empty; refusing to start the v1.1 scanner \
              (no silent default)"
         );
     }
-    let cookie = std::env::var(V11_SCANNER_COOKIE_ENV).map_err(|_| {
+    let cookie = std::env::var(V1_SCANNER_COOKIE_ENV).map_err(|_| {
         anyhow::anyhow!(
-            "ZKCOINS_V11_SHADOW=1 requires {V11_SCANNER_COOKIE_ENV} (bitcoind \
+            "ZKCOINS_V1_SHADOW=1 requires {V1_SCANNER_COOKIE_ENV} (bitcoind \
              cookie file). Refusing to fall back to the legacy scanner"
         )
     })?;
     if cookie.trim().is_empty() {
         bail!(
-            "{V11_SCANNER_COOKIE_ENV} is empty; refusing to start the v1.1 scanner \
+            "{V1_SCANNER_COOKIE_ENV} is empty; refusing to start the v1.1 scanner \
              (no silent default)"
         );
     }

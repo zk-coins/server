@@ -40,7 +40,7 @@ use crate::runtime::{
 use crate::state::State;
 use crate::test_db::setup_pool;
 use crate::username::UsernameStore;
-use crate::v11::{
+use crate::v1::{
     set_process_stack_mode, ScanStackMode,
 };
 use dashmap::DashMap;
@@ -142,7 +142,7 @@ async fn start_rest_node_binds_and_serves_health() {
             &addr,
             pool,
             &proofs_dir,
-            crate::runtime::V11Readiness::default(),
+            crate::runtime::V1Readiness::default(),
             None,
         )
         .await
@@ -218,10 +218,10 @@ async fn start_rest_node_binds_and_serves_health() {
 // guarded against can no longer arise, so the test that exercised the
 // `CRITICAL: minting state desync` Err arm is gone too.
 
-static V11_STACK_TEST_LOCK: Mutex<()> = Mutex::new(());
+static V1_STACK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-fn lock_v11_stack_for_test() -> MutexGuard<'static, ()> {
-    V11_STACK_TEST_LOCK
+fn lock_v1_stack_for_test() -> MutexGuard<'static, ()> {
+    V1_STACK_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -287,24 +287,24 @@ async fn plant_edge_job_with_claim(
     };
 
     let (mut entry, submission) =
-        crate::v11::signature::test_fixtures::v5_mainnet_entry_and_submission();
-    let advertised = crate::v11::awaiting_signature_result_json(&entry);
-    let accepted = crate::v11::accept_wallet_transition_signature(
-        crate::v11::V11ShadowMode::On,
+        crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+    let advertised = crate::v1::awaiting_signature_result_json(&entry);
+    let accepted = crate::v1::accept_wallet_transition_signature(
+        crate::v1::V1ShadowMode::On,
         entry.network,
         &entry.pending,
         &submission,
     )
     .expect("verify");
     entry.install_signature(accepted).expect("install");
-    let outcome = crate::v11::FinaliseOutcome::from_pending_proof_data_with_publisher(
+    let outcome = crate::v1::FinaliseOutcome::from_pending_proof_data_with_publisher(
         &entry.pending,
         entry.publisher_pubkey,
     );
     entry
         .install_completion(outcome.to_result_json(), 200)
         .expect("install completion");
-    let persist = crate::v11::DurableFinalisationPersist::from_entry(&entry).expect("encode");
+    let persist = crate::v1::DurableFinalisationPersist::from_entry(&entry).expect("encode");
 
     store
         .set_awaiting_signature(job_id, 1, advertised)
@@ -313,7 +313,7 @@ async fn plant_edge_job_with_claim(
     let row = store.load(job_id).await.expect("load").expect("row");
     let mut body = row.request_body;
     body.as_object_mut().unwrap().insert(
-        crate::v11::FINALISATION_BODY_KEY.to_string(),
+        crate::v1::FINALISATION_BODY_KEY.to_string(),
         serde_json::to_value(&persist).unwrap(),
     );
     sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
@@ -341,8 +341,8 @@ async fn plant_edge_job_with_claim(
 /// not strand it by pretending a still-owned claim is free, nor skip free work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn immediate_restart_drives_abandoned_edge_job_forward() {
-    let _guard = lock_v11_stack_for_test();
-    set_process_stack_mode(ScanStackMode::V11);
+    let _guard = lock_v1_stack_for_test();
+    set_process_stack_mode(ScanStackMode::V1);
 
     let scope = setup_pool().await;
     let dead_owner = uuid::Uuid::new_v4();
@@ -404,8 +404,8 @@ async fn immediate_restart_drives_abandoned_edge_job_forward() {
 /// lease expires the deferred reclaim drives the edge job forward.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_claim_not_enqueued_then_deferred_reclaim_after_expiry() {
-    let _guard = lock_v11_stack_for_test();
-    set_process_stack_mode(ScanStackMode::V11);
+    let _guard = lock_v1_stack_for_test();
+    set_process_stack_mode(ScanStackMode::V1);
 
     let scope = setup_pool().await;
     let dead_owner = uuid::Uuid::new_v4();
@@ -523,8 +523,8 @@ fn boot_db_error_disposition_leaves_row_untouched_for_retry() {
 /// ownership.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn free_phase_edge_job_enqueued_despite_release_false() {
-    let _guard = lock_v11_stack_for_test();
-    set_process_stack_mode(ScanStackMode::V11);
+    let _guard = lock_v1_stack_for_test();
+    set_process_stack_mode(ScanStackMode::V1);
 
     let scope = setup_pool().await;
     let store = JobStore::new(scope.pool.clone());
@@ -581,8 +581,8 @@ async fn free_phase_edge_job_enqueued_despite_release_false() {
 async fn boot_resume_cannot_fail_job_claimed_since_snapshot() {
     use std::time::Duration as StdDuration;
 
-    let _guard = lock_v11_stack_for_test();
-    set_process_stack_mode(ScanStackMode::V11);
+    let _guard = lock_v1_stack_for_test();
+    set_process_stack_mode(ScanStackMode::V1);
 
     let scope = setup_pool().await;
     let owner = uuid::Uuid::new_v4();
@@ -636,7 +636,7 @@ async fn boot_resume_cannot_fail_job_claimed_since_snapshot() {
         "snapshot-status fail must be a no-op once the row has moved and been claimed"
     );
 
-    // Full boot path: unsigned claimed broadcasting is not v11-resumable,
+    // Full boot path: unsigned claimed broadcasting is not v1-resumable,
     // so it takes the fail arm — which must still refuse the claim.
     let boot_store = Arc::new(JobStore::new(scope.pool.clone()));
     let notify_map: Arc<DashMap<uuid::Uuid, Arc<crate::job_dispatcher::JobNotifier>>> =

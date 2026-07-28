@@ -24,7 +24,7 @@
 //! module's logic needs to cover.
 
 use super::*;
-use crate::v11::{
+use crate::v1::{
     claim_stack_scan_mode, set_process_stack_mode, ScanStackMode,
 };
 use crate::account_node::CanaryOutcome;
@@ -328,11 +328,11 @@ async fn heal_reset_on_digest_mismatch_wipes_state_and_skips_canary() {
     assert!(!proofs_subdir.exists(), "proof-store dir wiped");
 }
 
-/// Under a v1.1 process claim, Reset must wipe v11 proof-dependent tables
+/// Under a v1.1 process claim, Reset must wipe v1 proof-dependent tables
 /// + leftover legacy `accounts`, while leaving structures v1.1 does not
 /// use (SMT/MMR/latest_block) intact.
 #[tokio::test]
-async fn heal_reset_under_v11_wipes_v11_state_preserves_unused_legacy_structures() {
+async fn heal_reset_under_v1_wipes_v1_state_preserves_unused_legacy_structures() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     let proofs = tempfile::tempdir().expect("tempdir");
@@ -343,29 +343,29 @@ async fn heal_reset_under_v11_wipes_v11_state_preserves_unused_legacy_structures
 
     // Claim v1.1 (empty DB). Seed proof-bearing accounts + orphan SMT/MMR
     // rows via raw SQL (structures v1.1 does not use — must survive reset).
-    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+    claim_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
-        .expect("claim v11");
-    set_process_stack_mode(ScanStackMode::V11);
+        .expect("claim v1");
+    set_process_stack_mode(ScanStackMode::V1);
 
     let owner = zkcoins_program::hash::digest_from_bytes(&[7u8; 32]);
     let asset_id = zkcoins_program::hash::digest_from_bytes(&[8u8; 32]);
     let key = crate::account_node::account_key_bytes(&owner, &asset_id);
-    db::upsert_account(&pool, &key, b"stale-v11-account-blob")
+    db::upsert_account(&pool, &key, b"stale-v1-account-blob")
         .await
-        .expect("seed account under v11");
-    // Seed minimal v11 engine meta + one nflog row so the wipe has rows to drop.
+        .expect("seed account under v1");
+    // Seed minimal v1 engine meta + one nflog row so the wipe has rows to drop.
     sqlx::query(
-        "INSERT INTO v11_engine_meta \
+        "INSERT INTO v1_engine_meta \
          (id, network, activation_height, tip_height, tip_hash, fold_seq, updated_at) \
          VALUES (1, 'regtest', 0, 1, $1, 0, NOW())",
     )
     .bind([0xAAu8; 32].as_slice())
     .execute(&pool)
     .await
-    .expect("seed v11_engine_meta");
+    .expect("seed v1_engine_meta");
     sqlx::query(
-        "INSERT INTO v11_nflog_entries \
+        "INSERT INTO v1_nflog_entries \
          (position, height, tx_index, vin_index, member_index, pk, r) \
          VALUES (0, 1, 0, 0, 0, $1, $2)",
     )
@@ -373,9 +373,9 @@ async fn heal_reset_under_v11_wipes_v11_state_preserves_unused_legacy_structures
     .bind([0xCCu8; 32].as_slice())
     .execute(&pool)
     .await
-    .expect("seed v11_nflog_entries");
+    .expect("seed v1_nflog_entries");
     sqlx::query(
-        "INSERT INTO v11_accounts \
+        "INSERT INTO v1_accounts \
          (owner, account_state, nk, genesis_pubkey, last_proof, \
           last_nav_opening, last_nullifier, last_nullifier_pos, \
           coin_history_root, updated_at) \
@@ -389,7 +389,7 @@ async fn heal_reset_under_v11_wipes_v11_state_preserves_unused_legacy_structures
     .bind([0x05u8; 32].as_slice())
     .execute(&pool)
     .await
-    .expect("seed v11_accounts");
+    .expect("seed v1_accounts");
     // Bypass stack writers: raw insert of structures v1.1 never reads.
     sqlx::query(
         "INSERT INTO smt_state (id, data, updated_at) VALUES (1, $1, NOW()) \
@@ -416,9 +416,9 @@ async fn heal_reset_under_v11_wipes_v11_state_preserves_unused_legacy_structures
     .await
     .expect("seed latest_block");
 
-    // Changed digest (tagged v11 shape so the test documents the real blob).
-    let old = crate::v11::encode_v11_live_digest(&[0x11; 32], &[0x22; 32]);
-    let new = crate::v11::encode_v11_live_digest(&[0x33; 32], &[0x44; 32]);
+    // Changed digest (tagged v1 shape so the test documents the real blob).
+    let old = crate::v1::encode_v1_live_digest(&[0x11; 32], &[0x22; 32]);
+    let new = crate::v1::encode_v1_live_digest(&[0x33; 32], &[0x44; 32]);
     assert_ne!(old, new, "test oracle: digests must differ");
     db::store_circuit_digest(&pool, &old)
         .await
@@ -427,7 +427,7 @@ async fn heal_reset_under_v11_wipes_v11_state_preserves_unused_legacy_structures
 
     let decision = heal_circuit_digest(&pool, &new, proofs_dir, &canary_must_not_run)
         .await
-        .expect("heal ok under v11");
+        .expect("heal ok under v1");
 
     assert_eq!(decision, ResetDecision::Reset);
     assert_eq!(
@@ -440,23 +440,23 @@ async fn heal_reset_under_v11_wipes_v11_state_preserves_unused_legacy_structures
         Some(new.as_slice()),
         "digest must update to the live pin encoding"
     );
-    // v11 proof-dependent rows must be gone (changed digest triggers reset,
+    // v1 proof-dependent rows must be gone (changed digest triggers reset,
     // not ignore).
-    let (v11_meta,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v11_engine_meta")
+    let (v1_meta,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_engine_meta")
         .fetch_one(&pool)
         .await
         .unwrap();
-    let (v11_nflog,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v11_nflog_entries")
+    let (v1_nflog,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_nflog_entries")
         .fetch_one(&pool)
         .await
         .unwrap();
-    let (v11_acc,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v11_accounts")
+    let (v1_acc,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_accounts")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(v11_meta, 0, "v11_engine_meta wiped on digest mismatch");
-    assert_eq!(v11_nflog, 0, "v11_nflog_entries wiped on digest mismatch");
-    assert_eq!(v11_acc, 0, "v11_accounts wiped on digest mismatch");
+    assert_eq!(v1_meta, 0, "v1_engine_meta wiped on digest mismatch");
+    assert_eq!(v1_nflog, 0, "v1_nflog_entries wiped on digest mismatch");
+    assert_eq!(v1_acc, 0, "v1_accounts wiped on digest mismatch");
     // Structures v1.1 does not use must remain (not a full legacy wipe).
     assert_eq!(
         db::load_smt(&pool).await.unwrap().as_deref(),
@@ -478,19 +478,19 @@ async fn heal_reset_under_v11_wipes_v11_state_preserves_unused_legacy_structures
 
 /// Would go red if a changed digest were treated as Keep / ignored.
 #[tokio::test]
-async fn heal_v11_changed_digest_triggers_reset_not_ignore() {
+async fn heal_v1_changed_digest_triggers_reset_not_ignore() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     let proofs = tempfile::tempdir().expect("tempdir");
     let proofs_dir = proofs.path().to_str().unwrap();
 
-    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+    claim_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
-        .expect("claim v11");
-    set_process_stack_mode(ScanStackMode::V11);
+        .expect("claim v1");
+    set_process_stack_mode(ScanStackMode::V1);
 
-    let old = crate::v11::encode_v11_live_digest(&[0x01; 32], &[0x02; 32]);
-    let new = crate::v11::encode_v11_live_digest(&[0x01; 32], &[0xFF; 32]); // C_balance only
+    let old = crate::v1::encode_v1_live_digest(&[0x01; 32], &[0x02; 32]);
+    let new = crate::v1::encode_v1_live_digest(&[0x01; 32], &[0xFF; 32]); // C_balance only
     db::store_circuit_digest(&pool, &old).await.unwrap();
 
     let decision = heal_circuit_digest(&pool, &new, proofs_dir, &canary_must_not_run)
@@ -513,18 +513,18 @@ async fn heal_v11_changed_digest_triggers_reset_not_ignore() {
 /// fast path that skips prove/apply), runs a digest-mismatch heal, and
 /// asserts the row is `failed` with the finalisation envelope stripped.
 ///
-/// Would go red if reset only wiped v11 tables and left jobs rows intact.
+/// Would go red if reset only wiped v1 tables and left jobs rows intact.
 #[tokio::test]
-async fn heal_v11_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
+async fn heal_v1_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     let proofs = tempfile::tempdir().expect("tempdir");
     let proofs_dir = proofs.path().to_str().unwrap();
 
-    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+    claim_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
-        .expect("claim v11");
-    set_process_stack_mode(ScanStackMode::V11);
+        .expect("claim v1");
+    set_process_stack_mode(ScanStackMode::V1);
 
     let store = crate::job_store::JobStore::new(pool.clone());
     let account = [0xABu8; 32];
@@ -570,8 +570,8 @@ async fn heal_v11_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
         .await
         .expect("advance to broadcasting + claimed");
 
-    let old = crate::v11::encode_v11_live_digest(&[0x11; 32], &[0x22; 32]);
-    let new = crate::v11::encode_v11_live_digest(&[0x33; 32], &[0x44; 32]);
+    let old = crate::v1::encode_v1_live_digest(&[0x11; 32], &[0x22; 32]);
+    let new = crate::v1::encode_v1_live_digest(&[0x33; 32], &[0x44; 32]);
     db::store_circuit_digest(&pool, &old).await.unwrap();
 
     let decision = heal_circuit_digest(&pool, &new, proofs_dir, &canary_must_not_run)
@@ -634,16 +634,16 @@ async fn heal_v11_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
 ///
 /// Would go red if `set_status` / `complete` matched `public_id` only.
 #[tokio::test]
-async fn heal_v11_reset_fences_pre_loaded_job_resurrection() {
+async fn heal_v1_reset_fences_pre_loaded_job_resurrection() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     let proofs = tempfile::tempdir().expect("tempdir");
     let proofs_dir = proofs.path().to_str().unwrap();
 
-    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+    claim_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
-        .expect("claim v11");
-    set_process_stack_mode(ScanStackMode::V11);
+        .expect("claim v1");
+    set_process_stack_mode(ScanStackMode::V1);
 
     let store = crate::job_store::JobStore::new(pool.clone());
     let account = [0xCDu8; 32];
@@ -665,8 +665,8 @@ async fn heal_v11_reset_fences_pre_loaded_job_resurrection() {
     assert_eq!(gen_before, 0, "fresh DB starts at generation 0");
 
     // Simulate worker A holding the loaded public_id (status still queued).
-    let old = crate::v11::encode_v11_live_digest(&[0x01; 32], &[0x02; 32]);
-    let new = crate::v11::encode_v11_live_digest(&[0x03; 32], &[0x04; 32]);
+    let old = crate::v1::encode_v1_live_digest(&[0x01; 32], &[0x02; 32]);
+    let new = crate::v1::encode_v1_live_digest(&[0x03; 32], &[0x04; 32]);
     db::store_circuit_digest(&pool, &old).await.unwrap();
 
     let decision = heal_circuit_digest(&pool, &new, proofs_dir, &canary_must_not_run)
@@ -728,19 +728,19 @@ async fn heal_v11_reset_fences_pre_loaded_job_resurrection() {
 ///
 /// Would go red if job-advancing writes ignored `reset_generation`.
 #[tokio::test]
-async fn heal_v11_reset_fences_stale_generation_admit() {
+async fn heal_v1_reset_fences_stale_generation_admit() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     let proofs = tempfile::tempdir().expect("tempdir");
     let proofs_dir = proofs.path().to_str().unwrap();
 
-    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+    claim_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
-        .expect("claim v11");
-    set_process_stack_mode(ScanStackMode::V11);
+        .expect("claim v1");
+    set_process_stack_mode(ScanStackMode::V1);
 
-    let old = crate::v11::encode_v11_live_digest(&[0x11; 32], &[0x22; 32]);
-    let new = crate::v11::encode_v11_live_digest(&[0x33; 32], &[0x44; 32]);
+    let old = crate::v1::encode_v1_live_digest(&[0x11; 32], &[0x22; 32]);
+    let new = crate::v1::encode_v1_live_digest(&[0x33; 32], &[0x44; 32]);
     db::store_circuit_digest(&pool, &old).await.unwrap();
     let decision = heal_circuit_digest(&pool, &new, proofs_dir, &canary_must_not_run)
         .await
@@ -1039,10 +1039,10 @@ async fn heal_complete_reports_zero_rows_and_no_completed_event() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
 
-    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+    claim_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
-        .expect("claim v11");
-    set_process_stack_mode(ScanStackMode::V11);
+        .expect("claim v1");
+    set_process_stack_mode(ScanStackMode::V1);
 
     let store = crate::job_store::JobStore::new(pool.clone());
     let account = [0xCEu8; 32];
@@ -1128,10 +1128,10 @@ async fn heal_set_status_reports_zero_rows_on_generation_fence() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
 
-    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+    claim_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
-        .expect("claim v11");
-    set_process_stack_mode(ScanStackMode::V11);
+        .expect("claim v1");
+    set_process_stack_mode(ScanStackMode::V1);
 
     let store = crate::job_store::JobStore::new(pool.clone());
     let account = [0x99u8; 32];
@@ -1175,8 +1175,8 @@ async fn heal_set_status_reports_zero_rows_on_generation_fence() {
 
 }
 
-/// Flag-off path: process not claimed v11 → full legacy wipe on mismatch.
-/// Would go red if the v11-only wipe were applied under flag-off.
+/// Flag-off path: process not claimed v1 → full legacy wipe on mismatch.
+/// Would go red if the v1-only wipe were applied under flag-off.
 #[tokio::test]
 async fn heal_flag_off_self_heal_still_full_legacy_wipe() {
     let scope = setup_pool().await;
@@ -1207,21 +1207,21 @@ async fn heal_flag_off_self_heal_still_full_legacy_wipe() {
     );
 }
 
-/// Adoption-boundary canary Stale under v11 must wipe v11 state.
+/// Adoption-boundary canary Stale under v1 must wipe v1 state.
 #[tokio::test]
-async fn heal_v11_stale_canary_resets_v11_state() {
+async fn heal_v1_stale_canary_resets_v1_state() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     let proofs = tempfile::tempdir().expect("tempdir");
     let proofs_dir = proofs.path().to_str().unwrap();
 
-    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+    claim_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
-        .expect("claim v11");
-    set_process_stack_mode(ScanStackMode::V11);
+        .expect("claim v1");
+    set_process_stack_mode(ScanStackMode::V1);
 
     sqlx::query(
-        "INSERT INTO v11_engine_meta \
+        "INSERT INTO v1_engine_meta \
          (id, network, activation_height, tip_height, tip_hash, fold_seq, updated_at) \
          VALUES (1, 'regtest', 0, 0, $1, 0, NOW())",
     )
@@ -1231,16 +1231,16 @@ async fn heal_v11_stale_canary_resets_v11_state() {
     .unwrap();
 
     // No persisted digest → canary consulted.
-    let live = crate::v11::encode_v11_live_digest(&[0xAA; 32], &[0xBB; 32]);
+    let live = crate::v1::encode_v1_live_digest(&[0xAA; 32], &[0xBB; 32]);
     let decision = heal_circuit_digest(&pool, &live, proofs_dir, &|| CanaryOutcome::Stale)
         .await
         .unwrap();
     assert_eq!(decision, ResetDecision::Reset);
-    let (v11_meta,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v11_engine_meta")
+    let (v1_meta,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_engine_meta")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(v11_meta, 0, "stale canary must wipe v11_engine_meta");
+    assert_eq!(v1_meta, 0, "stale canary must wipe v1_engine_meta");
     assert_eq!(
         db::load_circuit_digest(&pool).await.unwrap().as_deref(),
         Some(live.as_slice())

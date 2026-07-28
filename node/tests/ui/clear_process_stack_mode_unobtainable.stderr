@@ -1,8 +1,8 @@
-error[E0425]: cannot find function `clear_process_stack_mode_for_test` in module `node::v11`
+error[E0425]: cannot find function `clear_process_stack_mode_for_test` in module `node::v1`
   --> tests/ui/clear_process_stack_mode_unobtainable.rs:14:16
    |
-14 |     node::v11::clear_process_stack_mode_for_test();
-   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `node::v11`
+14 |     node::v1::clear_process_stack_mode_for_test();
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `node::v1`
 
 error[E0425]: cannot find function `clear_process_stack_mode_for_test` in crate `stack_policy`
   --> tests/ui/clear_process_stack_mode_unobtainable.rs:17:19

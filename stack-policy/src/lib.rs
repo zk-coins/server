@@ -33,24 +33,24 @@ pub enum ScanStackMode {
     /// Commitment inscriptions → global SMT + MMR (node default).
     Legacy,
     /// `AggregateStateNullifierV3` → NfLog first-occurrence (§3.6).
-    V11,
+    V1,
 }
 
 impl ScanStackMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Legacy => "legacy",
-            Self::V11 => "v11",
+            Self::V1 => "v1",
         }
     }
 
     pub fn parse(s: &str) -> Result<Self, StackPolicyError> {
         match s {
             "legacy" => Ok(Self::Legacy),
-            "v11" => Ok(Self::V11),
+            "v1" => Ok(Self::V1),
             other => Err(StackPolicyError::new(format!(
                 "stack_scan_mode={other:?} is not a known mode \
-                 (expected exactly \"legacy\" or \"v11\")"
+                 (expected exactly \"legacy\" or \"v1\")"
             ))),
         }
     }
@@ -147,7 +147,7 @@ pub fn clear_process_stack_mode_for_test() {
 /// When the process has not claimed a mode yet (unit tests that never boot
 /// dual-stack), unset process mode **allows** the legacy path so existing
 /// tests stay green without a silent cross-stack fall-back. A process that
-/// claimed [`ScanStackMode::V11`] always refuses.
+/// claimed [`ScanStackMode::V1`] always refuses.
 ///
 /// Called from the `esplora-bound` broadcast-client constructor so every
 /// construction of a broadcast-capable facade runs this check — including
@@ -155,7 +155,7 @@ pub fn clear_process_stack_mode_for_test() {
 pub fn ensure_legacy_publisher_allowed() -> Result<(), StackPolicyError> {
     match process_stack_mode() {
         None | Some(ScanStackMode::Legacy) => Ok(()),
-        Some(ScanStackMode::V11) => Err(StackPolicyError::new(format!(
+        Some(ScanStackMode::V1) => Err(StackPolicyError::new(format!(
             "{STACK_SEPARATION_REFUSAL}: process is running the v1.1 scan stack; \
              legacy Commitment publish is forbidden (no silent fall-back to \
              commitment_data inscriptions)"
@@ -177,10 +177,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_refused_under_v11_claim() {
+    fn legacy_refused_under_v1_claim() {
         clear_process_stack_mode_for_test();
-        set_process_stack_mode(ScanStackMode::V11);
-        let err = ensure_legacy_publisher_allowed().expect_err("v11 blocks legacy");
+        set_process_stack_mode(ScanStackMode::V1);
+        let err = ensure_legacy_publisher_allowed().expect_err("v1 blocks legacy");
         assert!(
             err.to_string().contains(STACK_SEPARATION_REFUSAL),
             "got: {err}"
@@ -201,14 +201,14 @@ mod tests {
     #[test]
     fn process_claim_is_monotonic_under_public_production_api() {
         clear_process_stack_mode_for_test();
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
 
         // Re-affirming the same mode is a no-op, not a reset.
-        set_process_stack_mode(ScanStackMode::V11);
-        assert_eq!(process_stack_mode(), Some(ScanStackMode::V11));
+        set_process_stack_mode(ScanStackMode::V1);
+        assert_eq!(process_stack_mode(), Some(ScanStackMode::V1));
 
         // Legacy broadcast path stays refused for the life of the claim.
-        let err = ensure_legacy_publisher_allowed().expect_err("still v11");
+        let err = ensure_legacy_publisher_allowed().expect_err("still v1");
         assert!(
             err.to_string().contains(STACK_SEPARATION_REFUSAL),
             "got: {err}"
@@ -221,12 +221,12 @@ mod tests {
     }
 
     /// Conflicting `set_process_stack_mode` panics — the claim cannot flip
-    /// from V11 to Legacy (or the reverse) via the production API.
+    /// from V1 to Legacy (or the reverse) via the production API.
     #[test]
     #[should_panic(expected = "conflicts with already-set")]
     fn conflicting_set_process_stack_mode_panics() {
         clear_process_stack_mode_for_test();
-        set_process_stack_mode(ScanStackMode::V11);
+        set_process_stack_mode(ScanStackMode::V1);
         set_process_stack_mode(ScanStackMode::Legacy);
     }
 

@@ -21,7 +21,7 @@
 //!   the run was checked against. The budgets are persisted on the
 //!   row so a future budget tweak does NOT retroactively flip the
 //!   pass/fail in [`SummaryRow`]. Migration 0023 adds `prover_mode`
-//!   (`legacy` | `v11`) plus nullable v1.1 shape columns so both
+//!   (`legacy` | `v1`) plus nullable v1.1 shape columns so both
 //!   circuits can coexist without false-red reclassification.
 //! * `r2_probe_warm_calls` — one row per warm call (call_index +
 //!   wall_ms). Lets the operator recompute percentiles or inspect
@@ -169,7 +169,7 @@ pub struct ProbeRun {
     pub rustc_version: String,
     pub build_profile: String,
     pub allocator: String,
-    /// `"legacy"` or `"v11"` — see [`crate::r2_budgets::ProverMode`].
+    /// `"legacy"` or `"v1"` — see [`crate::r2_budgets::ProverMode`].
     /// Defaults to `"legacy"` at the DB layer so pre-0023 insert paths
     /// and historical rows stay valid.
     pub prover_mode: String,
@@ -214,7 +214,7 @@ pub struct SummaryRow {
     pub git_sha: String,
     pub build_profile: String,
     pub allocator: String,
-    /// `"legacy"` or `"v11"` (migration 0023).
+    /// `"legacy"` or `"v1"` (migration 0023).
     pub prover_mode: String,
     pub circuit_build_wall_ms: i64,
     pub prove_cold_wall_ms: i64,

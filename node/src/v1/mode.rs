@@ -1,4 +1,4 @@
-//! `ZKCOINS_V11_SHADOW` resolution and §3.6 boot-pin validation.
+//! `ZKCOINS_V1_SHADOW` resolution and §3.6 boot-pin validation.
 //!
 //! Stages 1–2: flag-gated v1.1 path. Stage 2 makes publisher/scanner
 //! **exclusive** (legacy Commitment/SMT **or** AggregateStateNullifierV3/NfLog,
@@ -14,27 +14,27 @@ use zkcoins_program::circuit::compliance::Network;
 
 /// Whether the v1.1 dual stack is enabled (Stage 2: exclusive scan/publish).
 ///
-/// Default is [`V11ShadowMode::Off`]. Selected only by the exact env value
-/// `ZKCOINS_V11_SHADOW=1`. When on, the node claims the database for the
+/// Default is [`V1ShadowMode::Off`]. Selected only by the exact env value
+/// `ZKCOINS_V1_SHADOW=1`. When on, the node claims the database for the
 /// NfLog / AggregateStateNullifierV3 stack and refuses the legacy
 /// Commitment scanner/publisher. Proving remains legacy until Stage 3.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum V11ShadowMode {
+pub enum V1ShadowMode {
     Off,
     On,
 }
 
-/// Error when `ZKCOINS_V11_SHADOW` is set to an unsupported value.
+/// Error when `ZKCOINS_V1_SHADOW` is set to an unsupported value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct V11ShadowModeError {
+pub struct V1ShadowModeError {
     pub raw: String,
 }
 
-impl fmt::Display for V11ShadowModeError {
+impl fmt::Display for V1ShadowModeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ZKCOINS_V11_SHADOW={:?} is not supported — use unset / empty / \"off\" \
+            "ZKCOINS_V1_SHADOW={:?} is not supported — use unset / empty / \"off\" \
              for the legacy Commitment/SMT stack (default), or \"1\" for the exclusive \
              v1.1 AggregateStateNullifierV3/NfLog publisher+scanner (proving remains \
              legacy until Stage 3). Refusing to start (no silent fall-back)",
@@ -43,7 +43,7 @@ impl fmt::Display for V11ShadowModeError {
     }
 }
 
-impl std::error::Error for V11ShadowModeError {}
+impl std::error::Error for V1ShadowModeError {}
 
 /// Resolve the shadow mode from an optional env string (testable without
 /// mutating process env).
@@ -55,25 +55,25 @@ impl std::error::Error for V11ShadowModeError {}
 /// | anything else | `Err` (fail loud) |
 ///
 /// Case-sensitive, no whitespace trim: `"1 "` / `"ON"` / `"true"` all fail.
-pub fn resolve_v11_shadow_mode(raw: Option<&str>) -> Result<V11ShadowMode, V11ShadowModeError> {
+pub fn resolve_v1_shadow_mode(raw: Option<&str>) -> Result<V1ShadowMode, V1ShadowModeError> {
     match raw {
-        None => Ok(V11ShadowMode::Off),
-        Some(s) if s.is_empty() || s == "off" => Ok(V11ShadowMode::Off),
-        Some("1") => Ok(V11ShadowMode::On),
-        Some(other) => Err(V11ShadowModeError {
+        None => Ok(V1ShadowMode::Off),
+        Some(s) if s.is_empty() || s == "off" => Ok(V1ShadowMode::Off),
+        Some("1") => Ok(V1ShadowMode::On),
+        Some(other) => Err(V1ShadowModeError {
             raw: other.to_string(),
         }),
     }
 }
 
-/// Read `ZKCOINS_V11_SHADOW` from the process environment.
-pub fn v11_shadow_mode_from_env() -> Result<V11ShadowMode, V11ShadowModeError> {
-    match env::var("ZKCOINS_V11_SHADOW") {
-        Err(env::VarError::NotPresent) => resolve_v11_shadow_mode(None),
-        Err(env::VarError::NotUnicode(_)) => Err(V11ShadowModeError {
+/// Read `ZKCOINS_V1_SHADOW` from the process environment.
+pub fn v1_shadow_mode_from_env() -> Result<V1ShadowMode, V1ShadowModeError> {
+    match env::var("ZKCOINS_V1_SHADOW") {
+        Err(env::VarError::NotPresent) => resolve_v1_shadow_mode(None),
+        Err(env::VarError::NotUnicode(_)) => Err(V1ShadowModeError {
             raw: "<non-utf8>".to_string(),
         }),
-        Ok(v) => resolve_v11_shadow_mode(Some(v.as_str())),
+        Ok(v) => resolve_v1_shadow_mode(Some(v.as_str())),
     }
 }
 
@@ -111,8 +111,8 @@ pub fn network_tag_for(network: Network) -> Result<&'static str, String> {
 }
 
 /// Human-readable boot-config error for the v1.1 shadow path.
-pub const V11_BOOT_CONFIG_ERROR: &str = "\
-ZKCOINS_V11_SHADOW=1 requires ZKCOINS_NETWORK (mainnet|testnet|regtest), \
+pub const V1_BOOT_CONFIG_ERROR: &str = "\
+ZKCOINS_V1_SHADOW=1 requires ZKCOINS_NETWORK (mainnet|testnet|regtest), \
 ZKCOINS_ACTIVATION_HEIGHT (non-negative integer), ZKCOINS_EXPECTED_PARAMS_IDENTIFIER \
 (64 lowercase hex chars — the published network-params.json SHA-256), and the \
 parameter-set fields ZKCOINS_CIRCUIT_DIGEST_C, ZKCOINS_CIRCUIT_DIGEST_C_BALANCE, \
@@ -123,7 +123,7 @@ outcome available here.";
 
 /// Validated Stage-1 boot pins: network + activation height after §3.6 checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct V11BootPins {
+pub struct V1BootPins {
     pub network: Network,
     pub activation_height: u64,
     pub network_params: NetworkParams,
@@ -143,7 +143,7 @@ pub struct V11BootPins {
 /// 2. `network_params.network_tag()` matches the §3.6 tag for `network`
 /// 3. regtest pin: `network_params.activation_height() == 0`
 /// 4. `activation_height == network_params.activation_height()`
-pub fn validate_v11_boot_pins(
+pub fn validate_v1_boot_pins(
     network: Network,
     activation_height: u64,
     network_params: &NetworkParams,
@@ -241,17 +241,17 @@ fn parse_hex_32(raw: &str, env_name: &str) -> Result<[u8; 32], String> {
 ///
 /// Both the parameter set and the **published** identifier are mandatory.
 /// There is no default (including no implicit regtest / activation_height=0).
-pub fn v11_boot_pins_from_env() -> Result<V11BootPins, String> {
-    let network_raw = env::var("ZKCOINS_NETWORK").map_err(|_| V11_BOOT_CONFIG_ERROR.to_string())?;
+pub fn v1_boot_pins_from_env() -> Result<V1BootPins, String> {
+    let network_raw = env::var("ZKCOINS_NETWORK").map_err(|_| V1_BOOT_CONFIG_ERROR.to_string())?;
     if network_raw.trim().is_empty() {
-        return Err(V11_BOOT_CONFIG_ERROR.to_string());
+        return Err(V1_BOOT_CONFIG_ERROR.to_string());
     }
     let network = parse_network_label(network_raw.trim())?;
 
     let height_raw =
-        env::var("ZKCOINS_ACTIVATION_HEIGHT").map_err(|_| V11_BOOT_CONFIG_ERROR.to_string())?;
+        env::var("ZKCOINS_ACTIVATION_HEIGHT").map_err(|_| V1_BOOT_CONFIG_ERROR.to_string())?;
     if height_raw.trim().is_empty() {
-        return Err(V11_BOOT_CONFIG_ERROR.to_string());
+        return Err(V1_BOOT_CONFIG_ERROR.to_string());
     }
     let activation_height: u64 = height_raw.trim().parse().map_err(|_| {
         format!(
@@ -261,32 +261,32 @@ pub fn v11_boot_pins_from_env() -> Result<V11BootPins, String> {
     })?;
 
     let expected_raw = env::var("ZKCOINS_EXPECTED_PARAMS_IDENTIFIER")
-        .map_err(|_| V11_BOOT_CONFIG_ERROR.to_string())?;
+        .map_err(|_| V1_BOOT_CONFIG_ERROR.to_string())?;
     if expected_raw.trim().is_empty() {
-        return Err(V11_BOOT_CONFIG_ERROR.to_string());
+        return Err(V1_BOOT_CONFIG_ERROR.to_string());
     }
     let expected_params_identifier =
         parse_hex_32(&expected_raw, "ZKCOINS_EXPECTED_PARAMS_IDENTIFIER")?;
 
     let digest_c_raw =
-        env::var("ZKCOINS_CIRCUIT_DIGEST_C").map_err(|_| V11_BOOT_CONFIG_ERROR.to_string())?;
+        env::var("ZKCOINS_CIRCUIT_DIGEST_C").map_err(|_| V1_BOOT_CONFIG_ERROR.to_string())?;
     if digest_c_raw.trim().is_empty() {
-        return Err(V11_BOOT_CONFIG_ERROR.to_string());
+        return Err(V1_BOOT_CONFIG_ERROR.to_string());
     }
     let circuit_digest_c = parse_hex_32(&digest_c_raw, "ZKCOINS_CIRCUIT_DIGEST_C")?;
 
     let digest_bal_raw = env::var("ZKCOINS_CIRCUIT_DIGEST_C_BALANCE")
-        .map_err(|_| V11_BOOT_CONFIG_ERROR.to_string())?;
+        .map_err(|_| V1_BOOT_CONFIG_ERROR.to_string())?;
     if digest_bal_raw.trim().is_empty() {
-        return Err(V11_BOOT_CONFIG_ERROR.to_string());
+        return Err(V1_BOOT_CONFIG_ERROR.to_string());
     }
     let circuit_digest_c_balance =
         parse_hex_32(&digest_bal_raw, "ZKCOINS_CIRCUIT_DIGEST_C_BALANCE")?;
 
     let bootstrap_raw =
-        env::var("ZKCOINS_BOOTSTRAP_PUBKEY").map_err(|_| V11_BOOT_CONFIG_ERROR.to_string())?;
+        env::var("ZKCOINS_BOOTSTRAP_PUBKEY").map_err(|_| V1_BOOT_CONFIG_ERROR.to_string())?;
     if bootstrap_raw.trim().is_empty() {
-        return Err(V11_BOOT_CONFIG_ERROR.to_string());
+        return Err(V1_BOOT_CONFIG_ERROR.to_string());
     }
     let bootstrap_pubkey = parse_hex_32(&bootstrap_raw, "ZKCOINS_BOOTSTRAP_PUBKEY")?;
 
@@ -301,14 +301,14 @@ pub fn v11_boot_pins_from_env() -> Result<V11BootPins, String> {
     )
     .map_err(|e| format!("NetworkParams construction failed: {e}"))?;
 
-    validate_v11_boot_pins(
+    validate_v1_boot_pins(
         network,
         activation_height,
         &network_params,
         expected_params_identifier,
     )?;
 
-    Ok(V11BootPins {
+    Ok(V1BootPins {
         network,
         activation_height,
         network_params,
@@ -322,37 +322,37 @@ mod unit_tests {
 
     #[test]
     fn unset_empty_and_off_disable_shadow() {
-        assert_eq!(resolve_v11_shadow_mode(None).unwrap(), V11ShadowMode::Off);
+        assert_eq!(resolve_v1_shadow_mode(None).unwrap(), V1ShadowMode::Off);
         assert_eq!(
-            resolve_v11_shadow_mode(Some("")).unwrap(),
-            V11ShadowMode::Off
+            resolve_v1_shadow_mode(Some("")).unwrap(),
+            V1ShadowMode::Off
         );
         assert_eq!(
-            resolve_v11_shadow_mode(Some("off")).unwrap(),
-            V11ShadowMode::Off
+            resolve_v1_shadow_mode(Some("off")).unwrap(),
+            V1ShadowMode::Off
         );
     }
 
     #[test]
     fn one_enables_shadow() {
         assert_eq!(
-            resolve_v11_shadow_mode(Some("1")).unwrap(),
-            V11ShadowMode::On
+            resolve_v1_shadow_mode(Some("1")).unwrap(),
+            V1ShadowMode::On
         );
     }
 
     #[test]
     fn unknown_value_fails_loud() {
-        let err = resolve_v11_shadow_mode(Some("v11")).unwrap_err();
+        let err = resolve_v1_shadow_mode(Some("v1")).unwrap_err();
         assert!(err.to_string().contains("not supported"));
         // Case-sensitive / no silent normalize.
-        assert!(resolve_v11_shadow_mode(Some("ON")).is_err());
-        assert!(resolve_v11_shadow_mode(Some("True")).is_err());
-        assert!(resolve_v11_shadow_mode(Some("true")).is_err());
-        assert!(resolve_v11_shadow_mode(Some("1 ")).is_err());
-        assert!(resolve_v11_shadow_mode(Some(" 1")).is_err());
-        assert!(resolve_v11_shadow_mode(Some("legacy")).is_err());
-        assert!(resolve_v11_shadow_mode(Some("0")).is_err());
+        assert!(resolve_v1_shadow_mode(Some("ON")).is_err());
+        assert!(resolve_v1_shadow_mode(Some("True")).is_err());
+        assert!(resolve_v1_shadow_mode(Some("true")).is_err());
+        assert!(resolve_v1_shadow_mode(Some("1 ")).is_err());
+        assert!(resolve_v1_shadow_mode(Some(" 1")).is_err());
+        assert!(resolve_v1_shadow_mode(Some("legacy")).is_err());
+        assert!(resolve_v1_shadow_mode(Some("0")).is_err());
     }
 
     #[test]
@@ -373,7 +373,7 @@ mod unit_tests {
         let tag = network_tag_for(Network::Testnet).unwrap();
         let params = fixture_params(tag, 2_500_000);
         let id = params.identifier().expect("id");
-        validate_v11_boot_pins(Network::Testnet, 2_500_000, &params, id)
+        validate_v1_boot_pins(Network::Testnet, 2_500_000, &params, id)
             .expect("matching pins must pass");
     }
 
@@ -390,7 +390,7 @@ mod unit_tests {
             published_id,
             "height change must change the content-addressed identifier"
         );
-        let err = validate_v11_boot_pins(Network::Testnet, 99, &wrong, published_id)
+        let err = validate_v1_boot_pins(Network::Testnet, 99, &wrong, published_id)
             .expect_err("self-consistent unpublished set must fail");
         assert!(
             err.contains("expected_params_identifier") || err.contains("identifier"),
@@ -407,7 +407,7 @@ mod unit_tests {
         let tag = network_tag_for(Network::Mainnet).unwrap();
         let params = fixture_params(tag, 840_000);
         let id = params.identifier().expect("id");
-        let err = validate_v11_boot_pins(Network::Mainnet, 1, &params, id)
+        let err = validate_v1_boot_pins(Network::Mainnet, 1, &params, id)
             .expect_err("height mismatch must fail");
         assert!(err.contains("activation_height"), "unexpected error: {err}");
     }
@@ -417,7 +417,7 @@ mod unit_tests {
         let tag = network_tag_for(Network::Regtest).unwrap();
         let params = fixture_params(tag, 7);
         let id = params.identifier().expect("id");
-        let err = validate_v11_boot_pins(Network::Regtest, 7, &params, id)
+        let err = validate_v1_boot_pins(Network::Regtest, 7, &params, id)
             .expect_err("regtest non-zero must fail");
         assert!(
             err.contains("regtest") || err.contains("§3.6"),

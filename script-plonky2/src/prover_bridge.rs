@@ -1,4 +1,4 @@
-//! Production host bridge for the frozen spec-v1.1 `C` and `C_balance`
+//! Production host bridge for the frozen spec-v1.2 `C` and `C_balance`
 //! circuits.
 //!
 //! The witness setters in this module are the production counterparts of the

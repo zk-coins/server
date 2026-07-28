@@ -1,0 +1,16 @@
+error[E0061]: this function takes 2 arguments but 3 arguments were supplied
+  --> tests/ui/v1_provenance_source_witness_unobtainable.rs:15:17
+   |
+15 |         let _ = node::v1::begin_v1_send(engine, req, sources);
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^              ------- unexpected argument #3 of type `&[Option<InCoinSourceWitness<'_>>]`
+   |
+note: function defined here
+  --> src/v1/provenance.rs
+   |
+   | pub fn begin_v1_send(engine: &StateEngine, req: SendRequest) -> Result<PendingTransition> {
+   |        ^^^^^^^^^^^^^^
+help: remove the extra argument
+   |
+15 -         let _ = node::v1::begin_v1_send(engine, req, sources);
+15 +         let _ = node::v1::begin_v1_send(engine, req);
+   |

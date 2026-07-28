@@ -14,9 +14,9 @@ use zkcoins_prover::state_engine::{
     AccountRecord, MintRequest, OpSecret, ScannedNullifier, StateEngine, TrackedCoin,
 };
 
-use super::db_v11::{self, EngineSnapshot};
+use super::db_v1::{self, EngineSnapshot};
 use super::mode::{
-    network_tag_for, resolve_v11_shadow_mode, validate_v11_boot_pins, V11ShadowMode,
+    network_tag_for, resolve_v1_shadow_mode, validate_v1_boot_pins, V1ShadowMode,
 };
 use super::separation::{
     claim_stack_scan_mode, enforce_stack_scan_mode,
@@ -28,10 +28,10 @@ use crate::test_db::setup_pool;
 
 /// Claim the v1.1 stack marker on a fresh pool (DB row only; no process
 /// mode side-effect unless the caller also calls `set_process_stack_mode`).
-async fn claim_v11_marker(pool: &sqlx::PgPool) {
-    claim_stack_scan_mode(pool, ScanStackMode::V11)
+async fn claim_v1_marker(pool: &sqlx::PgPool) {
+    claim_stack_scan_mode(pool, ScanStackMode::V1)
         .await
-        .expect("claim v11 marker");
+        .expect("claim v1 marker");
 }
 
 fn pk(byte: u8) -> [u8; 32] {
@@ -175,33 +175,33 @@ fn flag_defaults_to_off_when_unset() {
     // Normative default: the pure resolver maps "env unset" → Off.
     // (Process-env is not mutated here so parallel tests cannot race.)
     assert_eq!(
-        resolve_v11_shadow_mode(None).expect("unset"),
-        V11ShadowMode::Off
+        resolve_v1_shadow_mode(None).expect("unset"),
+        V1ShadowMode::Off
     );
     assert_eq!(
-        resolve_v11_shadow_mode(Some("")).expect("empty"),
-        V11ShadowMode::Off
+        resolve_v1_shadow_mode(Some("")).expect("empty"),
+        V1ShadowMode::Off
     );
     assert_eq!(
-        resolve_v11_shadow_mode(Some("off")).expect("off"),
-        V11ShadowMode::Off
+        resolve_v1_shadow_mode(Some("off")).expect("off"),
+        V1ShadowMode::Off
     );
     // Only the exact token "1" enables shadow persistence.
     assert_eq!(
-        resolve_v11_shadow_mode(Some("1")).expect("1"),
-        V11ShadowMode::On
+        resolve_v1_shadow_mode(Some("1")).expect("1"),
+        V1ShadowMode::On
     );
     // Any other value fails loud — never silently treated as off.
-    // Includes the retired ZKCOINS_PROVER=v11 token and case/whitespace variants.
-    assert!(resolve_v11_shadow_mode(Some("v11")).is_err());
-    assert!(resolve_v11_shadow_mode(Some("ON")).is_err());
-    assert!(resolve_v11_shadow_mode(Some("true")).is_err());
-    assert!(resolve_v11_shadow_mode(Some("1 ")).is_err());
-    assert!(resolve_v11_shadow_mode(Some("legacy")).is_err());
+    // Includes the retired ZKCOINS_PROVER=v1 token and case/whitespace variants.
+    assert!(resolve_v1_shadow_mode(Some("v1")).is_err());
+    assert!(resolve_v1_shadow_mode(Some("ON")).is_err());
+    assert!(resolve_v1_shadow_mode(Some("true")).is_err());
+    assert!(resolve_v1_shadow_mode(Some("1 ")).is_err());
+    assert!(resolve_v1_shadow_mode(Some("legacy")).is_err());
 }
 
 /// Requirement 10: persist the operational bundle, drop local state, restore
-/// via [`db_v11::load_engine_snapshot`], reconstruct the engine, and reproduce
+/// via [`db_v1::load_engine_snapshot`], reconstruct the engine, and reproduce
 /// a **prior** `nav_rand` opening from the restored `op_secret`.
 ///
 /// Red if `load_engine_snapshot` dropped `op_secret` (e.g. restored as `None`):
@@ -213,7 +213,7 @@ async fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
 
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    claim_v11_marker(&pool).await;
+    claim_v1_marker(&pool).await;
 
     let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/req10/restore/nk").into();
     let (_, _, current_pubkey) =
@@ -297,7 +297,7 @@ async fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
     .expect("insert account with operational bundle");
 
     let snap = EngineSnapshot::from_engine_with_tip_hash(&live, [0x10; 32]);
-    db_v11::persist_engine_snapshot(&pool, &snap)
+    db_v1::persist_engine_snapshot(&pool, &snap)
         .await
         .expect("persist engine snapshot with op_secret");
 
@@ -308,7 +308,7 @@ async fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
     drop(engine);
 
     // --- Fresh node: load snapshot, reconstruct engine, reproduce opening ---
-    let loaded = db_v11::load_engine_snapshot(&pool)
+    let loaded = db_v1::load_engine_snapshot(&pool)
         .await
         .expect("load_engine_snapshot")
         .expect("snapshot must exist after persist");
@@ -358,7 +358,7 @@ fn boot_rejects_params_that_miss_published_identifier() {
         "height change must change the content-addressed identifier"
     );
 
-    let err = validate_v11_boot_pins(Network::Testnet, 99, &wrong, published_id)
+    let err = validate_v1_boot_pins(Network::Testnet, 99, &wrong, published_id)
         .expect_err("self-consistent unpublished set must fail");
     assert!(
         err.contains("expected_params_identifier") || err.contains("identifier"),
@@ -375,7 +375,7 @@ fn boot_rejects_params_that_miss_published_identifier() {
 async fn restart_identity_nflog_and_coinhist_roots() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    claim_v11_marker(&pool).await;
+    claim_v1_marker(&pool).await;
 
     let engine = seeded_engine();
     let before_nav = engine.nflog().nav();
@@ -403,12 +403,12 @@ async fn restart_identity_nflog_and_coinhist_roots() {
 
     let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, tip_hash);
     assert_eq!(snap.tip_hash, tip_hash);
-    db_v11::persist_engine_snapshot(&pool, &snap)
+    db_v1::persist_engine_snapshot(&pool, &snap)
         .await
         .expect("persist snapshot");
 
     // Fresh reconstruction path A: load snapshot → into_engine.
-    let loaded = db_v11::load_engine_snapshot(&pool)
+    let loaded = db_v1::load_engine_snapshot(&pool)
         .await
         .expect("load snapshot")
         .expect("meta must exist after persist");
@@ -448,13 +448,13 @@ async fn restart_identity_nflog_and_coinhist_roots() {
 
     // Mutate in memory, persist, reload — identity tracks the new state.
     // with_engine_mut requires a v1.1 process claim.
-    set_process_stack_mode(ScanStackMode::V11);
+    set_process_stack_mode(ScanStackMode::V1);
     adapter
         .with_engine_mut(|eng| {
             eng.append_nullifier(scanned(30, 0, pk(9), r_val(99)))
                 .expect("append fourth nullifier");
         })
-        .expect("with_engine_mut under v11 claim");
+        .expect("with_engine_mut under v1 claim");
     let (mid_nflog, mid_ch) = adapter.identity_roots();
     assert_ne!(mid_nflog, before_nflog_root);
     assert_eq!(mid_ch, before_coinhist); // accounts unchanged
@@ -470,7 +470,7 @@ async fn restart_identity_nflog_and_coinhist_roots() {
 async fn load_or_create_fresh_db_then_reload_empty_identity() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    claim_v11_marker(&pool).await;
+    claim_v1_marker(&pool).await;
 
     let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Testnet, 0)
         .await
@@ -494,7 +494,7 @@ async fn load_or_create_fresh_db_then_reload_empty_identity() {
 async fn pin_mismatch_fails_loud() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    claim_v11_marker(&pool).await;
+    claim_v1_marker(&pool).await;
 
     EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
         .await
@@ -523,30 +523,30 @@ async fn pin_mismatch_fails_loud() {
 async fn missing_meta_with_data_rows_fails_loud() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    claim_v11_marker(&pool).await;
+    claim_v1_marker(&pool).await;
 
     // Seed a complete snapshot so child tables have rows.
     let engine = seeded_engine();
     let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, [0x11; 32]);
-    db_v11::persist_engine_snapshot(&pool, &snap)
+    db_v1::persist_engine_snapshot(&pool, &snap)
         .await
         .expect("persist");
 
     // Delete only the singleton meta row — data remains.
-    let deleted = sqlx::query("DELETE FROM v11_engine_meta WHERE id = 1")
+    let deleted = sqlx::query("DELETE FROM v1_engine_meta WHERE id = 1")
         .execute(&pool)
         .await
         .expect("delete meta");
     assert_eq!(deleted.rows_affected(), 1, "meta row must have existed");
 
     // Sanity: data rows still present.
-    let (nflog_n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v11_nflog_entries")
+    let (nflog_n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_nflog_entries")
         .fetch_one(&pool)
         .await
         .expect("count nflog");
     assert!(nflog_n > 0, "test setup requires leftover nflog rows");
 
-    let err = db_v11::load_engine_snapshot(&pool)
+    let err = db_v1::load_engine_snapshot(&pool)
         .await
         .expect_err("meta missing with data must fail, not return empty");
     let msg = format!("{err:#}");
@@ -577,7 +577,7 @@ async fn missing_meta_with_data_rows_fails_loud() {
 async fn tip_hash_survives_persist_reload() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    claim_v11_marker(&pool).await;
+    claim_v1_marker(&pool).await;
 
     let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
         .await
@@ -586,16 +586,16 @@ async fn tip_hash_survives_persist_reload() {
     let fork_b = [0xBB; 32];
     assert_ne!(fork_a, fork_b);
 
-    set_process_stack_mode(ScanStackMode::V11);
+    set_process_stack_mode(ScanStackMode::V1);
     adapter
         .with_engine_mut(|eng| eng.set_tip_height(42))
-        .expect("with_engine_mut under v11 claim");
+        .expect("with_engine_mut under v1 claim");
     adapter
         .set_tip_hash(fork_a)
-        .expect("set_tip_hash under v11 claim");
+        .expect("set_tip_hash under v1 claim");
     adapter.persist().await.expect("persist fork A");
 
-    let loaded = db_v11::load_engine_snapshot(&pool)
+    let loaded = db_v1::load_engine_snapshot(&pool)
         .await
         .expect("load")
         .expect("meta");
@@ -605,7 +605,7 @@ async fn tip_hash_survives_persist_reload() {
     // Same height, different hash — the whole point of storing tip_hash.
     adapter
         .set_tip_hash(fork_b)
-        .expect("set_tip_hash under v11 claim");
+        .expect("set_tip_hash under v1 claim");
     adapter.persist().await.expect("persist fork B");
     adapter.reload_from_db().await.expect("reload");
     assert_eq!(adapter.tip_hash(), fork_b);
@@ -627,7 +627,7 @@ use super::scan::{
 };
 use super::separation::{
     claim_process_stack_from_shadow_mode, ensure_legacy_publisher_allowed,
-    ensure_v11_publisher_allowed,
+    ensure_v1_publisher_allowed,
 };
 use shared::spec_v1::LookupResult;
 
@@ -726,18 +726,18 @@ async fn seed_legacy_scan_state(pool: &sqlx::PgPool) {
 
 /// Seed one NfLog entry — the durable signal of v1.1 scan activity.
 /// Does **not** set the stack_scan_mode marker (for missing-marker tests).
-async fn seed_v11_scan_state_without_marker(pool: &sqlx::PgPool) {
+async fn seed_v1_scan_state_without_marker(pool: &sqlx::PgPool) {
     sqlx::query(
-        "INSERT INTO v11_engine_meta \
+        "INSERT INTO v1_engine_meta \
          (id, network, activation_height, tip_height, tip_hash, fold_seq, updated_at) \
          VALUES (1, 'regtest', 0, 1, $1, 0, NOW())",
     )
     .bind([0u8; 32].as_slice())
     .execute(pool)
     .await
-    .expect("seed v11 meta");
+    .expect("seed v1 meta");
     sqlx::query(
-        "INSERT INTO v11_nflog_entries \
+        "INSERT INTO v1_nflog_entries \
          (position, height, tx_index, vin_index, member_index, pk, r) \
          VALUES (0, 1, 0, 0, 0, $1, $2)",
     )
@@ -745,7 +745,7 @@ async fn seed_v11_scan_state_without_marker(pool: &sqlx::PgPool) {
     .bind(r_val(1).as_slice())
     .execute(pool)
     .await
-    .expect("seed v11_nflog_entries");
+    .expect("seed v1_nflog_entries");
 }
 
 /// Hard separation: data without a marker is refused on both sides — no
@@ -758,10 +758,10 @@ async fn hard_separation_refuses_data_without_marker() {
         let pool = scope.pool.clone();
         seed_legacy_scan_state(&pool).await;
 
-        let err_v11 = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+        let err_v1 = enforce_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
             .expect_err("v1.1 must refuse missing marker + legacy data");
-        let msg = format!("{err_v11:#}");
+        let msg = format!("{err_v1:#}");
         assert!(
             msg.contains(STACK_SEPARATION_REFUSAL) && msg.contains("marker is missing"),
             "missing marker + data must refuse without claiming; got: {msg}"
@@ -779,32 +779,32 @@ async fn hard_separation_refuses_data_without_marker() {
     {
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
-        seed_v11_scan_state_without_marker(&pool).await;
+        seed_v1_scan_state_without_marker(&pool).await;
 
         let err_legacy = enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
             .await
-            .expect_err("legacy must refuse missing marker + v11 data");
+            .expect_err("legacy must refuse missing marker + v1 data");
         assert!(
             format!("{err_legacy:#}").contains(STACK_SEPARATION_REFUSAL),
             "got: {err_legacy:#}"
         );
 
-        let err_v11 = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+        let err_v1 = enforce_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
             .expect_err("v1.1 must refuse missing marker even with same-side data");
         assert!(
-            format!("{err_v11:#}").contains("marker is missing"),
-            "no claim-from-data; got: {err_v11:#}"
+            format!("{err_v1:#}").contains("marker is missing"),
+            "no claim-from-data; got: {err_v1:#}"
         );
     }
 }
 
 /// Hard separation under a Legacy process claim (monotonic; nextest isolates
-/// from V11-claim cases). Same-side data accepted; opposite path refused.
+/// from V1-claim cases). Same-side data accepted; opposite path refused.
 #[tokio::test]
-async fn hard_separation_legacy_claim_accepts_own_refuses_v11() {
+async fn hard_separation_legacy_claim_accepts_own_refuses_v1() {
     // Claimed + same-side data: accepted; opposite refuses at the DB gate
-    // (never reaches set_process_stack_mode for V11).
+    // (never reaches set_process_stack_mode for V1).
     {
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
@@ -816,7 +816,7 @@ async fn hard_separation_legacy_claim_accepts_own_refuses_v11() {
             .await
             .expect("legacy re-boot with own marker + data");
 
-        let err = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+        let err = enforce_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
             .expect_err("v1.1 must refuse legacy claim + data");
         assert!(
@@ -834,7 +834,7 @@ async fn hard_separation_legacy_claim_accepts_own_refuses_v11() {
             .await
             .expect("fresh DB claims legacy");
 
-        let err = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+        let err = enforce_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
             .expect_err("v1.1 must refuse a DB claimed as legacy");
         let msg = format!("{err:#}");
@@ -845,29 +845,29 @@ async fn hard_separation_legacy_claim_accepts_own_refuses_v11() {
     }
 }
 
-/// Hard separation under a V11 process claim (split from the Legacy case:
+/// Hard separation under a V1 process claim (split from the Legacy case:
 /// process claim is monotonic and un-clearable outside stack-policy).
 #[tokio::test]
-async fn hard_separation_v11_claim_accepts_own_refuses_legacy() {
+async fn hard_separation_v1_claim_accepts_own_refuses_legacy() {
     {
         let scope = setup_pool().await;
         let pool = scope.pool.clone();
-        enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+        enforce_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
-            .expect("fresh DB claims v11");
+            .expect("fresh DB claims v1");
         // Persist a real snapshot under the claim (transactional writer).
         let engine = StateEngine::new(Network::Regtest, 0);
         let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, [0u8; 32]);
-        db_v11::persist_engine_snapshot(&pool, &snap)
+        db_v1::persist_engine_snapshot(&pool, &snap)
             .await
-            .expect("persist under v11 claim");
-        enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+            .expect("persist under v1 claim");
+        enforce_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
             .expect("v1.1 re-boot with own marker + data");
 
         let err = enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
             .await
-            .expect_err("legacy must refuse v11 claim + data");
+            .expect_err("legacy must refuse v1 claim + data");
         assert!(
             format!("{err:#}").contains(STACK_SEPARATION_REFUSAL),
             "got: {err:#}"
@@ -877,54 +877,54 @@ async fn hard_separation_v11_claim_accepts_own_refuses_legacy() {
     // Publisher guards follow the process claim.
     {
         let scope = setup_pool().await;
-        enforce_stack_scan_mode(&scope.pool, ScanStackMode::V11)
+        enforce_stack_scan_mode(&scope.pool, ScanStackMode::V1)
             .await
-            .expect("claim v11");
-        let legacy_err = ensure_legacy_publisher_allowed().expect_err("legacy publish under v11");
+            .expect("claim v1");
+        let legacy_err = ensure_legacy_publisher_allowed().expect_err("legacy publish under v1");
         assert!(
             legacy_err.to_string().contains(STACK_SEPARATION_REFUSAL),
-            "legacy publisher must refuse under v11 claim"
+            "legacy publisher must refuse under v1 claim"
         );
-        ensure_v11_publisher_allowed().expect("v11 publisher under v11 claim");
+        ensure_v1_publisher_allowed().expect("v1 publisher under v1 claim");
     }
 }
 
 /// Defect 1: a write to a v1.1 table under a mismatching (or missing)
 /// marker fails **inside** the transaction — nothing is committed.
 #[tokio::test]
-async fn v11_persist_refuses_under_mismatching_marker_in_transaction() {
+async fn v1_persist_refuses_under_mismatching_marker_in_transaction() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
 
-    // Claim legacy first so any v11 write is a capability mismatch.
+    // Claim legacy first so any v1 write is a capability mismatch.
     enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
         .await
         .expect("claim legacy");
 
     let engine = StateEngine::new(Network::Regtest, 0);
     let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, [0x42; 32]);
-    let err = db_v11::persist_engine_snapshot(&pool, &snap)
+    let err = db_v1::persist_engine_snapshot(&pool, &snap)
         .await
-        .expect_err("v11 persist under legacy marker must fail");
+        .expect_err("v1 persist under legacy marker must fail");
     let msg = format!("{err:#}");
     assert!(
         msg.contains(STACK_CAPABILITY_REFUSAL) || msg.contains("stack_scan_mode"),
         "must refuse on capability check; got: {msg}"
     );
 
-    // Transaction rolled back: no v11 meta row committed.
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v11_engine_meta")
+    // Transaction rolled back: no v1 meta row committed.
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_engine_meta")
         .fetch_one(&pool)
         .await
         .expect("count meta");
-    assert_eq!(n, 0, "failed persist must leave v11 tables empty");
+    assert_eq!(n, 0, "failed persist must leave v1 tables empty");
 
     // Missing marker is also refusal (no silent claim-from-write).
     let scope2 = setup_pool().await;
     let pool2 = scope2.pool.clone();
-    let err2 = db_v11::persist_engine_snapshot(&pool2, &snap)
+    let err2 = db_v1::persist_engine_snapshot(&pool2, &snap)
         .await
-        .expect_err("v11 persist without marker must fail");
+        .expect_err("v1 persist without marker must fail");
     assert!(
         format!("{err2:#}").contains("marker is missing")
             || format!("{err2:#}").contains(STACK_CAPABILITY_REFUSAL),
@@ -934,11 +934,11 @@ async fn v11_persist_refuses_under_mismatching_marker_in_transaction() {
 
 /// Defect 2: `resume_pending_inscriptions` refuses under a v1.1 process claim.
 #[tokio::test]
-async fn resume_pending_inscriptions_refuses_under_v11_claim() {
+async fn resume_pending_inscriptions_refuses_under_v1_claim() {
     let scope = setup_pool().await;
-    enforce_stack_scan_mode(&scope.pool, ScanStackMode::V11)
+    enforce_stack_scan_mode(&scope.pool, ScanStackMode::V1)
         .await
-        .expect("claim v11");
+        .expect("claim v1");
 
     let config = crate::publisher::EsploraConfig {
         url: "http://127.0.0.1:1/api".to_string(),
@@ -948,7 +948,7 @@ async fn resume_pending_inscriptions_refuses_under_v11_claim() {
     };
     let err = crate::publisher::resume_pending_inscriptions(&scope.pool, &config)
         .await
-        .expect_err("resume must refuse under v11 claim");
+        .expect_err("resume must refuse under v1 claim");
     let msg = err.to_string();
     assert!(
         msg.contains(STACK_SEPARATION_REFUSAL) || msg.contains("v1.1"),
@@ -963,9 +963,9 @@ async fn resume_pending_inscriptions_refuses_under_v11_claim() {
 async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+    enforce_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
-        .expect("claim v11");
+        .expect("claim v1");
 
     // Shared prefix heights 0..=10; height 11 diverges (depth-1 shallow reorg).
     let mut old_chain = mock_chain(12, 0xAA);
@@ -1227,7 +1227,7 @@ fn unresolvable_persisted_tip_refuses() {
 /// Defect 2: legacy DB with only smt_state / mmr_state / latest_block
 /// (no mmr_root_index) cannot be claimed by v1.1.
 #[tokio::test]
-async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v11_claim() {
+async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v1_claim() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
 
@@ -1265,7 +1265,7 @@ async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v11_claim() {
         .expect("count root index");
     assert_eq!(root_n, 0, "test requires no mmr_root_index rows");
 
-    let err = enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+    let err = enforce_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
         .expect_err("v1.1 must refuse legacy smt/mmr/latest_block without root index");
     let msg = format!("{err:#}");
@@ -1289,11 +1289,11 @@ async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v11_claim() {
 /// Defect 3: both unguarded-looking broadcast entry points refuse under a
 /// v1.1 process claim (structural guard at the Esplora choke point).
 #[tokio::test]
-async fn broadcast_inscription_paths_refuse_under_v11_claim() {
+async fn broadcast_inscription_paths_refuse_under_v1_claim() {
     let scope = setup_pool().await;
-    enforce_stack_scan_mode(&scope.pool, ScanStackMode::V11)
+    enforce_stack_scan_mode(&scope.pool, ScanStackMode::V1)
         .await
-        .expect("claim v11");
+        .expect("claim v1");
 
     // Minimal valid-looking txs (broadcast is refused before Esplora I/O).
     let commit_tx = bitcoin::Transaction {
@@ -1312,7 +1312,7 @@ async fn broadcast_inscription_paths_refuse_under_v11_claim() {
 
     let err1 = crate::publisher::broadcast_inscription_txs(&config, &commit_tx, &reveal_tx)
         .await
-        .expect_err("broadcast_inscription_txs must refuse under v11");
+        .expect_err("broadcast_inscription_txs must refuse under v1");
     let msg1 = err1.to_string();
     assert!(
         msg1.contains(STACK_SEPARATION_REFUSAL) || msg1.contains("v1.1"),
@@ -1326,7 +1326,7 @@ async fn broadcast_inscription_paths_refuse_under_v11_claim() {
         None,
     )
     .await
-    .expect_err("broadcast_inscription_txs_with_persistence must refuse under v11");
+    .expect_err("broadcast_inscription_txs_with_persistence must refuse under v1");
     let msg2 = err2.to_string();
     assert!(
         msg2.contains(STACK_SEPARATION_REFUSAL) || msg2.contains("v1.1"),
@@ -1338,10 +1338,10 @@ async fn broadcast_inscription_paths_refuse_under_v11_claim() {
 /// Crate-internal `with_engine_mut` refuses without a v1.1 process claim.
 /// (The method is sealed from downstream crates; this covers the runtime gate.)
 #[tokio::test]
-async fn with_engine_mut_refuses_without_v11_claim() {
+async fn with_engine_mut_refuses_without_v1_claim() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    claim_v11_marker(&pool).await;
+    claim_v1_marker(&pool).await;
 
     let adapter = EngineAdapter::load_or_create(pool, Network::Regtest, 0)
         .await
@@ -1358,10 +1358,10 @@ async fn with_engine_mut_refuses_without_v11_claim() {
 /// Defect 1 (round 4): a legacy write attempted while a v1.1 claim is
 /// mid-flight (emptiness observed, marker not yet committed) must not
 /// produce a mixed database. Writers require the marker inside their own
-/// transaction, so the interleaving cannot land SMT/MMR under a later v11
+/// transaction, so the interleaving cannot land SMT/MMR under a later v1
 /// claim.
 #[tokio::test]
-async fn legacy_write_between_emptiness_check_and_v11_claim_cannot_mix_db() {
+async fn legacy_write_between_emptiness_check_and_v1_claim_cannot_mix_db() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
 
@@ -1377,19 +1377,19 @@ async fn legacy_write_between_emptiness_check_and_v11_claim_cannot_mix_db() {
     .fetch_one(&mut *claim_tx)
     .await
     .expect("count legacy");
-    let (v11_n,): (i64,) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM v11_engine_meta) \
-           + (SELECT COUNT(*) FROM v11_nflog_entries) \
-           + (SELECT COUNT(*) FROM v11_nullifier_index) \
-           + (SELECT COUNT(*) FROM v11_accounts) \
-           + (SELECT COUNT(*) FROM v11_spendable_coins) \
-           + (SELECT COUNT(*) FROM v11_spent_coins)",
+    let (v1_n,): (i64,) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM v1_engine_meta) \
+           + (SELECT COUNT(*) FROM v1_nflog_entries) \
+           + (SELECT COUNT(*) FROM v1_nullifier_index) \
+           + (SELECT COUNT(*) FROM v1_accounts) \
+           + (SELECT COUNT(*) FROM v1_spendable_coins) \
+           + (SELECT COUNT(*) FROM v1_spent_coins)",
     )
     .fetch_one(&mut *claim_tx)
     .await
-    .expect("count v11");
+    .expect("count v1");
     assert_eq!(legacy_n, 0);
-    assert_eq!(v11_n, 0);
+    assert_eq!(v1_n, 0);
 
     // Concurrent legacy writer (separate connection): must refuse — no
     // matching stack_scan_mode marker yet.
@@ -1402,28 +1402,28 @@ async fn legacy_write_between_emptiness_check_and_v11_claim_cannot_mix_db() {
         "must refuse capability; got: {msg}"
     );
 
-    // Claim completes as v11.
+    // Claim completes as v1.
     sqlx::query(
-        "INSERT INTO stack_scan_mode (id, mode, claimed_at) VALUES (1, 'v11', NOW()) \
+        "INSERT INTO stack_scan_mode (id, mode, claimed_at) VALUES (1, 'v1', NOW()) \
          ON CONFLICT (id) DO NOTHING",
     )
     .execute(&mut *claim_tx)
     .await
     .expect("insert marker");
     claim_tx.commit().await.expect("commit claim");
-    set_process_stack_mode(ScanStackMode::V11);
+    set_process_stack_mode(ScanStackMode::V1);
 
-    // Marker is v11; another legacy write still refuses.
+    // Marker is v1; another legacy write still refuses.
     let err2 = crate::db::persist_state_tx(&pool, b"smt-late", b"mmr-late", &[0xBBu8; 32], None)
         .await
-        .expect_err("legacy write under v11 marker must refuse");
+        .expect_err("legacy write under v1 marker must refuse");
     assert!(
         err2.to_string().contains(STACK_CAPABILITY_REFUSAL)
             || err2.to_string().contains("claimed as"),
         "got: {err2}"
     );
 
-    // No mixed DB: no legacy scan rows; marker is v11.
+    // No mixed DB: no legacy scan rows; marker is v1.
     let (legacy_after,): (i64,) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM mmr_root_index) \
            + (SELECT COUNT(*) FROM smt_state) \
@@ -1435,19 +1435,19 @@ async fn legacy_write_between_emptiness_check_and_v11_claim_cannot_mix_db() {
     .expect("recount legacy");
     assert_eq!(legacy_after, 0, "legacy write must not have committed");
     let marker = load_stack_scan_mode(&pool).await.expect("load marker");
-    assert_eq!(marker, Some(ScanStackMode::V11));
+    assert_eq!(marker, Some(ScanStackMode::V1));
 }
 
 /// Defect 2 (round 5): exercise the **recovery binary's** stack-claim path
-/// (`claim_process_stack_from_shadow_mode` / `ZKCOINS_V11_SHADOW=1`), not a
-/// hand-set `set_process_stack_mode(V11)`. Under that claim,
+/// (`claim_process_stack_from_shadow_mode` / `ZKCOINS_V1_SHADOW=1`), not a
+/// hand-set `set_process_stack_mode(V1)`. Under that claim,
 /// `LegacyBroadcastClient::connect` refuses before any Esplora I/O.
 #[test]
-fn recover_inscription_binary_path_refuses_under_v11_shadow() {
-    // Same pure step the binary runs after reading ZKCOINS_V11_SHADOW=1.
-    claim_process_stack_from_shadow_mode(super::mode::V11ShadowMode::On);
+fn recover_inscription_binary_path_refuses_under_v1_shadow() {
+    // Same pure step the binary runs after reading ZKCOINS_V1_SHADOW=1.
+    claim_process_stack_from_shadow_mode(super::mode::V1ShadowMode::On);
     let err = crate::publisher::LegacyBroadcastClient::connect("http://127.0.0.1:1/api")
-        .expect_err("recover path must refuse under v11 shadow claim");
+        .expect_err("recover path must refuse under v1 shadow claim");
     let msg = err.to_string();
     assert!(
         msg.contains(STACK_SEPARATION_REFUSAL) || msg.contains("v1.1"),
@@ -1554,9 +1554,9 @@ async fn claim_stack_scan_mode_refuses_without_emptiness_invariant() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
 
-    seed_v11_scan_state_without_marker(&pool).await;
+    seed_v1_scan_state_without_marker(&pool).await;
 
-    let err = claim_stack_scan_mode(&pool, ScanStackMode::V11)
+    let err = claim_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
         .expect_err("claim over existing data must refuse");
     let msg = format!("{err:#}");
@@ -1587,17 +1587,17 @@ async fn reset_proof_dependent_state_tx_refuses_without_legacy_marker() {
         "got: {msg}"
     );
 
-    // V11 marker also refuses (legacy-table mutator).
-    claim_stack_scan_mode(&pool, ScanStackMode::V11)
+    // V1 marker also refuses (legacy-table mutator).
+    claim_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
-        .expect("claim v11 on empty");
+        .expect("claim v1 on empty");
     let err2 = crate::db::reset_proof_dependent_state_tx(&pool, b"DIGEST")
         .await
-        .expect_err("reset under v11 marker must refuse");
+        .expect_err("reset under v1 marker must refuse");
     let msg2 = err2.to_string();
     assert!(
         msg2.contains(STACK_CAPABILITY_REFUSAL)
-            || msg2.contains("v11")
+            || msg2.contains("v1")
             || msg2.contains("legacy"),
         "got: {msg2}"
     );
@@ -1730,7 +1730,7 @@ fn restored_node_behind_persisted_height_is_retryable_not_fatal() {
 /// `(height, tx_index, vin_index, member_index)` order; duplicate `Pk`
 /// keeps the **first** occurrence's `R`.
 #[test]
-fn v11_scan_fold_canonical_order_first_occurrence_wins() {
+fn v1_scan_fold_canonical_order_first_occurrence_wins() {
     // Three members in one inscription, deliberately **not** in member
     // order in the input vector — plus a fourth survivor that reuses Pk
     // of member 0 with a different R (must lose).
@@ -1834,15 +1834,15 @@ fn v11_scan_fold_canonical_order_first_occurrence_wins() {
 }
 
 /// Flag-off default: pure resolver stays Off; legacy publisher allowed
-/// when process has not claimed v11 (and after an explicit legacy claim).
+/// when process has not claimed v1 (and after an explicit legacy claim).
 #[test]
 fn flag_off_leaves_legacy_publisher_allowed() {
     assert_eq!(
-        resolve_v11_shadow_mode(None).expect("unset"),
-        V11ShadowMode::Off
+        resolve_v1_shadow_mode(None).expect("unset"),
+        V1ShadowMode::Off
     );
     // Unclaimed process: legacy publish still allowed (unit-test / pre-boot).
     ensure_legacy_publisher_allowed().expect("legacy ok when unclaimed");
     // v1.1 publisher requires an exclusive claim — no silent open.
-    assert!(ensure_v11_publisher_allowed().is_err());
+    assert!(ensure_v1_publisher_allowed().is_err());
 }

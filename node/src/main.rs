@@ -21,12 +21,12 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use node::account_node;
 use node::db;
 use node::publisher::EsploraConfig;
-use node::runtime::{start_rest_node, V11Readiness};
+use node::runtime::{start_rest_node, V1Readiness};
 use node::scanner_runtime::scan_for_inscriptions;
 use node::scanner_ws::{run_scanner_ws, ScannerWsConfig};
 use node::state::State;
 use node::username;
-use node::v11::{self, ScanStackMode, V11ShadowMode};
+use node::v1::{self, ScanStackMode, V1ShadowMode};
 use node::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
 use shared::commitment::Commitment;
 use std::error::Error as StdError;
@@ -105,28 +105,28 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     // Cutover Stages 1–2: optional v1.1 **exclusive dual stack**.
     // Default is off (unset / empty / "off") → legacy Commitment publisher
-    // + Esplora SMT scanner. `ZKCOINS_V11_SHADOW=1` claims the database for
+    // + Esplora SMT scanner. `ZKCOINS_V1_SHADOW=1` claims the database for
     // AggregateStateNullifierV3 / NfLog only (hard separation). Proving
     // remains legacy until Stage 3. Missing pins fail loud — never fall
     // back silently to the other stack.
-    let shadow_mode = v11::mode::v11_shadow_mode_from_env().unwrap_or_else(|e| {
+    let shadow_mode = v1::mode::v1_shadow_mode_from_env().unwrap_or_else(|e| {
         panic!("{e}");
     });
-    let v11_adapter: Option<Arc<node::v11::EngineAdapter>> = match shadow_mode {
-        V11ShadowMode::Off => {
+    let v1_adapter: Option<Arc<node::v1::EngineAdapter>> = match shadow_mode {
+        V1ShadowMode::Off => {
             // Exclusive claim: this DB is the legacy scan stack.
-            v11::enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
+            v1::enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
                 .await
                 .expect("legacy stack separation gate");
             println!(
-                "v1.1 dual stack: off (ZKCOINS_V11_SHADOW unset / empty / off); \
+                "v1.1 dual stack: off (ZKCOINS_V1_SHADOW unset / empty / off); \
                  legacy Commitment publisher + SMT scanner; proving remains legacy"
             );
             None
         }
-        V11ShadowMode::On => {
+        V1ShadowMode::On => {
             // Exclusive claim before any NfLog write.
-            v11::enforce_stack_scan_mode(&pool, ScanStackMode::V11)
+            v1::enforce_stack_scan_mode(&pool, ScanStackMode::V1)
                 .await
                 .expect("v1.1 stack separation gate");
             println!(
@@ -134,15 +134,15 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                  scanner; proving remains legacy until Stage 3; legacy commitment \
                  publish is refused)"
             );
-            let adapter = node::v11::EngineAdapter::load_or_create_from_env((*pool).clone())
+            let adapter = node::v1::EngineAdapter::load_or_create_from_env((*pool).clone())
                 .await
-                .expect("v11 EngineAdapter bootstrap");
+                .expect("v1 EngineAdapter bootstrap");
             // Live digests for self-heal are taken from the circuits the
             // prover bridge just built (construction-time §1.7.9 pin check).
             // Stage 1 still boots the legacy Prover for AccountNode/REST until
             // Stage 3.
             println!(
-                "v11 EngineAdapter ready (network={:?}, activation_height={})",
+                "v1 EngineAdapter ready (network={:?}, activation_height={})",
                 adapter.network(),
                 adapter.activation_height()
             );
@@ -156,7 +156,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // pay the ~14 s circuit build exactly once.
     //
     // Stage 1–2 still boots the legacy AccountNode/REST surface even under
-    // `ZKCOINS_V11_SHADOW=1` (Stage 3 swaps prove call-sites). The v11
+    // `ZKCOINS_V1_SHADOW=1` (Stage 3 swaps prove call-sites). The v1
     // adapter above maintains exclusive NfLog state; the legacy Prover
     // remains required for the existing REST flows until Stage 3.
     let prover = zkcoins_prover::Prover::new();
@@ -199,8 +199,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // each circuit and refuses when it does not match the §3.6 pins
     // (§1.7.9 — not pins-vs-pins, not an embedded generator artefact).
     // Canary = predecessor nullifier + NAV + last ComplianceProof structural
-    // probe (full re-prove is too slow for boot — see `v11::self_heal`
-    // module docs; operator opt-in via `ZKCOINS_V11_SLOW_CANARY=1`).
+    // probe (full re-prove is too slow for boot — see `v1::self_heal`
+    // module docs; operator opt-in via `ZKCOINS_V1_SLOW_CANARY=1`).
     //
     // On a mismatch / stale probe this resets the proof-dependent state
     // to genesis and stores the new digest. A DB error aborts bootstrap
@@ -216,12 +216,12 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             None::<bitcoin::secp256k1::PublicKey>
         };
 
-    let heal_decision = if let Some(ref adapter) = v11_adapter {
+    let heal_decision = if let Some(ref adapter) = v1_adapter {
         // Live baseline = digests of the circuits just constructed via
         // ProverBridge, cross-checked against §3.6 pins at construction.
         // Pins alone must not supply the live blob (§1.7.9).
-        let pins = v11::mode::v11_boot_pins_from_env().expect("v11 pins re-read after adapter boot");
-        let live_digest = v11::resolve_v11_live_digest(
+        let pins = v1::mode::v1_boot_pins_from_env().expect("v1 pins re-read after adapter boot");
+        let live_digest = v1::resolve_v1_live_digest(
             pins.network,
             &pins.network_params.circuit_digest_c(),
             &pins.network_params.circuit_digest_c_balance(),
@@ -232,10 +232,10 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         println!(
             "v1.1 self-heal: live digest = tagged C||C_balance from the circuits \
              just built through ProverBridge (matched §3.6 pins at construction; \
-             set ZKCOINS_V11_SLOW_CANARY=1 for verify_transition canary)"
+             set ZKCOINS_V1_SLOW_CANARY=1 for verify_transition canary)"
         );
         node::self_heal::heal_circuit_digest(&pool, &live_digest, &proofs_dir, &|| {
-            v11::v11_canary_for_heal(adapter)
+            v1::v1_canary_for_heal(adapter)
         })
         .await
         .expect("v1.1 circuit-digest self-heal")
@@ -266,11 +266,11 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             account_node::AccountNode::load_from_pg(Arc::clone(&state), &pool, prover)
                 .await
                 .expect("reload account node after self-heal reset");
-        if let Some(ref adapter) = v11_adapter {
+        if let Some(ref adapter) = v1_adapter {
             adapter
                 .reinit_after_self_heal_reset()
                 .await
-                .expect("reinit v11 engine after self-heal reset");
+                .expect("reinit v1 engine after self-heal reset");
             println!("Re-inited v1.1 EngineAdapter to empty genesis after self-heal reset");
         }
         println!("Reloaded State + AccountNode from genesis after self-heal reset");
@@ -298,11 +298,11 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // before the scanner connects/catches up. Share atomics so
     // `/health/ready` stays 503 until the first successful apply and
     // trips on `finality_broken`. Legacy path leaves both `None`.
-    let (v11_readiness, v11_scan_caught_up, v11_finality_ok) = if v11_adapter.is_some() {
+    let (v1_readiness, v1_scan_caught_up, v1_finality_ok) = if v1_adapter.is_some() {
         let caught_up = Arc::new(AtomicBool::new(false));
         let finality_ok = Arc::new(AtomicBool::new(true));
         (
-            V11Readiness {
+            V1Readiness {
                 scan_caught_up: Some(Arc::clone(&caught_up)),
                 finality_ok: Some(Arc::clone(&finality_ok)),
             },
@@ -310,7 +310,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             Some(finality_ok),
         )
     } else {
-        (V11Readiness::default(), None, None)
+        (V1Readiness::default(), None, None)
     };
     // `proofs_dir` was already read at the binary edge above (for the
     // self-heal proof-store cleanup) and is moved into the spawned
@@ -318,7 +318,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // runtime tests can each pass their own `tempfile::tempdir()` path
     // instead of racing on the process-wide env var under
     // `--test-threads=8` (issue #181 Opt A).
-    let v11_engine_for_rest = v11_adapter.clone();
+    let v1_engine_for_rest = v1_adapter.clone();
     tokio::spawn(async move {
         if let Err(e) = start_rest_node(
             account_node,
@@ -326,8 +326,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             ACCOUNT_NODE_ADDR,
             pool_for_rest,
             &proofs_dir,
-            v11_readiness,
-            v11_engine_for_rest,
+            v1_readiness,
+            v1_engine_for_rest,
         )
         .await
         {
@@ -338,8 +338,8 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     // Stage 2 dual stack: either the v1.1 NfLog scanner **or** the legacy
     // Commitment/SMT scanner — never both against the same process state.
-    if let Some(adapter) = v11_adapter {
-        run_v11_scan_loop(adapter, v11_scan_caught_up, v11_finality_ok).await?;
+    if let Some(adapter) = v1_adapter {
+        run_v1_scan_loop(adapter, v1_scan_caught_up, v1_finality_ok).await?;
         return Ok(());
     }
 
@@ -676,7 +676,7 @@ fn mark_pending_complete_from_sync_context(
 ///
 /// ## Reorg (live)
 /// When `scan_to_tip` reports a reorg, the full post-reorg survivor stream
-/// replaces the engine NfLog ([`v11::apply_canonical_survivors`]). Forward
+/// replaces the engine NfLog ([`v1::apply_canonical_survivors`]). Forward
 /// progress without reorg appends only newly seen survivors.
 /// `ReorgOutcome::finality_broken` stops crediting and fails readiness.
 ///
@@ -687,22 +687,22 @@ fn mark_pending_complete_from_sync_context(
 /// against that scan's tip, re-verify the tip is unchanged, then apply
 /// from the same survivors. A reorg between a free-standing recon and a
 /// later scan cannot slip through — there is no free-standing recon.
-async fn run_v11_scan_loop(
-    adapter: Arc<node::v11::EngineAdapter>,
+async fn run_v1_scan_loop(
+    adapter: Arc<node::v1::EngineAdapter>,
     scan_caught_up: Option<Arc<AtomicBool>>,
     finality_ok: Option<Arc<AtomicBool>>,
 ) -> Result<(), Box<dyn StdError>> {
     use std::collections::HashSet;
     use std::time::Duration;
-    use v11::{
+    use v1::{
         first_boot_requires_full_replace, folded_keys_from_nflog_mirror,
         observation_tip_still_live, reconcile_persisted_tip, PersistedTipReconciliation,
         TipReconcileOutcome,
     };
 
-    let pins = v11::mode::v11_boot_pins_from_env().map_err(|e| e.to_string())?;
+    let pins = v1::mode::v1_boot_pins_from_env().map_err(|e| e.to_string())?;
     let (rpc_url, cookie_path) =
-        v11::scan::v11_bitcoind_rpc_from_env().map_err(|e| e.to_string())?;
+        v1::scan::v1_bitcoind_rpc_from_env().map_err(|e| e.to_string())?;
 
     let scanner_config = zkcoins_prover::scanner::ScannerConfig {
         rpc_url: rpc_url.clone(),
@@ -727,11 +727,11 @@ async fn run_v11_scan_loop(
     // pending work is fatal. With an empty table, a connect failure is still
     // logged loud (receive path will need the publisher later).
     {
-        use v11::{
-            connect_v11_publisher, resume_all_pending_publishes, v11_publisher_env_from_env,
+        use v1::{
+            connect_v1_publisher, resume_all_pending_publishes, v1_publisher_env_from_env,
         };
-        match v11_publisher_env_from_env(pins.network) {
-            Ok(env) => match connect_v11_publisher(env) {
+        match v1_publisher_env_from_env(pins.network) {
+            Ok(env) => match connect_v1_publisher(env) {
                 Ok(publisher) => match resume_all_pending_publishes(&adapter, &publisher).await {
                     Ok(0) => println!("v1.1 resume_all_pending_publishes: nothing pending"),
                     Ok(n) => println!(
@@ -746,7 +746,7 @@ async fn run_v11_scan_loop(
                     }
                 },
                 Err(e) => {
-                    let pending = node::v11::db_v11::list_resumable_pending_publishes(adapter.pool())
+                    let pending = node::v1::db_v1::list_resumable_pending_publishes(adapter.pool())
                         .await
                         .map(|r| r.len())
                         .unwrap_or(0);
@@ -763,7 +763,7 @@ async fn run_v11_scan_loop(
                 }
             },
             Err(e) => {
-                let pending = node::v11::db_v11::list_resumable_pending_publishes(adapter.pool())
+                let pending = node::v1::db_v1::list_resumable_pending_publishes(adapter.pool())
                     .await
                     .map(|r| r.len())
                     .unwrap_or(0);
@@ -868,7 +868,7 @@ async fn run_v11_scan_loop(
 
             let recon_result = tokio::task::spawn_blocking(move || {
                 use bitcoincore_rpc::RpcApi;
-                use v11::scan::ResolvedBlock;
+                use v1::scan::ResolvedBlock;
 
                 let open_client = || {
                     bitcoincore_rpc::Client::new(
@@ -976,7 +976,7 @@ async fn run_v11_scan_loop(
                     tip_height,
                     hex::encode(tip_hash)
                 );
-                // scanner-polling-ok: v11 bound-observation tip-stability retry
+                // scanner-polling-ok: v1 bound-observation tip-stability retry
                 tokio::time::sleep(RECON_RETRY_BACKOFF).await;
                 continue;
             }
@@ -992,7 +992,7 @@ async fn run_v11_scan_loop(
                         "v1.1 boot tip: incomplete live view at height \
                          {queried_height} — {detail}; staying unready and retrying"
                     );
-                    // scanner-polling-ok: v11 incomplete-view RPC-behind backoff
+                    // scanner-polling-ok: v1 incomplete-view RPC-behind backoff
                     tokio::time::sleep(RECON_RETRY_BACKOFF).await;
                     continue;
                 }
@@ -1052,7 +1052,7 @@ async fn run_v11_scan_loop(
         let do_full_replace = force_full_replace;
         if do_full_replace {
             // Full replace: scanner survivors are the canonical stream.
-            let stats = v11::apply_canonical_survivors(
+            let stats = v1::apply_canonical_survivors(
                 &adapter,
                 tip_height,
                 tip_hash,
@@ -1092,7 +1092,7 @@ async fn run_v11_scan_loop(
                 })
                 .collect();
             if !new.is_empty() || tip_height > adapter.with_engine(|e| e.tip_height()) {
-                let stats = v11::apply_forward_scan(&adapter, tip_height, tip_hash, &new)
+                let stats = v1::apply_forward_scan(&adapter, tip_height, tip_hash, &new)
                     .await
                     .map_err(|e| format!("v1.1 forward NfLog apply failed: {e:#}"))?;
                 for nf in &new {
@@ -1120,7 +1120,7 @@ async fn run_v11_scan_loop(
         if let Some(flag) = &scan_caught_up {
             if !flag.load(Ordering::SeqCst) {
                 flag.store(true, Ordering::SeqCst);
-                println!("v1.1 scanner: catch-up complete; readiness may pass v11_scan gate");
+                println!("v1.1 scanner: catch-up complete; readiness may pass v1_scan gate");
             }
         }
 
@@ -1128,7 +1128,7 @@ async fn run_v11_scan_loop(
         // last-resort backoff between successful scan_to_tip calls (no
         // Esplora WS on this path). Marked so CI lint grandfathering matches
         // scanner_runtime's HTTP backoff token style.
-        // scanner-polling-ok: v11 bitcoind scan_to_tip idle backoff
+        // scanner-polling-ok: v1 bitcoind scan_to_tip idle backoff
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }

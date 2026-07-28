@@ -2,7 +2,7 @@
 //!
 //! Owns a mutex-protected in-memory engine and the Postgres pool used to
 //! snapshot / reload it. Stage 2 folds NfLog survivors through this
-//! adapter (`scan` / `main::run_v11_scan_loop`). Wallet signing and
+//! adapter (`scan` / `main::run_v1_scan_loop`). Wallet signing and
 //! prove-path REST remain Stage 3.
 //!
 //! ## Write serialisation (receive ↔ scanner)
@@ -27,9 +27,9 @@ use zkcoins_program::circuit::compliance::Network;
 use zkcoins_prover::prover_bridge::ProverBridge;
 use zkcoins_prover::state_engine::StateEngine;
 
-use super::db_v11::{self, EngineSnapshot};
-use super::mode::{network_label, v11_boot_pins_from_env, V11_BOOT_CONFIG_ERROR};
-use super::separation::require_v11_process_for_nflog_write;
+use super::db_v1::{self, EngineSnapshot};
+use super::mode::{network_label, v1_boot_pins_from_env, V1_BOOT_CONFIG_ERROR};
+use super::separation::require_v1_process_for_nflog_write;
 
 /// In-memory engine plus the tip block hash the StateEngine does not yet
 /// carry (Stage 1: hash lives on the adapter / snapshot so equal-height
@@ -50,16 +50,16 @@ pub struct EngineAdapter {
 }
 
 impl EngineAdapter {
-    /// Load from Postgres, or create an empty engine when the v11 tables are
+    /// Load from Postgres, or create an empty engine when the v1 tables are
     /// empty. Fails loud if meta is present but inconsistent with the caller's
     /// pins (network / activation height), or if meta is missing while data
-    /// rows remain (see [`db_v11::load_engine_snapshot`]).
+    /// rows remain (see [`db_v1::load_engine_snapshot`]).
     pub async fn load_or_create(
         pool: PgPool,
         network: Network,
         activation_height: u64,
     ) -> Result<Self> {
-        match db_v11::load_engine_snapshot(&pool)
+        match db_v1::load_engine_snapshot(&pool)
             .await
             .context("EngineAdapter: load snapshot")?
         {
@@ -115,13 +115,13 @@ impl EngineAdapter {
     /// Bootstrap from env pins (`ZKCOINS_NETWORK`, `ZKCOINS_ACTIVATION_HEIGHT`,
     /// published params identity, …).
     ///
-    /// Call only when `ZKCOINS_V11_SHADOW=1`. Missing env vars fail with
-    /// [`V11_BOOT_CONFIG_ERROR`] — never fall back to legacy pins.
+    /// Call only when `ZKCOINS_V1_SHADOW=1`. Missing env vars fail with
+    /// [`V1_BOOT_CONFIG_ERROR`] — never fall back to legacy pins.
     pub async fn load_or_create_from_env(pool: PgPool) -> Result<Self> {
-        let pins = v11_boot_pins_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pins = v1_boot_pins_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
         // Re-surface the canonical message if either pin was empty after trim.
         if network_label(pins.network).is_empty() {
-            bail!("{V11_BOOT_CONFIG_ERROR}");
+            bail!("{V1_BOOT_CONFIG_ERROR}");
         }
         Self::load_or_create(pool, pins.network, pins.activation_height).await
     }
@@ -167,7 +167,7 @@ impl EngineAdapter {
     /// **Crate-private mutation sink.** Tip moves only through scan apply
     /// (and crate-internal receive/test setup).
     pub(crate) fn set_tip_hash(&self, tip_hash: [u8; 32]) -> Result<()> {
-        require_v11_process_for_nflog_write()
+        require_v1_process_for_nflog_write()
             .context("EngineAdapter::set_tip_hash: stack claim required")?;
         self.live
             .lock()
@@ -196,7 +196,7 @@ impl EngineAdapter {
     }
 
     /// Mutate the in-memory engine. Requires an exclusive v1.1 process claim
-    /// ([`require_v11_process_for_nflog_write`]) — unguarded NfLog mutation
+    /// ([`require_v1_process_for_nflog_write`]) — unguarded NfLog mutation
     /// under a legacy / unset claim is refused.
     ///
     /// Callers that also persist **must** restore via [`Self::restore_live`]
@@ -210,7 +210,7 @@ impl EngineAdapter {
         &self,
         f: impl FnOnce(&mut StateEngine) -> R,
     ) -> Result<R> {
-        require_v11_process_for_nflog_write()
+        require_v1_process_for_nflog_write()
             .context("EngineAdapter::with_engine_mut: stack claim required")?;
         let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");
         Ok(f(&mut guard.engine))
@@ -233,7 +233,7 @@ impl EngineAdapter {
     ///
     /// **Crate-private mutation sink.**
     pub(crate) fn restore_live(&self, snap: EngineSnapshot) -> Result<()> {
-        require_v11_process_for_nflog_write()
+        require_v1_process_for_nflog_write()
             .context("EngineAdapter::restore_live: stack claim required")?;
         if snap.network != self.network {
             bail!(
@@ -268,7 +268,7 @@ impl EngineAdapter {
             let guard = self.live.lock().expect("EngineAdapter mutex poisoned");
             EngineSnapshot::from_engine_with_tip_hash(&guard.engine, guard.tip_hash)
         };
-        db_v11::persist_engine_snapshot(&self.pool, &snap)
+        db_v1::persist_engine_snapshot(&self.pool, &snap)
             .await
             .context("EngineAdapter::persist")
     }
@@ -285,13 +285,13 @@ impl EngineAdapter {
     /// is for in-process restart-identity (crate tests) and future self-heal.
     #[allow(dead_code)] // exercised by crate tests; not on the production boot path
     pub(crate) async fn reload_from_db(&self) -> Result<()> {
-        require_v11_process_for_nflog_write()
+        require_v1_process_for_nflog_write()
             .context("EngineAdapter::reload_from_db: stack claim required")?;
-        let snap = db_v11::load_engine_snapshot(&self.pool)
+        let snap = db_v1::load_engine_snapshot(&self.pool)
             .await
             .context("EngineAdapter::reload_from_db load")?
             .context(
-                "EngineAdapter::reload_from_db: v11 tables are empty — \
+                "EngineAdapter::reload_from_db: v1 tables are empty — \
                  cannot reload (no silent re-init to empty engine)",
             )?;
         if snap.network != self.network {
@@ -346,7 +346,7 @@ impl EngineAdapter {
     /// Requires an exclusive v1.1 process claim — same capability as any
     /// live-engine mutation. Fails loud if the claim is missing.
     pub async fn reinit_after_self_heal_reset(&self) -> Result<()> {
-        require_v11_process_for_nflog_write()
+        require_v1_process_for_nflog_write()
             .context("EngineAdapter::reinit_after_self_heal_reset: stack claim required")?;
         {
             let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");
