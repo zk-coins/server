@@ -103,180 +103,126 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     );
     println!("Connected to Postgres state-layer");
 
-    // Cutover Stages 1–2: optional v1.1 **exclusive dual stack**.
-    // Default is off (unset / empty / "off") → legacy Commitment publisher
-    // + Esplora SMT scanner. `ZKCOINS_V1_SHADOW=1` claims the database for
-    // AggregateStateNullifierV3 / NfLog only (hard separation). Proving
-    // remains legacy until Stage 3. Missing pins fail loud — never fall
-    // back silently to the other stack.
+    // Cutover Stage 3 — **atomic default switch**.
+    //
+    // The production binary always claims the exclusive v1 stack
+    // (AggregateStateNullifierV3 → NfLog). There is no dual-stack
+    // fall-back to the legacy Commitment/SMT scanner or to
+    // `Prover::new()` / `circuit::main`. Missing §3.6 pins fail loud.
+    //
+    // `ZKCOINS_V1_SHADOW=off` is refused at the binary edge: Stage 3
+    // makes the legacy prover unreachable from this path, not merely
+    // unused. Legacy code remains in the tree for Stage 4 deletion and
+    // for unit tests that construct `AccountNode::new()` explicitly.
     let shadow_mode = v1::mode::v1_shadow_mode_from_env().unwrap_or_else(|e| {
         panic!("{e}");
     });
-    let v1_adapter: Option<Arc<node::v1::EngineAdapter>> = match shadow_mode {
+    match shadow_mode {
+        V1ShadowMode::On => {}
         V1ShadowMode::Off => {
-            // Exclusive claim: this DB is the legacy scan stack.
-            v1::enforce_stack_scan_mode(&pool, ScanStackMode::Legacy)
-                .await
-                .expect("legacy stack separation gate");
-            println!(
-                "v1.1 dual stack: off (ZKCOINS_V1_SHADOW unset / empty / off); \
-                 legacy Commitment publisher + SMT scanner; proving remains legacy"
+            panic!(
+                "Stage 3 binary refuses the legacy dual stack \
+                 (ZKCOINS_V1_SHADOW unset/empty/off). Set ZKCOINS_V1_SHADOW=1 \
+                 and the §3.6 pin env vars. Rollback after cutover requires a \
+                 pre-cutover DB restore — not a flag flip (wallets may already \
+                 have published v1 nullifiers)."
             );
-            None
         }
-        V1ShadowMode::On => {
-            // Exclusive claim before any NfLog write.
-            v1::enforce_stack_scan_mode(&pool, ScanStackMode::V1)
-                .await
-                .expect("v1.1 stack separation gate");
-            println!(
-                "v1.1 dual stack: on (AggregateStateNullifierV3 publisher + NfLog \
-                 scanner; proving remains legacy until Stage 3; legacy commitment \
-                 publish is refused)"
-            );
-            let adapter = node::v1::EngineAdapter::load_or_create_from_env((*pool).clone())
-                .await
-                .expect("v1 EngineAdapter bootstrap");
-            // Live digests for self-heal are taken from the circuits the
-            // prover bridge just built (construction-time §1.7.9 pin check).
-            // Stage 1 still boots the legacy Prover for AccountNode/REST until
-            // Stage 3.
-            println!(
-                "v1 EngineAdapter ready (network={:?}, activation_height={})",
-                adapter.network(),
-                adapter.activation_height()
-            );
-            Some(Arc::new(adapter))
-        }
-    };
+    }
 
-    // Build the Plonky2 prover ONCE, up front. Under the legacy stack its
-    // `circuit_digest_bytes` drives the boot-time self-heal below, and
-    // the same instance is reused by the `AccountNode` rehydration so we
-    // pay the ~14 s circuit build exactly once.
-    //
-    // Stage 1–2 still boots the legacy AccountNode/REST surface even under
-    // `ZKCOINS_V1_SHADOW=1` (Stage 3 swaps prove call-sites). The v1
-    // adapter above maintains exclusive NfLog state; the legacy Prover
-    // remains required for the existing REST flows until Stage 3.
-    let prover = zkcoins_prover::Prover::new();
-    // Capture legacy digest before moving the prover into AccountNode.
-    // Under v1.1 the self-heal baseline is the build-time-embedded v1.1
-    // circuit digests (not this legacy bincode HashOut), but the legacy
-    // AccountNode still needs the same prover instance until Stage 3.
-    let legacy_live_digest = prover.circuit_digest_bytes();
-    println!("Built Plonky2 prover (circuit ready)");
+    // Exclusive claim before any NfLog write.
+    v1::enforce_stack_scan_mode(&pool, ScanStackMode::V1)
+        .await
+        .expect("v1 stack separation gate");
+    println!(
+        "Stage 3 v1 stack: AggregateStateNullifierV3 publisher + NfLog scanner; \
+         prove path = StateEngine / ProverBridge (legacy Prover::new is not on \
+         the binary path)"
+    );
+    let v1_adapter = Arc::new(
+        node::v1::EngineAdapter::load_or_create_from_env((*pool).clone())
+            .await
+            .expect("v1 EngineAdapter bootstrap"),
+    );
+    println!(
+        "v1 EngineAdapter ready (network={:?}, activation_height={})",
+        v1_adapter.network(),
+        v1_adapter.activation_height()
+    );
 
-    // Load existing state from Postgres (PR-A2). When SMT/MMR rows are
-    // absent (fresh DB), `load_from_pg` returns an empty State —
-    // equivalent to the previous file-based `State::new()` fallback.
+    // Stage 3: do **not** call `Prover::new()`. The legacy AccountNode
+    // ledger is still rehydrated for residual balance/history REST, but
+    // without a legacy circuit. Prove work is Engine/Bridge only.
     let state = Arc::new(Mutex::new(
         State::load_from_pg(&pool)
             .await
             .expect("load state from Postgres"),
     ));
-    println!("Loaded State from Postgres");
+    println!("Loaded State from Postgres (residual SMT/MMR tables; v1 uses NfLog)");
 
-    // Reload AccountNode + UsernameStore from Postgres. The matching
-    // file-based loaders from PR-A1/A2 are gone — these two calls are
-    // the single source of truth after PR-A3. A DB error here aborts
-    // the bootstrap (same reasoning as the State load above). The
-    // pre-built `prover` is moved in here so the circuit is built once.
-    let account_node = account_node::AccountNode::load_from_pg(Arc::clone(&state), &pool, prover)
+    let account_node = account_node::AccountNode::load_ledger_from_pg(Arc::clone(&state), &pool)
         .await
-        .expect("load account node from Postgres");
-    println!("Loaded AccountNode from Postgres");
+        .expect("load account node ledger from Postgres (no legacy Prover)");
+    println!("Loaded AccountNode ledger (no Prover::new)");
 
-    // Self-heal on a breaking circuit change. A circuit change makes
-    // every persisted proof incompatible with the current circuit; the
-    // next AccountUpdate send/mint would fail to prove ("prove failed").
-    //
-    // Flag off (legacy): digest = legacy `Prover::circuit_digest_bytes`
-    // (bincode HashOut); canary = CMP/MMR AccountUpdate recursion.
-    //
-    // Flag on (v1.1 Gap G5): digest = tagged §1.7.1 `C || C_balance` of the
-    // circuits **just built** through ProverBridge. Construction digests
-    // each circuit and refuses when it does not match the §3.6 pins
-    // (§1.7.9 — not pins-vs-pins, not an embedded generator artefact).
-    // Canary = predecessor nullifier + NAV + last ComplianceProof structural
-    // probe (full re-prove is too slow for boot — see `v1::self_heal`
-    // module docs; operator opt-in via `ZKCOINS_V1_SLOW_CANARY=1`).
-    //
-    // On a mismatch / stale probe this resets the proof-dependent state
-    // to genesis and stores the new digest. A DB error aborts bootstrap
-    // (serving with half-reset state is worse than failing loudly).
+    // Self-heal: digest = tagged §1.7.1 `C || C_balance` of the circuits
+    // just built through ProverBridge; canary = v1 structural / slow path.
+    // On mismatch this uses the G5 generation fence (`reset_v1_proof_dependent_state_tx`):
+    // bump `self_heal_reset_meta.generation`, fail non-terminal jobs (leave
+    // their `reset_generation` behind the live epoch), wipe v1 proof state.
+    // Jobs in flight across the reset cannot advance (generation CAS).
     let proofs_dir = std::env::var("PROOFS_DIR").unwrap_or_else(|_| "./proofs".to_string());
 
-    // Legacy canary: §8(b)/(c) need the account's current pubkey. Neutral
-    // model has no server-held minting key → resolver returns None →
-    // NoSample → Baseline (data-loss-safe). Digest fast path remains primary.
-    let current_pubkey_for =
-        |_addr: &zkcoins_program::hash::HashDigest,
-         _smt: &zkcoins_program::merkle::sparse_merkle_tree::SparseMerkleTree| {
-            None::<bitcoin::secp256k1::PublicKey>
-        };
-
-    let heal_decision = if let Some(ref adapter) = v1_adapter {
-        // Live baseline = digests of the circuits just constructed via
-        // ProverBridge, cross-checked against §3.6 pins at construction.
-        // Pins alone must not supply the live blob (§1.7.9).
-        let pins = v1::mode::v1_boot_pins_from_env().expect("v1 pins re-read after adapter boot");
-        let live_digest = v1::resolve_v1_live_digest(
-            pins.network,
-            &pins.network_params.circuit_digest_c(),
-            &pins.network_params.circuit_digest_c_balance(),
-        )
-        .unwrap_or_else(|e| {
-            panic!("v1.1 live circuit digest (just-built circuit vs §3.6 pins): {e}");
-        });
-        println!(
-            "v1.1 self-heal: live digest = tagged C||C_balance from the circuits \
-             just built through ProverBridge (matched §3.6 pins at construction; \
-             set ZKCOINS_V1_SLOW_CANARY=1 for verify_transition canary)"
-        );
-        node::self_heal::heal_circuit_digest(&pool, &live_digest, &proofs_dir, &|| {
-            v1::v1_canary_for_heal(adapter)
-        })
-        .await
-        .expect("v1.1 circuit-digest self-heal")
-    } else {
-        node::self_heal::heal_circuit_digest(&pool, &legacy_live_digest, &proofs_dir, &|| {
-            account_node.canary_recursion(&current_pubkey_for)
-        })
-        .await
-        .expect("circuit-digest self-heal")
-    };
+    let pins = v1::mode::v1_boot_pins_from_env().expect("v1 pins re-read after adapter boot");
+    let live_digest = v1::resolve_v1_live_digest(
+        pins.network,
+        &pins.network_params.circuit_digest_c(),
+        &pins.network_params.circuit_digest_c_balance(),
+    )
+    .unwrap_or_else(|e| {
+        panic!("v1 live circuit digest (just-built circuit vs §3.6 pins): {e}");
+    });
+    println!(
+        "v1 self-heal: live digest = tagged C||C_balance from the circuits \
+         just built through ProverBridge (matched §3.6 pins at construction; \
+         set ZKCOINS_V1_SLOW_CANARY=1 for verify_transition canary)"
+    );
+    let heal_decision = node::self_heal::heal_circuit_digest(&pool, &live_digest, &proofs_dir, &|| {
+        v1::v1_canary_for_heal(&v1_adapter)
+    })
+    .await
+    .expect("v1 circuit-digest self-heal");
     println!("Circuit-digest self-heal: {:?}", heal_decision);
 
-    // On a reset the in-memory `state` + `account_node` were rehydrated
-    // from the pre-reset rows that `heal_circuit_digest` just wiped, so
-    // they no longer match Postgres. Reload both from the now-empty DB,
-    // recovering the prover (and its ~14 s circuit build) from the stale
-    // `account_node` so the circuit is still built exactly once.
-    // Under v1.1 also re-init the EngineAdapter (durable tables empty,
-    // in-memory engine still holds pre-reset NfLog / last_proof).
-    let (state, account_node) = if heal_decision == node::self_heal::ResetDecision::Reset {
-        let prover = account_node.take_prover();
+    // On a reset the in-memory ledger + engine were rehydrated from
+    // pre-reset rows; reload empty genesis and re-init the engine.
+    // Jobs that were in flight across the reset are left behind the
+    // G5 generation fence (failed + pre-bump reset_generation) and
+    // cannot complete against wiped state.
+    // `state` is owned by AccountNode after load; the outer Arc is only
+    // needed when reloading after a self-heal wipe (and by the residual
+    // uncalled legacy scan function).
+    let account_node = if heal_decision == node::self_heal::ResetDecision::Reset {
         let state = Arc::new(Mutex::new(
             State::load_from_pg(&pool)
                 .await
                 .expect("reload state after self-heal reset"),
         ));
-        let account_node =
-            account_node::AccountNode::load_from_pg(Arc::clone(&state), &pool, prover)
-                .await
-                .expect("reload account node after self-heal reset");
-        if let Some(ref adapter) = v1_adapter {
-            adapter
-                .reinit_after_self_heal_reset()
-                .await
-                .expect("reinit v1 engine after self-heal reset");
-            println!("Re-inited v1.1 EngineAdapter to empty genesis after self-heal reset");
-        }
-        println!("Reloaded State + AccountNode from genesis after self-heal reset");
-        (state, account_node)
+        let account_node = account_node::AccountNode::load_ledger_from_pg(Arc::clone(&state), &pool)
+            .await
+            .expect("reload account node ledger after self-heal reset");
+        v1_adapter
+            .reinit_after_self_heal_reset()
+            .await
+            .expect("reinit v1 engine after self-heal reset");
+        println!(
+            "Re-inited v1 EngineAdapter + AccountNode ledger to empty genesis after self-heal reset"
+        );
+        account_node
     } else {
-        (state, account_node)
+        // Drop the outer state Arc — AccountNode already holds its clone.
+        drop(state);
+        account_node
     };
 
     let username_store = username::UsernameStore::load_from_pg(&pool)
@@ -294,31 +240,24 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // alerting fires on the loop, matching the panic-hook behaviour
     // above (zk-coins/node#89 round-2 MAJOR 2).
     let pool_for_rest = Arc::clone(&pool);
-    // v1.1 readiness handles: under the exclusive NfLog stack, REST binds
-    // before the scanner connects/catches up. Share atomics so
-    // `/health/ready` stays 503 until the first successful apply and
-    // trips on `finality_broken`. Legacy path leaves both `None`.
-    let (v1_readiness, v1_scan_caught_up, v1_finality_ok) = if v1_adapter.is_some() {
-        let caught_up = Arc::new(AtomicBool::new(false));
-        let finality_ok = Arc::new(AtomicBool::new(true));
-        (
-            V1Readiness {
-                scan_caught_up: Some(Arc::clone(&caught_up)),
-                finality_ok: Some(Arc::clone(&finality_ok)),
-            },
-            Some(caught_up),
-            Some(finality_ok),
-        )
-    } else {
-        (V1Readiness::default(), None, None)
+    // Stage 3: always exclusive NfLog stack. REST binds before the scanner
+    // connects/catches up; `/health/ready` stays 503 until the first
+    // successful apply and trips on `finality_broken`.
+    let caught_up = Arc::new(AtomicBool::new(false));
+    let finality_ok = Arc::new(AtomicBool::new(true));
+    let v1_readiness = V1Readiness {
+        scan_caught_up: Some(Arc::clone(&caught_up)),
+        finality_ok: Some(Arc::clone(&finality_ok)),
     };
+    let v1_scan_caught_up = Some(caught_up);
+    let v1_finality_ok = Some(finality_ok);
     // `proofs_dir` was already read at the binary edge above (for the
     // self-heal proof-store cleanup) and is moved into the spawned
     // task here. `start_rest_node` no longer touches `std::env` so the
     // runtime tests can each pass their own `tempfile::tempdir()` path
     // instead of racing on the process-wide env var under
     // `--test-threads=8` (issue #181 Opt A).
-    let v1_engine_for_rest = v1_adapter.clone();
+    let v1_engine_for_rest = Some(Arc::clone(&v1_adapter));
     tokio::spawn(async move {
         if let Err(e) = start_rest_node(
             account_node,
@@ -336,14 +275,24 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
     });
 
-    // Stage 2 dual stack: either the v1.1 NfLog scanner **or** the legacy
-    // Commitment/SMT scanner — never both against the same process state.
-    if let Some(adapter) = v1_adapter {
-        run_v1_scan_loop(adapter, v1_scan_caught_up, v1_finality_ok).await?;
-        return Ok(());
-    }
+    // Stage 3: only the v1 NfLog scanner. The legacy Commitment/SMT
+    // Esplora path is retained as an uncalled function below for Stage 4
+    // deletion — it is not reachable from this binary.
+    run_v1_scan_loop(v1_adapter, v1_scan_caught_up, v1_finality_ok).await?;
+    Ok(())
+}
 
-    // —— Legacy path (flag off) — Commitment → SMT/MMR via Esplora ——
+/// Legacy Commitment → SMT/MMR Esplora scan loop.
+///
+/// **Stage 3:** uncalled from production boot (`main` returns after the
+/// v1 NfLog loop). Left in the tree so Stage 4 can delete it with the
+/// rest of the legacy stack. Reachability is structural (no call site
+/// on the binary path), not a comment-only convention.
+#[allow(dead_code)]
+async fn legacy_commitment_scan_loop(
+    pool: Arc<sqlx::PgPool>,
+    state: Arc<Mutex<State>>,
+) -> Result<(), Box<dyn StdError>> {
     // Try to load the latest block hash from Postgres or fall back to
     // Esplora's current tip. The Postgres row is written atomically
     // alongside the SMT/MMR snapshot in the scanner callback, which is

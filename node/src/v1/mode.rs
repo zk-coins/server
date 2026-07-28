@@ -1,9 +1,10 @@
 //! `ZKCOINS_V1_SHADOW` resolution and §3.6 boot-pin validation.
 //!
-//! Stages 1–2: flag-gated v1.1 path. Stage 2 makes publisher/scanner
-//! **exclusive** (legacy Commitment/SMT **or** AggregateStateNullifierV3/NfLog,
-//! never both — see [`super::separation`]). Proving remains legacy until
-//! Stage 3; the flag name must not imply that proving is already v1.1.
+//! **Stage 3:** the production binary requires `ZKCOINS_V1_SHADOW=1` and
+//! always claims the exclusive AggregateStateNullifierV3 / NfLog stack
+//! with Engine/Bridge proving. Unset / `off` is refused at the binary
+//! edge (not a silent fall-back to legacy). Unit tests may still resolve
+//! the flag independently when they do not boot `main`.
 
 use std::env;
 use std::fmt;
@@ -12,12 +13,12 @@ use shared::spec_v1::network_params::NetworkParams;
 use shared::spec_v1::tags::{NETWORK_TAG_MAINNET, NETWORK_TAG_REGTEST, NETWORK_TAG_TESTNET};
 use zkcoins_program::circuit::compliance::Network;
 
-/// Whether the v1.1 dual stack is enabled (Stage 2: exclusive scan/publish).
+/// Whether the v1 exclusive stack is selected for this process.
 ///
-/// Default is [`V1ShadowMode::Off`]. Selected only by the exact env value
-/// `ZKCOINS_V1_SHADOW=1`. When on, the node claims the database for the
-/// NfLog / AggregateStateNullifierV3 stack and refuses the legacy
-/// Commitment scanner/publisher. Proving remains legacy until Stage 3.
+/// Stage 3 production binary requires [`V1ShadowMode::On`]
+/// (`ZKCOINS_V1_SHADOW=1`). [`V1ShadowMode::Off`] remains resolvable for
+/// residual unit tests and Stage-4 cleanup tooling, but is not a
+/// production dual-stack mode anymore.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum V1ShadowMode {
     Off,

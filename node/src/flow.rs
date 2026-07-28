@@ -222,6 +222,23 @@ pub(crate) async fn mint_flow(
     state: &AppState,
     request: MintRequest,
 ) -> Result<(u64, SendCommitHashes), FlowError> {
+    // Stage 3: under the exclusive v1 process claim the legacy
+    // `prepare_mint` / `Prover::prove_initial` path is refused. Prove
+    // call sites go through StateEngine (`begin_v1_mint` → sign →
+    // finalise). A residual ash‖ocr mint job body cannot be served —
+    // fail loud, no silent fall-back to the legacy circuit.
+    if matches!(
+        crate::v1::process_stack_mode(),
+        Some(crate::v1::ScanStackMode::V1)
+    ) {
+        return Err(FlowError::new(
+            StatusCode::CONFLICT,
+            "Stage-3 v1 claim: legacy mint prove path refused; use begin_v1_mint \
+             (StateEngine / AssetIssuance + TransitionSignature). Silent fall-back \
+             to Prover::new / circuit::main is forbidden",
+        ));
+    }
+
     // Re-validate (signature + timestamp). The admit handler already
     // ran this, but the job may have been queued for a while;
     // re-checking the timestamp here keeps the freshness window honest
@@ -548,6 +565,20 @@ pub(crate) async fn send_flow(
     state: &AppState,
     request: SendCoinRequest,
 ) -> Result<(u64, SendCommitHashes), FlowError> {
+    // Stage 3: residual legacy send builds InCoinSourceWitness +
+    // source-aggregator. Under the v1 claim that path is refused
+    // (also gated inside AccountNode::send_coins); fail here first so
+    // the job never touches the legacy Prover.
+    if matches!(
+        crate::v1::process_stack_mode(),
+        Some(crate::v1::ScanStackMode::V1)
+    ) {
+        return Err(FlowError::new(
+            StatusCode::CONFLICT,
+            crate::v1::LEGACY_SEND_REFUSED_UNDER_V1.to_string(),
+        ));
+    }
+
     let (from_address_bytes, to_address_bytes) = validate_send_request(&request)?;
     let from_address = digest_from_bytes(&from_address_bytes);
     let to_address = digest_from_bytes(&to_address_bytes);

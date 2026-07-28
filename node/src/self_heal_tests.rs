@@ -662,7 +662,22 @@ async fn heal_v1_reset_fences_pre_loaded_job_resurrection() {
     };
     let job_id = job.public_id;
     let gen_before = job.reset_generation;
-    assert_eq!(gen_before, 0, "fresh DB starts at generation 0");
+    // Stage-3 migration 0028 one-shot genesis reset bumps generation at
+    // migrate time (sqlx `_sqlx_migrations` — once per DB, not every boot).
+    // A post-switch "fresh" migrated schema therefore starts at 1, not 0.
+    // Pre-Stage-3 premise "fresh DB starts at generation 0" is stale.
+    let live_at_admit = db::load_self_heal_reset_generation(&pool)
+        .await
+        .expect("load live generation after migrations");
+    assert_eq!(
+        gen_before, live_at_admit,
+        "admitted job must stamp the live meta generation"
+    );
+    assert_eq!(
+        live_at_admit, 1,
+        "post-Stage-3 migrated DB starts at generation 1 \
+         (0024 seed 0 + 0028 one-shot cutover bump); not re-bumped on boot"
+    );
 
     // Simulate worker A holding the loaded public_id (status still queued).
     let old = crate::v1::encode_v1_live_digest(&[0x01; 32], &[0x02; 32]);

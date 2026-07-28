@@ -285,7 +285,17 @@ pub struct AccountNode {
     /// create their own asset and mint their own supply into their own
     /// `(owner, asset_id)` account.
     accounts: HashMap<AccountKey, Account>,
-    prover: Prover,
+    /// Legacy Plonky2 `circuit::main` prover.
+    ///
+    /// **Stage 3 (default v1 path):** production bootstrap loads
+    /// [`None`] — [`Prover::new`] is not on the binary path. Prove call
+    /// sites go through [`crate::v1::EngineAdapter`] / `StateEngine`.
+    /// Legacy unit tests still construct `Some(Prover::new())` via
+    /// [`Self::new`] / [`Self::load_from_pg`].
+    ///
+    /// Access only through [`Self::legacy_prover`]; under a v1 process
+    /// claim residual prove methods refuse before reading this field.
+    prover: Option<Prover>,
     state: Arc<Mutex<State>>,
 }
 
@@ -314,13 +324,39 @@ impl AccountNode {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(state: Arc<Mutex<State>>) -> Self {
         let accounts = HashMap::new();
-        let prover = Prover::new();
+        // Test/fixture constructor only: pays for the legacy circuit.
+        // Production Stage-3 bootstrap uses [`Self::load_ledger_from_pg`]
+        // (no `Prover::new`).
+        let prover = Some(Prover::new());
 
         AccountNode {
             accounts,
             prover,
             state,
         }
+    }
+
+    /// Production Stage-3 constructor: ledger + shared SMT/MMR state, **no**
+    /// legacy [`Prover`]. Prove work goes through the v1 Engine/Bridge.
+    ///
+    /// Calling residual `prepare_mint` / `send_coins` / `warmup_prover` /
+    /// `canary_recursion` on this node fails loud (v1 claim refuse and/or
+    /// missing prover) rather than building a circuit.
+    pub fn new_without_legacy_prover(state: Arc<Mutex<State>>) -> Self {
+        AccountNode {
+            accounts: HashMap::new(),
+            prover: None,
+            state,
+        }
+    }
+
+    /// Borrow the legacy prover, or refuse if this node was loaded on the
+    /// Stage-3 binary path (no `Prover::new`).
+    fn legacy_prover(&self) -> Result<&Prover, &'static str> {
+        self.prover.as_ref().ok_or(
+            "legacy Prover is unreachable on the Stage-3 binary path; \
+             use StateEngine / ProverBridge (v1) prove transitions",
+        )
     }
 
     /// Import an account at its `(owner, asset_id)` key. The asset is
@@ -574,8 +610,9 @@ impl AccountNode {
             .accounts
             .remove(&key)
             .ok_or("Unknown account address")?;
+        let prover = self.legacy_prover()?;
         match Self::send_coins_inner(
-            &self.prover,
+            prover,
             &self.state,
             &mut account,
             invoices,
@@ -978,6 +1015,18 @@ impl AccountNode {
         amount: u64,
         next_public_key: &zkcoins_program::types::PublicKey,
     ) -> Result<MintingPrepared, &'static str> {
+        // Stage 3: under a v1 process claim residual legacy mint must not
+        // touch `circuit::main`. Use `crate::v1::begin_v1_mint` instead.
+        if matches!(
+            crate::v1::process_stack_mode(),
+            Some(crate::v1::ScanStackMode::V1)
+        ) {
+            return Err(
+                "legacy prepare_mint refused under Stage-3 v1 claim; use begin_v1_mint \
+                 (StateEngine / AssetIssuance). Silent fall-back to Prover::prove_initial \
+                 is forbidden",
+            );
+        }
         use zkcoins_program::hash::hash_bytes;
         use zkcoins_program::types::{calculate_asset_id, calculate_name_hash};
 
@@ -1065,7 +1114,7 @@ impl AccountNode {
                     ..MAX_OUT_COINS)
                     .map(|_| (false, ZERO_HASH, 0u64, &dummy_nip))
                     .collect();
-                self.prover
+                self.legacy_prover()?
                     .prove_initial_with_in_and_out_coins(
                         &account_state_for_prove,
                         history_root_extended,
@@ -1153,6 +1202,12 @@ impl AccountNode {
     /// the witness shape (fresh `AccountState::new(_)` + `ZERO_HASH`) in
     /// sync if either side changes.
     pub fn warmup_prover(&self) -> anyhow::Result<()> {
+        // Stage 3 binary path carries no legacy Prover — warmup is a no-op
+        // (v1 proves go through ProverBridge, which caches circuits on first
+        // use). Legacy test nodes with `Some(prover)` still warm as before.
+        let Some(prover) = self.prover.as_ref() else {
+            return Ok(());
+        };
         // 33-byte well-formed secp256k1-compressed pubkey placeholder.
         // The circuit does not verify the pubkey is on-curve in
         // `prove_initial`, only that the witness layout matches; the
@@ -1169,8 +1224,7 @@ impl AccountNode {
         // placeholder — the proof is discarded.
         let asset_id = ZERO_HASH;
         let warmup_account_state = AccountState::new(pk, asset_id);
-        self.prover
-            .prove_initial(&warmup_account_state, ZERO_HASH, asset_id, None)?;
+        prover.prove_initial(&warmup_account_state, ZERO_HASH, asset_id, None)?;
         Ok(())
     }
 
@@ -1291,6 +1345,17 @@ impl AccountNode {
         &self,
         current_pubkey_for: &dyn Fn(&Address, &SparseMerkleTree) -> Option<PublicKey>,
     ) -> CanaryOutcome {
+        // Stage 3 binary path has no legacy Prover; the production boot
+        // canary is `v1::v1_canary_for_heal` (C / ComplianceProof). A
+        // call here without a prover is a programming error on the
+        // legacy self-heal path — treat as NoSample (data-loss-safe).
+        let Some(prover) = self.prover.as_ref() else {
+            tracing::warn!(
+                "self-heal canary: AccountNode has no legacy Prover (Stage-3 path); \
+                 returning NoSample — use v1::v1_canary_for_heal on the production boot"
+            );
+            return CanaryOutcome::NoSample;
+        };
         let state = self
             .state
             .lock()
@@ -1383,8 +1448,7 @@ impl AccountNode {
             // `next_public_key` only affects the canary's OWN (discarded)
             // output state hash, which is not constrained against anything
             // persisted — keep it equal to the current key (no rotation).
-            return match self
-                .prover
+            return match prover
                 .prove_account_update_with_in_and_out_coins_and_sources(
                     &account_state,
                     history_root_extended,
@@ -1417,22 +1481,15 @@ impl AccountNode {
         CanaryOutcome::NoSample
     }
 
-    /// Consume this `AccountNode`, returning its pre-built [`Prover`].
+    /// Consume this `AccountNode`, returning its optional pre-built
+    /// legacy [`Prover`].
     ///
-    /// Used by the boot path's self-heal: when the circuit-digest probe
-    /// decides a [`crate::self_heal::ResetDecision::Reset`] is needed,
-    /// the in-memory maps loaded against the pre-reset rows are stale, so
-    /// the bootstrap reloads an empty `AccountNode` from the now-wiped
-    /// DB. The (~14 s) circuit build is recovered here and handed to the
-    /// fresh [`Self::load_from_pg`] so the circuit is still built exactly
-    /// once across the whole boot.
+    /// Stage 3 production boot carries `None` (no `Prover::new`). Legacy
+    /// self-heal reload paths that still inject a prover recover it here.
     ///
-    /// `coverage(off)`: called only from the self-heal reset path in
-    /// `main.rs` (in the CI `--ignore-filename-regex`); a unit test would
-    /// have to pay a full `Prover::new()` circuit build to construct the
-    /// `AccountNode` it consumes. Exercised by the live boot-gate repro.
+    /// `coverage(off)`: only residual legacy boot / test reload paths.
     #[cfg_attr(coverage_nightly, coverage(off))]
-    pub fn take_prover(self) -> Prover {
+    pub fn take_prover(self) -> Option<Prover> {
         self.prover
     }
 
@@ -1473,26 +1530,22 @@ impl AccountNode {
             .expect("bincode::serialize cannot fail for the current Account shape")
     }
 
-    /// Reload an `AccountNode` from Postgres, reusing a pre-built
-    /// [`Prover`].
+    /// Reload an `AccountNode` from Postgres, optionally reusing a
+    /// pre-built legacy [`Prover`].
+    ///
+    /// **Stage 3 production:** pass `prover: None` — the binary path
+    /// never constructs [`Prover::new`]. Residual legacy tests pass
+    /// `Some(Prover::new())`.
     ///
     /// The bootstrap-seeded minting account is NOT created here —
     /// `start_rest_node` does that explicitly once it has observed an
     /// absent minting row. Returning the rebuilt map here keeps this
     /// constructor a pure "rehydrate everything that was persisted"
     /// call with no side effects.
-    ///
-    /// The `Prover` is injected (rather than built here) so the
-    /// bootstrap can build the circuit exactly once: `main.rs` builds
-    /// it, reads its `circuit_digest_bytes` to run the circuit-digest
-    /// self-heal against Postgres (see [`crate::self_heal`]) BEFORE this
-    /// rehydration loads any account row, then hands the same prover in
-    /// here. Building the circuit twice would double the ~14 s startup
-    /// cost.
     pub async fn load_from_pg(
         state: Arc<Mutex<State>>,
         pool: &PgPool,
-        prover: Prover,
+        prover: Option<Prover>,
     ) -> Result<Self, LoadAccountNodeError> {
         let rows = db::load_all_accounts(pool).await?;
         let mut accounts: HashMap<AccountKey, Account> = HashMap::with_capacity(rows.len());
@@ -1519,6 +1572,18 @@ impl AccountNode {
             prover,
             state,
         })
+    }
+
+    /// Stage-3 production load: ledger only, **no** legacy [`Prover`].
+    ///
+    /// Equivalent to [`Self::load_from_pg`] with `prover: None`. Named so
+    /// the binary boot path cannot accidentally pass a constructed
+    /// prover without a deliberate API choice.
+    pub async fn load_ledger_from_pg(
+        state: Arc<Mutex<State>>,
+        pool: &PgPool,
+    ) -> Result<Self, LoadAccountNodeError> {
+        Self::load_from_pg(state, pool, None).await
     }
 }
 
@@ -1907,7 +1972,7 @@ mod inline_tests {
         // unreachable in a passing test, which leaves the Coverage
         // Gate (`account_node.rs` is in scope, only `_tests.rs$`
         // files are ignored) at 99.83% on the dead match arm.
-        let err = AccountNode::load_from_pg(state, &pool, Prover::new())
+        let err = AccountNode::load_from_pg(state, &pool, Some(Prover::new()))
             .await
             .err()
             .expect("load_from_pg should fail when DB is unreachable");

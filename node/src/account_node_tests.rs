@@ -602,7 +602,7 @@ async fn test_persist_and_load_from_pg_roundtrip() {
     // 64-byte (owner, asset_id) composite). The prover is injected
     // (built once by the bootstrap in production) — see
     // `AccountNode::load_from_pg`.
-    let loaded = AccountNode::load_from_pg(state_arc, &pool, Prover::new())
+    let loaded = AccountNode::load_from_pg(state_arc, &pool, Some(Prover::new()))
         .await
         .expect("load_from_pg ok");
     assert_eq!(loaded.get_account_balance(&address, &asset_id).unwrap(), 11);
@@ -669,7 +669,7 @@ async fn test_load_from_pg_rejects_corrupted_blob() {
     let state_arc = Arc::new(Mutex::new(State::new()));
     // `AccountNode` is intentionally not `Debug`, so `expect_err`
     // isn't available; match the Result instead.
-    match AccountNode::load_from_pg(state_arc, &pool, Prover::new()).await {
+    match AccountNode::load_from_pg(state_arc, &pool, Some(Prover::new())).await {
         Ok(_) => panic!("expected deserialize error"),
         Err(err) => assert!(
             matches!(
@@ -720,7 +720,7 @@ async fn test_load_from_pg_rejects_wrong_address_length() {
         .unwrap();
 
     let state_arc = Arc::new(Mutex::new(State::new()));
-    match AccountNode::load_from_pg(state_arc, &pool, Prover::new()).await {
+    match AccountNode::load_from_pg(state_arc, &pool, Some(Prover::new())).await {
         Ok(_) => panic!("expected bad-address length"),
         Err(err) => assert!(
             matches!(

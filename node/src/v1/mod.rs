@@ -1,14 +1,14 @@
-//! v1.1 cutover Stages 1–2 (+ G3 receive): flag-gated **shadow** path.
+//! v1 cutover Stages 1–3: exclusive NfLog / ComplianceProof stack.
 //!
-//! ## Stage 1
-//! [`StateEngine`] persistence behind `ZKCOINS_V1_SHADOW=1`. Proving remains
+//! ## Stage 1–2 (historical)
+//! Flag-gated shadow path behind `ZKCOINS_V1_SHADOW=1`. Proving remained
 //! legacy until Stage 3.
 //!
-//! ## Stage 2
-//! Exclusive dual stack for **publisher + scanner**:
-//! - Flag off → legacy Commitment publisher + Esplora SMT scanner (default).
-//! - Flag on → script-plonky2 `AggregateStateNullifierV3` publisher + NfLog
-//!   scan-fold (§3.6). Missing bitcoind pins fail loud — never fall back.
+//! ## Stage 3 (current default)
+//! Atomic switch: production binary always claims [`ScanStackMode::V1`].
+//! Prove call sites → [`StateEngine`] / [`ProverBridge`]; scanner folds only
+//! `AggregateStateNullifierV3`; [`Prover::new`] is not on the binary path.
+//! Legacy code remains in the tree for Stage 4 deletion.
 //!
 //! ## G3 — Receive as a real transition
 //! [`receive`] wires `begin_receive` → compliance proof → account apply
@@ -85,6 +85,9 @@ pub mod scan;
 pub mod self_heal;
 pub mod separation;
 pub mod signature;
+// Stage 3 atomic-switch properties (compile/source + load-path pins).
+#[cfg(test)]
+mod stage3;
 
 pub use adapter::EngineAdapter;
 pub use attest::{
