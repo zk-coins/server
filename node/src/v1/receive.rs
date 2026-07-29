@@ -288,6 +288,23 @@ pub(crate) fn refuse_legacy_receive_under_v1() -> Result<(), &'static str> {
     }
 }
 
+/// §-Grenze für die Zahl der Eingangs-Slots eines v1-Receive.
+///
+/// Leere und überlange Requests werden vor der NAV-Auflösung verworfen —
+/// gleiche Fehlertypen und Meldungen wie der frühere Inline-`ensure!`-Block.
+fn validate_receive_slot_count(len: usize) -> Result<()> {
+    ensure!(
+        len > 0,
+        "v1.1 receive requires at least one received coin (no empty transition)"
+    );
+    ensure!(
+        len <= MAX_RX_COINS,
+        "v1.1 receive: {} coins exceeds MAX_RX_COINS={MAX_RX_COINS} (§2.5); refusing (no silent truncate)",
+        len
+    );
+    Ok(())
+}
+
 /// Host-side clause-10 verification for every slot, then
 /// [`StateEngine::begin_receive`].
 ///
@@ -303,15 +320,7 @@ pub fn verify_and_begin_receive(
     require_v1_process_for_nflog_write()
         .context("v1.1 receive: exclusive stack claim required (no legacy fall-back)")?;
 
-    ensure!(
-        !req.slots.is_empty(),
-        "v1.1 receive requires at least one received coin (no empty transition)"
-    );
-    ensure!(
-        req.slots.len() <= MAX_RX_COINS,
-        "v1.1 receive: {} coins exceeds MAX_RX_COINS={MAX_RX_COINS} (§2.5); refusing (no silent truncate)",
-        req.slots.len()
-    );
+    validate_receive_slot_count(req.slots.len())?;
 
     let receiver_nav = size_final_nav(engine)?;
 
@@ -801,12 +810,39 @@ fn prepared_batch_from_pending_row(
         deserialize(commit_tx_bytes).context("resume: deserialize commit_tx")?;
     let reveal_tx: Transaction =
         deserialize(reveal_tx_bytes).context("resume: deserialize reveal_tx")?;
+
+    // Persisted txids must match the recomputed digests of the stored bytes.
+    // A divergence means durable state was corrupted or partially rewritten —
+    // fail closed before any broadcast (not a generic send error).
+    let stored_commit_txid = row.commit_txid.as_ref().context(
+        "resume: row missing commit_txid; refusing broadcast from incomplete durable state",
+    )?;
+    let stored_reveal_txid = row.reveal_txid.as_ref().context(
+        "resume: row missing reveal_txid; refusing broadcast from incomplete durable state",
+    )?;
+    let computed_commit_txid = signed_commit.compute_txid().to_byte_array();
+    let computed_reveal_txid = reveal_tx.compute_txid().to_byte_array();
+    ensure!(
+        *stored_commit_txid == computed_commit_txid,
+        "resume: persisted commit_txid {} does not match recomputed txid {} from \
+         commit_tx bytes — durable state and transaction bytes diverged; refusing broadcast",
+        hex::encode(stored_commit_txid),
+        hex::encode(computed_commit_txid)
+    );
+    ensure!(
+        *stored_reveal_txid == computed_reveal_txid,
+        "resume: persisted reveal_txid {} does not match recomputed txid {} from \
+         reveal_tx bytes — durable state and transaction bytes diverged; refusing broadcast",
+        hex::encode(stored_reveal_txid),
+        hex::encode(computed_reveal_txid)
+    );
+
     let commit_output = signed_commit
         .output
         .first()
         .cloned()
         .context("resume: commit has no outputs")?;
-    Ok(PreparedBatch {
+    let prepared = PreparedBatch {
         aggregate: zkcoins_prover::half_agg::AggregateStateNullifierV3 {
             version: 3,
             format: 0x01,
@@ -824,7 +860,14 @@ fn prepared_batch_from_pending_row(
         reveal_vsize: 0,
         commit_fee: bitcoin::Amount::from_sat(0),
         reveal_fee: bitcoin::Amount::from_sat(0),
-    })
+    };
+    // Same pair integrity as broadcast_commit/broadcast_reveal: reconstructed
+    // bytes are not trusted. Fail before the first send so a corrupt reveal
+    // cannot ride alongside a valid commit onto the chain.
+    prepared.validate_pair().context(
+        "resume: reconstructed commit/reveal pair failed integrity check; refusing broadcast",
+    )?;
+    Ok(prepared)
 }
 
 /// Resume a durable pending publish after crash. Reconstructs from
@@ -1392,25 +1435,50 @@ mod tests {
         fn dummy_prepared(member: &BatchMember) -> PreparedBatch {
             // Distinct lock_time from pk/r so each member has unique txids
             // (unique index on commit_txid in v1_pending_publishes).
+            // Structurally valid commit/reveal pair (P2TR commit, single-input
+            // reveal spending vout 0) so resume integrity checks pass for
+            // honest fixtures; corrupt-pair tests mutate after construction.
             let commit_lock = u32::from_le_bytes(member.sig.pk[0..4].try_into().unwrap());
             let reveal_lock = u32::from_le_bytes(member.sig.r[0..4].try_into().unwrap());
+            // BIP-341 NUMS internal key — valid x-only point, yields P2TR.
+            let nums = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&[
+                0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9,
+                0x7a, 0x5e, 0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a,
+                0xce, 0x80, 0x3a, 0xc0,
+            ])
+            .expect("BIP-341 NUMS x-only key");
+            let p2tr = ScriptBuf::new_p2tr(
+                &bitcoin::secp256k1::Secp256k1::verification_only(),
+                nums,
+                None,
+            );
+            let commit_output = TxOut {
+                value: Amount::from_sat(600),
+                script_pubkey: p2tr.clone(),
+            };
             let signed_commit = Transaction {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: bitcoin::absolute::LockTime::from_consensus(commit_lock),
                 input: vec![],
-                output: vec![TxOut {
-                    value: Amount::from_sat(600),
-                    script_pubkey: ScriptBuf::new(),
-                }],
+                output: vec![commit_output.clone()],
             };
+            let commit_txid = signed_commit.compute_txid();
             let reveal_tx = Transaction {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: bitcoin::absolute::LockTime::from_consensus(reveal_lock),
-                input: vec![],
+                input: vec![bitcoin::TxIn {
+                    previous_output: bitcoin::OutPoint {
+                        txid: commit_txid,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: bitcoin::Witness::new(),
+                }],
                 output: vec![
                     TxOut {
                         value: Amount::from_sat(330),
-                        script_pubkey: ScriptBuf::new(),
+                        script_pubkey: p2tr,
                     },
                     TxOut {
                         value: Amount::from_sat(600),
@@ -1430,10 +1498,7 @@ mod tests {
                 payload: vec![0x42],
                 signed_commit,
                 reveal_tx,
-                commit_output: TxOut {
-                    value: Amount::from_sat(600),
-                    script_pubkey: ScriptBuf::new(),
-                },
+                commit_output,
                 block_anchor: member.build_tip,
                 commit_vsize: 100,
                 reveal_vsize: 200,
@@ -1652,21 +1717,23 @@ mod tests {
     fn max_rx_coins_boundary_length_gate() {
         // §2.5: at most MAX_RX_COINS; the length check is the first gate in
         // verify_and_begin_receive and must fail loud (no silent truncate).
+        // Production and tests share validate_receive_slot_count.
         assert_eq!(MAX_RX_COINS, 4, "spec §2.5 MAX_RX_COINS");
         for n in 1..=MAX_RX_COINS {
-            assert!(
-                n <= MAX_RX_COINS,
-                "at-limit {n} must be allowed by length gate"
-            );
+            validate_receive_slot_count(n)
+                .unwrap_or_else(|e| panic!("at-limit {n} must be allowed by length gate: {e:#}"));
         }
+        let err = validate_receive_slot_count(MAX_RX_COINS + 1)
+            .expect_err("above-limit must be rejected by length gate");
+        let msg = format!("{err:#}");
         assert!(
-            MAX_RX_COINS + 1 > MAX_RX_COINS,
-            "above-limit must be rejected by length gate"
+            msg.contains("MAX_RX_COINS") && msg.contains(&(MAX_RX_COINS + 1).to_string()),
+            "must name the over-limit cause: {msg}"
         );
 
         set_process_stack_mode(ScanStackMode::V1);
         let engine = StateEngine::new(Network::Regtest, 0);
-        // Empty slots → fails "at least one" before MAX check.
+        // Empty slots → fails "at least one" before MAX check (same function).
         let err = verify_and_begin_receive(
             &engine,
             V1ReceiveRequest {
@@ -1681,23 +1748,22 @@ mod tests {
         )
         .expect_err("empty receive");
         assert!(format!("{err:#}").contains("at least one"), "got: {err:#}");
+        // Same cause via the shared gate.
+        let err = validate_receive_slot_count(0).expect_err("empty must fail");
+        assert!(format!("{err:#}").contains("at least one"), "got: {err:#}");
     }
 
     #[test]
     fn max_rx_coins_over_limit_fails_loud_without_constructing_slots() {
         // Construct MAX_RX_COINS+1 dummy slots is expensive (each needs a full
-        // ComplianceProof). The length gate runs first — we exercise it by
-        // calling the same ensure the production path uses.
+        // ComplianceProof). Exercise the shared production gate directly.
         let n = MAX_RX_COINS + 1;
-        let result: Result<()> = (|| {
-            ensure!(
-                n <= MAX_RX_COINS,
-                "v1.1 receive: {n} coins exceeds MAX_RX_COINS={MAX_RX_COINS} (§2.5); refusing (no silent truncate)"
-            );
-            Ok(())
-        })();
-        let err = result.expect_err("over limit");
-        assert!(format!("{err:#}").contains("MAX_RX_COINS"));
+        let err = validate_receive_slot_count(n).expect_err("over limit");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("MAX_RX_COINS") && msg.contains(&n.to_string()),
+            "must name the concrete over-limit cause: {msg}"
+        );
     }
 
     /// Port of legacy `test_receive_coin_rejects_invalid_inclusion_proof`:
@@ -2376,6 +2442,213 @@ mod tests {
             msg.contains("connection refused") || msg.contains("not an already-done"),
             "got: {msg}"
         );
+    }
+
+    /// Corrupt reveal outpoint (wrong commit txid): resume must fail before any
+    /// commit broadcast. Without pair integrity, a valid commit would land and
+    /// the reveal would be rejected — permanent NUMS burn.
+    #[tokio::test]
+    async fn resume_refuses_corrupt_reveal_outpoint_before_broadcast() {
+        use crate::test_db::setup_pool;
+        use crate::v1::db_v1;
+        use crate::v1::separation::claim_stack_scan_mode;
+        use crate::v1::EngineAdapter;
+
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim");
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("adapter");
+
+        let owner = Address(xonly_from_label(b"v1-rx/corrupt-out/owner"));
+        let pk = xonly_from_label(b"v1-rx/corrupt-out/pk");
+        let r = xonly_from_label(b"v1-rx/corrupt-out/r");
+        let s = [0x66u8; 32];
+        let r_prime = xonly_from_label(b"v1-rx/corrupt-out/rp");
+        let member = BatchMember {
+            sig: NullifierSig { pk, r, s },
+            build_tip: BlockAnchor {
+                block_hash: [0xDD; 32],
+                height: 7,
+            },
+        };
+        let mut prepared = RecordingPublisher::dummy_prepared(&member);
+        // Valid commit; reveal outpoint points at a different txid.
+        prepared.reveal_tx.input[0].previous_output.txid = Txid::from_byte_array([0xEE; 32]);
+
+        db_v1::insert_pending_publish_members_ready(&pool, owner, pk, r, s, r_prime, 7, [0xDD; 32])
+            .await
+            .expect("members_ready");
+        // Persist stored txids matching the (mutated) serialised bytes so the
+        // failure is the pair check, not the txid-digest check.
+        db_v1::mark_pending_publish_constructed(
+            &pool,
+            pk,
+            &serialize(&prepared.signed_commit),
+            &serialize(&prepared.reveal_tx),
+            prepared.signed_commit.compute_txid().to_byte_array(),
+            prepared.reveal_tx.compute_txid().to_byte_array(),
+        )
+        .await
+        .expect("constructed");
+
+        let publisher = RecordingPublisher::new();
+        let err = resume_pending_publish_with(&adapter, &publisher, pk)
+            .await
+            .expect_err("corrupt reveal outpoint must fail resume");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("integrity")
+                || msg.contains("outpoint")
+                || msg.contains("does not match commit"),
+            "must name pair integrity / outpoint failure: {msg}"
+        );
+        assert_eq!(
+            *publisher.commit_calls.lock().expect("lock"),
+            0,
+            "commit must not be broadcast when the reveal does not match"
+        );
+        assert_eq!(
+            *publisher.reveal_calls.lock().expect("lock"),
+            0,
+            "reveal must not be broadcast either"
+        );
+    }
+
+    /// Reveal references a non-existent commit vout — pair integrity fails
+    /// before broadcast. (The `commit_output` field mismatch case is covered
+    /// by the publisher unit test: after resume reconstruction that field is
+    /// taken from the commit's first output, so it cannot diverge on-disk.)
+    #[tokio::test]
+    async fn resume_refuses_missing_commit_vout_before_broadcast() {
+        use crate::test_db::setup_pool;
+        use crate::v1::db_v1;
+        use crate::v1::separation::claim_stack_scan_mode;
+        use crate::v1::EngineAdapter;
+
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim");
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("adapter");
+
+        let owner = Address(xonly_from_label(b"v1-rx/missing-vout/owner"));
+        let pk = xonly_from_label(b"v1-rx/missing-vout/pk");
+        let r = xonly_from_label(b"v1-rx/missing-vout/r");
+        let s = [0x67u8; 32];
+        let r_prime = xonly_from_label(b"v1-rx/missing-vout/rp");
+        let member = BatchMember {
+            sig: NullifierSig { pk, r, s },
+            build_tip: BlockAnchor {
+                block_hash: [0xDE; 32],
+                height: 8,
+            },
+        };
+        let mut prepared = RecordingPublisher::dummy_prepared(&member);
+        prepared.reveal_tx.input[0].previous_output.vout = 99;
+
+        db_v1::insert_pending_publish_members_ready(&pool, owner, pk, r, s, r_prime, 8, [0xDE; 32])
+            .await
+            .expect("members_ready");
+        db_v1::mark_pending_publish_constructed(
+            &pool,
+            pk,
+            &serialize(&prepared.signed_commit),
+            &serialize(&prepared.reveal_tx),
+            prepared.signed_commit.compute_txid().to_byte_array(),
+            prepared.reveal_tx.compute_txid().to_byte_array(),
+        )
+        .await
+        .expect("constructed");
+
+        let publisher = RecordingPublisher::new();
+        let err = resume_pending_publish_with(&adapter, &publisher, pk)
+            .await
+            .expect_err("missing commit vout must fail resume");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("vout") || msg.contains("integrity") || msg.contains("does not exist"),
+            "must name missing-vout integrity failure: {msg}"
+        );
+        assert_eq!(
+            *publisher.commit_calls.lock().expect("lock"),
+            0,
+            "commit must not be broadcast for a broken pair"
+        );
+    }
+
+    /// Persisted commit_txid diverges from the recomputed digest of commit_tx.
+    #[tokio::test]
+    async fn resume_refuses_mismatched_persisted_commit_txid_before_broadcast() {
+        use crate::test_db::setup_pool;
+        use crate::v1::db_v1;
+        use crate::v1::separation::claim_stack_scan_mode;
+        use crate::v1::EngineAdapter;
+
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim");
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("adapter");
+
+        let owner = Address(xonly_from_label(b"v1-rx/txid-div/owner"));
+        let pk = xonly_from_label(b"v1-rx/txid-div/pk");
+        let r = xonly_from_label(b"v1-rx/txid-div/r");
+        let s = [0x68u8; 32];
+        let r_prime = xonly_from_label(b"v1-rx/txid-div/rp");
+        let member = BatchMember {
+            sig: NullifierSig { pk, r, s },
+            build_tip: BlockAnchor {
+                block_hash: [0xDF; 32],
+                height: 9,
+            },
+        };
+        let prepared = RecordingPublisher::dummy_prepared(&member);
+
+        db_v1::insert_pending_publish_members_ready(&pool, owner, pk, r, s, r_prime, 9, [0xDF; 32])
+            .await
+            .expect("members_ready");
+        // Honest tx bytes, deliberately wrong stored commit_txid.
+        db_v1::mark_pending_publish_constructed(
+            &pool,
+            pk,
+            &serialize(&prepared.signed_commit),
+            &serialize(&prepared.reveal_tx),
+            [0xCA; 32],
+            prepared.reveal_txid().to_byte_array(),
+        )
+        .await
+        .expect("constructed");
+
+        let publisher = RecordingPublisher::new();
+        let err = resume_pending_publish_with(&adapter, &publisher, pk)
+            .await
+            .expect_err("txid divergence must fail resume");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("diverged")
+                || msg.contains("does not match recomputed")
+                || msg.contains("persisted commit_txid"),
+            "must name durable-state / txid divergence (not a generic broadcast error): {msg}"
+        );
+        assert_eq!(
+            *publisher.commit_calls.lock().expect("lock"),
+            0,
+            "commit must not be broadcast when persisted txid disagrees with bytes"
+        );
+        assert_eq!(*publisher.reveal_calls.lock().expect("lock"), 0);
     }
 
     /// Test 2: multi-slot host clause-10 through the real entry point
@@ -3106,7 +3379,7 @@ mod tests {
             let entries: Vec<NfLogEntry> = engine.nflog_mirror().iter().map(|(_, e)| *e).collect();
             (change, entries)
         });
-        let all_output_ids = vec![bob_coin.identifier, alice_change_id];
+        let all_output_ids = [bob_coin.identifier, alice_change_id];
         let sibling = host::leaf_hash(TreeKind::CoinsRoot, all_output_ids[1]);
         let output_inclusion = OutputInclusionProof {
             leaf_index: bob_coin_index,

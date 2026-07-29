@@ -218,6 +218,12 @@ pub struct PublisherConfig {
     pub inclusion_delay_margin: u32,
 }
 
+/// Test-only pre-broadcast hook slot: optional `FnMut` over the wallet RPC
+/// client, invoked once immediately before the anchor identity re-check so a
+/// deterministic reorg can be injected without racing the publish path.
+#[cfg(test)]
+type PreBroadcastHookSlot = Mutex<Option<Box<dyn FnMut(&Client) + Send>>>;
+
 /// Connected publisher bound to one wallet RPC endpoint.
 pub struct Publisher {
     rpc: Client,
@@ -226,7 +232,7 @@ pub struct Publisher {
     /// identity re-check, so a deterministic reorg can be injected without
     /// racing the publish path.
     #[cfg(test)]
-    pre_broadcast_hook: Mutex<Option<Box<dyn FnMut(&Client) + Send>>>,
+    pre_broadcast_hook: PreBroadcastHookSlot,
     /// Test-only: counts `getblockhash` RPCs issued for **member** tip
     /// validation ([`Self::cached_block_hash`]). Tip acquisition via
     /// [`Self::current_anchor`] and the pre-broadcast identity re-check are
@@ -328,6 +334,10 @@ pub struct PreparedBatch {
     pub reveal_fee: Amount,
 }
 
+/// Expected number of inputs on a zkCoins reveal: a single spend of the
+/// inscription commit output (see [`crate::inscription::build_inscription`]).
+const EXPECTED_REVEAL_INPUTS: usize = 1;
+
 impl PreparedBatch {
     pub fn commit_txid(&self) -> Txid {
         self.signed_commit.compute_txid()
@@ -335,6 +345,65 @@ impl PreparedBatch {
 
     pub fn reveal_txid(&self) -> Txid {
         self.reveal_tx.compute_txid()
+    }
+
+    /// Fail-closed integrity check of this commit/reveal pair.
+    ///
+    /// The commit pays to an unspendable NUMS keypath, so the reveal is the
+    /// only way to spend it: broadcasting a commit next to a reveal that does
+    /// not match it loses the value permanently. Every broadcast path — and
+    /// the crash-resume path, which rebuilds the batch from persisted bytes
+    /// that nothing has vouched for — validates the pair first.
+    ///
+    /// Checks: reveal input count, reveal outpoint txid == commit txid, the
+    /// referenced `vout` exists, and the commit output at that `vout` matches
+    /// `commit_output` in value, `script_pubkey` and Taproot type.
+    pub fn validate_pair(&self) -> Result<()> {
+        let reveal_inputs = self.reveal_tx.input.len();
+        ensure!(
+            reveal_inputs == EXPECTED_REVEAL_INPUTS,
+            "prepared pair integrity: reveal has {reveal_inputs} inputs, expected \
+             {EXPECTED_REVEAL_INPUTS} (single commit spend)"
+        );
+
+        let outpoint = self.reveal_tx.input[0].previous_output;
+        let commit_txid = self.signed_commit.compute_txid();
+        ensure!(
+            outpoint.txid == commit_txid,
+            "prepared pair integrity: reveal outpoint txid {} does not match commit \
+             txid {commit_txid}",
+            outpoint.txid
+        );
+
+        let vout = usize::try_from(outpoint.vout)
+            .context("prepared pair integrity: reveal outpoint vout does not fit usize")?;
+        let commit_out = self.signed_commit.output.get(vout).ok_or_else(|| {
+            anyhow!(
+                "prepared pair integrity: reveal outpoint vout {vout} does not exist \
+                 on commit {commit_txid} (commit has {} outputs)",
+                self.signed_commit.output.len()
+            )
+        })?;
+
+        ensure!(
+            commit_out.value == self.commit_output.value
+                && commit_out.script_pubkey == self.commit_output.script_pubkey,
+            "prepared pair integrity: commit output at vout {vout} does not match \
+             prepared.commit_output — on-tx value={} sat script_pubkey={} vs \
+             commit_output value={} sat script_pubkey={}",
+            commit_out.value.to_sat(),
+            commit_out.script_pubkey,
+            self.commit_output.value.to_sat(),
+            self.commit_output.script_pubkey
+        );
+        ensure!(
+            commit_out.script_pubkey.is_p2tr(),
+            "prepared pair integrity: commit output at vout {vout} is not P2TR \
+             (expected Taproot/inscription type); script_pubkey={}",
+            commit_out.script_pubkey
+        );
+
+        Ok(())
     }
 }
 
@@ -711,11 +780,19 @@ impl Publisher {
 
     /// Broadcast only the commit leg of a previously prepared pair.
     ///
-    /// Re-checks the block-anchor identity immediately before
-    /// `sendrawtransaction`. Does **not** broadcast the reveal.
+    /// Validates the commit/reveal pair against itself, then re-checks the
+    /// block-anchor identity, before `sendrawtransaction`. Does **not**
+    /// broadcast the reveal.
     pub fn broadcast_commit(&self, prepared: &PreparedBatch) -> Result<Txid> {
+        // Fail-closed pair check before any RPC: a mismatched reveal would
+        // permanently burn the NUMS commit value once the commit is accepted.
+        prepared.validate_pair().context(
+            "refuse broadcast_commit: prepared commit/reveal pair failed integrity check",
+        )?;
+
         // Test-only injection point: deterministic reorg before the identity
-        // re-check (no wall-clock race).
+        // re-check (no wall-clock race). Runs only after the pair is sound so
+        // a corrupt pair never reaches the network layer.
         #[cfg(test)]
         {
             if let Some(mut hook) = self
@@ -740,9 +817,16 @@ impl Publisher {
 
     /// Broadcast only the reveal leg of a previously prepared pair.
     ///
-    /// Intended for the resume path after commit is already on chain (or
-    /// immediately after a successful [`Self::broadcast_commit`]).
+    /// Validates the pair against itself before `sendrawtransaction` so a
+    /// resume path that only rebroadcasts the reveal still refuses a
+    /// corrupted reconstruct. Intended for the resume path after commit is
+    /// already on chain (or immediately after a successful
+    /// [`Self::broadcast_commit`]).
     pub fn broadcast_reveal(&self, prepared: &PreparedBatch) -> Result<Txid> {
+        prepared.validate_pair().context(
+            "refuse broadcast_reveal: prepared commit/reveal pair failed integrity check",
+        )?;
+
         let commit_txid = prepared.commit_txid();
         let reveal_txid = prepared.reveal_txid();
         self.rpc
@@ -1521,13 +1605,6 @@ pub(crate) fn ensure_deterministic_funding(script_pubkey: &Script) -> Result<()>
     );
 }
 
-/// Back-compat name: deterministic segwit funding only (see
-/// [`ensure_deterministic_funding`]).
-#[cfg(test)]
-pub(crate) fn ensure_segwit_funding(script_pubkey: &Script) -> Result<()> {
-    ensure_deterministic_funding(script_pubkey)
-}
-
 /// Measure the weight (WU) of a reveal transaction that carries `payload`.
 ///
 /// Uses a dummy funding outpoint and a P2TR reveal output; only the reveal
@@ -2002,6 +2079,157 @@ mod tests {
         ensure_deterministic_funding(&p2tr).expect("v1 p2tr must pass");
     }
 
+    /// Minimal self-consistent commit/reveal pair for pair-integrity unit tests
+    /// (no bitcoind, no real inscription witness — only structural fields).
+    fn sample_valid_prepared_batch() -> PreparedBatch {
+        let nums = nums_internal_key().expect("NUMS key");
+        let p2tr = ScriptBuf::new_p2tr(
+            &bitcoin::secp256k1::Secp256k1::verification_only(),
+            nums,
+            None,
+        );
+        let commit_output = TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: p2tr.clone(),
+        };
+        let signed_commit = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![commit_output.clone()],
+        };
+        let commit_txid = signed_commit.compute_txid();
+        let reveal_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: OutPoint {
+                    txid: commit_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(500),
+                script_pubkey: p2tr,
+            }],
+        };
+        PreparedBatch {
+            aggregate: AggregateStateNullifierV3 {
+                version: 3,
+                format: 0x01,
+                block_anchor: BlockAnchor {
+                    block_hash: [0xAB; 32],
+                    height: 1,
+                },
+                members: vec![([0x01; 32], [0x02; 32])],
+                raw_s: None,
+                s_agg: Some([0x03; 32]),
+            },
+            payload: vec![0x42],
+            signed_commit,
+            reveal_tx,
+            commit_output,
+            block_anchor: BlockAnchor {
+                block_hash: [0xAB; 32],
+                height: 1,
+            },
+            commit_vsize: 100,
+            reveal_vsize: 200,
+            commit_fee: Amount::from_sat(100),
+            reveal_fee: Amount::from_sat(200),
+        }
+    }
+
+    #[test]
+    fn validate_prepared_pair_accepts_self_consistent_batch() {
+        let prepared = sample_valid_prepared_batch();
+        prepared.validate_pair().expect("valid pair must pass");
+    }
+
+    /// Corrupt reveal outpoint txid: pair check fails. Without this gate,
+    /// `broadcast_commit` would send a valid commit that no matching reveal
+    /// can spend — permanent value loss on the NUMS keypath.
+    #[test]
+    fn validate_prepared_pair_rejects_wrong_reveal_outpoint_txid() {
+        let mut prepared = sample_valid_prepared_batch();
+        prepared.reveal_tx.input[0].previous_output.txid = Txid::from_byte_array([0xFF; 32]);
+        let err = prepared
+            .validate_pair()
+            .expect_err("wrong outpoint txid must fail pair integrity");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reveal outpoint txid") && msg.contains("does not match commit"),
+            "must name the outpoint-txid condition: {msg}"
+        );
+    }
+
+    /// Non-existent commit vout referenced by the reveal.
+    #[test]
+    fn validate_prepared_pair_rejects_missing_commit_vout() {
+        let mut prepared = sample_valid_prepared_batch();
+        prepared.reveal_tx.input[0].previous_output.vout = 7;
+        let err = prepared
+            .validate_pair()
+            .expect_err("non-existent vout must fail pair integrity");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("vout 7") && msg.contains("does not exist"),
+            "must name the missing-vout condition: {msg}"
+        );
+    }
+
+    /// `prepared.commit_output` diverges from the actual commit output at the
+    /// reveal's outpoint (value mismatch).
+    #[test]
+    fn validate_prepared_pair_rejects_commit_output_mismatch() {
+        let mut prepared = sample_valid_prepared_batch();
+        prepared.commit_output.value = Amount::from_sat(9_999);
+        let err = prepared
+            .validate_pair()
+            .expect_err("commit_output value mismatch must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not match") && msg.contains("commit_output"),
+            "must name the commit_output mismatch: {msg}"
+        );
+    }
+
+    /// Wrong input count (empty reveal inputs).
+    #[test]
+    fn validate_prepared_pair_rejects_wrong_reveal_input_count() {
+        let mut prepared = sample_valid_prepared_batch();
+        prepared.reveal_tx.input.clear();
+        let err = prepared
+            .validate_pair()
+            .expect_err("empty reveal inputs must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("inputs") && msg.contains("expected"),
+            "must name the input-count condition: {msg}"
+        );
+    }
+
+    /// Non-P2TR commit output (wrong script type).
+    #[test]
+    fn validate_prepared_pair_rejects_non_p2tr_commit_output() {
+        let mut prepared = sample_valid_prepared_batch();
+        let legacy = ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([0x44; 20]));
+        prepared.signed_commit.output[0].script_pubkey = legacy.clone();
+        prepared.commit_output.script_pubkey = legacy;
+        // Reveal still points at the old commit txid — recompute outpoint.
+        let commit_txid = prepared.signed_commit.compute_txid();
+        prepared.reveal_tx.input[0].previous_output.txid = commit_txid;
+        let err = prepared.validate_pair().expect_err("non-P2TR must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not P2TR") || msg.contains("Taproot"),
+            "must name the script-type condition: {msg}"
+        );
+    }
+
     #[test]
     fn fee_for_vsize_arithmetic_and_overflow() {
         assert_eq!(fee_for_vsize(250, 10).expect("ok").to_sat(), 2_500);
@@ -2225,7 +2453,7 @@ mod tests {
         // then pad the logical member list in the serialized payload shape via
         // the structural constructor above for the true oversize case — the
         // crypto sum of ~max members is intentionally avoided in unit tests.
-        let repeated: Vec<NullifierSig> = std::iter::repeat(one).take(3).collect();
+        let repeated: Vec<NullifierSig> = std::iter::repeat_n(one, 3).collect();
         let agg = aggregate_sig_with_anchor(&repeated, BlockAnchor::default())
             .expect("aggregate_sig_with_anchor accepts repeated members");
         assert_eq!(agg.members.len(), 3);
@@ -3289,7 +3517,7 @@ mod tests {
             .lock_unspent(&to_lock)
             .expect("lock_unspent large UTXOs");
 
-        let result = (|| {
+        let result = {
             let candidates = publisher.list_funding_candidates().expect("cands");
             assert!(
                 candidates.iter().all(|c| c.amount < reveal_out) && !candidates.is_empty(),
@@ -3323,7 +3551,7 @@ mod tests {
                 "must report zero constructions / prefilter skips: {msg}"
             );
             Ok::<(), String>(())
-        })();
+        };
 
         let _ = publisher.rpc.unlock_unspent_all();
         result.expect("F5 prefilter path");
@@ -3371,7 +3599,7 @@ mod tests {
                 .expect("lock all but tiny");
         }
 
-        let result = (|| {
+        let result = {
             let (sigs, _) = signed_members(1, Network::Regtest);
             let members = batch_at_tip(&publisher, &sigs);
             let err = publisher
@@ -3394,7 +3622,7 @@ mod tests {
                 "after-measurement count should be zero or absent: {msg}"
             );
             Ok::<(), String>(())
-        })();
+        };
 
         let _ = publisher.rpc.unlock_unspent_all();
         result.expect("F6 unmeasured shortfall path");
