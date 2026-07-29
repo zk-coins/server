@@ -140,20 +140,63 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         v1_finality_ok: v1_readiness.finality_ok,
         pending_sign_map: Arc::new(DashMap::new()),
         // Production finalise: prove outside the engine lock, then apply
-        // with live re-validation (receive-path invariant). Under the v1.1
-        // claim a missing driver fails the job loud rather than
-        // short-circuiting to "signature_accepted" alone.
+        // with live re-validation (receive-path invariant), stage
+        // members_ready, then durable-publish that row — same order as the
+        // direct receive path. Under the v1.1 claim a missing driver fails
+        // the job loud rather than short-circuiting to "signature_accepted"
+        // alone. The publisher handle is connected once at boot so the hook
+        // can reach durable_publish without breaking the AppState layering
+        // (AppState / V1FinaliseHook still carry no publisher type).
         v1_finalise: v1_engine.as_ref().map(|adapter| {
             let adapter = Arc::clone(adapter);
+            let network = adapter.network();
+            // Fail-loud connect once. An incomplete env / bitcoind outage
+            // yields Err on every finalise (after members_ready stage when
+            // prove already ran on a prior attempt that left a row — the
+            // resume path still stages first). No silent skip of publish.
+            //
+            // Classification uses a typed [`crate::v1::signature::PublishRejected`]
+            // cause so the dispatcher stores `publish_rejected` via downcast —
+            // same outward code as a mid-finalise handoff failure. Display
+            // text is **diagnostic only**, not a machine-code contract (no
+            // `publish_rejected:` prefix dependency).
+            //
+            // Why `PublishRejected` and not a separate config code: a missing
+            // publisher at boot makes the durable nullifier handoff impossible
+            // for every finalise; the §7.5 surface the wallet already treats
+            // as retryable publish failure is `publish_rejected`. Inventing
+            // `internal_error` would change the outward code for the same
+            // operational fact (handoff cannot run).
+            let publisher_slot: Arc<
+                Result<crate::v1::V1Publisher, crate::v1::signature::PublishRejected>,
+            > = Arc::new(
+                crate::v1::v1_publisher_env_from_env(network)
+                    .and_then(crate::v1::connect_v1_publisher)
+                    .map_err(
+                        |e| crate::v1::signature::PublishRejected::DurableHandoffFailed {
+                            detail: format!(
+                                "v1.1 finalise publisher unavailable at REST boot \
+                                 (nullifier handoff cannot run): {e:#}"
+                            ),
+                        },
+                    ),
+            );
             let hook: crate::router::V1FinaliseHook = Arc::new(move |pending, signature, fence| {
                 let adapter = Arc::clone(&adapter);
+                let publisher_slot = Arc::clone(&publisher_slot);
                 // publisher_pubkey is filled by the dispatcher from the job
                 // request_body after the hook returns.
                 // Durable + fenced: prove → apply → engine snapshot +
-                // members_ready only while this claim epoch still holds.
+                // members_ready → durable publish handoff, only while this
+                // claim epoch still holds for the persist step.
                 Box::pin(async move {
+                    let publisher = match publisher_slot.as_ref() {
+                        Ok(p) => p,
+                        // Preserve the typed cause for dispatcher downcast.
+                        Err(cause) => return Err(anyhow::Error::new(cause.clone())),
+                    };
                     crate::v1::finalise_accepted_prove_persist_and_stage(
-                        &adapter, pending, signature, None, fence,
+                        &adapter, pending, signature, None, fence, publisher,
                     )
                     .await
                 })

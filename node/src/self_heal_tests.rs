@@ -573,6 +573,7 @@ async fn heal_v1_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
     store
         .set_status(
             job_id,
+            crate::job_store::JobStatus::Queued,
             crate::job_store::JobStatus::Broadcasting,
             crate::job_store::FINALISE_CLAIM_PHASE,
         )
@@ -711,7 +712,12 @@ async fn heal_v1_reset_fences_pre_loaded_job_resurrection() {
 
     // Worker A's set_status must report zero rows and not resurrect.
     let advanced = store
-        .set_status(job_id, crate::job_store::JobStatus::Proving, "proving")
+        .set_status(
+            job_id,
+            crate::job_store::JobStatus::Queued,
+            crate::job_store::JobStatus::Proving,
+            "proving",
+        )
         .await
         .expect("set_status query ok");
     assert!(
@@ -728,7 +734,12 @@ async fn heal_v1_reset_fences_pre_loaded_job_resurrection() {
     // Worker A's unconditional complete must report zero rows and not mark
     // completed either.
     let completed = store
-        .complete(job_id, serde_json::json!({"stolen": true}), 200)
+        .complete(
+            job_id,
+            crate::job_store::JobStatus::Queued,
+            serde_json::json!({"stolen": true}),
+            200,
+        )
         .await
         .expect("complete query ok");
     assert!(
@@ -791,7 +802,12 @@ async fn heal_v1_reset_fences_stale_generation_admit() {
 
     let store = crate::job_store::JobStore::new(pool.clone());
     let stale_advanced = store
-        .set_status(public_id, crate::job_store::JobStatus::Proving, "proving")
+        .set_status(
+            public_id,
+            crate::job_store::JobStatus::Queued,
+            crate::job_store::JobStatus::Proving,
+            "proving",
+        )
         .await
         .expect("set_status query ok");
     assert!(
@@ -799,7 +815,12 @@ async fn heal_v1_reset_fences_stale_generation_admit() {
         "stale-generation set_status must report 0 rows (false)"
     );
     let completed = store
-        .complete(public_id, serde_json::json!({"nope": true}), 200)
+        .complete(
+            public_id,
+            crate::job_store::JobStatus::Queued,
+            serde_json::json!({"nope": true}),
+            200,
+        )
         .await
         .expect("complete query ok");
     assert!(!completed, "stale-generation complete must report 0 rows");
@@ -829,6 +850,7 @@ async fn heal_v1_reset_fences_stale_generation_admit() {
     let advanced_ok = store
         .set_status(
             fresh_job.public_id,
+            crate::job_store::JobStatus::Queued,
             crate::job_store::JobStatus::Proving,
             "proving",
         )
@@ -898,7 +920,12 @@ async fn heal_legacy_reset_fences_pre_loaded_job_resurrection() {
     );
 
     let resurrected = store
-        .set_status(job_id, crate::job_store::JobStatus::Proving, "proving")
+        .set_status(
+            job_id,
+            crate::job_store::JobStatus::Queued,
+            crate::job_store::JobStatus::Proving,
+            "proving",
+        )
         .await
         .expect("set_status query ok");
     assert!(
@@ -906,7 +933,12 @@ async fn heal_legacy_reset_fences_pre_loaded_job_resurrection() {
         "legacy pre-reset set_status must report 0 rows"
     );
     let completed = store
-        .complete(job_id, serde_json::json!({"legacy_stolen": true}), 200)
+        .complete(
+            job_id,
+            crate::job_store::JobStatus::Queued,
+            serde_json::json!({"legacy_stolen": true}),
+            200,
+        )
         .await
         .expect("complete query ok");
     assert!(!completed, "legacy pre-reset complete must report 0 rows");
@@ -1036,6 +1068,7 @@ async fn heal_set_status_blocks_until_open_generation_bump_commits() {
 
     let set_fut = store.set_status(
         job_id,
+        crate::job_store::JobStatus::Queued,
         crate::job_store::JobStatus::Broadcasting,
         "broadcasting",
     );
@@ -1096,8 +1129,9 @@ async fn heal_complete_reports_zero_rows_and_no_completed_event() {
     assert!(store
         .set_status(
             job_id,
+            crate::job_store::JobStatus::Queued,
             crate::job_store::JobStatus::Broadcasting,
-            "broadcasting"
+            "broadcasting",
         )
         .await
         .expect("set broadcasting"));
@@ -1118,7 +1152,12 @@ async fn heal_complete_reports_zero_rows_and_no_completed_event() {
     notify_map.insert(job_id, notifier);
 
     let applied = store
-        .complete(job_id, serde_json::json!({"stolen": true}), 200)
+        .complete(
+            job_id,
+            crate::job_store::JobStatus::Broadcasting,
+            serde_json::json!({"stolen": true}),
+            200,
+        )
         .await
         .expect("complete query ok");
     assert!(
@@ -1193,6 +1232,7 @@ async fn heal_set_status_reports_zero_rows_on_generation_fence() {
     let applied = store
         .set_status(
             job.public_id,
+            crate::job_store::JobStatus::Queued,
             crate::job_store::JobStatus::Proving,
             "proving",
         )

@@ -217,7 +217,7 @@ mod cancel_tests {
             _ => panic!(),
         };
         store
-            .set_status(id, JobStatus::Proving, "proving")
+            .set_status(id, JobStatus::Queued, JobStatus::Proving, "proving")
             .await
             .expect("proving");
         let err = cancel_job(
@@ -247,7 +247,7 @@ mod cancel_tests {
             _ => panic!(),
         };
         store
-            .set_status(id, JobStatus::Proving, "proving")
+            .set_status(id, JobStatus::Queued, JobStatus::Proving, "proving")
             .await
             .expect("proving");
         let job = cancel_job(
@@ -273,7 +273,12 @@ mod cancel_tests {
             _ => panic!(),
         };
         store
-            .set_status(pub_id, JobStatus::Broadcasting, "broadcasting")
+            .set_status(
+                pub_id,
+                JobStatus::Queued,
+                JobStatus::Broadcasting,
+                "broadcasting",
+            )
             .await
             .expect("broadcasting");
         let err = cancel_job(
@@ -330,7 +335,7 @@ mod cancel_tests {
         // Non-zero progress + non-default phase: store cancel does not
         // rewrite progress; projection must keep it and set phase only.
         store
-            .set_status(id, JobStatus::Proving, "proving_circuit")
+            .set_status(id, JobStatus::Queued, JobStatus::Proving, "proving_circuit")
             .await
             .expect("proving");
         // Plant progress directly — set_status does not take progress.

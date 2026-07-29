@@ -422,9 +422,19 @@ async fn process_attest_balance(
     job: Job,
 ) -> anyhow::Result<()> {
     let public_id = job.public_id;
-    job_store
-        .set_status(public_id, JobStatus::Proving, "proving")
-        .await?;
+    // Allowed transition: queued → proving. Miss = someone else advanced.
+    if !job_store
+        .set_status(public_id, JobStatus::Queued, JobStatus::Proving, "proving")
+        .await?
+    {
+        tracing::warn!(
+            "Job dispatcher: attest job {} set_status(queued→proving) matched 0 rows; \
+             aborting without event",
+            public_id
+        );
+        notify_map.remove(&public_id);
+        return Ok(());
+    }
     publish_phase(
         notify_map,
         public_id,
@@ -444,7 +454,16 @@ async fn process_attest_balance(
                 "proving_failed",
                 format!("invalid attest job body: {e}"),
             );
-            job_store.fail(public_id, &msg).await?;
+            // Allowed: proving → failed. Miss: no failed event.
+            if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
+                tracing::warn!(
+                    "Job dispatcher: attest job {} fail(proving) matched 0 rows; \
+                     not publishing failed event",
+                    public_id
+                );
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -467,7 +486,15 @@ async fn process_attest_balance(
                 "internal_error",
                 "v1 EngineAdapter missing for attest_balance job",
             );
-            job_store.fail(public_id, &msg).await?;
+            if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
+                tracing::warn!(
+                    "Job dispatcher: attest job {} fail(proving) matched 0 rows; \
+                     not publishing failed event",
+                    public_id
+                );
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -500,7 +527,15 @@ async fn process_attest_balance(
                 Ok(b) => b,
                 Err(e) => {
                     let msg = crate::v1::encode_job_error("proving_failed", e.message());
-                    job_store.fail(public_id, &msg).await?;
+                    if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
+                        tracing::warn!(
+                            "Job dispatcher: attest job {} fail(proving) matched 0 rows; \
+                             not publishing failed event",
+                            public_id
+                        );
+                        notify_map.remove(&public_id);
+                        return Ok(());
+                    }
                     publish_phase(
                         notify_map,
                         public_id,
@@ -516,8 +551,20 @@ async fn process_attest_balance(
                 }
             };
             // §7.5 result for attest_balance: only `attestation` is present.
+            // Allowed: proving → completed.
             let result = crate::v1::completed_attest_result(&bytes);
-            job_store.complete(public_id, result.clone(), 200).await?;
+            if !job_store
+                .complete(public_id, JobStatus::Proving, result.clone(), 200)
+                .await?
+            {
+                tracing::warn!(
+                    "Job dispatcher: attest job {} complete(proving) matched 0 rows; \
+                     not publishing completed event",
+                    public_id
+                );
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -549,7 +596,15 @@ async fn process_attest_balance(
                     return Ok(());
                 }
             }
-            job_store.fail(public_id, &msg).await?;
+            if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
+                tracing::warn!(
+                    "Job dispatcher: attest job {} fail(proving) matched 0 rows; \
+                     not publishing failed event",
+                    public_id
+                );
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
             publish_phase(
                 notify_map,
                 public_id,
@@ -618,14 +673,15 @@ async fn process_mint(
     job: Job,
 ) -> anyhow::Result<()> {
     let public_id = job.public_id;
+    // Allowed: queued → proving. Miss = concurrent advance / fence — stop.
     if !job_store
-        .set_status(public_id, JobStatus::Proving, "proving")
+        .set_status(public_id, JobStatus::Queued, JobStatus::Proving, "proving")
         .await?
     {
-        // Zero rows: generation fence or concurrent terminal — do not prove
+        // Zero rows: wrong status, claim phase, generation fence — do not prove
         // against wiped / foreign state (no silent fallback).
         tracing::warn!(
-            "Job dispatcher: mint job {} set_status(proving) matched 0 rows; aborting",
+            "Job dispatcher: mint job {} set_status(queued→proving) matched 0 rows; aborting",
             public_id
         );
         notify_map.remove(&public_id);
@@ -647,7 +703,8 @@ async fn process_mint(
         Ok(r) => r,
         Err(e) => {
             let msg = format!("invalid mint request body: {}", e);
-            if !job_store.fail(public_id, &msg).await? {
+            // Allowed: proving → failed.
+            if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
                 tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
@@ -689,7 +746,11 @@ async fn process_mint(
                     return Ok(());
                 }
             }
-            if !job_store.fail(public_id, &message).await? {
+            // Allowed: proving → failed.
+            if !job_store
+                .fail(public_id, JobStatus::Proving, &message)
+                .await?
+            {
                 tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
@@ -747,7 +808,8 @@ async fn process_mint(
                 msg
             );
             let err = fail_error_string(&msg);
-            if !job_store.fail(public_id, &err).await? {
+            // Allowed: proving → failed (still on prove path).
+            if !job_store.fail(public_id, JobStatus::Proving, &err).await? {
                 tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
@@ -1177,12 +1239,13 @@ async fn process_send_initial(
     job: Job,
 ) -> anyhow::Result<()> {
     let public_id = job.public_id;
+    // Allowed: queued → proving. Miss = concurrent advance / fence — stop.
     if !job_store
-        .set_status(public_id, JobStatus::Proving, "proving")
+        .set_status(public_id, JobStatus::Queued, JobStatus::Proving, "proving")
         .await?
     {
         tracing::warn!(
-            "Job dispatcher: send job {} set_status(proving) matched 0 rows; aborting",
+            "Job dispatcher: send job {} set_status(queued→proving) matched 0 rows; aborting",
             public_id
         );
         notify_map.remove(&public_id);
@@ -1204,7 +1267,8 @@ async fn process_send_initial(
         Ok(r) => r,
         Err(e) => {
             let msg = format!("invalid send request body: {}", e);
-            if !job_store.fail(public_id, &msg).await? {
+            // Allowed: proving → failed.
+            if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
                 tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
@@ -1246,7 +1310,11 @@ async fn process_send_initial(
                     return Ok(());
                 }
             }
-            if !job_store.fail(public_id, &message).await? {
+            // Allowed: proving → failed.
+            if !job_store
+                .fail(public_id, JobStatus::Proving, &message)
+                .await?
+            {
                 tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
@@ -1311,7 +1379,8 @@ async fn process_send_initial(
                 msg
             );
             let err = fail_error_string(&msg);
-            if !job_store.fail(public_id, &err).await? {
+            // Allowed: proving → failed.
+            if !job_store.fail(public_id, JobStatus::Proving, &err).await? {
                 tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
@@ -1636,7 +1705,11 @@ async fn wait_for_commit(
         Ok(c) => c,
         Err(e) => {
             let msg = format!("invalid commit body: {}", e);
-            if !job_store.fail(public_id, &msg).await? {
+            // Allowed: awaiting_signature → failed (still pre-broadcast).
+            if !job_store
+                .fail(public_id, JobStatus::AwaitingSignature, &msg)
+                .await?
+            {
                 tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
@@ -1659,14 +1732,20 @@ async fn wait_for_commit(
         }
     };
 
+    // Allowed: awaiting_signature → broadcasting (legacy post-sign path).
     if !job_store
-        .set_status(public_id, JobStatus::Broadcasting, "broadcasting")
+        .set_status(
+            public_id,
+            JobStatus::AwaitingSignature,
+            JobStatus::Broadcasting,
+            "broadcasting",
+        )
         .await?
     {
-        // Zero rows: self-heal fence / missing row. Never run commit flows
-        // against wiped proof state after a silent no-op status write.
+        // Zero rows: wrong status / claim phase / generation fence. Never run
+        // commit flows against wiped proof state after a silent no-op write.
         tracing::warn!(
-            "Job dispatcher: job {} set_status(broadcasting) matched 0 rows; \
+            "Job dispatcher: job {} set_status(awaiting_signature→broadcasting) matched 0 rows; \
              refusing mint_commit_flow/commit_flow",
             public_id
         );
@@ -1698,15 +1777,21 @@ async fn wait_for_commit(
     };
     match commit_outcome {
         Ok((response_body, response_status)) => {
+            // Allowed: broadcasting → completed (legacy; not finalise_claimed).
             if !job_store
-                .complete(public_id, response_body.clone(), response_status as i16)
+                .complete(
+                    public_id,
+                    JobStatus::Broadcasting,
+                    response_body.clone(),
+                    response_status as i16,
+                )
                 .await?
             {
-                // Zero rows: generation fence / terminal / missing. Never
-                // publish completed against a row that did not advance
-                // (e.g. reset failed the job while commit_flow was in flight).
+                // Zero rows: generation fence / claim phase / terminal / missing.
+                // Never publish completed against a row that did not advance.
                 tracing::warn!(
-                    "Job dispatcher: job {} complete matched 0 rows; refusing completed event",
+                    "Job dispatcher: job {} complete(broadcasting) matched 0 rows; \
+                     refusing completed event",
                     public_id
                 );
                 cleanup_pending_sign(job_store, app_state, public_id).await;
@@ -1733,9 +1818,13 @@ async fn wait_for_commit(
                 status.as_u16(),
                 message
             );
-            if !job_store.fail(public_id, &message).await? {
+            // Allowed: broadcasting → failed (legacy).
+            if !job_store
+                .fail(public_id, JobStatus::Broadcasting, &message)
+                .await?
+            {
                 tracing::warn!(
-                    "Job dispatcher: job {} fail matched 0 rows after commit error; \
+                    "Job dispatcher: job {} fail(broadcasting) matched 0 rows after commit error; \
                      not publishing failed event",
                     public_id
                 );
@@ -2007,6 +2096,36 @@ where
     }
 }
 
+/// Encode a finalise-hook failure for the job `error` column.
+///
+/// Uses the typed host helpers only:
+/// - [`crate::v1::signature::machine_code_from_engine_error`] — downcast
+/// - [`crate::v1::signature::encode_job_error_from_anyhow`] — structured JSON
+/// - [`crate::v1::signature::http_status_for_machine_code`] — RPC table for
+///   KernelErrorCode reasons (`dependency_not_final` → 409); job-body-only
+///   codes (`publish_rejected`, default `proving_failed`) return `None`
+///
+/// Free-form text is **not** classified by substring: without a typed cause
+/// the stored code is `proving_failed`.
+fn encoded_finalise_hook_failure(err: &anyhow::Error) -> String {
+    use crate::v1::signature::{
+        encode_job_error_from_anyhow, http_status_for_machine_code, machine_code_from_engine_error,
+    };
+
+    if let Some(code) = machine_code_from_engine_error(err) {
+        // Pin the single transport table for KernelErrorCode reasons. Absence
+        // means job-body-only code (poll HTTP stays 200) — not an inventable status.
+        if let Some(rpc_http) = http_status_for_machine_code(code) {
+            tracing::debug!(
+                code,
+                rpc_http,
+                "typed finalise cause maps to KernelErrorCode RPC status"
+            );
+        }
+    }
+    encode_job_error_from_anyhow(err)
+}
+
 /// Documented host edge of the job-path finalise resume.
 ///
 /// ## Where completion ends (and why)
@@ -2015,23 +2134,27 @@ where
 ///
 /// 1. exclusive claim (owner + lease, renewed during long prove)
 /// 2. prove + apply + **durable** engine snapshot + `v1_pending_publishes`
-///    (`members_ready`) via [`crate::router::V1FinaliseHook`] **or** skip
-///    when `completion_result` is already durable (crash after stage)
+///    (`members_ready`) + **durable nullifier publish handoff** via
+///    [`crate::router::V1FinaliseHook`] **or** skip prove when
+///    `completion_result` is already durable (crash after host work)
 /// 3. persist the §7.5 completion surface on the durable capability
-/// 4. [`JobStore::complete_if_finalise_owner`] — §7.5 result published onto the job row
+/// 4. refuse terminal complete while a pending publish is still only
+///    `members_ready` (handoff not yet recorded)
+/// 5. [`JobStore::complete_if_finalise_owner`] — §7.5 result published onto the job row
 ///
 /// That is the **host edge**. The production hook
-/// ([`crate::v1::finalise_accepted_prove_persist_and_stage`]) leaves the
-/// applied account and a `members_ready` rebroadcast intent on disk so a
-/// restarted node — or later publisher wiring — finds the job exactly at
-/// this edge. On-chain AggregateStateNullifierV3 **broadcast** still needs
-/// a live bitcoind wallet ([`crate::v1::V1Publisher`]); that is outside
-/// the host edge, not a silent skip of durability up to it.
+/// ([`crate::v1::finalise_accepted_prove_persist_and_stage`]) stages the
+/// applied account, then hands the same row to
+/// [`crate::v1::resume_pending_publish`] (construct/broadcast) before
+/// returning Ok — the same order as the direct receive path. A job is not
+/// `completed` while the intent remains `members_ready`. NfLog scan-fold
+/// after on-chain confirmation remains outside this edge.
 ///
-/// Resume is covered durably up to this edge so a job can be driven to exactly
-/// the point where chain-publish takes over.
+/// Resume is covered durably up to this edge so a crash mid-handoff leaves
+/// a progressive `v1_pending_publishes` row; boot still runs
+/// `resume_all_pending_publishes` for any leftover mid-broadcast status.
 pub const JOB_FINALISE_HOST_EDGE: &str =
-    "job_result_published_after_durable_engine_and_members_ready; on-chain AggregateStateNullifierV3 broadcast requires bitcoind (publisher not driven by this path)";
+    "job_result_published_after_durable_engine_members_ready_and_nullifier_broadcast_handoff; on-chain AggregateStateNullifierV3 confirmation / NfLog scan-fold still needs bitcoind scanner (not a silent skip of publish handoff)";
 
 /// Drive an accepted v1.1 signature through the durable host path up to
 /// [`JOB_FINALISE_HOST_EDGE`].
@@ -2057,12 +2180,12 @@ pub const JOB_FINALISE_HOST_EDGE: &str =
 /// | Write | Actual `WHERE` / lock (ground truth) | Zero-row report |
 /// |-------|--------------------------------------|-----------------|
 /// | [`JobStore::create`] (`INSERT`) | tx: `SELECT generation … FOR UPDATE` then `INSERT … reset_generation = $8` | `CreateResult` |
-/// | [`JobStore::set_status`] | lock gen; `WHERE public_id AND reset_generation = $4 AND status NOT IN (terminal)` | **bool** |
+/// | [`JobStore::set_status`] | lock gen; `WHERE public_id AND status = $from AND phase ≠ finalise_claimed AND reset_generation = $N` | **bool** |
 /// | [`JobStore::set_awaiting_signature`] | lock gen; `WHERE public_id AND status IN (queued,proving) AND reset_generation = $4` | **bool** |
-/// | [`JobStore::complete`] | lock gen; `WHERE public_id AND reset_generation = $4 AND status NOT IN (terminal)` | **bool** |
+/// | [`JobStore::complete`] | lock gen; `WHERE public_id AND status = $from AND phase ≠ finalise_claimed AND reset_generation = $N` | **bool** |
 /// | [`JobStore::complete_if_status`] | lock gen; status ANY + not claim phase + `reset_generation = $6` | **bool** |
 /// | [`JobStore::complete_if_finalise_owner`] | lock gen; claim fence + lease + `reset_generation = $7` | **bool** |
-/// | [`JobStore::fail`] | lock gen; `WHERE public_id AND reset_generation = $3 AND status NOT IN (terminal)` | **bool** |
+/// | [`JobStore::fail`] | lock gen; `WHERE public_id AND status = $from AND phase ≠ finalise_claimed AND reset_generation = $N` | **bool** |
 /// | [`JobStore::fail_if_status`] | lock gen; status ANY + not claim phase + `reset_generation = $5` | **bool** |
 /// | [`JobStore::fail_if_finalise_owner`] | lock gen; claim fence + lease + `reset_generation = $6` | **bool** |
 /// | [`JobStore::claim_finalise_exclusive`] path A/B | lock gen once; status/phase CAS + `reset_generation = $N`; **mints** fence | `FinaliseClaim` |
@@ -2158,6 +2281,25 @@ async fn drive_v1_finalise(
         message: String,
     ) -> anyhow::Result<()> {
         let err = crate::v1::encode_job_error(code, message.clone());
+        fail_v1_as_owner_encoded(
+            job_store, app_state, notify_map, public_id, owner, fence, err,
+        )
+        .await
+    }
+
+    /// Fence-qualified fail with a pre-encoded §7.5 `{error, message}` JSON
+    /// string (from [`crate::v1::signature::encode_job_error_from_anyhow`] or
+    /// [`crate::v1::encode_job_error`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_v1_as_owner_encoded(
+        job_store: &JobStore,
+        app_state: &AppState,
+        notify_map: &JobNotifyMap,
+        public_id: Uuid,
+        owner: Uuid,
+        fence: i64,
+        err: String,
+    ) -> anyhow::Result<()> {
         let failed = job_store
             .fail_if_finalise_owner(public_id, owner, fence, &err)
             .await?;
@@ -2448,7 +2590,11 @@ async fn drive_v1_finalise(
                     }
                     app_state.pending_sign_map.insert(public_id, entry.clone());
                 }
-                Err(e) if e == crate::job_store::FINALISE_FENCE_LOST => {
+                Err(e)
+                    if e.to_string() == crate::job_store::FINALISE_FENCE_LOST
+                        || e.chain()
+                            .any(|c| c.to_string() == crate::job_store::FINALISE_FENCE_LOST) =>
+                {
                     // Stale epoch lost the engine/members_ready commit (or the
                     // resume shortcut). Quiet exit — do not terminal-fail a
                     // job another fence may hold.
@@ -2460,17 +2606,21 @@ async fn drive_v1_finalise(
                     return Ok(());
                 }
                 Err(e) => {
-                    let msg = format!("v1.1 finalise failed: {e}");
-                    tracing::warn!("Job dispatcher: job {} {}", public_id, msg);
-                    return fail_v1_as_owner(
+                    // Typed causes (`PublishRejected`, `DependencyNotFinal`)
+                    // classify via downcast — never by message substring.
+                    // Free-form text with the same wording stores
+                    // `proving_failed` (encode_job_error_from_anyhow default).
+                    let err = e.context("v1.1 finalise failed");
+                    tracing::warn!("Job dispatcher: job {} {err:#}", public_id);
+                    let encoded = encoded_finalise_hook_failure(&err);
+                    return fail_v1_as_owner_encoded(
                         job_store,
                         app_state,
                         notify_map,
                         public_id,
                         claim_owner,
                         claim_fence,
-                        "proving_failed",
-                        msg,
+                        encoded,
                     )
                     .await;
                 }
@@ -2478,7 +2628,7 @@ async fn drive_v1_finalise(
         }
 
         // Host §7.5 job-result publication + terminal complete.
-        // This is [`JOB_FINALISE_HOST_EDGE`] — not on-chain AggregateStateNullifierV3.
+        // This is [`JOB_FINALISE_HOST_EDGE`] — after durable publish handoff.
         // Fence is claim token + unexpired lease, not status or owner alone.
         if let Err(msg) = crate::v1::ensure_completion_ready(&entry) {
             return fail_v1_as_owner(
@@ -2492,6 +2642,51 @@ async fn drive_v1_finalise(
                 format!("v1.1 finalise: incomplete capability for host complete: {msg}"),
             )
             .await;
+        }
+        // Refuse completed while the staged nullifier is still only
+        // members_ready (broadcast handoff not recorded). The production
+        // hook advances the row before returning Ok; a crash/test double
+        // that left members_ready must not claim host completion.
+        if let Some(sig) = entry.signature.as_ref() {
+            match crate::v1::db_v1::load_pending_publish(&app_state.pool, sig.pk_i).await {
+                Ok(Some(row)) if row.status == crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY => {
+                    return fail_v1_as_owner(
+                        job_store,
+                        app_state,
+                        notify_map,
+                        public_id,
+                        claim_owner,
+                        claim_fence,
+                        "publish_rejected",
+                        // Diagnostic message only — the stored machine code is
+                        // the explicit `code` argument above, not parsed from
+                        // this text (no `publish_rejected:` prefix contract).
+                        format!(
+                            "v1.1 finalise refuses completed while \
+                             pending publish for pk={} is still members_ready \
+                             (broadcast handoff not recorded; row retained)",
+                            hex::encode(sig.pk_i)
+                        ),
+                    )
+                    .await;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return fail_v1_as_owner(
+                        job_store,
+                        app_state,
+                        notify_map,
+                        public_id,
+                        claim_owner,
+                        claim_fence,
+                        "internal_error",
+                        format!(
+                            "v1.1 finalise: cannot load pending publish before complete: {e:#}"
+                        ),
+                    )
+                    .await;
+                }
+            }
         }
         let response_body = entry
             .completion_result
@@ -2522,8 +2717,7 @@ async fn drive_v1_finalise(
                 },
             );
             tracing::info!(
-                "Job dispatcher: job {} reached host finalise edge ({}); \
-                 on-chain nullifier publish is not driven by this path",
+                "Job dispatcher: job {} reached host finalise edge ({})",
                 public_id,
                 JOB_FINALISE_HOST_EDGE
             );
@@ -2603,4 +2797,645 @@ fn parse_persisted_transition_signature(
         signature,
         r_prime,
     })
+}
+
+#[cfg(test)]
+mod finalise_publish_handoff_tests {
+    //! Host-edge publish handoff (Befund 1): job completion is gated on a
+    //! recorded broadcast handoff, not on `members_ready` alone.
+
+    use super::*;
+    use crate::publisher::EsploraConfig;
+    use crate::router::{AppState, ProofStore};
+    use crate::v1::{
+        claim_stack_scan_mode, set_process_stack_mode, FinaliseOutcome, ScanStackMode,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use zkcoins_program::circuit::compliance::Network;
+    use zkcoins_prover::half_agg::AggregateStateNullifierV3;
+    use zkcoins_prover::publisher::{BatchMember, PublishedBatch};
+    /// Recording double mirroring receive-path `RecordingPublisher` without
+    /// construct/broadcast legs (`try_prepare` → `None` → `publish_batch`).
+    struct RecordingPublisher {
+        batches: Mutex<Vec<Vec<BatchMember>>>,
+        fail: bool,
+    }
+
+    impl RecordingPublisher {
+        fn ok() -> Self {
+            Self {
+                batches: Mutex::new(Vec::new()),
+                fail: false,
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                batches: Mutex::new(Vec::new()),
+                fail: true,
+            }
+        }
+        fn published_count(&self) -> usize {
+            self.batches
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|b| b.len())
+                .sum()
+        }
+    }
+
+    impl crate::v1::receive::NullifierBatchPublisher for RecordingPublisher {
+        fn publish_batch(&self, members: &[BatchMember]) -> anyhow::Result<PublishedBatch> {
+            if self.fail {
+                anyhow::bail!("recording publisher: forced broadcast handoff failure");
+            }
+            anyhow::ensure!(!members.is_empty(), "recording publisher: empty batch");
+            self.batches.lock().expect("lock").push(members.to_vec());
+            let agg = AggregateStateNullifierV3 {
+                version: 3,
+                format: 0x01,
+                block_anchor: members[0].build_tip,
+                members: members.iter().map(|m| (m.sig.pk, m.sig.r)).collect(),
+                raw_s: None,
+                s_agg: Some([0xAB; 32]),
+            };
+            Ok(PublishedBatch {
+                aggregate: agg,
+                payload: vec![0x42],
+                commit_txid: bitcoin::Txid::from_raw_hash(
+                    <bitcoin::hashes::sha256d::Hash as bitcoin::hashes::Hash>::from_byte_array(
+                        [0x11; 32],
+                    ),
+                ),
+                reveal_txid: bitcoin::Txid::from_raw_hash(
+                    <bitcoin::hashes::sha256d::Hash as bitcoin::hashes::Hash>::from_byte_array(
+                        [0x22; 32],
+                    ),
+                ),
+                commit_output: bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(600),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                },
+                block_anchor: members[0].build_tip,
+            })
+        }
+    }
+
+    fn test_app_state(pool: Arc<sqlx::PgPool>) -> AppState {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let proof_dir = tmp.path().to_str().expect("utf8").to_string();
+        std::mem::forget(tmp);
+        let state_arc = Arc::new(Mutex::new(crate::state::State::new()));
+        AppState {
+            account_node: Arc::new(Mutex::new(crate::account_node::AccountNode::new(state_arc))),
+            proof_store: Arc::new(ProofStore::new(&proof_dir)),
+            mint_store: Arc::new(crate::router::MintStore::new()),
+            username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
+            pool: Arc::clone(&pool),
+            esplora_config: Arc::new(EsploraConfig {
+                url: "http://127.0.0.1:1".to_string(),
+                is_mainnet: false,
+                network_name: "Regtest".to_string(),
+                ws_url: None,
+            }),
+            prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            prover_health: Arc::new(crate::prover_health::ProverHealth::new()),
+            job_store: Arc::new(crate::job_store::JobStore::new((*pool).clone())),
+            job_tx: tokio::sync::mpsc::channel::<JobEnvelope>(8).0,
+            job_notify_map: Arc::new(dashmap::DashMap::new()),
+            v1_scan_caught_up: None,
+            v1_finality_ok: None,
+            pending_sign_map: Arc::new(dashmap::DashMap::new()),
+            v1_finalise: None,
+            v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
+            v1_pending_after_prove: None,
+            v1_engine: None,
+            attest_challenges: Arc::new(dashmap::DashMap::new()),
+            public_hosts: Arc::new(vec!["node.test".to_string()]),
+        }
+    }
+
+    async fn plant_signed_broadcasting_job(
+        store: &JobStore,
+        owner_tag: u8,
+        idem: &str,
+        with_completion: bool,
+    ) -> (uuid::Uuid, crate::v1::PendingSignEntry) {
+        let result = store
+            .create(
+                JobKind::Send,
+                &[owner_tag; 32],
+                Some(idem),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!("expected fresh job"),
+        };
+        let (mut entry, submission) =
+            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v1::awaiting_signature_result_json(&entry);
+        let accepted = crate::v1::accept_wallet_transition_signature(
+            crate::v1::V1ShadowMode::On,
+            entry.network,
+            &entry.pending,
+            &submission,
+        )
+        .expect("verify");
+        entry.install_signature(accepted).expect("install");
+        if with_completion {
+            let outcome = FinaliseOutcome::from_pending_proof_data_with_publisher(
+                &entry.pending,
+                entry.publisher_pubkey,
+            );
+            entry
+                .install_completion(outcome.to_result_json(), 200)
+                .expect("install completion");
+        }
+        let persist = crate::v1::DurableFinalisationPersist::from_entry(&entry).expect("encode");
+        let mut body = serde_json::json!({});
+        body.as_object_mut().unwrap().insert(
+            crate::v1::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&body)
+            .bind(job_id)
+            .execute(store.pool())
+            .await
+            .expect("plant body");
+        store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        // Re-plant durable capability after status flip (same as router tests).
+        let row = store.load(job_id).await.expect("load").expect("row");
+        let mut body = row.request_body;
+        body.as_object_mut().unwrap().insert(
+            crate::v1::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&body)
+            .bind(job_id)
+            .execute(store.pool())
+            .await
+            .expect("replant durable");
+        (job_id, entry)
+    }
+
+    /// While the intent is only `members_ready`, the job must not complete.
+    #[tokio::test]
+    async fn job_not_completed_while_members_ready_without_handoff() {
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim v1");
+
+        let mut state = test_app_state(Arc::clone(&pool));
+        let (job_id, entry) =
+            plant_signed_broadcasting_job(&state.job_store, 0xA1, "mr-no-handoff", true).await;
+        let sig = entry.signature.clone().expect("signed");
+        crate::v1::db_v1::insert_pending_publish_members_ready(
+            &pool,
+            entry.pending.owner,
+            sig.pk_i,
+            sig.signature_r(),
+            sig.signature_s(),
+            sig.r_prime,
+            0,
+            [0u8; 32],
+        )
+        .await
+        .expect("stage members_ready");
+
+        // Hook must not run (completion already durable); gate still applies.
+        state.v1_finalise = Some(Arc::new(move |pending, _sig, _fence| {
+            Box::pin(async move { Ok(FinaliseOutcome::from_pending_proof_data(&pending)) })
+        }));
+
+        process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("drive");
+
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_ne!(
+            after.status,
+            JobStatus::Completed,
+            "must not complete while members_ready; status={:?} err={:?}",
+            after.status,
+            after.error
+        );
+        let pending = crate::v1::db_v1::load_pending_publish(&pool, sig.pk_i)
+            .await
+            .expect("load")
+            .expect("row retained");
+        assert_eq!(
+            pending.status,
+            crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY
+        );
+        drop(scope);
+    }
+
+    /// Successful recorded broadcast handoff allows host completion.
+    #[tokio::test]
+    async fn job_completes_after_recorded_broadcast_handoff() {
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim v1");
+
+        let adapter = Arc::new(
+            crate::v1::EngineAdapter::load_or_create((*pool).clone(), Network::Regtest, 0)
+                .await
+                .expect("adapter"),
+        );
+        let recorder = Arc::new(RecordingPublisher::ok());
+        let mut state = test_app_state(Arc::clone(&pool));
+        let (job_id, entry) =
+            plant_signed_broadcasting_job(&state.job_store, 0xA2, "mr-handoff-ok", false).await;
+        let sig = entry.signature.clone().expect("signed");
+        let owner = entry.pending.owner;
+        let recorder_h = Arc::clone(&recorder);
+        let adapter_h = Arc::clone(&adapter);
+        state.v1_finalise = Some(Arc::new(move |pending, signature, fence| {
+            let recorder_h = Arc::clone(&recorder_h);
+            let adapter_h = Arc::clone(&adapter_h);
+            let pool_h = adapter_h.pool().clone();
+            Box::pin(async move {
+                let staged =
+                    crate::v1::db_v1::persist_engine_with_pending_members_ready_if_finalise_fence(
+                        &pool_h,
+                        &crate::v1::db_v1::EngineSnapshot {
+                            network: Network::Regtest,
+                            activation_height: 0,
+                            tip_height: 0,
+                            tip_hash: [0u8; 32],
+                            fold_seq: 0,
+                            nflog: vec![],
+                            accounts: vec![],
+                        },
+                        pending.owner,
+                        signature.pk_i,
+                        signature.signature_r(),
+                        signature.signature_s(),
+                        signature.r_prime,
+                        0,
+                        [0u8; 32],
+                        fence,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("stage: {e:#}"))?;
+                if !staged {
+                    return Err(anyhow::Error::msg(crate::job_store::FINALISE_FENCE_LOST));
+                }
+                // Same handoff the production finalise helper uses.
+                crate::v1::receive::resume_pending_publish_with(
+                    adapter_h.as_ref(),
+                    recorder_h.as_ref(),
+                    signature.pk_i,
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::Error::new(
+                        crate::v1::signature::PublishRejected::DurableHandoffFailed {
+                            detail: format!("{e:#}"),
+                        },
+                    )
+                })?;
+                Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            })
+        }));
+
+        process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("drive");
+
+        assert_eq!(
+            recorder.published_count(),
+            1,
+            "recording publisher must observe the broadcast handoff"
+        );
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(
+            after.status,
+            JobStatus::Completed,
+            "status={:?} err={:?}",
+            after.status,
+            after.error
+        );
+        let pending = crate::v1::db_v1::load_pending_publish(&pool, sig.pk_i)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_ne!(
+            pending.status,
+            crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY,
+            "handoff must advance status past members_ready; got {}",
+            pending.status
+        );
+        assert_eq!(pending.owner, owner);
+        drop(scope);
+    }
+
+    /// Failed handoff keeps `members_ready` and refuses `completed`.
+    #[tokio::test]
+    async fn failed_handoff_keeps_members_ready_and_job_not_completed() {
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim v1");
+
+        let adapter = Arc::new(
+            crate::v1::EngineAdapter::load_or_create((*pool).clone(), Network::Regtest, 0)
+                .await
+                .expect("adapter"),
+        );
+        let recorder = Arc::new(RecordingPublisher::failing());
+        let mut state = test_app_state(Arc::clone(&pool));
+        let (job_id, entry) =
+            plant_signed_broadcasting_job(&state.job_store, 0xA3, "mr-handoff-fail", false).await;
+        let sig = entry.signature.clone().expect("signed");
+        let recorder_h = Arc::clone(&recorder);
+        let adapter_h = Arc::clone(&adapter);
+        state.v1_finalise = Some(Arc::new(move |pending, signature, fence| {
+            let recorder_h = Arc::clone(&recorder_h);
+            let adapter_h = Arc::clone(&adapter_h);
+            let pool_h = adapter_h.pool().clone();
+            Box::pin(async move {
+                let staged =
+                    crate::v1::db_v1::persist_engine_with_pending_members_ready_if_finalise_fence(
+                        &pool_h,
+                        &crate::v1::db_v1::EngineSnapshot {
+                            network: Network::Regtest,
+                            activation_height: 0,
+                            tip_height: 0,
+                            tip_hash: [0u8; 32],
+                            fold_seq: 0,
+                            nflog: vec![],
+                            accounts: vec![],
+                        },
+                        pending.owner,
+                        signature.pk_i,
+                        signature.signature_r(),
+                        signature.signature_s(),
+                        signature.r_prime,
+                        0,
+                        [0u8; 32],
+                        fence,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("stage: {e:#}"))?;
+                if !staged {
+                    return Err(anyhow::Error::msg(crate::job_store::FINALISE_FENCE_LOST));
+                }
+                crate::v1::receive::resume_pending_publish_with(
+                    adapter_h.as_ref(),
+                    recorder_h.as_ref(),
+                    signature.pk_i,
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::Error::new(
+                        crate::v1::signature::PublishRejected::DurableHandoffFailed {
+                            detail: format!("{e:#}"),
+                        },
+                    )
+                })?;
+                Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            })
+        }));
+
+        process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("drive");
+
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_ne!(
+            after.status,
+            JobStatus::Completed,
+            "failed handoff must not complete; status={:?} err={:?}",
+            after.status,
+            after.error
+        );
+        assert_eq!(
+            after.status,
+            JobStatus::Failed,
+            "failed handoff must be terminal-failed as retryable publish_rejected; got {:?}",
+            after.status
+        );
+        let err = after.error.as_deref().unwrap_or("");
+        let outward = crate::v1::decode_job_error(Some(err), JobStatus::Failed);
+        assert_eq!(
+            outward["error"], "publish_rejected",
+            "outward code must be publish_rejected (retryable handoff failure); got {err}"
+        );
+        let pending = crate::v1::db_v1::load_pending_publish(&pool, sig.pk_i)
+            .await
+            .expect("load")
+            .expect("members_ready row must be retained");
+        assert_eq!(
+            pending.status,
+            crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY,
+            "failed handoff must not delete or mark the intent done"
+        );
+        assert_eq!(recorder.published_count(), 0);
+        drop(scope);
+    }
+
+    /// Typed finalise-hook cause → same stored §7.5 code as before; free-form
+    /// text with the same wording does **not** classify (substring bridge gone).
+    #[test]
+    fn typed_finalise_cause_encodes_publish_rejected_free_form_does_not() {
+        use crate::v1::signature::PublishRejected;
+
+        let typed = anyhow::Error::new(PublishRejected::DurableHandoffFailed {
+            detail: "recording publisher: forced broadcast handoff failure".to_string(),
+        })
+        .context("v1.1 finalise failed");
+        let encoded = encoded_finalise_hook_failure(&typed);
+        let outward = crate::v1::decode_job_error(Some(&encoded), JobStatus::Failed);
+        assert_eq!(
+            outward["error"], "publish_rejected",
+            "typed PublishRejected must store publish_rejected; got {encoded}"
+        );
+
+        // Same diagnostic wording, no typed cause in the chain.
+        let free = anyhow::anyhow!(
+            "v1.1 finalise failed: publish_rejected: v1.1 finalise durable nullifier \
+             publish after members_ready failed (row retained for resume): \
+             recording publisher: forced broadcast handoff failure"
+        );
+        let free_encoded = encoded_finalise_hook_failure(&free);
+        let free_outward = crate::v1::decode_job_error(Some(&free_encoded), JobStatus::Failed);
+        assert_eq!(
+            free_outward["error"], "proving_failed",
+            "free-form text with publish_rejected wording must NOT classify; got {free_encoded}"
+        );
+
+        // Typed DependencyNotFinal still maps (downcast path, not substring).
+        let dep = anyhow::Error::new(
+            zkcoins_prover::state_engine::DependencyNotFinal::PredecessorAbsentFromCanonicalNfLog,
+        )
+        .context("v1.1 finalise failed");
+        let dep_encoded = encoded_finalise_hook_failure(&dep);
+        let dep_outward = crate::v1::decode_job_error(Some(&dep_encoded), JobStatus::Failed);
+        assert_eq!(
+            dep_outward["error"], "dependency_not_final",
+            "typed DependencyNotFinal must store dependency_not_final; got {dep_encoded}"
+        );
+        assert_eq!(
+            crate::v1::signature::http_status_for_machine_code("dependency_not_final"),
+            Some(409),
+            "RPC table for dependency_not_final stays 409"
+        );
+    }
+}
+
+/// from-CAS: a write that does not match must not publish a phase event.
+#[cfg(test)]
+mod from_cas_no_event_tests {
+    use super::*;
+    use crate::job_store::{CreateResult, JobKind, JobStatus, JobStore, FINALISE_CLAIM_PHASE};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cas_miss_does_not_publish_phase_event() {
+        let scope = crate::test_db::setup_pool().await;
+        let store = JobStore::new(scope.pool.clone());
+        let CreateResult::Fresh(job) = store
+            .create(
+                JobKind::Mint,
+                &[0xCAu8; 32],
+                Some("cas-no-event"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create")
+        else {
+            panic!("expected Fresh");
+        };
+        let job_id = job.public_id;
+
+        // Advance to awaiting_signature and win finalise claim (foreign owner).
+        assert!(store
+            .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+            .await
+            .expect("asig"));
+        let fence = match store.claim_finalise_exclusive(job_id).await.expect("claim") {
+            crate::job_store::FinaliseClaim::Won { fence } => fence,
+            other => panic!("expected Won, got {other:?}"),
+        };
+        let _ = fence;
+        let claimed = store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(claimed.phase, FINALISE_CLAIM_PHASE);
+
+        // Subscriber is parked before any write attempt.
+        let notify_map: JobNotifyMap = std::sync::Arc::new(dashmap::DashMap::new());
+        let notifier = std::sync::Arc::new(JobNotifier::new());
+        let mut rx = notifier.phase_tx.subscribe();
+        notify_map.insert(job_id, std::sync::Arc::clone(&notifier));
+
+        // Same pattern as process_mint/process_attest: only publish on CAS hit.
+        let applied = store
+            .set_status(job_id, JobStatus::Queued, JobStatus::Proving, "proving")
+            .await
+            .expect("set_status");
+        assert!(
+            !applied,
+            "late queued→proving must miss under finalise claim"
+        );
+        // Production gates: `if !applied { return }` — never publish on miss.
+        // Call publish only on hit so a regression that returns true would
+        // also fail the no-event assertion below.
+        // Non-hit branch: warn path only (no event, no invented success) —
+        // same as production `if !applied { tracing::warn!(...); return }`.
+        if applied {
+            publish_phase(
+                &notify_map,
+                job_id,
+                JobPhaseEvent {
+                    status: JobStatus::Proving,
+                    phase: "proving".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: None,
+                },
+            );
+        }
+
+        let applied_fail = store
+            .fail(job_id, JobStatus::Proving, "late fail")
+            .await
+            .expect("fail");
+        assert!(!applied_fail, "late proving→failed must miss");
+        if applied_fail {
+            publish_phase(
+                &notify_map,
+                job_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some("late fail".into()),
+                },
+            );
+        }
+
+        // No event may have been delivered.
+        match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            Err(_) => {} // timeout: no event — expected
+            Ok(Ok(ev)) => panic!("CAS miss must not publish phase event; got {ev:?}"),
+            Ok(Err(e)) => panic!("unexpected recv error: {e}"),
+        }
+
+        // Claimed fields still intact.
+        let after = store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(after.status, JobStatus::Broadcasting);
+        assert_eq!(after.phase, FINALISE_CLAIM_PHASE);
+        drop(scope);
+    }
 }

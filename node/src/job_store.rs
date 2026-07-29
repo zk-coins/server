@@ -577,25 +577,35 @@ impl JobStore {
         }
     }
 
-    /// Advance a job to the supplied status + phase. The phase is a
-    /// free-form refinement of the coarse status enum so the
-    /// dispatcher can publish dispatch-level progress milestones
-    /// without churning the constraint-enforced status.
+    /// Advance a job to the supplied status + phase **only from** `from`.
+    ///
+    /// The phase is a free-form refinement of the coarse status enum so the
+    /// dispatcher can publish dispatch-level progress milestones without
+    /// churning the constraint-enforced status.
+    ///
+    /// **Compare-and-set:** `WHERE status = $from` is the primary guard
+    /// against same-generation races (e.g. a late `queued → proving` after
+    /// another process already reached `broadcasting` / finalise claim).
+    /// Generation alone does not order concurrent writers within one epoch.
     ///
     /// **Lock + fence:** acquires [`Self::begin_with_locked_generation`]
-    /// then binds the locked generation into the UPDATE. Second line of
-    /// defence: never advances a row that is already terminal
-    /// (`completed` / `failed` / `cancelled`) — not a substitute for the
-    /// lock, but blocks resurrection if a stale writer races a reset that
-    /// already failed the job under the same generation.
+    /// then binds the locked generation into the UPDATE.
+    ///
+    /// **Claim defence-in-depth:** never mutates a row whose phase is
+    /// [`FINALISE_CLAIM_PHASE`] — even when `from` would otherwise match
+    /// `broadcasting`. Terminal complete/fail of a claimed epoch must go
+    /// through the fence-qualified APIs.
     ///
     /// Returns `Ok(true)` when exactly one row was updated, `Ok(false)`
-    /// when zero rows matched (stale generation, terminal row, missing
-    /// job). Callers **must** act on `false` — never treat a no-op write
-    /// as success and continue side effects against possibly wiped state.
+    /// when zero rows matched (wrong status, claim phase, stale generation,
+    /// missing job). Callers **must** act on `false` — never treat a no-op
+    /// write as success and continue side effects against possibly wiped
+    /// or foreign state. A miss is not a caller error: someone else moved
+    /// the job; log and stop without inventing success.
     pub async fn set_status(
         &self,
         public_id: Uuid,
+        from: JobStatus,
         status: JobStatus,
         phase: &str,
     ) -> sqlx::Result<bool> {
@@ -603,12 +613,15 @@ impl JobStore {
         let result = sqlx::query(
             "UPDATE jobs SET status = $1, phase = $2, updated_at = NOW() \
              WHERE public_id = $3 \
-               AND reset_generation = $4 \
-               AND status NOT IN ('completed', 'failed', 'cancelled')",
+               AND status = $4 \
+               AND phase IS DISTINCT FROM $5 \
+               AND reset_generation = $6",
         )
         .bind(status.as_str())
         .bind(phase)
         .bind(public_id)
+        .bind(from.as_str())
+        .bind(FINALISE_CLAIM_PHASE)
         .bind(generation)
         .execute(&mut *tx)
         .await?;
@@ -658,19 +671,18 @@ impl JobStore {
         Ok(q.rows_affected() == 1)
     }
 
-    /// Move a job to the `completed` terminal state. Stamps the
-    /// cached response body + status code so an idempotent replay
-    /// returns byte-identical JSON.
+    /// Move a job to the `completed` terminal state **only from** `from`.
+    /// Stamps the cached response body + status code so an idempotent
+    /// replay returns byte-identical JSON.
     ///
     /// Atomically strips durable finalisation keys from `request_body`
     /// (`finalisation`, legacy `pending_sign` / `sign`): a terminal row
     /// must not retain a restart envelope that boot recovery could treat
     /// as live work.
     ///
-    /// **Legacy behaviour:** status-unqualified except the locked
-    /// generation fence and a terminal-status guard (never re-complete an
-    /// already-terminal row). Status-qualified completion for the v1.1
-    /// path lives on [`Self::complete_if_status`].
+    /// **Compare-and-set:** requires `status = $from`. Claim defence-in-depth:
+    /// never completes a row under [`FINALISE_CLAIM_PHASE`] — use
+    /// [`Self::complete_if_finalise_owner`] for the fenced host edge.
     ///
     /// Returns `Ok(true)` when one row completed, `Ok(false)` when zero
     /// rows matched. Callers **must** act on `false` — never publish a
@@ -678,6 +690,7 @@ impl JobStore {
     pub async fn complete(
         &self,
         public_id: Uuid,
+        from: JobStatus,
         response_body: serde_json::Value,
         response_status: i16,
     ) -> sqlx::Result<bool> {
@@ -689,12 +702,15 @@ impl JobStore {
                                   - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               progress = 100, updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $3 \
-               AND reset_generation = $4 \
-               AND status NOT IN ('completed', 'failed', 'cancelled')",
+               AND status = $4 \
+               AND phase IS DISTINCT FROM $5 \
+               AND reset_generation = $6",
         )
         .bind(&response_body)
         .bind(response_status)
         .bind(public_id)
+        .bind(from.as_str())
+        .bind(FINALISE_CLAIM_PHASE)
         .bind(generation)
         .execute(&mut *tx)
         .await?;
@@ -792,21 +808,21 @@ impl JobStore {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Move a job to the `failed` terminal state with an error
-    /// message. The wallet surfaces `error` verbatim in the
+    /// Move a job to the `failed` terminal state **only from** `from`,
+    /// with an error message. The wallet surfaces `error` verbatim in the
     /// `KNOWN_SERVER_ERRORS` mapping table.
     ///
     /// Atomically strips durable finalisation keys from `request_body`
     /// with the status flip so a failed cleanup path cannot leave a
     /// restart envelope on a terminal row.
     ///
-    /// **Legacy behaviour:** status-unqualified except the locked
-    /// generation fence and a terminal-status guard. Status-qualified
-    /// fail for the v1.1 path lives on [`Self::fail_if_status`].
+    /// **Compare-and-set:** requires `status = $from`. Claim defence-in-depth:
+    /// never fails a row under [`FINALISE_CLAIM_PHASE`] — use
+    /// [`Self::fail_if_finalise_owner`] for a claimed epoch.
     ///
     /// Returns `Ok(true)` when one row failed, `Ok(false)` on zero rows.
-    /// Callers must act on `false` (no silent fallback).
-    pub async fn fail(&self, public_id: Uuid, error: &str) -> sqlx::Result<bool> {
+    /// Callers must act on `false` (no silent fallback, no invented event).
+    pub async fn fail(&self, public_id: Uuid, from: JobStatus, error: &str) -> sqlx::Result<bool> {
         let (mut tx, generation) = self.begin_with_locked_generation().await?;
         let result = sqlx::query(
             "UPDATE jobs SET status = 'failed', phase = 'failed', \
@@ -815,11 +831,14 @@ impl JobStore {
                                   - 'finalisation' - 'pending_sign' - 'sign' - 'finalise_claim'), \
                               updated_at = NOW(), completed_at = NOW() \
              WHERE public_id = $2 \
-               AND reset_generation = $3 \
-               AND status NOT IN ('completed', 'failed', 'cancelled')",
+               AND status = $3 \
+               AND phase IS DISTINCT FROM $4 \
+               AND reset_generation = $5",
         )
         .bind(error)
         .bind(public_id)
+        .bind(from.as_str())
+        .bind(FINALISE_CLAIM_PHASE)
         .bind(generation)
         .execute(&mut *tx)
         .await?;
@@ -1374,3 +1393,370 @@ impl JobStore {
 #[cfg(test)]
 #[path = "job_store_tests.rs"]
 mod tests;
+
+/// Regression: a late same-generation writer must not clobber a live
+/// finalise claim (two store instances / process roles).
+#[cfg(test)]
+mod from_cas_fence_regression {
+    use super::*;
+    use crate::test_db::setup_pool;
+
+    fn expect_won(claim: FinaliseClaim) -> i64 {
+        match claim {
+            FinaliseClaim::Won { fence } => fence,
+            other => panic!("expected FinaliseClaim::Won, got {other:?}"),
+        }
+    }
+
+    fn claim_snapshot(job: &Job) -> (String, i64, String) {
+        let claim = job
+            .request_body
+            .get(FINALISE_CLAIM_BODY_KEY)
+            .expect("finalise_claim present");
+        let owner = claim
+            .get("owner")
+            .and_then(|v| v.as_str())
+            .expect("owner")
+            .to_string();
+        let fence = claim.get("fence").and_then(|v| v.as_i64()).expect("fence");
+        let lease = claim
+            .get("lease_expires_at")
+            .and_then(|v| v.as_str())
+            .expect("lease_expires_at")
+            .to_string();
+        (owner, fence, lease)
+    }
+
+    /// Late `set_status` / `complete` / `fail` from a stale process must
+    /// all return `false` and leave status, phase, owner, fence, lease,
+    /// and generation untouched — then the fence owner can still complete.
+    #[tokio::test]
+    async fn late_naked_writes_cannot_clobber_finalise_claim_owner() {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+
+        // Process A: admits and would still think the job is queued/proving.
+        let store_a = JobStore::with_process_owner(pool.clone(), Uuid::new_v4());
+        // Process B: wins the exclusive finalise claim.
+        let store_b = JobStore::with_process_owner(pool.clone(), Uuid::new_v4());
+
+        let CreateResult::Fresh(job) = store_a
+            .create(
+                JobKind::Send,
+                &[0xF1u8; 32],
+                Some("from-cas-fence"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create")
+        else {
+            panic!("expected Fresh");
+        };
+        let job_id = job.public_id;
+        let gen_at_admit = job.reset_generation;
+
+        // Reach awaiting_signature so B can claim finalise.
+        assert!(
+            store_a
+                .set_awaiting_signature(job_id, 1, serde_json::json!({"staged": true}))
+                .await
+                .expect("awaiting_signature"),
+            "precondition: A stages awaiting_signature"
+        );
+
+        let fence = expect_won(
+            store_b
+                .claim_finalise_exclusive(job_id)
+                .await
+                .expect("B claim"),
+        );
+        let claimed = store_b.load(job_id).await.expect("load").expect("row");
+        assert_eq!(claimed.status, JobStatus::Broadcasting);
+        assert_eq!(claimed.phase, FINALISE_CLAIM_PHASE);
+        assert_eq!(claimed.reset_generation, gen_at_admit);
+        let (owner_before, fence_before, lease_before) = claim_snapshot(&claimed);
+        assert_eq!(owner_before, store_b.process_owner().to_string());
+        assert_eq!(fence_before, fence);
+        // Snapshot fields that late fail/complete would plant if they hit.
+        // `set_awaiting_signature` already wrote the sign payload into
+        // `response_body`; equality (not is_none) is the right post-check.
+        let error_before = claimed.error.clone();
+        let response_body_before = claimed.response_body.clone();
+
+        // Every formerly-naked write from A must miss.
+        assert!(
+            !store_a
+                .set_status(job_id, JobStatus::Queued, JobStatus::Proving, "proving")
+                .await
+                .expect("queued→proving"),
+            "queued→proving must not hit a claimed row"
+        );
+        assert!(
+            !store_a
+                .set_status(job_id, JobStatus::Proving, JobStatus::Proving, "proving")
+                .await
+                .expect("proving→proving"),
+            "proving→proving must not hit a claimed row"
+        );
+        assert!(
+            !store_a
+                .set_status(
+                    job_id,
+                    JobStatus::Broadcasting,
+                    JobStatus::Proving,
+                    "proving"
+                )
+                .await
+                .expect("broadcasting→proving"),
+            "broadcasting→proving must not hit finalise_claimed (phase guard)"
+        );
+        assert!(
+            !store_a
+                .fail(job_id, JobStatus::Proving, "late fail from A")
+                .await
+                .expect("proving→failed"),
+            "proving→failed must not hit a claimed row"
+        );
+        assert!(
+            !store_a
+                .fail(job_id, JobStatus::Queued, "late fail from A")
+                .await
+                .expect("queued→failed"),
+            "queued→failed must not hit a claimed row"
+        );
+        assert!(
+            !store_a
+                .fail(job_id, JobStatus::Broadcasting, "late fail from A")
+                .await
+                .expect("broadcasting→failed"),
+            "broadcasting→failed must not hit finalise_claimed (phase guard)"
+        );
+        assert!(
+            !store_a
+                .complete(
+                    job_id,
+                    JobStatus::Proving,
+                    serde_json::json!({"stolen": true}),
+                    200
+                )
+                .await
+                .expect("proving→completed"),
+            "proving→completed must not hit a claimed row"
+        );
+        assert!(
+            !store_a
+                .complete(
+                    job_id,
+                    JobStatus::Broadcasting,
+                    serde_json::json!({"stolen": true}),
+                    200
+                )
+                .await
+                .expect("broadcasting→completed"),
+            "broadcasting→completed must not hit finalise_claimed (phase guard)"
+        );
+        assert!(
+            !store_a
+                .set_status(
+                    job_id,
+                    JobStatus::AwaitingSignature,
+                    JobStatus::Broadcasting,
+                    "broadcasting"
+                )
+                .await
+                .expect("awaiting→broadcasting"),
+            "awaiting_signature→broadcasting must not hit after claim"
+        );
+
+        let after = store_b.load(job_id).await.expect("load").expect("row");
+        assert_eq!(after.status, JobStatus::Broadcasting, "status unchanged");
+        assert_eq!(after.phase, FINALISE_CLAIM_PHASE, "phase unchanged");
+        assert_eq!(after.reset_generation, gen_at_admit, "generation unchanged");
+        let (owner_after, fence_after, lease_after) = claim_snapshot(&after);
+        assert_eq!(owner_after, owner_before, "owner unchanged");
+        assert_eq!(fence_after, fence_before, "fence unchanged");
+        assert_eq!(lease_after, lease_before, "lease unchanged");
+        assert_eq!(after.error, error_before, "error unchanged by late fail");
+        assert_eq!(
+            after.response_body, response_body_before,
+            "response_body unchanged by late complete"
+        );
+
+        // Legitimate fence owner can still complete under the claim.
+        assert!(
+            store_b
+                .complete_if_finalise_owner(
+                    job_id,
+                    store_b.process_owner(),
+                    fence,
+                    serde_json::json!({"ok": true}),
+                    200
+                )
+                .await
+                .expect("owner complete"),
+            "fence owner must still complete after late writers miss"
+        );
+        let done = store_b.load(job_id).await.expect("load").expect("row");
+        assert_eq!(done.status, JobStatus::Completed);
+        assert_eq!(done.phase, "completed");
+        drop(scope);
+    }
+
+    /// A non-matching `from` CAS reports `false` (caller must not invent
+    /// success / events). Store-level contract; dispatcher must gate
+    /// `publish_phase` on this bool.
+    #[tokio::test]
+    async fn from_cas_miss_returns_false_without_mutating_row() {
+        let scope = setup_pool().await;
+        let store = JobStore::new(scope.pool.clone());
+        let CreateResult::Fresh(job) = store
+            .create(
+                JobKind::Mint,
+                &[0xF2u8; 32],
+                Some("from-cas-miss"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create")
+        else {
+            panic!("expected Fresh");
+        };
+        let job_id = job.public_id;
+        let before = store.load(job_id).await.expect("load").expect("row");
+
+        // Wrong from: proving while still queued.
+        assert!(
+            !store
+                .fail(job_id, JobStatus::Proving, "should not apply")
+                .await
+                .expect("fail"),
+            "fail from proving must miss on queued"
+        );
+        assert!(
+            !store
+                .complete(
+                    job_id,
+                    JobStatus::Proving,
+                    serde_json::json!({"nope": true}),
+                    200
+                )
+                .await
+                .expect("complete"),
+            "complete from proving must miss on queued"
+        );
+        assert!(
+            !store
+                .set_status(
+                    job_id,
+                    JobStatus::AwaitingSignature,
+                    JobStatus::Broadcasting,
+                    "broadcasting"
+                )
+                .await
+                .expect("set_status"),
+            "set_status from awaiting_signature must miss on queued"
+        );
+
+        let after = store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.reset_generation, before.reset_generation);
+        assert_eq!(after.error, before.error);
+        assert_eq!(after.response_body, before.response_body);
+        assert_eq!(after.request_body, before.request_body);
+        drop(scope);
+    }
+
+    /// Happy-path from-CAS still advances when the expected status matches.
+    #[tokio::test]
+    async fn from_cas_hit_advances_queued_to_proving() {
+        let scope = setup_pool().await;
+        let store = JobStore::new(scope.pool.clone());
+        let CreateResult::Fresh(job) = store
+            .create(JobKind::Mint, &[0xF3u8; 32], None, serde_json::json!({}))
+            .await
+            .expect("create")
+        else {
+            panic!("expected Fresh");
+        };
+        assert!(
+            store
+                .set_status(
+                    job.public_id,
+                    JobStatus::Queued,
+                    JobStatus::Proving,
+                    "proving"
+                )
+                .await
+                .expect("set_status"),
+            "queued→proving must apply"
+        );
+        let after = store.load(job.public_id).await.expect("load").expect("row");
+        assert_eq!(after.status, JobStatus::Proving);
+        assert_eq!(after.phase, "proving");
+        drop(scope);
+    }
+
+    /// Two stores: B claims; A tries lease-blind broadcasting complete/fail
+    /// with matching status but claim phase — must miss (phase guard).
+    #[tokio::test]
+    async fn phase_guard_blocks_legacy_complete_fail_on_finalise_claimed() {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        let store_a = JobStore::with_process_owner(pool.clone(), Uuid::new_v4());
+        let store_b = JobStore::with_process_owner(pool.clone(), Uuid::new_v4());
+        let CreateResult::Fresh(job) = store_a
+            .create(
+                JobKind::Send,
+                &[0xF4u8; 32],
+                Some("phase-guard"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create")
+        else {
+            panic!("expected Fresh");
+        };
+        let job_id = job.public_id;
+        assert!(store_a
+            .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+            .await
+            .expect("asig"));
+        let fence = expect_won(
+            store_b
+                .claim_finalise_exclusive(job_id)
+                .await
+                .expect("claim"),
+        );
+        let claimed = store_b.load(job_id).await.expect("load").expect("row");
+        let (owner, f, lease) = claim_snapshot(&claimed);
+        assert_eq!(f, fence);
+
+        assert!(!store_a
+            .complete(
+                job_id,
+                JobStatus::Broadcasting,
+                serde_json::json!({"x": 1}),
+                200
+            )
+            .await
+            .expect("complete"));
+        assert!(!store_a
+            .fail(job_id, JobStatus::Broadcasting, "nope")
+            .await
+            .expect("fail"));
+        assert!(!store_a
+            .set_status(job_id, JobStatus::Broadcasting, JobStatus::Failed, "failed")
+            .await
+            .expect("set_status"));
+
+        let after = store_b.load(job_id).await.expect("load").expect("row");
+        assert_eq!(after.status, JobStatus::Broadcasting);
+        assert_eq!(after.phase, FINALISE_CLAIM_PHASE);
+        let (o2, f2, l2) = claim_snapshot(&after);
+        assert_eq!(o2, owner);
+        assert_eq!(f2, f);
+        assert_eq!(l2, lease);
+        drop(scope);
+    }
+}

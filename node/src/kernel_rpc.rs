@@ -594,7 +594,12 @@ mod tests {
             _ => panic!("fresh"),
         };
         store
-            .set_status(id, crate::job_store::JobStatus::Proving, "proving_circuit")
+            .set_status(
+                id,
+                crate::job_store::JobStatus::Queued,
+                crate::job_store::JobStatus::Proving,
+                "proving_circuit",
+            )
             .await
             .expect("proving");
         let domain = DomainKernel::new(
@@ -727,7 +732,12 @@ mod tests {
             _ => panic!("fresh"),
         };
         store
-            .set_status(id, crate::job_store::JobStatus::Proving, "proving")
+            .set_status(
+                id,
+                crate::job_store::JobStatus::Queued,
+                crate::job_store::JobStatus::Proving,
+                "proving",
+            )
             .await
             .expect("proving");
 

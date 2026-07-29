@@ -299,7 +299,8 @@ pub(crate) type V1FinaliseHook = Arc<
             crate::job_store::FinaliseFence,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<crate::v1::FinaliseOutcome, String>> + Send,
+                dyn std::future::Future<Output = Result<crate::v1::FinaliseOutcome, anyhow::Error>>
+                    + Send,
             >,
         > + Send
         + Sync,
@@ -1400,13 +1401,34 @@ async fn admit_and_enqueue(
         tracing::error!("Job dispatcher channel send failed: {}", e);
         // The row exists but the dispatcher cannot be reached —
         // mark the job failed so the wallet observes a terminal
-        // status on its next poll. Best-effort; the dispatcher
-        // would only be down on a shutdown / catastrophic
-        // panic-recovery scenario.
-        let _ = state
+        // status on its next poll. Allowed: queued → failed. A CAS
+        // miss means another writer already advanced the job — do not
+        // invent success, still refuse the admit response.
+        match state
             .job_store
-            .fail(job.public_id, "dispatcher unavailable")
-            .await;
+            .fail(
+                job.public_id,
+                crate::job_store::JobStatus::Queued,
+                "dispatcher unavailable",
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "enqueue-fail path: fail(queued) matched 0 rows for job {} \
+                     (concurrent advance); not inventing success",
+                    job.public_id
+                );
+            }
+            Err(store_err) => {
+                tracing::error!(
+                    "enqueue-fail path: fail(queued) store error for job {}: {}",
+                    job.public_id,
+                    store_err
+                );
+            }
+        }
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(JobErrorResponse {
@@ -2187,13 +2209,34 @@ pub(crate) async fn attest_balance_handler(
         .await
     {
         tracing::error!("attest job enqueue failed: {}", e);
-        let _ = state
+        // Allowed: queued → failed. CAS miss → log, no invented success.
+        let err_body =
+            crate::v1::encode_job_error("internal_error", format!("enqueue failed: {e}"));
+        match state
             .job_store
             .fail(
                 job.public_id,
-                &crate::v1::encode_job_error("internal_error", format!("enqueue failed: {e}")),
+                crate::job_store::JobStatus::Queued,
+                &err_body,
             )
-            .await;
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "attest enqueue-fail: fail(queued) matched 0 rows for job {} \
+                     (concurrent advance); not inventing success",
+                    job.public_id
+                );
+            }
+            Err(store_err) => {
+                tracing::error!(
+                    "attest enqueue-fail: fail(queued) store error for job {}: {}",
+                    job.public_id,
+                    store_err
+                );
+            }
+        }
         return attest_error_response(crate::v1::AttestError::Internal(
             "Failed to enqueue attestation job".into(),
         ));

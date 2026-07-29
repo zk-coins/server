@@ -85,6 +85,50 @@ impl ScannedNullifier {
 }
 
 // ---------------------------------------------------------------------------
+// Dependency-not-final (typed cause for §7.5 `dependency_not_final`)
+// ---------------------------------------------------------------------------
+
+/// Why a transition cannot yet bind its predecessor nullifier.
+///
+/// Returned as the **cause** of an `anyhow::Error` from
+/// [`StateEngine::account_transition_context`] (via `begin_*`). The human
+/// [`Display`] text is diagnostic only — outward classification must
+/// downcast this type, not parse the message.
+///
+/// Spec §7.5 maps both variants to machine code `dependency_not_final`
+/// (HTTP 409): the wallet waits for finality / inclusion and resubmits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyNotFinal {
+    /// Account `last_nullifier` is absent from the canonical NfLog
+    /// (applied receive not yet scan-folded, or never published).
+    PredecessorAbsentFromCanonicalNfLog,
+    /// Predecessor is on the NfLog but its position is not covered by
+    /// `size_final` at the current tip (not yet 6-confirmation-final).
+    PredecessorPositionNotCoveredBySizeFinal { position: u64, size_final: u64 },
+}
+
+impl std::fmt::Display for DependencyNotFinal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PredecessorAbsentFromCanonicalNfLog => write!(
+                f,
+                "predecessor nullifier is not in the canonical NfLog \
+                 (awaiting on-chain inclusion / scan-fold); refusing AccountUpdateProof"
+            ),
+            Self::PredecessorPositionNotCoveredBySizeFinal {
+                position,
+                size_final,
+            } => write!(
+                f,
+                "predecessor nullifier position {position} is not covered by size_final nav.size {size_final}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DependencyNotFinal {}
+
+// ---------------------------------------------------------------------------
 // Request types (wallet → engine)
 // ---------------------------------------------------------------------------
 
@@ -2133,18 +2177,19 @@ impl StateEngine {
                     pos
                 }
                 LookupResult::Absent => {
-                    bail!(
-                        "predecessor nullifier is not in the canonical NfLog \
-                         (awaiting on-chain inclusion / scan-fold); refusing AccountUpdateProof"
-                    );
+                    return Err(DependencyNotFinal::PredecessorAbsentFromCanonicalNfLog.into());
                 }
             };
 
-            ensure!(
-                pos < nav.size,
-                "predecessor nullifier position {pos} is not covered by size_final nav.size {}",
-                nav.size
-            );
+            if pos >= nav.size {
+                return Err(
+                    DependencyNotFinal::PredecessorPositionNotCoveredBySizeFinal {
+                        position: pos,
+                        size_final: nav.size,
+                    }
+                    .into(),
+                );
+            }
             // Inclusion path over the size_final prefix.
             let prefix = &self.nflog_entries[..nav.size as usize];
             let nav_inclusion = host::inclusion_path(pos, prefix)
@@ -2788,6 +2833,264 @@ mod tests {
         assert!(
             !msg.contains("clause (e)"),
             "clause (f) refusal must not be reported as clause (e): {msg}"
+        );
+    }
+
+    /// Host-only: AccountUpdateProof with `last_nullifier` not yet on the
+    /// canonical NfLog must fail as typed [`DependencyNotFinal`], not a bare
+    /// string that callers have to substring-match.
+    #[test]
+    fn begin_mint_predecessor_absent_from_nflog_is_dependency_not_final() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let first = test_mint_request(1);
+        let nk_commit = host::nk_commit(&first.nk);
+        let name_hash = host::name_hash(&first.name).expect("name_hash");
+        let asset_id = host::asset_id_v1(
+            host::GENESIS_TAG,
+            &first.current_pubkey,
+            &name_hash,
+            first.decimals,
+            1,
+        );
+        let empty = AccountState::new(
+            first.owner,
+            nk_commit,
+            BTreeMap::new(),
+            first.current_pubkey,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let prior_coin = Coin {
+            identifier: host::coin_identifier(empty_ash, &first.owner.0, asset_id, 100, 0),
+            recipient: first.owner,
+            amount: 100,
+            asset_id,
+        };
+        let mut coinhist = CoinHistTree::new();
+        let prior_id = host::digest_to_bytes(&prior_coin.identifier);
+        coinhist.admit(prior_id).expect("admit");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            prior_id,
+            TrackedCoin {
+                coin: prior_coin,
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 100u128);
+        let state = AccountState::new(
+            first.owner,
+            nk_commit,
+            balances,
+            first.next_pubkey,
+            1,
+            coinhist.root(),
+        )
+        .expect("post-mint state");
+        // last_nullifier set, but never folded into the NfLog.
+        engine
+            .insert_account(
+                first.owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk: first.nk,
+                    op_secret: Some(first.op_secret),
+                    genesis_pubkey: first.current_pubkey,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: Some(host_dummy_last_proof()),
+                    last_nav_opening: Some(NavOpening {
+                        nav: Nav {
+                            size: 0,
+                            mth: host::nflog_empty(),
+                        },
+                        nav_rand: first.op_secret.derive_nav_rand(0),
+                    }),
+                    last_nullifier: Some(NullifierOpening {
+                        public_key: first.current_pubkey,
+                        signature_r: [0x71u8; 32],
+                        r_prime: [0; 32],
+                    }),
+                    last_nullifier_pos: None,
+                },
+            )
+            .expect("insert");
+
+        let (_, _, remint_next) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/test-mint/pk2-absent-pred",
+        ));
+        let remint = MintRequest {
+            owner: first.owner,
+            nk: first.nk,
+            op_secret: first.op_secret,
+            current_pubkey: first.next_pubkey,
+            next_pubkey: remint_next,
+            name: first.name.clone(),
+            decimals: first.decimals,
+            amount: 40,
+            issuance_version: 1,
+            cap_total: 0,
+            terms_salt: [0u8; 32],
+            npk_rand: [0x44; 32],
+        };
+        let err = engine
+            .begin_mint(remint)
+            .expect_err("absent predecessor must refuse AccountUpdateProof");
+        let cause = err
+            .downcast_ref::<DependencyNotFinal>()
+            .expect("typed DependencyNotFinal cause, not a bare string");
+        assert_eq!(
+            *cause,
+            DependencyNotFinal::PredecessorAbsentFromCanonicalNfLog
+        );
+    }
+
+    /// Host-only: predecessor on the NfLog but not inside `size_final` is the
+    /// second typed [`DependencyNotFinal`] variant (no circuit prove).
+    #[test]
+    fn begin_mint_predecessor_beyond_size_final_is_dependency_not_final() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let first = test_mint_request(1);
+        let nk_commit = host::nk_commit(&first.nk);
+        let name_hash = host::name_hash(&first.name).expect("name_hash");
+        let asset_id = host::asset_id_v1(
+            host::GENESIS_TAG,
+            &first.current_pubkey,
+            &name_hash,
+            first.decimals,
+            1,
+        );
+        // Fold a predecessor at height 10; tip stays at 10 so size_final = 0
+        // (confirmation depth not yet met).
+        let predecessor_position = ChainPosition {
+            height: 10,
+            tx_index: 0,
+            vin_index: 0,
+            member_index: 0,
+        };
+        let predecessor_entry = NfLogEntry {
+            pk: first.current_pubkey,
+            r: [0x71u8; 32],
+        };
+        engine.set_tip_height(10);
+        assert_eq!(
+            engine
+                .nflog
+                .fold(
+                    predecessor_position,
+                    predecessor_entry.pk,
+                    predecessor_entry.r,
+                )
+                .unwrap(),
+            FoldOutcome::Appended(0)
+        );
+        engine.nflog_entries.push(predecessor_entry);
+        engine.nflog_positions.push(predecessor_position);
+        // Keep tip at 10: size_final(10) does not cover height-10 entries.
+        assert_eq!(engine.nflog.size_final(10), 0);
+
+        let empty = AccountState::new(
+            first.owner,
+            nk_commit,
+            BTreeMap::new(),
+            first.current_pubkey,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let prior_coin = Coin {
+            identifier: host::coin_identifier(empty_ash, &first.owner.0, asset_id, 100, 0),
+            recipient: first.owner,
+            amount: 100,
+            asset_id,
+        };
+        let mut coinhist = CoinHistTree::new();
+        let prior_id = host::digest_to_bytes(&prior_coin.identifier);
+        coinhist.admit(prior_id).expect("admit");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            prior_id,
+            TrackedCoin {
+                coin: prior_coin,
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 100u128);
+        let state = AccountState::new(
+            first.owner,
+            nk_commit,
+            balances,
+            first.next_pubkey,
+            1,
+            coinhist.root(),
+        )
+        .expect("post-mint state");
+        engine
+            .insert_account(
+                first.owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk: first.nk,
+                    op_secret: Some(first.op_secret),
+                    genesis_pubkey: first.current_pubkey,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: Some(host_dummy_last_proof()),
+                    last_nav_opening: Some(NavOpening {
+                        nav: Nav {
+                            size: 0,
+                            mth: host::nflog_empty(),
+                        },
+                        nav_rand: first.op_secret.derive_nav_rand(0),
+                    }),
+                    last_nullifier: Some(NullifierOpening {
+                        public_key: predecessor_entry.pk,
+                        signature_r: predecessor_entry.r,
+                        r_prime: [0; 32],
+                    }),
+                    last_nullifier_pos: Some(0),
+                },
+            )
+            .expect("insert");
+
+        let (_, _, remint_next) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/test-mint/pk2-size-final",
+        ));
+        let remint = MintRequest {
+            owner: first.owner,
+            nk: first.nk,
+            op_secret: first.op_secret,
+            current_pubkey: first.next_pubkey,
+            next_pubkey: remint_next,
+            name: first.name.clone(),
+            decimals: first.decimals,
+            amount: 40,
+            issuance_version: 1,
+            cap_total: 0,
+            terms_salt: [0u8; 32],
+            npk_rand: [0x44; 32],
+        };
+        let err = engine
+            .begin_mint(remint)
+            .expect_err("pos ≥ size_final must refuse AccountUpdateProof");
+        let cause = err
+            .downcast_ref::<DependencyNotFinal>()
+            .expect("typed DependencyNotFinal cause, not a bare string");
+        assert_eq!(
+            *cause,
+            DependencyNotFinal::PredecessorPositionNotCoveredBySizeFinal {
+                position: 0,
+                size_final: 0,
+            }
         );
     }
 

@@ -253,9 +253,10 @@ impl TryFrom<WalletSignSubmissionWire> for WalletSignSubmission {
 /// an empty in-memory map.
 ///
 /// **Edge:** production finalise stages `v1_pending_publishes`
-/// (`members_ready`) with the engine snapshot; on-chain
-/// AggregateStateNullifierV3 **broadcast** still needs bitcoind. See
-/// [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`].
+/// (`members_ready`) with the engine snapshot, then hands that row to the
+/// durable nullifier publisher before the host marks the job complete.
+/// NfLog scan-fold after on-chain confirmation remains outside the host edge.
+/// See [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`].
 #[derive(Clone, Debug)]
 pub struct PendingSignEntry {
     pub pending: PendingTransition,
@@ -943,13 +944,16 @@ pub fn finalise_accepted_prove_outside_lock(
 
 /// Production job-path finalise: prove outside the lock, apply under the
 /// write gate, then **atomically** persist the engine snapshot and stage
-/// `v1_pending_publishes` (`members_ready`) **under the claim fence**.
+/// `v1_pending_publishes` (`members_ready`) **under the claim fence**, then
+/// hand the staged intent to the durable nullifier publisher
+/// ([`crate::v1::resume_pending_publish`] / `durable_publish_nullifier`).
 ///
-/// This is what makes [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`] a
-/// durable handoff: a crash after this function returns leaves the account
-/// advanced on disk and a rebroadcast intent the publisher path can pick
-/// up. On-chain AggregateStateNullifierV3 broadcast still needs bitcoind;
-/// that step is outside the host edge, not a silent skip of durability.
+/// Order is safety-relevant and fixed: **persist → publish → return Ok**
+/// (caller may then mark the job `completed`). A crash after this function
+/// returns leaves the account advanced, a progressive publish status, and
+/// (once the host edge finishes) a completed job. Publish failure returns
+/// `Err` **without** deleting or completing the `members_ready` row so a
+/// later resume can still pick it up.
 ///
 /// ## Fence
 ///
@@ -962,12 +966,12 @@ pub fn finalise_accepted_prove_outside_lock(
 ///
 /// ## Resume / crash after durable stage
 ///
-/// If a `members_ready` (or later) row already exists for `signature.pk_i`,
-/// prove+apply are skipped and the §7.5 outcome is rebuilt from the pending
-/// witness **only while `fence` still holds**. Re-applying an already-advanced
-/// account would fail; the staged row is the durable signal that apply already
-/// landed. A lost fence refuses the resume shortcut so a stale worker cannot
-/// drive host-edge completion after reclaim.
+/// If a pending-publish row already exists for `signature.pk_i`, prove+apply
+/// are skipped **only while `fence` still holds**, then the durable publisher
+/// is driven for that row (members_ready / constructed / commit_broadcast).
+/// Re-applying an already-advanced account would fail; the staged row is the
+/// durable signal that apply already landed. A lost fence refuses the resume
+/// shortcut so a stale worker cannot drive host-edge completion after reclaim.
 ///
 /// ## Lease liveness
 ///
@@ -979,7 +983,8 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     signature: TransitionSignature,
     publisher_pubkey: Option<[u8; 32]>,
     fence: crate::job_store::FinaliseFence,
-) -> Result<FinaliseOutcome, String> {
+    publisher: &impl crate::v1::receive::NullifierBatchPublisher,
+) -> Result<FinaliseOutcome, anyhow::Error> {
     use crate::job_store::FINALISE_FENCE_LOST;
     use crate::v1::db_v1;
 
@@ -988,10 +993,10 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     // completion after another claim reclaimed the job.
     if let Some(row) = db_v1::load_pending_publish(adapter.pool(), signature.pk_i)
         .await
-        .map_err(|e| format!("load_pending_publish before finalise: {e:#}"))?
+        .map_err(|e| anyhow::anyhow!("load_pending_publish before finalise: {e:#}"))?
     {
         if row.owner.0 != pending.owner.0 {
-            return Err(format!(
+            return Err(anyhow::anyhow!(
                 "v1.1 finalise: pending publish for pk={} has owner {}, \
                  pending.owner is {} — refusing silent mismatch",
                 hex_lower(&signature.pk_i),
@@ -999,8 +1004,11 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
                 hex_lower(&pending.owner.0),
             ));
         }
-        if !claim_fence_still_holds(adapter.pool(), fence).await? {
-            return Err(FINALISE_FENCE_LOST.to_string());
+        if !claim_fence_still_holds(adapter.pool(), fence)
+            .await
+            .map_err(anyhow::Error::msg)?
+        {
+            return Err(anyhow::Error::msg(FINALISE_FENCE_LOST));
         }
         tracing::info!(
             pk = %hex_lower(&signature.pk_i),
@@ -1009,6 +1017,7 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
             "v1.1 finalise: pending publish already durable; \
              skipping re-prove/re-apply (crash-resume after stage)"
         );
+        publish_staged_nullifier_after_members_ready(adapter, publisher, signature.pk_i).await?;
         return Ok(FinaliseOutcome::from_pending_proof_data_with_publisher(
             &pending,
             publisher_pubkey,
@@ -1027,8 +1036,9 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
         )
     })
     .await
-    .map_err(|e| format!("prove_pending_transition_detached join: {e}"))?
-    .map_err(|e| format!("prove_pending_transition_detached failed: {e:#}"))?;
+    .map_err(|e| anyhow::anyhow!("prove_pending_transition_detached join: {e}"))?
+    // Preserve typed engine causes (e.g. DependencyNotFinal) for host encode.
+    .map_err(|e| e.context("prove_pending_transition_detached failed"))?;
 
     // Write gate: snapshot → apply → atomic fenced engine + members_ready → restore on fail.
     let _write_gate = adapter.lock_writes().await;
@@ -1038,29 +1048,36 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
         Ok(Ok(a)) => a,
         Ok(Err(e)) => {
             let _ = adapter.restore_live(pre);
-            return Err(format!("apply_proved_transition failed: {e:#}"));
+            // Preserve typed engine causes through the host encode path.
+            return Err(e.context("apply_proved_transition failed"));
         }
         Err(e) => {
-            return Err(format!("apply_proved_transition (engine lock): {e:#}"));
+            return Err(anyhow::anyhow!(
+                "apply_proved_transition (engine lock): {e:#}"
+            ));
         }
     };
 
     let (pk, r) = applied.nullifier();
     if signature.pk_i != pk {
         let _ = adapter.restore_live(pre);
-        return Err(
-            "v1.1 finalise: signature.pk_i does not match applied nullifier Pk".to_string(),
-        );
+        return Err(anyhow::anyhow!(
+            "v1.1 finalise: signature.pk_i does not match applied nullifier Pk"
+        ));
     }
     if signature.signature_r() != r {
         let _ = adapter.restore_live(pre);
-        return Err("v1.1 finalise: signature R does not match applied nullifier R".to_string());
+        return Err(anyhow::anyhow!(
+            "v1.1 finalise: signature R does not match applied nullifier R"
+        ));
     }
 
     let tip_hash = adapter.tip_hash();
     let tip_height = adapter.with_engine(|engine| engine.tip_height());
     let tip_height_u32 = u32::try_from(tip_height).map_err(|_| {
-        format!("v1.1 finalise: tip_height {tip_height} does not fit u32 for pending publish")
+        anyhow::anyhow!(
+            "v1.1 finalise: tip_height {tip_height} does not fit u32 for pending publish"
+        )
     })?;
 
     let snap = adapter.snapshot_live();
@@ -1083,26 +1100,34 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
         }
         Ok(false) => {
             if let Err(restore_err) = adapter.restore_live(pre) {
-                return Err(format!(
+                return Err(anyhow::anyhow!(
                     "v1.1 finalise: claim fence/lease lost before durable stage; \
                      engine restore also failed ({restore_err:#})"
                 ));
             }
-            return Err(FINALISE_FENCE_LOST.to_string());
+            return Err(anyhow::Error::msg(FINALISE_FENCE_LOST));
         }
         Err(e) => {
             if let Err(restore_err) = adapter.restore_live(pre) {
-                return Err(format!(
+                return Err(anyhow::anyhow!(
                     "v1.1 finalise: atomic engine+members_ready persist failed ({e:#}); \
                      engine restore also failed ({restore_err:#})"
                 ));
             }
-            return Err(format!(
+            return Err(anyhow::anyhow!(
                 "v1.1 finalise: atomic engine+members_ready persist failed; \
                  engine restored (no silent credit): {e:#}"
             ));
         }
     }
+
+    // Persist landed. Drop the write gate before broadcast (same ordering as
+    // the direct receive path): scanner liveness must not wait on bitcoind.
+    drop(_write_gate);
+
+    // Hand off this staged row to the durable publisher. Failure keeps the
+    // members_ready (or progressive) row for later resume — never mark done.
+    publish_staged_nullifier_after_members_ready(adapter, publisher, pk).await?;
 
     let pd = &applied.proved().proof_data;
     Ok(FinaliseOutcome {
@@ -1112,6 +1137,59 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
         output_coin_ids,
         publisher_pubkey,
     })
+}
+
+/// Typed cause for §7.5 `publish_rejected` (durable nullifier broadcast
+/// handoff failed after `members_ready` was persisted).
+///
+/// The human [`Display`] text is diagnostic only — outward classification
+/// must downcast this type via [`machine_code_from_engine_error`] /
+/// [`encode_job_error_from_anyhow`], not parse the message. Same form as
+/// [`zkcoins_prover::state_engine::DependencyNotFinal`].
+#[derive(Debug, Clone)]
+pub(crate) enum PublishRejected {
+    /// Finalise-path durable publish after `members_ready` failed; the
+    /// pending row is retained for the in-process / boot resumer.
+    DurableHandoffFailed { detail: String },
+}
+
+impl std::fmt::Display for PublishRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DurableHandoffFailed { detail } => write!(
+                f,
+                "v1.1 finalise durable nullifier publish after members_ready \
+                 failed (row retained for resume): {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PublishRejected {}
+
+/// Drive the durable publisher for a row that is already on disk
+/// (`members_ready` or a progressive mid-broadcast status).
+///
+/// Reuses the receive-path resumer so construct → commit → reveal status
+/// transitions stay single-sourced. On failure the row is left as-is
+/// (not deleted, not marked complete).
+///
+/// Failure is a typed [`PublishRejected`] cause. Display text is **diagnostic
+/// only** — host edges classify via [`encode_job_error_from_anyhow`] /
+/// [`machine_code_from_engine_error`], never by parsing the message.
+async fn publish_staged_nullifier_after_members_ready(
+    adapter: &crate::v1::EngineAdapter,
+    publisher: &impl crate::v1::receive::NullifierBatchPublisher,
+    pk: [u8; 32],
+) -> Result<(), anyhow::Error> {
+    crate::v1::receive::resume_pending_publish_with(adapter, publisher, pk)
+        .await
+        .map_err(|e| {
+            anyhow::Error::new(PublishRejected::DurableHandoffFailed {
+                detail: format!("{e:#}"),
+            })
+        })?;
+    Ok(())
 }
 
 /// True while `fence` is still the current claim epoch with an unexpired lease.
@@ -1303,6 +1381,54 @@ pub(crate) fn encode_job_error(code: &str, message: impl Into<String>) -> String
     .to_string()
 }
 
+/// Encode a job failure from an engine / host `anyhow::Error`.
+///
+/// Reads a typed [`zkcoins_prover::state_engine::DependencyNotFinal`] or
+/// [`PublishRejected`] cause when present and maps it to the closed §7.5
+/// machine code. The Display text is diagnostic only — never the contract.
+/// All other causes default to `proving_failed` (callers that know a more
+/// specific closed code should use [`encode_job_error`] directly).
+pub(crate) fn encode_job_error_from_anyhow(err: &anyhow::Error) -> String {
+    if let Some(code) = machine_code_from_engine_error(err) {
+        return encode_job_error(code, format!("{err:#}"));
+    }
+    encode_job_error("proving_failed", format!("{err:#}"))
+}
+
+/// Closed §7.5 machine code for a typed engine / host cause, if any.
+///
+/// Walks the `anyhow` chain so intermediate `.context(...)` wrappers do not
+/// hide [`DependencyNotFinal`](zkcoins_prover::state_engine::DependencyNotFinal)
+/// or [`PublishRejected`].
+pub(crate) fn machine_code_from_engine_error(err: &anyhow::Error) -> Option<&'static str> {
+    for cause in err.chain() {
+        if cause
+            .downcast_ref::<zkcoins_prover::state_engine::DependencyNotFinal>()
+            .is_some()
+        {
+            return Some("dependency_not_final");
+        }
+        if cause.downcast_ref::<PublishRejected>().is_some() {
+            return Some("publish_rejected");
+        }
+    }
+    None
+}
+
+/// HTTP status the §7.5 / §7.8 error contract assigns to a closed machine code.
+///
+/// Used by tests and host edges that must assert the transport mapping without
+/// inventing a second table. Unknown codes return `None` (fail closed).
+pub(crate) fn http_status_for_machine_code(code: &str) -> Option<u16> {
+    use crate::kernel::KernelErrorCode;
+    use crate::transport::error_contract;
+    KernelErrorCode::ALL
+        .iter()
+        .copied()
+        .find(|c| c.reason() == code)
+        .map(|c| error_contract::describe(c).http_status)
+}
+
 /// Closed §7.5 `machine_code` set admissible on job poll `error` objects.
 /// A stored JSON `"error"` string is **not** automatically valid — only
 /// members of this set (plus the additional surface codes below) may leave
@@ -1393,9 +1519,12 @@ fn classify_stored_failure(msg: &str, status: crate::job_store::JobStatus) -> &'
         return "internal_error";
     }
     let lower = msg.to_ascii_lowercase();
-    if lower.contains("publish_rejected") || lower.contains("publisher rejected") {
-        return "publish_rejected";
-    }
+    // `publish_rejected` is intentionally **not** recovered from free-form
+    // text. Production encodes a typed [`PublishRejected`] cause via
+    // [`encode_job_error_from_anyhow`] / [`machine_code_from_engine_error`]
+    // (or stores structured JSON with the closed code). Substring matching
+    // here would make a message rewrite at a distant call site silently
+    // move the outward code — the silent-fallback class this project forbids.
     if lower.contains("unknown_publisher") {
         return "unknown_publisher";
     }
@@ -1408,9 +1537,13 @@ fn classify_stored_failure(msg: &str, status: crate::job_store::JobStatus) -> &'
     if lower.contains("bounds_exceeded") {
         return "bounds_exceeded";
     }
-    if lower.contains("dependency_not_final") {
-        return "dependency_not_final";
-    }
+    // `dependency_not_final` is intentionally **not** recovered from free-form
+    // text. The engine emits a typed
+    // [`zkcoins_prover::state_engine::DependencyNotFinal`] cause; production
+    // encodes it via [`encode_job_error_from_anyhow`] /
+    // [`machine_code_from_engine_error`]. Substring matching here would make a
+    // message rewrite at a distant call site silently move an HTTP status —
+    // the silent-fallback class this project forbids.
     if lower.contains("circuit_digest") {
         return "circuit_digest_mismatch";
     }
@@ -2633,5 +2766,365 @@ mod tests {
         let structured = encode_job_error("internal_error", legacy);
         assert_ne!(structured.as_bytes(), legacy.as_bytes());
         assert!(structured.contains("internal_error"));
+    }
+
+    /// Typed engine cause (not a message substring) maps to
+    /// `dependency_not_final` with the contract HTTP 409.
+    ///
+    /// Engine emission of both variants with a real account/`last_nullifier`
+    /// is covered in `state_engine` host-only tests (no Plonky2 prove). This
+    /// test pins the **outward** encode/decode + 409 contract path.
+    #[test]
+    fn typed_dependency_not_final_encodes_as_409_not_proving_failed() {
+        use crate::job_store::JobStatus;
+        use zkcoins_prover::state_engine::DependencyNotFinal;
+
+        for cause in [
+            DependencyNotFinal::PredecessorAbsentFromCanonicalNfLog,
+            DependencyNotFinal::PredecessorPositionNotCoveredBySizeFinal {
+                position: 0,
+                size_final: 0,
+            },
+        ] {
+            // Intermediate context must not hide the typed cause.
+            let err = anyhow::Error::new(cause).context("begin_mint host refuse");
+            assert_eq!(
+                machine_code_from_engine_error(&err),
+                Some("dependency_not_final"),
+                "cause={cause:?}"
+            );
+            let encoded = encode_job_error_from_anyhow(&err);
+            let outward = decode_job_error(Some(&encoded), JobStatus::Failed);
+            assert_eq!(
+                outward["error"], "dependency_not_final",
+                "caller must see dependency_not_final, not proving_failed; got {outward}"
+            );
+            assert_eq!(
+                http_status_for_machine_code("dependency_not_final"),
+                Some(409),
+                "§7.5 / error_contract maps dependency_not_final → 409"
+            );
+        }
+
+        // Free-form predecessor prose without typed encode must NOT
+        // silently become dependency_not_final (substring match removed).
+        let free = decode_job_error(
+            Some("predecessor nullifier is not in the canonical NfLog"),
+            JobStatus::Failed,
+        );
+        assert_eq!(
+            free["error"], "proving_failed",
+            "substring match removed; free-form stays proving_failed"
+        );
+    }
+
+    /// Typed host cause (not a message substring) maps to `publish_rejected`.
+    ///
+    /// §7.5: `publish_rejected` is a terminal **job error object**; the job
+    /// poll HTTP status remains 200 (same as `proving_failed`) — it is not
+    /// an RPC `KernelErrorCode`. Free-form text that merely contains the
+    /// word must not classify as `publish_rejected` after the substring
+    /// branch was removed.
+    #[test]
+    fn typed_publish_rejected_encodes_not_from_free_form_text() {
+        use crate::job_store::JobStatus;
+
+        let cause = PublishRejected::DurableHandoffFailed {
+            detail: "recording publisher: forced broadcast handoff failure".to_string(),
+        };
+        // Intermediate context must not hide the typed cause.
+        let err = anyhow::Error::new(cause).context("finalise durable handoff");
+        assert_eq!(
+            machine_code_from_engine_error(&err),
+            Some("publish_rejected"),
+            "typed PublishRejected must classify as publish_rejected"
+        );
+        let encoded = encode_job_error_from_anyhow(&err);
+        let outward = decode_job_error(Some(&encoded), JobStatus::Failed);
+        assert_eq!(
+            outward["error"], "publish_rejected",
+            "caller must see publish_rejected, not proving_failed; got {outward}"
+        );
+        // §7.5 job-poll surface: terminal job errors ride a successful poll
+        // (HTTP 200) with the closed code in the body — not an RPC mapping.
+        // `http_status_for_machine_code` only covers KernelErrorCode RPC
+        // reasons; publish_rejected is intentionally absent there (same as
+        // proving_failed).
+        assert_eq!(
+            http_status_for_machine_code("publish_rejected"),
+            None,
+            "publish_rejected is a terminal job body code, not an RPC KernelErrorCode"
+        );
+        assert_eq!(
+            http_status_for_machine_code("proving_failed"),
+            None,
+            "proving_failed shares the same non-RPC job-body surface"
+        );
+        // Normative job-poll HTTP for both terminal job-body codes (§7.5).
+        const JOB_POLL_HTTP_FOR_TERMINAL_JOB_ERROR: u16 = 200;
+        assert_eq!(
+            JOB_POLL_HTTP_FOR_TERMINAL_JOB_ERROR, 200,
+            "§7.5: job poll itself returns 200; error is in the body"
+        );
+
+        // Free-form text with the same diagnostic wording must NOT silently
+        // become publish_rejected (substring match removed — the point).
+        let free_wording = "publish_rejected: v1.1 finalise durable nullifier publish \
+             after members_ready failed (row retained for resume): bitcoind down";
+        let free = decode_job_error(Some(free_wording), JobStatus::Failed);
+        assert_eq!(
+            free["error"], "proving_failed",
+            "substring match removed; free-form stays proving_failed, got {free}"
+        );
+        let free_alt = decode_job_error(Some("publisher rejected the batch"), JobStatus::Failed);
+        assert_eq!(
+            free_alt["error"], "proving_failed",
+            "legacy 'publisher rejected' free-form must not map either"
+        );
+    }
+
+    /// Recording double: `try_prepare` → None so durable path uses
+    /// `publish_batch` (same shape as the job_dispatcher finalise tests).
+    struct TickRecordingPublisher {
+        batches: std::sync::Mutex<Vec<usize>>,
+        fail: bool,
+    }
+
+    impl TickRecordingPublisher {
+        fn ok() -> Self {
+            Self {
+                batches: std::sync::Mutex::new(Vec::new()),
+                fail: false,
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                batches: std::sync::Mutex::new(Vec::new()),
+                fail: true,
+            }
+        }
+        fn published_count(&self) -> usize {
+            self.batches.lock().expect("lock").iter().sum()
+        }
+    }
+
+    impl crate::v1::receive::NullifierBatchPublisher for TickRecordingPublisher {
+        fn publish_batch(
+            &self,
+            members: &[zkcoins_prover::publisher::BatchMember],
+        ) -> anyhow::Result<zkcoins_prover::publisher::PublishedBatch> {
+            if self.fail {
+                anyhow::bail!("recording publisher: forced broadcast handoff failure");
+            }
+            anyhow::ensure!(!members.is_empty(), "recording publisher: empty batch");
+            self.batches.lock().expect("lock").push(members.len());
+            let agg = zkcoins_prover::half_agg::AggregateStateNullifierV3 {
+                version: 3,
+                format: 0x01,
+                block_anchor: members[0].build_tip,
+                members: members.iter().map(|m| (m.sig.pk, m.sig.r)).collect(),
+                raw_s: None,
+                s_agg: Some([0xAB; 32]),
+            };
+            Ok(zkcoins_prover::publisher::PublishedBatch {
+                aggregate: agg,
+                payload: vec![0x42],
+                commit_txid: bitcoin::Txid::from_raw_hash(
+                    <bitcoin::hashes::sha256d::Hash as bitcoin::hashes::Hash>::from_byte_array(
+                        [0x11; 32],
+                    ),
+                ),
+                reveal_txid: bitcoin::Txid::from_raw_hash(
+                    <bitcoin::hashes::sha256d::Hash as bitcoin::hashes::Hash>::from_byte_array(
+                        [0x22; 32],
+                    ),
+                ),
+                commit_output: bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(600),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                },
+                block_anchor: members[0].build_tip,
+            })
+        }
+    }
+
+    fn tick_xonly(label: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"v1/sig/resume-tick/");
+        h.update(label);
+        let d = h.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&d);
+        out
+    }
+
+    /// One resume sweep — same pickup path the binary resumer uses
+    /// (`resume_all_pending_publishes` → `resume_pending_publish`). Kept
+    /// local to tests so the binary can stay on the public `V1Publisher`
+    /// surface without a second rebroadcast implementation.
+    async fn resume_pending_publishes_tick(
+        adapter: &crate::v1::EngineAdapter,
+        publisher: &impl crate::v1::receive::NullifierBatchPublisher,
+    ) -> anyhow::Result<usize> {
+        crate::v1::receive::resume_all_pending_publishes_with(adapter, publisher).await
+    }
+
+    /// A waiting `members_ready` row is picked up by the resume tick without
+    /// a process restart (recording publisher, no real bitcoind).
+    #[tokio::test]
+    async fn resume_tick_picks_up_members_ready_without_restart() {
+        use crate::test_db::setup_pool;
+        use crate::v1::db_v1;
+        use crate::v1::separation::claim_stack_scan_mode;
+        use crate::v1::EngineAdapter;
+        use shared::spec_v1::Address;
+
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim v1");
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("adapter");
+
+        let owner = Address(tick_xonly(b"owner-ok"));
+        let pk = tick_xonly(b"pk-ok");
+        let r = tick_xonly(b"r-ok");
+        let s = [0x55u8; 32];
+        let r_prime = tick_xonly(b"rp-ok");
+        db_v1::insert_pending_publish_members_ready(
+            &pool, owner, pk, r, s, r_prime, 42, [0xAA; 32],
+        )
+        .await
+        .expect("stage members_ready");
+
+        let before = db_v1::list_resumable_pending_publishes(&pool)
+            .await
+            .expect("list");
+        assert_eq!(before.len(), 1, "row must be resumable before tick");
+        assert_eq!(before[0].status, db_v1::PENDING_PUBLISH_MEMBERS_READY);
+
+        let recorder = TickRecordingPublisher::ok();
+        let completed = resume_pending_publishes_tick(&adapter, &recorder)
+            .await
+            .expect("tick must succeed");
+        assert_eq!(completed, 1, "one pending publish must complete");
+        assert_eq!(
+            recorder.published_count(),
+            1,
+            "recording publisher must observe the broadcast handoff"
+        );
+
+        let after = db_v1::list_resumable_pending_publishes(&pool)
+            .await
+            .expect("list after");
+        assert!(
+            after.is_empty(),
+            "row must no longer be resumable after successful tick; got {after:?}"
+        );
+        let row = db_v1::load_pending_publish(&pool, pk)
+            .await
+            .expect("load")
+            .expect("row retained");
+        assert_ne!(
+            row.status,
+            db_v1::PENDING_PUBLISH_MEMBERS_READY,
+            "status must advance past members_ready; got {}",
+            row.status
+        );
+        drop(scope);
+    }
+
+    /// Failed handoff leaves the row waiting; a later tick still attempts
+    /// resume (resumer does not give up after a permanent-looking error).
+    #[tokio::test]
+    async fn resume_tick_failure_keeps_row_and_retries() {
+        use crate::test_db::setup_pool;
+        use crate::v1::db_v1;
+        use crate::v1::separation::claim_stack_scan_mode;
+        use crate::v1::EngineAdapter;
+        use shared::spec_v1::Address;
+
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim v1");
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("adapter");
+
+        let owner = Address(tick_xonly(b"owner-fail"));
+        let pk = tick_xonly(b"pk-fail");
+        let r = tick_xonly(b"r-fail");
+        let s = [0x66u8; 32];
+        let r_prime = tick_xonly(b"rp-fail");
+        db_v1::insert_pending_publish_members_ready(&pool, owner, pk, r, s, r_prime, 7, [0xBB; 32])
+            .await
+            .expect("stage members_ready");
+
+        let failing = TickRecordingPublisher::failing();
+        let err1 = resume_pending_publishes_tick(&adapter, &failing)
+            .await
+            .expect_err("first tick must surface publisher failure");
+        assert!(
+            format!("{err1:#}").contains("forced broadcast handoff failure")
+                || format!("{err1:#}").contains("publish_batch"),
+            "error must name the handoff failure; got {err1:#}"
+        );
+        assert_eq!(
+            failing.published_count(),
+            0,
+            "failing publisher must not publish"
+        );
+
+        let still = db_v1::list_resumable_pending_publishes(&pool)
+            .await
+            .expect("list");
+        assert_eq!(
+            still.len(),
+            1,
+            "row must remain resumable after failed tick"
+        );
+        assert_eq!(still[0].status, db_v1::PENDING_PUBLISH_MEMBERS_READY);
+
+        // Second attempt still runs (resumer does not mark done / give up).
+        let err2 = resume_pending_publishes_tick(&adapter, &failing)
+            .await
+            .expect_err("second tick must still attempt and fail");
+        assert!(
+            format!("{err2:#}").contains("forced broadcast handoff failure")
+                || format!("{err2:#}").contains("publish_batch"),
+            "retry error must name the handoff failure; got {err2:#}"
+        );
+        let still2 = db_v1::list_resumable_pending_publishes(&pool)
+            .await
+            .expect("list");
+        assert_eq!(
+            still2.len(),
+            1,
+            "row must remain resumable after second failed tick"
+        );
+        assert_eq!(still2[0].pk, pk);
+
+        // Recovery on a subsequent successful tick (same process — no restart).
+        let ok = TickRecordingPublisher::ok();
+        let completed = resume_pending_publishes_tick(&adapter, &ok)
+            .await
+            .expect("recovery tick");
+        assert_eq!(completed, 1);
+        assert_eq!(ok.published_count(), 1);
+        let gone = db_v1::list_resumable_pending_publishes(&pool)
+            .await
+            .expect("list");
+        assert!(
+            gone.is_empty(),
+            "row must clear after successful recovery tick"
+        );
+        drop(scope);
     }
 }

@@ -2735,6 +2735,7 @@ mod jobs_endpoint_tests {
             .job_store
             .complete(
                 job_id,
+                crate::job_store::JobStatus::Queued,
                 serde_json::json!({"success": true, "proof_id": 99u64}),
                 200,
             )
@@ -2926,6 +2927,7 @@ mod jobs_endpoint_tests {
             .job_store
             .complete(
                 job_id,
+                crate::job_store::JobStatus::Queued,
                 serde_json::json!({"success": true, "proof_id": 7u64}),
                 200,
             )
@@ -2962,7 +2964,11 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .fail(job_id, "synthetic error")
+            .fail(
+                job_id,
+                crate::job_store::JobStatus::Queued,
+                "synthetic error",
+            )
             .await
             .expect("fail");
 
@@ -3192,7 +3198,12 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .set_status(job_id, crate::job_store::JobStatus::Proving, "proving")
+            .set_status(
+                job_id,
+                crate::job_store::JobStatus::Queued,
+                crate::job_store::JobStatus::Proving,
+                "proving",
+            )
             .await
             .expect("proving");
 
@@ -3760,9 +3771,16 @@ mod jobs_endpoint_tests {
         assert!(result_json.get("new_account_state_hash").is_some());
         assert!(result_json.get("signature_accepted").is_none());
 
+        // Job is still awaiting_signature (hook was invoked directly, not
+        // via claim/finalise owner complete).
         state
             .job_store
-            .complete(job_id, result_json.clone(), 200)
+            .complete(
+                job_id,
+                crate::job_store::JobStatus::AwaitingSignature,
+                result_json.clone(),
+                200,
+            )
             .await
             .expect("complete");
         let req = Request::get(format!("/v1/jobs/{}", job_id))
@@ -3938,7 +3956,12 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .complete(job_id, result_json, 200)
+            .complete(
+                job_id,
+                crate::job_store::JobStatus::Queued,
+                result_json,
+                200,
+            )
             .await
             .expect("complete");
         let req = Request::get(format!("/v1/jobs/{}", job_id))
@@ -4831,9 +4854,13 @@ mod jobs_endpoint_tests {
 
     /// Defect 1 (host edge): resume drives exactly to the documented host edge
     /// ([`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`]) — §7.5 job complete
-    /// after durable completion surface — and does not silently stop earlier.
-    /// Remaining work is on-chain AggregateStateNullifierV3 **broadcast**
-    /// (bitcoind); engine + `members_ready` are the durable handoff.
+    /// after durable completion surface **and** recorded nullifier broadcast
+    /// handoff — and does not silently stop earlier.
+    ///
+    /// With a durable completion surface and **no** leftover `members_ready`
+    /// row (handoff already recorded, or never staged), resume may complete.
+    /// Remaining work after the host edge is on-chain AggregateStateNullifierV3
+    /// confirmation / NfLog scan-fold (bitcoind).
     #[tokio::test]
     async fn resume_drives_to_documented_host_edge_not_silent_stop() {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
@@ -4845,8 +4872,9 @@ mod jobs_endpoint_tests {
         let scope = crate::test_db::setup_pool().await;
         let pool = Arc::new(scope.pool.clone());
         let plant_store = crate::job_store::JobStore::new((*pool).clone());
-        // Durable completion_result already present: crash after prove+apply,
-        // before host complete — the resumable window up to the host edge.
+        // Durable completion_result already present, no members_ready row:
+        // crash after host work + handoff recorded (or never staged), before
+        // terminal complete — resumable window up to the host edge.
         let (job_id, entry) =
             plant_signed_finalisation_job(&plant_store, 0xE4, "k-host-edge", true).await;
         assert!(
@@ -4904,23 +4932,37 @@ mod jobs_endpoint_tests {
             "terminal strip must clear finalise_claim at host edge"
         );
 
-        // Documented edge is host-complete + durable stage, not chain broadcast.
+        // Documented edge names durable members_ready + broadcast handoff, and
+        // the chain/bitcoind remainder after host complete.
         let edge = crate::job_dispatcher::JOB_FINALISE_HOST_EDGE;
         assert!(
             edge.contains("AggregateStateNullifierV3") && edge.contains("bitcoind"),
             "JOB_FINALISE_HOST_EDGE must name the chain/bitcoind remainder; got: {edge}"
         );
         assert!(
-            edge.contains("members_ready") || edge.contains("durable_engine"),
-            "JOB_FINALISE_HOST_EDGE must name the durable engine/members_ready handoff; got: {edge}"
+            edge.contains("members_ready"),
+            "JOB_FINALISE_HOST_EDGE must name the durable members_ready stage; got: {edge}"
+        );
+        assert!(
+            edge.contains("nullifier_broadcast_handoff")
+                || edge.contains("broadcast_handoff")
+                || edge.contains("publish handoff"),
+            "JOB_FINALISE_HOST_EDGE must name the nullifier broadcast handoff; got: {edge}"
         );
 
         drop(scope);
     }
 
     /// Defect 1 (P0): a crash at the edge leaves a **durable** job — engine
-    /// intent via `v1_pending_publishes` + completion surface — that the
-    /// resume path picks up without re-running the finalise hook.
+    /// intent via `v1_pending_publishes` (`members_ready`) + completion
+    /// surface — that the resume path picks up without re-running the
+    /// finalise hook.
+    ///
+    /// Host edge (new): while the pending publish is still only
+    /// `members_ready` (broadcast handoff not recorded), resume must **not**
+    /// mark the job `completed`. Both: not completed **and** the
+    /// `members_ready` row retained. Crash/resume durability remains the
+    /// primary assertion — only the terminal end-state changes.
     #[tokio::test]
     async fn crash_at_edge_leaves_durable_job_resume_picks_up() {
         use crate::v1::{
@@ -4960,7 +5002,7 @@ mod jobs_endpoint_tests {
         .expect("stage members_ready at edge");
 
         // And the §7.5 completion surface is durable (crash after stage +
-        // completion persist, before terminal complete).
+        // completion persist, before broadcast handoff / terminal complete).
         let mut entry = entry;
         let outcome = FinaliseOutcome::from_pending_proof_data_with_publisher(
             &entry.pending,
@@ -5016,21 +5058,24 @@ mod jobs_endpoint_tests {
             .await
             .expect("load")
             .expect("row");
-        assert_eq!(
+        // New host edge: members_ready alone is not host-complete.
+        assert_ne!(
             after.status,
             crate::job_store::JobStatus::Completed,
-            "resume must complete the job left at the edge; status={:?} err={:?}",
+            "must not complete while pending publish is still members_ready; \
+             status={:?} err={:?}",
             after.status,
             after.error
         );
-        // Publisher work finds the staged intent.
+        // Publisher / boot resume still finds the staged intent (durable handoff).
         let pending = crate::v1::db_v1::load_pending_publish(&pool, sig.pk_i)
             .await
             .expect("load pending")
             .expect("members_ready must survive crash + resume");
         assert_eq!(
             pending.status,
-            crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY
+            crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY,
+            "members_ready row must be retained for later broadcast handoff"
         );
         assert_eq!(pending.owner, owner);
 
@@ -5040,6 +5085,12 @@ mod jobs_endpoint_tests {
     /// Defect 1 (P0): when the finalise hook runs, it must leave a durable
     /// `v1_pending_publishes` row (test double stages intent the way
     /// production `finalise_accepted_prove_persist_and_stage` does).
+    ///
+    /// This test stages **only** (no broadcast handoff). Host edge: the job
+    /// must **not** become `completed` while the intent remains
+    /// `members_ready` — both not-completed and the staged row retained.
+    /// Successful handoff → completed is covered by
+    /// `job_dispatcher::finalise_publish_handoff_tests` via `RecordingPublisher`.
     #[tokio::test]
     async fn finalise_hook_stages_pending_publish_for_durable_handoff() {
         use crate::v1::{
@@ -5061,9 +5112,10 @@ mod jobs_endpoint_tests {
         state.v1_finalise = Some(Arc::new(move |pending, signature, fence| {
             let pool_for_hook = Arc::clone(&pool_for_hook);
             Box::pin(async move {
-                // Mirror production: stage members_ready under the claim fence
-                // before returning the §7.5 outcome (real path also persists
-                // the engine under the same predicate).
+                // Mirror production stage only: members_ready under the claim
+                // fence before returning the §7.5 outcome. Deliberately no
+                // broadcast handoff (see job_dispatcher RecordingPublisher tests
+                // for the handoff→completed path).
                 let staged =
                     crate::v1::db_v1::persist_engine_with_pending_members_ready_if_finalise_fence(
                         &pool_for_hook,
@@ -5086,9 +5138,9 @@ mod jobs_endpoint_tests {
                         fence,
                     )
                     .await
-                    .map_err(|e| format!("stage members_ready under fence: {e:#}"))?;
+                    .map_err(|e| anyhow::anyhow!("stage members_ready under fence: {e:#}"))?;
                 if !staged {
-                    return Err(crate::job_store::FINALISE_FENCE_LOST.to_string());
+                    return Err(anyhow::Error::msg(crate::job_store::FINALISE_FENCE_LOST));
                 }
                 Ok(FinaliseOutcome::from_pending_proof_data(&pending))
             })
@@ -5110,7 +5162,14 @@ mod jobs_endpoint_tests {
             .await
             .expect("load")
             .expect("row");
-        assert_eq!(after.status, crate::job_store::JobStatus::Completed);
+        assert_ne!(
+            after.status,
+            crate::job_store::JobStatus::Completed,
+            "staging members_ready without broadcast handoff must not complete; \
+             status={:?} err={:?}",
+            after.status,
+            after.error
+        );
         let sig = entry.signature.expect("signed");
         let pending = crate::v1::db_v1::load_pending_publish(&pool, sig.pk_i)
             .await
@@ -5118,7 +5177,8 @@ mod jobs_endpoint_tests {
             .expect("hook must stage v1_pending_publishes for the publisher handoff");
         assert_eq!(
             pending.status,
-            crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY
+            crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY,
+            "members_ready must remain for durable handoff"
         );
     }
 
@@ -5289,7 +5349,11 @@ mod jobs_endpoint_tests {
         // Terminal fail: envelope strip is atomic with the status flip.
         state
             .job_store
-            .fail(job_id, "awaiting_signature timeout")
+            .fail(
+                job_id,
+                crate::job_store::JobStatus::AwaitingSignature,
+                "awaiting_signature timeout",
+            )
             .await
             .expect("fail");
         let after_fail = state
@@ -5418,7 +5482,12 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .set_status(proving_id, crate::job_store::JobStatus::Proving, "proving")
+            .set_status(
+                proving_id,
+                crate::job_store::JobStatus::Queued,
+                crate::job_store::JobStatus::Proving,
+                "proving",
+            )
             .await
             .expect("proving");
 
@@ -5449,6 +5518,7 @@ mod jobs_endpoint_tests {
             .job_store
             .set_status(
                 pub_id,
+                crate::job_store::JobStatus::Queued,
                 crate::job_store::JobStatus::Broadcasting,
                 "broadcasting",
             )
@@ -6027,6 +6097,7 @@ mod jobs_endpoint_tests {
             .job_store
             .complete(
                 job_id,
+                crate::job_store::JobStatus::Queued,
                 serde_json::json!({"success": true, "proof_id": 5u64}),
                 200,
             )
@@ -6086,7 +6157,11 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .fail(job_id, "synthetic fail")
+            .fail(
+                job_id,
+                crate::job_store::JobStatus::Queued,
+                "synthetic fail",
+            )
             .await
             .expect("fail");
 

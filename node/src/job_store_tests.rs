@@ -230,7 +230,12 @@ async fn set_status_advances_status_and_phase() {
         panic!("expected Fresh");
     };
     let applied = store
-        .set_status(job.public_id, JobStatus::Proving, "running_prover")
+        .set_status(
+            job.public_id,
+            JobStatus::Queued,
+            JobStatus::Proving,
+            "running_prover",
+        )
         .await
         .expect("set_status");
     assert!(applied, "set_status must report true when one row matches");
@@ -245,7 +250,7 @@ async fn set_status_reports_false_when_no_row_matches() {
     let (store, _c) = setup_store().await;
     let missing = uuid::Uuid::new_v4();
     let applied = store
-        .set_status(missing, JobStatus::Proving, "proving")
+        .set_status(missing, JobStatus::Queued, JobStatus::Proving, "proving")
         .await
         .expect("query ok");
     assert!(!applied, "missing public_id must yield Ok(false)");
@@ -257,7 +262,7 @@ async fn complete_reports_false_when_no_row_matches() {
     let (store, _c) = setup_store().await;
     let missing = uuid::Uuid::new_v4();
     let applied = store
-        .complete(missing, serde_json::json!({}), 200)
+        .complete(missing, JobStatus::Queued, serde_json::json!({}), 200)
         .await
         .expect("query ok");
     assert!(
@@ -278,9 +283,17 @@ async fn set_status_refuses_terminal_rows() {
     else {
         panic!("expected Fresh");
     };
-    assert!(store.fail(job.public_id, "terminal").await.expect("fail"));
+    assert!(store
+        .fail(job.public_id, JobStatus::Queued, "terminal")
+        .await
+        .expect("fail"));
     let applied = store
-        .set_status(job.public_id, JobStatus::Broadcasting, "broadcasting")
+        .set_status(
+            job.public_id,
+            JobStatus::Queued,
+            JobStatus::Broadcasting,
+            "broadcasting",
+        )
         .await
         .expect("set_status");
     assert!(!applied, "must not advance a failed job");
@@ -332,7 +345,7 @@ async fn complete_persists_response_body_and_status() {
     };
     let body = serde_json::json!({"success": true, "proof_id": 7});
     let completed = store
-        .complete(job.public_id, body.clone(), 200)
+        .complete(job.public_id, JobStatus::Queued, body.clone(), 200)
         .await
         .expect("complete");
     assert!(completed, "complete must report true when one row matches");
@@ -356,7 +369,7 @@ async fn fail_persists_error_and_completed_at() {
         panic!("expected Fresh");
     };
     let failed = store
-        .fail(job.public_id, "Insufficient funds")
+        .fail(job.public_id, JobStatus::Queued, "Insufficient funds")
         .await
         .expect("fail");
     assert!(failed, "fail must report true when one row matches");
@@ -396,7 +409,12 @@ async fn cancel_legacy_rejects_proving_and_awaiting_signature() {
         panic!("expected Fresh");
     };
     store
-        .set_status(proving.public_id, JobStatus::Proving, "proving")
+        .set_status(
+            proving.public_id,
+            JobStatus::Queued,
+            JobStatus::Proving,
+            "proving",
+        )
         .await
         .expect("set proving");
     let applied = store.cancel(proving.public_id).await.expect("cancel");
@@ -436,7 +454,12 @@ async fn cancel_not_yet_published_accepts_proving_and_awaiting_signature() {
         panic!("expected Fresh");
     };
     store
-        .set_status(job.public_id, JobStatus::Proving, "proving")
+        .set_status(
+            job.public_id,
+            JobStatus::Queued,
+            JobStatus::Proving,
+            "proving",
+        )
         .await
         .expect("set proving");
     let applied = store
@@ -522,7 +545,11 @@ async fn fail_atomically_strips_pending_sign_envelope() {
         .await
         .expect("plant");
     store
-        .fail(job.public_id, "awaiting_signature timeout")
+        .fail(
+            job.public_id,
+            JobStatus::Queued,
+            "awaiting_signature timeout",
+        )
         .await
         .expect("fail");
     let after = store.load(job.public_id).await.unwrap().unwrap();
@@ -2115,7 +2142,12 @@ async fn cancel_from_broadcasting_returns_false_and_leaves_status_untouched() {
         panic!("expected Fresh");
     };
     store
-        .set_status(job.public_id, JobStatus::Broadcasting, "broadcasting")
+        .set_status(
+            job.public_id,
+            JobStatus::Queued,
+            JobStatus::Broadcasting,
+            "broadcasting",
+        )
         .await
         .expect("set broadcasting");
     let applied = store.cancel(job.public_id).await.expect("cancel");
@@ -2149,7 +2181,12 @@ async fn queue_depth_counts_queued_and_proving_only() {
         .expect("q2");
     // promote one to proving
     store
-        .set_status(q1.public_id, JobStatus::Proving, "proving")
+        .set_status(
+            q1.public_id,
+            JobStatus::Queued,
+            JobStatus::Proving,
+            "proving",
+        )
         .await
         .unwrap();
     // one completed (must not count)
@@ -2161,7 +2198,12 @@ async fn queue_depth_counts_queued_and_proving_only() {
         panic!()
     };
     store
-        .complete(done.public_id, serde_json::json!({}), 200)
+        .complete(
+            done.public_id,
+            JobStatus::Queued,
+            serde_json::json!({}),
+            200,
+        )
         .await
         .unwrap();
     // one cancelled (must not count)
@@ -2223,7 +2265,12 @@ async fn list_non_terminal_for_resume_returns_queued_and_awaiting() {
         panic!()
     };
     store
-        .complete(done.public_id, serde_json::json!({}), 200)
+        .complete(
+            done.public_id,
+            JobStatus::Queued,
+            serde_json::json!({}),
+            200,
+        )
         .await
         .unwrap();
     let CreateResult::Fresh(broadcasting) = store
@@ -2236,6 +2283,7 @@ async fn list_non_terminal_for_resume_returns_queued_and_awaiting() {
     store
         .set_status(
             broadcasting.public_id,
+            JobStatus::Queued,
             JobStatus::Broadcasting,
             "broadcasting",
         )
@@ -2267,7 +2315,12 @@ async fn list_interrupted_for_resume_returns_proving_and_broadcasting() {
         panic!()
     };
     store
-        .set_status(p.public_id, JobStatus::Proving, "proving")
+        .set_status(
+            p.public_id,
+            JobStatus::Queued,
+            JobStatus::Proving,
+            "proving",
+        )
         .await
         .unwrap();
     let CreateResult::Fresh(b) = store
@@ -2278,7 +2331,12 @@ async fn list_interrupted_for_resume_returns_proving_and_broadcasting() {
         panic!()
     };
     store
-        .set_status(b.public_id, JobStatus::Broadcasting, "broadcasting")
+        .set_status(
+            b.public_id,
+            JobStatus::Queued,
+            JobStatus::Broadcasting,
+            "broadcasting",
+        )
         .await
         .unwrap();
     let CreateResult::Fresh(q) = store

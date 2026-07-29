@@ -209,7 +209,12 @@ mod tests {
             _ => panic!("fresh"),
         };
         store
-            .complete(id, serde_json::json!({"success": true, "proof_id": 9}), 200)
+            .complete(
+                id,
+                crate::job_store::JobStatus::Queued,
+                serde_json::json!({"success": true, "proof_id": 9}),
+                200,
+            )
             .await
             .expect("complete");
 
@@ -247,7 +252,10 @@ mod tests {
             crate::job_store::CreateResult::Fresh(j) => j.public_id,
             _ => panic!(),
         };
-        store.fail(fail_id, "boom").await.expect("fail");
+        store
+            .fail(fail_id, crate::job_store::JobStatus::Queued, "boom")
+            .await
+            .expect("fail");
         let stream = hub
             .subscribe(store.as_ref(), JobRequest { id: JobId(fail_id) })
             .await
@@ -311,7 +319,12 @@ mod tests {
             _ => panic!(),
         };
         store
-            .set_status(id, StoreStatus::Proving, "proving_circuit")
+            .set_status(
+                id,
+                StoreStatus::Queued,
+                StoreStatus::Proving,
+                "proving_circuit",
+            )
             .await
             .expect("proving");
 

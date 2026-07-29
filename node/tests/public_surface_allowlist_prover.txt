@@ -265,6 +265,7 @@ zkcoins_prover_plonky2::state_engine::AccountRecord::op_secret
 zkcoins_prover_plonky2::state_engine::AccountRecord::spendable
 zkcoins_prover_plonky2::state_engine::AccountRecord::spent_ids
 zkcoins_prover_plonky2::state_engine::AccountRecord::state
+zkcoins_prover_plonky2::state_engine::DependencyNotFinal
 zkcoins_prover_plonky2::state_engine::AppliedTransition
 zkcoins_prover_plonky2::state_engine::AppliedTransition::nullifier
 zkcoins_prover_plonky2::state_engine::AppliedTransition::proved

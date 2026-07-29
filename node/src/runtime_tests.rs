@@ -615,7 +615,7 @@ async fn boot_resume_cannot_fail_job_claimed_since_snapshot() {
 
     // Snapshot status boot would have observed for an interrupted prove.
     store
-        .set_status(job_id, JobStatus::Proving, "proving")
+        .set_status(job_id, JobStatus::Queued, JobStatus::Proving, "proving")
         .await
         .expect("set proving");
     let snapshot_status = JobStatus::Proving;

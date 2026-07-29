@@ -540,7 +540,7 @@ mod genesis_fence_tests {
 
         // Pre-reset worker cannot resurrect: set_status / complete lose the CAS.
         let advanced = store
-            .set_status(public_id, JobStatus::Proving, "proving")
+            .set_status(public_id, JobStatus::Queued, JobStatus::Proving, "proving")
             .await
             .expect("set_status");
         assert!(
@@ -548,7 +548,7 @@ mod genesis_fence_tests {
             "set_status must return false when generation fence matches 0 rows"
         );
         let completed = store
-            .complete(public_id, serde_json::json!({}), 200)
+            .complete(public_id, JobStatus::Queued, serde_json::json!({}), 200)
             .await
             .expect("complete");
         assert!(
@@ -605,7 +605,7 @@ mod genesis_fence_tests {
         // Advance to proving so `complete` is a legal transition shape.
         assert!(
             store
-                .set_status(job_id, JobStatus::Proving, "proving")
+                .set_status(job_id, JobStatus::Queued, JobStatus::Proving, "proving")
                 .await
                 .expect("set proving"),
             "pre-reset set_status must land on live generation"
@@ -630,7 +630,14 @@ mod genesis_fence_tests {
         .await
         .expect("fail job in open reset");
 
-        let complete_fut = store.complete(job_id, serde_json::json!({"should": "not land"}), 200);
+        // Job is proving; complete must still take the generation lock and
+        // lose after the concurrent reset fails the row.
+        let complete_fut = store.complete(
+            job_id,
+            JobStatus::Proving,
+            serde_json::json!({"should": "not land"}),
+            200,
+        );
         tokio::pin!(complete_fut);
         let blocked =
             tokio::time::timeout(std::time::Duration::from_millis(200), &mut complete_fut).await;

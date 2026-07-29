@@ -263,6 +263,13 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // instead of racing on the process-wide env var under
     // `--test-threads=8` (issue #181 Opt A).
     let v1_engine_for_rest = Some(Arc::clone(&v1_adapter));
+
+    // Boot-time pending-publish resume **before** REST accepts work. If the
+    // node cannot determine whether mid-flight AggregateStateNullifierV3
+    // publishes remain (or cannot recover them when the publisher is up),
+    // refuse to bind the listener — never a short window of accept-then-exit.
+    boot_resume_pending_publishes(&v1_adapter, pins.network).await?;
+
     // REST + kernel.v1 gRPC share one job store / notify map inside
     // `start_rest_node` (StreamJob must see dispatcher phase events).
     // `KERNEL_GRPC_ADDR` was validated at boot — no default host/port.
@@ -284,11 +291,194 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         }
     });
 
+    // In-process resumer for members_ready / progressive rows left after a
+    // failed finalise handoff. Own task — must not share the scan loop's
+    // await points (a hung bitcoind scan must not delay rebroadcast, and a
+    // slow rebroadcast must not block tip fold).
+    {
+        let adapter_for_resumer = Arc::clone(&v1_adapter);
+        let network = pins.network;
+        tokio::spawn(async move {
+            run_pending_publish_resumer(adapter_for_resumer, network).await;
+        });
+    }
+
     // Stage 3: only the v1 NfLog scanner. The legacy Commitment/SMT
     // Esplora path lives behind `LegacyCommitmentScanCap` (sealed; no
     // production mint) — not reachable from this binary.
     run_v1_scan_loop(v1_adapter, v1_scan_caught_up, v1_finality_ok).await?;
     Ok(())
+}
+
+/// Interval for the in-process AggregateStateNullifierV3 pending-publish
+/// resumer.
+///
+/// Matches the v1 scan-loop idle backoff (`Duration::from_secs(5)` after each
+/// successful `scan_to_tip`) and the recon incomplete-view backoff
+/// (`RECON_RETRY_BACKOFF` in [`run_v1_scan_loop`]) so a stranded
+/// `members_ready` row is retried on the same order of magnitude as tip
+/// observation — without a tight spin that would flood logs on a permanent
+/// publisher / bitcoind outage.
+const PENDING_PUBLISH_RESUME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Boot-time resume of durable AggregateStateNullifierV3 publishes left
+/// mid-flight by a previous crash (or a failed finalise handoff).
+///
+/// Fail-closed: publisher connect failure with pending work is fatal; a
+/// non-determinable pending-row list is fatal (never treated as empty).
+/// With a confirmed empty table, connect failure is logged loud and boot
+/// continues (receive/finalise paths will need the publisher later).
+async fn boot_resume_pending_publishes(
+    adapter: &node::v1::EngineAdapter,
+    network: zkcoins_program::circuit::compliance::Network,
+) -> Result<(), Box<dyn StdError>> {
+    use v1::{connect_v1_publisher, resume_all_pending_publishes, v1_publisher_env_from_env};
+
+    match v1_publisher_env_from_env(network) {
+        Ok(env) => match connect_v1_publisher(env) {
+            Ok(publisher) => match resume_all_pending_publishes(adapter, &publisher).await {
+                Ok(0) => println!("v1.1 resume_all_pending_publishes: nothing pending"),
+                Ok(n) => {
+                    println!("v1.1 resume_all_pending_publishes: completed {n} pending publish(es)")
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "v1.1 resume_all_pending_publishes failed: {e:#} — refusing to \
+                         continue with unrecovered mid-flight nullifier publishes"
+                    )
+                    .into());
+                }
+            },
+            Err(e) => {
+                let pending =
+                    match node::v1::db_v1::list_resumable_pending_publishes(adapter.pool()).await {
+                        Ok(rows) => rows.len(),
+                        Err(list_err) => {
+                            return Err(format!(
+                                "v1.1 publisher connect failed and resumable pending \
+                             publishes are not determinable ({list_err:#}); original \
+                             connect error: {e:#} — refusing to start without \
+                             knowing whether mid-flight nullifier publishes remain"
+                            )
+                            .into());
+                        }
+                    };
+                if pending > 0 {
+                    return Err(format!(
+                        "v1.1 publisher connect failed with {pending} resumable \
+                         pending publish(es): {e:#}"
+                    )
+                    .into());
+                }
+                eprintln!(
+                    "v1.1 publisher connect failed (no pending publishes; continuing boot): {e:#}"
+                );
+            }
+        },
+        Err(e) => {
+            let pending =
+                match node::v1::db_v1::list_resumable_pending_publishes(adapter.pool()).await {
+                    Ok(rows) => rows.len(),
+                    Err(list_err) => {
+                        return Err(format!(
+                            "v1.1 publisher env incomplete and resumable pending \
+                         publishes are not determinable ({list_err:#}); original \
+                         env error: {e:#} — refusing to start without \
+                         knowing whether mid-flight nullifier publishes remain"
+                        )
+                        .into());
+                    }
+                };
+            if pending > 0 {
+                return Err(format!(
+                    "v1.1 publisher env incomplete with {pending} resumable \
+                     pending publish(es): {e:#}"
+                )
+                .into());
+            }
+            eprintln!(
+                "v1.1 publisher env incomplete (no pending publishes; continuing boot): {e:#}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Periodic in-process resumer: same work as boot [`boot_resume_pending_publishes`],
+/// without aborting the process on a single failed sweep.
+///
+/// On durable publisher / bitcoind outage the open row count is logged and the
+/// next interval retries — never silent drop, never tight-loop flood.
+async fn run_pending_publish_resumer(
+    adapter: Arc<node::v1::EngineAdapter>,
+    network: zkcoins_program::circuit::compliance::Network,
+) {
+    use v1::{connect_v1_publisher, resume_all_pending_publishes, v1_publisher_env_from_env};
+
+    loop {
+        // scanner-polling-ok: pending-publish resume idle backoff (same form
+        // as v1 scan_to_tip idle sleep — named const, not a magic body literal)
+        tokio::time::sleep(PENDING_PUBLISH_RESUME_INTERVAL).await;
+
+        // Fail-closed list: undeterminable is an error, not "nothing pending".
+        let open = match node::v1::db_v1::list_resumable_pending_publishes(adapter.pool()).await {
+            Ok(rows) => rows.len(),
+            Err(list_err) => {
+                eprintln!(
+                    "v1.1 pending-publish resumer: open rows not determinable \
+                     ({list_err:#}) — not treating as empty; will retry next interval"
+                );
+                continue;
+            }
+        };
+        if open == 0 {
+            continue;
+        }
+
+        let env = match v1_publisher_env_from_env(network) {
+            Ok(env) => env,
+            Err(e) => {
+                eprintln!(
+                    "v1.1 pending-publish resumer: {open} open row(s); publisher \
+                     env incomplete ({e:#}) — will retry next interval"
+                );
+                continue;
+            }
+        };
+        let publisher = match connect_v1_publisher(env) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "v1.1 pending-publish resumer: {open} open row(s); publisher \
+                     connect failed ({e:#}) — will retry next interval"
+                );
+                continue;
+            }
+        };
+
+        // Same pickup path as boot — no second rebroadcast logic beside
+        // `resume_all_pending_publishes` / `resume_pending_publish`.
+        match resume_all_pending_publishes(adapter.as_ref(), &publisher).await {
+            Ok(0) => {
+                // Listed open rows, then none completed: another writer may
+                // have advanced them between list and resume, or statuses
+                // moved to non-resumable. Log the earlier open count.
+                println!(
+                    "v1.1 pending-publish resumer: saw {open} open row(s); \
+                     resume pass completed 0 (rows may have advanced concurrently)"
+                );
+            }
+            Ok(n) => println!(
+                "v1.1 pending-publish resumer: completed {n} of {open} open pending publish(es)"
+            ),
+            Err(e) => {
+                eprintln!(
+                    "v1.1 pending-publish resumer: failed with {open} open row(s) \
+                     still pending ({e:#}) — will retry next interval; rows left as-is"
+                );
+            }
+        }
+    }
 }
 
 /// Stage 2 v1.1 exclusive scan loop: bitcoind RPC + script-plonky2
@@ -341,65 +531,10 @@ async fn run_v1_scan_loop(
         pins.network, pins.activation_height
     );
 
-    // Boot-time resumer for durable AggregateStateNullifierV3 publishes left
-    // mid-flight by a previous crash. Runs before the scan loop so a pending
-    // row is rebroadcast (idempotently) without waiting for an operator to
-    // call `resume_pending_publish` by hand. Publisher env is mandatory under
-    // the v1.1 claim whenever any resumable row exists; connect failure with
-    // pending work is fatal. With an empty table, a connect failure is still
-    // logged loud (receive path will need the publisher later).
-    {
-        use v1::{connect_v1_publisher, resume_all_pending_publishes, v1_publisher_env_from_env};
-        match v1_publisher_env_from_env(pins.network) {
-            Ok(env) => match connect_v1_publisher(env) {
-                Ok(publisher) => match resume_all_pending_publishes(&adapter, &publisher).await {
-                    Ok(0) => println!("v1.1 resume_all_pending_publishes: nothing pending"),
-                    Ok(n) => println!(
-                        "v1.1 resume_all_pending_publishes: completed {n} pending publish(es)"
-                    ),
-                    Err(e) => {
-                        return Err(format!(
-                            "v1.1 resume_all_pending_publishes failed: {e:#} — refusing to \
-                             continue with unrecovered mid-flight nullifier publishes"
-                        )
-                        .into());
-                    }
-                },
-                Err(e) => {
-                    let pending = node::v1::db_v1::list_resumable_pending_publishes(adapter.pool())
-                        .await
-                        .map(|r| r.len())
-                        .unwrap_or(0);
-                    if pending > 0 {
-                        return Err(format!(
-                            "v1.1 publisher connect failed with {pending} resumable \
-                             pending publish(es): {e:#}"
-                        )
-                        .into());
-                    }
-                    eprintln!(
-                        "v1.1 publisher connect failed (no pending publishes; continuing scan): {e:#}"
-                    );
-                }
-            },
-            Err(e) => {
-                let pending = node::v1::db_v1::list_resumable_pending_publishes(adapter.pool())
-                    .await
-                    .map(|r| r.len())
-                    .unwrap_or(0);
-                if pending > 0 {
-                    return Err(format!(
-                        "v1.1 publisher env incomplete with {pending} resumable \
-                         pending publish(es): {e:#}"
-                    )
-                    .into());
-                }
-                eprintln!(
-                    "v1.1 publisher env incomplete (no pending publishes; continuing scan): {e:#}"
-                );
-            }
-        }
-    }
+    // Boot-time pending-publish resume runs in `main` *before* REST bind
+    // (and a periodic resumer runs beside this loop). The scanner path
+    // only folds NfLog — it must not be the sole pickup for stranded
+    // members_ready rows.
 
     // Connect is synchronous (blocking RPC). Keep it off the async worker.
     let mut scanner = tokio::task::spawn_blocking(move || {
