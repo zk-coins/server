@@ -720,4 +720,208 @@ mod tests {
         set_process_stack_mode(ScanStackMode::V1);
         assert!(ensure_v1_provenance_path().is_ok());
     }
+
+    /// Port of legacy `test_mint_single_invoice` (send side): one recipient
+    /// template with full spend of inputs stages one recipient output and
+    /// no change when amounts match.
+    #[test]
+    fn begin_v1_send_single_recipient_template_produces_one_output() {
+        with_v1_process_claim(|| {
+            let (engine, owner, coins, next_pubkey) = seeded_spendable_engine();
+            let total: u128 = coins.iter().map(|c| c.amount).sum();
+            let pending = begin_v1_send(
+                &engine,
+                SendRequest {
+                    owner,
+                    input_coin_ids: coins.iter().map(|c| c.identifier).collect(),
+                    output_templates: vec![CoinTemplate {
+                        recipient: Address([0x71; 32]),
+                        amount: total,
+                        asset_id: coins[0].asset_id,
+                    }],
+                    next_pubkey,
+                    npk_rand: [0x73; 32],
+                },
+            )
+            .expect("single-recipient full spend");
+            assert_eq!(pending.witness_wip.output_templates.len(), 1);
+            assert_eq!(pending.witness_wip.output_coins.len(), 1);
+            assert_eq!(pending.witness_wip.output_coins[0].amount, total);
+        });
+    }
+
+    /// Port of legacy `test_send_coins_rejects_too_many_invoices`:
+    /// more than `MAX_TX_OUTPUTS` recipient templates is refused loud.
+    #[test]
+    fn begin_v1_send_rejects_too_many_output_templates() {
+        use zkcoins_program::circuit::compliance::MAX_TX_OUTPUTS;
+        with_v1_process_claim(|| {
+            let (engine, owner, coins, next_pubkey) = seeded_spendable_engine();
+            let templates: Vec<CoinTemplate> = (0..(MAX_TX_OUTPUTS + 1))
+                .map(|i| CoinTemplate {
+                    recipient: Address([i as u8; 32]),
+                    amount: 1,
+                    asset_id: coins[0].asset_id,
+                })
+                .collect();
+            let err = begin_v1_send(
+                &engine,
+                SendRequest {
+                    owner,
+                    input_coin_ids: coins.iter().map(|c| c.identifier).collect(),
+                    output_templates: templates,
+                    next_pubkey,
+                    npk_rand: [0x73; 32],
+                },
+            )
+            .expect_err("over MAX_TX_OUTPUTS must refuse");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("too many output templates") || msg.contains("MAX_TX_OUTPUTS"),
+                "unexpected error: {msg}"
+            );
+        });
+    }
+
+    /// Port of legacy `test_send_coins_rejects_too_many_coins_in_queue`:
+    /// more than `MAX_TX_INPUTS` spendable inputs is refused loud.
+    #[test]
+    fn begin_v1_send_rejects_too_many_input_coins() {
+        use zkcoins_program::circuit::compliance::MAX_TX_INPUTS;
+        with_v1_process_claim(|| {
+            let mut engine = StateEngine::new(Network::Testnet, 0);
+            let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/g9-provenance/max-in/nk").into();
+            let op_secret =
+                OpSecret::new(Sha256::digest(b"zkCoins/v1/g9-provenance/max-in/op").into());
+            let (_, _, genesis_pubkey) =
+                normalized_key(deterministic_secret(b"zkCoins/v1/g9-provenance/max-in/pk0"));
+            let (_, _, current_pubkey) =
+                normalized_key(deterministic_secret(b"zkCoins/v1/g9-provenance/max-in/pk1"));
+            let (_, _, next_pubkey) =
+                normalized_key(deterministic_secret(b"zkCoins/v1/g9-provenance/max-in/pk2"));
+            let owner = Address(host::address(&genesis_pubkey, host::nk_commit(&nk)));
+            let asset_id = host::asset_id_v1(host::GENESIS_TAG, &genesis_pubkey, &[0x52; 32], 2, 1);
+            let creating_state = AccountState::new(
+                owner,
+                host::nk_commit(&nk),
+                BTreeMap::new(),
+                genesis_pubkey,
+                0,
+                host::coinhist_empty_root(),
+            )
+            .unwrap();
+            let creating_prev_ash = host::account_state_hash(&creating_state).unwrap();
+            let n = MAX_TX_INPUTS + 1;
+            let mut coinhist = CoinHistTree::new();
+            let mut spendable = BTreeMap::new();
+            let mut total = 0u128;
+            let mut input_ids = Vec::with_capacity(n);
+            for i in 0..n {
+                let amount = 1u128;
+                let coin = Coin {
+                    identifier: host::coin_identifier(
+                        creating_prev_ash,
+                        &owner.0,
+                        asset_id,
+                        amount,
+                        i as u32,
+                    ),
+                    recipient: owner,
+                    amount,
+                    asset_id,
+                };
+                let id = host::digest_to_bytes(&coin.identifier);
+                coinhist.admit(id).unwrap();
+                input_ids.push(coin.identifier);
+                spendable.insert(
+                    id,
+                    TrackedCoin {
+                        coin,
+                        creating_prev_ash,
+                        coin_index: i as u32,
+                    },
+                );
+                total += amount;
+            }
+            let mut balances = BTreeMap::new();
+            balances.insert(host::digest_to_bytes(&asset_id), total);
+            let state = AccountState::new(
+                owner,
+                host::nk_commit(&nk),
+                balances,
+                current_pubkey,
+                1,
+                coinhist.root(),
+            )
+            .unwrap();
+            let predecessor_position = ChainPosition {
+                height: 10,
+                tx_index: 0,
+                vin_index: 0,
+                member_index: 0,
+            };
+            engine.set_tip_height(10);
+            assert_eq!(
+                engine
+                    .append_nullifier(ScannedNullifier::from_survivor(&host::PublishedNullifier {
+                        chain_pos: predecessor_position,
+                        pk: genesis_pubkey,
+                        r: [0x61; 32],
+                    },))
+                    .unwrap(),
+                0
+            );
+            engine.set_tip_height(15);
+            engine
+                .insert_account(
+                    owner,
+                    AccountRecord {
+                        state,
+                        coinhist,
+                        nk,
+                        op_secret: Some(op_secret),
+                        genesis_pubkey,
+                        spendable,
+                        spent_ids: BTreeSet::new(),
+                        last_proof: Some(host_dummy_last_proof()),
+                        last_nav_opening: Some(NavOpening {
+                            nav: Nav {
+                                size: 0,
+                                mth: host::nflog_empty(),
+                            },
+                            nav_rand: op_secret.derive_nav_rand(0),
+                        }),
+                        last_nullifier: Some(NullifierOpening {
+                            public_key: genesis_pubkey,
+                            signature_r: [0x61; 32],
+                            r_prime: [0; 32],
+                        }),
+                        last_nullifier_pos: Some(0),
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(input_ids.len(), n);
+            let err = begin_v1_send(
+                &engine,
+                SendRequest {
+                    owner,
+                    input_coin_ids: input_ids,
+                    output_templates: vec![CoinTemplate {
+                        recipient: Address([0x99; 32]),
+                        amount: 1,
+                        asset_id,
+                    }],
+                    next_pubkey,
+                    npk_rand: [0x73; 32],
+                },
+            )
+            .expect_err("over MAX_TX_INPUTS must refuse");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("too many input coins") || msg.contains("MAX_TX_INPUTS"),
+                "unexpected error: {msg}"
+            );
+        });
+    }
 }

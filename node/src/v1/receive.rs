@@ -1700,6 +1700,217 @@ mod tests {
         assert!(format!("{err:#}").contains("MAX_RX_COINS"));
     }
 
+    /// Port of legacy `test_receive_coin_rejects_invalid_inclusion_proof`:
+    /// a leaf that does not open `output_coins_root` is refused (clause 10(b)).
+    #[test]
+    fn verify_output_inclusion_rejects_tampered_identifier() {
+        let honest_id = digest_label(b"honest-coin-id");
+        let ocr = host::merkle_root(TreeKind::CoinsRoot, &[honest_id]);
+        // depth-0 single-leaf tree: empty siblings, leaf is the root.
+        let inclusion = OutputInclusionProof {
+            leaf_index: 0,
+            depth: 0,
+            siblings: Vec::new(),
+        };
+        verify_output_inclusion(honest_id, &inclusion, ocr).expect("honest leaf must open root");
+
+        let tampered = digest_label(b"tampered-coin-id");
+        let err = verify_output_inclusion(tampered, &inclusion, ocr)
+            .expect_err("tampered identifier must fail inclusion");
+        assert!(
+            format!("{err:#}").contains("output inclusion does not open"),
+            "unexpected: {err:#}"
+        );
+    }
+
+    /// Port of legacy `test_receive_updates_balance` + duplicate/replay guards:
+    /// host `begin_receive` credits the received amount into the new account
+    /// state; a second receive of the same coin_id against coinhist fails.
+    #[test]
+    fn begin_receive_credits_balance_and_rejects_already_admitted_coin() {
+        use std::collections::{BTreeMap, BTreeSet};
+        use zkcoins_prover::prover_bridge::test_signing::{deterministic_secret, normalized_key};
+        use zkcoins_prover::state_engine::ScannedNullifier;
+
+        set_process_stack_mode(ScanStackMode::V1);
+        let mut engine = StateEngine::new(Network::Regtest, 0);
+        engine.set_tip_height(0);
+
+        let nk: [u8; 32] = Sha256::digest(b"v1-rx/balance-replay/nk").into();
+        let op_secret = OpSecret::new(Sha256::digest(b"v1-rx/balance-replay/op").into());
+        let (_, _, current_pubkey) =
+            normalized_key(deterministic_secret(b"v1-rx/balance-replay/pk0"));
+        let (_, _, next_pubkey) = normalized_key(deterministic_secret(b"v1-rx/balance-replay/pk1"));
+        let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &current_pubkey, &[0x31; 32], 2, 1);
+        let empty = host::AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            current_pubkey,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let creating_prev_ash = host::account_state_hash(&empty).expect("ash");
+        let amount = 250u128;
+        let coin = Coin {
+            identifier: host::coin_identifier(creating_prev_ash, &owner.0, asset_id, amount, 0),
+            recipient: owner,
+            amount,
+            asset_id,
+        };
+
+        let hollow = hollow_compliance_proof_with_pis(
+            &ProofData {
+                new_account_state_hash: digest_label(b"create-ash"),
+                output_coins_root: host::merkle_root(TreeKind::CoinsRoot, &[coin.identifier]),
+                input_nullifiers_root: host::merkle_root(TreeKind::NullifiersRoot, &[]),
+                coin_history_root: host::coinhist_empty_root(),
+                nav_commitment: digest_label(b"nav"),
+                npk_commit: [0; 32],
+            },
+            current_pubkey,
+        );
+        let auth = ReceivedAuthorization {
+            creating_proof: hollow.clone(),
+            output_inclusion: OutputInclusionProof {
+                leaf_index: 0,
+                depth: 0,
+                siblings: Vec::new(),
+            },
+            creating_prev_ash,
+            creating_nullifier: NullifierOpening {
+                public_key: [0; 32],
+                signature_r: [0; 32],
+                r_prime: [0; 32],
+            },
+            creating_nav_inclusion: Vec::new(),
+            pos_create: 0,
+            creating_nav_opening: NavOpening {
+                nav: Nav {
+                    size: 0,
+                    mth: host::nflog_empty(),
+                },
+                nav_rand: [0; 32],
+            },
+            creating_nav_consistency: Vec::new(),
+            history_proof: host::CoinHistTree::new().prove([0; 32]),
+        };
+
+        let pending = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret,
+                current_pubkey,
+                received_coins: vec![coin.clone()],
+                received_auth: vec![auth.clone()],
+                next_pubkey,
+                npk_rand: [0x42; 32],
+            })
+            .expect("first receive must stage");
+        assert_eq!(
+            pending
+                .witness_wip
+                .new_account_state
+                .balances
+                .get(&host::digest_to_bytes(&asset_id))
+                .copied(),
+            Some(amount),
+            "receive must credit the received amount into new_account_state"
+        );
+
+        // Replay / duplicate: account already holds the coin in coinhist.
+        let mut hist = host::CoinHistTree::new();
+        let id = host::digest_to_bytes(&coin.identifier);
+        hist.admit(id).expect("admit");
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), amount);
+        let state = host::AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            balances,
+            next_pubkey,
+            1,
+            hist.root(),
+        )
+        .expect("post-receive state");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: coin.clone(),
+                creating_prev_ash,
+                coin_index: 0,
+            },
+        );
+        // Predecessor nullifier for AccountUpdate receive.
+        let pred_pk = current_pubkey;
+        let pred_r = [0x71u8; 32];
+        engine.set_tip_height(10);
+        engine
+            .append_nullifier(ScannedNullifier::from_survivor(&host::PublishedNullifier {
+                chain_pos: host::ChainPosition {
+                    height: 10,
+                    tx_index: 0,
+                    vin_index: 0,
+                    member_index: 0,
+                },
+                pk: pred_pk,
+                r: pred_r,
+            }))
+            .expect("fold predecessor");
+        engine.set_tip_height(15);
+        let (_, _, next2) = normalized_key(deterministic_secret(b"v1-rx/balance-replay/pk2"));
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist: hist,
+                    nk,
+                    op_secret: Some(op_secret),
+                    genesis_pubkey: current_pubkey,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: Some(hollow),
+                    last_nav_opening: Some(NavOpening {
+                        nav: Nav {
+                            size: 0,
+                            mth: host::nflog_empty(),
+                        },
+                        nav_rand: op_secret.derive_nav_rand(0),
+                    }),
+                    last_nullifier: Some(NullifierOpening {
+                        public_key: pred_pk,
+                        signature_r: pred_r,
+                        r_prime: [0; 32],
+                    }),
+                    last_nullifier_pos: Some(0),
+                },
+            )
+            .expect("insert post-receive account");
+
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret,
+                current_pubkey: next_pubkey,
+                received_coins: vec![coin],
+                received_auth: vec![auth],
+                next_pubkey: next2,
+                npk_rand: [0x43; 32],
+            })
+            .expect_err("re-receive of admitted coin must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already present in coinhist") || msg.contains("already present"),
+            "unexpected replay error: {msg}"
+        );
+    }
+
     // ---- helpers for orchestration / multi-slot tests -----------------------
 
     fn xonly_from_label(label: &[u8]) -> [u8; 32] {

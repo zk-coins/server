@@ -499,4 +499,47 @@ mod tests {
         set_process_stack_mode(ScanStackMode::V1);
         ensure_v1_mint_path().expect("v1 claim must allow");
     }
+
+    /// Port of legacy `test_mint_single_invoice` / first-mint happy path:
+    /// a genesis std1 mint stages exactly one output coin for the amount.
+    #[test]
+    fn begin_v1_mint_genesis_emits_single_output_coin() {
+        with_v1_process_claim(|| {
+            let engine = StateEngine::new(Network::Testnet, 0);
+            let req = std1_request();
+            let amount = req.amount;
+            let pending = begin_v1_mint(&engine, req).expect("genesis mint");
+            assert_eq!(pending.mode, TransitionMode::InitialProof);
+            assert_eq!(
+                pending.witness_wip.output_coins.len(),
+                1,
+                "single-amount mint must stage one output coin"
+            );
+            assert_eq!(pending.witness_wip.output_coins[0].amount, amount);
+            assert_eq!(
+                pending
+                    .witness_wip
+                    .new_account_state
+                    .balances
+                    .values()
+                    .copied()
+                    .sum::<u128>(),
+                amount,
+            );
+        });
+    }
+
+    /// Port of legacy `test_mint_repro_live_setup`: mint amount = 1 must
+    /// build a host witness (the live DEV amount-1 configuration).
+    #[test]
+    fn begin_v1_mint_amount_one_stages_witness() {
+        with_v1_process_claim(|| {
+            let engine = StateEngine::new(Network::Testnet, 0);
+            let mut req = std1_request();
+            req.amount = 1;
+            let pending = begin_v1_mint(&engine, req).expect("amount-1 mint");
+            assert_eq!(pending.witness_wip.output_coins.len(), 1);
+            assert_eq!(pending.witness_wip.output_coins[0].amount, 1);
+        });
+    }
 }
