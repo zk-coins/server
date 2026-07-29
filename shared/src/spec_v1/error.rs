@@ -16,6 +16,9 @@ pub enum SpecError {
     NameEmpty,
     /// NameConsent `network` field is empty.
     NetworkEmpty,
+    /// NameConsent `network` is not in the closed §7.3 set
+    /// `{mainnet, testnet, regtest}` (same vocabulary as `zkcoins.network`).
+    NetworkUnknown { network: String },
     /// Identifier has no `@` separator (§4.3).
     NameMissingAt,
     /// Identifier has more than one `@` (§4.3).
@@ -105,6 +108,13 @@ impl fmt::Display for SpecError {
             }
             SpecError::NetworkEmpty => {
                 write!(f, "network field is empty")
+            }
+            SpecError::NetworkUnknown { network } => {
+                write!(
+                    f,
+                    "network {network:?} is not in the closed set \
+                     {{mainnet, testnet, regtest}} (§4.3 / §7.3)"
+                )
             }
             SpecError::NameMissingAt => {
                 write!(f, "identifier missing '@' separator (§4.3)")

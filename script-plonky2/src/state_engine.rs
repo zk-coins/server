@@ -789,6 +789,17 @@ impl StateEngine {
     /// Insert a pre-built account (e.g. funded fixture for tests / recovery).
     ///
     /// Fails if `owner` is already present.
+    ///
+    /// Also enforces the host invariant that the durable sets and the
+    /// committed coin-history root agree — the same checks the DB loader
+    /// applies when reconstructing a `CoinHistTree` from
+    /// `spendable`/`spent_ids` (see `node/src/v1/db_v1.rs` `into_record`):
+    /// - `spendable ∩ spent_ids = ∅`
+    /// - `rebuild_coinhist(leaves_from_sets(...)).root() == state.coin_history_root`
+    ///
+    /// The tree itself is not persisted; reconstruction from those sets is
+    /// authoritative. Guarding only `record.coinhist.root()` would miss a
+    /// contradictory set pair whose provided tree happens to match the root.
     pub fn insert_account(&mut self, owner: Address, record: AccountRecord) -> Result<()> {
         ensure!(
             record.state.owner == owner,
@@ -797,6 +808,18 @@ impl StateEngine {
         ensure!(
             !self.accounts.contains_key(&owner),
             "account already present in the engine"
+        );
+        for id in record.spendable.keys() {
+            ensure!(
+                !record.spent_ids.contains(id),
+                "coin_id is both spendable and spent"
+            );
+        }
+        let rebuilt = rebuild_coinhist(&leaves_from_sets(&record.spendable, &record.spent_ids))
+            .context("insert_account: rebuild coinhist from spendable/spent_ids")?;
+        ensure!(
+            rebuilt.root() == record.state.coin_history_root,
+            "coinhist root after rebuild does not match AccountState.coin_history_root"
         );
         ensure!(
             record.coinhist.root() == record.state.coin_history_root,
@@ -1167,6 +1190,11 @@ impl StateEngine {
             nav_consistency,
             mut hist_leaves,
         ) = self.account_transition_context(&req.owner, &record.nk, record.state.current_pubkey)?;
+        // Defense-in-depth only: structurally unreachable once
+        // `account_transition_context` has returned for an existing account
+        // (that path always yields `AccountUpdateProof`). Kept because the
+        // mode decision is load-bearing for send, not because a missing
+        // invariant hides behind it.
         ensure!(
             matches!(mode, TransitionMode::AccountUpdateProof),
             "send requires a prior account transition (AccountUpdateProof)"
@@ -1181,10 +1209,10 @@ impl StateEngine {
         for tracked in &input_coins {
             let id_bytes = host::digest_to_bytes(&tracked.coin.identifier);
             let history_proof = hist_for_proofs.prove(id_bytes);
-            ensure!(
-                history_proof.state == host::CoinHistState::Admitted,
-                "input coin is not Admitted in coinhist"
-            );
+            // No Admitted-state ensure here: every input already passed
+            // "input coin is not spendable", and `leaves_from_sets` marks
+            // every spendable key Admitted (spent cannot overlap after
+            // `insert_account`). The real host invariant sits there.
             ensure!(
                 history_proof.verify(&id_bytes, hist_for_proofs.root()),
                 "input history proof does not open the current sequential coin-history root"
@@ -1643,10 +1671,11 @@ impl StateEngine {
                     next_spendable.remove(&id).is_some(),
                     "apply: spent input missing from spendable set"
                 );
-                ensure!(
-                    leaves.get(&id) == Some(&host::CoinHistState::Admitted),
-                    "apply: input not Admitted"
-                );
+                // No Admitted-state ensure here: `leaves_from_sets` marks every
+                // spendable key Admitted (and would overwrite Spent), so after
+                // the remove check above the leaf is Admitted by construction.
+                // Consistency of spendable/spent_ids/coin_history_root is
+                // enforced in `insert_account` (and the DB loader).
                 leaves.insert(id, host::CoinHistState::Spent);
                 next_spent.insert(id);
             }
@@ -3163,6 +3192,217 @@ mod tests {
         );
     }
 
+    /// Second `begin_send` from the same account after a prior AccountUpdate:
+    /// the first send's change coin is spendable/`Admitted`, `send_counter`
+    /// and `current_pubkey` have advanced, and a further `begin_send` that
+    /// spends the change succeeds without a Plonky2 prove.
+    ///
+    /// Replaces the deleted legacy
+    /// `test_send_coins_twice_from_same_account_uses_update_account` host
+    /// property for the v1 entry point. Engine state is installed as if the
+    /// first send had already been applied (no prove path).
+    #[test]
+    fn begin_send_second_send_spends_prior_change_coin() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/second-send/nk").into();
+        let (_, _, pk0) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/second-send/pk0",
+        ));
+        let (_, _, pk1) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/second-send/pk1",
+        ));
+        // current_pubkey after first send (= next of that send)
+        let (_, _, pk2) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/second-send/pk2",
+        ));
+        // next_pubkey for the second send
+        let (_, _, pk3) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/second-send/pk3",
+        ));
+        let owner = Address(host::address(&pk0, host::nk_commit(&nk)));
+        let op_secret = label_op_secret(b"zkCoins/v1/state-engine/second-send/op_secret");
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk0, &[0x5a; 32], 2, 1);
+
+        // Creating ash of the mint that produced the original 100-coin.
+        let mint_prev = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("mint prev");
+        let mint_prev_ash = host::account_state_hash(&mint_prev).expect("mint ash");
+        let funded = Coin {
+            identifier: host::coin_identifier(mint_prev_ash, &owner.0, asset_id, 100, 0),
+            recipient: owner,
+            amount: 100,
+            asset_id,
+        };
+        let funded_id = host::digest_to_bytes(&funded.identifier);
+
+        // First send: spend 100 → 30 external + 70 change. Creating ash of
+        // that send is the post-mint account state (send_counter=1, pk1).
+        let mut post_mint_hist = CoinHistTree::new();
+        post_mint_hist.admit(funded_id).expect("admit funded");
+        let mut post_mint_balances = BTreeMap::new();
+        post_mint_balances.insert(host::digest_to_bytes(&asset_id), 100);
+        let post_mint_state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            post_mint_balances,
+            pk1,
+            1,
+            post_mint_hist.root(),
+        )
+        .expect("post-mint state");
+        let first_send_prev_ash =
+            host::account_state_hash(&post_mint_state).expect("first-send prev ash");
+
+        let change = Coin {
+            identifier: host::coin_identifier(first_send_prev_ash, &owner.0, asset_id, 70, 1),
+            recipient: owner,
+            amount: 70,
+            asset_id,
+        };
+        let change_id = host::digest_to_bytes(&change.identifier);
+
+        // Post-first-send coinhist: funded Spent, change Admitted.
+        let mut coinhist = CoinHistTree::new();
+        coinhist.admit(funded_id).expect("admit funded");
+        coinhist.spend(funded_id).expect("spend funded");
+        coinhist.admit(change_id).expect("admit change");
+
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            change_id,
+            TrackedCoin {
+                coin: change.clone(),
+                creating_prev_ash: first_send_prev_ash,
+                coin_index: 1,
+            },
+        );
+        let mut spent_ids = BTreeSet::new();
+        spent_ids.insert(funded_id);
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 70);
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            balances,
+            pk2, // rotated by first send
+            2,   // send_counter after mint + first send
+            coinhist.root(),
+        )
+        .expect("post-first-send state");
+
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        // Predecessor nullifier = first send's consumed key (pk1).
+        let predecessor_position = ChainPosition {
+            height: 20,
+            tx_index: 0,
+            vin_index: 0,
+            member_index: 0,
+        };
+        let predecessor_entry = NfLogEntry {
+            pk: pk1,
+            r: [0x62; 32],
+        };
+        engine.set_tip_height(20);
+        assert_eq!(
+            engine
+                .nflog
+                .fold(
+                    predecessor_position,
+                    predecessor_entry.pk,
+                    predecessor_entry.r,
+                )
+                .unwrap(),
+            FoldOutcome::Appended(0)
+        );
+        engine.nflog_entries.push(predecessor_entry);
+        engine.nflog_positions.push(predecessor_position);
+        engine.set_tip_height(25);
+
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state: state.clone(),
+                    coinhist,
+                    nk,
+                    op_secret: Some(op_secret),
+                    genesis_pubkey: pk0,
+                    spendable,
+                    spent_ids,
+                    last_proof: Some(host_dummy_last_proof()),
+                    last_nav_opening: Some(NavOpening {
+                        nav: Nav {
+                            size: 0,
+                            mth: host::nflog_empty(),
+                        },
+                        nav_rand: op_secret.derive_nav_rand(1),
+                    }),
+                    last_nullifier: Some(NullifierOpening {
+                        public_key: pk1,
+                        signature_r: [0x62; 32],
+                        r_prime: [0; 32],
+                    }),
+                    last_nullifier_pos: Some(0),
+                },
+            )
+            .expect("insert post-first-send account");
+
+        // Precondition: change is the sole spendable coin and Admitted.
+        let rec = engine.account(&owner).expect("account");
+        assert_eq!(rec.state.send_counter, 2);
+        assert_eq!(rec.state.current_pubkey, pk2);
+        assert_eq!(rec.spendable.len(), 1);
+        assert!(rec.spendable.contains_key(&change_id));
+        assert!(rec.spent_ids.contains(&funded_id));
+        assert_eq!(
+            rec.coinhist.prove(change_id).state,
+            host::CoinHistState::Admitted,
+            "change must be Admitted for the second begin_send"
+        );
+
+        let external = Address([0x71; 32]);
+        let pending = engine
+            .begin_send(SendRequest {
+                owner,
+                input_coin_ids: vec![change.identifier],
+                output_templates: vec![CoinTemplate {
+                    recipient: external,
+                    amount: 30,
+                    asset_id,
+                }],
+                next_pubkey: pk3,
+                npk_rand: [0x74; 32],
+            })
+            .expect("second begin_send from same account must succeed");
+
+        assert_eq!(pending.mode, TransitionMode::AccountUpdateProof);
+        assert_eq!(pending.witness_wip.prev_account_state.send_counter, 2);
+        assert_eq!(pending.witness_wip.prev_account_state.current_pubkey, pk2);
+        assert_eq!(pending.witness_wip.new_account_state.send_counter, 3);
+        assert_eq!(pending.witness_wip.new_account_state.current_pubkey, pk3);
+        assert_eq!(pending.witness_wip.input_coins.len(), 1);
+        assert_eq!(
+            pending.witness_wip.input_coins[0].identifier,
+            change.identifier
+        );
+        // Input history path opens the post-first-send root as Admitted.
+        let hist = &pending.witness_wip.input_auth[0].history_proof;
+        assert_eq!(hist.state, host::CoinHistState::Admitted);
+        assert!(hist.verify(&change_id, state.coin_history_root));
+        // Change of the second send: 70 − 30 = 40 to self.
+        assert_eq!(pending.witness_wip.output_coins.len(), 2);
+        assert_eq!(pending.witness_wip.output_templates[0].recipient, external);
+        assert_eq!(pending.witness_wip.output_templates[0].amount, 30);
+        assert_eq!(pending.witness_wip.output_templates[1].recipient, owner);
+        assert_eq!(pending.witness_wip.output_templates[1].amount, 40);
+    }
+
     #[test]
     fn finalise_rejects_pending_envelope_mismatches_before_proving() {
         let engine = StateEngine::new(Network::Testnet, 0);
@@ -3287,6 +3527,223 @@ mod tests {
                 && message.contains("proof_data differs"),
             "unexpected error: {message}"
         );
+    }
+
+    /// `insert_account` refuses a record whose spendable and spent sets
+    /// share a coin_id — the same invariant the DB loader enforces.
+    #[test]
+    fn insert_account_rejects_overlapping_spendable_and_spent() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/insert-overlap/nk").into();
+        let nk_commit = host::nk_commit(&nk);
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/insert-overlap/pk",
+        ));
+        let owner = Address(host::address(&pk, nk_commit));
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x11; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let coin = Coin {
+            identifier: host::coin_identifier(empty_ash, &owner.0, asset_id, 50, 0),
+            recipient: owner,
+            amount: 50,
+            asset_id,
+        };
+        let id = host::digest_to_bytes(&coin.identifier);
+        let mut coinhist = CoinHistTree::new();
+        coinhist.admit(id).expect("admit");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: coin.clone(),
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut spent_ids = BTreeSet::new();
+        spent_ids.insert(id);
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 50);
+        let state =
+            AccountState::new(owner, nk_commit, balances, pk, 1, coinhist.root()).expect("state");
+        let record = AccountRecord {
+            state,
+            coinhist,
+            nk,
+            op_secret: Some(label_op_secret(
+                b"zkCoins/v1/state-engine/insert-overlap/op_secret",
+            )),
+            genesis_pubkey: pk,
+            spendable,
+            spent_ids,
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let err = engine
+            .insert_account(owner, record)
+            .expect_err("overlap must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("coin_id is both spendable and spent"),
+            "expected overlap cause, got: {msg}"
+        );
+    }
+
+    /// `insert_account` refuses when rebuild from spendable/spent_ids does
+    /// not reproduce `AccountState.coin_history_root`.
+    #[test]
+    fn insert_account_rejects_coinhist_root_mismatch_after_rebuild() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/insert-root/nk").into();
+        let nk_commit = host::nk_commit(&nk);
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/insert-root/pk",
+        ));
+        let owner = Address(host::address(&pk, nk_commit));
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x22; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let coin = Coin {
+            identifier: host::coin_identifier(empty_ash, &owner.0, asset_id, 50, 0),
+            recipient: owner,
+            amount: 50,
+            asset_id,
+        };
+        let id = host::digest_to_bytes(&coin.identifier);
+        // Tree / spendable claim coin is admitted, but AccountState pins the
+        // empty root — rebuild from sets must disagree with that pin.
+        let mut coinhist = CoinHistTree::new();
+        coinhist.admit(id).expect("admit");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: coin.clone(),
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 50);
+        let state = AccountState::new(
+            owner,
+            nk_commit,
+            balances,
+            pk,
+            1,
+            host::coinhist_empty_root(), // deliberately wrong vs spendable
+        )
+        .expect("state");
+        // Provided tree root also wrong relative to state so the failure is
+        // unambiguously the rebuild-vs-state check (not only the tree field).
+        let record = AccountRecord {
+            state,
+            coinhist,
+            nk,
+            op_secret: Some(label_op_secret(
+                b"zkCoins/v1/state-engine/insert-root/op_secret",
+            )),
+            genesis_pubkey: pk,
+            spendable,
+            spent_ids: BTreeSet::new(),
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let err = engine
+            .insert_account(owner, record)
+            .expect_err("root mismatch must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(
+                "coinhist root after rebuild does not match AccountState.coin_history_root"
+            ),
+            "expected rebuild-root cause, got: {msg}"
+        );
+    }
+
+    /// Consistent spendable/spent/coinhist triple is accepted.
+    #[test]
+    fn insert_account_accepts_consistent_record() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/insert-ok/nk").into();
+        let nk_commit = host::nk_commit(&nk);
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/insert-ok/pk",
+        ));
+        let owner = Address(host::address(&pk, nk_commit));
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x33; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let coin = Coin {
+            identifier: host::coin_identifier(empty_ash, &owner.0, asset_id, 50, 0),
+            recipient: owner,
+            amount: 50,
+            asset_id,
+        };
+        let id = host::digest_to_bytes(&coin.identifier);
+        let mut coinhist = CoinHistTree::new();
+        coinhist.admit(id).expect("admit");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: coin.clone(),
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 50);
+        let state =
+            AccountState::new(owner, nk_commit, balances, pk, 1, coinhist.root()).expect("state");
+        let record = AccountRecord {
+            state,
+            coinhist,
+            nk,
+            op_secret: Some(label_op_secret(
+                b"zkCoins/v1/state-engine/insert-ok/op_secret",
+            )),
+            genesis_pubkey: pk,
+            spendable,
+            spent_ids: BTreeSet::new(),
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine
+            .insert_account(owner, record)
+            .expect("consistent record must insert");
+        assert!(engine.account(&owner).is_some());
     }
 
     /// Fast: `begin_send` with outputs > inputs returns Err before proving.

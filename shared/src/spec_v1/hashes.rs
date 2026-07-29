@@ -349,21 +349,55 @@ fn is_domain_label_char(ch: char) -> bool {
     matches!(ch, 'a'..='z' | '0'..='9' | '-')
 }
 
+/// Bare `zkcoins.network` label of a full [`NETWORK_TAG_*`](super::tags) constant.
+///
+/// `NETWORK_TAG_*` are `b"zkCoins/v1/<label>"` (inputs to `Hc("Network", …)`).
+/// NameConsent / `/v1/info.network` use the bare closed label
+/// `{mainnet, testnet, regtest}` (§4.3 / §7.3) — the suffix after the last `/`.
+fn network_label_of(tag: &'static [u8]) -> &'static [u8] {
+    match tag.rsplit(|b| *b == b'/').next() {
+        Some(label) if !label.is_empty() => label,
+        _ => unreachable!(
+            "NETWORK_TAG_* constants are b\"zkCoins/v1/<label>\" with a non-empty label"
+        ),
+    }
+}
+
+/// §4.3 / §7.3: `network` is the same closed string as `zkcoins.network`
+/// (`mainnet` | `testnet` | `regtest`). Labels are taken from the existing
+/// `NETWORK_TAG_*` constants (bare suffix), not retyped. Kept as `&str` (not
+/// the circuit `Network` enum) because the preimage absorbs the wire label
+/// and call sites (V.12 fixture, NIP-05 framing) already pass that string.
+fn validate_name_consent_network(network: &str) -> Result<(), SpecError> {
+    if network.is_empty() {
+        return Err(SpecError::NetworkEmpty);
+    }
+    let bytes = network.as_bytes();
+    if bytes == network_label_of(NETWORK_TAG_MAINNET)
+        || bytes == network_label_of(NETWORK_TAG_TESTNET)
+        || bytes == network_label_of(NETWORK_TAG_REGTEST)
+    {
+        return Ok(());
+    }
+    Err(SpecError::NetworkUnknown {
+        network: network.to_string(),
+    })
+}
+
 /// Build the §4.3 / V.12 `name_message` preimage:
 /// `"zkCoins/v1/NameConsent" ‖ network ‖ u32-be(name_len) ‖ UTF-8(name) ‖ op_pubkey`.
 ///
 /// `name` is lowercased first, then validated against the §4.3 identifier
 /// grammar (fail-closed). `name_len` is the canonical UTF-8 **byte** length of
-/// that normalized name (not character count). Empty `network` or any grammar
-/// violation is an error — no silent default or cleanup.
+/// that normalized name (not character count). `network` must be exactly one
+/// of the closed §7.3 labels (`mainnet` | `testnet` | `regtest`); empty or
+/// any other value is an error — no silent default or cleanup.
 pub fn name_consent_preimage(
     network: &str,
     name: &str,
     op_pubkey: &[u8; 32],
 ) -> Result<Vec<u8>, SpecError> {
-    if network.is_empty() {
-        return Err(SpecError::NetworkEmpty);
-    }
+    validate_name_consent_network(network)?;
     // §4.3: lowercase before validation and comparison.
     let normalized = normalize_name(name);
     validate_identifier_syntax(&normalized)?;
@@ -620,14 +654,64 @@ mod tests {
     #[test]
     fn name_consent_rejects_empty_network() {
         let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
-        assert!(matches!(
+        assert_eq!(
             name_consent_preimage("", "alice@example.com", &op_pubkey),
             Err(SpecError::NetworkEmpty)
-        ));
-        assert!(matches!(
+        );
+        assert_eq!(
             name_message("", "alice@example.com", &op_pubkey),
             Err(SpecError::NetworkEmpty)
-        ));
+        );
+    }
+
+    #[test]
+    fn name_consent_rejects_wrong_case_network() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        assert_eq!(
+            name_consent_preimage("Regtest", "alice@example.com", &op_pubkey),
+            Err(SpecError::NetworkUnknown {
+                network: "Regtest".to_string()
+            })
+        );
+        assert_eq!(
+            name_message("Regtest", "alice@example.com", &op_pubkey),
+            Err(SpecError::NetworkUnknown {
+                network: "Regtest".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn name_consent_rejects_unknown_network() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        assert_eq!(
+            name_consent_preimage("mutinynet", "alice@example.com", &op_pubkey),
+            Err(SpecError::NetworkUnknown {
+                network: "mutinynet".to_string()
+            })
+        );
+        assert_eq!(
+            name_message("mutinynet", "alice@example.com", &op_pubkey),
+            Err(SpecError::NetworkUnknown {
+                network: "mutinynet".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn name_consent_accepts_closed_network_labels() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        for network in ["mainnet", "testnet", "regtest"] {
+            let preimage = name_consent_preimage(network, "alice@example.com", &op_pubkey)
+                .unwrap_or_else(|e| panic!("closed network {network:?} must be accepted: {e}"));
+            assert_eq!(
+                &preimage[TAG_NAME_CONSENT.len()..TAG_NAME_CONSENT.len() + network.len()],
+                network.as_bytes(),
+                "preimage must absorb the wire label {network:?}"
+            );
+            name_message(network, "alice@example.com", &op_pubkey)
+                .unwrap_or_else(|e| panic!("closed network {network:?} name_message: {e}"));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -833,10 +917,13 @@ mod tests {
 
         // Negative: same signature must not verify under op_pubkey (the
         // node-held key) — the V.12 reject case "sig under op rather than pk0".
+        // secp256k1::Error distinguishes IncorrectSignature (verify failed)
+        // from InvalidSignature (malformed) / InvalidPublicKey; pin the cause.
         let xonly_op = XOnlyPublicKey::from_slice(&op_pubkey).expect("op_pubkey is x-only");
-        assert!(
-            secp.verify_schnorr(&sig, &message, &xonly_op).is_err(),
-            "name_sig under pk0 must not verify under op_pubkey"
+        assert_eq!(
+            secp.verify_schnorr(&sig, &message, &xonly_op),
+            Err(bitcoin::secp256k1::Error::IncorrectSignature),
+            "name_sig under pk0 must fail verification under op_pubkey as IncorrectSignature"
         );
     }
 
