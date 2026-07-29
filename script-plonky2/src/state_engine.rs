@@ -3062,7 +3062,7 @@ mod tests {
         )
         .unwrap();
         let creating_prev_ash = host::account_state_hash(&creating_state).unwrap();
-        let coins = vec![
+        let coins = [
             Coin {
                 identifier: host::coin_identifier(creating_prev_ash, &owner.0, asset_id, 40, 0),
                 recipient: owner,

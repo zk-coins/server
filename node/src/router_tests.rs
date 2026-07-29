@@ -2479,17 +2479,26 @@ fn mint_store_add_take_roundtrips_and_consumes() {
 mod jobs_endpoint_tests {
     use super::*;
     use crate::router::create_router;
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::{Arc, Mutex};
 
     /// Serialise tests that flip the process-global stack claim so
     /// parallel postgres-backed cases do not clear each other's mode
     /// mid-request (shared container + shared `PROCESS_STACK_MODE`).
-    static V1_STACK_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static V1_STACK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    fn lock_v1_stack_for_test() -> MutexGuard<'static, ()> {
-        V1_STACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Acquire the process-global stack-mode serialisation lock.
+    ///
+    /// Held across `.await` points on purpose: these tests touch shared
+    /// process state (`PROCESS_STACK_MODE` / the shared container) and
+    /// must not interleave. `tokio::sync::Mutex` is the correct tool for
+    /// that (unlike `std::sync::MutexGuard`, which is thread-bound).
+    ///
+    /// `tokio::sync::Mutex` has no poison flag — a panicking holder does
+    /// not permanently lock out later tests. That resilience used to be
+    /// expressed via `unwrap_or_else(|poisoned| poisoned.into_inner())` on
+    /// `std::sync::Mutex`; do not reintroduce a poison recovery path.
+    async fn lock_v1_stack_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+        V1_STACK_TEST_LOCK.lock().await
     }
 
     /// Build an `AppState` whose `job_store` is wired to a fresh
@@ -3346,7 +3355,7 @@ mod jobs_endpoint_tests {
     async fn jobs_sign_valid_v1_signature_accepted_through_route() {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -3412,7 +3421,7 @@ mod jobs_endpoint_tests {
     async fn jobs_sign_malformed_encoding_rejected_at_boundary() {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -3460,7 +3469,7 @@ mod jobs_endpoint_tests {
 
     #[tokio::test]
     async fn jobs_sign_flag_off_refuses_and_legacy_commit_still_works() {
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         // Flag / claim off (default).
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -3548,7 +3557,7 @@ mod jobs_endpoint_tests {
     async fn v1_job_poll_and_sign_follow_section_7_5_envelope() {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -3640,7 +3649,7 @@ mod jobs_endpoint_tests {
         use crate::v1::{set_process_stack_mode, FinaliseOutcome, ScanStackMode};
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let finalise_called = Arc::new(AtomicBool::new(false));
@@ -3777,7 +3786,7 @@ mod jobs_endpoint_tests {
     async fn jobs_sign_without_dispatcher_reports_failure_not_acceptance() {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -3843,7 +3852,7 @@ mod jobs_endpoint_tests {
             DurableFinalisationPersist, ScanStackMode,
         };
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (mut entry, submission) =
@@ -3874,7 +3883,7 @@ mod jobs_endpoint_tests {
         use crate::v1::{set_process_stack_mode, FinaliseOutcome, ScanStackMode};
         use shared::spec_v1::{digest_from_bytes, digest_to_bytes, Coin, ZERO_HASH};
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (mut entry, _) = crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
@@ -3951,7 +3960,7 @@ mod jobs_endpoint_tests {
     async fn v1_extractors_map_malformed_json_and_uuid_to_malformed_request() {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -4001,7 +4010,7 @@ mod jobs_endpoint_tests {
     async fn jobs_sign_works_after_simulated_restart() {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -4077,7 +4086,7 @@ mod jobs_endpoint_tests {
     async fn dispatcher_staging_path_allows_v1_sign() {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (mut state, _pool, _c) = jobs_test_state().await;
@@ -4170,7 +4179,7 @@ mod jobs_endpoint_tests {
     async fn jobs_sign_rejects_when_dispatcher_handoff_already_timed_out() {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -4253,7 +4262,7 @@ mod jobs_endpoint_tests {
     async fn production_begin_registry_staging_allows_v1_sign() {
         use crate::v1::{register_live_pending_after_begin, set_process_stack_mode, ScanStackMode};
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (mut state, _pool, _c) = jobs_test_state().await;
@@ -4329,7 +4338,7 @@ mod jobs_endpoint_tests {
     async fn jobs_sign_persist_before_signal_invariant() {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -4516,7 +4525,7 @@ mod jobs_endpoint_tests {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
         use std::time::Duration;
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let scope = crate::test_db::setup_pool().await;
@@ -4576,7 +4585,7 @@ mod jobs_endpoint_tests {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
         use std::time::Duration;
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let scope = crate::test_db::setup_pool().await;
@@ -4654,7 +4663,7 @@ mod jobs_endpoint_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let hook_count = Arc::new(AtomicUsize::new(0));
@@ -4759,7 +4768,7 @@ mod jobs_endpoint_tests {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
         use std::time::Duration;
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -4830,7 +4839,7 @@ mod jobs_endpoint_tests {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
         use std::time::Duration;
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let scope = crate::test_db::setup_pool().await;
@@ -4920,12 +4929,12 @@ mod jobs_endpoint_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let scope = crate::test_db::setup_pool().await;
         let pool = Arc::new(scope.pool.clone());
-        claim_stack_scan_mode(&*pool, ScanStackMode::V1)
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
             .expect("claim stack_scan_mode v1");
 
@@ -4938,7 +4947,7 @@ mod jobs_endpoint_tests {
         // Simulate production durable stage at the edge: members_ready for
         // this nullifier is on disk (engine snapshot co-persisted in prod).
         crate::v1::db_v1::insert_pending_publish_members_ready(
-            &*pool,
+            &pool,
             owner,
             sig.pk_i,
             sig.signature_r(),
@@ -5015,7 +5024,7 @@ mod jobs_endpoint_tests {
             after.error
         );
         // Publisher work finds the staged intent.
-        let pending = crate::v1::db_v1::load_pending_publish(&*pool, sig.pk_i)
+        let pending = crate::v1::db_v1::load_pending_publish(&pool, sig.pk_i)
             .await
             .expect("load pending")
             .expect("members_ready must survive crash + resume");
@@ -5038,11 +5047,11 @@ mod jobs_endpoint_tests {
         };
         use std::time::Duration;
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (mut state, pool, _c) = jobs_test_state().await;
-        claim_stack_scan_mode(&*pool, ScanStackMode::V1)
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
             .await
             .expect("claim stack_scan_mode v1");
 
@@ -5057,7 +5066,7 @@ mod jobs_endpoint_tests {
                 // the engine under the same predicate).
                 let staged =
                     crate::v1::db_v1::persist_engine_with_pending_members_ready_if_finalise_fence(
-                        &*pool_for_hook,
+                        &pool_for_hook,
                         &crate::v1::db_v1::EngineSnapshot {
                             network: zkcoins_program::circuit::compliance::Network::Regtest,
                             activation_height: 0,
@@ -5103,7 +5112,7 @@ mod jobs_endpoint_tests {
             .expect("row");
         assert_eq!(after.status, crate::job_store::JobStatus::Completed);
         let sig = entry.signature.expect("signed");
-        let pending = crate::v1::db_v1::load_pending_publish(&*pool, sig.pk_i)
+        let pending = crate::v1::db_v1::load_pending_publish(&pool, sig.pk_i)
             .await
             .expect("load")
             .expect("hook must stage v1_pending_publishes for the publisher handoff");
@@ -5121,7 +5130,7 @@ mod jobs_endpoint_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let finalise_count = Arc::new(AtomicUsize::new(0));
@@ -5231,7 +5240,7 @@ mod jobs_endpoint_tests {
         use crate::v1::{set_process_stack_mode, ScanStackMode};
         use std::time::Duration;
 
-        let _stack_guard = lock_v1_stack_for_test();
+        let _stack_guard = lock_v1_stack_for_test().await;
         set_process_stack_mode(ScanStackMode::V1);
 
         let (state, _pool, _c) = jobs_test_state().await;
@@ -6365,7 +6374,7 @@ mod jobs_endpoint_tests {
     /// Flag-off: both attest routes refuse with `feature_disabled` (404).
     #[tokio::test]
     async fn attest_balance_flag_off_returns_feature_disabled() {
-        let _lock = lock_v1_stack_for_test();
+        let _lock = lock_v1_stack_for_test().await;
 
         let state = test_state();
         let body = serde_json::json!({
@@ -6407,7 +6416,7 @@ mod jobs_endpoint_tests {
     /// `malformed_request`.
     #[tokio::test]
     async fn attest_balance_flag_off_malformed_body_is_feature_disabled() {
-        let _lock = lock_v1_stack_for_test();
+        let _lock = lock_v1_stack_for_test().await;
 
         let state = test_state();
 
@@ -6448,7 +6457,7 @@ mod jobs_endpoint_tests {
     /// §7.5 path + envelope + closed error codes under a v1.1 claim.
     #[tokio::test]
     async fn attest_balance_route_matches_section_7_5() {
-        let _lock = lock_v1_stack_for_test();
+        let _lock = lock_v1_stack_for_test().await;
         use crate::v1::{
             parse_u64_decimal, set_process_stack_mode, ScanStackMode,
             ATTEST_BALANCE_CHALLENGE_DOMAIN,
@@ -6677,7 +6686,7 @@ mod jobs_endpoint_tests {
     /// (not Axum's default 422).
     #[tokio::test]
     async fn attest_balance_malformed_json_returns_malformed_request() {
-        let _lock = lock_v1_stack_for_test();
+        let _lock = lock_v1_stack_for_test().await;
         use crate::v1::{set_process_stack_mode, ScanStackMode};
 
         set_process_stack_mode(ScanStackMode::V1);
@@ -6718,7 +6727,7 @@ mod jobs_endpoint_tests {
     /// flag is on**.
     #[tokio::test]
     async fn root_advertises_attest_balance_endpoints_when_flag_on() {
-        let _lock = lock_v1_stack_for_test();
+        let _lock = lock_v1_stack_for_test().await;
         use crate::v1::{set_process_stack_mode, ScanStackMode};
         set_process_stack_mode(ScanStackMode::V1);
 
@@ -6774,7 +6783,7 @@ mod jobs_endpoint_tests {
     /// discards key order and would green-wash a sorted-map regression.
     #[tokio::test]
     async fn root_flag_off_is_byte_identical_to_pre_attestation_map() {
-        let _lock = lock_v1_stack_for_test();
+        let _lock = lock_v1_stack_for_test().await;
 
         let state = test_state();
         let req = Request::get("/").body(Body::empty()).unwrap();
@@ -7530,14 +7539,14 @@ async fn history_item_missing_params_still_gone_not_422() {
 
 // --- Pure-function coverage for the helpers --------------------------------
 
-/// Covers the **settled-balance** shape of an `Account` blob: a post-send
-/// account whose `coin_queue` has been drained into `coin_history` and
-/// whose remaining funds sit in the `balance` field. The companion
-/// **queue-only** shape (the actual production write produced by
-/// `commit_mint_tx` / `receive_coin` for a credit) requires a real
-/// `CoinProof` and is pinned in
-/// `account_node_tests::history_row_to_item_balance_from_coin_queue_only`
-/// where the prover fixtures live.
+// Covers the **settled-balance** shape of an `Account` blob: a post-send
+// account whose `coin_queue` has been drained into `coin_history` and
+// whose remaining funds sit in the `balance` field. The companion
+// **queue-only** shape (the actual production write produced by
+// `commit_mint_tx` / `receive_coin` for a credit) requires a real
+// `CoinProof` and is pinned in
+// `account_node_tests::history_row_to_item_balance_from_coin_queue_only`
+// where the prover fixtures live.
 // ── GET /api/history/{id} — TxDetail conversion (issue: tx-detail) ──────
 
 // ===========================================================================

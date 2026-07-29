@@ -70,7 +70,7 @@ use zkcoins_prover::prover_bridge::{
 use super::adapter::EngineAdapter;
 use super::db_v1;
 #[cfg(test)]
-use super::mode::V1ShadowMode;
+use super::separation::set_process_stack_mode;
 use super::separation::{process_stack_mode, ScanStackMode};
 
 // ---------------------------------------------------------------------------
@@ -325,15 +325,6 @@ impl AttestError {
 /// True when the process claim is v1.1 (flag on and stack claimed).
 pub(crate) fn v1_attest_route_active() -> bool {
     matches!(process_stack_mode(), Some(ScanStackMode::V1))
-}
-
-#[cfg(test)]
-pub(crate) fn ensure_v1_attest_path(mode: V1ShadowMode) -> Result<(), AttestError> {
-    match mode {
-        V1ShadowMode::On if v1_attest_route_active() => Ok(()),
-        V1ShadowMode::On => Err(AttestError::FeatureDisabled),
-        V1ShadowMode::Off => Err(AttestError::FeatureDisabled),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,8 +1397,27 @@ mod tests {
 
     #[test]
     fn feature_disabled_when_flag_off() {
-        let err = ensure_v1_attest_path(V1ShadowMode::Off).unwrap_err();
-        assert_eq!(err.http_status_and_code(), (404, "feature_disabled"));
+        // Effective route gate (router `RequireAttestRoute`): process claim V1 only.
+        // Unclaimed → set Legacy; re-affirm is a no-op. Monotonic claim cannot flip V1→Legacy.
+        match process_stack_mode() {
+            None => set_process_stack_mode(ScanStackMode::Legacy),
+            Some(ScanStackMode::Legacy) => {}
+            Some(ScanStackMode::V1) => {
+                panic!(
+                    "process claim already V1 in this process; cannot demonstrate \
+                     inactive attest route (nextest process isolation expected)"
+                );
+            }
+        }
+        assert!(
+            !v1_attest_route_active(),
+            "non-V1 process claim must keep the attest surface dark"
+        );
+        // Same mapping the router returns when the gate refuses.
+        assert_eq!(
+            AttestError::FeatureDisabled.http_status_and_code(),
+            (404, "feature_disabled")
+        );
     }
 
     /// Canonical §7.1 `BalanceAttestationV1` layout: every fixed field at

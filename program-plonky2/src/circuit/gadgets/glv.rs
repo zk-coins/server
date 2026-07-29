@@ -335,21 +335,22 @@ mod curve_tests {
             let bytes = field_bytes(x);
             let oracle = XOnlyPublicKey::from_slice(&bytes);
             let ours = lift_x_even_y(x);
-            assert_eq!(
-                ours.is_ok(),
-                oracle.is_ok(),
-                "lift_x disagreement for x={x_u64}"
-            );
-            if oracle.is_err() {
-                saw_non_residue = true;
-                assert!(ours.is_err(), "non-residue must fail loudly");
-            } else {
-                let point = ours.expect("status checked");
-                let expected = oracle_point(PublicKey::from_x_only_public_key(
-                    oracle.expect("status checked"),
-                    Parity::Even,
-                ));
-                assert_eq!(point, expected);
+            match (ours, oracle) {
+                (Err(_), Err(_)) => {
+                    // both reject — agreed
+                    saw_non_residue = true;
+                }
+                (Ok(point), Ok(x_only)) => {
+                    let expected =
+                        oracle_point(PublicKey::from_x_only_public_key(x_only, Parity::Even));
+                    assert_eq!(point, expected, "lift_x point mismatch for x={x_u64}");
+                }
+                (Ok(_), Err(e)) => panic!(
+                    "lift_x disagreement for x={x_u64}: ours accepted, oracle rejected: {e:?}"
+                ),
+                (Err(e), Ok(_)) => panic!(
+                    "lift_x disagreement for x={x_u64}: ours rejected: {e:?}, oracle accepted"
+                ),
             }
         }
         assert!(saw_non_residue, "test range must contain a non-residue");

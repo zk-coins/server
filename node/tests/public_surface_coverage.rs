@@ -61,19 +61,19 @@ fn assert_surface_match(label: &str, actual: &BTreeSet<String>, expected: &BTree
         expected.len()
     );
     if !unexpected.is_empty() {
-        msg.push_str(&format!(
+        msg.push_str(
             "\nNEW public paths (not on allowlist — either pub(crate) them \
-             or add an item-specific list entry + allowlist line):\n"
-        ));
+             or add an item-specific list entry + allowlist line):\n",
+        );
         for p in &unexpected {
             msg.push_str(&format!("  + {p}\n"));
         }
     }
     if !missing.is_empty() {
-        msg.push_str(&format!(
+        msg.push_str(
             "\nSTALE allowlist paths (no longer public — remove from allowlist \
-             and from the crate-root positive list):\n"
-        ));
+             and from the crate-root positive list):\n",
+        );
         for p in &missing {
             msg.push_str(&format!("  - {p}\n"));
         }
@@ -159,7 +159,7 @@ fn walk_public_paths(json_path: &Path) -> BTreeSet<String> {
     out
 }
 
-fn item<'a>(index: &'a serde_json::Map<String, Value>, id: u64) -> Option<&'a Value> {
+fn item(index: &serde_json::Map<String, Value>, id: u64) -> Option<&Value> {
     index.get(&id.to_string())
 }
 

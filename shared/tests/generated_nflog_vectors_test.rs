@@ -11,9 +11,9 @@
 //!
 //! Line format (fixed for this generator):
 //! - Scalars: `mth@n = 0x<64 hex>`, `nav_root@n = 0x<64 hex>`
-//! - Paths:   `inclusion@p,n = 0x…,0x…` (comma-separated digests, production
-//!            PATH order; empty path ⇒ empty RHS after `= `)
-//! - Paths:   `consistency@m,n = 0x…,0x…` (same comma-separated form)
+//! - Paths: `inclusion@p,n = 0x…,0x…` (comma-separated digests, production
+//!   PATH order; empty path ⇒ empty RHS after `= `)
+//! - Paths: `consistency@m,n = 0x…,0x…` (same comma-separated form)
 //!
 //! `nflog_empty` is intentionally **not** emitted — V.4 / the Poseidon generator
 //! already pins it.

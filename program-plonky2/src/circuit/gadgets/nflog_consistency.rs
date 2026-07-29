@@ -575,12 +575,18 @@ mod tests {
         }
         let (b_at_term, depth) = terminal_b_and_depth(m, n);
         let mut slots = [ZERO_HASH; 2 * H_MAX];
+        // Two ZERO_HASH meanings (lenient only — production panics on empty right-turn):
+        // * b_at_term: base slot unread; circuit picks `mth_a` instead.
+        // * empty host at b=false: deliberate poison for a negative witness.
         let (base_digest, regular): (HashDigest, &[HashDigest]) = if b_at_term {
-            (ZERO_HASH, proof_host)
-        } else if proof_host.is_empty() {
+            // Base slot is unread when b is true: the circuit picks `mth_a`.
             (ZERO_HASH, proof_host)
         } else {
-            (proof_host[0], &proof_host[1..])
+            match proof_host.split_first() {
+                Some((base, rest)) => (*base, rest),
+                // Malformed negative witness: poison the required base slot.
+                None => (ZERO_HASH, &[][..]),
+            }
         };
         let place = regular.len().min(depth as usize).min(H_MAX);
         for level in 0..place {
@@ -1070,6 +1076,43 @@ mod tests {
             mth_b,
             &[],
         ));
+
+        // Right-turn empty proof: (3,4) terminates with b=false, so a correct
+        // host proof is terminal base + ≥1 sibling. Truncation-by-one never
+        // empties that shape — cover the empty host list explicitly.
+        {
+            let (m, n) = (3u64, 4u64);
+            let (b_at_term, depth) = terminal_b_and_depth(m, n);
+            assert!(
+                !b_at_term && depth >= 1,
+                "fixture (3,4) must be a right-turn needing a base slot"
+            );
+            let mth_a = nflog_mth(&entries[..m as usize]);
+            let mth_b = nflog_mth(&entries[..n as usize]);
+            // Honest public roots, empty proof_host.
+            assert!(
+                !ref_verify_consistency(m, mth_a, n, mth_b, &[]),
+                "ref must reject empty right-turn consistency proof"
+            );
+            assert!(
+                !verify_consistency(m, mth_a, n, mth_b, &[]),
+                "host must reject empty right-turn consistency proof"
+            );
+            // consistency_prove_is_err only reports bool (prove failed), not
+            // a typed reject reason — multi-layer reject above is the cause.
+            assert!(
+                consistency_prove_is_err(
+                    &consistency_data,
+                    consistency_targets,
+                    m,
+                    mth_a,
+                    n,
+                    mth_b,
+                    &[],
+                ),
+                "gadget must reject empty right-turn proof with honest roots"
+            );
+        }
     }
 
     /// V.11 differential Accept suite: independent reference, host verifiers,

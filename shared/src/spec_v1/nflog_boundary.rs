@@ -29,7 +29,7 @@ pub fn ref_split_point(n: u64) -> u64 {
     assert!(n >= 2, "ref_split_point requires n >= 2, got {n}");
     let bits = 64 - (n - 1).leading_zeros();
     assert!(
-        bits >= 1 && bits <= 64,
+        (1..=64).contains(&bits),
         "ref_split_point: impossible bit length {bits} for n={n}"
     );
     1u64 << (bits - 1)
@@ -544,8 +544,9 @@ fn consistency_proof_len_with_top_pivot(m: u64, n: u64, top_k: u64) -> usize {
     if m <= top_k {
         // Need m < top_k or handle m == top_k.
         if m == top_k {
-            // subproof terminates early on left with b=true → empty + sibling
-            0 + 1
+            // subproof terminates early on left with b=true →
+            // empty subproof (0) + sibling (1) = 1
+            1
         } else {
             honest_len(m, top_k, true) + 1
         }

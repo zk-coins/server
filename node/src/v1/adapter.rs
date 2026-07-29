@@ -39,6 +39,11 @@ struct LiveEngine {
     tip_hash: [u8; 32],
 }
 
+/// Identity fingerprints for restart tests:
+/// `(nflog_nav_root_bytes, sorted (owner, coinhist_root_bytes))`.
+#[cfg(test)]
+type IdentityRoots = ([u8; 32], Vec<([u8; 32], [u8; 32])>);
+
 /// Flag-gated handle: node process ↔ v1.1 StateEngine + shadow persistence.
 pub struct EngineAdapter {
     live: Mutex<LiveEngine>,
@@ -310,7 +315,7 @@ impl EngineAdapter {
     /// Identity fingerprints used by restart-identity tests:
     /// `(nflog_nav_root_bytes, sorted (owner, coinhist_root_bytes))`.
     #[cfg(test)]
-    pub(crate) fn identity_roots(&self) -> ([u8; 32], Vec<([u8; 32], [u8; 32])>) {
+    pub(crate) fn identity_roots(&self) -> IdentityRoots {
         self.with_engine(|engine| {
             let nav = engine.nflog().nav();
             let nflog_root = shared::spec_v1::digest_to_bytes(&nav.root());
@@ -323,7 +328,7 @@ impl EngineAdapter {
                     )
                 })
                 .collect();
-            accounts.sort_by(|a, b| a.0.cmp(&b.0));
+            accounts.sort_by_key(|a| a.0);
             (nflog_root, accounts)
         })
     }

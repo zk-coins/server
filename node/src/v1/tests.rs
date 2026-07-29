@@ -382,7 +382,7 @@ async fn restart_identity_nflog_and_coinhist_roots() {
         .accounts()
         .map(|(owner, rec)| (owner.0, host::digest_to_bytes(&rec.coinhist.root())))
         .collect();
-    before_coinhist.sort_by(|a, b| a.0.cmp(&b.0));
+    before_coinhist.sort_by_key(|a| a.0);
     assert_eq!(before_coinhist.len(), 1);
     // Non-empty CoinHist (not the empty root) so the test is not vacuous.
     assert_ne!(
@@ -425,7 +425,7 @@ async fn restart_identity_nflog_and_coinhist_roots() {
         .accounts()
         .map(|(owner, rec)| (owner.0, host::digest_to_bytes(&rec.coinhist.root())))
         .collect();
-    after_coinhist.sort_by(|a, b| a.0.cmp(&b.0));
+    after_coinhist.sort_by_key(|a| a.0);
     assert_eq!(
         after_coinhist, before_coinhist,
         "per-account CoinHist roots must be byte-identical after restart"
@@ -1244,8 +1244,8 @@ async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v1_claim() {
     assert!(marker.is_none(), "failed claim must leave marker unset");
 }
 
-/// Defect 3: both unguarded-looking broadcast entry points refuse under a
-/// v1.1 process claim (structural guard at the Esplora choke point).
+// Defect 3: both unguarded-looking broadcast entry points refuse under a
+// v1.1 process claim (structural guard at the Esplora choke point).
 
 /// Crate-internal `with_engine_mut` refuses without a v1.1 process claim.
 /// (The method is sealed from downstream crates; this covers the runtime gate.)

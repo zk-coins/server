@@ -61,9 +61,7 @@ use zkcoins_program::F;
 const DEFAULT_API_URL: &str = "https://dev-api.zkcoins.app";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-const POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const MINT_AMOUNT: u64 = 50_000;
-const SEND_AMOUNT: u64 = 10_000;
 /// Asset metadata the happy-path roundtrips mint under. Each test uses a
 /// freshly-generated creator wallet, so `(creator_pubkey, name, decimals)`
 /// — and thus the derived `asset_id` — is unique per test even with a
@@ -2139,13 +2137,6 @@ fn random_suffix() -> String {
 /// failing fast on a genuinely stuck job.
 const JOB_POLL_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Wait between scanner-race retries in
-/// [`submit_send_no_prev_until_awaiting`] — roughly one mutinynet block,
-/// so a re-submit only happens after the scanner has had real time to
-/// index the prior commitment (avoids a back-to-back prove storm on the
-/// single-threaded dispatcher).
-const SCANNER_SETTLE_INTERVAL: Duration = Duration::from_secs(20);
-
 /// A fresh, unique `Idempotency-Key` for an admit request. Each test
 /// mints/sends into freshly-generated wallets, so a random key per
 /// call guarantees no accidental idempotent-replay across the suite.
@@ -2358,140 +2349,6 @@ async fn submit_send_job(
     (job_id, status, parsed)
 }
 
-/// Node prove-time errors that all mean the same thing in the
-/// send→commit→send sequence: the *previous* send's commitment has been
-/// broadcast but the scanner has not yet fully indexed it into the
-/// in-process SMT / history MMR, so the next send's prove cannot find
-/// the prev commitment's merkle/inclusion proofs (see
-/// `account_node::get_merkle_proofs` / `prepare_send_coins`). On the
-/// async Job-API this is a transient, retryable scanner-indexing race —
-/// the legacy synchronous `/api/commit` masked it by advancing the
-/// in-process SMT before returning. Depending on exactly how far the
-/// scanner has progressed, the prove leg surfaces one of these:
-const TRANSIENT_SCANNER_RACE_ERRS: &[&str] = &[
-    "Unable to get merkle proofs for provided public key",
-    "Should provide an inclusion proof",
-    "Source commitment not present in history MMR",
-    "In-coin not present in source's output_coins_root",
-];
-
-/// `true` if `err` is one of the transient scanner-indexing-race
-/// substrings the second-send retry loop tolerates.
-fn is_transient_scanner_race(err: &str) -> bool {
-    TRANSIENT_SCANNER_RACE_ERRS
-        .iter()
-        .any(|needle| err.contains(needle))
-}
-
-/// Submit a send job WITHOUT `prev_commitment_pubkey`, re-signing with a
-/// fresh timestamp on each attempt, and poll to `awaiting_signature`.
-///
-/// Retries only the transient scanner-indexing race (see
-/// [`is_transient_scanner_race`]): when a prior send's commitment was
-/// committed via the async `commit_flow` (which does NOT advance the
-/// in-process SMT), the next send's prove can't find the prev
-/// commitment's merkle/inclusion proofs until the scanner ingests the
-/// on-chain inscription. A bounded retry tolerates that lag while still
-/// surfacing a genuine regression (any other terminal failure, or never
-/// recovering within the cap, fails the test). Returns the send job's
-/// `job_id` alongside its `awaiting_signature` body — the caller needs
-/// the `job_id` to drive the commit leg that releases the inline worker
-/// (a job left parked in `awaiting_signature` pins the single dispatcher
-/// worker for the full `awaiting_signature_timeout`, starving every
-/// later test in the serial suite).
-async fn submit_send_no_prev_until_awaiting(
-    client: &reqwest::Client,
-    wallet: &TestWallet,
-    recipient: &str,
-    asset_id: &str,
-    amount: u64,
-    signing_idx: u32,
-) -> (String, Value) {
-    // A more generous budget than a single job's `JOB_POLL_TIMEOUT`:
-    // clearing the scanner race can require waiting for the next
-    // mutinynet block (~30 s) across one or more re-submits.
-    let deadline = std::time::Instant::now() + Duration::from_secs(240);
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        let ts = unix_now();
-        let sig = wallet.sign_send_at(&wallet.address_hex(), recipient, amount, ts, signing_idx);
-        let body = json!({
-            "account_address": wallet.address_hex(),
-            "recipient": recipient,
-            "amount": amount,
-            "public_key": hex::encode(wallet.pubkey(signing_idx).serialize()),
-            "next_public_key": hex::encode(wallet.pubkey(signing_idx + 1).serialize()),
-            // `prev_commitment_pubkey` deliberately omitted.
-            "signature": sig,
-            "timestamp": ts,
-            "asset_id": asset_id,
-        });
-        let (job_id, status, admit) = submit_send_job(client, &body).await;
-        assert_eq!(
-            status,
-            StatusCode::ACCEPTED,
-            "send without prev_commitment_pubkey must be admitted; got {} body={}",
-            status,
-            admit
-        );
-        let job_id = job_id.expect("admitted send job carries a job_id");
-
-        // Poll this job to a terminal/awaiting state inline (cannot use
-        // `poll_job_until_status`, which panics on a `failed` we want to
-        // retry on).
-        let terminal_or_awaiting = loop {
-            let resp = client
-                .get(url(&format!("/api/jobs/{}", job_id)))
-                .send()
-                .await
-                .expect("GET /api/jobs/:id");
-            assert_eq!(resp.status(), StatusCode::OK);
-            let body: Value = resp.json().await.expect("job status body is JSON");
-            let status = body["status"].as_str().unwrap_or("").to_string();
-            if status == "awaiting_signature"
-                || matches!(status.as_str(), "completed" | "failed" | "cancelled")
-            {
-                break body;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "send job {} stuck in `{}` past the retry budget; body={}",
-                job_id,
-                status,
-                body
-            );
-            tokio::time::sleep(POLL_INTERVAL).await;
-        };
-
-        let status = terminal_or_awaiting["status"].as_str().unwrap_or("");
-        if status == "awaiting_signature" {
-            return (job_id, terminal_or_awaiting);
-        }
-        // Retry only the known transient scanner race; any other
-        // terminal failure is a real regression.
-        let err = terminal_or_awaiting["error"].as_str().unwrap_or("");
-        let transient = status == "failed" && is_transient_scanner_race(err);
-        assert!(
-            transient,
-            "second send job ended in non-retryable terminal state: {}",
-            terminal_or_awaiting
-        );
-        assert!(
-            std::time::Instant::now() < deadline,
-            "second send never reached awaiting_signature within the retry \
-             budget (transient scanner race `{}` did not clear after {} attempts)",
-            err,
-            attempt
-        );
-        // Back off a full scanner-settle interval (≈ one mutinynet block)
-        // before re-signing + resubmitting, so we give the scanner real
-        // time to index the prior commitment instead of hammering the
-        // dispatcher with back-to-back prove attempts.
-        tokio::time::sleep(SCANNER_SETTLE_INTERVAL).await;
-    }
-}
-
 /// Decode `(ash, ocr)` from a send job's `CoinProof`. The send proof's
 /// `.commitment` is `None`; the account-state-hash / output-coins-root
 /// pair lives in the Plonky2 proof public inputs. Decode exactly like
@@ -2500,7 +2357,6 @@ async fn submit_send_no_prev_until_awaiting(
 ///
 /// Retained for residual/ignored helpers; Stage 3 closed unauthenticated
 /// `GET /api/proof/:id`, so live tests must not depend on this path.
-#[allow(dead_code)]
 #[allow(dead_code)]
 fn ash_ocr_from_send_proof(coin_proof: &CoinProof) -> ([u8; 32], [u8; 32]) {
     let pis: [F; N_PROOF_DATA_PUBLIC_INPUTS] = coin_proof.proof.public_inputs

@@ -149,13 +149,11 @@ impl Account {
             decimals: None,
         }
     }
-    /// Uses the coin_template and next_public_key to create the next account_state and generates a
-    /// Coin with filled in identifier (as it commits to the next account state hash).
-    ///
-    /// Total: caller (`send_coins`) is responsible for upstream balance + slot-count validation;
-    /// once that is done this function cannot fail. Returns `Vec<Coin>` directly so the call site
-    /// has no dead `?` propagation path.
 
+    // Orphaned note (former coin-construction helper): caller (`send_coins`) is
+    // responsible for upstream balance + slot-count validation; once that is
+    // done that path cannot fail and returns `Vec<Coin>` directly so the call
+    // site has no dead `?` propagation path.
     #[cfg(test)]
     pub(crate) fn get_balance(&self) -> Amount {
         self.coin_queue

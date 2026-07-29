@@ -313,14 +313,6 @@ mod tests {
         }
     }
 
-    fn published_at(chain_pos: ChainPosition, pk_b: u8, r_b: u8) -> PublishedNullifier {
-        PublishedNullifier {
-            chain_pos,
-            pk: pk(pk_b),
-            r: r(r_b),
-        }
-    }
-
     #[test]
     fn first_occurrence_duplicate_pk_does_not_move_position() {
         let mut acc = NfLogAccumulator::new(0);

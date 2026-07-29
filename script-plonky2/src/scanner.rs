@@ -3440,9 +3440,7 @@ mod tests {
         }
         // Ensure the payload still deserializes (canonical scalar may reject —
         // flip low bits that keep it a 32-byte field element on the wire).
-        let payload = match agg.serialize() {
-            p => p,
-        };
+        let payload = agg.serialize();
         // serialize() validates canonical scalar; if corruption broke that,
         // rebuild with a still-canonical but wrong scalar.
         let payload = if AggregateStateNullifierV3::deserialize(&payload).is_err() {
@@ -4757,7 +4755,7 @@ mod tests {
             "committed nullifier must remain after post-commit abort"
         );
         assert!(
-            scanner.accumulator().nav().size >= size_before + 1,
+            scanner.accumulator().nav().size > size_before,
             "accumulator must retain the committed admission"
         );
 
@@ -5019,7 +5017,7 @@ mod tests {
             .find(|b| b.height == h)
             .expect("replacement block at H must appear in report");
         assert!(
-            repl.admitted.len() >= 1,
+            !repl.admitted.is_empty(),
             "replacement must report admitted>=1; got {}",
             repl.admitted.len()
         );
@@ -5144,7 +5142,7 @@ mod tests {
             "scanned_through must be first block only"
         );
         assert!(
-            scanner.accumulator().nav().size >= size_before + 1,
+            scanner.accumulator().nav().size > size_before,
             "first nullifier must be committed"
         );
         assert!(

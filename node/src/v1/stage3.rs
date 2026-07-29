@@ -403,10 +403,9 @@ fn stage3_account_node_has_no_legacy_prover() {
 /// matrices prove dependency builds cannot mint.
 #[test]
 fn legacy_commitment_scan_cap_is_test_only_mint() {
-    let cap = crate::legacy_commitment_scan::LegacyCommitmentScanCap::mint_for_test();
-    // Cap is a ZST token; possession is the proof. Drop without running
-    // the multi-minute scan loop (Stage 4 deletes the body).
-    drop(cap);
+    // Successful construction *is* the assertion: the capability is mintable
+    // in tests and nowhere else. No Drop effect is expected or needed.
+    let _cap = crate::legacy_commitment_scan::LegacyCommitmentScanCap::mint_for_test();
 }
 
 #[cfg(test)]

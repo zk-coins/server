@@ -154,11 +154,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.81.0
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.81.0"
-          components: rustfmt, clippy
+      # The repo pins its toolchain in `rust-toolchain` (a dated nightly, with
+      # `rustfmt` and `clippy` in `components`) and every other job uses it.
+      # This step used to install 1.81.0 explicitly and export
+      # `RUSTUP_TOOLCHAIN`, which overrides the file — so formatting and lints
+      # were checked on a toolchain seventeen releases older than the one that
+      # builds and tests the same tree. That is not a conservative choice, it
+      # is a different compiler: a clippy suggestion can name an API the build
+      # toolchain has and the lint toolchain does not, and a lint that only
+      # exists in one of them is either invisible or unfixable. Installing the
+      # pinned toolchain instead keeps a single pin with nothing to drift.
+      - name: Install the pinned toolchain (rust-toolchain)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -174,14 +185,21 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      # `--all-targets` on every clippy step: without it clippy lints the
+      # library targets only, so tests, benches and feature-gated fixture
+      # modules — several thousand lines that decide whether a green run
+      # means anything — were never linted at all. Two real lints were
+      # hiding in `shared/src/spec_v1/nflog_boundary.rs`, which is behind
+      # the `test-fixtures` feature and therefore invisible to a plain
+      # `-p shared` run.
       - name: Run clippy (node + shared, MVP feature set)
-        run: cargo clippy -p node -p shared -- -D warnings
+        run: cargo clippy -p node -p shared --all-targets -- -D warnings
 
       - name: Run clippy (node, all features)
-        run: cargo clippy -p node --all-features -- -D warnings
+        run: cargo clippy -p node --all-features --all-targets -- -D warnings
 
-      - name: Run clippy (program + prover libs)
-        run: cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib -- -D warnings
+      - name: Run clippy (program + prover)
+        run: cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --all-targets -- -D warnings
 
       # Issue #84: the chain-tip wait path and the publisher's
       # commit→reveal propagation wait must be event-driven (WS /
