@@ -16,6 +16,34 @@ pub enum SpecError {
     NameEmpty,
     /// NameConsent `network` field is empty.
     NetworkEmpty,
+    /// Identifier has no `@` separator (§4.3).
+    NameMissingAt,
+    /// Identifier has more than one `@` (§4.3).
+    NameMultipleAt,
+    /// Local part (before `@`) is empty (§4.3).
+    NameEmptyLocal,
+    /// Domain part (after `@`) is empty (§4.3).
+    NameEmptyDomain,
+    /// Local part begins with `.` (§4.3).
+    NameLocalLeadingDot,
+    /// Local part ends with `.` (§4.3).
+    NameLocalTrailingDot,
+    /// Local part contains consecutive `..` (§4.3).
+    NameLocalConsecutiveDots,
+    /// Local part contains a character outside `a-z0-9-_.` (§4.3).
+    NameLocalInvalidChar { ch: char },
+    /// Domain label is empty (§4.3 DNS hostname).
+    NameDomainLabelEmpty,
+    /// Domain label begins with `-` (§4.3 DNS hostname).
+    NameDomainLabelLeadingHyphen,
+    /// Domain label ends with `-` (§4.3 DNS hostname).
+    NameDomainLabelTrailingHyphen,
+    /// Domain label contains a character outside `a-z0-9-` (§4.3 DNS hostname).
+    NameDomainLabelInvalidChar { ch: char },
+    /// Domain label longer than 63 octets (§4.3 DNS hostname).
+    NameDomainLabelTooLong { len: usize },
+    /// Domain longer than 253 octets (§4.3 DNS hostname).
+    NameDomainTooLong { len: usize },
     /// `AccountState.balances` exceeds `MAX_ACCOUNT_ASSETS`.
     TooManyBalances { count: usize, max: usize },
 
@@ -77,6 +105,66 @@ impl fmt::Display for SpecError {
             }
             SpecError::NetworkEmpty => {
                 write!(f, "network field is empty")
+            }
+            SpecError::NameMissingAt => {
+                write!(f, "identifier missing '@' separator (§4.3)")
+            }
+            SpecError::NameMultipleAt => {
+                write!(f, "identifier has more than one '@' (§4.3)")
+            }
+            SpecError::NameEmptyLocal => {
+                write!(f, "identifier local part is empty (§4.3)")
+            }
+            SpecError::NameEmptyDomain => {
+                write!(f, "identifier domain is empty (§4.3)")
+            }
+            SpecError::NameLocalLeadingDot => {
+                write!(f, "identifier local part begins with '.' (§4.3)")
+            }
+            SpecError::NameLocalTrailingDot => {
+                write!(f, "identifier local part ends with '.' (§4.3)")
+            }
+            SpecError::NameLocalConsecutiveDots => {
+                write!(f, "identifier local part contains consecutive '..' (§4.3)")
+            }
+            SpecError::NameLocalInvalidChar { ch } => {
+                write!(
+                    f,
+                    "identifier local part has invalid character {ch:?} (only a-z0-9-_. allowed, §4.3)"
+                )
+            }
+            SpecError::NameDomainLabelEmpty => {
+                write!(f, "identifier domain has empty label (§4.3 DNS hostname)")
+            }
+            SpecError::NameDomainLabelLeadingHyphen => {
+                write!(
+                    f,
+                    "identifier domain label begins with '-' (§4.3 DNS hostname)"
+                )
+            }
+            SpecError::NameDomainLabelTrailingHyphen => {
+                write!(
+                    f,
+                    "identifier domain label ends with '-' (§4.3 DNS hostname)"
+                )
+            }
+            SpecError::NameDomainLabelInvalidChar { ch } => {
+                write!(
+                    f,
+                    "identifier domain label has invalid character {ch:?} (only a-z0-9- allowed, §4.3)"
+                )
+            }
+            SpecError::NameDomainLabelTooLong { len } => {
+                write!(
+                    f,
+                    "identifier domain label too long: {len} octets (max 63, §4.3 DNS hostname)"
+                )
+            }
+            SpecError::NameDomainTooLong { len } => {
+                write!(
+                    f,
+                    "identifier domain too long: {len} octets (max 253, §4.3 DNS hostname)"
+                )
             }
             SpecError::TooManyBalances { count, max } => {
                 write!(f, "too many balance entries: {count} (max {max})")

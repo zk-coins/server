@@ -236,17 +236,126 @@ pub fn name_hash(name: &[u8]) -> Result<[u8; 32], SpecError> {
 ///
 /// `Alice@Example.COM` and `alice@example.com` produce the same preimage.
 /// The §4.3 grammar admits only ASCII, so ASCII case folding is the whole
-/// normalization for every conforming name.
+/// normalization for every conforming name. Validation of the grammar is
+/// separate ([`validate_identifier_syntax`]) and runs *after* this step.
 pub fn normalize_name(name: &str) -> String {
     name.to_ascii_lowercase()
+}
+
+/// Maximum DNS hostname length in octets (without trailing root label).
+const DNS_HOSTNAME_MAX_LEN: usize = 253;
+/// Maximum DNS label length in octets.
+const DNS_LABEL_MAX_LEN: usize = 63;
+
+/// Enforce §4.3 identifier syntax on an already-normalized (lowercased) name.
+///
+/// Spec order: lowercase first, then validate. Callers must pass the result of
+/// [`normalize_name`]. Fail-closed: no cleanup, no silent substitution.
+fn validate_identifier_syntax(normalized: &str) -> Result<(), SpecError> {
+    if normalized.is_empty() {
+        return Err(SpecError::NameEmpty);
+    }
+
+    let at_count = bytecount_at(normalized);
+    if at_count == 0 {
+        return Err(SpecError::NameMissingAt);
+    }
+    if at_count > 1 {
+        return Err(SpecError::NameMultipleAt);
+    }
+
+    // Exactly one `@` (checked above) — split once.
+    let (local, domain) = normalized
+        .split_once('@')
+        .expect("at_count == 1 guarantees a single '@'");
+
+    validate_local_part(local)?;
+    validate_domain_part(domain)?;
+    Ok(())
+}
+
+fn bytecount_at(s: &str) -> usize {
+    s.as_bytes().iter().filter(|&&b| b == b'@').count()
+}
+
+/// Local name: only `a-z0-9-_.`, non-empty, no leading/trailing `.`, no `..`.
+fn validate_local_part(local: &str) -> Result<(), SpecError> {
+    if local.is_empty() {
+        return Err(SpecError::NameEmptyLocal);
+    }
+    if local.starts_with('.') {
+        return Err(SpecError::NameLocalLeadingDot);
+    }
+    if local.ends_with('.') {
+        return Err(SpecError::NameLocalTrailingDot);
+    }
+    if local.contains("..") {
+        return Err(SpecError::NameLocalConsecutiveDots);
+    }
+    for ch in local.chars() {
+        if !is_local_char(ch) {
+            return Err(SpecError::NameLocalInvalidChar { ch });
+        }
+    }
+    Ok(())
+}
+
+fn is_local_char(ch: char) -> bool {
+    matches!(ch, 'a'..='z' | '0'..='9' | '-' | '_' | '.')
+}
+
+/// Domain: DNS hostname — labels separated by `.`, each non-empty, only
+/// `a-z0-9-`, no leading/trailing `-`, label ≤ 63, total ≤ 253. ASCII only;
+/// no Punycode / IDN conversion.
+fn validate_domain_part(domain: &str) -> Result<(), SpecError> {
+    if domain.is_empty() {
+        return Err(SpecError::NameEmptyDomain);
+    }
+    let domain_len = domain.len();
+    if domain_len > DNS_HOSTNAME_MAX_LEN {
+        return Err(SpecError::NameDomainTooLong { len: domain_len });
+    }
+
+    // `split('.')` yields an empty label for leading/trailing/consecutive dots.
+    for label in domain.split('.') {
+        validate_domain_label(label)?;
+    }
+    Ok(())
+}
+
+fn validate_domain_label(label: &str) -> Result<(), SpecError> {
+    if label.is_empty() {
+        return Err(SpecError::NameDomainLabelEmpty);
+    }
+    let label_len = label.len();
+    if label_len > DNS_LABEL_MAX_LEN {
+        return Err(SpecError::NameDomainLabelTooLong { len: label_len });
+    }
+    if label.starts_with('-') {
+        return Err(SpecError::NameDomainLabelLeadingHyphen);
+    }
+    if label.ends_with('-') {
+        return Err(SpecError::NameDomainLabelTrailingHyphen);
+    }
+    for ch in label.chars() {
+        if !is_domain_label_char(ch) {
+            return Err(SpecError::NameDomainLabelInvalidChar { ch });
+        }
+    }
+    Ok(())
+}
+
+fn is_domain_label_char(ch: char) -> bool {
+    matches!(ch, 'a'..='z' | '0'..='9' | '-')
 }
 
 /// Build the §4.3 / V.12 `name_message` preimage:
 /// `"zkCoins/v1/NameConsent" ‖ network ‖ u32-be(name_len) ‖ UTF-8(name) ‖ op_pubkey`.
 ///
-/// `name` is normalized first (§4.3). `name_len` is the canonical UTF-8
-/// **byte** length of that normalized name (not character count). Empty
-/// `network` or empty normalized name is an error — no silent default.
+/// `name` is lowercased first, then validated against the §4.3 identifier
+/// grammar (fail-closed). `name_len` is the canonical UTF-8 **byte** length of
+/// that normalized name (not character count). Empty `network` or any grammar
+/// violation is an error — no silent default or cleanup.
 pub fn name_consent_preimage(
     network: &str,
     name: &str,
@@ -255,10 +364,9 @@ pub fn name_consent_preimage(
     if network.is_empty() {
         return Err(SpecError::NetworkEmpty);
     }
+    // §4.3: lowercase before validation and comparison.
     let normalized = normalize_name(name);
-    if normalized.is_empty() {
-        return Err(SpecError::NameEmpty);
-    }
+    validate_identifier_syntax(&normalized)?;
     let name_bytes = normalized.as_bytes();
     let name_len = u32::try_from(name_bytes.len()).map_err(|_| SpecError::NameTooLong {
         len: name_bytes.len(),
@@ -520,6 +628,174 @@ mod tests {
             name_message("", "alice@example.com", &op_pubkey),
             Err(SpecError::NetworkEmpty)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // §4.3 identifier grammar — fail-closed, named SpecError variants
+    // -----------------------------------------------------------------------
+
+    fn assert_name_err(name: &str, expected: SpecError) {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        let err = name_consent_preimage("regtest", name, &op_pubkey)
+            .expect_err("expected §4.3 rejection");
+        assert_eq!(err, expected, "input {name:?}");
+        let err_msg = name_message("regtest", name, &op_pubkey)
+            .expect_err("name_message must reject the same input");
+        assert_eq!(err_msg, expected, "name_message input {name:?}");
+    }
+
+    fn assert_name_ok(name: &str) -> Vec<u8> {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        name_consent_preimage("regtest", name, &op_pubkey)
+            .unwrap_or_else(|e| panic!("expected accept for {name:?}, got {e}"))
+    }
+
+    #[test]
+    fn name_grammar_accepts_positive_cases() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        let alice = assert_name_ok("alice@example.com");
+        assert_name_ok("a@b.co");
+        assert_name_ok("a.b-c_d@sub.example.co.uk");
+
+        // Case folding then validate: Alice@Example.com → alice@example.com.
+        let folded = assert_name_ok("Alice@Example.com");
+        assert_eq!(
+            alice, folded,
+            "case-folded form must match lowercased preimage"
+        );
+        assert_eq!(
+            name_message("regtest", "alice@example.com", &op_pubkey).unwrap(),
+            name_message("regtest", "Alice@Example.com", &op_pubkey).unwrap(),
+        );
+    }
+
+    #[test]
+    fn name_grammar_local_leading_trailing_consecutive_dots() {
+        // Rejection.
+        assert_name_err(".alice@example.com", SpecError::NameLocalLeadingDot);
+        assert_name_err("alice.@example.com", SpecError::NameLocalTrailingDot);
+        assert_name_err("ali..ce@example.com", SpecError::NameLocalConsecutiveDots);
+
+        // Boundary still accepted: single interior dots, no leading/trailing.
+        assert_name_ok("a.b@example.com");
+        assert_name_ok("a.b.c@example.com");
+    }
+
+    #[test]
+    fn name_grammar_local_invalid_chars() {
+        assert_name_err(
+            "alice+bob@example.com",
+            SpecError::NameLocalInvalidChar { ch: '+' },
+        );
+        assert_name_err(
+            "alice bob@example.com",
+            SpecError::NameLocalInvalidChar { ch: ' ' },
+        );
+        // Non-ASCII survives to_ascii_lowercase unchanged → rejected.
+        assert_name_err(
+            "ALICE@ÉXAMPLE.COM",
+            SpecError::NameDomainLabelInvalidChar { ch: 'É' },
+        );
+        // Non-ASCII in the local part.
+        assert_name_err(
+            "alicé@example.com",
+            SpecError::NameLocalInvalidChar { ch: 'é' },
+        );
+
+        // Boundary: every allowed local char class still passes.
+        assert_name_ok("a-b_c.d0@example.com");
+    }
+
+    #[test]
+    fn name_grammar_at_separator() {
+        assert_name_err("aliceexample.com", SpecError::NameMissingAt);
+        assert_name_err("alice@@example.com", SpecError::NameMultipleAt);
+        assert_name_err("alice@ex@ample.com", SpecError::NameMultipleAt);
+        assert_name_err("@example.com", SpecError::NameEmptyLocal);
+        assert_name_err("alice@", SpecError::NameEmptyDomain);
+
+        // Boundary: shortest valid local + domain with TLD-style labels.
+        assert_name_ok("a@b.co");
+    }
+
+    #[test]
+    fn name_grammar_domain_empty_labels() {
+        // Empty label (leading / consecutive / trailing dots on domain).
+        assert_name_err("alice@.example.com", SpecError::NameDomainLabelEmpty);
+        assert_name_err("alice@example..com", SpecError::NameDomainLabelEmpty);
+        assert_name_err("alice@example.com.", SpecError::NameDomainLabelEmpty);
+
+        // Boundary: ordinary multi-label domain still accepted.
+        assert_name_ok("alice@sub.example.com");
+    }
+
+    #[test]
+    fn name_grammar_domain_hyphen_and_charset() {
+        // Interior hyphen accepted.
+        assert_name_ok("alice@ex-ample.com");
+        assert_name_ok("alice@a-b.example.com");
+
+        // Leading / trailing hyphen rejected.
+        assert_name_err(
+            "alice@-example.com",
+            SpecError::NameDomainLabelLeadingHyphen,
+        );
+        assert_name_err(
+            "alice@example-.com",
+            SpecError::NameDomainLabelTrailingHyphen,
+        );
+        assert_name_err(
+            "alice@example.com-",
+            SpecError::NameDomainLabelTrailingHyphen,
+        );
+
+        // Underscore is legal in local, illegal in domain.
+        assert_name_err(
+            "alice@ex_ample.com",
+            SpecError::NameDomainLabelInvalidChar { ch: '_' },
+        );
+    }
+
+    #[test]
+    fn name_grammar_domain_label_length() {
+        // 63-char label: accepted (DNS max).
+        let label63 = "a".repeat(63);
+        assert_name_ok(&format!("user@{label63}.com"));
+
+        // 64-char label: rejected.
+        let label64 = "a".repeat(64);
+        assert_name_err(
+            &format!("user@{label64}.com"),
+            SpecError::NameDomainLabelTooLong { len: 64 },
+        );
+    }
+
+    #[test]
+    fn name_grammar_domain_total_length() {
+        // Build a hostname of exactly 253 octets: 3×63 + 1×61 + 3 dots = 253.
+        // labels: 63 + '.' + 63 + '.' + 63 + '.' + 61 = 253
+        let l63 = "a".repeat(63);
+        let l61 = "a".repeat(61);
+        let domain253 = format!("{l63}.{l63}.{l63}.{l61}");
+        assert_eq!(domain253.len(), 253);
+        assert_name_ok(&format!("u@{domain253}"));
+
+        // 254 octets: rejected.
+        let l62 = "a".repeat(62);
+        let domain254 = format!("{l63}.{l63}.{l63}.{l62}");
+        assert_eq!(domain254.len(), 254);
+        assert_name_err(
+            &format!("u@{domain254}"),
+            SpecError::NameDomainTooLong { len: 254 },
+        );
+    }
+
+    #[test]
+    fn name_grammar_empty_domain_labels_boundary() {
+        // Single-label domain is accepted (DNS hostname; not required multi-label).
+        assert_name_ok("alice@localhost");
+        // Two single-char labels.
+        assert_name_ok("a@b.c");
     }
 
     /// V.12: `name_sig = BIP-340(sk₀, name_message)` is verified under `pk0`,
