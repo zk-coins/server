@@ -1,0 +1,129 @@
+# Local developer stack for the zkCoins node (Stage-3 binary).
+#
+# Services are derived from the node bootstrap code, not from guesswork:
+#   - postgres:17  — state layer (node/src/test_db.rs with_tag("17"), README)
+#   - node         — Dockerfile + 0.0.0.0:4242 (node/src/main.rs ACCOUNT_NODE_ADDR)
+#
+# Deliberately NOT included (see docs/local-stack.md):
+#   - zk-coins/api (parallel, not runnable yet)
+#   - bitcoind / electrs-Esplora (external; Stage-3 scanner is bitcoind RPC)
+#
+# No restart:always — a boot failure must stay visible.
+# No invented PUBLISHER_KEY / chain pins — compose fails at parse if missing.
+# No IS_MAINNET=true.
+
+name: zkcoins-local
+
+services:
+  postgres:
+    # Version pin: testcontainers and README use postgres:17
+    # (node/src/test_db.rs:348 `.with_tag("17")`, README.md local Postgres).
+    image: postgres:17
+    environment:
+      POSTGRES_USER: zkcoins
+      # Local-only DB password for the compose network (not a crypto key).
+      # Documented in docs/local-stack.md. Do not reuse outside this stack.
+      POSTGRES_PASSWORD: localdev
+      POSTGRES_DB: zkcoins
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # Real Postgres readiness — not a always-true probe.
+      test: ["CMD-SHELL", "pg_isready -U zkcoins -d zkcoins"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Listener address is hard-coded: node/src/main.rs ACCOUNT_NODE_ADDR
+      # "0.0.0.0:4242"; Dockerfile EXPOSE 4242.
+      - "4242:4242"
+    volumes:
+      - node_data:/data
+      # bitcoind cookie file (Stage-3 scanner + publisher cookie auth).
+      # Host path is mandatory; empty/missing aborts compose parse.
+      - type: bind
+        source: ${BITCOIND_COOKIE_HOST_PATH:?set BITCOIND_COOKIE_HOST_PATH to the host path of bitcoind .cookie}
+        target: /run/bitcoind/cookie
+        read_only: true
+    environment:
+      # --- Postgres (internal compose network; matches postgres service) ---
+      # Panic site if unset outside compose: node/src/lib.rs DATABASE_URL lazy_static.
+      DATABASE_URL: postgresql://zkcoins:localdev@postgres:5432/zkcoins
+
+      # --- Chain label for residual EsploraConfig (NOT mainnet) ---
+      # Panic: node/src/lib.rs build_network_config_from_env IS_MAINNET.
+      # Only exact "true" | "false". Local stack is never mainnet.
+      IS_MAINNET: "false"
+      NETWORK_NAME: regtest
+
+      # Still required at REST bootstrap even though Stage-3 NfLog scan is
+      # bitcoind RPC (main.rs run_v1_scan_loop). NETWORK_CONFIG panics without
+      # them (lib.rs); /health/ready pings ESPLORA_URL (router.rs ready_handler).
+      ESPLORA_URL: ${ESPLORA_URL:?set ESPLORA_URL to a live Esplora HTTP base URL}
+      ESPLORA_WS_URL: ${ESPLORA_WS_URL:?set ESPLORA_WS_URL to a live Esplora WebSocket URL}
+
+      # --- Publisher key (crypto secret — never invent a default) ---
+      # Panic: node/src/lib.rs PUBLISHER_KEY lazy_static.
+      PUBLISHER_KEY: ${PUBLISHER_KEY:?set PUBLISHER_KEY — generate with: openssl rand -hex 32}
+
+      # --- Username domain returned by /api/info ---
+      # Panic: node/src/lib.rs USERNAME_DOMAIN lazy_static.
+      USERNAME_DOMAIN: ${USERNAME_DOMAIN:?set USERNAME_DOMAIN e.g. local.zkcoins.test}
+
+      # --- Stage 3 exclusive stack (binary refuses Off) ---
+      # Panic: node/src/main.rs match shadow_mode V1ShadowMode::Off.
+      ZKCOINS_V1_SHADOW: "1"
+
+      # §3.6 boot pins — missing any → V1_BOOT_CONFIG_ERROR
+      # (node/src/v1/mode.rs v1_boot_pins_from_env).
+      # Regtest activation_height is pinned at 0 (mode.rs validate_v1_boot_pins).
+      ZKCOINS_NETWORK: regtest
+      ZKCOINS_ACTIVATION_HEIGHT: "0"
+      ZKCOINS_CIRCUIT_DIGEST_C: ${ZKCOINS_CIRCUIT_DIGEST_C:?set ZKCOINS_CIRCUIT_DIGEST_C (64 lowercase hex; see docs/local-stack.md)}
+      ZKCOINS_CIRCUIT_DIGEST_C_BALANCE: ${ZKCOINS_CIRCUIT_DIGEST_C_BALANCE:?set ZKCOINS_CIRCUIT_DIGEST_C_BALANCE (64 lowercase hex; see docs/local-stack.md)}
+      ZKCOINS_BOOTSTRAP_PUBKEY: ${ZKCOINS_BOOTSTRAP_PUBKEY:?set ZKCOINS_BOOTSTRAP_PUBKEY (64 lowercase hex x-only)}
+      ZKCOINS_EXPECTED_PARAMS_IDENTIFIER: ${ZKCOINS_EXPECTED_PARAMS_IDENTIFIER:?set ZKCOINS_EXPECTED_PARAMS_IDENTIFIER (SHA-256 of canonical network-params; see docs/local-stack.md)}
+
+      # Stage-3 scanner: bitcoind RPC only (node/src/v1/scan.rs
+      # v1_bitcoind_rpc_from_env). No fall-back to Esplora commitment scan.
+      ZKCOINS_V1_BITCOIND_RPC_URL: ${ZKCOINS_V1_BITCOIND_RPC_URL:?set ZKCOINS_V1_BITCOIND_RPC_URL e.g. http://host.docker.internal:18443}
+      ZKCOINS_V1_BITCOIND_COOKIE_PATH: /run/bitcoind/cookie
+
+      # Publisher wallet (required when resumable pending publishes exist or
+      # when exercising publish; incomplete env is logged and boot continues
+      # only if the pending table is empty — main.rs run_v1_scan_loop).
+      ZKCOINS_V1_BITCOIND_WALLET: ${ZKCOINS_V1_BITCOIND_WALLET:-}
+      ZKCOINS_V1_FEE_RATE_SAT_PER_VB: ${ZKCOINS_V1_FEE_RATE_SAT_PER_VB:-}
+      ZKCOINS_V1_REVEAL_OUTPUT_SATS: ${ZKCOINS_V1_REVEAL_OUTPUT_SATS:-}
+
+      # Optional: comma-separated hosts for attest channel binding
+      # (node/src/v1/attest.rs public_hosts_from_env — empty is OK, fails loud on use).
+      ZKCOINS_PUBLIC_HOST: ${ZKCOINS_PUBLIC_HOST:-}
+
+      PROOFS_DIR: /data/proofs
+      RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      # Liveness only: GET /health returns "ok" once the TCP listener is bound
+      # (node/src/router.rs health_handler). Does not mask dependency failure —
+      # /health/ready is the readiness probe (db + esplora + prover + v1_scan).
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4242/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      # Cold circuit construction + migrations can take tens of seconds.
+      start_period: 120s
+
+volumes:
+  postgres_data:
+  node_data:
