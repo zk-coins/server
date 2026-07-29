@@ -7,4 +7,3 @@ target/
 
 # accidentally-tracked tmp file
 .tmp
-shared/tests/generated_poseidon_vectors.txt

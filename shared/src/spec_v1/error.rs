@@ -12,8 +12,13 @@ use super::accumulator::ChainPosition;
 pub enum SpecError {
     /// Asset name longer than 255 bytes.
     NameTooLong { len: usize },
+    /// NameConsent / identifier name is empty after §4.3 normalization.
+    NameEmpty,
+    /// NameConsent `network` field is empty.
+    NetworkEmpty,
     /// `AccountState.balances` exceeds `MAX_ACCOUNT_ASSETS`.
     TooManyBalances { count: usize, max: usize },
+
     /// A balance entry has `amount == 0` (must be omitted).
     ZeroAmountBalance,
     /// Input byte length does not match the expected fixed width.
@@ -66,6 +71,12 @@ impl fmt::Display for SpecError {
         match self {
             SpecError::NameTooLong { len } => {
                 write!(f, "asset name too long: {len} bytes (max 255)")
+            }
+            SpecError::NameEmpty => {
+                write!(f, "name is empty after §4.3 normalization")
+            }
+            SpecError::NetworkEmpty => {
+                write!(f, "network field is empty")
             }
             SpecError::TooManyBalances { count, max } => {
                 write!(f, "too many balance entries: {count} (max {max})")

@@ -53,5 +53,9 @@ pub const NETWORK_TAG_REGTEST: &[u8] = b"zkCoins/v1/regtest";
 /// Raw ASCII prefix for `npk_commit = SHA256(TAG_NPK_COMMIT || next_pubkey || npk_rand)`.
 pub const TAG_NPK_COMMIT: &[u8] = b"zkCoins/v1/NpkCommit";
 
+/// Raw ASCII prefix for §4.3 / V.12 name consent:
+/// `name_message = SHA256(TAG_NAME_CONSENT ‖ network ‖ u32-be(name_len) ‖ UTF-8(name) ‖ op_pubkey)`.
+pub const TAG_NAME_CONSENT: &[u8] = b"zkCoins/v1/NameConsent";
+
 /// Bech32m HRP for addresses (§1.7.7).
 pub const ADDRESS_HRP: &str = "zk";

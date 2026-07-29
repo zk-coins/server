@@ -1,8 +1,13 @@
-//! Generates `shared/tests/generated_nflog_vectors.txt` from the live
-//! nullifier-log primitives (V.11 hand-listed smoke set).
+//! Generates / verifies `shared/tests/generated_nflog_vectors.txt` from the
+//! live nullifier-log primitives (V.11 hand-listed smoke set).
 //!
-//! Values are **computed**, never hand-copied. Re-run with `cargo test -p shared`
-//! to refresh the file.
+//! Values are **computed**, never hand-copied.
+//!
+//! ## CI / default
+//!
+//! Without an env var the test **verifies** live digests against the committed
+//! file and fails on drift. Local regen (writes the vector file):
+//! `REGEN_NFLOG_VECTORS=1 cargo test -p shared --test generated_nflog_vectors_test -- --nocapture`
 //!
 //! Line format (fixed for this generator):
 //! - Scalars: `mth@n = 0x<64 hex>`, `nav_root@n = 0x<64 hex>`
@@ -172,12 +177,36 @@ fn generate_nflog_vectors_file() {
     }
 
     lines.push(String::new()); // trailing newline
+    let generated = lines.join("\n");
 
     let path = PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/generated_nflog_vectors.txt"
     ));
-    fs::write(&path, lines.join("\n")).expect("write generated_nflog_vectors.txt");
+
+    // Default: verify the committed file matches live digests.
+    // REGEN_NFLOG_VECTORS=1: rewrite the file (after a real NfLog change).
+    let regen = matches!(std::env::var("REGEN_NFLOG_VECTORS").as_deref(), Ok("1"));
+    if regen {
+        fs::write(&path, &generated).expect("write generated_nflog_vectors.txt");
+        println!("REGEN: wrote {}", path.display());
+    } else {
+        let committed = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read committed nflog vectors file {}: {e} \
+                 (set REGEN_NFLOG_VECTORS=1 to create it)",
+                path.display()
+            )
+        });
+        assert_eq!(
+            committed, generated,
+            "live NfLog digests diverge from committed generated_nflog_vectors.txt — \
+             either an NfLog domain tag / leaf/node/root encoding changed \
+             (run with REGEN_NFLOG_VECTORS=1 and commit) \
+             or the generator no longer matches the production primitives"
+        );
+        println!("verified {} matches live primitives", path.display());
+    }
 
     let written = fs::read_to_string(&path).expect("read back vectors file");
     for &n in mth_ns {

@@ -20,8 +20,13 @@
 //! - the V.8 nonce-rule signer recomputes the pinned V.8 rows bit-for-bit
 //!   before those members feed `s_agg`.
 //!
-//! Re-run:
-//! `cargo test -p zkcoins-prover-plonky2 --test generated_sig_agg_vectors_test generate_sig_agg_vectors -- --nocapture`
+//! ## CI / local
+//!
+//! Default (no env): **verify** the committed file against live signatures /
+//! aggregation — drift fails the test.
+//!
+//! Regen (writes the vector file):
+//! `REGEN_SIG_AGG_VECTORS=1 cargo test -p zkcoins-prover-plonky2 --test generated_sig_agg_vectors_test generate_sig_agg_vectors -- --nocapture`
 //!
 //! Lives under `tests/` (not `src/`) so the generator is never part of the
 //! library. Helpers that mirror `prover_bridge`'s `pub(crate)` encoding
@@ -434,7 +439,29 @@ fn generate_sig_agg_vectors() {
     path.push("tests");
     path.push("generated_sig_agg_vectors.txt");
     fs::create_dir_all(path.parent().expect("tests/ parent")).expect("create tests/");
-    let body = lines.join("\n") + "\n";
-    fs::write(&path, &body).expect("write generated_sig_agg_vectors.txt");
-    println!("wrote {}", path.display());
+    let generated = lines.join("\n") + "\n";
+
+    // Default: verify the committed file matches the just-built vectors.
+    // REGEN_SIG_AGG_VECTORS=1: rewrite the file (developer after a real
+    // signing / aggregation change). CI never sets REGEN — it must fail on drift.
+    let regen = matches!(std::env::var("REGEN_SIG_AGG_VECTORS").as_deref(), Ok("1"));
+    if regen {
+        fs::write(&path, &generated).expect("write generated_sig_agg_vectors.txt");
+        println!("REGEN: wrote {}", path.display());
+    } else {
+        let committed = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read committed sig-agg vectors file {}: {e} \
+                 (set REGEN_SIG_AGG_VECTORS=1 to create it)",
+                path.display()
+            )
+        });
+        assert_eq!(
+            committed, generated,
+            "live sig-agg vectors diverge from committed generated_sig_agg_vectors.txt — \
+             either signing / aggregation changed (run with REGEN_SIG_AGG_VECTORS=1 and \
+             commit) or the generator no longer matches the production encoding"
+        );
+        println!("verified {} matches live signatures", path.display());
+    }
 }

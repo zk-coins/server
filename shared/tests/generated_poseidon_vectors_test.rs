@@ -1,20 +1,28 @@
-//! Generates `shared/tests/generated_poseidon_vectors.txt` from the live
-//! Poseidon/`Hc` primitives (V.4 `<REGEN>` table).
+//! Generates / verifies `shared/tests/generated_poseidon_vectors.txt` from the
+//! live Poseidon/`Hc` primitives (V.4 `<REGEN>` table) and the V.12 NameConsent
+//! framing vector.
 //!
-//! Values are **computed**, never hand-copied. Re-run with `cargo test -p shared`
-//! to refresh the file.
+//! Values are **computed**, never hand-copied.
+//!
+//! ## CI / default
+//!
+//! Without an env var the test **verifies** live digests against the committed
+//! file and fails on drift. Local regen (writes the vector file):
+//! `REGEN_POSEIDON_VECTORS=1 cargo test -p shared --test generated_poseidon_vectors_test -- --nocapture`
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 use shared::spec_v1::{
     account_state_hash, address, asset_id_v1, asset_id_v2, coin_identifier, coinhist_empty_root,
     coinhist_root_after_first_insert, detect_tag, digest_to_bytes, hash_proof_data, merkle_root,
-    name_hash, nav_commitment, network_id_mainnet, network_id_regtest, network_id_testnet,
-    nflog_empty, nflog_root, nk_commit, npk_commit, nullifier, serialize_proof_data, terms_hash_v1,
-    terms_hash_v2, AccountState, Address, CoinHistState, ProofData, TreeKind, GENESIS_TAG,
+    name_consent_preimage, name_hash, name_message, nav_commitment, network_id_mainnet,
+    network_id_regtest, network_id_testnet, nflog_empty, nflog_root, nk_commit, npk_commit,
+    nullifier, serialize_proof_data, terms_hash_v1, terms_hash_v2, AccountState, Address,
+    CoinHistState, ProofData, TreeKind, GENESIS_TAG,
 };
 
 fn sha256_label(label: &str) -> [u8; 32] {
@@ -27,6 +35,39 @@ fn hex32(bytes: &[u8; 32]) -> String {
 
 fn hex_digest(d: &shared::spec_v1::HashDigest) -> String {
     hex32(&digest_to_bytes(d))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+/// V.2-ext `op` secret (`m/1798'/0'/2'`) — pinned in the spec V.2-ext table.
+const V2EXT_OP_SECRET_HEX: &str =
+    "6516c985b442d51f1e91760c9327a593ddcb7fe06b363aa5b2b8547cc61d7395";
+/// Expected BIP-340 x-only public key for the V.2-ext `op` secret (sanity pin).
+const V2EXT_OP_PUBKEY_HEX: &str =
+    "6424b41eea59c6a3aa6169b802c96ff5194962d3bf5f941130e4ebc86de3b485";
+
+fn parse_hex32(hex_str: &str) -> [u8; 32] {
+    let bytes = hex::decode(hex_str).unwrap_or_else(|e| {
+        panic!("fixture hex decode failed for {hex_str}: {e}");
+    });
+    <[u8; 32]>::try_from(bytes.as_slice()).unwrap_or_else(|_| {
+        panic!(
+            "fixture must be 32 bytes, got {} for {hex_str}",
+            bytes.len()
+        );
+    })
+}
+
+/// BIP-340 x-only public key from a 32-byte secret (even-y normalisation).
+fn xonly_from_secret(secret_hex: &str) -> [u8; 32] {
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&parse_hex32(secret_hex))
+        .unwrap_or_else(|e| panic!("V.2-ext secret is not a valid secp256k1 key: {e}"));
+    let kp = Keypair::from_secret_key(&secp, &sk);
+    let (xonly, _) = kp.x_only_public_key();
+    xonly.serialize()
 }
 
 #[test]
@@ -181,6 +222,29 @@ fn generate_poseidon_vectors_file() {
     // 21
     let terms_hash_v2_v = terms_hash_v2(asset_id_v2_v, 2, 500_000_000u128, &terms_salt);
 
+    // 22 — V.12 NameConsent framing (spec §4.3): V.2-ext op_pubkey, network=regtest,
+    //      name=alice@example.com → 82-byte preimage + SHA-256 digest.
+    // 22 — V.12 name-consent framing. Inputs: V.2-ext (sk₀, pk0, op_pubkey),
+    // network = "regtest", name = alice@example.com. op_pubkey is derived from
+    // the pinned V.2-ext `op` secret (BIP-340 x-only), not hand-copied.
+    let v12_op_pubkey = xonly_from_secret(V2EXT_OP_SECRET_HEX);
+    assert_eq!(
+        hex::encode(v12_op_pubkey),
+        V2EXT_OP_PUBKEY_HEX,
+        "V.2-ext op → op_pubkey x-only derivation regressed"
+    );
+    let v12_preimage = name_consent_preimage("regtest", "alice@example.com", &v12_op_pubkey)
+        .expect("V.12 NameConsent preimage");
+    assert_eq!(
+        v12_preimage.len(),
+        82,
+        "V.12 preimage must be 22+7+4+17+32 = 82 bytes"
+    );
+    let v12_name_message =
+        name_message("regtest", "alice@example.com", &v12_op_pubkey).expect("V.12 name_message");
+    println!("name_consent_preimage = {}", hex_bytes(&v12_preimage));
+    println!("name_message = {}", hex32(&v12_name_message));
+
     let mut lines = Vec::new();
     lines.push(format!("nflog_empty = {}", hex_digest(&nflog_empty_v)));
     lines.push(format!(
@@ -232,13 +296,43 @@ fn generate_poseidon_vectors_file() {
     lines.push(format!("asset_id_v2 = {}", hex_digest(&asset_id_v2_v)));
     lines.push(format!("terms_hash_v1 = {}", hex_digest(&terms_hash_v1_v)));
     lines.push(format!("terms_hash_v2 = {}", hex_digest(&terms_hash_v2_v)));
+    lines.push(format!(
+        "name_consent_preimage = {}",
+        hex_bytes(&v12_preimage)
+    ));
+    lines.push(format!("name_message = {}", hex32(&v12_name_message)));
     lines.push(String::new()); // trailing newline
+
+    let generated = lines.join("\n");
 
     let path = PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/generated_poseidon_vectors.txt"
     ));
-    fs::write(&path, lines.join("\n")).expect("write generated_poseidon_vectors.txt");
+
+    // Default: verify the committed file matches live digests.
+    // REGEN_POSEIDON_VECTORS=1: rewrite the file (after a real primitive change).
+    let regen = matches!(std::env::var("REGEN_POSEIDON_VECTORS").as_deref(), Ok("1"));
+    if regen {
+        fs::write(&path, &generated).expect("write generated_poseidon_vectors.txt");
+        println!("REGEN: wrote {}", path.display());
+    } else {
+        let committed = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read committed poseidon vectors file {}: {e} \
+                 (set REGEN_POSEIDON_VECTORS=1 to create it)",
+                path.display()
+            )
+        });
+        assert_eq!(
+            committed, generated,
+            "live Poseidon/V.12 digests diverge from committed generated_poseidon_vectors.txt — \
+             either a domain tag / Hc encoding / NameConsent framing changed \
+             (run with REGEN_POSEIDON_VECTORS=1 and commit) \
+             or the generator no longer matches the production primitives"
+        );
+        println!("verified {} matches live primitives", path.display());
+    }
 
     // File must exist and contain every label.
     let written = fs::read_to_string(&path).expect("read back vectors file");
@@ -266,6 +360,8 @@ fn generate_poseidon_vectors_file() {
         "asset_id_v2",
         "terms_hash_v1",
         "terms_hash_v2",
+        "name_consent_preimage",
+        "name_message",
     ] {
         assert!(
             written.contains(label),

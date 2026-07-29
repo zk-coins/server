@@ -13,7 +13,8 @@ use super::error::SpecError;
 use super::tags::{
     NETWORK_TAG_MAINNET, NETWORK_TAG_REGTEST, NETWORK_TAG_TESTNET, TAG_ACCOUNT_STATE, TAG_ASSET_ID,
     TAG_ASSET_ID_V2, TAG_COIN, TAG_DETECT_TAG, TAG_ISSUANCE_TERMS, TAG_ISSUANCE_TERMS_V2,
-    TAG_NAV_COMMIT, TAG_NAV_RAND, TAG_NETWORK, TAG_NK_COMMIT, TAG_NPK_COMMIT, TAG_NULLIFIER,
+    TAG_NAME_CONSENT, TAG_NAV_COMMIT, TAG_NAV_RAND, TAG_NETWORK, TAG_NK_COMMIT, TAG_NPK_COMMIT,
+    TAG_NULLIFIER,
 };
 use zkcoins_program::hash::HashDigest;
 
@@ -228,6 +229,66 @@ pub fn name_hash(name: &[u8]) -> Result<[u8; 32], SpecError> {
 }
 
 // ---------------------------------------------------------------------------
+// Name consent framing (§4.3 / V.12) — plain SHA-256 concatenation
+// ---------------------------------------------------------------------------
+
+/// §4.3 identifier normalization: lowercase ASCII before validation/comparison.
+///
+/// `Alice@Example.COM` and `alice@example.com` produce the same preimage.
+/// The §4.3 grammar admits only ASCII, so ASCII case folding is the whole
+/// normalization for every conforming name.
+pub fn normalize_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+/// Build the §4.3 / V.12 `name_message` preimage:
+/// `"zkCoins/v1/NameConsent" ‖ network ‖ u32-be(name_len) ‖ UTF-8(name) ‖ op_pubkey`.
+///
+/// `name` is normalized first (§4.3). `name_len` is the canonical UTF-8
+/// **byte** length of that normalized name (not character count). Empty
+/// `network` or empty normalized name is an error — no silent default.
+pub fn name_consent_preimage(
+    network: &str,
+    name: &str,
+    op_pubkey: &[u8; 32],
+) -> Result<Vec<u8>, SpecError> {
+    if network.is_empty() {
+        return Err(SpecError::NetworkEmpty);
+    }
+    let normalized = normalize_name(name);
+    if normalized.is_empty() {
+        return Err(SpecError::NameEmpty);
+    }
+    let name_bytes = normalized.as_bytes();
+    let name_len = u32::try_from(name_bytes.len()).map_err(|_| SpecError::NameTooLong {
+        len: name_bytes.len(),
+    })?;
+
+    let mut preimage = Vec::with_capacity(
+        TAG_NAME_CONSENT.len() + network.len() + 4 + name_bytes.len() + op_pubkey.len(),
+    );
+    preimage.extend_from_slice(TAG_NAME_CONSENT);
+    preimage.extend_from_slice(network.as_bytes());
+    preimage.extend_from_slice(&name_len.to_be_bytes());
+    preimage.extend_from_slice(name_bytes);
+    preimage.extend_from_slice(op_pubkey);
+    Ok(preimage)
+}
+
+/// `name_message = SHA-256(name_consent_preimage(…))` (§4.3 / V.12).
+pub fn name_message(
+    network: &str,
+    name: &str,
+    op_pubkey: &[u8; 32],
+) -> Result<[u8; 32], SpecError> {
+    let preimage = name_consent_preimage(network, name, op_pubkey)?;
+    let dig = Sha256::digest(&preimage);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&dig);
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // SHA-256 boundary (plain byte concatenation — no Hc / E(·))
 // ---------------------------------------------------------------------------
 
@@ -318,6 +379,189 @@ mod tests {
             Err(SpecError::NameTooLong { len: 256 })
         ));
         assert!(name_hash(&vec![b'a'; 255]).is_ok());
+    }
+
+    // V.2-ext op secret → x-only op_pubkey (BIP-340 even-y).
+    // Derived independently; used only as the V.12 framing fixture key.
+    const V2EXT_OP_PUBKEY_HEX: &str =
+        "6424b41eea59c6a3aa6169b802c96ff5194962d3bf5f941130e4ebc86de3b485";
+    // V.2-ext Pk₀ — a different valid x-only key for the op_pubkey mutation.
+    const V2EXT_PK0_HEX: &str = "7c9cdde9b8cb1e33a48a5c2b6ab1fa6fd753fa1762f56c0b3e8169e4f2d54630";
+
+    fn parse_hex32(hex_str: &str) -> [u8; 32] {
+        let bytes = hex::decode(hex_str).expect("fixture hex");
+        <[u8; 32]>::try_from(bytes.as_slice()).expect("32 bytes")
+    }
+
+    /// Manual preimage builder for mutation tests — bypasses the production
+    /// name_len / normalization so each framing field can be corrupted alone.
+    fn raw_name_consent_preimage(
+        network: &str,
+        name_len_be: [u8; 4],
+        name_bytes: &[u8],
+        op_pubkey: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut preimage =
+            Vec::with_capacity(TAG_NAME_CONSENT.len() + network.len() + 4 + name_bytes.len() + 32);
+        preimage.extend_from_slice(TAG_NAME_CONSENT);
+        preimage.extend_from_slice(network.as_bytes());
+        preimage.extend_from_slice(&name_len_be);
+        preimage.extend_from_slice(name_bytes);
+        preimage.extend_from_slice(op_pubkey);
+        preimage
+    }
+
+    fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+        Sha256::digest(bytes).into()
+    }
+
+    #[test]
+    fn name_consent_v12_fixture_preimage_is_82_bytes() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        let preimage = name_consent_preimage("regtest", "alice@example.com", &op_pubkey)
+            .expect("fixture preimage");
+        assert_eq!(preimage.len(), 82, "V.12: 22 + 7 + 4 + 17 + 32 = 82 bytes");
+        assert_eq!(&preimage[..22], TAG_NAME_CONSENT);
+        assert_eq!(&preimage[22..29], b"regtest");
+        assert_eq!(&preimage[29..33], &17u32.to_be_bytes());
+        assert_eq!(&preimage[33..50], b"alice@example.com");
+        assert_eq!(&preimage[50..82], &op_pubkey);
+    }
+
+    #[test]
+    fn name_consent_unnormalized_control_is_identical() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        let a = name_consent_preimage("regtest", "alice@example.com", &op_pubkey).unwrap();
+        let b = name_consent_preimage("regtest", "Alice@Example.COM", &op_pubkey).unwrap();
+        assert_eq!(a, b, "§4.3 normalization must fold case");
+        assert_eq!(
+            name_message("regtest", "alice@example.com", &op_pubkey).unwrap(),
+            name_message("regtest", "Alice@Example.COM", &op_pubkey).unwrap(),
+        );
+    }
+
+    #[test]
+    fn name_consent_mutation_different_network_changes_digest() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        let base = name_message("regtest", "alice@example.com", &op_pubkey).unwrap();
+        let mut_net = name_message("testnet", "alice@example.com", &op_pubkey).unwrap();
+        assert_ne!(base, mut_net, "different network must change name_message");
+    }
+
+    #[test]
+    fn name_consent_mutation_name_len_little_endian_changes_digest() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        let name = b"alice@example.com";
+        let base = name_message("regtest", "alice@example.com", &op_pubkey).unwrap();
+        let le_pre = raw_name_consent_preimage("regtest", 17u32.to_le_bytes(), name, &op_pubkey);
+        let le_dig = sha256_bytes(&le_pre);
+        assert_ne!(
+            base, le_dig,
+            "little-endian name_len must change name_message"
+        );
+    }
+
+    #[test]
+    fn name_consent_mutation_name_len_plus_one_changes_digest() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        let name = b"alice@example.com";
+        let base = name_message("regtest", "alice@example.com", &op_pubkey).unwrap();
+        let pre = raw_name_consent_preimage("regtest", 18u32.to_be_bytes(), name, &op_pubkey);
+        assert_ne!(
+            base,
+            sha256_bytes(&pre),
+            "name_len + 1 must change name_message"
+        );
+    }
+
+    #[test]
+    fn name_consent_mutation_name_len_minus_one_changes_digest() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        let name = b"alice@example.com";
+        let base = name_message("regtest", "alice@example.com", &op_pubkey).unwrap();
+        let pre = raw_name_consent_preimage("regtest", 16u32.to_be_bytes(), name, &op_pubkey);
+        assert_ne!(
+            base,
+            sha256_bytes(&pre),
+            "name_len - 1 must change name_message"
+        );
+    }
+
+    #[test]
+    fn name_consent_mutation_different_op_pubkey_changes_digest() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        let other = parse_hex32(V2EXT_PK0_HEX);
+        let base = name_message("regtest", "alice@example.com", &op_pubkey).unwrap();
+        let mut_pk = name_message("regtest", "alice@example.com", &other).unwrap();
+        assert_ne!(base, mut_pk, "different op_pubkey must change name_message");
+    }
+
+    #[test]
+    fn name_consent_rejects_empty_name() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        assert!(matches!(
+            name_consent_preimage("regtest", "", &op_pubkey),
+            Err(SpecError::NameEmpty)
+        ));
+        assert!(matches!(
+            name_message("regtest", "", &op_pubkey),
+            Err(SpecError::NameEmpty)
+        ));
+    }
+
+    #[test]
+    fn name_consent_rejects_empty_network() {
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+        assert!(matches!(
+            name_consent_preimage("", "alice@example.com", &op_pubkey),
+            Err(SpecError::NetworkEmpty)
+        ));
+        assert!(matches!(
+            name_message("", "alice@example.com", &op_pubkey),
+            Err(SpecError::NetworkEmpty)
+        ));
+    }
+
+    /// V.12: `name_sig = BIP-340(sk₀, name_message)` is verified under `pk0`,
+    /// not byte-compared (nonce derivation includes auxiliary randomness).
+    /// Uses the already-wired `bitcoin` Schnorr path — no new signing stack.
+    #[test]
+    fn name_consent_bip340_sig_verifies_under_pk0() {
+        use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey, XOnlyPublicKey};
+
+        // V.2-ext sk₀ / Pk₀ (pinned).
+        const V2EXT_SK0_HEX: &str =
+            "4a8e3a83404f1aa99e89af57179dcf033820b816c0d78ac94fcb322d6ee85649";
+        let sk0_bytes = parse_hex32(V2EXT_SK0_HEX);
+        let pk0 = parse_hex32(V2EXT_PK0_HEX);
+        let op_pubkey = parse_hex32(V2EXT_OP_PUBKEY_HEX);
+
+        let msg = name_message("regtest", "alice@example.com", &op_pubkey).unwrap();
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&sk0_bytes).expect("V.2-ext sk₀");
+        let keypair = Keypair::from_secret_key(&secp, &secret);
+        let (xonly, _parity) = keypair.x_only_public_key();
+        assert_eq!(
+            xonly.serialize(),
+            pk0,
+            "V.2-ext sk₀ must derive the pinned Pk₀"
+        );
+
+        let message = Message::from_digest(msg);
+        // Deterministic aux for the test only — production may use random aux;
+        // either way the signature is verified, never byte-compared.
+        let sig = secp.sign_schnorr_no_aux_rand(&message, &keypair);
+        let xonly_pk0 = XOnlyPublicKey::from_slice(&pk0).expect("pk0 is x-only");
+        secp.verify_schnorr(&sig, &message, &xonly_pk0)
+            .expect("name_sig must verify under pk0 over name_message");
+
+        // Negative: same signature must not verify under op_pubkey (the
+        // node-held key) — the V.12 reject case "sig under op rather than pk0".
+        let xonly_op = XOnlyPublicKey::from_slice(&op_pubkey).expect("op_pubkey is x-only");
+        assert!(
+            secp.verify_schnorr(&sig, &message, &xonly_op).is_err(),
+            "name_sig under pk0 must not verify under op_pubkey"
+        );
     }
 
     #[test]
