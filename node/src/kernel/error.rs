@@ -37,6 +37,32 @@ pub(crate) enum KernelErrorCode {
 }
 
 impl KernelErrorCode {
+    /// Every code in §7.8 order. The closed set is the contract, so this
+    /// inventory is what makes it checkable — not a convenience list.
+    pub(crate) const ALL: [KernelErrorCode; 21] = [
+        Self::MalformedRequest,
+        Self::BoundsExceeded,
+        Self::InvalidInputCoin,
+        Self::InsufficientBalance,
+        Self::UnknownPublisher,
+        Self::JobNotFound,
+        Self::NotFound,
+        Self::WrongPhase,
+        Self::StaleMessage,
+        Self::InvalidSignature,
+        Self::RetentionHold,
+        Self::DependencyNotFinal,
+        Self::IdempotencyConflict,
+        Self::Unauthorized,
+        Self::ChallengeExpired,
+        Self::SessionExpired,
+        Self::ScopeExceeded,
+        Self::RateLimited,
+        Self::PayloadTooLarge,
+        Self::CircuitDigestMismatch,
+        Self::InternalError,
+    ];
+
     /// Normative machine-code string (§7.5 / §7.8 `ErrorInfo.reason`).
     pub(crate) fn reason(self) -> &'static str {
         match self {

@@ -13,6 +13,4 @@ pub(crate) mod types;
 pub(crate) use error::{KernelError, KernelErrorCode};
 pub(crate) use job_events::JobEventHub;
 pub(crate) use service::KernelService;
-pub(crate) use types::{
-    CancelPolicy, Job, JobEvent, JobId, JobRequest, JobState, NormativeJobStatus,
-};
+pub(crate) use types::{CancelPolicy, Job, JobEvent, JobId, JobRequest, JobState};

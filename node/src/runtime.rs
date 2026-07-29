@@ -38,43 +38,64 @@ pub struct V1Readiness {
     pub finality_ok: Option<Arc<AtomicBool>>,
 }
 
+/// Everything `start_rest_node` needs, resolved at the binary edge.
+pub struct RestNodeConfig {
+    pub account_node: AccountNode,
+    pub username_store: UsernameStore,
+    /// REST listen address, parsed inside `start_rest_node`.
+    pub addr: String,
+    pub pool: Arc<PgPool>,
+    /// Proof-store directory. The env read (`PROOFS_DIR`) stays at the
+    /// binary edge so parallel test binaries (`runtime_tests.rs` under
+    /// issue #181 Opt A's `--test-threads=8`) each pass their own
+    /// `tempfile::tempdir()` path instead of racing on a process-wide
+    /// env var. Proof files keep using a local directory — the proof
+    /// store is append-only and the proofs themselves are large
+    /// (bincode-serialized Plonky2 proofs) so a `BYTEA` column would
+    /// balloon the Postgres image.
+    pub proofs_dir: String,
+    pub v1_readiness: V1Readiness,
+    /// Shared v1.1 engine (when `ZKCOINS_V1_SHADOW=1`). Used to drive
+    /// `StateEngine::finalise` after an accepted `/v1/jobs/{id}/sign`.
+    pub v1_engine: Option<Arc<crate::v1::EngineAdapter>>,
+    /// Kernel gRPC listen address (**required**, no default).
+    /// Validated at the binary edge via `KERNEL_GRPC_ADDR` before this
+    /// is called. Served with the same job store + notify map as REST
+    /// so `StreamJob` subscribers see dispatcher phase events.
+    pub kernel_grpc_addr: SocketAddr,
+}
+
 /// Bind REST + job dispatcher + kernel gRPC, sharing one job store and notify map.
 ///
-/// # Parameters
-///
-/// - `kernel_grpc_addr` — Kernel gRPC listen address (**required**, no default).
-///   Validated at the binary edge via `KERNEL_GRPC_ADDR` before this is called.
-///   Served with the same job store + notify map as REST so `StreamJob`
-///   subscribers see dispatcher phase events.
-pub async fn start_rest_node(
-    account_node: AccountNode,
-    username_store: UsernameStore,
-    addr: &str,
-    pool: Arc<PgPool>,
-    proofs_dir: &str,
-    v1_readiness: V1Readiness,
-    // Shared v1.1 engine (when `ZKCOINS_V1_SHADOW=1`). Used to drive
-    // `StateEngine::finalise` after an accepted `/v1/jobs/{id}/sign`.
-    v1_engine: Option<Arc<crate::v1::EngineAdapter>>,
-    kernel_grpc_addr: SocketAddr,
-) -> anyhow::Result<()> {
+/// The normative error table is hand-written and both transports depend
+/// on it. [`crate::transport::error_contract::validate_table`] runs
+/// before the REST socket is bound so a release built without green
+/// tests cannot ship wrong codes for **every** failure. The check is
+/// microseconds once and fails closed.
+pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
+    let RestNodeConfig {
+        account_node,
+        username_store,
+        addr,
+        pool,
+        proofs_dir,
+        v1_readiness,
+        v1_engine,
+        kernel_grpc_addr,
+    } = config;
+
+    // Fail closed on a drifted §7.8 error table before any listener binds.
+    if let Err(e) = crate::transport::error_contract::validate_table() {
+        anyhow::bail!("kernel error contract invalid: {e}");
+    }
+
     let socket_addr = addr
         .parse::<SocketAddr>()
         .map_err(|e| anyhow::anyhow!("Failed to parse address: {}", e))?;
 
     let shared_account_node = Arc::new(Mutex::new(account_node));
 
-    // Proof files keep using a local directory — the proof store is
-    // append-only and the proofs themselves are large (bincode-
-    // serialized Plonky2 proofs) so a `BYTEA` column would balloon the
-    // Postgres image. The `proofs_dir` arrives as a parameter from the
-    // binary edge (`main.rs` reads the `PROOFS_DIR` env var and passes
-    // the resolved value through) — keeping the env read out of this
-    // function lets parallel test binaries (`runtime_tests.rs` under
-    // issue #181 Opt A's `--test-threads=8`) each pass their own
-    // `tempfile::tempdir()` path instead of racing on a process-wide
-    // env var.
-    let proof_store = Arc::new(ProofStore::new(proofs_dir));
+    let proof_store = Arc::new(ProofStore::new(&proofs_dir));
 
     // Neutral, permissionless model (Milestone 2): there is NO central
     // minting authority. The node holds no minting key and bootstraps

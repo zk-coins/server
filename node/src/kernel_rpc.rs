@@ -135,19 +135,18 @@ fn not_yet(procedure: &'static str) -> Status {
 /// Parse proto `JobRequest.job_id` into a domain request.
 ///
 /// Empty / non-UUID → `malformed_request` (never a silent nil UUID).
-fn parse_job_request(req: kernel_proto::JobRequest) -> Result<DomainJobRequest, Status> {
+/// Returns a domain error; callers map through [`map_domain_err`] so the
+/// parse path never stamps a transport status itself.
+fn parse_job_request(req: kernel_proto::JobRequest) -> Result<DomainJobRequest, KernelError> {
     let raw = req.job_id.trim();
     if raw.is_empty() {
-        return Err(kernel_error_to_status(&KernelError::new(
+        return Err(KernelError::new(
             KernelErrorCode::MalformedRequest,
             "job_id is required",
-        )));
+        ));
     }
     let id = Uuid::parse_str(raw).map_err(|_| {
-        kernel_error_to_status(&KernelError::new(
-            KernelErrorCode::MalformedRequest,
-            "job_id must be a UUID",
-        ))
+        KernelError::new(KernelErrorCode::MalformedRequest, "job_id must be a UUID")
     })?;
     Ok(DomainJobRequest { id: JobId(id) })
 }
@@ -200,7 +199,7 @@ impl Kernel for GrpcKernelService {
     }
 
     async fn get_job(&self, request: Request<JobRequest>) -> Result<Response<Job>, Status> {
-        let req = parse_job_request(request.into_inner())?;
+        let req = parse_job_request(request.into_inner()).map_err(map_domain_err)?;
         let job = self.domain.get_job(req).await.map_err(map_domain_err)?;
         let proto = job_to_proto(&job).map_err(map_domain_err)?;
         Ok(Response::new(proto))
@@ -212,7 +211,7 @@ impl Kernel for GrpcKernelService {
         &self,
         request: Request<JobRequest>,
     ) -> Result<Response<Self::StreamJobStream>, Status> {
-        let req = parse_job_request(request.into_inner())?;
+        let req = parse_job_request(request.into_inner()).map_err(map_domain_err)?;
         let domain_stream = self.domain.stream_job(req).await.map_err(map_domain_err)?;
 
         let stream = async_stream::stream! {
@@ -250,7 +249,7 @@ impl Kernel for GrpcKernelService {
     }
 
     async fn cancel_job(&self, request: Request<JobRequest>) -> Result<Response<Job>, Status> {
-        let req = parse_job_request(request.into_inner())?;
+        let req = parse_job_request(request.into_inner()).map_err(map_domain_err)?;
         // §7.8 CancelJob uses the normative not-yet-published policy.
         let job = self
             .domain
@@ -768,6 +767,7 @@ mod tests {
             Err(s) => s,
         };
         assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "job_id is required");
         assert_eq!(
             status
                 .metadata()
@@ -776,6 +776,68 @@ mod tests {
                 .to_str()
                 .expect("str"),
             "malformed_request"
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get("error-http-status")
+                .expect("http")
+                .to_str()
+                .expect("str"),
+            "400"
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get("error-domain")
+                .expect("domain")
+                .to_str()
+                .expect("str"),
+            crate::transport::error_contract::ERROR_INFO_DOMAIN
+        );
+    }
+
+    #[tokio::test]
+    async fn non_uuid_job_id_is_malformed_request() {
+        let (domain, _scope) = test_domain().await;
+        let svc = grpc_svc(domain);
+        let status = match svc
+            .get_job(Request::new(JobRequest {
+                job_id: "not-a-uuid".to_string(),
+            }))
+            .await
+        {
+            Ok(_) => panic!("non-UUID job_id must not Ok"),
+            Err(s) => s,
+        };
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "job_id must be a UUID");
+        assert_eq!(
+            status
+                .metadata()
+                .get("error-reason")
+                .expect("reason")
+                .to_str()
+                .expect("str"),
+            "malformed_request"
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get("error-http-status")
+                .expect("http")
+                .to_str()
+                .expect("str"),
+            "400"
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get("error-domain")
+                .expect("domain")
+                .to_str()
+                .expect("str"),
+            crate::transport::error_contract::ERROR_INFO_DOMAIN
         );
     }
 }

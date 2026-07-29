@@ -109,6 +109,15 @@ node::router::Capabilities::lnurl
 node::router::Capabilities::multi_asset
 node::router::Capabilities::username_claim
 node::runtime
+node::runtime::RestNodeConfig
+node::runtime::RestNodeConfig::account_node
+node::runtime::RestNodeConfig::addr
+node::runtime::RestNodeConfig::kernel_grpc_addr
+node::runtime::RestNodeConfig::pool
+node::runtime::RestNodeConfig::proofs_dir
+node::runtime::RestNodeConfig::username_store
+node::runtime::RestNodeConfig::v1_engine
+node::runtime::RestNodeConfig::v1_readiness
 node::runtime::V1Readiness
 node::runtime::V1Readiness::finality_ok
 node::runtime::V1Readiness::scan_caught_up

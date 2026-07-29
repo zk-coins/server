@@ -21,7 +21,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use node::account_node;
 use node::db;
 use node::kernel_rpc;
-use node::runtime::{start_rest_node, V1Readiness};
+use node::runtime::{start_rest_node, RestNodeConfig, V1Readiness};
 use node::state::State;
 use node::username;
 use node::v1::{self, ScanStackMode, V1ShadowMode};
@@ -267,16 +267,16 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // `start_rest_node` (StreamJob must see dispatcher phase events).
     // `KERNEL_GRPC_ADDR` was validated at boot — no default host/port.
     tokio::spawn(async move {
-        if let Err(e) = start_rest_node(
+        if let Err(e) = start_rest_node(RestNodeConfig {
             account_node,
             username_store,
-            ACCOUNT_NODE_ADDR,
-            pool_for_rest,
-            &proofs_dir,
+            addr: ACCOUNT_NODE_ADDR.to_string(),
+            pool: pool_for_rest,
+            proofs_dir,
             v1_readiness,
-            v1_engine_for_rest,
+            v1_engine: v1_engine_for_rest,
             kernel_grpc_addr,
-        )
+        })
         .await
         {
             eprintln!("Account node error: {}", e);

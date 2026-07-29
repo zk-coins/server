@@ -26,6 +26,18 @@ pub(crate) enum GrpcStatusCode {
 }
 
 impl GrpcStatusCode {
+    /// Closed set of admissible gRPC status codes, declaration order.
+    pub(crate) const ALL: [GrpcStatusCode; 8] = [
+        Self::InvalidArgument,
+        Self::NotFound,
+        Self::FailedPrecondition,
+        Self::Unauthenticated,
+        Self::PermissionDenied,
+        Self::ResourceExhausted,
+        Self::Unavailable,
+        Self::Internal,
+    ];
+
     /// Stable name matching `tonic::Code` / gRPC status code identifiers.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -171,9 +183,126 @@ pub(crate) fn describe(code: KernelErrorCode) -> ErrorDescriptor {
     }
 }
 
-/// Convenience: reason string equals `KernelErrorCode::reason()`.
-pub(crate) fn reason(code: KernelErrorCode) -> &'static str {
-    describe(code).reason
+/// One row of the normative table as checked by [`validate_table_rows`].
+///
+/// Production rows come from [`describe`] + [`KernelErrorCode::reason`];
+/// tests inject deliberately broken rows into the same checker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableRow {
+    /// Debug label for error messages (code name).
+    pub label: &'static str,
+    /// `describe(code).reason`
+    pub wire_reason: &'static str,
+    /// `code.reason()`
+    pub code_reason: &'static str,
+    pub http_status: u16,
+    pub grpc_code: GrpcStatusCode,
+}
+
+/// Validate a list of table rows. Fails closed: a duplicate reason, an
+/// out-of-range status, or a drift between `describe().reason` and
+/// `KernelErrorCode::reason()` would give every failure of an affected code
+/// the wrong wire contract on **both** transports.
+///
+/// Shared by [`validate_table`] and the effectiveness tests — one checker,
+/// no second copy of the rules.
+pub(crate) fn validate_table_rows(rows: &[TableRow]) -> Result<(), String> {
+    let mut seen_reasons: Vec<&'static str> = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        if row.wire_reason != row.code_reason {
+            return Err(format!(
+                "reason drift for {}: describe()={:?} code.reason()={:?}",
+                row.label, row.wire_reason, row.code_reason
+            ));
+        }
+        if row.wire_reason.is_empty() {
+            return Err(format!("empty reason for {}", row.label));
+        }
+        if let Some(other) = seen_reasons.iter().find(|&&r| r == row.wire_reason) {
+            return Err(format!(
+                "duplicate reason {:?} (seen before, also on {})",
+                other, row.label
+            ));
+        }
+        seen_reasons.push(row.wire_reason);
+
+        if !(400..=599).contains(&row.http_status) {
+            return Err(format!(
+                "http_status out of range for {}: {}",
+                row.label, row.http_status
+            ));
+        }
+        if row.grpc_code.as_str().is_empty() {
+            return Err(format!("empty grpc_code name for {}", row.label));
+        }
+    }
+
+    validate_grpc_status_names()?;
+    Ok(())
+}
+
+/// The eight `GrpcStatusCode` names must be non-empty and pairwise distinct.
+fn validate_grpc_status_names() -> Result<(), String> {
+    let mut seen: Vec<&'static str> = Vec::with_capacity(GrpcStatusCode::ALL.len());
+    for code in GrpcStatusCode::ALL {
+        let name = code.as_str();
+        if name.is_empty() {
+            return Err(format!("empty GrpcStatusCode name for {:?}", code));
+        }
+        if let Some(other) = seen.iter().find(|&&n| n == name) {
+            return Err(format!(
+                "duplicate GrpcStatusCode name {:?} (also on {:?})",
+                other, code
+            ));
+        }
+        seen.push(name);
+    }
+    Ok(())
+}
+
+/// Validate the normative error table. Fails closed: a duplicate reason, an
+/// out-of-range status, or a drift between `describe().reason` and
+/// `KernelErrorCode::reason()` would give every failure of an affected code
+/// the wrong wire contract on **both** transports.
+pub(crate) fn validate_table() -> Result<(), String> {
+    let rows: [TableRow; 21] = KernelErrorCode::ALL.map(|code| {
+        let d = describe(code);
+        TableRow {
+            label: code_label(code),
+            wire_reason: d.reason,
+            code_reason: code.reason(),
+            http_status: d.http_status,
+            grpc_code: d.grpc_code,
+        }
+    });
+    validate_table_rows(&rows)
+}
+
+fn code_label(code: KernelErrorCode) -> &'static str {
+    match code {
+        KernelErrorCode::MalformedRequest => "MalformedRequest",
+        KernelErrorCode::BoundsExceeded => "BoundsExceeded",
+        KernelErrorCode::InvalidInputCoin => "InvalidInputCoin",
+        KernelErrorCode::InsufficientBalance => "InsufficientBalance",
+        KernelErrorCode::UnknownPublisher => "UnknownPublisher",
+        KernelErrorCode::JobNotFound => "JobNotFound",
+        KernelErrorCode::NotFound => "NotFound",
+        KernelErrorCode::WrongPhase => "WrongPhase",
+        KernelErrorCode::StaleMessage => "StaleMessage",
+        KernelErrorCode::InvalidSignature => "InvalidSignature",
+        KernelErrorCode::RetentionHold => "RetentionHold",
+        KernelErrorCode::DependencyNotFinal => "DependencyNotFinal",
+        KernelErrorCode::IdempotencyConflict => "IdempotencyConflict",
+        KernelErrorCode::Unauthorized => "Unauthorized",
+        KernelErrorCode::ChallengeExpired => "ChallengeExpired",
+        KernelErrorCode::SessionExpired => "SessionExpired",
+        KernelErrorCode::ScopeExceeded => "ScopeExceeded",
+        KernelErrorCode::RateLimited => "RateLimited",
+        KernelErrorCode::PayloadTooLarge => "PayloadTooLarge",
+        KernelErrorCode::CircuitDigestMismatch => "CircuitDigestMismatch",
+        KernelErrorCode::InternalError => "InternalError",
+    }
 }
 
 #[cfg(test)]
@@ -181,36 +310,9 @@ mod tests {
     use super::*;
     use crate::kernel::error::KernelErrorCode;
 
-    /// Every code once — pins the full Entwurf / §7.8 table.
-    fn all_codes() -> [KernelErrorCode; 21] {
-        [
-            KernelErrorCode::MalformedRequest,
-            KernelErrorCode::BoundsExceeded,
-            KernelErrorCode::InvalidInputCoin,
-            KernelErrorCode::InsufficientBalance,
-            KernelErrorCode::UnknownPublisher,
-            KernelErrorCode::JobNotFound,
-            KernelErrorCode::NotFound,
-            KernelErrorCode::WrongPhase,
-            KernelErrorCode::StaleMessage,
-            KernelErrorCode::InvalidSignature,
-            KernelErrorCode::RetentionHold,
-            KernelErrorCode::DependencyNotFinal,
-            KernelErrorCode::IdempotencyConflict,
-            KernelErrorCode::Unauthorized,
-            KernelErrorCode::ChallengeExpired,
-            KernelErrorCode::SessionExpired,
-            KernelErrorCode::ScopeExceeded,
-            KernelErrorCode::RateLimited,
-            KernelErrorCode::PayloadTooLarge,
-            KernelErrorCode::CircuitDigestMismatch,
-            KernelErrorCode::InternalError,
-        ]
-    }
-
     #[test]
     fn mapping_is_total_and_reason_matches_code() {
-        for code in all_codes() {
+        for code in KernelErrorCode::ALL {
             let d = describe(code);
             assert_eq!(d.reason, code.reason());
             assert!(
@@ -220,6 +322,90 @@ mod tests {
                 d.http_status
             );
         }
+    }
+
+    #[test]
+    fn validate_table_accepts_current_mapping() {
+        match validate_table() {
+            Ok(()) => {}
+            Err(e) => panic!("validate_table must accept current mapping, got: {e}"),
+        }
+    }
+
+    #[test]
+    fn validate_table_rows_rejects_reason_drift() {
+        let rows = [TableRow {
+            label: "MalformedRequest",
+            wire_reason: "malformed_request",
+            code_reason: "not_the_same",
+            http_status: 400,
+            grpc_code: GrpcStatusCode::InvalidArgument,
+        }];
+        let err = match validate_table_rows(&rows) {
+            Ok(()) => panic!("expected Err on reason drift"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("reason drift") && err.contains("MalformedRequest"),
+            "error must name the cause and code, got: {err}"
+        );
+        assert!(
+            err.contains("malformed_request") && err.contains("not_the_same"),
+            "error must name both reasons, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_table_rows_rejects_duplicate_reason() {
+        let rows = [
+            TableRow {
+                label: "MalformedRequest",
+                wire_reason: "malformed_request",
+                code_reason: "malformed_request",
+                http_status: 400,
+                grpc_code: GrpcStatusCode::InvalidArgument,
+            },
+            TableRow {
+                label: "BoundsExceeded",
+                wire_reason: "malformed_request",
+                code_reason: "malformed_request",
+                http_status: 400,
+                grpc_code: GrpcStatusCode::InvalidArgument,
+            },
+        ];
+        let err = match validate_table_rows(&rows) {
+            Ok(()) => panic!("expected Err on duplicate reason"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("duplicate reason") && err.contains("malformed_request"),
+            "error must name the duplicate reason, got: {err}"
+        );
+        assert!(
+            err.contains("BoundsExceeded"),
+            "error must name the second code, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_table_rows_rejects_http_status_out_of_range() {
+        let rows = [TableRow {
+            label: "InternalError",
+            wire_reason: "internal_error",
+            code_reason: "internal_error",
+            http_status: 200,
+            grpc_code: GrpcStatusCode::Internal,
+        }];
+        let err = match validate_table_rows(&rows) {
+            Ok(()) => panic!("expected Err on out-of-range http_status"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("http_status out of range")
+                && err.contains("InternalError")
+                && err.contains("200"),
+            "error must name range failure, code, and status, got: {err}"
+        );
     }
 
     #[test]
@@ -324,7 +510,7 @@ mod tests {
     /// N-28: same triple is deterministic across repeated describe() calls.
     #[test]
     fn n28_mapping_is_byte_identical_across_calls() {
-        for code in all_codes() {
+        for code in KernelErrorCode::ALL {
             let a = describe(code);
             let b = describe(code);
             assert_eq!(a, b);

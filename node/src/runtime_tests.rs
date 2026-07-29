@@ -26,7 +26,7 @@
 //! shape; once a third bootstrap test lands the duplicated setup is
 //! worth extracting into a helper.
 
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::account_node::AccountNode;
@@ -141,16 +141,16 @@ async fn start_rest_node_binds_and_serves_health() {
     drop(grpc_probe);
 
     let handle = tokio::spawn(async move {
-        start_rest_node(
+        start_rest_node(crate::runtime::RestNodeConfig {
             account_node,
             username_store,
-            &addr,
+            addr,
             pool,
-            &proofs_dir,
-            crate::runtime::V1Readiness::default(),
-            None,
+            proofs_dir,
+            v1_readiness: crate::runtime::V1Readiness::default(),
+            v1_engine: None,
             kernel_grpc_addr,
-        )
+        })
         .await
     });
 
@@ -224,12 +224,21 @@ async fn start_rest_node_binds_and_serves_health() {
 // guarded against can no longer arise, so the test that exercised the
 // `CRITICAL: minting state desync` Err arm is gone too.
 
-static V1_STACK_TEST_LOCK: Mutex<()> = Mutex::new(());
+static V1_STACK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn lock_v1_stack_for_test() -> MutexGuard<'static, ()> {
-    V1_STACK_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Acquire the process-global stack-mode serialisation lock.
+///
+/// Held across `.await` points on purpose: these tests touch shared
+/// process state (`PROCESS_STACK_MODE` / the shared container) and
+/// must not interleave. `tokio::sync::Mutex` is the correct tool for
+/// that (unlike `std::sync::MutexGuard`, which is thread-bound).
+///
+/// `tokio::sync::Mutex` has no poison flag — a panicking holder does
+/// not permanently lock out later tests. That resilience used to be
+/// expressed via `unwrap_or_else(|poisoned| poisoned.into_inner())` on
+/// `std::sync::Mutex`; do not reintroduce a poison recovery path.
+async fn lock_v1_stack_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+    V1_STACK_TEST_LOCK.lock().await
 }
 
 /// Defect 2 (P0): pure decision table — boot action by release result + phase.
@@ -343,7 +352,7 @@ async fn plant_edge_job_with_claim(
 /// not strand it by pretending a still-owned claim is free, nor skip free work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn immediate_restart_drives_abandoned_edge_job_forward() {
-    let _guard = lock_v1_stack_for_test();
+    let _guard = lock_v1_stack_for_test().await;
     set_process_stack_mode(ScanStackMode::V1);
 
     let scope = setup_pool().await;
@@ -406,7 +415,7 @@ async fn immediate_restart_drives_abandoned_edge_job_forward() {
 /// lease expires the deferred reclaim drives the edge job forward.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_claim_not_enqueued_then_deferred_reclaim_after_expiry() {
-    let _guard = lock_v1_stack_for_test();
+    let _guard = lock_v1_stack_for_test().await;
     set_process_stack_mode(ScanStackMode::V1);
 
     let scope = setup_pool().await;
@@ -525,7 +534,7 @@ fn boot_db_error_disposition_leaves_row_untouched_for_retry() {
 /// ownership.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn free_phase_edge_job_enqueued_despite_release_false() {
-    let _guard = lock_v1_stack_for_test();
+    let _guard = lock_v1_stack_for_test().await;
     set_process_stack_mode(ScanStackMode::V1);
 
     let scope = setup_pool().await;
@@ -583,7 +592,7 @@ async fn free_phase_edge_job_enqueued_despite_release_false() {
 async fn boot_resume_cannot_fail_job_claimed_since_snapshot() {
     use std::time::Duration as StdDuration;
 
-    let _guard = lock_v1_stack_for_test();
+    let _guard = lock_v1_stack_for_test().await;
     set_process_stack_mode(ScanStackMode::V1);
 
     let scope = setup_pool().await;

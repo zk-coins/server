@@ -80,6 +80,10 @@ impl NormativeJobStatus {
     /// Status aliases live **only** here:
     /// - `queued` → `Accepted`
     /// - `broadcasting` → `Publishing`
+    ///
+    /// SSE and poll both project through this mapping (via
+    /// [`Job::normative_status`] / [`Self::as_v1_str`]), so the two
+    /// transports cannot drift on alias expansion.
     pub(crate) fn from_store(status: job_store::JobStatus) -> Self {
         match status {
             job_store::JobStatus::Queued => Self::Accepted,

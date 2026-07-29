@@ -40,7 +40,7 @@ use crate::job_dispatcher::{JobEnvelope, JobNotifyMap, JobPhaseEvent};
 use crate::job_store::{CreateResult, JobKind, JobStatus, JobStore};
 use crate::kernel::{
     CancelPolicy, JobEvent, JobEventHub, JobId, JobRequest, JobState, KernelError, KernelErrorCode,
-    KernelService, NormativeJobStatus,
+    KernelService,
 };
 use crate::publisher::EsploraConfig;
 use crate::transport::error_contract;
@@ -2040,15 +2040,6 @@ pub(crate) async fn jobs_sign_handler(
         })),
     )
         .into_response()
-}
-
-/// Map legacy job-store status to the §7.5 closed status set.
-///
-/// Aliases (`queued`→`accepted`, `broadcasting`→`publishing`) live only in
-/// [`NormativeJobStatus::from_store`] — this helper delegates there so SSE
-/// and poll cannot drift.
-fn v1_status_wire(status: JobStatus) -> &'static str {
-    NormativeJobStatus::from_store(status).as_v1_str()
 }
 
 /// `progress` as a float in `[0, 1]` (§7.5). The store keeps 0–100.
