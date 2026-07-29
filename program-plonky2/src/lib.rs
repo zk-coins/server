@@ -26,12 +26,14 @@ pub type C = PoseidonGoldilocksConfig;
 /// `standard_recursion_config`.
 pub const D: usize = 2;
 
-#[allow(clippy::chunks_exact_to_as_chunks, clippy::needless_range_loop)]
+// `clippy::chunks_exact_to_as_chunks` does not exist on the pinned
+// nightly-2026-06-18; allowing an unknown lint fails under `-D warnings`.
+// Keep only lints that this toolchain knows.
+#[allow(clippy::needless_range_loop)]
 pub mod circuit;
 pub mod hash;
 pub mod inputs;
 pub mod merkle;
-#[allow(clippy::chunks_exact_to_as_chunks)]
 pub mod types;
 pub mod u32_lib;
 

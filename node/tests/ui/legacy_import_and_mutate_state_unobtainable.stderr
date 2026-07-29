@@ -140,8 +140,8 @@ error[E0624]: method `import_account` is private
    |
   ::: src/account_node.rs
    |
-   |         pub(crate) fn import_account(&mut self, address: HashDigest, account: Account) {
-   |         ------------------------------------------------------------------------------ private method defined here
+   |     pub(crate) fn import_account(&mut self, address: HashDigest, account: Account) {
+   |     ------------------------------------------------------------------------------ private method defined here
 
 error[E0624]: method `state` is private
   --> tests/ui/legacy_import_and_mutate_state_unobtainable.rs:13:46

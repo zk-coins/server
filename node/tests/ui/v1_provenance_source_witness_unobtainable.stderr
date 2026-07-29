@@ -1,15 +1,3 @@
-error[E0603]: function `begin_v1_send` is private
-  --> tests/ui/v1_provenance_source_witness_unobtainable.rs:15:27
-   |
-15 |         let _ = node::v1::begin_v1_send(engine, req, sources);
-   |                           ^^^^^^^^^^^^^ private function
-   |
-note: the function `begin_v1_send` is defined here
-  --> src/v1/mod.rs
-   |
-   |     assert_receive_provenance_is_creating_proof, begin_v1_send, ensure_v1_provenance_path,
-   |                                                  ^^^^^^^^^^^^^
-
 error[E0061]: this function takes 2 arguments but 3 arguments were supplied
   --> tests/ui/v1_provenance_source_witness_unobtainable.rs:15:17
    |
@@ -19,8 +7,8 @@ error[E0061]: this function takes 2 arguments but 3 arguments were supplied
 note: function defined here
   --> src/v1/provenance.rs
    |
-   | pub(crate) fn begin_v1_send(engine: &StateEngine, req: SendRequest) -> Result<PendingTransition> {
-   |               ^^^^^^^^^^^^^
+   | pub fn begin_v1_send(engine: &StateEngine, req: SendRequest) -> Result<PendingTransition> {
+   |        ^^^^^^^^^^^^^
 help: remove the extra argument
    |
 15 -         let _ = node::v1::begin_v1_send(engine, req, sources);

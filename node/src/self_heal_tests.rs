@@ -24,11 +24,9 @@
 //! module's logic needs to cover.
 
 use super::*;
-use crate::v1::{
-    claim_stack_scan_mode, set_process_stack_mode, ScanStackMode,
-};
 use crate::account_node::CanaryOutcome;
 use crate::test_db::setup_pool;
+use crate::v1::{claim_stack_scan_mode, set_process_stack_mode, ScanStackMode};
 
 // ----------------------------------------------------------------------
 // reset_decision — pure, every match arm
@@ -155,6 +153,11 @@ fn reset_proof_store_dir_propagates_non_notfound_error() {
 /// Seed one account + an SMT/MMR snapshot so the Reset path has
 /// something to actually wipe.
 async fn seed_proof_dependent_state(pool: &sqlx::PgPool) {
+    // Stage 3 stack separation: exclusive claim before any write to
+    // legacy scan/account tables (fail-closed, no claim-from-write).
+    claim_stack_scan_mode(pool, ScanStackMode::Legacy)
+        .await
+        .expect("claim legacy for self_heal seed");
     // `accounts.address` stores the 64-byte `owner ‖ asset_id` composite
     // key since migration 0017 (`accounts_address_length` CHECK = 64);
     // the synthetic blob does not need to decode, but the key must be a
@@ -167,9 +170,6 @@ async fn seed_proof_dependent_state(pool: &sqlx::PgPool) {
         .expect("seed account");
     let prev_root = zkcoins_program::hash::digest_from_bytes(&[0x10u8; 32]);
     let smt_root = zkcoins_program::hash::digest_from_bytes(&[0x20u8; 32]);
-    claim_stack_scan_mode(pool, ScanStackMode::Legacy)
-        .await
-        .expect("claim legacy for self_heal seed");
     db::persist_state_tx(
         pool,
         b"smt-blob",
@@ -348,12 +348,21 @@ async fn heal_reset_under_v1_wipes_v1_state_preserves_unused_legacy_structures()
         .expect("claim v1");
     set_process_stack_mode(ScanStackMode::V1);
 
+    // Bypass stack writers: under a v1 claim `db::upsert_account` refuses
+    // legacy `accounts` writes (Stage 3 stack separation). Seed the leftover
+    // legacy row with raw SQL so the wipe still has something to drop.
     let owner = zkcoins_program::hash::digest_from_bytes(&[7u8; 32]);
     let asset_id = zkcoins_program::hash::digest_from_bytes(&[8u8; 32]);
     let key = crate::account_node::account_key_bytes(&owner, &asset_id);
-    db::upsert_account(&pool, &key, b"stale-v1-account-blob")
-        .await
-        .expect("seed account under v1");
+    sqlx::query(
+        "INSERT INTO accounts (address, data, updated_at) VALUES ($1, $2, NOW()) \
+         ON CONFLICT (address) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()",
+    )
+    .bind(key.as_slice())
+    .bind(b"stale-v1-account-blob".as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed leftover legacy account under v1 via raw SQL");
     // Seed minimal v1 engine meta + one nflog row so the wipe has rows to drop.
     sqlx::query(
         "INSERT INTO v1_engine_meta \
@@ -622,7 +631,6 @@ async fn heal_v1_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
         crate::job_store::JobStatus::Completed,
         "job must not report completed for wiped work"
     );
-
 }
 
 /// Defect 2: pre-reset worker cannot resurrect a job after the v1.1 reset.
@@ -733,8 +741,10 @@ async fn heal_v1_reset_fences_pre_loaded_job_resurrection() {
         crate::job_store::JobStatus::Failed,
         "complete must not succeed for a pre-reset generation"
     );
-    assert_ne!(after_complete.status, crate::job_store::JobStatus::Completed);
-
+    assert_ne!(
+        after_complete.status,
+        crate::job_store::JobStatus::Completed
+    );
 }
 
 /// Defect 2: a job stamped with a stale generation after the reset cannot
@@ -827,7 +837,6 @@ async fn heal_v1_reset_fences_stale_generation_admit() {
     assert!(advanced_ok, "live-generation set_status must update 1 row");
     let advanced = store.load(fresh_job.public_id).await.unwrap().unwrap();
     assert_eq!(advanced.status, crate::job_store::JobStatus::Proving);
-
 }
 
 /// Defect 3: legacy reset must fence jobs the same way (generation bump +
@@ -865,7 +874,9 @@ async fn heal_legacy_reset_fences_pre_loaded_job_resurrection() {
     let job_id = job.public_id;
     let gen_before = job.reset_generation;
 
-    db::store_circuit_digest(&pool, b"OLD-LEGACY").await.unwrap();
+    db::store_circuit_digest(&pool, b"OLD-LEGACY")
+        .await
+        .unwrap();
     let decision = heal_circuit_digest(&pool, b"NEW-LEGACY", proofs_dir, &canary_must_not_run)
         .await
         .expect("heal ok");
@@ -890,7 +901,10 @@ async fn heal_legacy_reset_fences_pre_loaded_job_resurrection() {
         .set_status(job_id, crate::job_store::JobStatus::Proving, "proving")
         .await
         .expect("set_status query ok");
-    assert!(!resurrected, "legacy pre-reset set_status must report 0 rows");
+    assert!(
+        !resurrected,
+        "legacy pre-reset set_status must report 0 rows"
+    );
     let completed = store
         .complete(job_id, serde_json::json!({"legacy_stolen": true}), 200)
         .await
@@ -902,7 +916,6 @@ async fn heal_legacy_reset_fences_pre_loaded_job_resurrection() {
         crate::job_store::JobStatus::Failed,
         "legacy pre-reset worker must not complete after generation bump"
     );
-
 }
 
 /// Defect 1: admit and reset are mutually exclusive via a row lock on
@@ -946,7 +959,8 @@ async fn heal_admit_blocks_until_open_generation_bump_commits() {
     // under the old generation. Give it a short window; it should still be
     // pending when we poll with a timeout.
     tokio::pin!(create_fut);
-    let blocked = tokio::time::timeout(std::time::Duration::from_millis(200), &mut create_fut).await;
+    let blocked =
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut create_fut).await;
     assert!(
         blocked.is_err(),
         "create must block on self_heal_reset_meta while reset holds the row lock"
@@ -963,7 +977,6 @@ async fn heal_admit_blocks_until_open_generation_bump_commits() {
         job.reset_generation, bumped,
         "admit after open bump must stamp the post-bump generation, never the pre-bump snapshot"
     );
-
 }
 
 /// Defect 1 (advancing writers): `set_status` takes the same meta-row lock as
@@ -1021,10 +1034,13 @@ async fn heal_set_status_blocks_until_open_generation_bump_commits() {
     .await
     .expect("fail job in open reset");
 
-    let set_fut = store.set_status(job_id, crate::job_store::JobStatus::Broadcasting, "broadcasting");
+    let set_fut = store.set_status(
+        job_id,
+        crate::job_store::JobStatus::Broadcasting,
+        "broadcasting",
+    );
     tokio::pin!(set_fut);
-    let blocked =
-        tokio::time::timeout(std::time::Duration::from_millis(200), &mut set_fut).await;
+    let blocked = tokio::time::timeout(std::time::Duration::from_millis(200), &mut set_fut).await;
     assert!(
         blocked.is_err(),
         "set_status must block on self_heal_reset_meta while reset holds the row lock"
@@ -1043,7 +1059,6 @@ async fn heal_set_status_blocks_until_open_generation_bump_commits() {
         "advancing write must not resurrect a job failed by the concurrent reset"
     );
     assert_eq!(row.reset_generation, gen_before);
-
 }
 
 /// Zero-row `complete` is reported (`false`) so callers refuse completed
@@ -1079,7 +1094,11 @@ async fn heal_complete_reports_zero_rows_and_no_completed_event() {
     // Advance to a non-terminal status so a bug that ignored the generation
     // fence would actually flip the row to completed.
     assert!(store
-        .set_status(job_id, crate::job_store::JobStatus::Broadcasting, "broadcasting")
+        .set_status(
+            job_id,
+            crate::job_store::JobStatus::Broadcasting,
+            "broadcasting"
+        )
         .await
         .expect("set broadcasting"));
 
@@ -1133,7 +1152,6 @@ async fn heal_complete_reports_zero_rows_and_no_completed_event() {
         "zero-row complete must leave the durable row untouched"
     );
     assert_ne!(row.status, crate::job_store::JobStatus::Completed);
-
 }
 
 /// Zero-row `set_status` is reported (`false`) so callers can refuse side
@@ -1180,14 +1198,16 @@ async fn heal_set_status_reports_zero_rows_on_generation_fence() {
         )
         .await
         .expect("query ok");
-    assert!(!applied, "generation fence must yield Ok(false), not silent Ok");
+    assert!(
+        !applied,
+        "generation fence must yield Ok(false), not silent Ok"
+    );
     let row = store.load(job.public_id).await.unwrap().unwrap();
     assert_eq!(
         row.status,
         crate::job_store::JobStatus::Queued,
         "zero-row set_status must leave the row untouched"
     );
-
 }
 
 /// Flag-off path: process not claimed v1 → full legacy wipe on mismatch.
@@ -1206,7 +1226,9 @@ async fn heal_flag_off_self_heal_still_full_legacy_wipe() {
     set_process_stack_mode(ScanStackMode::Legacy);
 
     seed_proof_dependent_state(&pool).await;
-    db::store_circuit_digest(&pool, b"OLD-LEGACY").await.unwrap();
+    db::store_circuit_digest(&pool, b"OLD-LEGACY")
+        .await
+        .unwrap();
 
     let decision = heal_circuit_digest(&pool, b"NEW-LEGACY", proofs_dir, &canary_must_not_run)
         .await

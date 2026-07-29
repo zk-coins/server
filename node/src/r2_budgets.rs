@@ -333,7 +333,6 @@ pub fn budgets_for_mode(mode: ProverMode) -> Result<R2BudgetSet, BudgetUnavailab
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,8 +359,7 @@ mod tests {
         let err = derive_budget_from_samples(&[1_000], 25, "warm_prove_ms", ProverMode::V1)
             .expect_err("single sample must refuse");
         assert!(
-            err.detail.contains("single sample is not a budget")
-                || err.detail.contains("at least"),
+            err.detail.contains("single sample is not a budget") || err.detail.contains("at least"),
             "unexpected detail: {}",
             err.detail
         );
@@ -430,7 +428,10 @@ mod tests {
     #[test]
     fn resolve_mode_cli_legacy_refused() {
         let err = resolve_prover_mode(Some("legacy"), None).expect_err("legacy deleted");
-        assert!(err.contains("deleted") || err.contains("legacy"), "got: {err}");
+        assert!(
+            err.contains("deleted") || err.contains("legacy"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -444,10 +445,7 @@ mod tests {
     #[test]
     fn resolve_mode_default_is_v1() {
         assert_eq!(resolve_prover_mode(None, None).unwrap(), ProverMode::V1);
-        assert_eq!(
-            resolve_prover_mode(None, Some("")).unwrap(),
-            ProverMode::V1
-        );
+        assert_eq!(resolve_prover_mode(None, Some("")).unwrap(), ProverMode::V1);
         assert_eq!(
             resolve_prover_mode(None, Some("off")).unwrap(),
             ProverMode::V1
@@ -458,7 +456,13 @@ mod tests {
     fn resolve_mode_unknown_shadow_fails_loud() {
         let err = resolve_prover_mode(None, Some("true")).expect_err("true must fail");
         assert!(err.contains("not supported"));
-        assert!(err.contains("false-red") || err.contains("fall back"));
+        // Stage 3: legacy prover mode deleted — message names the allowed
+        // values and refuses silent cross-mode budget selection (no
+        // "fall back" / "false-red" wording anymore).
+        assert!(
+            err.contains("Refusing") || err.contains("legacy mode deleted"),
+            "error must refuse loud; got {err}"
+        );
     }
 
     #[test]

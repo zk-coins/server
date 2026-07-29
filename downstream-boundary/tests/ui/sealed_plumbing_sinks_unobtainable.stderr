@@ -197,11 +197,8 @@ error[E0603]: function `persist_engine_snapshot` is private
 note: the function `persist_engine_snapshot` is defined here
   --> $WORKSPACE/node/src/v1/db_v1.rs
    |
-   | / pub(crate) async fn persist_engine_snapshot(
-   | |     pool: &PgPool,
-   | |     snap: &EngineSnapshot,
-   | | ) -> Result<()> {
-   | |_______________^
+   | pub(crate) async fn persist_engine_snapshot(pool: &PgPool, snap: &EngineSnapshot) -> Result<()> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 error[E0603]: function `persist_engine_with_pending_members_ready` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:41:30
@@ -425,16 +422,13 @@ help: import `BatchMember` directly
 error[E0624]: method `with_engine_mut` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:47:38
    |
-47 |       let _ = node::v1::EngineAdapter::with_engine_mut;
-   |                                        ^^^^^^^^^^^^^^^ private method
+47 |     let _ = node::v1::EngineAdapter::with_engine_mut;
+   |                                      ^^^^^^^^^^^^^^^ private method
    |
   ::: $WORKSPACE/node/src/v1/adapter.rs
    |
-   | /     pub(crate) fn with_engine_mut<R>(
-   | |         &self,
-   | |         f: impl FnOnce(&mut StateEngine) -> R,
-   | |     ) -> Result<R> {
-   | |__________________- private method defined here
+   |     pub(crate) fn with_engine_mut<R>(&self, f: impl FnOnce(&mut StateEngine) -> R) -> Result<R> {
+   |     ------------------------------------------------------------------------------------------- private method defined here
 
 error[E0624]: method `restore_live` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:48:38
@@ -525,16 +519,13 @@ error[E0599]: no method named `prepare` found for struct `V1Publisher` in the cu
 error[E0624]: method `broadcast_commit` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:75:23
    |
-75 |       let _ = publisher.broadcast_commit(loop {});
-   |                         ^^^^^^^^^^^^^^^^ private method
+75 |     let _ = publisher.broadcast_commit(loop {});
+   |                       ^^^^^^^^^^^^^^^^ private method
    |
   ::: $WORKSPACE/node/src/v1/publish.rs
    |
-   | /     pub(crate) fn broadcast_commit(
-   | |         &self,
-   | |         prepared: &PreparedBatch,
-   | |     ) -> Result<bitcoin::Txid> {
-   | |______________________________- private method defined here
+   |     pub(crate) fn broadcast_commit(&self, prepared: &PreparedBatch) -> Result<bitcoin::Txid> {
+   |     ---------------------------------------------------------------------------------------- private method defined here
 
 warning: unreachable call
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:75:23
@@ -547,16 +538,13 @@ warning: unreachable call
 error[E0624]: method `broadcast_reveal` is private
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:76:23
    |
-76 |       let _ = publisher.broadcast_reveal(loop {});
-   |                         ^^^^^^^^^^^^^^^^ private method
+76 |     let _ = publisher.broadcast_reveal(loop {});
+   |                       ^^^^^^^^^^^^^^^^ private method
    |
   ::: $WORKSPACE/node/src/v1/publish.rs
    |
-   | /     pub(crate) fn broadcast_reveal(
-   | |         &self,
-   | |         prepared: &PreparedBatch,
-   | |     ) -> Result<bitcoin::Txid> {
-   | |______________________________- private method defined here
+   |     pub(crate) fn broadcast_reveal(&self, prepared: &PreparedBatch) -> Result<bitcoin::Txid> {
+   |     ---------------------------------------------------------------------------------------- private method defined here
 
 warning: unreachable call
   --> tests/ui/sealed_plumbing_sinks_unobtainable.rs:76:23

@@ -128,20 +128,19 @@ fn spec_registers_critical_schemas() {
         "`SendCoinResponse` must be registered under components.schemas"
     );
 
-    // `HistoryResponse` / `HistoryItem` describe the `/api/history`
-    // page contract (issue #153). The wallet's transaction list reads
-    // this shape directly; a missing schema here means a wallet build
-    // would have no compile-time check against drift.
-    for name in [
-        "HistoryResponse",
-        "HistoryItem",
-        "HistoryErrorResponse",
-        "TxDetail",
-    ] {
+    // Stage 3 Runde 6 closed unauthenticated `/api/history` (410 Gone).
+    // Only the error envelope remains in the OpenAPI schema — list/detail
+    // success bodies (`HistoryResponse` / `HistoryItem` / `TxDetail`) are
+    // gone with the handlers.
+    assert!(
+        schemas.contains_key("HistoryErrorResponse"),
+        "`HistoryErrorResponse` must be registered under components.schemas — \
+         closed `/api/history` still documents its 410 body"
+    );
+    for gone in ["HistoryResponse", "HistoryItem", "TxDetail"] {
         assert!(
-            schemas.contains_key(name),
-            "`{name}` must be registered under components.schemas — \
-             `/api/history` clients depend on it"
+            !schemas.contains_key(gone),
+            "`{gone}` must NOT remain registered after Stage 3 closed history"
         );
     }
 
