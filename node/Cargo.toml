@@ -204,6 +204,23 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 # rather than through a transitive path that could shift on `cargo
 # update`.
 async-stream = "0.3"
+# Generated `kernel.v1` types + service traits (proto only; no business logic).
+kernel-proto = { path = "../kernel-proto" }
+# gRPC server runtime for `kernel_rpc`. Version locked to the same line as
+# `kernel-proto` (tonic 0.13 / prost 0.13) so the generated stubs link.
+# Feature list is the tonic 0.13.1 `default` set, written out so a later
+# upstream default expansion cannot silently re-introduce extras:
+#   transport → server + channel (`Server::builder` / `.serve`)
+#   router    → `Server::add_service` (gated `#[cfg(feature = "router")]`)
+#   codegen   → `async_trait` re-export for `#[tonic::async_trait]`
+#   prost     → protobuf codec for generated stubs
+# `server` is NOT listed: it is implied by `transport`.
+tonic = { version = "0.13.1", default-features = false, features = [
+    "codegen",
+    "prost",
+    "transport",
+    "router",
+] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

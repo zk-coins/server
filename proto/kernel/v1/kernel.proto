@@ -1,0 +1,286 @@
+// kernel.v1 — normative kernel RPC contract extracted from
+// docs/specification.md §7.8 (tag spec-v1.2, package kernel.v1).
+// Source of truth: the ```proto block under
+// "kernel.v1 message contract (normative)". Do not invent fields.
+// Fixed-width bytes (32B digests, 64B signatures) are checked in the
+// implementation; proto3 has no fixed-length type. Closed string
+// value sets stay as strings here (as in the normative block), not
+// as enums. google.rpc.Status / google.rpc.ErrorInfo are used for
+// errors and are not re-declared in this file.
+//
+// Unbounded scope sentinels (§5.1 / §5.2 / §7.5 / Scope below):
+//   asset_ids = "*"  ⇔  Scope.all_assets = true (asset_ids empty)
+//   not_before = 0                 — no lower bound
+//   not_after  = 9223372036854775807 (2⁶³−1) — no upper bound
+// Proto3 scalar zero defaults resolve to the same pair; do not
+// introduce `optional` on not_before/not_after to invent a second
+// "unbounded" encoding.
+
+syntax = "proto3";
+package kernel.v1;
+
+service Kernel {
+  rpc GetInfo(GetInfoRequest) returns (Info);
+  rpc GetAccumulator(GetAccumulatorRequest) returns (AccumulatorTip);
+  rpc ListInscriptions(ListInscriptionsRequest) returns (stream Inscription);
+  rpc GetNullifierPath(NullifierPathRequest) returns (NullifierPath);
+  rpc SubmitTransition(TransitionRequest) returns (JobHandle);
+  rpc GetJob(JobRequest) returns (Job);
+  rpc StreamJob(JobRequest) returns (stream JobEvent);
+  rpc SignTransition(SignRequest) returns (Job);
+  rpc CancelJob(JobRequest) returns (Job);
+  rpc OpenPullChallenge(PullChallengeRequest) returns (Challenge);
+  rpc Pull(PullRequest) returns (PullResult);
+  rpc GetRecord(RecordRequest) returns (RecordBlob);
+  rpc GetCoinProof(CoinProofRequest) returns (CoinProofBlob);
+  rpc GetAccountState(AccountStateRequest) returns (AccountStateResult);
+  rpc SubscribeReceipts(SubscribeReceiptsRequest) returns (stream Receipt);
+  rpc Publish(PublishRequest) returns (PublishResult);
+  rpc EntrustOperationalBundle(EntrustRequest) returns (EntrustResult);
+  rpc RevokeOperationalBundle(RevokeRequest) returns (RevokeResult);
+  rpc AttestBalance(AttestRequest) returns (JobHandle);
+  rpc IssueViewGrant(GrantRequest) returns (GrantResult);
+}
+
+message GetInfoRequest {}
+message Info {
+  string network = 1;                      // exactly one of "mainnet" | "testnet" | "regtest" — 1:1 to the §2.2 tags
+                                           //   (Bitcoin network is pinned 1:1 to this tag; no separate bitcoin_network field)
+  reserved 2;                              // was bitcoin_network; removed (v1: bitcoin_network == network always)
+  string protocol_version = 3;             // "v1"
+  map<string, bytes> circuit_digests = 4;  // {"C": 32B, "C_balance": 32B} (§1.7.9)
+  string relay_url = 5;
+  string blossom_url = 6;
+  uint32 finality_confirmations = 7;       // 6 (§3.9)
+  uint32 max_tx_inputs = 8;                // §2.5 bounds
+  uint32 max_tx_outputs = 9;
+  uint32 max_rx_coins = 10;
+  uint32 max_account_assets = 11;
+  bool ready = 12;                         // backs /health/ready
+  uint64 bitcoin_tip_height = 13;
+  bytes accumulator_root = 14; // = nav_root (§3.7)
+  uint64 scanner_lag = 15;
+  uint64 max_blob_bytes = 16;              // §7.4 Blossom advertised size limit
+  uint64 activation_height = 17;           // pinned per-network scan origin (§3.6)
+  BootstrapManifest bootstrap = 18;        // §4.3 global infrastructure only
+  repeated string kernel_parts = 19;       // which kernel parts this kernel runs: each ∈
+                                           //   {"scanner","prover","publisher"}. NOT the §7.5 /v1/info
+                                           //   `features` array — that is API-layer configuration the API
+                                           //   owns and constructs itself, and the kernel cannot know it.
+  optional string ready_reason = 20;       // set iff ready == false; closed set (§7.5 /health/ready):
+                                           //   "syncing" | "scanner_lag" | "circuit_mismatch" | "deep_reorg"
+                                           //   | "dependency_unavailable"
+  bytes bootstrap_pubkey = 21;             // 32B x-only; pinned network-parameter trust anchor for BootstrapManifest (§3.6, §4.3)
+}
+message BootstrapManifest {
+  string network = 1;
+  string protocol_version = 2;             // "v1"
+  repeated string seed_relays = 3;
+  repeated string blob_stores = 4;
+  repeated bytes operator_ids = 5;         // 32B x-only each
+  uint64 issued_at = 6;
+  uint64 expires_at = 7;
+  bytes manifest_sig = 8;                  // 64B BIP-340
+}
+
+message GetAccumulatorRequest {}
+message AccumulatorTip { bytes root = 1; bytes tip_block_hash = 2; uint64 tip_height = 3; uint64 size = 4; } // root = nav_root = Hc("NfLog/Root", size ‖ mth) (§3.7)
+
+message ListInscriptionsRequest {
+  // Defaults (API-normalised before RPC when the REST query omits them, §7.5): from_height = 0,
+  //   from_tx_index = 0, from_vin_index = 0, limit = 100. Valid limit ∈ 1..1000; 0 or >1000 →
+  //   INVALID_ARGUMENT / HTTP 400 bounds_exceeded.
+  // Proto3: optional so absence is distinguishable from zero; a caller that sets limit = 0 is rejected.
+  // Inclusive lexicographic lower bound on (height, tx_index, vin_index); REST response carries
+  //   next_height + next_tx_index + next_vin_index as the exclusive triple-cursor (§7.5) — all three
+  //   together or all three absent. The kernel stream itself yields Inscription messages in stable
+  //   (height, tx_index, vin_index) sort order (then §3.6 payload-member order inside one inscription).
+  optional uint64 from_height = 1;
+  optional uint32 limit = 2;
+  optional uint64 from_tx_index = 3;
+  optional uint64 from_vin_index = 4;
+}
+message Nullifier {
+  bytes pubkey = 1;                        // Pkⱼ, §3.1
+  bytes r = 2;                             // Rⱼ, §3.1
+  string state = 3;                        // §3.10 per-member: "completed" | "pending" | "failed"
+}
+message Inscription {
+  bytes txid = 1;                          // internal byte order (§1.7.7)
+  uint64 height = 2;
+  uint32 count = 3;
+  uint32 format = 4;                       // 0x00 raw | 0x01 half-aggregated (§3.5)
+  repeated Nullifier nullifiers = 5;       // each element carries its own state (§7.5)
+  string confirmation_state = 6;           // reveal-tx confirmation only: "pending" | "completed"
+                                           //   (never "failed"; not a top-level §3.10 aggregate state)
+  uint64 tx_index = 7;                     // reveal-tx index within the block
+  uint64 vin_index = 8;                    // reveal-input index within the tx; with height+tx_index
+                                           //   forms the triple sort/cursor key (§3.6, §7.5)
+}
+
+message NullifierPathRequest { bytes pubkey = 1; }
+message NullifierPath {
+  bytes root = 1; uint64 tip_height = 2; bool present = 3;
+  bytes leaf = 4;                          // Rᵢ when present, else empty
+  uint64 position = 5;                     // log position p when present
+  repeated bytes audit_path = 6;           // ≤ 64 × 32B RFC-6962 inclusion audit path when present
+                                           //   (§1.7.6, §3.7); empty when present == false
+  uint64 tree_size = 7;                    // log size against which an inclusion proof is stated
+  bytes tip_block_hash = 8;                // 32B, internal order (§1.7.7)
+  // present == false is an unauthenticated local-index absence answer, NOT an RFC-6962
+  //   non-inclusion proof; MUST NOT back a credit (§3.7 Path B).
+}
+
+message OutputTemplate { string recipient = 1; bytes asset_id = 2; string amount = 3; }
+message Issuance {
+  string name = 1; uint32 decimals = 2; uint32 issuance_version = 3;
+  string amount = 4;
+  string cap_total = 5;                    // set iff issuance_version == 2
+  bytes terms_salt = 6;                    // set iff issuance_version == 2
+}
+message TransitionRequest {
+  string kind = 1;                         // "mint" | "send" | "receive"
+  string subject = 2;                      // zk-address (Bech32m string)
+  bytes next_pubkey = 3;
+  bytes npk_rand = 11;                     // 32 unmodified CSPRNG bytes per attempt (§2.1 clause 2)
+  repeated bytes input_coins = 4;
+  repeated OutputTemplate output_templates = 5;
+  bytes publisher_pubkey = 6;              // empty ⇒ self-publish (case a); set ⇒ case (b) or (c)
+  string fee_address = 7;                  // deferred (§3.8.1): MUST be empty in v1 (§7.5 matrix cases (a)/(c))
+  repeated bytes fold_coin_ids = 8;
+  Issuance issuance = 9;
+  string idempotency_key = 10;             // §7.5 Idempotency-Key pass-through
+}
+
+message JobHandle { string job_id = 1; string status = 2; }
+message JobRequest { string job_id = 1; }
+message AwaitingSignature {
+  bytes new_account_state_hash = 1; bytes output_coins_root = 2;
+  bytes input_nullifiers_root = 3; bytes coin_history_root = 4;
+  bytes nav_commitment = 5; bytes npk_commit = 6;
+  bytes proof_data_hash = 7;    // §7.5 awaiting_signature shape
+  bytes txn_pubkey = 8;         // Pkᵢ (x-only); MUST equal prev_account_state.current_pubkey
+  uint64 send_counter = 9;      // entry counter i; skᵢ = A/0'/i' (§1.2, §7.5)
+}
+message JobResult {
+  bytes new_account_state_hash = 1; bytes output_coins_root = 2;
+  bytes input_nullifiers_root = 3; repeated bytes output_coin_ids = 4;
+  bytes publisher_pubkey = 5;              // set for every externally published kind (b)/(c); empty on self-publish (§7.5)
+  bytes attestation = 6;                   // set only for attest jobs (§5.7 BalanceAttestation bytes)
+}
+message JobError { string error = 1; string message = 2; }          // §7.5 machine_code shape
+message Job {
+  string job_id = 1; string kind = 2; string status = 3;
+  string phase = 4;                           // optional non-stable diagnostic [a-z0-9_]{1,64} (§7.5);
+                                              //   empty when absent / in terminal status; clients dispatch on status only
+  float progress = 5;
+  AwaitingSignature awaiting_signature = 6;   // set only while status == "awaiting_signature"
+  JobResult result = 7;                       // set only once status == "completed"
+  JobError error = 8;                         // set only once status ∈ {"failed","cancelled"}
+}
+message JobEvent { string event = 1; Job job = 2; }                 // event: "phase"|"complete"|"error"
+message SignRequest { string job_id = 1; bytes signature = 2; bytes s2c_nonce = 3; }  // signature length MUST be 64, s2c_nonce length MUST be 32 (INVALID_ARGUMENT otherwise)
+
+message Scope {                              // §5.1 scope; all_assets=true ⇔ asset_ids "*"
+  repeated bytes asset_ids = 1; bool all_assets = 2;
+  uint64 not_before = 3; uint64 not_after = 4;
+  // INVARIANT: exactly one of all_assets == true (⇔ asset_ids empty) or a non-empty asset_ids
+  //   MUST hold; all_assets == false with empty asset_ids is INVALID_ARGUMENT.
+  // UNBOUNDED SENTINELS (identical to the §5.1 JSON scope — single pair, no Proto-only zero
+  //   convention): not_before = 0 means no lower bound; not_after = 2⁶³−1
+  //   (9223372036854775807) means no upper bound. Proto3 scalar default 0 is therefore
+  //   correct for not_before but **MUST NOT** be read as unbounded for not_after — a bare
+  //   not_after = 0 is a closed window ending at the epoch. The API layer normalises omitted
+  //   JSON fields to these sentinels before the RPC (§5.1, §7.5).
+}
+message PullChallengeRequest {
+  string subject = 1; Scope requested_scope = 2;
+  string action = 3;                        // "" (pull) | "entrust" | "revoke" (§7.7 domains)
+                                            //   | "attest_balance" | "issue_grant" (§7.5 action-bound
+                                            //   OwnershipProof domains; scope unused for those two)
+}
+message Challenge { bytes nonce = 1; uint64 expiry = 2; string domain = 3; }
+message PullRequest {
+  bytes nonce = 1;                          // consumes the §5.1 challenge (single use)
+  string subject = 2;                       // the subject the API layer authenticated
+  Scope resolved_scope = 3;                 // the already-intersected scope (§5.1) — the kernel
+                                            //   trusts the API layer for ACCESS, never widens
+  bytes chan_bind = 4;                      // opaque 32B equality token for session binding (§5.1)
+}
+message RecordRef {
+  bytes record_id = 1;                     // opaque 32B id of this Private record
+  string record_type = 2;                  // closed: "coinproof" | "self_delivery" — body-type discriminator (§7.5)
+  string transition_kind = 3;              // closed: "mint" | "send" | "receive"; required for self_delivery;
+                                           //   optional (empty) for coinproof — NOT a body-type tag
+  bytes blob_id = 4;                       // H(ciphertext), §4.2.1
+  uint64 occurred_at = 5;                  // first-occurrence-derived; 0 if unknown
+}
+message PullResult { repeated RecordRef records = 1; string session = 2; uint64 session_expiry = 3; }
+message RecordRequest { bytes record_id = 1; string session = 2; bytes chan_bind = 3; }
+message RecordBlob {
+  bytes canonical = 1;                     // §7.1 CoinProof or SelfDeliveryRecordV1 bytes
+  string record_type = 2;                  // closed: "coinproof" | "self_delivery" — discriminates canonical
+  string transition_kind = 3;              // closed: "mint" | "send" | "receive"; required for self_delivery;
+                                           //   optional (empty) for coinproof
+}
+message CoinProofRequest { bytes coin_id = 1; string session = 2; bytes chan_bind = 3; }
+message CoinProofBlob { bytes canonical = 1; }                      // the §7.1 canonical CoinProof bundle bytes
+
+// ownership pull session only — grant sessions are UNAUTHENTICATED/unauthorized (§7.5)
+message AccountStateRequest { string session = 1; bytes chan_bind = 2; }
+message AccountStateResult {
+  bytes account_state = 1;                 // serialize(AccountState), §1.7.4
+  bytes state_head = 2;                    // ash of the spendable head (32B)
+  bytes head_record_id = 3;                // 32B Private-record locator; empty if not indexed
+  uint64 send_counter = 4;                 // MUST equal AccountState.send_counter
+  bytes current_pubkey = 5;                // Pkᵢ (32B x-only); MUST equal AccountState.current_pubkey
+  bytes last_nullifier_pk = 6;             // 32B; empty iff no prior state-advancing transition
+  bytes last_nullifier_r = 7;              // 32B; empty iff last_nullifier_pk empty
+}
+
+// session + chan_bind only — subject/scope come from the server-side pull-session state
+// (ownership or grant), never from a client-supplied subject field (analogous to CoinProofRequest)
+message SubscribeReceiptsRequest { string session = 1; bytes chan_bind = 2; }
+message Receipt {
+  bytes coin_id = 1; bytes asset_id = 2; string amount = 3;
+  string state = 4;                         // §3.10 state at emission
+  uint64 credited_at = 5;
+}
+
+message BlockAnchor { bytes block_hash = 1; uint32 height = 2; }    // hash internal order (§1.7.7); height matches the on-chain u32 (§1.7.3)
+message PublishRequest {
+  bytes public_key = 1; bytes r = 2; bytes s = 3; bytes r_prime = 4;
+  bytes fee_blob_id = 5;                    // 32B; deferred (§3.8.1): MUST be empty in v1 ⇒ fee-less (§7.6)
+  BlockAnchor block_anchor = 6;
+  bytes fee_epk = 7;                        // 32B x-only; empty iff fee_blob_id empty; fresh per hand-off
+  bytes fee_blob_locators = 8;              // UTF-8 of NIP44Binary(K_tx, "blob-locators", serialize(BlobLocatorSet)); empty iff fee_blob_id empty
+}
+message PublishResult {
+  bool accepted = 1;
+  optional string reason = 2;               // present iff accepted == false; closed set (§7.6):
+                                            //   "invalid_signature" | "invalid_s2c_opening" | "invalid_fee_coinproof"
+                                            //   | "fee_address_mismatch" | "ocr_mismatch" | "fee_too_low"
+                                            //   | "unknown_fee_asset" | "policy" | "anchor_stale"
+                                            //   (proto3 optional: absence ≠ empty string)
+  optional uint64 batch_eta = 3;            // seconds to next inscription; present iff accepted == true
+                                            //   (proto3 optional: absence ≠ 0)
+}
+message EntrustRequest { bytes nonce = 1; string subject = 2; bytes bundle = 3; bytes chan_bind = 4; }   // bundle = the 161-byte §7.7 serialization
+message EntrustResult { bool accepted = 1; }
+message RevokeRequest { bytes nonce = 1; string subject = 2; bytes chan_bind = 3; }
+message RevokeResult { bool revoked = 1; }  // §7.7 fail-closed revocation: irrecoverably erase {ivk, ovk, op, nk, op_secret}
+// API layer has already verified the action-bound OwnershipProof (§5.1 / §7.5); kernel trusts
+// the caller for ACCESS and consumes the single-use nonce for audit/idempotency of the gate
+message AttestRequest {
+  string subject = 1; bytes asset_id = 2;
+  bytes nav_ceiling = 3;                    // 32B nav_root; empty ⇒ node's current size_final
+  uint64 size_ceiling = 4;                  // 0 ⇒ derive from size_final
+  bytes nonce = 5;                          // consumes the AttestBalanceChallenge (single use)
+  bytes chan_bind = 6;                      // opaque 32B equality token (§5.1)
+}
+message GrantRequest {
+  string subject = 1; bytes grantee_pk = 2; Scope scope = 3; uint64 expiry = 4;
+  bytes nonce = 5;                          // consumes the IssueGrantChallenge (single use)
+  bytes chan_bind = 6;                      // opaque 32B equality token (§5.1)
+}
+message GrantResult { string grant = 1; }

@@ -20,6 +20,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use node::account_node;
 use node::db;
+use node::kernel_rpc;
 use node::runtime::{start_rest_node, V1Readiness};
 use node::state::State;
 use node::username;
@@ -84,6 +85,14 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .with_env_filter(env_filter)
         .with_target(false)
         .try_init();
+
+    // Fail-loud on the kernel gRPC bind address before any expensive
+    // bootstrap work. `KERNEL_GRPC_ADDR` has no default host/port
+    // (same posture as `DATABASE_URL` / `PUBLISHER_KEY`). The listener
+    // itself is spawned later next to the REST router.
+    let kernel_grpc_addr = kernel_rpc::kernel_grpc_addr_from_env().unwrap_or_else(|e| {
+        panic!("{e}");
+    });
 
     // Open the Postgres pool and run pending migrations BEFORE any
     // state load — `connect_and_migrate` is idempotent (sqlx tracks
@@ -267,6 +276,17 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         .await
         {
             eprintln!("Account node error: {}", e);
+            std::process::exit(1);
+        }
+    });
+
+    // Additive kernel.v1 gRPC edge (§7.8). Does **not** replace or redirect
+    // the HTTP router — Kernel/API cutover is a separate step. Address was
+    // validated at boot (`KERNEL_GRPC_ADDR`); procedures are currently
+    // unimplemented skeletons (see `node::kernel_rpc`).
+    tokio::spawn(async move {
+        if let Err(e) = kernel_rpc::serve_kernel_grpc(kernel_grpc_addr).await {
+            eprintln!("Kernel gRPC error: {}", e);
             std::process::exit(1);
         }
     });
