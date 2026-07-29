@@ -3980,4 +3980,1456 @@ mod tests {
             "a different send_counter must not reproduce the prior opening"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Guard coverage: begin_send / begin_mint / begin_receive
+    //
+    // Each named host-side ensure!/context failure that is reachable without
+    // a Plonky2 prove has a test that asserts the *message*, not merely
+    // is_err(). Unreachable guards are documented in the task report only.
+    // -----------------------------------------------------------------------
+
+    /// Labels are unique per fixture so parallel nextest workers never share
+    /// digest material accidentally across tests.
+    fn send_guard_keys(label: &[u8]) -> (Address, [u8; 32], [u8; 32], [u8; 32], OpSecret) {
+        let mut nk_label = label.to_vec();
+        nk_label.extend_from_slice(b"/nk");
+        let nk: [u8; 32] = Sha256::digest(&nk_label).into();
+        let mut pk0_label = label.to_vec();
+        pk0_label.extend_from_slice(b"/pk0");
+        let (_, _, pk0) = normalized_key(deterministic_secret(&pk0_label));
+        let mut pk1_label = label.to_vec();
+        pk1_label.extend_from_slice(b"/pk1");
+        let (_, _, pk1) = normalized_key(deterministic_secret(&pk1_label));
+        let mut op_label = label.to_vec();
+        op_label.extend_from_slice(b"/op");
+        let op_secret = label_op_secret(&op_label);
+        let owner = Address(host::address(&pk0, host::nk_commit(&nk)));
+        (owner, nk, pk0, pk1, op_secret)
+    }
+
+    /// One or more spendable coins under a single owner. Early begin_send
+    /// guards (before AccountUpdateProof wiring) only need spendable +
+    /// op_secret; `wire_predecessor` adds last_proof / NfLog when a later
+    /// guard or happy path needs AccountUpdateProof.
+    struct GuardAccount {
+        engine: StateEngine,
+        owner: Address,
+        coins: Vec<Coin>,
+        creating_prev_ash: HashDigest,
+    }
+
+    fn install_guard_account(
+        label: &[u8],
+        coin_specs: &[(HashDigest, u128)],
+        wire_predecessor: bool,
+    ) -> GuardAccount {
+        let (owner, nk, pk0, pk1, op_secret) = send_guard_keys(label);
+        let nk_commit = host::nk_commit(&nk);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty genesis state");
+        let creating_prev_ash = host::account_state_hash(&empty).expect("ash");
+
+        let mut coinhist = CoinHistTree::new();
+        let mut spendable = BTreeMap::new();
+        let mut balances: BTreeMap<[u8; 32], u128> = BTreeMap::new();
+        let mut coins = Vec::with_capacity(coin_specs.len());
+        for (index, &(asset_id, amount)) in coin_specs.iter().enumerate() {
+            let coin = Coin {
+                identifier: host::coin_identifier(
+                    creating_prev_ash,
+                    &owner.0,
+                    asset_id,
+                    amount,
+                    index as u32,
+                ),
+                recipient: owner,
+                amount,
+                asset_id,
+            };
+            let id = host::digest_to_bytes(&coin.identifier);
+            coinhist.admit(id).expect("admit");
+            spendable.insert(
+                id,
+                TrackedCoin {
+                    coin: coin.clone(),
+                    creating_prev_ash,
+                    coin_index: index as u32,
+                },
+            );
+            let entry = balances
+                .entry(host::digest_to_bytes(&asset_id))
+                .or_insert(0);
+            *entry = entry.checked_add(amount).expect("balance sum");
+            coins.push(coin);
+        }
+
+        let state = AccountState::new(owner, nk_commit, balances, pk1, 1, coinhist.root())
+            .expect("post-genesis state");
+
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let (last_proof, last_nav_opening, last_nullifier, last_nullifier_pos) = if wire_predecessor
+        {
+            let predecessor_position = ChainPosition {
+                height: 10,
+                tx_index: 0,
+                vin_index: 0,
+                member_index: 0,
+            };
+            let predecessor_entry = NfLogEntry {
+                pk: pk0,
+                r: [0x61; 32],
+            };
+            engine.set_tip_height(10);
+            assert_eq!(
+                engine
+                    .nflog
+                    .fold(
+                        predecessor_position,
+                        predecessor_entry.pk,
+                        predecessor_entry.r,
+                    )
+                    .unwrap(),
+                FoldOutcome::Appended(0)
+            );
+            engine.nflog_entries.push(predecessor_entry);
+            engine.nflog_positions.push(predecessor_position);
+            engine.set_tip_height(15);
+            (
+                Some(host_dummy_last_proof()),
+                Some(NavOpening {
+                    nav: Nav {
+                        size: 0,
+                        mth: host::nflog_empty(),
+                    },
+                    nav_rand: op_secret.derive_nav_rand(0),
+                }),
+                Some(NullifierOpening {
+                    public_key: pk0,
+                    signature_r: [0x61; 32],
+                    r_prime: [0; 32],
+                }),
+                Some(0u64),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk,
+                    op_secret: Some(op_secret),
+                    genesis_pubkey: pk0,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof,
+                    last_nav_opening,
+                    last_nullifier,
+                    last_nullifier_pos,
+                },
+            )
+            .expect("insert guard account");
+
+        GuardAccount {
+            engine,
+            owner,
+            coins,
+            creating_prev_ash,
+        }
+    }
+
+    fn err_msg(err: anyhow::Error) -> String {
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn begin_send_account_not_found() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let err = engine
+            .begin_send(SendRequest {
+                owner: Address([0xab; 32]),
+                input_coin_ids: vec![host::ZERO_HASH],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0xcd; 32]),
+                    amount: 1,
+                    asset_id: host::ZERO_HASH,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("missing account must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("send: account not found"),
+            "expected account-not-found, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_send_requires_at_least_one_input_coin() {
+        let label = b"zkCoins/v1/state-engine/guard-send/no-input";
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &[1u8; 32], &[2u8; 32], 2, 1);
+        let fx = install_guard_account(label, &[(asset, 50)], false);
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: vec![],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 1,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("empty inputs must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("send requires at least one input coin"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_send_duplicate_input_coin_id() {
+        let label = b"zkCoins/v1/state-engine/guard-send/dup-input";
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &[3u8; 32], &[4u8; 32], 2, 1);
+        let fx = install_guard_account(label, &[(asset, 50)], false);
+        let id = fx.coins[0].identifier;
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: vec![id, id],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 1,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("duplicate input must refuse");
+        let msg = err_msg(err);
+        assert!(msg.contains("duplicate input coin_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_send_input_coin_not_spendable() {
+        let label = b"zkCoins/v1/state-engine/guard-send/not-spendable";
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &[5u8; 32], &[6u8; 32], 2, 1);
+        let fx = install_guard_account(label, &[(asset, 50)], false);
+        let foreign_id = host::coin_identifier(fx.creating_prev_ash, &fx.owner.0, asset, 7, 99);
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: vec![foreign_id],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 1,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("unknown input must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("input coin is not spendable on this account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_send_tracked_coin_identifier_mismatch() {
+        let label = b"zkCoins/v1/state-engine/guard-send/id-mismatch";
+        let (owner, nk, pk0, pk1, op_secret) = send_guard_keys(label);
+        let nk_commit = host::nk_commit(&nk);
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk0, &[0x21; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let map_id = host::coin_identifier(ash, &owner.0, asset, 50, 0);
+        let inner_id = host::coin_identifier(ash, &owner.0, asset, 50, 1);
+        assert_ne!(map_id, inner_id);
+        let mut coinhist = CoinHistTree::new();
+        let map_bytes = host::digest_to_bytes(&map_id);
+        coinhist.admit(map_bytes).unwrap();
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            map_bytes,
+            TrackedCoin {
+                coin: Coin {
+                    identifier: inner_id, // key/id diverge — the defect under test
+                    recipient: owner,
+                    amount: 50,
+                    asset_id: asset,
+                },
+                creating_prev_ash: ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset), 50);
+        let state = AccountState::new(owner, nk_commit, balances, pk1, 1, coinhist.root()).unwrap();
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk,
+                    op_secret: Some(op_secret),
+                    genesis_pubkey: pk0,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+
+        let err = engine
+            .begin_send(SendRequest {
+                owner,
+                input_coin_ids: vec![map_id],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 1,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("identifier mismatch must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("tracked coin identifier mismatch"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_send_input_recipient_not_spending_account() {
+        let label = b"zkCoins/v1/state-engine/guard-send/wrong-recipient";
+        let (owner, nk, pk0, pk1, op_secret) = send_guard_keys(label);
+        let nk_commit = host::nk_commit(&nk);
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk0, &[0x22; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let foreign = Address([0xee; 32]);
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 50, 0),
+            recipient: foreign, // not the spending account
+            amount: 50,
+            asset_id: asset,
+        };
+        let mut coinhist = CoinHistTree::new();
+        let id = host::digest_to_bytes(&coin.identifier);
+        coinhist.admit(id).unwrap();
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: coin.clone(),
+                creating_prev_ash: ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset), 50);
+        let state = AccountState::new(owner, nk_commit, balances, pk1, 1, coinhist.root()).unwrap();
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk,
+                    op_secret: Some(op_secret),
+                    genesis_pubkey: pk0,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+
+        let err = engine
+            .begin_send(SendRequest {
+                owner,
+                input_coin_ids: vec![coin.identifier],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 1,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("foreign recipient must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("input coin recipient is not the spending account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_send_output_template_amount_must_be_non_zero() {
+        let label = b"zkCoins/v1/state-engine/guard-send/zero-out";
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &[7u8; 32], &[8u8; 32], 2, 1);
+        let fx = install_guard_account(label, &[(asset, 50)], false);
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: vec![fx.coins[0].identifier],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 0,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("zero output amount must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("output template amount must be non-zero"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_send_in_amount_overflow() {
+        // Hand-built: balances cannot hold MAX+1, but In(a) sums coin amounts
+        // independently and must fail loud on checked_add overflow.
+        let label = b"zkCoins/v1/state-engine/guard-send/in-overflow";
+        let (owner, nk, pk0, pk1, op_secret) = send_guard_keys(label);
+        let nk_commit = host::nk_commit(&nk);
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk0, &[0x0a; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let coins = [
+            Coin {
+                identifier: host::coin_identifier(ash, &owner.0, asset, u128::MAX, 0),
+                recipient: owner,
+                amount: u128::MAX,
+                asset_id: asset,
+            },
+            Coin {
+                identifier: host::coin_identifier(ash, &owner.0, asset, 1, 1),
+                recipient: owner,
+                amount: 1,
+                asset_id: asset,
+            },
+        ];
+        let mut coinhist = CoinHistTree::new();
+        let mut spendable = BTreeMap::new();
+        for (i, coin) in coins.iter().enumerate() {
+            let id = host::digest_to_bytes(&coin.identifier);
+            coinhist.admit(id).unwrap();
+            spendable.insert(
+                id,
+                TrackedCoin {
+                    coin: coin.clone(),
+                    creating_prev_ash: ash,
+                    coin_index: i as u32,
+                },
+            );
+        }
+        // Deliberately under-state balances — In(a) still sums coin amounts.
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset), u128::MAX);
+        let state = AccountState::new(owner, nk_commit, balances, pk1, 1, coinhist.root()).unwrap();
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk,
+                    op_secret: Some(op_secret),
+                    genesis_pubkey: pk0,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let err = engine
+            .begin_send(SendRequest {
+                owner,
+                input_coin_ids: coins.iter().map(|c| c.identifier).collect(),
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 1,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("In(a) overflow must refuse");
+        let msg = err_msg(err);
+        assert!(msg.contains("In(a) amount overflow"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_send_out_amount_overflow() {
+        let label = b"zkCoins/v1/state-engine/guard-send/out-overflow";
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &[0x0b; 32], &[0x0c; 32], 2, 1);
+        let fx = install_guard_account(label, &[(asset, 1)], false);
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: vec![fx.coins[0].identifier],
+                output_templates: vec![
+                    CoinTemplate {
+                        recipient: Address([0x91; 32]),
+                        amount: u128::MAX,
+                        asset_id: asset,
+                    },
+                    CoinTemplate {
+                        recipient: Address([0x92; 32]),
+                        amount: 1,
+                        asset_id: asset,
+                    },
+                ],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("Out(a) overflow must refuse");
+        let msg = err_msg(err);
+        assert!(msg.contains("Out(a) amount overflow"), "got: {msg}");
+    }
+
+    /// Multi-asset over-spend: asset A is fully covered, asset B is not.
+    /// Carries the deleted legacy "foreign asset in queue" property.
+    #[test]
+    fn begin_send_multi_asset_overspend_returns_err() {
+        let label = b"zkCoins/v1/state-engine/guard-send/multi-overspend";
+        let asset_a = host::asset_id_v1(host::GENESIS_TAG, &[0x11; 32], &[0xa1; 32], 2, 1);
+        let asset_b = host::asset_id_v1(host::GENESIS_TAG, &[0x11; 32], &[0xb1; 32], 2, 1);
+        assert_ne!(asset_a, asset_b);
+        let fx = install_guard_account(label, &[(asset_a, 100), (asset_b, 10)], false);
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: fx.coins.iter().map(|c| c.identifier).collect(),
+                output_templates: vec![
+                    CoinTemplate {
+                        recipient: Address([0x91; 32]),
+                        amount: 50, // A covered
+                        asset_id: asset_a,
+                    },
+                    CoinTemplate {
+                        recipient: Address([0x92; 32]),
+                        amount: 20, // B over (In=10)
+                        asset_id: asset_b,
+                    },
+                ],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("multi-asset overspend must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("over-spend: outputs exceed inputs for an asset"),
+            "got: {msg}"
+        );
+    }
+
+    /// Templates alone stay ≤ MAX_TX_OUTPUTS; adding per-asset change tips
+    /// the total over the limit (distinct from the pure-template gate).
+    #[test]
+    fn begin_send_outputs_including_change_exceed_max_tx_outputs() {
+        let label = b"zkCoins/v1/state-engine/guard-send/change-exceeds";
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &[0x0d; 32], &[0x0e; 32], 2, 1);
+        // MAX templates of amount 1 + residual change ⇒ MAX+1 total outputs.
+        let input_amount = (MAX_TX_OUTPUTS as u128) + 10;
+        let fx = install_guard_account(label, &[(asset, input_amount)], false);
+        let templates: Vec<CoinTemplate> = (0..MAX_TX_OUTPUTS)
+            .map(|i| CoinTemplate {
+                recipient: Address([0x40 + i as u8; 32]),
+                amount: 1,
+                asset_id: asset,
+            })
+            .collect();
+        assert_eq!(templates.len(), MAX_TX_OUTPUTS);
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: vec![fx.coins[0].identifier],
+                output_templates: templates,
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("change must tip over MAX_TX_OUTPUTS");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("outputs including change exceed MAX_TX_OUTPUTS"),
+            "got: {msg}"
+        );
+    }
+
+    /// Green-path multi-asset conservation: both assets covered, change per
+    /// asset, change ordered by ascending asset_id after recipient templates.
+    #[test]
+    fn begin_send_multi_asset_covered_change_ordered_by_asset_id() {
+        let label = b"zkCoins/v1/state-engine/guard-send/multi-ok";
+        let asset_lo = host::asset_id_v1(host::GENESIS_TAG, &[0x31; 32], &[0x01; 32], 2, 1);
+        let asset_hi = host::asset_id_v1(host::GENESIS_TAG, &[0x31; 32], &[0xff; 32], 2, 1);
+        // Ensure lo < hi in byte order so the assertion is stable.
+        let (asset_a, asset_b) =
+            if host::digest_to_bytes(&asset_lo) < host::digest_to_bytes(&asset_hi) {
+                (asset_lo, asset_hi)
+            } else {
+                (asset_hi, asset_lo)
+            };
+        let fx = install_guard_account(label, &[(asset_a, 100), (asset_b, 50)], true);
+        let external = Address([0x77; 32]);
+        let pending = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: fx.coins.iter().map(|c| c.identifier).collect(),
+                output_templates: vec![
+                    CoinTemplate {
+                        recipient: external,
+                        amount: 30,
+                        asset_id: asset_a,
+                    },
+                    CoinTemplate {
+                        recipient: external,
+                        amount: 20,
+                        asset_id: asset_b,
+                    },
+                ],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect("covered multi-asset send");
+
+        assert_eq!(pending.mode, TransitionMode::AccountUpdateProof);
+        // Recipient templates first, then change by ascending asset_id.
+        assert_eq!(pending.witness_wip.output_templates.len(), 4);
+        assert_eq!(pending.witness_wip.output_templates[0].recipient, external);
+        assert_eq!(pending.witness_wip.output_templates[0].amount, 30);
+        assert_eq!(pending.witness_wip.output_templates[0].asset_id, asset_a);
+        assert_eq!(pending.witness_wip.output_templates[1].recipient, external);
+        assert_eq!(pending.witness_wip.output_templates[1].amount, 20);
+        assert_eq!(pending.witness_wip.output_templates[1].asset_id, asset_b);
+        // Change: A=70, B=30, ascending asset_id order.
+        assert_eq!(pending.witness_wip.output_templates[2].recipient, fx.owner);
+        assert_eq!(pending.witness_wip.output_templates[2].amount, 70);
+        assert_eq!(pending.witness_wip.output_templates[2].asset_id, asset_a);
+        assert_eq!(pending.witness_wip.output_templates[3].recipient, fx.owner);
+        assert_eq!(pending.witness_wip.output_templates[3].amount, 30);
+        assert_eq!(pending.witness_wip.output_templates[3].asset_id, asset_b);
+        let a_key = host::digest_to_bytes(&asset_a);
+        let b_key = host::digest_to_bytes(&asset_b);
+        assert!(
+            a_key < b_key,
+            "fixture assets must be ascending for change order"
+        );
+    }
+
+    // --- begin_mint guards ---------------------------------------------------
+
+    #[test]
+    fn begin_mint_rejects_unsupported_issuance_version() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let mut req = test_mint_request(1);
+        req.issuance_version = 3;
+        let err = engine.begin_mint(req).expect_err("bad version");
+        let msg = err_msg(err);
+        assert!(msg.contains("unsupported issuance_version"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_mint_rejects_zero_amount() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let mut req = test_mint_request(1);
+        req.amount = 0;
+        let err = engine.begin_mint(req).expect_err("zero amount");
+        let msg = err_msg(err);
+        assert!(msg.contains("mint amount must be non-zero"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_mint_std1_rejects_nonzero_cap_total() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let mut req = test_mint_request(1);
+        req.cap_total = 1;
+        let err = engine.begin_mint(req).expect_err("cap on std1");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("token-standard-1 mint requires cap_total == 0"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_mint_std1_rejects_nonzero_terms_salt() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let mut req = test_mint_request(1);
+        req.terms_salt = [1u8; 32];
+        let err = engine.begin_mint(req).expect_err("salt on std1");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("token-standard-1 mint requires all-zero terms_salt"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_mint_genesis_rejects_owner_mismatch() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let mut req = test_mint_request(1);
+        req.owner = Address([0xde; 32]);
+        let err = engine.begin_mint(req).expect_err("bad genesis owner");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("owner must equal H(current_pubkey ‖ nk_commit) for a genesis mint"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_mint_remint_refuses_when_op_secret_missing() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let base = test_mint_request(1);
+        let nk_commit = host::nk_commit(&base.nk);
+        let state = AccountState::new(
+            base.owner,
+            nk_commit,
+            BTreeMap::new(),
+            base.next_pubkey,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                base.owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk: base.nk,
+                    op_secret: None,
+                    genesis_pubkey: base.current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let mut req = base;
+        req.current_pubkey = req.next_pubkey;
+        let err = engine.begin_mint(req).expect_err("missing op_secret");
+        let msg = err_msg(err);
+        assert!(msg.contains("mint: op_secret missing"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_mint_remint_refuses_op_secret_mismatch() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let base = test_mint_request(1);
+        let nk_commit = host::nk_commit(&base.nk);
+        let state = AccountState::new(
+            base.owner,
+            nk_commit,
+            BTreeMap::new(),
+            base.next_pubkey,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                base.owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk: base.nk,
+                    op_secret: Some(base.op_secret),
+                    genesis_pubkey: base.current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let mut req = base;
+        req.current_pubkey = req.next_pubkey;
+        req.op_secret = label_op_secret(b"zkCoins/v1/state-engine/mint-guard/wrong-op");
+        let err = engine.begin_mint(req).expect_err("op_secret mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("op_secret does not match the registered account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_mint_remint_refuses_nk_mismatch() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let base = test_mint_request(1);
+        let nk_commit = host::nk_commit(&base.nk);
+        let state = AccountState::new(
+            base.owner,
+            nk_commit,
+            BTreeMap::new(),
+            base.next_pubkey,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                base.owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk: base.nk,
+                    op_secret: Some(base.op_secret),
+                    genesis_pubkey: base.current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let mut req = base;
+        req.current_pubkey = req.next_pubkey;
+        req.nk = [0x99; 32];
+        let err = engine.begin_mint(req).expect_err("nk mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("nk does not match the registered account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_mint_remint_refuses_current_pubkey_mismatch() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let base = test_mint_request(1);
+        let nk_commit = host::nk_commit(&base.nk);
+        let state = AccountState::new(
+            base.owner,
+            nk_commit,
+            BTreeMap::new(),
+            base.next_pubkey,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                base.owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk: base.nk,
+                    op_secret: Some(base.op_secret),
+                    genesis_pubkey: base.current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let mut req = base;
+        // Account holds next_pubkey; request carries a third key.
+        let (_, _, wrong_pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/mint-guard/wrong-pk",
+        ));
+        req.current_pubkey = wrong_pk;
+        let err = engine.begin_mint(req).expect_err("pubkey mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("current_pubkey does not match the registered account"),
+            "got: {msg}"
+        );
+    }
+
+    // --- begin_receive guards ------------------------------------------------
+
+    #[test]
+    fn begin_receive_length_mismatch() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/len/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/len/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x41; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 10, 0),
+            recipient: owner,
+            amount: 10,
+            asset_id: asset,
+        };
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/len/op"),
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![], // length mismatch
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("length mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("received_coins / received_auth length mismatch"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_receive_requires_at_least_one_coin() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/empty/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/empty/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/empty/op"),
+                current_pubkey: pk,
+                received_coins: vec![],
+                received_auth: vec![],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("empty receive");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("receive requires at least one received coin"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_receive_too_many_received_coins() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/max/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/max/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x42; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let n = MAX_RX_COINS + 1;
+        let mut coins = Vec::with_capacity(n);
+        let mut auth = Vec::with_capacity(n);
+        let dummy = host_dummy_last_proof();
+        for i in 0..n {
+            coins.push(Coin {
+                identifier: host::coin_identifier(ash, &owner.0, asset, 1, i as u32),
+                recipient: owner,
+                amount: 1,
+                asset_id: asset,
+            });
+            auth.push(dummy_received_auth(dummy.clone(), ash, i as u32));
+        }
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/max/op"),
+                current_pubkey: pk,
+                received_coins: coins,
+                received_auth: auth,
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("over MAX_RX_COINS");
+        let msg = err_msg(err);
+        assert!(msg.contains("too many received coins"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_receive_initial_rejects_owner_mismatch() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/owner/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/owner/pk",
+        ));
+        let real_owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let fake_owner = Address([0xde; 32]);
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x43; 32], 2, 1);
+        // Creating ash for the fake owner still lets recipient checks fail later
+        // if we get that far — owner gate is first for missing accounts.
+        let empty = AccountState::new(
+            fake_owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &fake_owner.0, asset, 10, 0),
+            recipient: fake_owner,
+            amount: 10,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner: fake_owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/owner/op"),
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("owner mismatch on InitialProof");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains(
+                "receive: owner must equal H(current_pubkey ‖ nk_commit) for an InitialProof"
+            ),
+            "got: {msg} (real_owner={real_owner:?})"
+        );
+    }
+
+    #[test]
+    fn begin_receive_rejects_wrong_recipient() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/recip/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/recip/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x44; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 10, 0),
+            recipient: Address([0xee; 32]), // not owner
+            amount: 10,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/recip/op"),
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("wrong recipient");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("received coin recipient is not the receiving account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_receive_rejects_zero_amount() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/zero/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/zero/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x45; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 0, 0),
+            recipient: owner,
+            amount: 0,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/zero/op"),
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("zero amount");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("received coin amount must be non-zero"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_receive_registered_refuses_when_op_secret_missing() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/noop/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/noop/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk,
+                    op_secret: None,
+                    genesis_pubkey: pk,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x46; 32], 2, 1);
+        let ash = host::ZERO_HASH;
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 10, 0),
+            recipient: owner,
+            amount: 10,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/noop/op"),
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("missing op_secret");
+        let msg = err_msg(err);
+        assert!(msg.contains("receive: op_secret missing"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_receive_registered_refuses_op_secret_mismatch() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/opmis/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/opmis/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let stored = label_op_secret(b"zkCoins/v1/state-engine/rx-guard/opmis/stored");
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk,
+                    op_secret: Some(stored),
+                    genesis_pubkey: pk,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x47; 32], 2, 1);
+        let ash = host::ZERO_HASH;
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 10, 0),
+            recipient: owner,
+            amount: 10,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/opmis/wrong"),
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("op_secret mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("receive: op_secret does not match the registered account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_receive_registered_refuses_nk_mismatch() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/nkmis/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/nkmis/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let op = label_op_secret(b"zkCoins/v1/state-engine/rx-guard/nkmis/op");
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk,
+                    op_secret: Some(op),
+                    genesis_pubkey: pk,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x48; 32], 2, 1);
+        let ash = host::ZERO_HASH;
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 10, 0),
+            recipient: owner,
+            amount: 10,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk: [0x99; 32],
+                op_secret: op,
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("nk mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("receive: nk does not match the registered account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_receive_registered_refuses_current_pubkey_mismatch() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/pkmis/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/pkmis/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let op = label_op_secret(b"zkCoins/v1/state-engine/rx-guard/pkmis/op");
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk,
+                    op_secret: Some(op),
+                    genesis_pubkey: pk,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x49; 32], 2, 1);
+        let ash = host::ZERO_HASH;
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 10, 0),
+            recipient: owner,
+            amount: 10,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let (_, _, wrong_pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/pkmis/wrong",
+        ));
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: op,
+                current_pubkey: wrong_pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("pubkey mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("receive: current_pubkey does not match the registered account"),
+            "got: {msg}"
+        );
+    }
 }
