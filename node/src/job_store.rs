@@ -14,6 +14,10 @@
 // covered by the testcontainers-backed `job_store_tests` suite.
 
 use std::convert::TryFrom;
+#[cfg(test)]
+use std::sync::atomic::{AtomicI32, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -372,6 +376,13 @@ pub struct JobStore {
     pool: PgPool,
     /// Process-generation token written into every won finalise claim.
     process_owner: Uuid,
+    /// Test-only load fault budget. `-1` = unlimited (default). When
+    /// non-negative, each successful `load` decrements; at `0` further
+    /// loads return a synthetic error. Shared across [`Clone`]s so an
+    /// `Arc<JobStore>` arming reaches the same store instance used by
+    /// domain code.
+    #[cfg(test)]
+    test_load_ok_budget: Arc<AtomicI32>,
 }
 
 impl JobStore {
@@ -379,6 +390,8 @@ impl JobStore {
         Self {
             pool,
             process_owner: Uuid::new_v4(),
+            #[cfg(test)]
+            test_load_ok_budget: Arc::new(AtomicI32::new(-1)),
         }
     }
 
@@ -389,7 +402,24 @@ impl JobStore {
         Self {
             pool,
             process_owner,
+            test_load_ok_budget: Arc::new(AtomicI32::new(-1)),
         }
+    }
+
+    /// Arm load failures after `ok_count` successful `load` calls.
+    ///
+    /// `ok_count = 1` lets CancelJob's pre-check load succeed while any
+    /// post-cancel reload would fail — used to prove a successful cancel
+    /// is never reported as a store/reload error.
+    #[cfg(test)]
+    pub fn arm_load_failures_after_ok_count(&self, ok_count: i32) {
+        self.test_load_ok_budget.store(ok_count, Ordering::SeqCst);
+    }
+
+    /// Clear any armed load-failure budget (unlimited loads again).
+    #[cfg(test)]
+    pub fn disarm_load_failures(&self) {
+        self.test_load_ok_budget.store(-1, Ordering::SeqCst);
     }
 
     /// Borrow the underlying pool — needed by callers that thread
@@ -498,6 +528,23 @@ impl JobStore {
     /// Load a single job by its public UUID. Returns `Ok(None)` if
     /// no row matches.
     pub async fn load(&self, public_id: Uuid) -> sqlx::Result<Option<Job>> {
+        #[cfg(test)]
+        {
+            // Budget semantics: -1 unlimited; 0 fail immediately; n>0 allow
+            // n successes then fail. fetch_sub on a positive budget is the
+            // decrement; when the pre-decrement value was 0 we fail.
+            let budget = self.test_load_ok_budget.load(Ordering::SeqCst);
+            if budget == 0 {
+                return Err(sqlx::Error::Protocol(
+                    "test-injected JobStore::load failure".into(),
+                ));
+            }
+            if budget > 0 {
+                // If two loads race, both may pass one slot — tests arm this
+                // under single-threaded cancel paths only.
+                self.test_load_ok_budget.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
         let row = sqlx::query("SELECT * FROM jobs WHERE public_id = $1")
             .bind(public_id)
             .fetch_optional(&self.pool)
@@ -851,35 +898,6 @@ impl JobStore {
         .bind(FINALISE_CLAIM_PHASE)
         .bind(&owner_text)
         .bind(fence)
-        .bind(generation)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(result.rows_affected() == 1)
-    }
-
-    /// Status-qualified status/phase advance. Returns `true` if applied.
-    ///
-    /// An update that assumes `from` fails (returns `false`) when the job
-    /// has moved on — never silently overwrites a later status.
-    #[cfg(test)]
-    pub async fn set_status_if(
-        &self,
-        public_id: Uuid,
-        from: JobStatus,
-        to: JobStatus,
-        phase: &str,
-    ) -> sqlx::Result<bool> {
-        let (mut tx, generation) = self.begin_with_locked_generation().await?;
-        let result = sqlx::query(
-            "UPDATE jobs SET status = $1, phase = $2, updated_at = NOW() \
-             WHERE public_id = $3 AND status = $4 \
-               AND reset_generation = $5",
-        )
-        .bind(to.as_str())
-        .bind(phase)
-        .bind(public_id)
-        .bind(from.as_str())
         .bind(generation)
         .execute(&mut *tx)
         .await?;

@@ -128,9 +128,28 @@ pub(crate) async fn cancel_job(
         }
     }
 
-    // Reload the cancelled row and project (terminal Cancelled is always
-    // well-formed — no required payload).
-    get_job(store, request).await
+    // Cancel already committed. Project from the pre-loaded row with the
+    // store's known cancel effects — do **not** reload. A second load that
+    // fails would turn an irreversible success into a client-visible error.
+    //
+    // `cancel` / `cancel_not_yet_published` (job_store.rs) set:
+    //   status = 'cancelled', phase = 'cancelled',
+    //   request_body strips finalisation keys,
+    //   updated_at = NOW(), completed_at = NOW().
+    // They do **not** write `error` or `progress`. Terminal Cancelled needs
+    // no payload; `request_body` / timestamps are unused by projection.
+    project_cancelled_from_pre_cancel_row(row)
+}
+
+/// Apply the known post-cancel row effects and project a domain job.
+///
+/// Pure: no store I/O. Call only after `cancel` / `cancel_not_yet_published`
+/// returned `Ok(true)`.
+fn project_cancelled_from_pre_cancel_row(mut row: crate::job_store::Job) -> KernelResult<Job> {
+    row.status = JobStatus::Cancelled;
+    row.phase = "cancelled".to_string();
+    // Terminal Cancelled is always well-formed — no required payload.
+    project_job_row(&row)
 }
 
 pub(crate) async fn cancel_job_arc(
@@ -283,5 +302,115 @@ mod cancel_tests {
         .await
         .expect_err("missing");
         assert_eq!(err.code, KernelErrorCode::JobNotFound);
+    }
+
+    /// Successful cancel must never surface as a cancel/load error just
+    /// because a subsequent store read would fail.
+    ///
+    /// Against the previous `get_job` reload at the end of `cancel_job`,
+    /// arming a load failure after the pre-check load made this test red:
+    /// cancel committed, reload returned `store_load_failed` / internal
+    /// error, and the caller saw failure for an irreversible success.
+    #[tokio::test]
+    async fn successful_cancel_is_not_error_when_subsequent_load_would_fail() {
+        let (store, _db) = fresh_store().await;
+        let created = store
+            .create(
+                StoreKind::Mint,
+                &[0x25u8; 32],
+                Some("k-c-no-reload"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let id = match created {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!("expected Fresh"),
+        };
+        // Non-zero progress + non-default phase: store cancel does not
+        // rewrite progress; projection must keep it and set phase only.
+        store
+            .set_status(id, JobStatus::Proving, "proving_circuit")
+            .await
+            .expect("proving");
+        // Plant progress directly — set_status does not take progress.
+        sqlx::query("UPDATE jobs SET progress = $1 WHERE public_id = $2")
+            .bind(40i16)
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .expect("progress");
+
+        // First load (cancel pre-check) succeeds; any later load fails.
+        store.arm_load_failures_after_ok_count(1);
+
+        let job = cancel_job(
+            store.as_ref(),
+            JobRequest { id: JobId(id) },
+            CancelPolicy::NotYetPublished,
+        )
+        .await
+        .expect(
+            "successful cancel must return Ok even when a post-cancel \
+             reload would fail",
+        );
+
+        // Cause, not mere is_ok: terminal Cancelled with store-true fields.
+        match &job.state {
+            JobState::Cancelled { error } => {
+                assert_eq!(
+                    error, &None,
+                    "store cancel does not write error; projection must not invent one"
+                );
+            }
+            other => panic!("expected Cancelled after successful cancel, got {other:?}"),
+        }
+        assert_eq!(job.phase, "cancelled");
+        assert_eq!(
+            job.progress, 40,
+            "store cancel leaves progress untouched; response must reflect that"
+        );
+
+        // Cancel is durable in the store (disarm so we can observe it).
+        store.disarm_load_failures();
+        let after = store.load(id).await.expect("load").expect("row");
+        assert_eq!(after.status, JobStatus::Cancelled);
+        assert_eq!(after.phase, "cancelled");
+        assert_eq!(after.progress, 40);
+        assert!(after.completed_at.is_some());
+        assert_eq!(after.error, None);
+    }
+
+    #[test]
+    fn project_cancelled_applies_known_store_effects_only() {
+        use crate::job_store::{Job as StoreJob, JobKind as StoreKind};
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        let row = StoreJob {
+            id: 1,
+            public_id: Uuid::from_u128(0xabcd),
+            kind: StoreKind::Send,
+            status: JobStatus::Proving,
+            phase: "proving_circuit".to_string(),
+            account_address: [0x11u8; 32],
+            idempotency_key: None,
+            request_body: serde_json::json!({"pending_sign": {"mode": "initial"}}),
+            response_body: None,
+            response_status: None,
+            proof_id: None,
+            error: None,
+            progress: 55,
+            reset_generation: 0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+        };
+        let job = project_cancelled_from_pre_cancel_row(row).expect("cancelled projects");
+        assert!(matches!(job.state, JobState::Cancelled { error: None }));
+        assert_eq!(job.phase, "cancelled");
+        assert_eq!(job.progress, 55);
+        assert_eq!(job.kind, crate::kernel::types::JobKind::Send);
+        assert_eq!(job.id.as_uuid(), Uuid::from_u128(0xabcd));
     }
 }

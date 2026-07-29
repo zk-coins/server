@@ -2058,7 +2058,6 @@ pub const JOB_FINALISE_HOST_EDGE: &str =
 /// |-------|--------------------------------------|-----------------|
 /// | [`JobStore::create`] (`INSERT`) | tx: `SELECT generation … FOR UPDATE` then `INSERT … reset_generation = $8` | `CreateResult` |
 /// | [`JobStore::set_status`] | lock gen; `WHERE public_id AND reset_generation = $4 AND status NOT IN (terminal)` | **bool** |
-/// | [`JobStore::set_status_if`] | lock gen; `WHERE public_id AND status = $4 AND reset_generation = $5` | **bool** |
 /// | [`JobStore::set_awaiting_signature`] | lock gen; `WHERE public_id AND status IN (queued,proving) AND reset_generation = $4` | **bool** |
 /// | [`JobStore::complete`] | lock gen; `WHERE public_id AND reset_generation = $4 AND status NOT IN (terminal)` | **bool** |
 /// | [`JobStore::complete_if_status`] | lock gen; status ANY + not claim phase + `reset_generation = $6` | **bool** |
