@@ -36,10 +36,11 @@ use zkcoins_prover::Proof;
 use crate::account_node::{AccountNode, CoinProof};
 use crate::db::InscriptionSummary;
 use crate::flow;
-use crate::job_dispatcher::{JobEnvelope, JobNotifier, JobNotifyMap, JobPhaseEvent};
-use crate::job_store::{CreateResult, Job, JobKind, JobStatus, JobStore};
+use crate::job_dispatcher::{JobEnvelope, JobNotifyMap, JobPhaseEvent};
+use crate::job_store::{CreateResult, JobKind, JobStatus, JobStore};
 use crate::kernel::{
-    JobId, JobRequest, JobState, KernelError, KernelErrorCode, KernelService, NormativeJobStatus,
+    CancelPolicy, JobEvent, JobEventHub, JobId, JobRequest, JobState, KernelError, KernelErrorCode,
+    KernelService, NormativeJobStatus,
 };
 use crate::publisher::EsploraConfig;
 use crate::transport::error_contract;
@@ -224,8 +225,8 @@ pub(crate) struct AppState {
     /// stay lock-free on the typical access pattern (one wallet per
     /// job + at most a handful of SSE streams).
     ///
-    /// See [`JobNotifier`] for the two coordination primitives the
-    /// dispatcher and the SSE handler share via this map; see
+    /// See [`crate::job_dispatcher::JobNotifier`] for the two coordination
+    /// primitives the dispatcher and the SSE handler share via this map; see
     /// [`stream_job_handler`] for the subscriber-side wiring.
     pub(crate) job_notify_map: JobNotifyMap,
     /// When `Some`, the v1.1 NfLog scanner has completed at least one
@@ -1450,7 +1451,7 @@ pub(crate) async fn get_job_handler(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> axum::response::Response {
-    let service = KernelService::new(Arc::clone(&state.job_store));
+    let service = KernelService::from_store(Arc::clone(&state.job_store));
     let job = match service.get_job(JobRequest { id: JobId(id) }).await {
         Ok(j) => j,
         Err(e) => return legacy_get_job_error(e),
@@ -2243,7 +2244,7 @@ pub(crate) async fn get_job_v1_handler(
     State(state): State<AppState>,
     V1JobId(id): V1JobId,
 ) -> axum::response::Response {
-    let service = KernelService::new(Arc::clone(&state.job_store));
+    let service = KernelService::from_store(Arc::clone(&state.job_store));
     let job = match service.get_job(JobRequest { id: JobId(id) }).await {
         Ok(j) => j,
         Err(e) => return v1_get_job_error(e),
@@ -2366,8 +2367,16 @@ pub(crate) async fn jobs_cancel_handler(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> axum::response::Response {
-    match state.job_store.cancel(id).await {
-        Ok(true) => {
+    // Legacy policy: only `queued`. Domain distinguishes not-found from
+    // wrong-phase; this adapter maps **both** to 409 free-text so the
+    // pre-split wire contract (and `jobs_cancel_unknown_returns_409`)
+    // stays byte-stable.
+    let service = KernelService::from_store(Arc::clone(&state.job_store));
+    match service
+        .cancel_job(JobRequest { id: JobId(id) }, CancelPolicy::LegacyQueuedOnly)
+        .await
+    {
+        Ok(_job) => {
             // Publish the terminal `cancelled` event to any attached
             // SSE listener BEFORE the dispatcher's notify-map entry
             // drops (it won't drop until the next admit, but the
@@ -2393,15 +2402,48 @@ pub(crate) async fn jobs_cancel_handler(
             )
                 .into_response()
         }
-        Ok(false) => (
+        Err(e) => legacy_cancel_error(e),
+    }
+}
+
+/// Map domain cancel errors onto the legacy jobs cancel envelope.
+///
+/// Legacy folds `job_not_found` and `wrong_phase` into a single 409 with
+/// free-text `"Job is not in a cancellable state"`.
+fn legacy_cancel_error(err: KernelError) -> axum::response::Response {
+    match err.code {
+        KernelErrorCode::JobNotFound | KernelErrorCode::WrongPhase => (
             StatusCode::CONFLICT,
             Json(JobErrorResponse {
                 error: "Job is not in a cancellable state".to_string(),
             }),
         )
             .into_response(),
-        Err(e) => {
-            tracing::error!("JobStore::cancel failed: {}", e);
+        KernelErrorCode::InternalError => {
+            // Wire contract: legacy cancel always said "Failed to cancel job"
+            // for any store failure. Domain may be more precise (e.g. load
+            // failed before cancel was attempted) — keep that in logs only.
+            if let Some(ctx) = &err.internal_context {
+                tracing::error!("CancelJob (legacy) internal_error: {}", ctx.detail);
+            } else {
+                tracing::error!("CancelJob (legacy) internal_error: {}", err.public_message);
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(JobErrorResponse {
+                    error: "Failed to cancel job".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        other => {
+            // CancelJob's closed error set is only the three above plus
+            // malformed/rate_limited (handled at the extractor). Anything
+            // else is a programming error — fail closed as 500.
+            tracing::error!(
+                "CancelJob (legacy) unexpected domain code {}",
+                other.reason()
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(JobErrorResponse {
@@ -2413,66 +2455,28 @@ pub(crate) async fn jobs_cancel_handler(
     }
 }
 
-/// §7.5: a job is cancellable while its nullifier is **not yet published**.
-/// `queued`, `proving`, and `awaiting_signature` qualify; once the job
-/// enters `broadcasting`/`publishing` the nullifier is in flight and
-/// cancel is refused.
-fn job_is_cancellable(status: JobStatus) -> bool {
-    matches!(
-        status,
-        JobStatus::Queued | JobStatus::Proving | JobStatus::AwaitingSignature
-    )
-}
-
 /// `POST /v1/jobs/:id/cancel` — §7.5 normative cancel route.
 ///
 /// Cancels a **not-yet-published** job (`queued` | `proving` |
 /// `awaiting_signature`). Once the nullifier is broadcast
 /// (`broadcasting` / completed), cancel is refused as `wrong_phase`.
 /// Outward errors use the closed §7.5 `{error, message}` body.
+///
+/// Spec foundation: §7.5 `POST /v1/jobs/<job_id>/cancel` — "cancels a
+/// not-yet-published job"; §7.8 `CancelJob` — same; wire table maps
+/// `wrong_phase` when the job is past the accepting status. The
+/// implementation set is exactly the statuses **before** `publishing`
+/// (`accepted`/`queued`, `proving`, `awaiting_signature`).
 pub(crate) async fn jobs_cancel_v1_handler(
     State(state): State<AppState>,
     V1JobId(id): V1JobId,
 ) -> axum::response::Response {
-    // Distinguish job_not_found from wrong_phase (legacy cancel folds both
-    // into a single Ok(false) conflict).
-    match state.job_store.load(id).await {
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(v1_error_body("job_not_found", "Job not found")),
-            )
-                .into_response();
-        }
-        Ok(Some(job)) if !job_is_cancellable(job.status) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(v1_error_body(
-                    "wrong_phase",
-                    format!(
-                        "Job is in status `{}` and is no longer cancellable \
-                         (nullifier already published or terminal)",
-                        v1_status_wire(job.status)
-                    ),
-                )),
-            )
-                .into_response();
-        }
-        Ok(Some(_)) => {}
-        Err(e) => {
-            tracing::error!("JobStore::load failed in v1 cancel: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v1_error_body("internal_error", "Failed to load job")),
-            )
-                .into_response();
-        }
-    }
-
-    // v1.1 path only — widened not-yet-published set. Legacy
-    // `/api/jobs/:id/cancel` keeps `JobStore::cancel` (queued only).
-    match state.job_store.cancel_not_yet_published(id).await {
-        Ok(true) => {
+    let service = KernelService::from_store(Arc::clone(&state.job_store));
+    match service
+        .cancel_job(JobRequest { id: JobId(id) }, CancelPolicy::NotYetPublished)
+        .await
+    {
+        Ok(_job) => {
             // Envelope strip is atomic with the status flip in
             // `cancel_not_yet_published`. Drop in-memory staging only.
             state.pending_sign_map.remove(&id);
@@ -2501,25 +2505,20 @@ pub(crate) async fn jobs_cancel_v1_handler(
             )
                 .into_response()
         }
-        Ok(false) => (
-            // Lost the race with the dispatcher between load and cancel
-            // (e.g. nullifier published into broadcasting).
-            StatusCode::CONFLICT,
-            Json(v1_error_body(
-                "wrong_phase",
-                "Job is no longer in a cancellable state",
-            )),
-        )
-            .into_response(),
-        Err(e) => {
-            tracing::error!("JobStore::cancel_not_yet_published failed: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v1_error_body("internal_error", "Failed to cancel job")),
-            )
-                .into_response()
+        Err(e) => v1_cancel_error(e),
+    }
+}
+
+fn v1_cancel_error(err: KernelError) -> axum::response::Response {
+    let desc = error_contract::describe(err.code);
+    let status = StatusCode::from_u16(desc.http_status)
+        .expect("error_contract http_status values are valid HTTP codes");
+    if err.code == KernelErrorCode::InternalError {
+        if let Some(ctx) = &err.internal_context {
+            tracing::error!("CancelJob (v1) internal_error: {}", ctx.detail);
         }
     }
+    (status, Json(v1_error_body(desc.reason, err.public_message))).into_response()
 }
 
 /// `GET /v1/jobs/:id/stream` — §7.5 normative SSE route.
@@ -2528,112 +2527,104 @@ pub(crate) async fn jobs_cancel_v1_handler(
 /// successful terminal job, and `event: error` for `failed` / `cancelled`
 /// with a closed enumeration `error` object. Unknown ids and DB failures
 /// return the closed §7.5 error body (never a bare framework status).
+///
+/// Domain source: [`KernelService::stream_job`]. Heartbeat is HTTP-only.
 pub(crate) async fn stream_job_v1_handler(
     V1JobId(id): V1JobId,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    use futures_util::StreamExt;
 
-    let job = match state.job_store.load(id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(v1_error_body("job_not_found", "Job not found")),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!("JobStore::load failed in v1 stream handler: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v1_error_body("internal_error", "Failed to load job")),
-            )
-                .into_response();
-        }
+    let service = KernelService::new(
+        Arc::clone(&state.job_store),
+        JobEventHub::new(Arc::clone(&state.job_notify_map)),
+    );
+    let domain_stream = match service.stream_job(JobRequest { id: JobId(id) }).await {
+        Ok(s) => s,
+        Err(e) => return v1_stream_open_error(e),
     };
 
-    let notifier = state
-        .job_notify_map
-        .entry(id)
-        .or_insert_with(|| Arc::new(JobNotifier::new()))
-        .clone();
-    let rx = notifier.phase_tx.subscribe();
-    let stream = build_phase_stream_v1(job, rx);
+    let stream = async_stream::stream! {
+        let mut domain_stream = domain_stream;
+        while let Some(item) = domain_stream.next().await {
+            match item {
+                Ok(ev) => {
+                    let terminal = ev.job.state.is_terminal();
+                    yield Ok::<Event, Infallible>(sse_event_from_job_event_v1(&ev));
+                    if terminal {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    // Mid-stream domain failure: log and close (no half-frame).
+                    if let Some(ctx) = &e.internal_context {
+                        tracing::error!("StreamJob (v1) mid-stream error: {}", ctx.detail);
+                    } else {
+                        tracing::error!("StreamJob (v1) mid-stream error: {}", e);
+                    }
+                    return;
+                }
+            }
+        }
+    };
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(SSE_HEARTBEAT_INTERVAL))
         .into_response()
 }
 
-/// §7.5 SSE stream: terminal `failed`/`cancelled` → `event: error` with
-/// enumeration body; `completed` → `event: complete`; else `event: phase`.
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn build_phase_stream_v1(
-    job: Job,
-    mut rx: tokio::sync::broadcast::Receiver<JobPhaseEvent>,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    async_stream::stream! {
-        let initial = initial_event_from_job_v1(&job);
-        let is_terminal = job.status.is_terminal();
-        yield Ok(initial);
-        if is_terminal {
-            return;
-        }
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let is_terminal = event.status.is_terminal();
-                    yield Ok(event_from_phase_v1(&event, job.public_id, job.kind.as_str()));
-                    if is_terminal {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
+fn v1_stream_open_error(err: KernelError) -> axum::response::Response {
+    let desc = error_contract::describe(err.code);
+    let status = StatusCode::from_u16(desc.http_status)
+        .expect("error_contract http_status values are valid HTTP codes");
+    if err.code == KernelErrorCode::InternalError {
+        if let Some(ctx) = &err.internal_context {
+            tracing::error!("StreamJob (v1) open internal_error: {}", ctx.detail);
         }
     }
+    (status, Json(v1_error_body(desc.reason, err.public_message))).into_response()
 }
 
-/// §7.5 initial SSE frame from a job row.
-pub(crate) fn initial_event_from_job_v1(job: &Job) -> Event {
-    let status_wire = v1_status_wire(job.status);
-    let (event_name, payload) = match job.status {
-        JobStatus::Completed => (
-            "complete",
-            serde_json::json!({
-                "job_id": job.public_id,
-                "kind": job.kind.as_str(),
-                "status": status_wire,
-                "result": job.response_body.clone().unwrap_or(serde_json::Value::Null),
-            }),
-        ),
-        JobStatus::Failed | JobStatus::Cancelled => (
-            "error",
-            serde_json::json!({
-                "job_id": job.public_id,
-                "status": status_wire,
-                "error": crate::v1::decode_job_error(job.error.as_deref(), job.status),
-            }),
-        ),
-        JobStatus::AwaitingSignature => {
+/// §7.5 SSE frame from a domain [`JobEvent`].
+pub(crate) fn sse_event_from_job_event_v1(event: &JobEvent) -> Event {
+    let job = &event.job;
+    let status_wire = job.normative_status().as_v1_str();
+    let event_name = event.kind.as_v1_str();
+    let payload = match &job.state {
+        JobState::Completed { result } => serde_json::json!({
+            "job_id": job.id.as_uuid(),
+            "kind": job.kind.as_str(),
+            "status": status_wire,
+            "result": result.0.clone(),
+        }),
+        JobState::Failed { error } => serde_json::json!({
+            "job_id": job.id.as_uuid(),
+            "status": status_wire,
+            "error": crate::v1::decode_job_error(error.as_deref(), JobStatus::Failed),
+        }),
+        JobState::Cancelled { error } => serde_json::json!({
+            "job_id": job.id.as_uuid(),
+            "status": status_wire,
+            "error": crate::v1::decode_job_error(error.as_deref(), JobStatus::Cancelled),
+        }),
+        JobState::AwaitingSignature { payload, .. } => {
             let mut data = serde_json::json!({
                 "status": status_wire,
                 "progress": v1_progress_wire(job.progress),
             });
-            if let Some(surface) = job.response_body.clone() {
-                data.as_object_mut()
-                    .expect("object")
-                    .insert("awaiting_signature".to_string(), surface);
-            }
+            // Presence enforced by projection — insert, do not `if let Some`.
+            data.as_object_mut()
+                .expect("object")
+                .insert("awaiting_signature".to_string(), payload.0.clone());
             if !job.phase.is_empty() {
                 data.as_object_mut().expect("object").insert(
                     "phase".to_string(),
                     serde_json::Value::String(job.phase.clone()),
                 );
             }
-            ("phase", data)
+            data
         }
-        _ => {
+        JobState::Accepted | JobState::Proving | JobState::Publishing => {
             let mut data = serde_json::json!({
                 "status": status_wire,
                 "progress": v1_progress_wire(job.progress),
@@ -2644,72 +2635,7 @@ pub(crate) fn initial_event_from_job_v1(job: &Job) -> Event {
                     serde_json::Value::String(job.phase.clone()),
                 );
             }
-            ("phase", data)
-        }
-    };
-    Event::default()
-        .event(event_name)
-        .json_data(payload)
-        .expect("Event::json_data cannot fail for a freshly built serde_json::Value")
-}
-
-/// §7.5 SSE frame from a dispatcher phase event.
-pub(crate) fn event_from_phase_v1(event: &JobPhaseEvent, job_id: Uuid, kind: &str) -> Event {
-    let status_wire = v1_status_wire(event.status);
-    let (event_name, payload) = match event.status {
-        JobStatus::Completed => (
-            "complete",
-            serde_json::json!({
-                "job_id": job_id,
-                "kind": kind,
-                "status": status_wire,
-                "result": event.result.clone().unwrap_or(serde_json::Value::Null),
-            }),
-        ),
-        JobStatus::Failed | JobStatus::Cancelled => {
-            let error = match event.error.as_deref() {
-                Some(raw) => crate::v1::decode_job_error(Some(raw), event.status),
-                None => crate::v1::decode_job_error(None, event.status),
-            };
-            (
-                "error",
-                serde_json::json!({
-                    "job_id": job_id,
-                    "status": status_wire,
-                    "error": error,
-                }),
-            )
-        }
-        JobStatus::AwaitingSignature => {
-            let mut data = serde_json::json!({
-                "status": status_wire,
-                "progress": 0.0,
-            });
-            if let Some(surface) = event.result.clone() {
-                data.as_object_mut()
-                    .expect("object")
-                    .insert("awaiting_signature".to_string(), surface);
-            }
-            if !event.phase.is_empty() {
-                data.as_object_mut().expect("object").insert(
-                    "phase".to_string(),
-                    serde_json::Value::String(event.phase.clone()),
-                );
-            }
-            ("phase", data)
-        }
-        _ => {
-            let mut data = serde_json::json!({
-                "status": status_wire,
-                "progress": 0.0,
-            });
-            if !event.phase.is_empty() {
-                data.as_object_mut().expect("object").insert(
-                    "phase".to_string(),
-                    serde_json::Value::String(event.phase.clone()),
-                );
-            }
-            ("phase", data)
+            data
         }
     };
     Event::default()
@@ -2731,85 +2657,113 @@ pub(crate) fn event_from_phase_v1(event: &JobPhaseEvent, job_id: Uuid, kind: &st
 // subscribes, forwards events as SSE frames, and closes on the
 // first terminal event.
 
-/// SSE event-builder helper: emit the current job snapshot as the
-/// first frame of a freshly-opened stream. Mirrors the wire-shape the
-/// `GET /api/jobs/:id` handler returns so the SSE consumer's parse
-/// path is identical to the existing poll parse path.
+/// Explicit JSON encoding of an optional integer field: `null` means
+/// "not present" on the legacy wire (a statement, not a mask).
+fn option_i64_json(value: Option<i64>) -> serde_json::Value {
+    match value {
+        Some(v) => serde_json::Value::from(v),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Explicit JSON encoding of an optional free-text error on the legacy wire.
+fn option_string_json(value: Option<&str>) -> serde_json::Value {
+    match value {
+        Some(s) => serde_json::Value::String(s.to_string()),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Legacy SSE frame from a domain [`JobEvent`].
 ///
-/// Pure (no I/O, no async) so the function-level coverage gate can hit
-/// every arm — split into a free function rather than baked into the
-/// stream future so the test suite can drive each branch directly.
-pub(crate) fn initial_event_from_job(job: &Job) -> Event {
-    let payload = serde_json::json!({
-        "status": job.status.as_str(),
-        "phase": job.phase,
-        "proof_id": if job.status == JobStatus::AwaitingSignature {
-            job.proof_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
-        } else {
-            serde_json::Value::Null
-        },
-        "result": if job.status == JobStatus::Completed
-            || job.status == JobStatus::AwaitingSignature
-        {
-            // `awaiting_signature` carries the ash/ocr hex the wallet
-            // signs; `completed` carries the terminal body. Both are in
-            // `response_body`, so the SSE initial frame mirrors the GET
-            // snapshot for either status.
-            job.response_body.clone().unwrap_or(serde_json::Value::Null)
-        } else {
-            serde_json::Value::Null
-        },
-        "error": if job.status == JobStatus::Failed {
-            job.error.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
-        } else {
-            serde_json::Value::Null
-        },
-    });
-    let event_name = if job.status.is_terminal() {
-        "complete"
-    } else {
-        "phase"
+/// Field set matches the pre-split `/api/jobs/:id/stream` wire for every
+/// well-formed state. Required payloads are already enforced by projection.
+pub(crate) fn sse_event_from_job_event_legacy(event: &JobEvent) -> Event {
+    let job = &event.job;
+    let status = job.normative_status().as_legacy_str();
+    let (proof_id, result, error) = match &job.state {
+        JobState::AwaitingSignature { payload, proof_id } => (
+            option_i64_json(*proof_id),
+            payload.0.clone(),
+            serde_json::Value::Null,
+        ),
+        JobState::Completed { result } => (
+            serde_json::Value::Null,
+            result.0.clone(),
+            serde_json::Value::Null,
+        ),
+        JobState::Failed { error } => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            option_string_json(error.as_deref()),
+        ),
+        // Legacy initial frames never projected `error` for cancelled.
+        // Mid-stream cancel events historically also left error null
+        // when the phase event carried none — cancelled with a free-text
+        // error is still projected as null on the initial path; for
+        // mid-stream phase conversion we keep the same status gate so
+        // wire stays equal to the legacy snapshot projection.
+        JobState::Accepted
+        | JobState::Proving
+        | JobState::Publishing
+        | JobState::Cancelled { .. } => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ),
     };
-    // `Event::json_data` only returns `Err` when its argument has a
-    // custom `Serialize` impl that itself errs (and even then only
-    // when the resulting bytes are not valid UTF-8 — which JSON's
-    // ASCII-superset output can't violate). The `payload` here is a
-    // `serde_json::Value` built inline above with no custom impls,
-    // so the error arm is structurally unreachable. `.expect()`
-    // documents the invariant inline — a failure here would mean
-    // axum/serde-json changed semantics, not a runtime data shape.
+    let payload = serde_json::json!({
+        "status": status,
+        "phase": job.phase,
+        "proof_id": proof_id,
+        "result": result,
+        "error": error,
+    });
+    let event_name = event.kind.as_legacy_str();
     Event::default()
         .event(event_name)
         .json_data(payload)
         .expect("Event::json_data cannot fail for a freshly built serde_json::Value")
 }
 
-/// SSE event-builder helper: translate a dispatcher-published
-/// [`JobPhaseEvent`] into an SSE frame. Terminal statuses emit
-/// `event: complete`; everything else emits `event: phase`.
-///
-/// Mirrors `initial_event_from_job` shape so the wallet's
-/// `EventSource.addEventListener('phase' | 'complete', …)` parse path
-/// handles both the initial frame and subsequent updates uniformly.
-pub(crate) fn event_from_phase(event: &JobPhaseEvent) -> Event {
-    let payload = serde_json::json!({
-        "status": event.status.as_str(),
-        "phase": event.phase,
-        "proof_id": event.proof_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
-        "result": event.result.clone().unwrap_or(serde_json::Value::Null),
-        "error": event.error.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
-    });
-    let event_name = if event.status.is_terminal() {
-        "complete"
-    } else {
-        "phase"
+/// Mid-stream legacy frame: unlike the initial snapshot, historical
+/// phase frames surface whatever the phase event carried (proof_id /
+/// result / error) without status-gating error to Failed only.
+/// Domain projection has already fail-closed required payloads.
+pub(crate) fn sse_event_from_job_event_legacy_phase(event: &JobEvent) -> Event {
+    let job = &event.job;
+    let status = job.normative_status().as_legacy_str();
+    let (proof_id, result, error) = match &job.state {
+        JobState::AwaitingSignature { payload, proof_id } => (
+            option_i64_json(*proof_id),
+            payload.0.clone(),
+            serde_json::Value::Null,
+        ),
+        JobState::Completed { result } => (
+            serde_json::Value::Null,
+            result.0.clone(),
+            serde_json::Value::Null,
+        ),
+        JobState::Failed { error } | JobState::Cancelled { error } => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            option_string_json(error.as_deref()),
+        ),
+        JobState::Accepted | JobState::Proving | JobState::Publishing => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ),
     };
-    // Same invariant as `initial_event_from_job`: `payload` is a
-    // freshly built `serde_json::Value` with no custom Serialize
-    // impls, so `Event::json_data` is structurally infallible. See
-    // the longer note in `initial_event_from_job` above.
+    let payload = serde_json::json!({
+        "status": status,
+        "phase": job.phase,
+        "proof_id": proof_id,
+        "result": result,
+        "error": error,
+    });
     Event::default()
-        .event(event_name)
+        .event(event.kind.as_legacy_str())
         .json_data(payload)
         .expect("Event::json_data cannot fail for a freshly built serde_json::Value")
 }
@@ -2879,92 +2833,71 @@ pub(crate) async fn stream_job_handler(
     Path(id): Path<Uuid>,
     State(state): State<AppState>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    // 1. Load the row up-front so a 404 surfaces with the standard
-    //    JSON shape (not as an immediately-closed SSE stream — the
-    //    wallet's polling fallback expects a non-stream error
-    //    response for unknown IDs).
-    let job = match state.job_store.load(id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => return Err(StatusCode::NOT_FOUND),
+    use futures_util::StreamExt;
+
+    // Domain StreamJob: load + project snapshot, then phase changes.
+    // 404 / 500 surface as plain status codes (legacy contract — no JSON body).
+    let service = KernelService::new(
+        Arc::clone(&state.job_store),
+        JobEventHub::new(Arc::clone(&state.job_notify_map)),
+    );
+    let domain_stream = match service.stream_job(JobRequest { id: JobId(id) }).await {
+        Ok(s) => s,
         Err(e) => {
-            tracing::error!("JobStore::load failed in stream handler: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err(legacy_stream_open_status(e));
         }
     };
 
-    // 2. Subscribe to the per-job broadcast channel BEFORE sending
-    //    the initial event so any event that lands between "build
-    //    initial" and "spawn stream loop" lands in the receiver
-    //    queue. The `or_insert_with` arm handles the (uncommon) case
-    //    where the dispatcher has not yet created the notifier
-    //    (e.g. the row is still `queued` waiting to be picked up).
-    //
-    //    Cleanup race: the dispatcher's terminal-publish path runs
-    //    `notify_map.remove(id)` AFTER pushing the final event onto
-    //    the broadcast channel. A fresh subscriber that opens between
-    //    publish and remove would `or_insert_with` a brand-new
-    //    notifier, replacing the just-dropped one. That is safe
-    //    because the initial-state read above already reflects the
-    //    terminal row (the dispatcher persisted before publishing),
-    //    so `initial_event_from_job` emits the `complete` / `fail`
-    //    frame and the stream returns end-of-stream on the next poll
-    //    without ever depending on the now-orphaned subscriber.
-    let notifier = state
-        .job_notify_map
-        .entry(id)
-        .or_insert_with(|| Arc::new(JobNotifier::new()))
-        .clone();
-    let rx = notifier.phase_tx.subscribe();
-
-    let stream = build_phase_stream(job, rx);
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_HEARTBEAT_INTERVAL)))
-}
-
-/// Build the long-lived SSE stream that fans out phase events to the
-/// wallet.
-///
-/// Coverage: the per-event loop is driven by tokio time + the
-/// broadcast channel, neither of which the deterministic test harness
-/// can exhaustively cover without a real wall-clock advance. The
-/// initial-state emission and the terminal-job-early-close path stay
-/// pure (covered by [`initial_event_from_job`]); the loop itself is
-/// annotated `coverage(off)` so the 100% line/function gate doesn't
-/// trip on the inner `tokio::select!` arms. Same shape as
-/// `scanner_ws::run_subscription_loop` — see CI workflow's
-/// `--ignore-filename-regex` and the `coverage_nightly` cfg in
-/// `Cargo.toml` for the project-wide pattern.
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn build_phase_stream(
-    job: Job,
-    mut rx: tokio::sync::broadcast::Receiver<JobPhaseEvent>,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    async_stream::stream! {
-        // 1. Initial event with the current state. If terminal,
-        //    close immediately — the wallet only needs the snapshot.
-        let initial = initial_event_from_job(&job);
-        let is_terminal = job.status.is_terminal();
-        yield Ok(initial);
-        if is_terminal {
-            return;
-        }
-
-        // 2. Forward every event published by the dispatcher. Close
-        //    the stream on the first terminal event so the wallet's
-        //    EventSource fires its `complete`-listener and detaches.
-        //    `Lagged` is treated the same as channel-closed — the
-        //    fallback polling path will surface the eventual terminal
-        //    state, so the stream does not need to recover.
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let is_terminal = event.status.is_terminal();
-                    yield Ok(event_from_phase(&event));
-                    if is_terminal {
+    // Snapshot uses status-gated error projection; subsequent frames use
+    // the historical phase-event shape (error field also on cancelled).
+    let stream = async_stream::stream! {
+        let mut domain_stream = domain_stream;
+        let mut first = true;
+        while let Some(item) = domain_stream.next().await {
+            match item {
+                Ok(ev) => {
+                    let terminal = ev.job.state.is_terminal();
+                    let frame = if first {
+                        first = false;
+                        sse_event_from_job_event_legacy(&ev)
+                    } else {
+                        sse_event_from_job_event_legacy_phase(&ev)
+                    };
+                    yield Ok::<Event, Infallible>(frame);
+                    if terminal {
                         return;
                     }
                 }
-                Err(_) => return,
+                Err(e) => {
+                    if let Some(ctx) = &e.internal_context {
+                        tracing::error!("StreamJob (legacy) mid-stream error: {}", ctx.detail);
+                    } else {
+                        tracing::error!("StreamJob (legacy) mid-stream error: {}", e);
+                    }
+                    return;
+                }
             }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_HEARTBEAT_INTERVAL)))
+}
+
+fn legacy_stream_open_status(err: KernelError) -> StatusCode {
+    match err.code {
+        KernelErrorCode::JobNotFound => StatusCode::NOT_FOUND,
+        KernelErrorCode::InternalError => {
+            if let Some(ctx) = &err.internal_context {
+                tracing::error!("StreamJob (legacy) open internal_error: {}", ctx.detail);
+            }
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        other => {
+            tracing::error!(
+                "StreamJob (legacy) unexpected open error {}",
+                other.reason()
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }

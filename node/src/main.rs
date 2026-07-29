@@ -263,6 +263,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // instead of racing on the process-wide env var under
     // `--test-threads=8` (issue #181 Opt A).
     let v1_engine_for_rest = Some(Arc::clone(&v1_adapter));
+    // REST + kernel.v1 gRPC share one job store / notify map inside
+    // `start_rest_node` (StreamJob must see dispatcher phase events).
+    // `KERNEL_GRPC_ADDR` was validated at boot — no default host/port.
     tokio::spawn(async move {
         if let Err(e) = start_rest_node(
             account_node,
@@ -272,21 +275,11 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             &proofs_dir,
             v1_readiness,
             v1_engine_for_rest,
+            kernel_grpc_addr,
         )
         .await
         {
             eprintln!("Account node error: {}", e);
-            std::process::exit(1);
-        }
-    });
-
-    // Additive kernel.v1 gRPC edge (§7.8). Does **not** replace or redirect
-    // the HTTP router — Kernel/API cutover is a separate step. Address was
-    // validated at boot (`KERNEL_GRPC_ADDR`); procedures are currently
-    // unimplemented skeletons (see `node::kernel_rpc`).
-    tokio::spawn(async move {
-        if let Err(e) = kernel_rpc::serve_kernel_grpc(kernel_grpc_addr).await {
-            eprintln!("Kernel gRPC error: {}", e);
             std::process::exit(1);
         }
     });

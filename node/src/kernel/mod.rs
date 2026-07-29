@@ -4,11 +4,15 @@
 //! does not move. This tree must not depend on `axum` or `tonic`.
 
 pub(crate) mod error;
+pub(crate) mod job_events;
 pub(crate) mod job_projection;
 pub(crate) mod jobs;
 pub(crate) mod service;
 pub(crate) mod types;
 
-pub(crate) use error::{KernelError, KernelErrorCode, KernelResult};
+pub(crate) use error::{KernelError, KernelErrorCode};
+pub(crate) use job_events::JobEventHub;
 pub(crate) use service::KernelService;
-pub(crate) use types::{Job, JobId, JobKind, JobRequest, JobState, NormativeJobStatus};
+pub(crate) use types::{
+    CancelPolicy, Job, JobEvent, JobId, JobRequest, JobState, NormativeJobStatus,
+};

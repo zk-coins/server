@@ -3,7 +3,12 @@
 //! A row that cannot be represented as a complete domain job is an
 //! `internal_error`, never a partial success. No silent omission of
 //! required payloads, no `unwrap_or` defaults, no JSON `null` stand-ins.
+//!
+//! Mid-stream dispatcher events (`JobPhaseEvent`) are decoded **once** here
+//! at the store/event boundary into the same typed `Job` — never re-parsed
+//! as free JSON inside each transport adapter.
 
+use crate::job_dispatcher::JobPhaseEvent;
 use crate::job_store;
 use crate::kernel::error::{KernelError, KernelResult};
 use crate::kernel::types::{Job, JobId, JobKind, JobPayload, JobState, NormativeJobStatus};
@@ -19,34 +24,12 @@ use crate::kernel::types::{Job, JobId, JobKind, JobPayload, JobState, NormativeJ
 pub(crate) fn project_job_row(row: &job_store::Job) -> KernelResult<Job> {
     let kind = JobKind::from_store(row.kind);
     let normative = NormativeJobStatus::from_store(row.status);
-    let state = match normative {
-        NormativeJobStatus::Accepted => JobState::Accepted,
-        NormativeJobStatus::Proving => JobState::Proving,
-        NormativeJobStatus::Publishing => JobState::Publishing,
-        NormativeJobStatus::AwaitingSignature => {
-            let payload = require_response_payload(
-                &row.response_body,
-                "awaiting_signature job is missing response_body payload",
-            )?;
-            JobState::AwaitingSignature {
-                payload,
-                proof_id: row.proof_id,
-            }
-        }
-        NormativeJobStatus::Completed => {
-            let result = require_response_payload(
-                &row.response_body,
-                "completed job is missing response_body result",
-            )?;
-            JobState::Completed { result }
-        }
-        NormativeJobStatus::Failed => JobState::Failed {
-            error: row.error.clone(),
-        },
-        NormativeJobStatus::Cancelled => JobState::Cancelled {
-            error: row.error.clone(),
-        },
-    };
+    let state = project_state(
+        normative,
+        &row.response_body,
+        row.proof_id,
+        row.error.as_deref(),
+    )?;
 
     Ok(Job {
         id: JobId(row.public_id),
@@ -55,6 +38,69 @@ pub(crate) fn project_job_row(row: &job_store::Job) -> KernelResult<Job> {
         progress: row.progress,
         state,
     })
+}
+
+/// Project a dispatcher phase event into a typed domain job.
+///
+/// `id` / `kind` come from the stream subscription snapshot (events do not
+/// carry them). `progress` is not on the wire event today — mid-stream
+/// v1 frames hard-code `0.0`; pass `0` to match.
+///
+/// Required payloads (`completed.result`, `awaiting_signature` surface)
+/// are fail-closed — same rules as [`project_job_row`].
+pub(crate) fn project_phase_event(
+    id: JobId,
+    kind: JobKind,
+    progress: i16,
+    event: &JobPhaseEvent,
+) -> KernelResult<Job> {
+    let normative = NormativeJobStatus::from_store(event.status);
+    let state = project_state(
+        normative,
+        &event.result,
+        event.proof_id,
+        event.error.as_deref(),
+    )?;
+    Ok(Job {
+        id,
+        kind,
+        phase: event.phase.clone(),
+        progress,
+        state,
+    })
+}
+
+fn project_state(
+    normative: NormativeJobStatus,
+    response_body: &Option<serde_json::Value>,
+    proof_id: Option<i64>,
+    error: Option<&str>,
+) -> KernelResult<JobState> {
+    match normative {
+        NormativeJobStatus::Accepted => Ok(JobState::Accepted),
+        NormativeJobStatus::Proving => Ok(JobState::Proving),
+        NormativeJobStatus::Publishing => Ok(JobState::Publishing),
+        NormativeJobStatus::AwaitingSignature => {
+            let payload = require_response_payload(
+                response_body,
+                "awaiting_signature job is missing response_body payload",
+            )?;
+            Ok(JobState::AwaitingSignature { payload, proof_id })
+        }
+        NormativeJobStatus::Completed => {
+            let result = require_response_payload(
+                response_body,
+                "completed job is missing response_body result",
+            )?;
+            Ok(JobState::Completed { result })
+        }
+        NormativeJobStatus::Failed => Ok(JobState::Failed {
+            error: error.map(str::to_owned),
+        }),
+        NormativeJobStatus::Cancelled => Ok(JobState::Cancelled {
+            error: error.map(str::to_owned),
+        }),
+    }
 }
 
 /// Require a non-null JSON payload. SQL NULL and JSON `null` are both
@@ -250,5 +296,55 @@ mod tests {
         let job = project_job_row(&row).expect("attest");
         assert_eq!(job.kind, JobKind::AttestBalance);
         assert_eq!(job.kind.as_str(), "attest_balance");
+    }
+
+    #[test]
+    fn phase_event_completed_without_result_is_internal_error() {
+        use crate::job_dispatcher::JobPhaseEvent;
+        let ev = JobPhaseEvent {
+            status: StoreStatus::Completed,
+            phase: "completed".to_string(),
+            proof_id: None,
+            result: None,
+            error: None,
+        };
+        let err = project_phase_event(JobId(Uuid::nil()), JobKind::Mint, 0, &ev)
+            .expect_err("masking null result");
+        assert_eq!(err.code, KernelErrorCode::InternalError);
+        let detail = &err.internal_context.expect("ctx").detail;
+        assert!(
+            detail.contains("completed") && detail.contains("response_body"),
+            "detail={detail}"
+        );
+    }
+
+    #[test]
+    fn phase_event_awaiting_signature_without_payload_is_internal_error() {
+        use crate::job_dispatcher::JobPhaseEvent;
+        let ev = JobPhaseEvent {
+            status: StoreStatus::AwaitingSignature,
+            phase: "awaiting_signature".to_string(),
+            proof_id: Some(1),
+            result: None,
+            error: None,
+        };
+        let err = project_phase_event(JobId(Uuid::nil()), JobKind::Send, 0, &ev)
+            .expect_err("masking missing payload");
+        assert_eq!(err.code, KernelErrorCode::InternalError);
+    }
+
+    #[test]
+    fn phase_event_proving_with_null_fields_is_well_formed() {
+        use crate::job_dispatcher::JobPhaseEvent;
+        // proof_id/result/error null on proving is a statement, not masking.
+        let ev = JobPhaseEvent {
+            status: StoreStatus::Proving,
+            phase: "proving".to_string(),
+            proof_id: None,
+            result: None,
+            error: None,
+        };
+        let job = project_phase_event(JobId(Uuid::nil()), JobKind::Mint, 0, &ev).expect("proving");
+        assert_eq!(job.state, JobState::Proving);
     }
 }

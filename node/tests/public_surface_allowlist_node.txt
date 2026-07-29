@@ -15,8 +15,6 @@ node::kernel_rpc
 node::kernel_rpc::KERNEL_GRPC_ADDR_ENV
 node::kernel_rpc::KernelGrpcStartError
 node::kernel_rpc::kernel_grpc_addr_from_env
-node::kernel_rpc::serve_kernel_grpc
-node::kernel_rpc::start_kernel_grpc
 node::legacy_commitment_scan
 node::legacy_commitment_scan::LegacyCommitmentScanCap
 node::openapi

@@ -5338,7 +5338,12 @@ mod jobs_endpoint_tests {
             )),
         );
         job.completed_at = Some(chrono::Utc::now());
-        let frame = crate::router::initial_event_from_job_v1(&job);
+        // Domain projection + v1 SSE adapter (replaces deleted
+        // initial_event_from_job_v1 wrapper).
+        let domain = crate::kernel::job_projection::project_job_row(&job)
+            .expect("failed row is well-formed");
+        let frame =
+            crate::router::sse_event_from_job_event_v1(&crate::kernel::JobEvent::from_job(domain));
         let wire = format!("{:?}", frame);
         assert!(
             wire.contains("error"),
@@ -5364,7 +5369,16 @@ mod jobs_endpoint_tests {
                 "witness assembly failed",
             )),
         };
-        let mid = crate::router::event_from_phase_v1(&ev, job.public_id, "send");
+        let mid_domain = crate::kernel::job_projection::project_phase_event(
+            crate::kernel::JobId(job.public_id),
+            crate::kernel::types::JobKind::Send,
+            0,
+            &ev,
+        )
+        .expect("failed phase");
+        let mid = crate::router::sse_event_from_job_event_v1(&crate::kernel::JobEvent::from_job(
+            mid_domain,
+        ));
         let mid_wire = format!("{:?}", mid);
         assert!(
             mid_wire.contains("proving_failed"),
@@ -5699,14 +5713,9 @@ mod jobs_endpoint_tests {
     // SSE push channel coverage — `GET /api/jobs/:id/stream` (PR2).
     // =======================================================================
     //
-    // The handler entry point + helper functions
-    // (`initial_event_from_job`, `event_from_phase`) stay covered
-    // here. The long-lived stream loop in `build_phase_stream` is
-    // marked `#[cfg_attr(coverage_nightly, coverage(off))]` because
-    // its inner `tokio::select!` arms depend on real-time
-    // broadcast-channel deliveries that can't be deterministically
-    // covered without a wall-clock advance — same exclusion pattern
-    // as `scanner_ws::run_subscription_loop`.
+    // The handler entry point + SSE projection helpers
+    // (`sse_event_from_job_event_legacy`, `_legacy_phase`) stay covered
+    // here. Domain event source coverage lives in `kernel/job_events`.
 
     use crate::job_dispatcher::{JobNotifier, JobPhaseEvent};
     use crate::job_store::{Job, JobKind, JobStatus};
@@ -5749,7 +5758,8 @@ mod jobs_endpoint_tests {
         String::from_utf8_lossy(&bytes).to_string()
     }
 
-    // ---- `initial_event_from_job` pure-helper coverage ----
+    // ---- Legacy SSE projection pure-helper coverage ----
+    // (domain event source: `kernel/job_events`; wire: `sse_event_from_job_event_*`)
 
     /// Helper: build a `Job` row directly (no DB) so the pure helpers
     /// can be exercised without a testcontainer.
@@ -5780,10 +5790,29 @@ mod jobs_endpoint_tests {
         }
     }
 
+    fn legacy_snapshot_event(job: &Job) -> axum::response::sse::Event {
+        let domain = crate::kernel::job_projection::project_job_row(job)
+            .unwrap_or_else(|e| panic!("corrupt row: {e}"));
+        crate::router::sse_event_from_job_event_legacy(&crate::kernel::JobEvent::from_job(domain))
+    }
+
+    fn legacy_phase_event(ev: &JobPhaseEvent) -> axum::response::sse::Event {
+        let domain = crate::kernel::job_projection::project_phase_event(
+            crate::kernel::JobId(uuid::Uuid::nil()),
+            crate::kernel::types::JobKind::Mint,
+            0,
+            ev,
+        )
+        .unwrap_or_else(|e| panic!("corrupt phase: {e}"));
+        crate::router::sse_event_from_job_event_legacy_phase(&crate::kernel::JobEvent::from_job(
+            domain,
+        ))
+    }
+
     #[test]
     fn initial_event_proving_serialises_as_phase() {
         let job = make_job(JobStatus::Proving, None, None, None);
-        let event = crate::router::initial_event_from_job(&job);
+        let event = legacy_snapshot_event(&job);
         let wire = format!("{:?}", event);
         // The Event Debug impl renders the assembled SSE frame; we
         // assert on the event name field rather than the entire
@@ -5806,7 +5835,7 @@ mod jobs_endpoint_tests {
             })),
             None,
         );
-        let event = crate::router::initial_event_from_job(&job);
+        let event = legacy_snapshot_event(&job);
         // Re-serialise to check the payload contents.
         let wire = format!("{:?}", event);
         assert!(wire.contains("phase"), "wire: {}", wire);
@@ -5830,7 +5859,7 @@ mod jobs_endpoint_tests {
             Some(serde_json::json!({"success": true})),
             None,
         );
-        let event = crate::router::initial_event_from_job(&job);
+        let event = legacy_snapshot_event(&job);
         let wire = format!("{:?}", event);
         assert!(wire.contains("complete"), "wire: {}", wire);
         assert!(
@@ -5843,7 +5872,7 @@ mod jobs_endpoint_tests {
     #[test]
     fn initial_event_failed_emits_complete_event_with_error() {
         let job = make_job(JobStatus::Failed, None, None, Some("boom".to_string()));
-        let event = crate::router::initial_event_from_job(&job);
+        let event = legacy_snapshot_event(&job);
         let wire = format!("{:?}", event);
         assert!(wire.contains("complete"), "wire: {}", wire);
         assert!(wire.contains("boom"), "wire: {}", wire);
@@ -5852,12 +5881,12 @@ mod jobs_endpoint_tests {
     #[test]
     fn initial_event_cancelled_emits_complete_event() {
         let job = make_job(JobStatus::Cancelled, None, None, None);
-        let event = crate::router::initial_event_from_job(&job);
+        let event = legacy_snapshot_event(&job);
         let wire = format!("{:?}", event);
         assert!(wire.contains("complete"), "wire: {}", wire);
     }
 
-    // ---- `event_from_phase` pure-helper coverage ----
+    // ---- mid-stream legacy phase projection ----
 
     #[test]
     fn event_from_phase_proving_emits_phase_event() {
@@ -5868,21 +5897,28 @@ mod jobs_endpoint_tests {
             result: None,
             error: None,
         };
-        let frame = crate::router::event_from_phase(&ev);
+        let frame = legacy_phase_event(&ev);
         let wire = format!("{:?}", frame);
         assert!(wire.contains("phase"), "wire: {}", wire);
     }
 
     #[test]
     fn event_from_phase_awaiting_signature_includes_proof_id() {
+        // Domain projection fail-closes without a signature surface payload
+        // (same rule as GetJob / project_job_row). Include a minimal body so
+        // the pure helper exercises the proof_id wire field.
+        // Statement now also held by kernel/job_events + sse projection.
         let ev = JobPhaseEvent {
             status: JobStatus::AwaitingSignature,
             phase: "awaiting_signature".to_string(),
             proof_id: Some(17),
-            result: None,
+            result: Some(serde_json::json!({
+                "account_state_hash": "aa".repeat(32),
+                "output_coins_root": "bb".repeat(32),
+            })),
             error: None,
         };
-        let frame = crate::router::event_from_phase(&ev);
+        let frame = legacy_phase_event(&ev);
         let wire = format!("{:?}", frame);
         assert!(wire.contains("phase"), "wire: {}", wire);
         assert!(wire.contains("17"), "wire: {}", wire);
@@ -5897,7 +5933,7 @@ mod jobs_endpoint_tests {
             result: Some(serde_json::json!({"ok": 1})),
             error: None,
         };
-        let frame = crate::router::event_from_phase(&ev);
+        let frame = legacy_phase_event(&ev);
         let wire = format!("{:?}", frame);
         assert!(wire.contains("complete"), "wire: {}", wire);
     }
@@ -5911,7 +5947,7 @@ mod jobs_endpoint_tests {
             result: None,
             error: Some("err".to_string()),
         };
-        let frame = crate::router::event_from_phase(&ev);
+        let frame = legacy_phase_event(&ev);
         let wire = format!("{:?}", frame);
         assert!(wire.contains("complete"), "wire: {}", wire);
     }
@@ -5925,7 +5961,7 @@ mod jobs_endpoint_tests {
             result: None,
             error: None,
         };
-        let frame = crate::router::event_from_phase(&ev);
+        let frame = legacy_phase_event(&ev);
         let wire = format!("{:?}", frame);
         assert!(wire.contains("complete"), "wire: {}", wire);
     }
@@ -6266,6 +6302,61 @@ mod jobs_endpoint_tests {
         assert_eq!(ev.status, JobStatus::Cancelled);
         assert_eq!(ev.phase, "cancelled");
     }
+
+    // ---- Block 2: fail-closed stream masking (would have been green on old code) ----
+
+    /// Plant a completed row with SQL NULL `response_body`. Opening the
+    /// legacy stream must not emit `event: complete` with `result: null`.
+    #[tokio::test]
+    async fn jobs_stream_completed_without_result_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let job_id = plant_completed_without_response_body(
+            pool.as_ref(),
+            [0xD1u8; 32],
+            "k-stream-corrupt-complete",
+        )
+        .await;
+
+        let req = Request::get(format!("/api/jobs/{}/stream", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "corrupt completed must not open an SSE stream that masks null result"
+        );
+    }
+
+    /// Same corrupt row on the normative stream → §7.5 `internal_error`.
+    #[tokio::test]
+    async fn v1_stream_completed_without_result_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let job_id = plant_completed_without_response_body(
+            pool.as_ref(),
+            [0xD2u8; 32],
+            "k-v1-stream-corrupt-complete",
+        )
+        .await;
+
+        let req = Request::get(format!("/v1/jobs/{}/stream", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "internal_error");
+        assert_eq!(v["message"], "Failed to load job");
+        assert!(
+            v.get("result").is_none(),
+            "must not look like success: {body}"
+        );
+    }
+
+    // Fail-closed pure-helper cases for completed / awaiting_signature
+    // without payload are covered in `kernel::job_projection` tests
+    // (assert on KernelErrorCode + detail cause — no `should_panic`).
 
     // -----------------------------------------------------------------------
     // Gap G6 — §7.5 balance attestation surface

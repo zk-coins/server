@@ -1,8 +1,8 @@
 //! Transport adapters and shared error contract.
 //!
-//! Block 1 only introduces the total error mapping. HTTP/gRPC adapter
-//! modules land with later blocks. Visibility is `pub(crate)`.
+//! Visibility is `pub(crate)`. HTTP SSE projections for jobs currently live
+//! in `router` (byte-stable with existing pure helpers); gRPC conversion
+//! for StreamJob/CancelJob lives under `grpc/`.
 
 pub(crate) mod error_contract;
-
-pub(crate) use error_contract::{describe, ErrorDescriptor, GrpcStatusCode, ERROR_INFO_DOMAIN};
+pub(crate) mod grpc;

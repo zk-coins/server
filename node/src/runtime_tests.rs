@@ -133,6 +133,13 @@ async fn start_rest_node_binds_and_serves_health() {
     let scope = setup_pool().await;
     let pool = Arc::new(scope.pool.clone());
 
+    // Ephemeral kernel gRPC port (same race window as the REST probe).
+    let grpc_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind grpc probe");
+    let kernel_grpc_addr = grpc_probe.local_addr().expect("grpc probe addr");
+    drop(grpc_probe);
+
     let handle = tokio::spawn(async move {
         start_rest_node(
             account_node,
@@ -142,6 +149,7 @@ async fn start_rest_node_binds_and_serves_health() {
             &proofs_dir,
             crate::runtime::V1Readiness::default(),
             None,
+            kernel_grpc_addr,
         )
         .await
     });

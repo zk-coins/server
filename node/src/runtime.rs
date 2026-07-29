@@ -38,6 +38,14 @@ pub struct V1Readiness {
     pub finality_ok: Option<Arc<AtomicBool>>,
 }
 
+/// Bind REST + job dispatcher + kernel gRPC, sharing one job store and notify map.
+///
+/// # Parameters
+///
+/// - `kernel_grpc_addr` — Kernel gRPC listen address (**required**, no default).
+///   Validated at the binary edge via `KERNEL_GRPC_ADDR` before this is called.
+///   Served with the same job store + notify map as REST so `StreamJob`
+///   subscribers see dispatcher phase events.
 pub async fn start_rest_node(
     account_node: AccountNode,
     username_store: UsernameStore,
@@ -48,6 +56,7 @@ pub async fn start_rest_node(
     // Shared v1.1 engine (when `ZKCOINS_V1_SHADOW=1`). Used to drive
     // `StateEngine::finalise` after an accepted `/v1/jobs/{id}/sign`.
     v1_engine: Option<Arc<crate::v1::EngineAdapter>>,
+    kernel_grpc_addr: SocketAddr,
 ) -> anyhow::Result<()> {
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -214,6 +223,24 @@ pub async fn start_rest_node(
         DEFAULT_AWAITING_SIGNATURE_TIMEOUT,
         job_rx,
     );
+
+    // Additive kernel.v1 gRPC edge (§7.8). Shares job store + notify map
+    // with REST/dispatcher so StreamJob is live, not snapshot-only.
+    // Fail-closed: domain façade is constructed with real state only.
+    {
+        let domain = crate::kernel_rpc::domain_from_parts(
+            Arc::clone(&job_store),
+            Arc::clone(&job_notify_map),
+        );
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::kernel_rpc::serve_kernel_grpc_with_domain(kernel_grpc_addr, domain).await
+            {
+                eprintln!("Kernel gRPC error: {}", e);
+                std::process::exit(1);
+            }
+        });
+    }
 
     let app = create_router(state);
 

@@ -115,6 +115,28 @@ impl KernelError {
     pub(crate) fn store_load_failed(detail: impl Into<String>) -> Self {
         Self::with_internal(KernelErrorCode::InternalError, "Failed to load job", detail)
     }
+
+    pub(crate) fn store_cancel_failed(detail: impl Into<String>) -> Self {
+        Self::with_internal(
+            KernelErrorCode::InternalError,
+            "Failed to cancel job",
+            detail,
+        )
+    }
+
+    /// Job is past the status set that accepts this operation (§7.5 `wrong_phase`).
+    pub(crate) fn wrong_phase(public_message: impl Into<String>) -> Self {
+        Self::new(KernelErrorCode::WrongPhase, public_message)
+    }
+
+    /// Phase broadcast channel lagged or closed mid-stream.
+    pub(crate) fn stream_channel_failed(detail: impl Into<String>) -> Self {
+        Self::with_internal(
+            KernelErrorCode::InternalError,
+            "Job event stream failed",
+            detail,
+        )
+    }
 }
 
 impl fmt::Display for KernelError {

@@ -1,26 +1,24 @@
-//! `kernel.v1` gRPC service skeleton (§7.8).
+//! `kernel.v1` gRPC service (§7.8).
 //!
-//! Binds a tonic server on `KERNEL_GRPC_ADDR` (required, no default) and
-//! implements every `service Kernel` procedure. Procedures whose node-side
-//! Fachlogik is **not** yet a faithful §7.8 mapping return
+//! Binds a tonic server on a configured address and implements every
+//! `service Kernel` procedure. Procedures whose node-side Fachlogik is
+//! **not** yet a faithful §7.8 mapping return
 //! `Status::unimplemented("<Name>: not yet implemented")` — never an
 //! invented `Ok(...)` payload.
 //!
+//! Wired today (Block 2): `GetJob`, `StreamJob`, `CancelJob`. These call
+//! the transport-neutral domain façade and map through
+//! `transport/grpc/` converters + the shared error contract.
+//!
 //! The existing HTTP router is untouched; this is an additive internal
 //! surface only (Kernel/API split is a later step).
-//!
-//! Mapping status is documented in `docs/kernel-rpc-mapping.md` and in the
-//! implementer report for this change. Today **0 of 20** procedures are
-//! wired: the five REST handlers that look closest (`GetJob`, `StreamJob`,
-//! `SignTransition`, `CancelJob`, `AttestBalance`) only *approximately*
-//! match §7.8 (HTTP/JSON shapes, OwnershipProof still on the node, no
-//! typed Job→proto mapper). Wiring them half-correctly would ship silent
-//! wrong `Ok` values — forbidden.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures_util::Stream;
+use futures_util::StreamExt;
 use kernel_proto::kernel_server::{Kernel, KernelServer};
 use kernel_proto::{
     AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, Challenge,
@@ -32,6 +30,14 @@ use kernel_proto::{
     TransitionRequest,
 };
 use tonic::{Request, Response, Status};
+use uuid::Uuid;
+
+use crate::job_store::JobStore;
+use crate::kernel::error::{KernelError, KernelErrorCode};
+use crate::kernel::job_events::JobEventHub;
+use crate::kernel::types::{CancelPolicy, JobId, JobRequest as DomainJobRequest};
+use crate::kernel::KernelService as DomainKernel;
+use crate::transport::grpc::{job_event_to_proto, job_to_proto, kernel_error_to_status};
 
 /// Environment variable that selects the kernel gRPC listen address.
 ///
@@ -85,9 +91,20 @@ pub fn kernel_grpc_addr_from_env() -> Result<SocketAddr, KernelGrpcStartError> {
         .map_err(|_| KernelGrpcStartError::InvalidAddr(raw))
 }
 
-/// Bind and serve `kernel.v1` on `addr` (runs until the process exits).
-pub async fn serve_kernel_grpc(addr: SocketAddr) -> Result<(), KernelGrpcStartError> {
-    let service = KernelService;
+/// Bind and serve with an explicit domain façade (shared store + hub).
+///
+/// Used by `start_rest_node` so gRPC and REST/dispatcher share one
+/// notify map. There is **no** pool-only public entry that fabricates a
+/// fresh empty notify map — a gRPC server without the dispatcher's hub
+/// would accept `StreamJob` and never emit phase events.
+///
+/// Domain types stay crate-private; the only production boot path is
+/// `start_rest_node` (binary) after `kernel_grpc_addr_from_env`.
+pub(crate) async fn serve_kernel_grpc_with_domain(
+    addr: SocketAddr,
+    domain: DomainKernel,
+) -> Result<(), KernelGrpcStartError> {
+    let service = GrpcKernelService::new(domain);
     tracing::info!(%addr, "kernel.v1 gRPC listening");
     tonic::transport::Server::builder()
         .add_service(KernelServer::new(service))
@@ -96,27 +113,58 @@ pub async fn serve_kernel_grpc(addr: SocketAddr) -> Result<(), KernelGrpcStartEr
         .map_err(|e| KernelGrpcStartError::Serve(e.to_string()))
 }
 
-/// Read `KERNEL_GRPC_ADDR` and serve. Fail-loud if the env var is missing
-/// or not a bindable socket address.
-pub async fn start_kernel_grpc() -> Result<(), KernelGrpcStartError> {
-    let addr = kernel_grpc_addr_from_env()?;
-    serve_kernel_grpc(addr).await
+/// gRPC adapter over the transport-neutral domain façade.
+///
+/// Constructed only with a real [`DomainKernel`] (store + event hub).
+/// No `Default` — an empty service would invent a silent no-data edge.
+#[derive(Clone)]
+struct GrpcKernelService {
+    domain: DomainKernel,
 }
 
-/// Honest `kernel.v1` implementation: every procedure is currently
-/// `unimplemented` (see module docs). Holds no state — state wiring is
-/// a later step once each procedure has a faithful §7.8 mapping.
-#[derive(Debug, Default, Clone)]
-struct KernelService;
+impl GrpcKernelService {
+    fn new(domain: DomainKernel) -> Self {
+        Self { domain }
+    }
+}
 
 fn not_yet(procedure: &'static str) -> Status {
     Status::unimplemented(format!("{procedure}: not yet implemented"))
 }
 
+/// Parse proto `JobRequest.job_id` into a domain request.
+///
+/// Empty / non-UUID → `malformed_request` (never a silent nil UUID).
+fn parse_job_request(req: kernel_proto::JobRequest) -> Result<DomainJobRequest, Status> {
+    let raw = req.job_id.trim();
+    if raw.is_empty() {
+        return Err(kernel_error_to_status(&KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            "job_id is required",
+        )));
+    }
+    let id = Uuid::parse_str(raw).map_err(|_| {
+        kernel_error_to_status(&KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            "job_id must be a UUID",
+        ))
+    })?;
+    Ok(DomainJobRequest { id: JobId(id) })
+}
+
+fn map_domain_err(err: KernelError) -> Status {
+    if err.code == KernelErrorCode::InternalError {
+        if let Some(ctx) = &err.internal_context {
+            tracing::error!("kernel gRPC internal_error: {}", ctx.detail);
+        }
+    }
+    kernel_error_to_status(&err)
+}
+
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 #[tonic::async_trait]
-impl Kernel for KernelService {
+impl Kernel for GrpcKernelService {
     async fn get_info(&self, _request: Request<GetInfoRequest>) -> Result<Response<Info>, Status> {
         Err(not_yet("GetInfo"))
     }
@@ -151,17 +199,47 @@ impl Kernel for KernelService {
         Err(not_yet("SubmitTransition"))
     }
 
-    async fn get_job(&self, _request: Request<JobRequest>) -> Result<Response<Job>, Status> {
-        Err(not_yet("GetJob"))
+    async fn get_job(&self, request: Request<JobRequest>) -> Result<Response<Job>, Status> {
+        let req = parse_job_request(request.into_inner())?;
+        let job = self.domain.get_job(req).await.map_err(map_domain_err)?;
+        let proto = job_to_proto(&job).map_err(map_domain_err)?;
+        Ok(Response::new(proto))
     }
 
     type StreamJobStream = BoxStream<JobEvent>;
 
     async fn stream_job(
         &self,
-        _request: Request<JobRequest>,
+        request: Request<JobRequest>,
     ) -> Result<Response<Self::StreamJobStream>, Status> {
-        Err(not_yet("StreamJob"))
+        let req = parse_job_request(request.into_inner())?;
+        let domain_stream = self.domain.stream_job(req).await.map_err(map_domain_err)?;
+
+        let stream = async_stream::stream! {
+            let mut domain_stream = domain_stream;
+            while let Some(item) = domain_stream.next().await {
+                match item {
+                    Ok(ev) => match job_event_to_proto(&ev) {
+                        Ok(proto) => {
+                            let terminal = ev.job.state.is_terminal();
+                            yield Ok(proto);
+                            if terminal {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            yield Err(map_domain_err(e));
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        yield Err(map_domain_err(e));
+                        return;
+                    }
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn sign_transition(
@@ -171,8 +249,16 @@ impl Kernel for KernelService {
         Err(not_yet("SignTransition"))
     }
 
-    async fn cancel_job(&self, _request: Request<JobRequest>) -> Result<Response<Job>, Status> {
-        Err(not_yet("CancelJob"))
+    async fn cancel_job(&self, request: Request<JobRequest>) -> Result<Response<Job>, Status> {
+        let req = parse_job_request(request.into_inner())?;
+        // §7.8 CancelJob uses the normative not-yet-published policy.
+        let job = self
+            .domain
+            .cancel_job(req, CancelPolicy::NotYetPublished)
+            .await
+            .map_err(map_domain_err)?;
+        let proto = job_to_proto(&job).map_err(map_domain_err)?;
+        Ok(Response::new(proto))
     }
 
     async fn open_pull_challenge(
@@ -252,9 +338,20 @@ impl Kernel for KernelService {
     }
 }
 
+/// Build a domain façade from store + notify map (production / tests).
+pub(crate) fn domain_from_parts(
+    job_store: Arc<JobStore>,
+    notify_map: crate::job_dispatcher::JobNotifyMap,
+) -> DomainKernel {
+    DomainKernel::new(job_store, JobEventHub::new(notify_map))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job_store::{CreateResult, JobKind as StoreKind, JobStore};
+    use crate::test_db::{setup_pool, SchemaScope};
+    use futures_util::StreamExt;
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
     use tonic::Code;
@@ -266,6 +363,17 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+    }
+
+    async fn test_domain() -> (DomainKernel, SchemaScope) {
+        let scope = setup_pool().await;
+        let store = Arc::new(JobStore::new(scope.pool.clone()));
+        let hub = JobEventHub::new(Arc::new(dashmap::DashMap::new()));
+        (DomainKernel::new(store, hub), scope)
+    }
+
+    fn grpc_svc(domain: DomainKernel) -> GrpcKernelService {
+        GrpcKernelService::new(domain)
     }
 
     #[test]
@@ -314,36 +422,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn start_kernel_grpc_fails_with_missing_addr_cause() {
-        let _guard = env_lock();
-        let previous = std::env::var_os(KERNEL_GRPC_ADDR_ENV);
-        std::env::remove_var(KERNEL_GRPC_ADDR_ENV);
-
-        let err = start_kernel_grpc()
-            .await
-            .expect_err("start without KERNEL_GRPC_ADDR must fail");
-        assert_eq!(
-            err,
-            KernelGrpcStartError::MissingAddr,
-            "assertion is on the error *cause*, not only Display"
-        );
-
-        match previous {
-            Some(v) => std::env::set_var(KERNEL_GRPC_ADDR_ENV, v),
-            None => std::env::remove_var(KERNEL_GRPC_ADDR_ENV),
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn serve_kernel_grpc_binds_configured_address() {
+    async fn serve_kernel_grpc_with_domain_binds_configured_address() {
         // Ephemeral port: probe → drop → rebind (same shape as runtime_tests).
+        // Uses the domain-façade path only — there is no pool-only serve
+        // that invents an empty notify map.
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind probe");
         let addr = probe.local_addr().expect("probe addr");
         drop(probe);
 
-        let handle = tokio::spawn(async move { serve_kernel_grpc(addr).await });
+        let (domain, _scope) = test_domain().await;
+        let handle = tokio::spawn(async move { serve_kernel_grpc_with_domain(addr, domain).await });
 
         let mut last_err = None;
         for _ in 0..50 {
@@ -362,15 +452,13 @@ mod tests {
         panic!("kernel gRPC did not accept TCP on {addr} within timeout; last_err={last_err:?}");
     }
 
-    /// Every procedure of `service Kernel` must name itself in an
-    /// `Unimplemented` status. No invented `Ok` payloads.
+    /// Procedures that are not yet faithfully mapped must name themselves
+    /// in an `Unimplemented` status. No invented `Ok` payloads.
     #[tokio::test]
-    async fn every_procedure_is_unimplemented_with_its_name() {
-        let svc = KernelService;
+    async fn unmapped_procedures_are_unimplemented_with_their_name() {
+        let (domain, _scope) = test_domain().await;
+        let svc = grpc_svc(domain);
 
-        // No `Debug` bound on `T`: streaming RPCs return `Response<dyn Stream…>`,
-        // which is not `Debug`. `Result::expect_err` would force that bound via
-        // its panic formatting — a plain `match` does not.
         async fn expect_unimplemented<T>(name: &'static str, result: Result<T, Status>) {
             let status = match result {
                 Ok(_) => panic!("{name} must not return Ok"),
@@ -393,8 +481,6 @@ mod tests {
             );
         }
 
-        // Empty Default bodies: we only assert the status code / message,
-        // never a successful payload. Avoids inventing field values.
         expect_unimplemented(
             "GetInfo",
             svc.get_info(Request::new(GetInfoRequest::default())).await,
@@ -425,24 +511,9 @@ mod tests {
         )
         .await;
         expect_unimplemented(
-            "GetJob",
-            svc.get_job(Request::new(JobRequest::default())).await,
-        )
-        .await;
-        expect_unimplemented(
-            "StreamJob",
-            svc.stream_job(Request::new(JobRequest::default())).await,
-        )
-        .await;
-        expect_unimplemented(
             "SignTransition",
             svc.sign_transition(Request::new(SignRequest::default()))
                 .await,
-        )
-        .await;
-        expect_unimplemented(
-            "CancelJob",
-            svc.cancel_job(Request::new(JobRequest::default())).await,
         )
         .await;
         expect_unimplemented(
@@ -504,5 +575,207 @@ mod tests {
                 .await,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn get_job_returns_complete_proving_snapshot() {
+        let scope = setup_pool().await;
+        let store = Arc::new(JobStore::new(scope.pool.clone()));
+        let created = store
+            .create(
+                StoreKind::Mint,
+                &[0xA1u8; 32],
+                Some("grpc-get-job"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let id = match created {
+            CreateResult::Fresh(j) => j.public_id,
+            _ => panic!("fresh"),
+        };
+        store
+            .set_status(id, crate::job_store::JobStatus::Proving, "proving_circuit")
+            .await
+            .expect("proving");
+        let domain = DomainKernel::new(
+            Arc::clone(&store),
+            JobEventHub::new(Arc::new(dashmap::DashMap::new())),
+        );
+        let svc = grpc_svc(domain);
+        let resp = svc
+            .get_job(Request::new(JobRequest {
+                job_id: id.to_string(),
+            }))
+            .await
+            .expect("GetJob Ok");
+        let job = resp.into_inner();
+        assert_eq!(job.job_id, id.to_string());
+        assert_eq!(job.kind, "mint");
+        assert_eq!(job.status, "proving");
+        assert_eq!(job.phase, "proving_circuit");
+        assert!(job.result.is_none());
+        assert!(job.awaiting_signature.is_none());
+        assert!(job.error.is_none());
+        assert!((job.progress - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn get_job_unknown_is_not_found_with_error_info_reason() {
+        let (domain, _scope) = test_domain().await;
+        let svc = grpc_svc(domain);
+        let missing = Uuid::new_v4();
+        let status = match svc
+            .get_job(Request::new(JobRequest {
+                job_id: missing.to_string(),
+            }))
+            .await
+        {
+            Ok(_) => panic!("unknown job must not return Ok"),
+            Err(s) => s,
+        };
+        assert_eq!(status.code(), Code::NotFound);
+        assert_eq!(status.message(), "Job not found");
+        assert_eq!(
+            status
+                .metadata()
+                .get("error-reason")
+                .expect("error-reason")
+                .to_str()
+                .expect("str"),
+            "job_not_found"
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get("error-domain")
+                .expect("error-domain")
+                .to_str()
+                .expect("str"),
+            crate::transport::error_contract::ERROR_INFO_DOMAIN
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get("error-http-status")
+                .expect("http")
+                .to_str()
+                .expect("str"),
+            "404"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_job_emits_complete_snapshot_for_terminal_cancelled() {
+        let scope = setup_pool().await;
+        let store = Arc::new(JobStore::new(scope.pool.clone()));
+        let created = store
+            .create(
+                StoreKind::Send,
+                &[0xA2u8; 32],
+                Some("grpc-stream-job"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let id = match created {
+            CreateResult::Fresh(j) => j.public_id,
+            _ => panic!("fresh"),
+        };
+        assert!(store.cancel(id).await.expect("cancel"));
+
+        let domain = DomainKernel::new(
+            Arc::clone(&store),
+            JobEventHub::new(Arc::new(dashmap::DashMap::new())),
+        );
+        let svc = grpc_svc(domain);
+        let resp = svc
+            .stream_job(Request::new(JobRequest {
+                job_id: id.to_string(),
+            }))
+            .await
+            .expect("StreamJob open");
+        let mut stream = resp.into_inner();
+        let first = stream.next().await.expect("one frame").expect("Ok frame");
+        assert_eq!(first.event, "error"); // cancelled → Error kind
+        let job = first.job.expect("job on event");
+        assert_eq!(job.job_id, id.to_string());
+        assert_eq!(job.status, "cancelled");
+        assert_eq!(job.kind, "send");
+        let err = job.error.expect("cancelled carries JobError");
+        assert_eq!(err.error, "internal_error");
+        assert!(job.result.is_none());
+        assert!(job.awaiting_signature.is_none());
+        // Terminal stream ends after the snapshot.
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_job_returns_complete_cancelled_job() {
+        let scope = setup_pool().await;
+        let store = Arc::new(JobStore::new(scope.pool.clone()));
+        let created = store
+            .create(
+                StoreKind::Mint,
+                &[0xA3u8; 32],
+                Some("grpc-cancel-job"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let id = match created {
+            CreateResult::Fresh(j) => j.public_id,
+            _ => panic!("fresh"),
+        };
+        store
+            .set_status(id, crate::job_store::JobStatus::Proving, "proving")
+            .await
+            .expect("proving");
+
+        let domain = DomainKernel::new(
+            Arc::clone(&store),
+            JobEventHub::new(Arc::new(dashmap::DashMap::new())),
+        );
+        let svc = grpc_svc(domain);
+        let resp = svc
+            .cancel_job(Request::new(JobRequest {
+                job_id: id.to_string(),
+            }))
+            .await
+            .expect("CancelJob Ok under NotYetPublished");
+        let job = resp.into_inner();
+        assert_eq!(job.job_id, id.to_string());
+        assert_eq!(job.status, "cancelled");
+        assert_eq!(job.kind, "mint");
+        let err = job.error.expect("JobError on cancelled");
+        assert_eq!(err.error, "internal_error");
+        assert!(job.phase.is_empty(), "terminal phase empty");
+        assert!(job.result.is_none());
+        assert!(job.awaiting_signature.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_job_id_is_malformed_request() {
+        let (domain, _scope) = test_domain().await;
+        let svc = grpc_svc(domain);
+        let status = match svc
+            .get_job(Request::new(JobRequest {
+                job_id: String::new(),
+            }))
+            .await
+        {
+            Ok(_) => panic!("empty job_id must not Ok"),
+            Err(s) => s,
+        };
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(
+            status
+                .metadata()
+                .get("error-reason")
+                .expect("reason")
+                .to_str()
+                .expect("str"),
+            "malformed_request"
+        );
     }
 }

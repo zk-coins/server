@@ -30,11 +30,13 @@
 //!   and legacy **write** sinks are `pub(crate)` (boot load goes through
 //!   `State` / `AccountNode` / `UsernameStore` methods).
 //! - [`runtime`] — binary `start_rest_node` / `V1Readiness`.
-//! - [`kernel_rpc`] — binary `start_kernel_grpc` (+ `KERNEL_GRPC_ADDR_ENV`,
-//!   `kernel_grpc_addr_from_env`, `serve_kernel_grpc`,
-//!   `KernelGrpcStartError`). Additive internal `kernel.v1` gRPC edge;
-//!   does not replace the HTTP router. Handlers stay private until a
-//!   faithful §7.8 mapping exists per procedure.
+//! - [`kernel_rpc`] — binary env edge `KERNEL_GRPC_ADDR_ENV` /
+//!   `kernel_grpc_addr_from_env` / `KernelGrpcStartError`. The gRPC server
+//!   itself is crate-private (`serve_kernel_grpc_with_domain`) and is
+//!   started only from `start_rest_node` with the shared job store + notify
+//!   map (no pool-only silent-stream boot). `GetJob` / `StreamJob` /
+//!   `CancelJob` are wired; remaining procedures stay unimplemented until
+//!   a faithful §7.8 mapping exists.
 //! - [`state`] — binary `State::load_from_pg` (+ `LoadStateError`). The
 //!   type is public so the binary can hold `Arc<Mutex<State>>`. **Not**
 //!   public: `new`, `update`, `serialize_for_persist`,
@@ -121,8 +123,9 @@ pub(crate) mod job_store;
 /// Transport-free kernel domain (§6.1 / §7.8). Crate-private so the
 /// public-surface allowlist does not move.
 pub(crate) mod kernel;
-/// `kernel.v1` gRPC skeleton (§7.8). Public for the binary boot path
-/// (`start_kernel_grpc`); service handlers are private.
+/// `kernel.v1` gRPC edge (§7.8). Public for the binary env parse
+/// (`kernel_grpc_addr_from_env`); serve path is crate-private and only
+/// wired from `start_rest_node` with a shared domain façade.
 pub mod kernel_rpc;
 /// Stage-3 sealed legacy Commitment → SMT/MMR scan sink (Stage 4 deletes).
 /// Public only so compile-fail matrices can name the sealed cap type.
