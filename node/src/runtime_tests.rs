@@ -40,9 +40,7 @@ use crate::runtime::{
 use crate::state::State;
 use crate::test_db::setup_pool;
 use crate::username::UsernameStore;
-use crate::v1::{
-    set_process_stack_mode, ScanStackMode,
-};
+use crate::v1::{set_process_stack_mode, ScanStackMode};
 use dashmap::DashMap;
 
 // Shared-Postgres test infra (issue #181 Optimisation B): see
@@ -236,11 +234,7 @@ fn boot_finalise_action_decision_table() {
     );
     // Still exclusively claimed under a live lease → do not enqueue as free.
     assert_eq!(
-        boot_finalise_action_after_release(
-            false,
-            JobStatus::Broadcasting,
-            FINALISE_CLAIM_PHASE
-        ),
+        boot_finalise_action_after_release(false, JobStatus::Broadcasting, FINALISE_CLAIM_PHASE),
         BootFinaliseAction::DeferUntilAbandoned
     );
     // Already free (nothing to release) → enqueue.
@@ -662,7 +656,10 @@ async fn boot_resume_cannot_fail_job_claimed_since_snapshot() {
         "boot must not fail a job claimed since the snapshot"
     );
     assert_eq!(row.phase, FINALISE_CLAIM_PHASE);
-    assert!(row.error.is_none(), "claimed row must not carry a boot error");
+    assert!(
+        row.error.is_none(),
+        "claimed row must not carry a boot error"
+    );
     assert_eq!(
         row.request_body
             .get("finalise_claim")

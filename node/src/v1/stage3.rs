@@ -192,9 +192,8 @@ fn last_proof_load_rejects_non_compliance_bytes() {
 /// only entry and must refuse a well-formed foreign prev_proof.
 #[test]
 fn transition_witness_decode_bound_refuses_foreign_prev_proof() {
-    let foreign: ComplianceProof =
-        bincode::deserialize(&well_formed_legacy_shaped_proof_bytes())
-            .expect("legacy-shaped proof must deserialize as ComplianceProof");
+    let foreign: ComplianceProof = bincode::deserialize(&well_formed_legacy_shaped_proof_bytes())
+        .expect("legacy-shaped proof must deserialize as ComplianceProof");
 
     let owner = Address([0x11u8; 32]);
     let account = AccountState::new(
@@ -265,9 +264,8 @@ fn transition_witness_decode_bound_refuses_foreign_creating_proof() {
         NavOpening, NullifierOpening, OutputInclusionProof, ReceivedAuthorization,
     };
 
-    let foreign: ComplianceProof =
-        bincode::deserialize(&well_formed_legacy_shaped_proof_bytes())
-            .expect("legacy-shaped proof must deserialize as ComplianceProof");
+    let foreign: ComplianceProof = bincode::deserialize(&well_formed_legacy_shaped_proof_bytes())
+        .expect("legacy-shaped proof must deserialize as ComplianceProof");
 
     let owner = Address([0x11u8; 32]);
     let account = AccountState::new(
@@ -460,14 +458,12 @@ mod genesis_fence_tests {
             .await
             .expect("store baseline digest");
         let proofs = tempfile::tempdir().expect("tempdir");
-        let decision = heal_circuit_digest(
-            &pool,
-            &digest,
-            proofs.path().to_str().unwrap(),
-            &|| panic!("canary must not run on digest Keep path"),
-        )
-        .await
-        .expect("heal Keep");
+        let decision =
+            heal_circuit_digest(&pool, &digest, proofs.path().to_str().unwrap(), &|| {
+                panic!("canary must not run on digest Keep path")
+            })
+            .await
+            .expect("heal Keep");
         assert_eq!(decision, ResetDecision::Keep);
         let gen_after_keep_boot = db::load_self_heal_reset_generation(&pool)
             .await

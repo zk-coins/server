@@ -71,16 +71,13 @@ const V1_SCAN_STATE_COUNT_SQL: &str = "SELECT \
   + (SELECT COUNT(*) FROM v1_spendable_coins) \
   + (SELECT COUNT(*) FROM v1_spent_coins)";
 
-
-
 /// Load the claimed mode, if any.
 #[cfg(test)]
 pub(crate) async fn load_stack_scan_mode(pool: &PgPool) -> Result<Option<ScanStackMode>> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT mode FROM stack_scan_mode WHERE id = 1")
-            .fetch_optional(pool)
-            .await
-            .context("load stack_scan_mode")?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT mode FROM stack_scan_mode WHERE id = 1")
+        .fetch_optional(pool)
+        .await
+        .context("load stack_scan_mode")?;
     match row {
         None => Ok(None),
         Some((mode,)) => Ok(Some(
@@ -98,7 +95,10 @@ pub(crate) async fn load_stack_scan_mode(pool: &PgPool) -> Result<Option<ScanSta
 /// [`set_process_stack_mode`] explicitly).
 #[cfg(test)]
 pub(crate) async fn claim_stack_scan_mode(pool: &PgPool, mode: ScanStackMode) -> Result<()> {
-    let mut tx = pool.begin().await.context("begin claim_stack_scan_mode tx")?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin claim_stack_scan_mode tx")?;
 
     let marker_row: Option<(String,)> =
         sqlx::query_as("SELECT mode FROM stack_scan_mode WHERE id = 1 FOR UPDATE")
@@ -107,9 +107,7 @@ pub(crate) async fn claim_stack_scan_mode(pool: &PgPool, mode: ScanStackMode) ->
             .context("lock stack_scan_mode for claim_stack_scan_mode")?;
     let marker = match marker_row {
         None => None,
-        Some((mode_s,)) => Some(
-            ScanStackMode::parse(&mode_s).map_err(|e| anyhow::anyhow!("{e}"))?,
-        ),
+        Some((mode_s,)) => Some(ScanStackMode::parse(&mode_s).map_err(|e| anyhow::anyhow!("{e}"))?),
     };
 
     let (legacy_n,): (i64,) = sqlx::query_as(LEGACY_SCAN_STATE_COUNT_SQL)
@@ -284,9 +282,7 @@ pub async fn enforce_stack_scan_mode(pool: &PgPool, selected: ScanStackMode) -> 
             .context("lock stack_scan_mode for enforce")?;
     let marker = match marker_row {
         None => None,
-        Some((mode_s,)) => Some(
-            ScanStackMode::parse(&mode_s).map_err(|e| anyhow::anyhow!("{e}"))?,
-        ),
+        Some((mode_s,)) => Some(ScanStackMode::parse(&mode_s).map_err(|e| anyhow::anyhow!("{e}"))?),
     };
 
     let (legacy_n,): (i64,) = sqlx::query_as(LEGACY_SCAN_STATE_COUNT_SQL)

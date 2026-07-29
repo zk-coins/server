@@ -277,16 +277,12 @@ pub(crate) fn evaluate_v1_structural_canary(
 
     match nflog.predecessor {
         None => {
-            warn!(
-                "v1.1 self-heal canary: predecessor nullifier Pk not on live NfLog; Stale"
-            );
+            warn!("v1.1 self-heal canary: predecessor nullifier Pk not on live NfLog; Stale");
             return CanaryOutcome::Stale;
         }
         Some((pos, r)) => {
             if r != nf.signature_r {
-                warn!(
-                    "v1.1 self-heal canary: predecessor nullifier R mismatch on NfLog; Stale"
-                );
+                warn!("v1.1 self-heal canary: predecessor nullifier R mismatch on NfLog; Stale");
                 return CanaryOutcome::Stale;
             }
             if let Some(recorded) = inputs.last_nullifier_pos {
@@ -302,9 +298,7 @@ pub(crate) fn evaluate_v1_structural_canary(
     }
 
     if nav_open.nav != nflog.nav {
-        warn!(
-            "v1.1 self-heal canary: last_nav_opening does not match live NfLog NAV; Stale"
-        );
+        warn!("v1.1 self-heal canary: last_nav_opening does not match live NfLog NAV; Stale");
         return CanaryOutcome::Stale;
     }
 
@@ -356,12 +350,13 @@ pub(crate) fn boot_canary(adapter: &EngineAdapter) -> CanaryOutcome {
                 last_nullifier_pos: record.last_nullifier_pos,
                 last_nav_opening: record.last_nav_opening.as_ref(),
             };
-            let predecessor = inputs.last_nullifier.and_then(|nf| {
-                match engine.nflog().lookup(nf.public_key) {
-                    LookupResult::Present { pos, r, .. } => Some((pos, r)),
-                    LookupResult::Absent => None,
-                }
-            });
+            let predecessor =
+                inputs
+                    .last_nullifier
+                    .and_then(|nf| match engine.nflog().lookup(nf.public_key) {
+                        LookupResult::Present { pos, r, .. } => Some((pos, r)),
+                        LookupResult::Absent => None,
+                    });
             let nflog = V1CanaryNflogView {
                 nav: engine.nflog().nav(),
                 predecessor,
@@ -395,12 +390,13 @@ pub(crate) fn slow_canary_verify_transition(adapter: &EngineAdapter) -> CanaryOu
                 last_nullifier_pos: record.last_nullifier_pos,
                 last_nav_opening: record.last_nav_opening.as_ref(),
             };
-            let predecessor = inputs.last_nullifier.and_then(|nf| {
-                match engine.nflog().lookup(nf.public_key) {
-                    LookupResult::Present { pos, r, .. } => Some((pos, r)),
-                    LookupResult::Absent => None,
-                }
-            });
+            let predecessor =
+                inputs
+                    .last_nullifier
+                    .and_then(|nf| match engine.nflog().lookup(nf.public_key) {
+                        LookupResult::Present { pos, r, .. } => Some((pos, r)),
+                        LookupResult::Absent => None,
+                    });
             let nflog = V1CanaryNflogView {
                 nav: engine.nflog().nav(),
                 predecessor,
@@ -758,8 +754,7 @@ mod unit_tests {
     #[test]
     fn resolve_v1_live_digest_source_forbids_encode_pins_shortcut() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/v1/self_heal.rs");
-        let src = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let prod = src
             .split("#[cfg(test)]\nmod unit_tests")
             .next()

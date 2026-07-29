@@ -90,9 +90,7 @@ pub fn v1_publisher_env_from_env(network: Network) -> Result<V1PublisherEnv> {
         )
     })?;
     let fee_rate_sat_per_vb: u64 = fee_raw.trim().parse().map_err(|_| {
-        anyhow::anyhow!(
-            "{V1_PUBLISHER_FEE_RATE_ENV}={fee_raw:?} is not a non-negative integer"
-        )
+        anyhow::anyhow!("{V1_PUBLISHER_FEE_RATE_ENV}={fee_raw:?} is not a non-negative integer")
     })?;
     if fee_rate_sat_per_vb == 0 {
         bail!("{V1_PUBLISHER_FEE_RATE_ENV} must be > 0 (no silent default)");
@@ -161,30 +159,19 @@ impl V1Publisher {
     }
 
     /// Construct a fee-converged commit/reveal pair without broadcasting.
-    pub(crate) fn try_prepare(
-        &self,
-        members: &[BatchMember],
-    ) -> Result<Option<PreparedBatch>> {
-        Ok(Some(
-            self.inner
-                .prepare(members)
-                .context("v1.1 Publisher::prepare failed (no legacy fall-back)")?,
-        ))
+    pub(crate) fn try_prepare(&self, members: &[BatchMember]) -> Result<Option<PreparedBatch>> {
+        Ok(Some(self.inner.prepare(members).context(
+            "v1.1 Publisher::prepare failed (no legacy fall-back)",
+        )?))
     }
 
-    pub(crate) fn broadcast_commit(
-        &self,
-        prepared: &PreparedBatch,
-    ) -> Result<bitcoin::Txid> {
+    pub(crate) fn broadcast_commit(&self, prepared: &PreparedBatch) -> Result<bitcoin::Txid> {
         self.inner
             .broadcast_commit(prepared)
             .context("v1.1 Publisher::broadcast_commit failed (no legacy fall-back)")
     }
 
-    pub(crate) fn broadcast_reveal(
-        &self,
-        prepared: &PreparedBatch,
-    ) -> Result<bitcoin::Txid> {
+    pub(crate) fn broadcast_reveal(&self, prepared: &PreparedBatch) -> Result<bitcoin::Txid> {
         self.inner
             .broadcast_reveal(prepared)
             .context("v1.1 Publisher::broadcast_reveal failed (no legacy fall-back)")

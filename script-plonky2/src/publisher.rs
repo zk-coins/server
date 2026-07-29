@@ -1740,7 +1740,10 @@ pub(crate) fn chain_matches_config(chain: BitcoinNetwork, config_network: Networ
 /// Fail if bitcoind's chain and [`PublisherConfig::network`] disagree.
 ///
 /// Error names both the configured network and the chain bitcoind reported.
-pub(crate) fn ensure_chain_matches_config(chain: BitcoinNetwork, config_network: Network) -> Result<()> {
+pub(crate) fn ensure_chain_matches_config(
+    chain: BitcoinNetwork,
+    config_network: Network,
+) -> Result<()> {
     ensure!(
         chain_matches_config(chain, config_network),
         "bitcoind chain {chain:?} does not match PublisherConfig.network {config_network:?} \

@@ -148,6 +148,44 @@ macro_rules! feature_skip {
     }};
 }
 
+/// Assert a closed Stage-3 legacy surface answers **HTTP 410 Gone** with a
+/// JSON error body that names the removed path (or Stage 3 / replacement
+/// surface). Never 200 with zeroed/partial ledger fields.
+async fn assert_legacy_gone(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    path: &str,
+    surface_markers: &[&str],
+) -> Value {
+    let resp = client
+        .request(method, url(path))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("request {path}: {e}"));
+    assert_eq!(
+        resp.status(),
+        StatusCode::GONE,
+        "legacy {path} must refuse loud (HTTP 410); status={}",
+        resp.status()
+    );
+    let body: Value = resp.json().await.expect("410 body JSON");
+    let err = body["error"].as_str().unwrap_or("");
+    assert!(
+        surface_markers.iter().any(|m| err.contains(m)),
+        "410 error must name the removed surface {surface_markers:?}; got {err:?} body={body}"
+    );
+    // Closed handlers must not leak BalanceResponse / HistoryResponse shapes.
+    assert!(
+        body.get("balance").is_none()
+            && body.get("assets").is_none()
+            && body.get("items").is_none()
+            && body.get("addresses").is_none()
+            && body.get("num_sends").is_none(),
+        "410 body must not carry ledger fields; got {body}"
+    );
+    body
+}
+
 // ---------------------------------------------------------------------------
 // Capability detection
 //
@@ -510,69 +548,56 @@ async fn health_publisher_returns_well_formed_response() {
 }
 
 #[tokio::test]
-async fn balance_unknown_address_returns_ok_with_zero() {
+async fn balance_unknown_address_is_gone() {
+    // Stage 3 Runde 5: GET /api/balance is closed (410) for every query shape,
+    // including a well-formed (address, asset_id) pair. Never 200 with
+    // balance:0 — that masked the protocol error.
     let address = format!("0x{}", "00".repeat(32));
-    // Balance is per-(owner, asset_id) under the multi-asset model: an
-    // unknown (address, asset_id) pair is canonical zero with 200 — not
-    // 404, and not the 422 that a *missing* asset_id would produce.
     let asset = format!("0x{}", "11".repeat(32));
-    let resp = http_client()
-        .get(url(&format!(
-            "/api/balance?address={}&asset_id={}",
-            address, asset
-        )))
-        .send()
-        .await
-        .expect("GET /api/balance");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = resp.json().await.expect("body JSON");
-    assert_eq!(body["balance"], 0);
+    assert_legacy_gone(
+        &http_client(),
+        reqwest::Method::GET,
+        &format!("/api/balance?address={}&asset_id={}", address, asset),
+        &["/api/balance", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn balance_missing_param_returns_422() {
-    let resp = http_client()
-        .get(url("/api/balance"))
-        .send()
-        .await
-        .expect("GET /api/balance (no params)");
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+async fn balance_missing_param_is_gone() {
+    // Closed handler ignores query validation: always 410, never 422.
+    assert_legacy_gone(
+        &http_client(),
+        reqwest::Method::GET,
+        "/api/balance",
+        &["/api/balance", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn balance_address_without_asset_id_returns_422() {
-    // Multi-asset contract: balance is per-(owner, asset_id), so a query
-    // with a valid `address` but NO `asset_id` is 422 — not a 200-with-zero.
+async fn balance_address_without_asset_id_is_gone() {
+    // Multi-asset missing-asset_id used to be 422; after Stage 3 the route
+    // is gone for every query shape.
     let address = format!("0x{}", "00".repeat(32));
-    let resp = http_client()
-        .get(url(&format!("/api/balance?address={}", address)))
-        .send()
-        .await
-        .expect("GET /api/balance (address, no asset_id)");
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_legacy_gone(
+        &http_client(),
+        reqwest::Method::GET,
+        &format!("/api/balance?address={}", address),
+        &["/api/balance", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn balance_invalid_hex_returns_422() {
-    let resp = http_client()
-        .get(url("/api/balance?address=not_hex"))
-        .send()
-        .await
-        .expect("GET /api/balance (bad hex)");
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    // The balance handler returns a `BalanceResponse` (not a
-    // `SendCoinResponse`) on the 422 branches — so the body has
-    // `balance: 0` and no `error` field. This anchors the contract:
-    // any future refactor that swaps the body for a `handler_error_response`
-    // envelope (with an `error: "Invalid hex"` string, matching the
-    // app's `KNOWN_SERVER_ERRORS`) must update this assertion.
-    let body: Value = resp.json().await.expect("balance body JSON");
-    assert_eq!(body["balance"], 0, "422 balance body must report balance 0");
-    assert!(
-        body.get("error").is_none(),
-        "balance 422 body must not carry an `error` field today (got {:?})",
-        body.get("error")
-    );
+async fn balance_invalid_hex_is_gone() {
+    assert_legacy_gone(
+        &http_client(),
+        reqwest::Method::GET,
+        "/api/balance?address=not_hex",
+        &["/api/balance", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -580,292 +605,162 @@ async fn balance_invalid_hex_returns_422() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn history_missing_address_returns_422() {
-    let resp = http_client()
-        .get(url("/api/history"))
-        .send()
-        .await
-        .expect("GET /api/history (no params)");
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+async fn history_missing_address_is_gone() {
+    assert_legacy_gone(
+        &http_client(),
+        reqwest::Method::GET,
+        "/api/history",
+        &["/api/history", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn history_invalid_hex_returns_422() {
-    let resp = http_client()
-        .get(url("/api/history?address=not_hex"))
-        .send()
-        .await
-        .expect("GET /api/history (bad hex)");
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let body: Value = resp.json().await.expect("history body JSON");
-    assert!(
-        body["error"].as_str().is_some(),
-        "422 body must carry an `error` string"
-    );
+async fn history_invalid_hex_is_gone() {
+    assert_legacy_gone(
+        &http_client(),
+        reqwest::Method::GET,
+        "/api/history?address=not_hex",
+        &["/api/history", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn history_limit_above_max_returns_422() {
+async fn history_limit_above_max_is_gone() {
     let address = format!("0x{}", "00".repeat(32));
-    let resp = http_client()
-        .get(url(&format!("/api/history?address={}&limit=201", address)))
-        .send()
-        .await
-        .expect("GET /api/history (oversize limit)");
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_legacy_gone(
+        &http_client(),
+        reqwest::Method::GET,
+        &format!("/api/history?address={}&limit=201", address),
+        &["/api/history", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn history_unknown_address_returns_empty_page() {
-    // DEV is a persistent, shared closed-env DB (no reset on develop
-    // push), so a hardcoded address accumulates history rows across runs
-    // and `total == 0` stops holding. A freshly-generated keypair's
-    // address has provably never been touched, so "unknown" is
-    // guaranteed regardless of prior suite runs.
+async fn history_unknown_address_is_gone() {
+    // Stage 3 Runde 6: unauthenticated history is closed. Fresh address
+    // still yields 410 (not 200 with empty page).
     let address = TestWallet::new().address_hex();
-    let resp = http_client()
-        .get(url(&format!("/api/history?address={}", address)))
-        .send()
-        .await
-        .expect("GET /api/history (unknown addr)");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = resp.json().await.expect("body JSON");
-    assert_eq!(body["total"], 0);
-    assert_eq!(body["offset"], 0);
-    assert_eq!(body["limit"], 50);
-    assert_eq!(body["items"].as_array().unwrap().len(), 0);
+    assert_legacy_gone(
+        &http_client(),
+        reqwest::Method::GET,
+        &format!("/api/history?address={}", address),
+        &["/api/history", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
-/// Live contract round-trip: mint into a freshly-generated address,
-/// then probe `/api/history` and assert that the credit lands on the
-/// minted account as a `direction: "mint"` row whose `amount` matches
-/// the mint size.
-///
-/// This is the only `/api/history` test that performs a state-mutating
-/// call; the bookkeeping mirrors `mint_roundtrip_lands_balance_and_proof`
-/// so the suite stays race-free against parallel runs.
+/// Stage 3 Runde 6: unauthenticated `/api/history` is closed (410).
 #[tokio::test]
-#[ignore = "blocked on zk-coins/node#226 — mint credits a Poseidon owner, not the spec SHA-256 address; minted balance is not visible/spendable via address_hex()"]
-async fn history_after_mint_records_mint_row() {
+async fn history_after_mint_is_gone() {
     let client = http_client();
     let alice = TestWallet::new();
-
-    // Mint via the async Job-API; `mint_via_job` runs the two-phase,
-    // creator-signed mint and returns the commit `result` on completion.
-    let mint_result = mint_via_job(&client, &alice, ASSET_NAME, ASSET_DECIMALS, MINT_AMOUNT).await;
-    assert_eq!(mint_result["success"], Value::Bool(true));
-    let aid = asset_id_hex(&alice.pubkey(0), ASSET_NAME, ASSET_DECIMALS);
-
-    // Wait for the mint credit to land on Alice's balance — same poll
-    // pattern the existing mint roundtrip uses; once balance >= MINT,
-    // the matching account_history row exists.
-    let _observed = poll_balance_at_least(&client, &alice.address_hex(), &aid, MINT_AMOUNT).await;
-
-    let history_resp = client
-        .get(url(&format!(
-            "/api/history?address={}",
-            alice.address_hex()
-        )))
-        .send()
-        .await
-        .expect("GET /api/history (post-mint)");
-    assert_eq!(history_resp.status(), StatusCode::OK);
-    let body: Value = history_resp.json().await.expect("history body JSON");
-
-    assert!(
-        body["total"].as_i64().unwrap_or(0) >= 1,
-        "expected at least one history row, got body={}",
-        body
-    );
-    let items = body["items"].as_array().expect("items array");
-    assert!(!items.is_empty(), "items must not be empty");
-    // Newest-first: the latest row is the mint credit we just landed.
-    let head = &items[0];
-    assert_eq!(head["direction"], "mint");
-    assert_eq!(head["amount"], MINT_AMOUNT);
-    // No Rust caller threads `zkcoins.account_commit_txid` through the
-    // mint path today (see the GUC TODO in db.rs::list_account_history),
-    // so `triggering_commit_txid` is NULL, the LEFT JOINs return NULL,
-    // and the on-chain side is not yet observable from `/api/history`:
-    // wire status is `pending`, not `confirmed`. The default flipped
-    // from `confirmed` -> `pending` in round 2 to stop misrepresenting
-    // DB-committed-only rows as on-chain confirmations.
-    assert_eq!(head["status"], "pending");
-    assert!(head["id"].as_i64().is_some(), "id must be set");
-    // Spec contract — these are nullable on the wire.
-    assert!(head["counterparty"].is_null() || head["counterparty"].is_string());
-    assert!(head["memo"].is_null());
+    assert_legacy_gone(
+        &client,
+        reqwest::Method::GET,
+        &format!("/api/history?address={}", alice.address_hex()),
+        &["/api/history", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
-/// Live contract round-trip for the per-transaction detail endpoint
-/// (`GET /api/history/{id}`): mint, read the history list to learn the
-/// row id, then fetch the detail and assert it carries the list fields
-/// plus the decoded account-state snapshot. State-mutating like
-/// `history_after_mint_records_mint_row`; uses a fresh wallet so it is
-/// race-free against parallel runs.
+/// Stage 3 Runde 6: `GET /api/history/{id}` is closed (410).
 #[tokio::test]
-#[ignore = "blocked on zk-coins/node#226 — mint credits a Poseidon owner, not the spec SHA-256 address; minted balance is not visible/spendable via address_hex()"]
-async fn history_item_after_mint_returns_full_detail() {
+async fn history_item_is_gone() {
     let client = http_client();
     let alice = TestWallet::new();
-    let mint_result = mint_via_job(&client, &alice, ASSET_NAME, ASSET_DECIMALS, MINT_AMOUNT).await;
-    assert_eq!(mint_result["success"], Value::Bool(true));
-    let aid = asset_id_hex(&alice.pubkey(0), ASSET_NAME, ASSET_DECIMALS);
-    let _ = poll_balance_at_least(&client, &alice.address_hex(), &aid, MINT_AMOUNT).await;
-
-    // Learn the row id from the list.
-    let list: Value = client
-        .get(url(&format!(
-            "/api/history?address={}",
-            alice.address_hex()
-        )))
-        .send()
-        .await
-        .expect("GET /api/history")
-        .json()
-        .await
-        .expect("history JSON");
-    let id = list["items"][0]["id"].as_i64().expect("row id");
-
-    // Fetch the detail.
-    let resp = client
-        .get(url(&format!(
-            "/api/history/{}?address={}",
-            id,
-            alice.address_hex()
-        )))
-        .send()
-        .await
-        .expect("GET /api/history/{id}");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let d: Value = resp.json().await.expect("detail JSON");
-
-    // Core fields (consistent with the list head).
-    assert_eq!(d["id"].as_i64(), Some(id));
-    assert_eq!(d["direction"], "mint");
-    assert_eq!(d["amount"], MINT_AMOUNT);
-    assert_eq!(d["address"], alice.address_hex().trim_start_matches("0x"));
-    // Decoded account-state snapshot: a from-genesis mint credits the
-    // full balance, leaves num_sends at 0, and sets no commitment pubkey.
-    assert_eq!(d["balance_after"].as_u64(), Some(MINT_AMOUNT));
-    assert!(
-        d["balance_before"].is_null(),
-        "first row has no prior state"
-    );
-    assert_eq!(d["num_sends_after"].as_u64(), Some(0));
-    assert!(
-        d["commitment_public_key"].is_null(),
-        "mint-only account has no commitment pubkey"
-    );
-    // The node has warmed a prover, so a verifier circuit digest exists.
-    assert!(
-        d["circuit_digest"].is_string(),
-        "circuit_digest should be populated post-warmup, got {}",
-        d["circuit_digest"]
-    );
+    assert_legacy_gone(
+        &client,
+        reqwest::Method::GET,
+        &format!("/api/history/1?address={}", alice.address_hex()),
+        &["/api/history", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
-/// `GET /api/history/{id}` validation + scoping contract (read-only, no
-/// state mutation — safe to run unconditionally).
+/// Closed handler ignores validation: every shape answers 410.
 #[tokio::test]
-async fn history_item_validation_and_scoping() {
+async fn history_item_validation_shapes_are_gone() {
+    // Closed handler ignores validation: missing address, bad id, bad hex,
+    // and unknown id all answer 410 (never 422 / 404).
     let client = http_client();
     let some_addr = format!("0x{}", "ab".repeat(32));
-
-    // Missing address -> 422.
-    let r = client
-        .get(url("/api/history/1"))
-        .send()
-        .await
-        .expect("GET no-address");
-    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
-
-    // Non-integer id -> 422 (parsed as string, not axum's default 400).
-    let r = client
-        .get(url(&format!(
-            "/api/history/not_a_number?address={}",
-            some_addr
-        )))
-        .send()
-        .await
-        .expect("GET bad-id");
-    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
-
-    // Bad address hex -> 422.
-    let r = client
-        .get(url("/api/history/1?address=not_hex"))
-        .send()
-        .await
-        .expect("GET bad-address");
-    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
-
-    // Well-formed but never-minted address + arbitrary id -> 404.
-    let fresh = TestWallet::new();
-    let r = client
-        .get(url(&format!(
+    for path in [
+        "/api/history/1".to_string(),
+        format!("/api/history/not_a_number?address={}", some_addr),
+        "/api/history/1?address=not_hex".to_string(),
+        format!(
             "/api/history/999999999?address={}",
-            fresh.address_hex()
-        )))
-        .send()
-        .await
-        .expect("GET unknown");
-    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+            TestWallet::new().address_hex()
+        ),
+    ] {
+        assert_legacy_gone(
+            &client,
+            reqwest::Method::GET,
+            &path,
+            &["/api/history", "Stage 3", "read.account"],
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
-async fn balance_wrong_length_returns_422() {
-    // 16 bytes = 32 hex chars, the handler requires exactly 32 bytes
+async fn balance_wrong_length_is_gone() {
     let address = format!("0x{}", "ab".repeat(16));
-    let resp = http_client()
-        .get(url(&format!("/api/balance?address={}", address)))
-        .send()
-        .await
-        .expect("GET /api/balance (short hex)");
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    // Same envelope shape as the invalid-hex branch above.
-    let body: Value = resp.json().await.expect("balance body JSON");
-    assert_eq!(body["balance"], 0, "422 balance body must report balance 0");
-    assert!(
-        body.get("error").is_none(),
-        "balance 422 body must not carry an `error` field today (got {:?})",
-        body.get("error")
-    );
+    let asset = format!("0x{}", "11".repeat(32));
+    assert_legacy_gone(
+        &http_client(),
+        reqwest::Method::GET,
+        &format!("/api/balance?address={}&asset_id={}", address, asset),
+        &["/api/balance", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn address_list_returns_addresses() {
+async fn address_list_is_gone() {
+    // Stage 3 Runde 6: unauthenticated address enumeration is closed.
+    // Feature gate still applies (route may 404 when `address-list` is off);
+    // when the route is mounted it must be 410, never a list payload.
     let client = http_client();
     let caps = fetch_capabilities(&client).await;
     if !caps.address_list {
-        feature_skip!("address_list", "address_list_returns_addresses");
+        feature_skip!("address_list", "address_list_is_gone");
     }
-    let resp = client
-        .get(url("/api/address"))
-        .send()
-        .await
-        .expect("GET /api/address");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = resp.json().await.expect("body JSON");
-    let addresses = body["addresses"].as_array().expect("addresses is an array");
-    assert!(!addresses.is_empty(), "address list must not be empty");
-    for addr in addresses {
-        let s = addr.as_str().expect("address entry is a string");
-        assert!(s.starts_with("0x"), "address must be 0x-prefixed: {}", s);
-        // 0x + 64 hex chars = 66 chars
-        assert_eq!(s.len(), 66, "address must be 32 bytes: {}", s);
-    }
+    assert_legacy_gone(
+        &client,
+        reqwest::Method::GET,
+        "/api/address",
+        &["/api/address", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn proof_for_huge_id_returns_404() {
-    // u64::MAX is guaranteed to exceed any real proof_id the node
-    // has issued, so the file-on-disk lookup misses and returns 404.
-    let resp = http_client()
-        .get(url(&format!("/api/proof/{}", u64::MAX)))
-        .send()
-        .await
-        .expect("GET /api/proof/<huge>");
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+async fn proof_for_huge_id_is_gone() {
+    // Stage 3 Runde 5: closed for every id — never 404 that probes the store.
+    assert_legacy_gone(
+        &http_client(),
+        reqwest::Method::GET,
+        &format!("/api/proof/{}", u64::MAX),
+        &["/api/proof", "Stage 3", "read.proof"],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn inscriptions_lookup_is_gone() {
+    // Stage 3 Runde 6: GET /api/inscriptions/:txid is closed.
+    let txid = "00".repeat(32);
+    assert_legacy_gone(
+        &http_client(),
+        reqwest::Method::GET,
+        &format!("/api/inscriptions/{}", txid),
+        &["/api/inscriptions", "Stage 3"],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1215,21 +1110,27 @@ async fn send_stale_timestamp_returns_401() {
 }
 
 #[tokio::test]
-async fn receive_empty_body_returns_default_failure() {
-    let resp = http_client()
+async fn receive_empty_body_is_gone() {
+    // Stage 3 Runde 4: POST /api/receive is closed (410), not 200+success:false.
+    let client = http_client();
+    let resp = client
         .post(url("/api/receive"))
         .body(Vec::<u8>::new())
         .send()
         .await
         .expect("POST /api/receive empty");
-    // Handler swallows bincode errors and returns Json(SendCoinResponse::default()) = 200.
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::GONE);
     let body: Value = resp.json().await.expect("body JSON");
+    let err = body["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/receive") || err.contains("Stage 3"),
+        "error must name the removed surface; got {err:?}"
+    );
     assert_eq!(body["success"], Value::Bool(false));
 }
 
 #[tokio::test]
-async fn receive_garbage_body_returns_default_failure() {
+async fn receive_garbage_body_is_gone() {
     let garbage = vec![0xFFu8; 64];
     let resp = http_client()
         .post(url("/api/receive"))
@@ -1237,8 +1138,13 @@ async fn receive_garbage_body_returns_default_failure() {
         .send()
         .await
         .expect("POST /api/receive garbage");
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::GONE);
     let body: Value = resp.json().await.expect("body JSON");
+    let err = body["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/receive") || err.contains("Stage 3"),
+        "error must name the removed surface; got {err:?}"
+    );
     assert_eq!(body["success"], Value::Bool(false));
 }
 
@@ -1381,188 +1287,58 @@ async fn claim_username_stale_timestamp_returns_401() {
         .expect("POST /api/username/claim stale");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
-
-// ---------------------------------------------------------------------------
-// Section 3 — happy-path roundtrips against the deployed node
-// ---------------------------------------------------------------------------
-
-/// Roundtrip A — mint into a fresh wallet and observe the balance.
-///
-/// Reads the proof_id back via `GET /api/proof/{id}` and deserializes
-/// it as a `CoinProof` so the side-effect (write to the proofs/
-/// directory) is visible to the test as well.
 #[tokio::test]
-#[ignore = "blocked on zk-coins/node#226 — mint credits a Poseidon owner, not the spec SHA-256 address; minted balance is not visible/spendable via address_hex()"]
-async fn mint_roundtrip_lands_balance_and_proof() {
+async fn mint_roundtrip_closed_observation_surfaces_are_gone() {
+    // Stage 3: legacy observation via GET /api/balance and GET /api/proof/:id
+    // is closed (410). #227 ignored the mint happy path over the #226 owner
+    // mismatch; the cutover additionally removes the unauthenticated read
+    // surfaces, so this test pins 410 rather than a ledger credit.
     let client = http_client();
     let alice = TestWallet::new();
-
-    // Mint through the async Job-API. `mint_via_job` runs the two-phase,
-    // creator-signed mint (admit → awaiting_signature → commit) and
-    // returns the commit `result`.
-    let mint_result = mint_via_job(&client, &alice, ASSET_NAME, ASSET_DECIMALS, MINT_AMOUNT).await;
-    assert_eq!(
-        mint_result["success"],
-        Value::Bool(true),
-        "mint not successful: {}",
-        mint_result
-    );
-    let proof_id = mint_result["proof_id"].as_u64().expect("proof_id present");
-    let aid = asset_id_hex(&alice.pubkey(0), ASSET_NAME, ASSET_DECIMALS);
-
-    // Poll the balance endpoint until the credit shows up.
-    let observed = poll_balance_at_least(&client, &alice.address_hex(), &aid, MINT_AMOUNT).await;
-    assert!(
-        observed >= MINT_AMOUNT,
-        "balance never reached mint amount; got {observed}"
-    );
-
-    // Verify the proof file is fetchable + bincode-decodable.
-    let coin_proof = fetch_coin_proof(&client, proof_id).await;
-    assert_eq!(coin_proof.coin.amount, MINT_AMOUNT);
+    let asset = format!("0x{}", "11".repeat(32));
+    assert_legacy_gone(
+        &client,
+        reqwest::Method::GET,
+        &format!(
+            "/api/balance?address={}&asset_id={}",
+            alice.address_hex(),
+            asset
+        ),
+        &["/api/balance", "Stage 3", "read.account"],
+    )
+    .await;
+    assert_legacy_gone(
+        &client,
+        reqwest::Method::GET,
+        &format!("/api/proof/{}", 1u64),
+        &["/api/proof", "Stage 3", "read.proof"],
+    )
+    .await;
 }
-
-/// Roundtrip B — full mint → send → commit pipeline.
-///
-/// The send half requires the previous commitment's signing key as
-/// `prev_commitment_pubkey`. After a mint that's the node's minting
-/// pubkey, embedded in the mint's `CoinProof.commitment`.
 #[tokio::test]
-#[ignore = "blocked on zk-coins/node#226 — mint credits a Poseidon owner, not the spec SHA-256 address; minted balance is not visible/spendable via address_hex()"]
-async fn send_commit_roundtrip_moves_balance() {
+async fn send_observation_via_balance_and_proof_is_gone() {
+    // Stage 3 closed GET /api/balance and GET /api/proof/:id.
     let client = http_client();
     let alice = TestWallet::new();
-    let bob = TestWallet::new();
-
-    // ---- Mint ----
-    // Post-#87 the scanner is event-driven (Esplora WS subscription),
-    // so by the time the mint job completes and writes alice's balance,
-    // the prior commitment is already at-most-one-block away from being
-    // indexed in the SMT. A `422 Unable to get merkle proofs` send
-    // failure later would therefore be a real scanner-side regression,
-    // not a benign timing flake.
-    let mint_result = mint_via_job(&client, &alice, ASSET_NAME, ASSET_DECIMALS, MINT_AMOUNT).await;
-    assert_eq!(mint_result["success"], Value::Bool(true), "mint failed");
-    let aid = asset_id_hex(&alice.pubkey(0), ASSET_NAME, ASSET_DECIMALS);
-
-    // Wait for the balance to settle so send_coins has something to spend.
-    let balance_before =
-        poll_balance_at_least(&client, &alice.address_hex(), &aid, MINT_AMOUNT).await;
-    assert!(
-        balance_before >= MINT_AMOUNT,
-        "scanner never observed mint after MINT_AMOUNT={} (saw {})",
-        MINT_AMOUNT,
-        balance_before
-    );
-
-    // ---- Send (phase 1: admit + prove → awaiting_signature) ----
-    // `prev_commitment_pubkey` is a legacy, server-ignored field now —
-    // the node reads the prior commitment key from its own state — so
-    // the send body omits it and carries the minted `asset_id` instead.
-    let amount = SEND_AMOUNT;
-    let ts = unix_now();
-    let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
-    let send_body = json!({
-        "account_address": alice.address_hex(),
-        "recipient": bob.address_hex(),
-        "amount": amount,
-        "public_key": hex::encode(alice.pubkey(0).serialize()),
-        "next_public_key": hex::encode(alice.pubkey(1).serialize()),
-        "signature": signature,
-        "timestamp": ts,
-        "asset_id": aid,
-    });
-    let (send_job_id, send_status, _admit) = submit_send_job(&client, &send_body).await;
-    assert_eq!(
-        send_status,
-        StatusCode::ACCEPTED,
-        "send job must be admitted with 202"
-    );
-    let send_job_id = send_job_id.expect("admitted send job carries a job_id");
-
-    // Poll to `awaiting_signature`; the body carries the send `proof_id`.
-    let awaiting = poll_job_until_status(&client, &send_job_id, "awaiting_signature").await;
-    let send_proof_id = awaiting["proof_id"]
-        .as_u64()
-        .expect("awaiting_signature job carries proof_id");
-    assert!(send_proof_id > 0, "proof_id must be a positive u64");
-
-    // ---- Derive ash || ocr from the send proof's public inputs ----
-    // The send proof's `.commitment` is None here; ash/ocr live in the
-    // Plonky2 proof public inputs. Value-bearing assertions: each hash
-    // must be exactly 32 bytes and non-zero. A shape-only check would
-    // mask a node bug that emitted a placeholder zero-hash.
-    let send_coin_proof = fetch_coin_proof(&client, send_proof_id).await;
-    let (ash_bytes, ocr_bytes) = ash_ocr_from_send_proof(&send_coin_proof);
-    assert_eq!(ash_bytes.len(), 32, "account_state_hash must be 32 bytes");
-    assert!(
-        ash_bytes.iter().any(|&b| b != 0),
-        "account_state_hash must be non-zero"
-    );
-    assert_eq!(ocr_bytes.len(), 32, "output_coins_root must be 32 bytes");
-    assert!(
-        ocr_bytes.iter().any(|&b| b != 0),
-        "output_coins_root must be non-zero"
-    );
-
-    // ---- Thin-client contract: ash/ocr hex on the awaiting_signature
-    // result ----
-    // A pure-TypeScript wallet cannot decode the binary bincode
-    // `CoinProof` from `GET /api/proof/{id}`, so the node surfaces the
-    // hashes it must sign directly on the job result as hex. Assert the
-    // `awaiting_signature` snapshot carries `result.account_state_hash`
-    // + `result.output_coins_root`, AND that they equal the digests
-    // decoded from the proof above — so what the wallet signs from the
-    // thin path is bit-identical to the proof's public inputs.
-    let result = awaiting
-        .get("result")
-        .and_then(Value::as_object)
-        .expect("awaiting_signature job carries a result object");
-    let result_ash = result
-        .get("account_state_hash")
-        .and_then(Value::as_str)
-        .expect("result carries account_state_hash hex");
-    let result_ocr = result
-        .get("output_coins_root")
-        .and_then(Value::as_str)
-        .expect("result carries output_coins_root hex");
-    assert_eq!(
-        result_ash,
-        hex::encode(ash_bytes),
-        "awaiting_signature result.account_state_hash must equal the proof-decoded ash"
-    );
-    assert_eq!(
-        result_ocr,
-        hex::encode(ocr_bytes),
-        "awaiting_signature result.output_coins_root must equal the proof-decoded ocr"
-    );
-
-    // ---- Commit (phase 2: sign ash || ocr, attach, broadcast) ----
-    let mut commit_message = Vec::with_capacity(64);
-    commit_message.extend_from_slice(&ash_bytes);
-    commit_message.extend_from_slice(&ocr_bytes);
-    let commit_sig = alice.sign_commit(&commit_message);
-
-    let commit_body = json!({
-        "proof_id": send_proof_id,
-        "public_key": hex::encode(alice.pubkey(0).serialize()),
-        "signature": commit_sig,
-        "message": hex::encode(&commit_message),
-    });
-    // `commit_send_job` posts the commit (200 {status:"broadcasting"}),
-    // polls to `completed`, and returns the legacy commit body.
-    let commit_result = commit_send_job(&client, &send_job_id, &commit_body).await;
-    assert_eq!(commit_result["success"], Value::Bool(true));
-
-    // ---- Balance decreased ----
-    let final_balance =
-        poll_balance_at_most(&client, &alice.address_hex(), &aid, balance_before - amount).await;
-    assert!(
-        final_balance <= balance_before - amount,
-        "balance never decreased after commit: before={}, after={}",
-        balance_before,
-        final_balance
-    );
+    let asset = format!("0x{}", "11".repeat(32));
+    assert_legacy_gone(
+        &client,
+        reqwest::Method::GET,
+        &format!(
+            "/api/balance?address={}&asset_id={}",
+            alice.address_hex(),
+            asset
+        ),
+        &["/api/balance", "Stage 3", "read.account"],
+    )
+    .await;
+    assert_legacy_gone(
+        &client,
+        reqwest::Method::GET,
+        &format!("/api/proof/{}", u64::MAX),
+        &["/api/proof", "Stage 3", "read.proof"],
+    )
+    .await;
 }
 
 /// Roundtrip C — claim a username, resolve it, then hit the LNURLp
@@ -1659,225 +1435,32 @@ async fn username_claim_resolve_lnurlp_roundtrip() {
         .as_str()
         .is_some_and(|s| !s.is_empty()));
 }
-
-// ---------------------------------------------------------------------------
-// Section 4 — value-bearing field coverage on wallet-app-facing routes
-//
-// The roundtrip tests above prove the happy path executes end-to-end;
-// the tests in this section assert the EXACT shape and content of
-// every response field the wallet app reads. A field that ships as
-// `null` / `""` / `"0x00...0"` instead of a real value passes
-// `.is_some()` but breaks the wallet — the assertions here catch that
-// class of regression at the API layer instead of in the wallet's
-// integration test loop.
-// ---------------------------------------------------------------------------
-
-/// Field coverage #1 — mint response carries the post-mint
-/// commitment fields (`account_state_hash`, `output_coins_root`).
-///
-/// **Contract expectation.** The wallet app needs the same SMT-root
-/// pair from the mint response that the send response already carries,
-/// so its local account snapshot can advance without a second round
-/// trip. Each hash field MUST be present, decode to exactly 32 bytes of
-/// hex, and be non-zero. A shape-only `.is_some()` check would mask a
-/// server bug that returned a placeholder zero-hash or a truncated hex
-/// string.
-///
-/// Under the async Job-API the mint `result` object (the job's
-/// completed body, surfaced by `mint_via_job`) is built by
-/// `flow::mint_flow`, which populates `account_state_hash` /
-/// `output_coins_root` from the final coin proof's public inputs — so
-/// the pair is present on every successful mint.
 #[tokio::test]
-#[ignore = "blocked on zk-coins/node#226 — mint credits a Poseidon owner, not the spec SHA-256 address; minted balance is not visible/spendable via address_hex()"]
-async fn mint_response_carries_state_hash_and_coins_root() {
+async fn mint_observation_surfaces_are_gone() {
     let client = http_client();
     let alice = TestWallet::new();
-
-    let body = mint_via_job(&client, &alice, ASSET_NAME, ASSET_DECIMALS, MINT_AMOUNT).await;
-    let aid = asset_id_hex(&alice.pubkey(0), ASSET_NAME, ASSET_DECIMALS);
-
-    assert_eq!(
-        body["success"],
-        Value::Bool(true),
-        "mint success must be true"
-    );
-    let proof_id = body["proof_id"]
-        .as_u64()
-        .expect("proof_id present and a u64");
-    assert!(
-        proof_id > 0,
-        "proof_id must be a positive u64, got {}",
-        proof_id
-    );
-
-    // Value-bearing assertions on the two post-mint hash fields.
-    // Mirrors the send-response block in
-    // `send_commit_roundtrip_moves_balance:1090-1109` verbatim — the
-    // mint client consumes the same pair to advance its local
-    // account snapshot, so the same shape guarantees apply.
-    let ash_hex = body["account_state_hash"]
-        .as_str()
-        .expect("account_state_hash present on mint response")
-        .to_string();
-    let ash_bytes = hex::decode(&ash_hex).expect("account_state_hash is hex");
-    assert_eq!(
-        ash_bytes.len(),
-        32,
-        "account_state_hash must be 32 bytes (got {})",
-        ash_bytes.len()
-    );
-    assert!(
-        ash_bytes.iter().any(|&b| b != 0),
-        "account_state_hash must be non-zero on a real mint"
-    );
-
-    let ocr_hex = body["output_coins_root"]
-        .as_str()
-        .expect("output_coins_root present on mint response")
-        .to_string();
-    let ocr_bytes = hex::decode(&ocr_hex).expect("output_coins_root is hex");
-    assert_eq!(
-        ocr_bytes.len(),
-        32,
-        "output_coins_root must be 32 bytes (got {})",
-        ocr_bytes.len()
-    );
-    assert!(
-        ocr_bytes.iter().any(|&b| b != 0),
-        "output_coins_root must be non-zero on a real mint"
-    );
-
-    // Balance must land — the proof is fetchable AND the balance is
-    // credited. Value-bearing check on the side effect.
-    let observed = poll_balance_at_least(&client, &alice.address_hex(), &aid, MINT_AMOUNT).await;
-    assert!(
-        observed >= MINT_AMOUNT,
-        "balance never reached mint amount; got {observed}"
-    );
+    assert_legacy_gone(
+        &client,
+        reqwest::Method::GET,
+        &format!(
+            "/api/balance?address={}&asset_id=0x{}",
+            alice.address_hex(),
+            "11".repeat(32)
+        ),
+        &["/api/balance", "Stage 3", "read.account"],
+    )
+    .await;
 }
-
-/// Field coverage #2 — commit response carries the post-commit
-/// commitment fields (`account_state_hash`, `output_coins_root`).
-///
-/// **Contract expectation.** Same as the mint test above — the wallet
-/// app needs the SMT-root pair from the commit response so its local
-/// account snapshot advances atomically with the broadcast. Each hash
-/// field MUST be present, decode to exactly 32 bytes of hex, and be
-/// non-zero. The full mint → send → commit pipeline is exercised
-/// because the commit step is otherwise unreachable.
-///
-/// Under the async Job-API the commit `result` object is built by
-/// `flow::commit_flow`, which populates the SMT-root pair from the
-/// committed proof's public inputs — so the pair is present on every
-/// successful commit.
 #[tokio::test]
-#[ignore = "blocked on zk-coins/node#226 — mint credits a Poseidon owner, not the spec SHA-256 address; minted balance is not visible/spendable via address_hex()"]
-async fn commit_response_carries_state_hash_and_coins_root() {
+async fn commit_observation_via_proof_download_is_gone() {
     let client = http_client();
-    let alice = TestWallet::new();
-    let bob = TestWallet::new();
-
-    // ---- Mint ----
-    let mint_result = mint_via_job(&client, &alice, ASSET_NAME, ASSET_DECIMALS, MINT_AMOUNT).await;
-    let _mint_proof_id = mint_result["proof_id"].as_u64().expect("mint proof_id");
-    let aid = asset_id_hex(&alice.pubkey(0), ASSET_NAME, ASSET_DECIMALS);
-
-    let _ = poll_balance_at_least(&client, &alice.address_hex(), &aid, MINT_AMOUNT).await;
-
-    // ---- Send (phase 1 → awaiting_signature) ----
-    // `prev_commitment_pubkey` is legacy/server-ignored; carry `asset_id`.
-    let amount = SEND_AMOUNT;
-    let ts = unix_now();
-    let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
-    let (send_job_id, send_status, _admit) = submit_send_job(
+    assert_legacy_gone(
         &client,
-        &json!({
-            "account_address": alice.address_hex(),
-            "recipient": bob.address_hex(),
-            "amount": amount,
-            "public_key": hex::encode(alice.pubkey(0).serialize()),
-            "next_public_key": hex::encode(alice.pubkey(1).serialize()),
-            "signature": signature,
-            "timestamp": ts,
-            "asset_id": aid,
-        }),
+        reqwest::Method::GET,
+        &format!("/api/proof/{}", 1u64),
+        &["/api/proof", "Stage 3", "read.proof"],
     )
     .await;
-    assert_eq!(send_status, StatusCode::ACCEPTED, "send must be admitted");
-    let send_job_id = send_job_id.expect("send job_id");
-    let awaiting = poll_job_until_status(&client, &send_job_id, "awaiting_signature").await;
-    let send_proof_id = awaiting["proof_id"].as_u64().expect("send proof_id");
-
-    // ---- Derive ash || ocr from the send proof ----
-    let send_coin_proof = fetch_coin_proof(&client, send_proof_id).await;
-    let (ash_bytes, ocr_bytes) = ash_ocr_from_send_proof(&send_coin_proof);
-
-    // ---- Commit (phase 2 → completed) ----
-    let mut commit_message = Vec::with_capacity(64);
-    commit_message.extend_from_slice(&ash_bytes);
-    commit_message.extend_from_slice(&ocr_bytes);
-    let commit_sig = alice.sign_commit(&commit_message);
-    let commit_body = commit_send_job(
-        &client,
-        &send_job_id,
-        &json!({
-            "proof_id": send_proof_id,
-            "public_key": hex::encode(alice.pubkey(0).serialize()),
-            "signature": commit_sig,
-            "message": hex::encode(&commit_message),
-        }),
-    )
-    .await;
-
-    assert_eq!(
-        commit_body["success"],
-        Value::Bool(true),
-        "commit success must be true"
-    );
-    let echoed_proof_id = commit_body["proof_id"]
-        .as_u64()
-        .expect("commit proof_id present and a u64");
-    assert_eq!(
-        echoed_proof_id, send_proof_id,
-        "commit must echo the send proof_id (got {}, sent {})",
-        echoed_proof_id, send_proof_id
-    );
-
-    // Value-bearing assertions on the post-commit hash fields. Same
-    // contract as the send response (see
-    // `send_commit_roundtrip_moves_balance:1090-1109`).
-    let commit_ash_hex = commit_body["account_state_hash"]
-        .as_str()
-        .expect("account_state_hash present on commit response")
-        .to_string();
-    let commit_ash_bytes = hex::decode(&commit_ash_hex).expect("commit ash is hex");
-    assert_eq!(
-        commit_ash_bytes.len(),
-        32,
-        "commit account_state_hash must be 32 bytes (got {})",
-        commit_ash_bytes.len()
-    );
-    assert!(
-        commit_ash_bytes.iter().any(|&b| b != 0),
-        "commit account_state_hash must be non-zero"
-    );
-
-    let commit_ocr_hex = commit_body["output_coins_root"]
-        .as_str()
-        .expect("output_coins_root present on commit response")
-        .to_string();
-    let commit_ocr_bytes = hex::decode(&commit_ocr_hex).expect("commit ocr is hex");
-    assert_eq!(
-        commit_ocr_bytes.len(),
-        32,
-        "commit output_coins_root must be 32 bytes (got {})",
-        commit_ocr_bytes.len()
-    );
-    assert!(
-        commit_ocr_bytes.iter().any(|&b| b != 0),
-        "commit output_coins_root must be non-zero"
-    );
 }
 
 /// Field coverage #3 — `/api/balance` carries the claimed username.
@@ -1889,16 +1472,14 @@ async fn commit_response_carries_state_hash_and_coins_root() {
 /// The wallet app reads this to render the "@<username>" badge next
 /// to a balance figure without making a second round-trip.
 #[tokio::test]
-async fn balance_response_carries_username_after_claim() {
+async fn balance_after_username_claim_is_gone() {
+    // Username claim may still succeed; the legacy balance surface that
+    // used to echo the username is closed (Stage 3 Runde 5).
     let client = http_client();
     let caps = fetch_capabilities(&client).await;
     if !caps.username_claim {
-        feature_skip!(
-            "username_claim",
-            "balance_response_carries_username_after_claim"
-        );
+        feature_skip!("username_claim", "balance_after_username_claim_is_gone");
     }
-
     let alice = TestWallet::new();
     let username = format!("u_{}", random_suffix());
     let ts = unix_now();
@@ -1916,28 +1497,17 @@ async fn balance_response_carries_username_after_claim() {
         .await
         .expect("POST /api/username/claim");
     assert_eq!(claim_resp.status(), StatusCode::OK, "claim must succeed");
-
-    // GET /api/balance and assert the username surfaces.
-    let bal_resp = client
-        .get(url(&format!(
-            "/api/balance?address={}&asset_id={}",
+    assert_legacy_gone(
+        &client,
+        reqwest::Method::GET,
+        &format!(
+            "/api/balance?address={}&asset_id=0x{}",
             alice.address_hex(),
-            asset_id_hex(&alice.pubkey(0), ASSET_NAME, ASSET_DECIMALS)
-        )))
-        .send()
-        .await
-        .expect("GET /api/balance after claim");
-    assert_eq!(bal_resp.status(), StatusCode::OK);
-    let body: Value = bal_resp.json().await.expect("balance body JSON");
-    // Server canonicalises usernames to lowercase before persisting,
-    // so the round-trip must compare against the lowercased form.
-    let want = username.to_lowercase();
-    assert_eq!(
-        body["username"].as_str(),
-        Some(want.as_str()),
-        "balance body must carry the just-claimed username, got {:?}",
-        body["username"]
-    );
+            "11".repeat(32)
+        ),
+        &["/api/balance", "Stage 3", "read.account"],
+    )
+    .await;
 }
 
 /// Field coverage #4 — `/api/username/claim` echoes the claimed
@@ -1994,448 +1564,59 @@ async fn claim_response_carries_address() {
 /// e.g. `""` (empty string) instead, which would render as a phantom
 /// empty username in the UI.
 #[tokio::test]
-async fn balance_response_has_no_username_for_unclaimed_wallet() {
+async fn balance_for_unclaimed_wallet_is_gone() {
     let client = http_client();
     let wallet = TestWallet::new();
-    // No claim happens — the wallet is fresh.
-    let resp = client
-        .get(url(&format!(
-            "/api/balance?address={}&asset_id={}",
+    assert_legacy_gone(
+        &client,
+        reqwest::Method::GET,
+        &format!(
+            "/api/balance?address={}&asset_id=0x{}",
             wallet.address_hex(),
-            asset_id_hex(&wallet.pubkey(0), ASSET_NAME, ASSET_DECIMALS)
-        )))
-        .send()
-        .await
-        .expect("GET /api/balance for unclaimed wallet");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = resp.json().await.expect("balance body JSON");
-    assert_eq!(
-        body["balance"], 0,
-        "fresh wallet must have zero balance, got {:?}",
-        body["balance"]
-    );
-    match body.get("username") {
-        // Preferred: field omitted entirely (`skip_serializing_if` path).
-        None => {}
-        // Permitted: explicit `null`.
-        Some(Value::Null) => {}
-        // Anything else (empty string, real string) is a contract
-        // violation — the wallet app would mis-render it.
-        Some(other) => panic!(
-            "unclaimed wallet must produce no `username` (or null), got {:?}",
-            other
+            "11".repeat(32)
         ),
-    }
+        &["/api/balance", "Stage 3", "read.account"],
+    )
+    .await;
 }
-
-/// Field coverage #6 — `/api/balance.num_sends` is the wallet's
-/// authoritative BIP-32 child-index counter.
-///
-/// Regression for the seed-restore desync that surfaced as
-/// `app/e2e/07-send.spec.ts::send-success` failing with
-/// `Interner Fehler: Vorheriger Public Key fehlt.` (the app message
-/// mapped from `"prev_commitment_pubkey required for account update"`):
-/// the wallet was deriving its `numPubkeys` purely from its local
-/// in-memory counter, which is reset to `0` by `restoreSeedWallet`
-/// even though the server held `account.proof = Some(...)` from a
-/// previous test's send. With this field the wallet hydrates its
-/// counter from the server on every balance tick.
-///
-/// Pre-condition: a fresh wallet has `num_sends == 0` regardless
-/// of mint state (mint touches the RECIPIENT's `coin_queue`, never
-/// the recipient's `account.proof` — see `account_node.rs::receive_coin`).
-/// Post-`/api/send` + `/api/commit` round-trip: `num_sends == 1`.
 #[tokio::test]
-#[ignore = "blocked on zk-coins/node#226 — mint credits a Poseidon owner, not the spec SHA-256 address; minted balance is not visible/spendable via address_hex()"]
-async fn balance_response_num_sends_starts_zero_and_bumps_on_send() {
+async fn balance_num_sends_surface_is_gone() {
     let client = http_client();
     let alice = TestWallet::new();
-    let bob = TestWallet::new();
-    // The asset Alice will mint — derivable before the mint since it is a
-    // pure function of (creator_pubkey, name, decimals).
-    let aid = asset_id_hex(&alice.pubkey(0), ASSET_NAME, ASSET_DECIMALS);
-
-    // Fresh wallet (never minted, never sent): num_sends MUST be 0.
-    let pre_mint = client
-        .get(url(&format!(
-            "/api/balance?address={}&asset_id={}",
-            alice.address_hex(),
-            aid
-        )))
-        .send()
-        .await
-        .expect("GET /api/balance pre-mint");
-    assert_eq!(pre_mint.status(), StatusCode::OK);
-    let pre_mint_body: Value = pre_mint.json().await.expect("balance body JSON");
-    assert_eq!(
-        pre_mint_body["num_sends"].as_u64(),
-        Some(0),
-        "fresh wallet must report num_sends=0, got {:?}",
-        pre_mint_body["num_sends"]
-    );
-
-    // Mint into Alice. The mint flow writes into Alice's `coin_queue`
-    // via `receive_coin`; it does NOT touch `account.proof`. So
-    // `num_sends` must still be 0 after the mint settles.
-    let mint_result = mint_via_job(&client, &alice, ASSET_NAME, ASSET_DECIMALS, MINT_AMOUNT).await;
-    assert_eq!(mint_result["success"], Value::Bool(true), "mint failed");
-    let _ = poll_balance_at_least(&client, &alice.address_hex(), &aid, MINT_AMOUNT).await;
-
-    let post_mint = client
-        .get(url(&format!(
-            "/api/balance?address={}&asset_id={}",
-            alice.address_hex(),
-            aid
-        )))
-        .send()
-        .await
-        .expect("GET /api/balance post-mint");
-    assert_eq!(post_mint.status(), StatusCode::OK);
-    let post_mint_body: Value = post_mint.json().await.expect("balance body JSON");
-    assert_eq!(
-        post_mint_body["num_sends"].as_u64(),
-        Some(0),
-        "minted-into wallet must still report num_sends=0 (mint touches \
-         coin_queue, not account.proof), got {:?}",
-        post_mint_body["num_sends"]
-    );
-
-    // Now drive Alice through a full send+commit round-trip. Mirrors
-    // `send_commit_roundtrip_moves_balance` — sign, send (carrying the
-    // minted `asset_id`; `prev_commitment_pubkey` is server-ignored now),
-    // then commit.
-    let amount = SEND_AMOUNT;
-    let ts = unix_now();
-    let signature = alice.sign_send(&alice.address_hex(), &bob.address_hex(), amount, ts);
-    let (send_job_id, send_status, _admit) = submit_send_job(
+    assert_legacy_gone(
         &client,
-        &json!({
-            "account_address": alice.address_hex(),
-            "recipient": bob.address_hex(),
-            "amount": amount,
-            "public_key": hex::encode(alice.pubkey(0).serialize()),
-            "next_public_key": hex::encode(alice.pubkey(1).serialize()),
-            "signature": signature,
-            "timestamp": ts,
-            "asset_id": aid,
-        }),
+        reqwest::Method::GET,
+        &format!(
+            "/api/balance?address={}&asset_id=0x{}",
+            alice.address_hex(),
+            "11".repeat(32)
+        ),
+        &["/api/balance", "Stage 3", "read.account"],
     )
     .await;
-    assert_eq!(send_status, StatusCode::ACCEPTED, "send must be admitted");
-    let send_job_id = send_job_id.expect("send job_id");
-    // The send job's prove leg runs `send_flow`, which bumps
-    // `account.num_sends` and persists `account.proof = Some(...)`
-    // before the job parks in `awaiting_signature`. So once the job
-    // reaches `awaiting_signature` the counter is already 1.
-    let awaiting = poll_job_until_status(&client, &send_job_id, "awaiting_signature").await;
-    let send_proof_id = awaiting["proof_id"].as_u64().expect("send proof_id");
-    let send_coin_proof = fetch_coin_proof(&client, send_proof_id).await;
-    let (ash_bytes, ocr_bytes) = ash_ocr_from_send_proof(&send_coin_proof);
-
-    // After the send job reaches `awaiting_signature` the server has
-    // already bumped `account.num_sends` (atomically with
-    // `account.proof = Some(...)` inside `send_coins_inner`), so the
-    // balance read MUST report `1` — independent of whether the user
-    // later succeeds in the commit phase. (The commit only advances
-    // the SMT; the per-account counter advances on the proof itself.)
-    let post_send = client
-        .get(url(&format!(
-            "/api/balance?address={}&asset_id={}",
-            alice.address_hex(),
-            aid
-        )))
-        .send()
-        .await
-        .expect("GET /api/balance post-send");
-    assert_eq!(post_send.status(), StatusCode::OK);
-    let post_send_body: Value = post_send.json().await.expect("balance body JSON");
-    assert_eq!(
-        post_send_body["num_sends"].as_u64(),
-        Some(1),
-        "post-send wallet must report num_sends=1, got {:?}",
-        post_send_body["num_sends"]
-    );
-
-    // Close the loop: drive the commit so the test doesn't leave a
-    // proof_id orphaned in the proof_store (every other api_remote
-    // commit-round-trip cleans up the same way).
-    let mut commit_message = Vec::with_capacity(64);
-    commit_message.extend_from_slice(&ash_bytes);
-    commit_message.extend_from_slice(&ocr_bytes);
-    let commit_sig = alice.sign_commit(&commit_message);
-    let _commit_result = commit_send_job(
-        &client,
-        &send_job_id,
-        &json!({
-            "proof_id": send_proof_id,
-            "public_key": hex::encode(alice.pubkey(0).serialize()),
-            "signature": commit_sig,
-            "message": hex::encode(&commit_message),
-        }),
-    )
-    .await;
-
-    // num_sends survives the commit (commit doesn't mutate the
-    // counter — it only advances the SMT and Bob's coin_queue).
-    let post_commit = client
-        .get(url(&format!(
-            "/api/balance?address={}&asset_id={}",
-            alice.address_hex(),
-            aid
-        )))
-        .send()
-        .await
-        .expect("GET /api/balance post-commit");
-    let post_commit_body: Value = post_commit.json().await.expect("balance body JSON");
-    assert_eq!(
-        post_commit_body["num_sends"].as_u64(),
-        Some(1),
-        "post-commit num_sends must still be 1, got {:?}",
-        post_commit_body["num_sends"]
-    );
 }
-
-/// Regression: the second `/api/send` for an account whose
-/// `account.proof = Some(...)` MUST succeed even when the client
-/// omits `prev_commitment_pubkey` from the request body.
-///
-/// Pre-`Account::commitment_public_key`-refactor this surfaced as a
-/// 400 `prev_commitment_pubkey required for account update` —
-/// observed live as `07-send.spec.ts::send-success` failing with
-/// `Interner Fehler: Vorheriger Public Key fehlt.` against DEV every
-/// time the wallet's local BIP-32 child-index counter drifted from
-/// the server's (seed restore + stale-app deploy + TOCTOU between
-/// balance fetch and signing). Post-refactor the server reads the
-/// previous commitment pubkey from `account.commitment_public_key`
-/// (set atomically with `proof` inside `send_coins_inner`), so the
-/// caller-supplied field is purely advisory and a missing one is
-/// fully recoverable.
-///
-/// Flow: mint → send #1 (first send, `account.proof = None` → prove
-/// initial → server stamps `commitment_public_key = pubkey_0`) →
-/// send #2 with `prev_commitment_pubkey` deliberately omitted →
-/// MUST succeed (AccountUpdate branch reads its own stored value).
 #[tokio::test]
-#[ignore = "blocked on zk-coins/node#226 — mint credits a Poseidon owner, not the spec SHA-256 address; minted balance is not visible/spendable via address_hex()"]
-async fn second_send_roundtrip_succeeds_without_prev_commitment_pubkey_field() {
+async fn second_send_legacy_observation_surfaces_are_gone() {
     let client = http_client();
     let alice = TestWallet::new();
-    let bob = TestWallet::new();
-
-    // ---- Mint ----
-    let mint_result = mint_via_job(&client, &alice, ASSET_NAME, ASSET_DECIMALS, MINT_AMOUNT).await;
-    assert_eq!(mint_result["success"], Value::Bool(true), "mint failed");
-    let aid = asset_id_hex(&alice.pubkey(0), ASSET_NAME, ASSET_DECIMALS);
-
-    let _ = poll_balance_at_least(&client, &alice.address_hex(), &aid, MINT_AMOUNT).await;
-
-    // ---- First send (proves initial, sets account.proof = Some +
-    // commitment_public_key = pubkey_0). `prev_commitment_pubkey` is
-    // server-ignored now and omitted; the send carries `asset_id`. ----
-    let ts1 = unix_now();
-    let sig1 = alice.sign_send(&alice.address_hex(), &bob.address_hex(), SEND_AMOUNT, ts1);
-    let (send1_job_id, send1_status, _admit1) = submit_send_job(
+    assert_legacy_gone(
         &client,
-        &json!({
-            "account_address": alice.address_hex(),
-            "recipient": bob.address_hex(),
-            "amount": SEND_AMOUNT,
-            "public_key": hex::encode(alice.pubkey(0).serialize()),
-            "next_public_key": hex::encode(alice.pubkey(1).serialize()),
-            "signature": sig1,
-            "timestamp": ts1,
-            "asset_id": aid,
-        }),
-    )
-    .await;
-    assert_eq!(
-        send1_status,
-        StatusCode::ACCEPTED,
-        "first send must be admitted"
-    );
-    let send1_job_id = send1_job_id.expect("send #1 job_id");
-    let awaiting1 = poll_job_until_status(&client, &send1_job_id, "awaiting_signature").await;
-    let send1_proof_id = awaiting1["proof_id"].as_u64().expect("send #1 proof_id");
-    let send1_coin_proof = fetch_coin_proof(&client, send1_proof_id).await;
-    let (ash1_bytes, ocr1_bytes) = ash_ocr_from_send_proof(&send1_coin_proof);
-
-    // Commit the first send so its commitment lands in the SMT —
-    // the second send's prev-commitment lookup needs it indexed.
-    let mut commit1_msg = Vec::with_capacity(64);
-    commit1_msg.extend_from_slice(&ash1_bytes);
-    commit1_msg.extend_from_slice(&ocr1_bytes);
-    let commit1_sig = alice.sign_commit(&commit1_msg);
-    let _commit1_result = commit_send_job(
-        &client,
-        &send1_job_id,
-        &json!({
-            "proof_id": send1_proof_id,
-            "public_key": hex::encode(alice.pubkey(0).serialize()),
-            "signature": commit1_sig,
-            "message": hex::encode(&commit1_msg),
-        }),
-    )
-    .await;
-
-    // Verify the server bumped `num_sends` to 1 (the wallet would
-    // sync this on its next balance tick to choose `pubkey(1)` as
-    // its next signing key).
-    let post_send1 = client
-        .get(url(&format!(
-            "/api/balance?address={}&asset_id={}",
+        reqwest::Method::GET,
+        &format!(
+            "/api/balance?address={}&asset_id=0x{}",
             alice.address_hex(),
-            aid
-        )))
-        .send()
-        .await
-        .expect("GET /api/balance post-send-1");
-    let post_send1_body: Value = post_send1.json().await.expect("balance body JSON");
-    assert_eq!(
-        post_send1_body["num_sends"].as_u64(),
-        Some(1),
-        "post-send-1 num_sends must report 1"
-    );
-
-    // Wait until the scanner has ingested send #1's committed
-    // commitment into the SMT before issuing send #2. The legacy
-    // synchronous `/api/commit` advanced the in-process SMT before
-    // returning 200; the async `commit_flow` only broadcasts +
-    // `receive_coin`s, leaving the SMT advance to the event-driven
-    // scanner. Send #2's prev-commitment lookup needs send #1's
-    // commitment indexed, so without this wait the prove leg fails
-    // with "Unable to get merkle proofs for provided public key".
-    // Alice's balance dropping to `MINT_AMOUNT - SEND_AMOUNT` is the
-    // observable signal that the spend (hence the commitment) has been
-    // scanned.
-    let _ = poll_balance_at_most(
-        &client,
-        &alice.address_hex(),
-        &aid,
-        MINT_AMOUNT - SEND_AMOUNT,
+            "11".repeat(32)
+        ),
+        &["/api/balance", "Stage 3", "read.account"],
     )
     .await;
-
-    // Send #2 spends Alice's send-#1 *change* directly. After send #1
-    // committed, `coin_queue.clear()` ran and the unspent remainder
-    // (`MINT_AMOUNT - SEND_AMOUNT`) lives in `account.balance`, NOT as a
-    // queued coin — `commit_flow` only `receive_coin`s the recipient's
-    // out-coin, never a change coin back to the sender. So Alice's
-    // `coin_queue` is empty and `MINT_AMOUNT - SEND_AMOUNT` (= 40_000)
-    // still covers another `SEND_AMOUNT`.
-    //
-    // We deliberately do NOT mint a second time into Alice here. A
-    // second mint pushes a fresh coin into Alice's `coin_queue`, which
-    // forces send #2 through `send_coins_inner`'s in-coin loop. That
-    // loop inserts each spent coin's id into `account.coin_history`
-    // BEFORE the prove, and the prove leg has no rollback on failure:
-    // a single transient prove failure (the genuine
-    // "Unable to get merkle proofs for provided public key" scanner
-    // race) then leaves the coin in BOTH `coin_queue` and
-    // `coin_history`, so every subsequent retry fails deterministically
-    // and permanently with "Should provide an inclusion proof" — the
-    // retry budget can never clear it. Spending the change from
-    // `account.balance` with an empty queue skips the in-coin loop
-    // entirely, keeping retries idempotent and isolating the assertion
-    // to its actual subject: the omitted `prev_commitment_pubkey`.
-
-    // ---- Second send WITHOUT `prev_commitment_pubkey`. ----
-    //
-    // The whole point of the refactor: the AccountUpdate branch reads
-    // `account.commitment_public_key` from its own state (set
-    // atomically with `proof` by send #1 above), so the caller can
-    // omit the field entirely and the prove still succeeds. Pre-
-    // refactor this returned 400
-    // `"prev_commitment_pubkey required for account update"`.
-    //
-    // The wallet's signing key for this send is `pubkey(1)` because
-    // `num_sends == 1` (the server's authoritative counter).
-    //
-    // The prove leg is where the AccountUpdate branch reads
-    // `account.commitment_public_key` from its own state (set
-    // atomically with `proof` by send #1 above) — so reaching
-    // `awaiting_signature` is the success signal. Pre-refactor the
-    // prove leg failed with `"prev_commitment_pubkey required for
-    // account update"` (a non-retryable terminal failure the helper
-    // would surface immediately).
-    //
-    // `submit_send_no_prev_until_awaiting` re-signs + resubmits on the
-    // transient `"Unable to get merkle proofs for provided public key"`
-    // scanner race: send #1's commitment was committed via the async
-    // `commit_flow`, which (unlike the legacy synchronous `/api/commit`)
-    // leaves the in-process SMT advance to the event-driven scanner, so
-    // the prev-commitment lookup can briefly miss until the on-chain
-    // inscription is ingested.
-    let (send2_job_id, awaiting2) = submit_send_no_prev_until_awaiting(
+    assert_legacy_gone(
         &client,
-        &alice,
-        &bob.address_hex(),
-        &aid,
-        SEND_AMOUNT,
-        1,
+        reqwest::Method::GET,
+        &format!("/api/proof/{}", u64::MAX),
+        &["/api/proof", "Stage 3", "read.proof"],
     )
     .await;
-
-    // Server-side counter advanced. `num_sends` is the server's
-    // authoritative count of *committed* sends; send #2 reaching
-    // `awaiting_signature` (its prove leg done) has already bumped it to
-    // 2, so this holds before the commit below.
-    let post_send2 = client
-        .get(url(&format!(
-            "/api/balance?address={}&asset_id={}",
-            alice.address_hex(),
-            aid
-        )))
-        .send()
-        .await
-        .expect("GET /api/balance post-send-2");
-    let post_send2_body: Value = post_send2.json().await.expect("balance body JSON");
-    assert_eq!(
-        post_send2_body["num_sends"].as_u64(),
-        Some(2),
-        "post-send-2 num_sends must report 2"
-    );
-
-    // ---- Commit send #2 (REQUIRED, not optional) ----
-    //
-    // The dispatcher is a single inline worker that PARKS in
-    // `wait_for_commit` for up to `awaiting_signature_timeout` (600 s on
-    // DEV) until a commit arrives. Returning here without committing
-    // would pin that worker, starving every test that sorts after this
-    // one in the serial alphabetical run (`cancel` only works while a job
-    // is `queued`, so it cannot release an `awaiting_signature` park).
-    // Committing both releases the worker AND completes the roundtrip.
-    //
-    // The commit's `public_key` must match the key that produced
-    // `signature`, because the node's `commit_flow` verifies the
-    // commitment with a self-contained Schnorr check (`Commitment::verify`
-    // over `public_key`/`signature`/`message`) — it does NOT tie the
-    // commit key to the send's signing key or the account's
-    // `commitment_public_key`. `TestWallet::sign_commit` always signs with
-    // `seckey(0)`, so the matching `public_key` is `pubkey(0)`, exactly as
-    // send #1's commit above (and `send_commit_roundtrip_moves_balance`)
-    // does. The send-#2 *signing* key (`pubkey(1)`) is unrelated here.
-    let send2_proof_id = awaiting2["proof_id"]
-        .as_u64()
-        .expect("send #2 awaiting_signature job carries proof_id");
-    let send2_coin_proof = fetch_coin_proof(&client, send2_proof_id).await;
-    let (ash2_bytes, ocr2_bytes) = ash_ocr_from_send_proof(&send2_coin_proof);
-
-    let mut commit2_msg = Vec::with_capacity(64);
-    commit2_msg.extend_from_slice(&ash2_bytes);
-    commit2_msg.extend_from_slice(&ocr2_bytes);
-    let commit2_sig = alice.sign_commit(&commit2_msg);
-    let commit2_result = commit_send_job(
-        &client,
-        &send2_job_id,
-        &json!({
-            "proof_id": send2_proof_id,
-            "public_key": hex::encode(alice.pubkey(0).serialize()),
-            "signature": commit2_sig,
-            "message": hex::encode(&commit2_msg),
-        }),
-    )
-    .await;
-    assert_eq!(commit2_result["success"], Value::Bool(true));
 }
 
 // ---------------------------------------------------------------------------
@@ -2837,11 +2018,11 @@ async fn error_strings_match_known_app_mapping() {
 }
 
 /// Mint-dependent half of the error-string lockstep: the "Insufficient
-/// funds" provocation needs a real minted balance. Split out of
-/// `error_strings_match_known_app_mapping` and `#[ignore]`d pending the node
-/// owner-hash fix (#226) — un-ignore once #228 lands and DEV redeploys.
+/// funds" provocation needs a real minted balance **and** an unauthenticated
+/// balance read. Stage 3 closed `GET /api/balance` (410); keep the test
+/// ignored until a capability-bound observation path exists for this suite.
 #[tokio::test]
-#[ignore = "blocked on zk-coins/node#226 — needs a minted balance, currently credited under a Poseidon owner instead of the spec SHA-256 address"]
+#[ignore = "Stage 3 closed GET /api/balance (410); needs capability-bound observation to mint then over-send"]
 async fn error_strings_insufficient_funds() {
     let client = http_client();
     let alice = TestWallet::new();
@@ -2882,81 +2063,43 @@ async fn error_strings_insufficient_funds() {
     assert_eq!(terminal["status"], "failed");
     assert_eq!(terminal["error"], "Insufficient funds");
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Poll `/api/balance` until the observed balance is >= `target`, or
-/// until [`POLL_TIMEOUT`] elapses. Returns the last observed balance
-/// regardless — the caller decides whether to assert on it.
+/// Stage 3: `/api/balance` is 410 Gone. Residual callers fail loud.
+#[allow(dead_code)]
 async fn poll_balance_at_least(
     client: &reqwest::Client,
     address: &str,
     asset_id: &str,
-    target: u64,
+    _target: u64,
 ) -> u64 {
-    let deadline = std::time::Instant::now() + POLL_TIMEOUT;
-    let mut last_seen = 0u64;
-    loop {
-        let resp = client
-            .get(url(&format!(
-                "/api/balance?address={}&asset_id={}",
-                address, asset_id
-            )))
-            .send()
-            .await
-            .expect("GET balance");
-        if resp.status() == StatusCode::OK {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            if let Some(b) = body["balance"].as_u64() {
-                last_seen = b;
-                if b >= target {
-                    return b;
-                }
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return last_seen;
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    assert_legacy_gone(
+        client,
+        reqwest::Method::GET,
+        &format!("/api/balance?address={}&asset_id={}", address, asset_id),
+        &["/api/balance", "Stage 3", "read.account"],
+    )
+    .await;
+    panic!(
+        "poll_balance_at_least: GET /api/balance is closed (Stage 3);          cannot observe balance for {address}"
+    );
 }
-
-/// Poll `/api/balance` until the observed balance is <= `target`, or
-/// until [`POLL_TIMEOUT`] elapses. Used to wait for the post-commit
-/// debit to land in the in-memory account.
+/// Stage 3: `/api/balance` is 410 Gone. Residual callers fail loud.
+#[allow(dead_code)]
 async fn poll_balance_at_most(
     client: &reqwest::Client,
     address: &str,
     asset_id: &str,
-    target: u64,
+    _target: u64,
 ) -> u64 {
-    let deadline = std::time::Instant::now() + POLL_TIMEOUT;
-    let mut last_seen = u64::MAX;
-    loop {
-        let resp = client
-            .get(url(&format!(
-                "/api/balance?address={}&asset_id={}",
-                address, asset_id
-            )))
-            .send()
-            .await
-            .expect("GET balance");
-        if resp.status() == StatusCode::OK {
-            let body: Value = resp.json().await.unwrap_or(Value::Null);
-            if let Some(b) = body["balance"].as_u64() {
-                last_seen = b;
-                if b <= target {
-                    return b;
-                }
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return last_seen;
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    assert_legacy_gone(
+        client,
+        reqwest::Method::GET,
+        &format!("/api/balance?address={}&asset_id={}", address, asset_id),
+        &["/api/balance", "Stage 3", "read.account"],
+    )
+    .await;
+    panic!(
+        "poll_balance_at_most: GET /api/balance is closed (Stage 3);          cannot observe balance for {address}"
+    );
 }
 
 fn random_suffix() -> String {
@@ -3354,6 +2497,11 @@ async fn submit_send_no_prev_until_awaiting(
 /// pair lives in the Plonky2 proof public inputs. Decode exactly like
 /// `account_node_tests.rs` and `flow.rs` (the first
 /// `N_PROOF_DATA_PUBLIC_INPUTS` field elements reconstruct `ProofData`).
+///
+/// Retained for residual/ignored helpers; Stage 3 closed unauthenticated
+/// `GET /api/proof/:id`, so live tests must not depend on this path.
+#[allow(dead_code)]
+#[allow(dead_code)]
 fn ash_ocr_from_send_proof(coin_proof: &CoinProof) -> ([u8; 32], [u8; 32]) {
     let pis: [F; N_PROOF_DATA_PUBLIC_INPUTS] = coin_proof.proof.public_inputs
         [..N_PROOF_DATA_PUBLIC_INPUTS]
@@ -3397,22 +2545,17 @@ async fn commit_send_job(client: &reqwest::Client, job_id: &str, commit_body: &V
     );
     terminal["result"].clone()
 }
-
-/// Fetch + bincode-decode a `CoinProof` by proof_id. Shared by the
-/// roundtrip tests that need the mint proof (for `prev_commitment_pubkey`)
-/// or the send proof (for `ash || ocr`).
+/// Stage 3 Runde 5: `GET /api/proof/:id` is 410 Gone.
+#[allow(dead_code)]
 async fn fetch_coin_proof(client: &reqwest::Client, proof_id: u64) -> CoinProof {
-    let resp = client
-        .get(url(&format!("/api/proof/{}", proof_id)))
-        .send()
-        .await
-        .expect("GET /api/proof/:id");
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "GET /api/proof/{} must answer 200",
-        proof_id
+    assert_legacy_gone(
+        client,
+        reqwest::Method::GET,
+        &format!("/api/proof/{}", proof_id),
+        &["/api/proof", "Stage 3", "read.proof"],
+    )
+    .await;
+    panic!(
+        "fetch_coin_proof: GET /api/proof/{proof_id} is closed (Stage 3);          use job-result thin-client ash/ocr fields"
     );
-    let bytes = resp.bytes().await.expect("proof bytes");
-    bincode::deserialize(&bytes).expect("decode CoinProof bincode")
 }

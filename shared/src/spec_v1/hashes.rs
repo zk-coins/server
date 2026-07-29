@@ -334,7 +334,10 @@ mod tests {
         let a = derive_nav_rand(&op_secret, 0);
         let b = derive_nav_rand(&op_secret, 0);
         let c = derive_nav_rand(&op_secret, 1);
-        assert_eq!(a, b, "same (op_secret, send_counter) must reproduce nav_rand");
+        assert_eq!(
+            a, b,
+            "same (op_secret, send_counter) must reproduce nav_rand"
+        );
         assert_ne!(a, c, "different send_counter must yield different nav_rand");
         // Wrong counter material (little-endian) must not match for a
         // multi-byte counter where BE ≠ LE (counter 0 is identical in both).

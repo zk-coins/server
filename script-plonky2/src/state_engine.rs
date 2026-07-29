@@ -431,9 +431,7 @@ impl FinalisationCapability {
     /// Fails if no signature has been installed — never invents a zero sig.
     pub fn into_finalise_parts(self) -> Result<(PendingTransition, TransitionSignature)> {
         let sig = self.signature.ok_or_else(|| {
-            anyhow::anyhow!(
-                "FinalisationCapability::into_finalise_parts: no signature installed"
-            )
+            anyhow::anyhow!("FinalisationCapability::into_finalise_parts: no signature installed")
         })?;
         Ok((self.pending, sig))
     }
@@ -449,8 +447,7 @@ impl FinalisationCapability {
             pending: self.pending.to_wire(),
             signature: self.signature.clone(),
         };
-        bincode::serialize(&wire)
-            .context("bincode serialize FinalisationCapability durable wire")
+        bincode::serialize(&wire).context("bincode serialize FinalisationCapability durable wire")
     }
 
     /// Inverse of [`to_durable_bytes`](Self::to_durable_bytes).
@@ -466,13 +463,10 @@ impl FinalisationCapability {
             .context("bincode deserialize FinalisationCapability durable wire")?;
         let pending = PendingTransition::from_wire(wire.pending);
         let bridge = ProverBridge::new(network);
-        pending
-            .witness_wip
-            .bind_embedded_proofs(&bridge)
-            .context(
-                "FinalisationCapability durable decode: embedded compliance \
+        pending.witness_wip.bind_embedded_proofs(&bridge).context(
+            "FinalisationCapability durable decode: embedded compliance \
                  proof(s) failed circuit-C identity bind",
-            )?;
+        )?;
         Ok(Self {
             pending,
             signature: wire.signature,
@@ -610,7 +604,6 @@ pub struct StateEngine {
     /// Strictly-increasing fold ordinal at the current tip (as `tx_index`).
     fold_seq: u32,
 }
-
 
 /// Shared begin_* setup: mode, prev state, recursion material, coinhist leaves.
 type AccountTransitionContext = (
@@ -894,9 +887,7 @@ impl StateEngine {
             );
             match existing.op_secret {
                 None => {
-                    bail!(
-                        "mint: op_secret missing for account — refusing (no silent default)"
-                    );
+                    bail!("mint: op_secret missing for account — refusing (no silent default)");
                 }
                 Some(stored) => {
                     ensure!(
@@ -1007,16 +998,13 @@ impl StateEngine {
 
         let nav_rand = req.op_secret.derive_nav_rand(entry_send_counter);
         let nav = self.size_final_nav()?;
-        let nav_opening = NavOpening {
-            nav,
-            nav_rand,
-        };
+        let nav_opening = NavOpening { nav, nav_rand };
         let proof_data = compute_proof_data(
             &new_account_state,
             std::slice::from_ref(&output_coin),
             &[],
             &req.nk,
-        (    nav,     &nav_rand,     &req.next_pubkey,     &req.npk_rand),
+            (nav, &nav_rand, &req.next_pubkey, &req.npk_rand),
         )?;
         let proof_data_hash = host::hash_proof_data(&host::serialize_proof_data(&proof_data));
 
@@ -1067,9 +1055,9 @@ impl StateEngine {
             .get(&req.owner)
             .context("send: account not found")?;
         ensure!(record.state.owner == req.owner, "account owner mismatch");
-        let op_secret = record.op_secret.context(
-            "send: op_secret missing for account — refusing (no silent default)",
-        )?;
+        let op_secret = record
+            .op_secret
+            .context("send: op_secret missing for account — refusing (no silent default)")?;
         ensure!(
             !req.input_coin_ids.is_empty(),
             "send requires at least one input coin"
@@ -1288,16 +1276,13 @@ impl StateEngine {
 
         let nav_rand = op_secret.derive_nav_rand(entry_send_counter);
         let nav = self.size_final_nav()?;
-        let nav_opening = NavOpening {
-            nav,
-            nav_rand,
-        };
+        let nav_opening = NavOpening { nav, nav_rand };
         let proof_data = compute_proof_data(
             &new_account_state,
             &output_coins,
             &input_coins,
             &record.nk,
-        (    nav,     &nav_rand,     &req.next_pubkey,     &req.npk_rand),
+            (nav, &nav_rand, &req.next_pubkey, &req.npk_rand),
         )?;
         let proof_data_hash = host::hash_proof_data(&host::serialize_proof_data(&proof_data));
 
@@ -1367,9 +1352,7 @@ impl StateEngine {
             );
             match record.op_secret {
                 None => {
-                    bail!(
-                        "receive: op_secret missing for account — refusing (no silent default)"
-                    );
+                    bail!("receive: op_secret missing for account — refusing (no silent default)");
                 }
                 Some(stored) => {
                     ensure!(
@@ -1457,16 +1440,13 @@ impl StateEngine {
 
         let nav_rand = req.op_secret.derive_nav_rand(entry_send_counter);
         let nav = self.size_final_nav()?;
-        let nav_opening = NavOpening {
-            nav,
-            nav_rand,
-        };
+        let nav_opening = NavOpening { nav, nav_rand };
         let proof_data = compute_proof_data(
             &new_account_state,
             &[],
             &[],
             &req.nk,
-        (    nav,     &nav_rand,     &req.next_pubkey,     &req.npk_rand),
+            (nav, &nav_rand, &req.next_pubkey, &req.npk_rand),
         )?;
         let proof_data_hash = host::hash_proof_data(&host::serialize_proof_data(&proof_data));
 
@@ -1955,8 +1935,7 @@ impl StateEngine {
             self.tip_height
         );
         ensure!(
-            self.nflog
-                .is_canonical(receiver_nav.size, receiver_nav.mth),
+            self.nflog.is_canonical(receiver_nav.size, receiver_nav.mth),
             "apply: pending receiver nav is no longer canonical on the live NfLog \
              (tip={}, size_final={})",
             self.tip_height,
@@ -2841,13 +2820,7 @@ mod tests {
         .expect("empty");
         let empty_ash = host::account_state_hash(&empty).expect("ash");
         let prior_coin = Coin {
-            identifier: host::coin_identifier(
-                empty_ash,
-                &first.owner.0,
-                asset_id,
-                prior_amount,
-                0,
-            ),
+            identifier: host::coin_identifier(empty_ash, &first.owner.0, asset_id, prior_amount, 0),
             recipient: first.owner,
             amount: prior_amount,
             asset_id,
@@ -3265,9 +3238,7 @@ mod tests {
         let mut via_finalise = StateEngine::new(Network::Testnet, 0);
         let mut via_alias = StateEngine::new(Network::Testnet, 0);
         let req = test_mint_request(1);
-        let pending_a = via_finalise
-            .begin_mint(req.clone())
-            .expect("begin mint A");
+        let pending_a = via_finalise.begin_mint(req.clone()).expect("begin mint A");
         let pending_b = via_alias.begin_mint(req).expect("begin mint B");
         let signature =
             placeholder_signature(pending_a.witness_wip.prev_account_state.current_pubkey);
@@ -3365,7 +3336,9 @@ mod tests {
             state,
             coinhist,
             nk,
-            op_secret: Some(label_op_secret(b"zkCoins/v1/state-engine/overspend/op_secret")),
+            op_secret: Some(label_op_secret(
+                b"zkCoins/v1/state-engine/overspend/op_secret",
+            )),
             genesis_pubkey: pk,
             spendable,
             spent_ids: BTreeSet::new(),
@@ -3442,7 +3415,12 @@ mod tests {
             &pending.witness_wip.output_coins,
             &pending.witness_wip.input_coins,
             &fixture.nk,
-        (    pending.nav_opening.nav,     &pending.nav_opening.nav_rand,     &fixture.next_pubkey,     &pending.witness_wip.npk_rand),
+            (
+                pending.nav_opening.nav,
+                &pending.nav_opening.nav_rand,
+                &fixture.next_pubkey,
+                &pending.witness_wip.npk_rand,
+            ),
         )
         .unwrap();
         assert_eq!(pending.proof_data, expected_pd);
@@ -3499,7 +3477,10 @@ mod tests {
             "finalise must not grow the canonical NfLog"
         );
         assert!(
-            matches!(engine.nflog.lookup(applied.nullifier.0), LookupResult::Absent),
+            matches!(
+                engine.nflog.lookup(applied.nullifier.0),
+                LookupResult::Absent
+            ),
             "send own nullifier must stay absent until scan-fold"
         );
         assert!(
@@ -3729,10 +3710,7 @@ mod tests {
             "last_nullifier_pos stays None until scan-fold"
         );
         assert_eq!(applied_rx.nullifier.0, bob_pk0);
-        assert!(matches!(
-            engine.nflog.lookup(bob_pk0),
-            LookupResult::Absent
-        ));
+        assert!(matches!(engine.nflog.lookup(bob_pk0), LookupResult::Absent));
 
         // Scanner places Bob's receive nullifier at a real chain position.
         let rx_scanned = ScannedNullifier::from_survivor(&PublishedNullifier {
@@ -3842,9 +3820,15 @@ mod tests {
         );
         let mut balances = BTreeMap::new();
         balances.insert(host::digest_to_bytes(&asset_id), 50);
-        let state =
-            AccountState::new(owner, host::nk_commit(&nk), balances, pk, 1, coinhist.root())
-                .unwrap();
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            balances,
+            pk,
+            1,
+            coinhist.root(),
+        )
+        .unwrap();
         let mut engine = StateEngine::new(Network::Testnet, 0);
         engine
             .insert_account(

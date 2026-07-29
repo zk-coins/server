@@ -254,10 +254,7 @@ fn generate_circuit_digests() {
     // Default: verify the committed file matches the just-built digests.
     // REGEN_CIRCUIT_DIGESTS=1: rewrite the file (developer after a real
     // circuit change). CI never sets REGEN — it must fail on drift.
-    let regen = matches!(
-        std::env::var("REGEN_CIRCUIT_DIGESTS").as_deref(),
-        Ok("1")
-    );
+    let regen = matches!(std::env::var("REGEN_CIRCUIT_DIGESTS").as_deref(), Ok("1"));
     if regen {
         fs::write(&path, &generated).expect("write generated_circuit_digests.txt");
         println!("REGEN: wrote {}", path.display());

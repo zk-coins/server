@@ -13,9 +13,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use serde::de::DeserializeOwned;
 use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, Message};
 use futures_util::stream::Stream;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -28,9 +28,9 @@ use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use utoipa::ToSchema;
 use uuid::Uuid;
-use zkcoins_program::hash::digest_to_bytes;
 #[cfg(feature = "username-claim")]
 use zkcoins_program::hash::digest_from_bytes;
+use zkcoins_program::hash::digest_to_bytes;
 use zkcoins_prover::Proof;
 
 use crate::account_node::{AccountNode, CoinProof};
@@ -294,11 +294,9 @@ pub(crate) type V1FinaliseHook = Arc<
             crate::job_store::FinaliseFence,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<crate::v1::FinaliseOutcome, String>>
-                    + Send,
+                dyn std::future::Future<Output = Result<crate::v1::FinaliseOutcome, String>> + Send,
             >,
-        >
-        + Send
+        > + Send
         + Sync,
 >;
 
@@ -895,7 +893,6 @@ pub(crate) async fn get_balance_handler(
         })),
     )
 }
-
 
 /// One asset entry in the [`OwnerBalanceResponse`] list.
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -1713,7 +1710,10 @@ where
 {
     type Rejection = Response;
 
-    async fn from_request(req: Request<axum::body::Body>, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(
+        req: Request<axum::body::Body>,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(V1Json(value)),
             Err(err) => {
@@ -2073,10 +2073,7 @@ where
 {
     type Rejection = Response;
 
-    async fn from_request_parts(
-        _parts: &mut Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(_parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         if !crate::v1::v1_attest_route_active() {
             return Err(attest_error_response(
                 crate::v1::AttestError::FeatureDisabled,
@@ -2192,10 +2189,7 @@ pub(crate) async fn attest_balance_handler(
             .job_store
             .fail(
                 job.public_id,
-                &crate::v1::encode_job_error(
-                    "internal_error",
-                    format!("enqueue failed: {e}"),
-                ),
+                &crate::v1::encode_job_error("internal_error", format!("enqueue failed: {e}")),
             )
             .await;
         return attest_error_response(crate::v1::AttestError::Internal(
@@ -2276,7 +2270,10 @@ pub(crate) async fn get_job_v1_handler(
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
             && phase.len() <= 64
         {
-            obj.insert("phase".to_string(), serde_json::Value::String(phase.to_string()));
+            obj.insert(
+                "phase".to_string(),
+                serde_json::Value::String(phase.to_string()),
+            );
         }
     }
 
@@ -2601,12 +2598,10 @@ pub(crate) fn initial_event_from_job_v1(job: &Job) -> Event {
                     .insert("awaiting_signature".to_string(), surface);
             }
             if !job.phase.is_empty() {
-                data.as_object_mut()
-                    .expect("object")
-                    .insert(
-                        "phase".to_string(),
-                        serde_json::Value::String(job.phase.clone()),
-                    );
+                data.as_object_mut().expect("object").insert(
+                    "phase".to_string(),
+                    serde_json::Value::String(job.phase.clone()),
+                );
             }
             ("phase", data)
         }
@@ -2616,12 +2611,10 @@ pub(crate) fn initial_event_from_job_v1(job: &Job) -> Event {
                 "progress": v1_progress_wire(job.progress),
             });
             if !job.phase.is_empty() {
-                data.as_object_mut()
-                    .expect("object")
-                    .insert(
-                        "phase".to_string(),
-                        serde_json::Value::String(job.phase.clone()),
-                    );
+                data.as_object_mut().expect("object").insert(
+                    "phase".to_string(),
+                    serde_json::Value::String(job.phase.clone()),
+                );
             }
             ("phase", data)
         }
@@ -2670,12 +2663,10 @@ pub(crate) fn event_from_phase_v1(event: &JobPhaseEvent, job_id: Uuid, kind: &st
                     .insert("awaiting_signature".to_string(), surface);
             }
             if !event.phase.is_empty() {
-                data.as_object_mut()
-                    .expect("object")
-                    .insert(
-                        "phase".to_string(),
-                        serde_json::Value::String(event.phase.clone()),
-                    );
+                data.as_object_mut().expect("object").insert(
+                    "phase".to_string(),
+                    serde_json::Value::String(event.phase.clone()),
+                );
             }
             ("phase", data)
         }
@@ -2685,12 +2676,10 @@ pub(crate) fn event_from_phase_v1(event: &JobPhaseEvent, job_id: Uuid, kind: &st
                 "progress": 0.0,
             });
             if !event.phase.is_empty() {
-                data.as_object_mut()
-                    .expect("object")
-                    .insert(
-                        "phase".to_string(),
-                        serde_json::Value::String(event.phase.clone()),
-                    );
+                data.as_object_mut().expect("object").insert(
+                    "phase".to_string(),
+                    serde_json::Value::String(event.phase.clone()),
+                );
             }
             ("phase", data)
         }

@@ -387,8 +387,7 @@ fn generate_sig_agg_vectors() {
     lines.push("# Computed by script-plonky2 generate_sig_agg_vectors; never hand-edit.".into());
     lines.push("#".into());
     lines.push(
-        "# V.5 inputs (reference-implementation output; proposed for V.5 in PR #124 draft):"
-            .into(),
+        "# V.5 inputs (reference-implementation output; proposed for V.5 in PR #124 draft):".into(),
     );
     lines.push("#   sk/Pk = V.2-ext sk₀/Pk₀ (BIP-340-normalised d used for signing)".into());
     lines.push("#   H(ProofData@0) = V.4 pin from generated_poseidon_vectors.txt".into());

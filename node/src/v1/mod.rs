@@ -116,13 +116,14 @@ pub(crate) use attest::{
     v1_attest_route_active, AttestBalanceRequest, AttestChallengeMap, AttestChallengeRequest,
     AttestError, AttestJobBody, U64Decimal, ATTEST_BALANCE_CHALLENGE_DOMAIN,
 };
-pub use mode::{v1_boot_pins_from_env, v1_shadow_mode_from_env, V1BootPins, V1ShadowMode};
 /// Kernel-API (§7.5): gRPC mint begin — process-claim-gated orchestration.
 pub use mint::begin_v1_mint;
+pub use mode::{v1_boot_pins_from_env, v1_shadow_mode_from_env, V1BootPins, V1ShadowMode};
 /// Kernel-API (§7.5): gRPC send begin — CoinHist provenance orchestration.
 pub use provenance::begin_v1_send;
 pub(crate) use provenance::{refuse_legacy_send_under_v1, LEGACY_SEND_REFUSED_UNDER_V1};
 pub use publish::{connect_v1_publisher, v1_publisher_env_from_env, V1Publisher, V1PublisherEnv};
+pub(crate) use receive::refuse_legacy_receive_under_v1;
 pub use receive::resume_all_pending_publishes;
 /// Kernel-API (§7.5): gRPC receive orchestration (begin / finalise / commit /
 /// one-shot / single-row resume) and request/outcome types.
@@ -131,11 +132,10 @@ pub use receive::{
     verify_and_begin_receive, PublishedBatchSummary, ReceivedCoinSlot, V1ReceiveOutcome,
     V1ReceiveRequest,
 };
-pub(crate) use receive::refuse_legacy_receive_under_v1;
 pub use scan::{
     apply_canonical_survivors, apply_forward_scan, first_boot_requires_full_replace,
-    folded_keys_from_nflog_mirror, observation_tip_still_live, reconcile_persisted_tip,
-    FoldStats, PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome,
+    folded_keys_from_nflog_mirror, observation_tip_still_live, reconcile_persisted_tip, FoldStats,
+    PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome,
 };
 pub use self_heal::{resolve_v1_live_digest, v1_canary_for_heal};
 pub use separation::{
@@ -144,20 +144,21 @@ pub use separation::{
 pub(crate) use separation::{
     ensure_legacy_publisher_allowed, process_stack_mode, require_stack_mode_for_update,
 };
-/// Kernel-API (§7.5): gRPC sign / finalise surface after wallet authorisation.
-pub use signature::{
-    durable_finalisation_with_signature, finalise_accepted_prove_outside_lock,
-    finalise_with_accepted_signature, register_live_pending_after_begin, FinaliseOutcome,
-    PendingSignEntry, PendingSignMap, SignatureCheck, TransitionSignatureError,
-    WalletSignSubmission,
-};
 pub(crate) use signature::{
     accept_wallet_transition_signature, decode_job_error, encode_job_error,
     ensure_completion_ready, ensure_finalise_ready, finalise_accepted_prove_persist_and_stage,
     publisher_pubkey_from_request_body, refuse_legacy_commitment_under_v1, rehydrate_pending_sign,
     select_awaiting_signature_result, sign_rejection, stage_pending_sign,
     strip_pending_sign_from_body, take_live_pending_after_begin, v1_sign_route_active,
-    DurableFinalisationPersist, WalletSignSubmissionWire, FINALISATION_BODY_KEY, PENDING_SIGN_BODY_KEY,
+    DurableFinalisationPersist, WalletSignSubmissionWire, FINALISATION_BODY_KEY,
+    PENDING_SIGN_BODY_KEY,
+};
+/// Kernel-API (§7.5): gRPC sign / finalise surface after wallet authorisation.
+pub use signature::{
+    durable_finalisation_with_signature, finalise_accepted_prove_outside_lock,
+    finalise_with_accepted_signature, register_live_pending_after_begin, FinaliseOutcome,
+    PendingSignEntry, PendingSignMap, SignatureCheck, TransitionSignatureError,
+    WalletSignSubmission,
 };
 
 // Test-only re-exports: unit tests reach these as `crate::v1::…` without

@@ -785,9 +785,8 @@ impl ProverBridge {
     /// slow-canary path). Identity is the circuit-digest tail bound at
     /// construction; nothing parallel is invented here.
     pub fn bind_loaded_prev_proof(&self, bytes: &[u8]) -> Result<ComplianceProof> {
-        let proof: ComplianceProof = bincode::deserialize(bytes).context(
-            "deserialize last_proof / prev_proof as ComplianceProof (bincode)",
-        )?;
+        let proof: ComplianceProof = bincode::deserialize(bytes)
+            .context("deserialize last_proof / prev_proof as ComplianceProof (bincode)")?;
         self.bind_prev_proof_identity(&proof)?;
         Ok(proof)
     }
@@ -908,17 +907,12 @@ fn compliance_circuit(network: Network) -> Result<&'static SkeletonCircuit> {
             .name("zkcoins-compliance-cache".to_owned())
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
-                let circuit = build_skeleton_circuit(
-                    CircuitConfig::standard_recursion_zk_config(),
-                    network,
-                );
+                let circuit =
+                    build_skeleton_circuit(CircuitConfig::standard_recursion_zk_config(), network);
                 let built = host::digest_to_bytes(&circuit.data.verifier_only.circuit_digest);
                 if let Some(pins) = pins_slot(network).get() {
                     if let Err(e) = crate::circuit_identity::require_one_live_digest_matches_pin(
-                        "C",
-                        &built,
-                        &pins.c,
-                        network,
+                        "C", &built, &pins.c, network,
                     ) {
                         return CircuitSlot::Refused(e);
                     }
@@ -2093,9 +2087,9 @@ pub mod test_signing {
         AffinePoint, Curve, CurveScalar, Secp256K1,
     };
 
-    use super::{field_bytes, is_odd, tagged_hash, Network, ProofData, TransitionSignature};
     #[cfg(test)]
     use super::{extract_transition_public_inputs, ProvedTransition};
+    use super::{field_bytes, is_odd, tagged_hash, Network, ProofData, TransitionSignature};
     use shared::spec_v1 as host;
 
     #[derive(Clone)]

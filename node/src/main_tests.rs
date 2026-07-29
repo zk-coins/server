@@ -187,4 +187,3 @@ fn build_network_config_panics_on_whitespace_esplora_ws_url() {
         ("ESPLORA_WS_URL", "   "),
     ]));
 }
-

@@ -648,9 +648,7 @@ async fn process_mint(
         Err(e) => {
             let msg = format!("invalid mint request body: {}", e);
             if !job_store.fail(public_id, &msg).await? {
-                tracing::warn!(
-                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
-                );
+                tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
                 return Ok(());
@@ -692,9 +690,7 @@ async fn process_mint(
                 }
             }
             if !job_store.fail(public_id, &message).await? {
-                tracing::warn!(
-                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
-                );
+                tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
                 return Ok(());
@@ -752,9 +748,7 @@ async fn process_mint(
             );
             let err = fail_error_string(&msg);
             if !job_store.fail(public_id, &err).await? {
-                tracing::warn!(
-                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
-                );
+                tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
                 return Ok(());
@@ -965,10 +959,9 @@ fn resolve_live_pending_after_prove(
     if !crate::v1::v1_sign_route_active() {
         return None;
     }
-    if let Some(entry) = crate::v1::take_live_pending_after_begin(
-        &app_state.v1_live_pending_after_begin,
-        public_id,
-    ) {
+    if let Some(entry) =
+        crate::v1::take_live_pending_after_begin(&app_state.v1_live_pending_after_begin, public_id)
+    {
         return Some(entry);
     }
     #[cfg(test)]
@@ -1029,8 +1022,7 @@ pub(crate) async fn stage_and_select_awaiting_signature(
             crate::v1::stage_pending_sign(&app_state.pending_sign_map, public_id, entry);
         let Some(guard) = app_state.pending_sign_map.get(&public_id) else {
             return Err(
-                "stage_pending_sign did not leave a map entry (internal lifecycle bug)"
-                    .to_string(),
+                "stage_pending_sign did not leave a map entry (internal lifecycle bug)".to_string(),
             );
         };
         let entry_clone = guard.clone();
@@ -1046,11 +1038,7 @@ pub(crate) async fn stage_and_select_awaiting_signature(
         None
     };
 
-    match crate::v1::select_awaiting_signature_result(
-        legacy_ash,
-        legacy_ocr,
-        staged_ref.as_ref(),
-    ) {
+    match crate::v1::select_awaiting_signature_result(legacy_ash, legacy_ocr, staged_ref.as_ref()) {
         Ok(v) => Ok(v),
         Err(e) => {
             // v1.1 without a staged pending — clean any partial state.
@@ -1090,11 +1078,7 @@ fn fail_error_string(message: &str) -> String {
 /// A leftover on a non-`awaiting_signature`, unclaimed row is harmless:
 /// boot resume and `/sign` only rehydrate when status is
 /// `awaiting_signature`, so a stale envelope cannot resurrect a job.
-async fn cleanup_pending_sign(
-    job_store: &JobStore,
-    app_state: &AppState,
-    public_id: Uuid,
-) {
+async fn cleanup_pending_sign(job_store: &JobStore, app_state: &AppState, public_id: Uuid) {
     app_state.pending_sign_map.remove(&public_id);
     let Ok(Some(job)) = job_store.load(public_id).await else {
         return;
@@ -1221,9 +1205,7 @@ async fn process_send_initial(
         Err(e) => {
             let msg = format!("invalid send request body: {}", e);
             if !job_store.fail(public_id, &msg).await? {
-                tracing::warn!(
-                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
-                );
+                tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
                 return Ok(());
@@ -1265,9 +1247,7 @@ async fn process_send_initial(
                 }
             }
             if !job_store.fail(public_id, &message).await? {
-                tracing::warn!(
-                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
-                );
+                tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
                 return Ok(());
@@ -1332,9 +1312,7 @@ async fn process_send_initial(
             );
             let err = fail_error_string(&msg);
             if !job_store.fail(public_id, &err).await? {
-                tracing::warn!(
-                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
-                );
+                tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
                 return Ok(());
@@ -1525,11 +1503,7 @@ async fn wait_for_commit(
                             public_id
                         );
                         return drive_v1_finalise(
-                            job_store,
-                            app_state,
-                            notify_map,
-                            public_id,
-                            &job,
+                            job_store, app_state, notify_map, public_id, &job,
                         )
                         .await;
                     }
@@ -1638,15 +1612,13 @@ async fn wait_for_commit(
     if crate::v1::v1_sign_route_active() {
         if let Ok(Some(entry)) = crate::v1::rehydrate_pending_sign(&job.request_body) {
             if entry.signature.is_some() {
-                return drive_v1_finalise(job_store, app_state, notify_map, public_id, &job)
-                    .await;
+                return drive_v1_finalise(job_store, app_state, notify_map, public_id, &job).await;
             }
         }
         // In-memory map may hold the signature if persist rehydrate raced.
         if let Some(entry) = app_state.pending_sign_map.get(&public_id) {
             if entry.signature.is_some() {
-                return drive_v1_finalise(job_store, app_state, notify_map, public_id, &job)
-                    .await;
+                return drive_v1_finalise(job_store, app_state, notify_map, public_id, &job).await;
             }
         }
     }
@@ -1665,9 +1637,7 @@ async fn wait_for_commit(
         Err(e) => {
             let msg = format!("invalid commit body: {}", e);
             if !job_store.fail(public_id, &msg).await? {
-                tracing::warn!(
-                    "Job dispatcher: fail matched 0 rows; not publishing failed event"
-                );
+                tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
                 notify_map.remove(&public_id);
                 return Ok(());
@@ -1840,7 +1810,10 @@ impl std::fmt::Display for FinaliseLeaseLivenessLost {
                 write!(f, "finalise lease renew timed out (stalled renew is loss)")
             }
             Self::HeartbeatTaskEnded => {
-                write!(f, "finalise lease heartbeat task ended while work in flight")
+                write!(
+                    f,
+                    "finalise lease heartbeat task ended while work in flight"
+                )
             }
         }
     }
@@ -2231,7 +2204,11 @@ async fn drive_v1_finalise(
     // cache of the same envelope — never a substitute for missing fields.
     let mut entry = match crate::v1::rehydrate_pending_sign(&job.request_body) {
         Ok(Some(e)) => e,
-        Ok(None) => match app_state.pending_sign_map.get(&public_id).map(|e| e.clone()) {
+        Ok(None) => match app_state
+            .pending_sign_map
+            .get(&public_id)
+            .map(|e| e.clone())
+        {
             Some(e) => e,
             None => {
                 return fail_v1(
@@ -2421,8 +2398,7 @@ async fn drive_v1_finalise(
                     // the terminal complete flip so a crash here is resumable.
                     // Fence-qualified jsonb_set: stale epochs cannot commit;
                     // concurrent lease renew is not clobbered.
-                    let persist = match crate::v1::DurableFinalisationPersist::from_entry(&entry)
-                    {
+                    let persist = match crate::v1::DurableFinalisationPersist::from_entry(&entry) {
                         Ok(p) => p,
                         Err(e) => {
                             return fail_v1_as_owner(
@@ -2449,9 +2425,7 @@ async fn drive_v1_finalise(
                                 claim_owner,
                                 claim_fence,
                                 "internal_error",
-                                format!(
-                                    "v1.1 finalise: json-encode completion capability: {e}"
-                                ),
+                                format!("v1.1 finalise: json-encode completion capability: {e}"),
                             )
                             .await;
                         }

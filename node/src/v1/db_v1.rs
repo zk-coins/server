@@ -11,9 +11,7 @@ use shared::spec_v1::{
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use zkcoins_program::circuit::compliance::Network;
-use zkcoins_prover::prover_bridge::{
-    ComplianceProof, NavOpening, NullifierOpening, ProverBridge,
-};
+use zkcoins_prover::prover_bridge::{ComplianceProof, NavOpening, NullifierOpening, ProverBridge};
 use zkcoins_prover::state_engine::{AccountRecord, OpSecret, StateEngine, TrackedCoin};
 
 use super::mode::{network_label, parse_network_label};
@@ -557,10 +555,7 @@ pub(crate) async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineS
 /// window between an advisory check and a later write.
 /// **Crate-private durable-write sink.** Downstream durable engine writes
 /// go through receive / scan orchestration only.
-pub(crate) async fn persist_engine_snapshot(
-    pool: &PgPool,
-    snap: &EngineSnapshot,
-) -> Result<()> {
+pub(crate) async fn persist_engine_snapshot(pool: &PgPool, snap: &EngineSnapshot) -> Result<()> {
     let mut tx = pool.begin().await.context("begin v1 persist tx")?;
     require_stack_mode_for_update(&mut tx, ScanStackMode::V1)
         .await
@@ -1080,7 +1075,10 @@ pub(crate) async fn mark_pending_publish_status(
 }
 
 /// Load one pending publish by Pk, or `None` if absent.
-pub(crate) async fn load_pending_publish(pool: &PgPool, pk: [u8; 32]) -> Result<Option<PendingPublishRow>> {
+pub(crate) async fn load_pending_publish(
+    pool: &PgPool,
+    pk: [u8; 32],
+) -> Result<Option<PendingPublishRow>> {
     let row = sqlx::query(
         "SELECT pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
                 commit_tx, reveal_tx, commit_txid, reveal_txid, status \
@@ -1102,7 +1100,10 @@ pub(crate) async fn load_pending_publish(pool: &PgPool, pk: [u8; 32]) -> Result<
         )?),
         r: fixed_32(row.get::<Vec<u8>, _>("r").as_slice(), "pending.r")?,
         s: fixed_32(row.get::<Vec<u8>, _>("s").as_slice(), "pending.s")?,
-        r_prime: fixed_32(row.get::<Vec<u8>, _>("r_prime").as_slice(), "pending.r_prime")?,
+        r_prime: fixed_32(
+            row.get::<Vec<u8>, _>("r_prime").as_slice(),
+            "pending.r_prime",
+        )?,
         build_tip_height: u32_from_i64(row.get("build_tip_height"), "pending.build_tip_height")?,
         build_tip_hash: fixed_32(
             row.get::<Vec<u8>, _>("build_tip_hash").as_slice(),
@@ -1148,7 +1149,10 @@ pub async fn list_resumable_pending_publishes(pool: &PgPool) -> Result<Vec<Pendi
             )?),
             r: fixed_32(row.get::<Vec<u8>, _>("r").as_slice(), "pending.r")?,
             s: fixed_32(row.get::<Vec<u8>, _>("s").as_slice(), "pending.s")?,
-            r_prime: fixed_32(row.get::<Vec<u8>, _>("r_prime").as_slice(), "pending.r_prime")?,
+            r_prime: fixed_32(
+                row.get::<Vec<u8>, _>("r_prime").as_slice(),
+                "pending.r_prime",
+            )?,
             build_tip_height: u32_from_i64(
                 row.get("build_tip_height"),
                 "pending.build_tip_height",

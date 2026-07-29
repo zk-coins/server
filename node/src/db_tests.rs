@@ -1029,8 +1029,6 @@ async fn insert_request_log_writes_row() {
     assert_eq!(count, 1);
 }
 
-
-
 #[tokio::test]
 async fn insert_block_log_writes_row_and_is_idempotent() {
     let scope = setup_pool().await;
@@ -1050,10 +1048,6 @@ async fn insert_block_log_writes_row_and_is_idempotent() {
         .unwrap();
     assert_eq!(count, 1);
 }
-
-
-
-
 
 #[tokio::test]
 async fn insert_tx_mining_log_writes_row() {
@@ -1328,14 +1322,7 @@ async fn get_inscription_summary_rejects_invalid_kind_in_row() {
 
 // ---- list_account_history (issue #153) ------------------------------------
 
-
-
-
-
-
 // ---- get_account_history_item (tx-detail endpoint) -------------------------
-
-
 
 // ---- Per-asset creator binding (off-circuit) ----------------------------
 

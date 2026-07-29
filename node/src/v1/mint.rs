@@ -56,7 +56,8 @@ use super::separation::{process_stack_mode, ScanStackMode};
 
 /// Refusal when the shadow flag / process claim is not v1.1 — remint is
 /// not dual-accepted on the legacy stack.
-pub(crate) const V1_MINT_SHADOW_OFF: &str = "ZKCOINS_V1_SHADOW is off — refusing v1.1 mint/remint path \
+pub(crate) const V1_MINT_SHADOW_OFF: &str =
+    "ZKCOINS_V1_SHADOW is off — refusing v1.1 mint/remint path \
      (legacy prepare_mint remains the default; remint stays refused there)";
 
 /// Gate the v1.1 mint/remint path on the **process stack claim**.
@@ -181,8 +182,7 @@ mod tests {
         let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/g7-remint/nk").into();
         let (_, _, current_pubkey) =
             normalized_key(deterministic_secret(b"zkCoins/v1/g7-remint/pk0"));
-        let (_, _, next_pubkey) =
-            normalized_key(deterministic_secret(b"zkCoins/v1/g7-remint/pk1"));
+        let (_, _, next_pubkey) = normalized_key(deterministic_secret(b"zkCoins/v1/g7-remint/pk1"));
         MintRequest {
             owner: Address(host::address(&current_pubkey, host::nk_commit(&nk))),
             nk,
@@ -235,8 +235,8 @@ mod tests {
 
         // Flag-off boot claims Legacy — same refusal surface.
         set_process_stack_mode(ScanStackMode::Legacy);
-        let err = begin_v1_mint(&engine, std1_request())
-            .expect_err("legacy claim must refuse v1.1 mint");
+        let err =
+            begin_v1_mint(&engine, std1_request()).expect_err("legacy claim must refuse v1.1 mint");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("ZKCOINS_V1_SHADOW is off"),
@@ -378,8 +378,7 @@ mod tests {
                 npk_rand: [0x44; 32],
             };
 
-            let pending =
-                begin_v1_mint(&engine, remint).expect("flag-on std1 remint must succeed");
+            let pending = begin_v1_mint(&engine, remint).expect("flag-on std1 remint must succeed");
 
             assert_eq!(pending.mode, TransitionMode::AccountUpdateProof);
             let issuance = pending
@@ -470,7 +469,8 @@ mod tests {
             req.cap_total = 100;
             req.terms_salt = [0x44; 32];
 
-            let err = begin_v1_mint(&engine, req).expect_err("v2 remint must fail at genesis binding");
+            let err =
+                begin_v1_mint(&engine, req).expect_err("v2 remint must fail at genesis binding");
             let msg = format!("{err:#}");
             assert!(
                 msg.contains("non-genesis account") && msg.contains("§6.5 clause (f)"),
@@ -487,16 +487,10 @@ mod tests {
     /// Split from the V1-allow case: claim is monotonic, no mid-process reset.
     #[test]
     fn ensure_v1_mint_path_refuses_unclaimed_and_legacy() {
-        assert!(
-            ensure_v1_mint_path().is_err(),
-            "unclaimed must refuse"
-        );
+        assert!(ensure_v1_mint_path().is_err(), "unclaimed must refuse");
 
         set_process_stack_mode(ScanStackMode::Legacy);
-        assert!(
-            ensure_v1_mint_path().is_err(),
-            "legacy claim must refuse"
-        );
+        assert!(ensure_v1_mint_path().is_err(), "legacy claim must refuse");
     }
 
     /// `ensure_v1_mint_path` allows a V1 process claim.

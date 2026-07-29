@@ -392,14 +392,11 @@ pub(crate) async fn finalise_publish_persist_with(
     // Concurrent scanner folds during this multi-minute window are fine:
     // apply re-validates every live dependency before commit.
     let bridge = adapter.bridge();
-    let proved_pending = StateEngine::prove_pending_transition_detached(
-        &bridge,
-        pending,
-        signature.clone(),
-    )
-    .context(
-        "v1.1 receive: prove_pending_transition failed — state unchanged, nothing persisted",
-    )?;
+    let proved_pending =
+        StateEngine::prove_pending_transition_detached(&bridge, pending, signature.clone())
+            .context(
+            "v1.1 receive: prove_pending_transition failed — state unchanged, nothing persisted",
+        )?;
 
     commit_proved_receive_with(adapter, proved_pending, signature, publisher, build_tip).await
 }
@@ -478,26 +475,20 @@ pub(crate) async fn commit_proved_receive_with(
         let pre = adapter.snapshot_live();
 
         // Caller-supplied durable fields: revalidate before any mutation.
-        revalidate_caller_supplied_commit_deps(
-            &pre,
-            &build_tip,
-            &signature,
-            &proved_signature,
-        )?;
+        revalidate_caller_supplied_commit_deps(&pre, &build_tip, &signature, &proved_signature)?;
 
         // Measure NfLog size *inside* the gate, immediately before apply —
         // never against a pre-prove snapshot a concurrent scan can move.
         let nflog_size_pre_apply = adapter.with_engine(|engine| engine.nflog().nav().size);
-        let applied = match adapter.with_engine_mut(|engine| {
-            engine.apply_proved_transition(proved_pending)
-        })? {
+        let applied = match adapter
+            .with_engine_mut(|engine| engine.apply_proved_transition(proved_pending))?
+        {
             Ok(a) => a,
             Err(err) => {
                 // Apply failed before the account insert; restore for safety.
                 let _ = adapter.restore_live(pre);
-                return Err(err).context(
-                    "v1.1 receive: apply_proved_transition failed — state restored",
-                );
+                return Err(err)
+                    .context("v1.1 receive: apply_proved_transition failed — state restored");
             }
         };
 
@@ -747,12 +738,13 @@ async fn durable_publish_nullifier(
             .await
             .context("mark commit_broadcast")?;
 
-            let reveal_txid = broadcast_reveal_idempotent(publisher, &prepared).with_context(|| {
-                format!(
-                    "broadcast reveal failed; commit already on chain as {commit_txid}; \
+            let reveal_txid =
+                broadcast_reveal_idempotent(publisher, &prepared).with_context(|| {
+                    format!(
+                        "broadcast reveal failed; commit already on chain as {commit_txid}; \
                      durable pair remains at commit_broadcast for resume"
-                )
-            })?;
+                    )
+                })?;
             db_v1::mark_pending_publish_status(
                 adapter.pool(),
                 member.sig.pk,
@@ -889,9 +881,10 @@ pub(crate) async fn resume_pending_publish_with(
                 PENDING_PUBLISH_COMMIT_BROADCAST,
             )
             .await?;
-            let reveal_txid = broadcast_reveal_idempotent(publisher, &prepared).with_context(|| {
-                format!("resume reveal failed; commit {commit_txid} already broadcast")
-            })?;
+            let reveal_txid =
+                broadcast_reveal_idempotent(publisher, &prepared).with_context(|| {
+                    format!("resume reveal failed; commit {commit_txid} already broadcast")
+                })?;
             db_v1::mark_pending_publish_status(
                 adapter.pool(),
                 pk,
@@ -911,9 +904,8 @@ pub(crate) async fn resume_pending_publish_with(
         "commit_broadcast" => {
             let prepared = prepared_batch_from_pending_row(&row, &member)?;
             let commit_txid = prepared.commit_txid();
-            let reveal_txid = broadcast_reveal_idempotent(publisher, &prepared).with_context(|| {
-                format!("resume reveal-only failed; commit was {commit_txid}")
-            })?;
+            let reveal_txid = broadcast_reveal_idempotent(publisher, &prepared)
+                .with_context(|| format!("resume reveal-only failed; commit was {commit_txid}"))?;
             db_v1::mark_pending_publish_status(
                 adapter.pool(),
                 pk,
@@ -1346,9 +1338,7 @@ fn summarize_published(batch: &PublishedBatch) -> PublishedBatchSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v1::separation::{
-        set_process_stack_mode, ScanStackMode,
-    };
+    use crate::v1::separation::{set_process_stack_mode, ScanStackMode};
     use bitcoin::{Amount, ScriptBuf, TxOut, Txid};
     use sha2::{Digest, Sha256};
     use std::sync::Mutex;
@@ -1664,7 +1654,10 @@ mod tests {
         // verify_and_begin_receive and must fail loud (no silent truncate).
         assert_eq!(MAX_RX_COINS, 4, "spec §2.5 MAX_RX_COINS");
         for n in 1..=MAX_RX_COINS {
-            assert!(n <= MAX_RX_COINS, "at-limit {n} must be allowed by length gate");
+            assert!(
+                n <= MAX_RX_COINS,
+                "at-limit {n} must be allowed by length gate"
+            );
         }
         assert!(
             MAX_RX_COINS + 1 > MAX_RX_COINS,
@@ -1687,10 +1680,7 @@ mod tests {
             },
         )
         .expect_err("empty receive");
-        assert!(
-            format!("{err:#}").contains("at least one"),
-            "got: {err:#}"
-        );
+        assert!(format!("{err:#}").contains("at least one"), "got: {err:#}");
     }
 
     #[test]
@@ -1724,7 +1714,10 @@ mod tests {
 
     /// Minimal ComplianceProof shell: only used where the proof object is
     /// required by type but never circuit-verified (host binding tests).
-    fn hollow_compliance_proof_with_pis(pd: &ProofData, consumed_pubkey: [u8; 32]) -> ComplianceProof {
+    fn hollow_compliance_proof_with_pis(
+        pd: &ProofData,
+        consumed_pubkey: [u8; 32],
+    ) -> ComplianceProof {
         use plonky2::field::polynomial::PolynomialCoeffs;
         use plonky2::field::types::Field;
         use plonky2::fri::proof::FriProof;
@@ -1797,8 +1790,7 @@ mod tests {
             deterministic_secret, normalized_key, sign_transition,
         };
 
-        let (sk, pk_pt, create_pk) =
-            normalized_key(deterministic_secret(&[b'K', tag, b's', b'k']));
+        let (sk, pk_pt, create_pk) = normalized_key(deterministic_secret(&[b'K', tag, b's', b'k']));
         let creating_prev_ash = digest_label(&[b'p', tag]);
         let asset_id = host::asset_id_v1(host::GENESIS_TAG, &create_pk, &[tag; 32], 2, 1);
         let amount = 10u128 + u128::from(tag);
@@ -1826,10 +1818,15 @@ mod tests {
         let sig = sign_transition(sk, pk_pt, &pd, Network::Regtest);
         let r = sig.transition.signature_r();
         let r_prime = sig.transition.r_prime;
-        ensure!(sig.transition.pk_i == create_pk, "signer pk must match create_pk");
+        ensure!(
+            sig.transition.pk_i == create_pk,
+            "signer pk must match create_pk"
+        );
 
         let pos_create = match engine.nflog().lookup(create_pk) {
-            LookupResult::Present { pos, r: folded_r, .. } => {
+            LookupResult::Present {
+                pos, r: folded_r, ..
+            } => {
                 ensure!(folded_r == r, "folded R must match signed R");
                 pos
             }
@@ -1897,10 +1894,7 @@ mod tests {
             nav_commitment: digest_label(&[b'n', tag]),
             npk_commit: [tag; 32],
         };
-        let (_, wrong_r_prime) = two_xonly(
-            &[b'r', tag, 1],
-            &[b'r', tag, 2],
-        );
+        let (_, wrong_r_prime) = two_xonly(&[b'r', tag, 1], &[b'r', tag, 2]);
         ReceivedCoinSlot {
             coin,
             creating_proof: hollow_compliance_proof_with_pis(&pd, create_pk),
@@ -1936,10 +1930,8 @@ mod tests {
         use zkcoins_prover::state_engine::ScannedNullifier;
         // Signature pin: if append_nullifier is ever re-opened to bare
         // ChainPosition, this assignment fails to compile.
-        let _: fn(
-            &mut StateEngine,
-            ScannedNullifier,
-        ) -> Result<u64> = StateEngine::append_nullifier;
+        let _: fn(&mut StateEngine, ScannedNullifier) -> Result<u64> =
+            StateEngine::append_nullifier;
 
         let mut engine = StateEngine::new(Network::Regtest, 0);
         engine.set_tip_height(50);
@@ -2024,15 +2016,7 @@ mod tests {
 
         let snap = adapter.snapshot_live();
         db_v1::persist_engine_with_pending_members_ready(
-            &pool,
-            &snap,
-            owner,
-            pk,
-            r,
-            s,
-            r_prime,
-            100,
-            [0xBB; 32],
+            &pool, &snap, owner, pk, r, s, r_prime, 100, [0xBB; 32],
         )
         .await
         .expect("atomic persist");
@@ -2107,14 +2091,7 @@ mod tests {
         let reveal_tx = serialize(&prepared.reveal_tx);
 
         db_v1::insert_pending_publish_members_ready(
-            &pool,
-            owner,
-            pk,
-            r,
-            s,
-            r_prime,
-            42,
-            [0xCC; 32],
+            &pool, owner, pk, r, s, r_prime, 42, [0xCC; 32],
         )
         .await
         .expect("members_ready");
@@ -2157,26 +2134,15 @@ mod tests {
         )
         .await
         .ok(); // may fail status machine; re-seed constructed path instead
-        // Fresh constructed row under a different pk for the negative case.
+               // Fresh constructed row under a different pk for the negative case.
         let pk2 = xonly_from_label(b"v1-rx/rebcast/pk2");
         let member2 = BatchMember {
-            sig: NullifierSig {
-                pk: pk2,
-                r,
-                s,
-            },
+            sig: NullifierSig { pk: pk2, r, s },
             build_tip: member.build_tip,
         };
         let prepared2 = RecordingPublisher::dummy_prepared(&member2);
         db_v1::insert_pending_publish_members_ready(
-            &pool,
-            owner,
-            pk2,
-            r,
-            s,
-            r_prime,
-            42,
-            [0xCC; 32],
+            &pool, owner, pk2, r, s, r_prime, 42, [0xCC; 32],
         )
         .await
         .expect("m2");
@@ -2199,7 +2165,6 @@ mod tests {
             msg.contains("connection refused") || msg.contains("not an already-done"),
             "got: {msg}"
         );
-
     }
 
     /// Test 2: multi-slot host clause-10 through the real entry point
@@ -2229,12 +2194,7 @@ mod tests {
                     let create_pk = xonly_from_label(&[b'p', tag]);
                     let create_r = xonly_from_label(&[b'r', tag]);
                     engine
-                        .append_nullifier(scanned(
-                            20 + i as u64,
-                            0,
-                            create_pk,
-                            create_r,
-                        ))
+                        .append_nullifier(scanned(20 + i as u64, 0, create_pk, create_r))
                         .expect("fold corrupt create");
                 } else {
                     // Fold only; slot body built after tip is final.
@@ -2324,7 +2284,6 @@ mod tests {
                 "expected clause-10/S2C failure for slot {corrupt_index}, got: {msg}"
             );
         }
-
     }
 
     /// Test 3: scan reconciliation — chain ordering wins over local
@@ -2375,15 +2334,18 @@ mod tests {
         ];
 
         assert_eq!(engine.nflog().nav().size, 0, "pre-scan NfLog empty");
-        let stats = crate::v1::scan::fold_survivors_into_engine(&mut engine, &survivors)
-            .expect("fold");
+        let stats =
+            crate::v1::scan::fold_survivors_into_engine(&mut engine, &survivors).expect("fold");
         assert_eq!(stats.appended, 2);
         assert_eq!(stats.duplicate_ignored, 0);
 
         let mirror = engine.nflog_mirror();
         assert_eq!(mirror.len(), 2);
         // Chain wins: B (height 50) before A (height 51), not local A-then-B.
-        assert_eq!(mirror[0].1.pk, pk_b, "first entry must be B (earlier height)");
+        assert_eq!(
+            mirror[0].1.pk, pk_b,
+            "first entry must be B (earlier height)"
+        );
         assert_eq!(mirror[0].1.r, r_b);
         assert_eq!(mirror[0].0.height, 50);
         assert_eq!(mirror[1].1.pk, pk_a, "second entry must be A");
@@ -2404,7 +2366,6 @@ mod tests {
             }
             other => panic!("pk_a present: {other:?}"),
         }
-
     }
 
     /// Deferred nullifier + publish + scan-fold: account may be credited and
@@ -2523,16 +2484,17 @@ mod tests {
             engine = rebuilt;
         }
 
-        assert_eq!(engine.nflog().nav().size, nflog_before, "apply must not grow NfLog");
+        assert_eq!(
+            engine.nflog().nav().size,
+            nflog_before,
+            "apply must not grow NfLog"
+        );
         {
             let rec = engine.account(&owner).expect("account");
             assert!(rec.last_nullifier_pos.is_none());
             assert!(rec.last_nullifier.is_some());
             assert!(rec.last_proof.is_some());
-            assert_eq!(
-                rec.state.balances.values().copied().sum::<u128>(),
-                77
-            );
+            assert_eq!(rec.state.balances.values().copied().sum::<u128>(), 77);
         }
 
         // Publish path exercises the batch publisher only (not a fabricatable
@@ -2552,9 +2514,7 @@ mod tests {
             },
             build_tip,
         };
-        publisher
-            .publish_batch(&[member])
-            .expect("publish batch");
+        publisher.publish_batch(&[member]).expect("publish batch");
         assert_eq!(publisher.published_members().len(), 1);
         assert_eq!(
             engine.nflog().nav().size,
@@ -2596,7 +2556,6 @@ mod tests {
             .expect("mirror entry");
         assert_eq!(p.height, 42, "chain height, not local tip 100");
         assert_eq!(p.tx_index, 7, "chain tx_index, not local fold_seq");
-
     }
 
     // -----------------------------------------------------------------------
@@ -2836,8 +2795,7 @@ mod tests {
             b"zkCoins/v1/state-engine/receive-e2e/alice-sk2",
         ));
 
-        let bob_nk: [u8; 32] =
-            Sha256::digest(b"zkCoins/v1/state-engine/receive-e2e/bob-nk").into();
+        let bob_nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/receive-e2e/bob-nk").into();
         let (bob_secret0, bob_public0, bob_pk0) = normalized_key(deterministic_secret(
             b"zkCoins/v1/state-engine/receive-e2e/bob-sk0",
         ));
@@ -2934,8 +2892,7 @@ mod tests {
                 .expect("change")
                 .coin
                 .identifier;
-            let entries: Vec<NfLogEntry> =
-                engine.nflog_mirror().iter().map(|(_, e)| *e).collect();
+            let entries: Vec<NfLogEntry> = engine.nflog_mirror().iter().map(|(_, e)| *e).collect();
             (change, entries)
         });
         let all_output_ids = vec![bob_coin.identifier, alice_change_id];
@@ -3035,12 +2992,9 @@ mod tests {
         let nflog_size_at_prove = adapter.with_engine(|e| e.nflog().nav().size);
 
         let bridge = adapter.bridge();
-        let proved = StateEngine::prove_pending_transition_detached(
-            &bridge,
-            pending,
-            signature.clone(),
-        )
-        .expect("real prove");
+        let proved =
+            StateEngine::prove_pending_transition_detached(&bridge, pending, signature.clone())
+                .expect("real prove");
 
         // Concurrent scanner append during the prove→apply window.
         let concurrent_pk = xonly_from_label(b"v1-rx/race/concurrent-pk");
@@ -3071,15 +3025,10 @@ mod tests {
         );
 
         let publisher = RecordingPublisher::new();
-        let outcome = commit_proved_receive_with(
-            &adapter,
-            proved,
-            signature,
-            &publisher,
-            build_tip,
-        )
-        .await
-        .expect("receive must commit despite concurrent append during prove");
+        let outcome =
+            commit_proved_receive_with(&adapter, proved, signature, &publisher, build_tip)
+                .await
+                .expect("receive must commit despite concurrent append during prove");
 
         assert_eq!(outcome.owner, owner);
         assert_eq!(outcome.nullifier.0, current_pubkey);
@@ -3107,11 +3056,7 @@ mod tests {
             .await
             .expect("load")
             .expect("durable intent");
-        assert_eq!(
-            pending_row.status,
-            db_v1::PENDING_PUBLISH_REVEAL_BROADCAST
-        );
-
+        assert_eq!(pending_row.status, db_v1::PENDING_PUBLISH_REVEAL_BROADCAST);
     }
 
     /// Concurrent scanner append lands **after** a successful broadcast.
@@ -3141,12 +3086,9 @@ mod tests {
         let (pending, signature, owner, current_pubkey, _tip_hash, build_tip) =
             genuine_bob_receive_ready(&adapter).await;
         let bridge = adapter.bridge();
-        let proved = StateEngine::prove_pending_transition_detached(
-            &bridge,
-            pending,
-            signature.clone(),
-        )
-        .expect("real prove");
+        let proved =
+            StateEngine::prove_pending_transition_detached(&bridge, pending, signature.clone())
+                .expect("real prove");
 
         let concurrent_pk = xonly_from_label(b"v1-rx/race/post-bc-pk");
         let concurrent_r = xonly_from_label(b"v1-rx/race/post-bc-r");
@@ -3171,18 +3113,13 @@ mod tests {
                 })
                 .expect("concurrent post-broadcast append");
         });
-        let outcome = commit_proved_receive_with(
-            &adapter,
-            proved,
-            signature,
-            &publisher,
-            build_tip,
-        )
-        .await
-        .expect(
-            "successful broadcast must not be reported as failure when an unrelated \
+        let outcome =
+            commit_proved_receive_with(&adapter, proved, signature, &publisher, build_tip)
+                .await
+                .expect(
+                    "successful broadcast must not be reported as failure when an unrelated \
              scanner append moves the global NfLog afterwards",
-        );
+                );
 
         assert_eq!(outcome.owner, owner);
         assert_eq!(outcome.nullifier.0, current_pubkey);
@@ -3197,7 +3134,6 @@ mod tests {
             );
             assert!(engine.account(&owner).is_some());
         });
-
     }
 
     /// Heavy production path with a **genuine** Plonky2 prove, entered through
@@ -3237,15 +3173,10 @@ mod tests {
             .collect();
 
         let publisher = RecordingPublisher::new();
-        let outcome = finalise_publish_persist_with(
-            &adapter,
-            pending_rx,
-            signature,
-            &publisher,
-            build_tip,
-        )
-        .await
-        .expect("finalise_publish_persist with genuine prove");
+        let outcome =
+            finalise_publish_persist_with(&adapter, pending_rx, signature, &publisher, build_tip)
+                .await
+                .expect("finalise_publish_persist with genuine prove");
 
         assert_eq!(outcome.nullifier.0, bob_pk0);
         assert_eq!(outcome.new_send_counter, 1);
@@ -3290,7 +3221,5 @@ mod tests {
             .expect("load after reload")
             .expect("pending still durable");
         assert_eq!(row2.status, db_v1::PENDING_PUBLISH_REVEAL_BROADCAST);
-
     }
-
 }

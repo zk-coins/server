@@ -181,11 +181,12 @@ async fn main() -> Result<(), Box<dyn StdError>> {
          just built through ProverBridge (matched §3.6 pins at construction; \
          set ZKCOINS_V1_SLOW_CANARY=1 for verify_transition canary)"
     );
-    let heal_decision = node::self_heal::heal_circuit_digest(&pool, &live_digest, &proofs_dir, &|| {
-        v1::v1_canary_for_heal(&v1_adapter)
-    })
-    .await
-    .expect("v1 circuit-digest self-heal");
+    let heal_decision =
+        node::self_heal::heal_circuit_digest(&pool, &live_digest, &proofs_dir, &|| {
+            v1::v1_canary_for_heal(&v1_adapter)
+        })
+        .await
+        .expect("v1 circuit-digest self-heal");
     println!("Circuit-digest self-heal: {:?}", heal_decision);
 
     // On a reset the in-memory ledger + engine were rehydrated from
@@ -202,9 +203,10 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 .await
                 .expect("reload state after self-heal reset"),
         ));
-        let account_node = account_node::AccountNode::load_ledger_from_pg(Arc::clone(&state), &pool)
-            .await
-            .expect("reload account node ledger after self-heal reset");
+        let account_node =
+            account_node::AccountNode::load_ledger_from_pg(Arc::clone(&state), &pool)
+                .await
+                .expect("reload account node ledger after self-heal reset");
         v1_adapter
             .reinit_after_self_heal_reset()
             .await
@@ -276,7 +278,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     Ok(())
 }
 
-
 /// Stage 2 v1.1 exclusive scan loop: bitcoind RPC + script-plonky2
 /// [`zkcoins_prover::scanner::Scanner`] → NfLog fold on [`EngineAdapter`].
 ///
@@ -310,8 +311,7 @@ async fn run_v1_scan_loop(
     };
 
     let pins = v1::mode::v1_boot_pins_from_env().map_err(|e| e.to_string())?;
-    let (rpc_url, cookie_path) =
-        v1::scan::v1_bitcoind_rpc_from_env().map_err(|e| e.to_string())?;
+    let (rpc_url, cookie_path) = v1::scan::v1_bitcoind_rpc_from_env().map_err(|e| e.to_string())?;
 
     let scanner_config = zkcoins_prover::scanner::ScannerConfig {
         rpc_url: rpc_url.clone(),
@@ -336,9 +336,7 @@ async fn run_v1_scan_loop(
     // pending work is fatal. With an empty table, a connect failure is still
     // logged loud (receive path will need the publisher later).
     {
-        use v1::{
-            connect_v1_publisher, resume_all_pending_publishes, v1_publisher_env_from_env,
-        };
+        use v1::{connect_v1_publisher, resume_all_pending_publishes, v1_publisher_env_from_env};
         match v1_publisher_env_from_env(pins.network) {
             Ok(env) => match connect_v1_publisher(env) {
                 Ok(publisher) => match resume_all_pending_publishes(&adapter, &publisher).await {
@@ -506,10 +504,7 @@ async fn run_v1_scan_loop(
                                 .previous_block_hash
                                 .map(|p| p.to_byte_array())
                                 .unwrap_or([0u8; 32]);
-                            Ok(Some(ResolvedBlock {
-                                height,
-                                prev_hash,
-                            }))
+                            Ok(Some(ResolvedBlock { height, prev_hash }))
                         }
                         Err(e) => {
                             let msg = e.to_string();
@@ -661,14 +656,9 @@ async fn run_v1_scan_loop(
         let do_full_replace = force_full_replace;
         if do_full_replace {
             // Full replace: scanner survivors are the canonical stream.
-            let stats = v1::apply_canonical_survivors(
-                &adapter,
-                tip_height,
-                tip_hash,
-                &survivors,
-            )
-            .await
-            .map_err(|e| format!("v1.1 reorg/full-replace NfLog apply failed: {e:#}"))?;
+            let stats = v1::apply_canonical_survivors(&adapter, tip_height, tip_hash, &survivors)
+                .await
+                .map_err(|e| format!("v1.1 reorg/full-replace NfLog apply failed: {e:#}"))?;
             folded_keys.clear();
             for nf in &survivors {
                 folded_keys.insert((
@@ -681,10 +671,7 @@ async fn run_v1_scan_loop(
             }
             println!(
                 "v1.1 scanner full-replace applied: tip={} hash={} appended={} dup_ignored={}",
-                tip_height,
-                tip.1,
-                stats.appended,
-                stats.duplicate_ignored
+                tip_height, tip.1, stats.appended, stats.duplicate_ignored
             );
         } else {
             let new: Vec<_> = survivors

@@ -62,10 +62,7 @@ impl LegacyBroadcastClient {
 
 #[cfg(test)]
 mod boundary_tests {
-    use stack_policy::{
-        set_process_stack_mode, ScanStackMode,
-        STACK_SEPARATION_REFUSAL,
-    };
+    use stack_policy::{set_process_stack_mode, ScanStackMode, STACK_SEPARATION_REFUSAL};
 
     /// `node` must not list `esplora-client` as a direct dependency — the
     /// raw types are only reachable through the `esplora-bound` facade.
@@ -119,8 +116,7 @@ mod boundary_tests {
     #[test]
     fn node_wrapper_and_facade_allow_under_legacy_claim() {
         set_process_stack_mode(ScanStackMode::Legacy);
-        super::LegacyBroadcastClient::connect("http://127.0.0.1:1")
-            .expect("wrapper under legacy");
+        super::LegacyBroadcastClient::connect("http://127.0.0.1:1").expect("wrapper under legacy");
         esplora_bound::EsploraBroadcastClient::connect("http://127.0.0.1:1")
             .expect("facade under legacy");
     }

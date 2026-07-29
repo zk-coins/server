@@ -378,8 +378,6 @@ async fn get_publisher_utxo_returns_empty_when_total_below_minimum() {
     );
 }
 
-
-
 // -----------------------------------------------------------------------------
 // create_and_broadcast_inscription — integration over the mocked HTTP layer
 // -----------------------------------------------------------------------------
@@ -1053,6 +1051,3 @@ async fn resume_tolerates_bad_inputs_error_on_double_spend() {
 //   3. Scanner-side fallback: an in-progress row (or no row at all)
 //      lets the scanner run `state.update` itself — the recovery /
 //      external-mint path stays intact.
-
-
-

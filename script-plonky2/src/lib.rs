@@ -24,7 +24,7 @@
 //! - [`state_engine`] — `StateEngine` orchestration; `FinalisationCapability`
 //!   durable load binds embedded proofs; read-only `pending()` for external
 //!   inspection (no mutable pending accessor — durable load gate stays closed).
-//! - [`publisher`] — production `Publisher` / batch types + 
+//! - [`publisher`] — production `Publisher` / batch types +
 //!   `BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN` (node `V1PublisherEnv` wiring).
 //!   Internal constants (`NUMS_*`, `MAX_STANDARD_TX_WEIGHT`,
 //!   `BLOCK_ANCHOR_MAX_GAP`, `BLOCK_ANCHOR_PUBLISH_MAX_GAP`) and free

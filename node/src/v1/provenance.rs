@@ -319,8 +319,7 @@ mod tests {
     use super::*;
     use crate::v1::mode::V1ShadowMode;
     use crate::v1::separation::{
-        claim_process_stack_from_shadow_mode,
-        set_process_stack_mode, ScanStackMode,
+        claim_process_stack_from_shadow_mode, set_process_stack_mode, ScanStackMode,
     };
     use plonky2::field::goldilocks_field::GoldilocksField;
     use plonky2::field::polynomial::PolynomialCoeffs;
@@ -456,13 +455,11 @@ mod tests {
         engine.set_tip_height(10);
         assert_eq!(
             engine
-                .append_nullifier(ScannedNullifier::from_survivor(
-                    &host::PublishedNullifier {
-                        chain_pos: predecessor_position,
-                        pk: predecessor_entry.pk,
-                        r: predecessor_entry.r,
-                    },
-                ))
+                .append_nullifier(ScannedNullifier::from_survivor(&host::PublishedNullifier {
+                    chain_pos: predecessor_position,
+                    pk: predecessor_entry.pk,
+                    r: predecessor_entry.r,
+                },))
                 .unwrap(),
             0
         );
@@ -715,10 +712,7 @@ mod tests {
             "unclaimed must refuse"
         );
         set_process_stack_mode(ScanStackMode::Legacy);
-        assert!(
-            ensure_v1_provenance_path().is_err(),
-            "legacy must refuse"
-        );
+        assert!(ensure_v1_provenance_path().is_err(), "legacy must refuse");
     }
 
     #[test]

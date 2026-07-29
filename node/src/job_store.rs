@@ -98,8 +98,6 @@ pub const FINALISE_CLAIM_PHASE: &str = "finalise_claimed";
 /// fencing token, and a lease.
 pub const FINALISE_CLAIM_BODY_KEY: &str = "finalise_claim";
 
-
-
 /// Default lease for a live finalise owner.
 ///
 /// Sized for a multi-minute prove; a live owner renews (see
@@ -243,10 +241,7 @@ impl std::fmt::Debug for Job {
             .field("phase", &self.phase)
             .field("account_address", &self.account_address)
             .field("idempotency_key", &self.idempotency_key)
-            .field(
-                "request_body",
-                &RedactedJobJson(&self.request_body),
-            )
+            .field("request_body", &RedactedJobJson(&self.request_body))
             .field(
                 "response_body",
                 &self.response_body.as_ref().map(RedactedJobJson),
@@ -427,11 +422,10 @@ impl JobStore {
         &self,
     ) -> sqlx::Result<(sqlx::Transaction<'_, sqlx::Postgres>, i64)> {
         let mut tx = self.pool.begin().await?;
-        let (generation,): (i64,) = sqlx::query_as(
-            "SELECT generation FROM self_heal_reset_meta WHERE id = 1 FOR UPDATE",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        let (generation,): (i64,) =
+            sqlx::query_as("SELECT generation FROM self_heal_reset_meta WHERE id = 1 FOR UPDATE")
+                .fetch_one(&mut *tx)
+                .await?;
         Ok((tx, generation))
     }
 
@@ -921,10 +915,7 @@ impl JobStore {
     /// only succeeds when the lease is expired (or no lease was ever
     /// registered — abandoned pre-lease / corrupt claim). A live concurrent
     /// loser **must not** continue into side-effectful finalise.
-    pub async fn claim_finalise_exclusive(
-        &self,
-        public_id: Uuid,
-    ) -> sqlx::Result<FinaliseClaim> {
+    pub async fn claim_finalise_exclusive(&self, public_id: Uuid) -> sqlx::Result<FinaliseClaim> {
         self.claim_finalise_exclusive_as(public_id, self.process_owner, FINALISE_CLAIM_LEASE)
             .await
     }

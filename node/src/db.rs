@@ -201,7 +201,10 @@ pub(crate) struct RequestLogEntry {
     pub duration_us: i64,
 }
 
-pub(crate) async fn insert_request_log(pool: &PgPool, entry: &RequestLogEntry) -> Result<(), sqlx::Error> {
+pub(crate) async fn insert_request_log(
+    pool: &PgPool,
+    entry: &RequestLogEntry,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO request_log \
          (method, path, query, remote_addr, client_ip, user_agent, \
@@ -234,21 +237,6 @@ pub(crate) async fn insert_request_log(pool: &PgPool, entry: &RequestLogEntry) -
 // `await` synchronously (mint flow, where the persisted row should land
 // before the request returns) or fire-and-forget via `tokio::spawn`
 // (high-volume / non-critical paths like esplora REST chatter).
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[derive(Debug, Clone)]
 pub(crate) struct TxMiningLogEntry {
@@ -287,7 +275,10 @@ pub(crate) struct BootLogEntry {
     pub metadata: Option<serde_json::Value>,
 }
 
-pub(crate) async fn insert_boot_log(pool: &PgPool, entry: &BootLogEntry) -> Result<(), sqlx::Error> {
+pub(crate) async fn insert_boot_log(
+    pool: &PgPool,
+    entry: &BootLogEntry,
+) -> Result<(), sqlx::Error> {
     sqlx::query("INSERT INTO boot_log (event_type, message, metadata) VALUES ($1, $2, $3)")
         .bind(&entry.event_type)
         .bind(&entry.message)
@@ -354,7 +345,6 @@ pub(crate) async fn load_mmr(pool: &PgPool) -> Result<Option<Vec<u8>>, sqlx::Err
     Ok(row.map(|(data,)| data))
 }
 
-
 /// Load the block hash for a scanned height from the durable `block_log`
 /// audit trail (most recent row at that height, if any).
 ///
@@ -395,7 +385,6 @@ pub(crate) async fn load_block_hash_at_height(
         }
     }
 }
-
 
 /// Phase-E atomic helper used by `mint_handler` after a successful
 /// broadcast: writes the SMT, MMR, `mmr_root_index` row AND advances
@@ -508,7 +497,9 @@ pub(crate) async fn persist_state_and_mark_complete_tx(
 ///
 /// Used at boot in PR-A3 to rebuild the in-memory `AccountNode`
 /// map. Returns an empty vector if the table is empty.
-pub(crate) async fn load_all_accounts(pool: &PgPool) -> Result<Vec<(Vec<u8>, Vec<u8>)>, sqlx::Error> {
+pub(crate) async fn load_all_accounts(
+    pool: &PgPool,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, sqlx::Error> {
     let rows: Vec<(Vec<u8>, Vec<u8>)> =
         sqlx::query_as("SELECT address, data FROM accounts ORDER BY address")
             .fetch_all(pool)
@@ -556,10 +547,6 @@ pub(crate) async fn upsert_account_with_source(
     .await?;
     tx.commit().await
 }
-
-
-
-
 
 /// Test helper: scanner-source upsert (production callers use
 /// [`upsert_account_with_source`] with an explicit tag).
@@ -733,7 +720,6 @@ pub(crate) async fn reset_proof_dependent_state_tx(
     tx.commit().await
 }
 
-
 /// Bump the process-wide self-heal reset generation inside an open
 /// transaction. Returns the new generation.
 ///
@@ -771,15 +757,11 @@ pub(crate) async fn bump_self_heal_reset_generation_in_tx(
 /// serialises with [`bump_self_heal_reset_generation_in_tx`].
 #[cfg(test)]
 pub(crate) async fn load_self_heal_reset_generation(pool: &PgPool) -> Result<i64, sqlx::Error> {
-    let (gen,): (i64,) =
-        sqlx::query_as("SELECT generation FROM self_heal_reset_meta WHERE id = 1")
-            .fetch_one(pool)
-            .await?;
+    let (gen,): (i64,) = sqlx::query_as("SELECT generation FROM self_heal_reset_meta WHERE id = 1")
+        .fetch_one(pool)
+        .await?;
     Ok(gen)
 }
-
-
-
 
 /// Fail every non-terminal job and strip durable finalisation / claim
 /// envelopes. Does **not** rewrite `reset_generation` — pre-reset rows stay
@@ -902,7 +884,9 @@ pub(crate) async fn reset_v1_proof_dependent_state_tx(
 // ---- Username persistence (PR-A3) -----------------------------------------
 
 /// Load every `(name, address)` pair from the `usernames` table.
-pub(crate) async fn load_all_usernames(pool: &PgPool) -> Result<Vec<(String, Vec<u8>)>, sqlx::Error> {
+pub(crate) async fn load_all_usernames(
+    pool: &PgPool,
+) -> Result<Vec<(String, Vec<u8>)>, sqlx::Error> {
     let rows: Vec<(String, Vec<u8>)> =
         sqlx::query_as("SELECT name, address FROM usernames ORDER BY name")
             .fetch_all(pool)
@@ -980,7 +964,10 @@ pub(crate) async fn claim_username(
 /// so a future `lnurl`-style read-through cache can call it directly
 /// without re-introducing a `HashMap` mirror.
 #[allow(dead_code)] // re-added when a read-through caller lands
-pub(crate) async fn resolve_username(pool: &PgPool, name: &str) -> Result<Option<Vec<u8>>, sqlx::Error> {
+pub(crate) async fn resolve_username(
+    pool: &PgPool,
+    name: &str,
+) -> Result<Option<Vec<u8>>, sqlx::Error> {
     let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT address FROM usernames WHERE name = $1")
         .bind(name)
         .fetch_optional(pool)
@@ -1042,7 +1029,6 @@ pub(crate) async fn register_asset_creator(
 }
 
 // ---- Minting commit transaction (Phase D) ---------------------------------
-
 
 // ---- Pending inscription persistence (Phase B) ----------------------------
 
@@ -1144,7 +1130,6 @@ pub(crate) async fn update_pending_status(
     Ok(())
 }
 
-
 /// Load every row whose status is not `complete`, ordered by `id` so
 /// the resumer walks them in insertion order. The partial index
 /// `pending_inscriptions_status_idx` keeps this scan O(pending), not
@@ -1244,9 +1229,7 @@ pub(crate) struct InscriptionSummary {
     pub updated_at: String,
 }
 
-
 // ---- MMR root index persistence (Phase C) ---------------------------------
-
 
 /// Load every `(prev_mmr_root, smt_root, leaf_index)` row from the
 /// `mmr_root_index` table, ordered by `leaf_index` so the caller can
@@ -1307,13 +1290,9 @@ pub(crate) async fn load_root_indices(
 
 // ---- Account history listing (issue #153) ---------------------------------
 
-
-
-
 #[cfg(test)]
 #[path = "db_tests.rs"]
 mod tests;
-
 
 // Stage 4: test-only residual of legacy durable helper.
 #[cfg(test)]
@@ -1413,7 +1392,6 @@ pub(crate) async fn persist_state_tx(
     tx.commit().await
 }
 
-
 // Stage 4: test-only residual of legacy durable helper.
 #[cfg(test)]
 /// Load the 32-byte block hash of the last fully-processed block.
@@ -1443,7 +1421,6 @@ pub(crate) async fn load_latest_block(pool: &PgPool) -> Result<Option<[u8; 32]>,
         }
     }
 }
-
 
 // Stage 4: test-only residual of legacy durable helper.
 #[cfg(test)]
@@ -1489,14 +1466,16 @@ pub(crate) async fn insert_root_index(
     Ok(())
 }
 
-
 // Stage 4: test-only residual of legacy durable helper.
 #[cfg(test)]
 /// Insert (or no-op on UNIQUE conflict — replayed blocks land twice
 /// when the scanner restarts mid-stream). Marks `processed_at = NOW()`
 /// in the same statement so the row reflects "scanner saw + processed
 /// this block".
-pub(crate) async fn insert_block_log(pool: &PgPool, entry: &BlockLogEntry) -> Result<(), sqlx::Error> {
+pub(crate) async fn insert_block_log(
+    pool: &PgPool,
+    entry: &BlockLogEntry,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO block_log \
          (block_hash, block_height, processed_at, inscription_count, processing_duration_us) \
@@ -1512,7 +1491,6 @@ pub(crate) async fn insert_block_log(pool: &PgPool, entry: &BlockLogEntry) -> Re
     Ok(())
 }
 
-
 // Stage 4: test-only residual of legacy durable helper.
 #[cfg(test)]
 #[derive(Debug, Clone)]
@@ -1526,7 +1504,6 @@ pub(crate) struct BlockLogEntry {
     pub inscription_count: i32,
     pub processing_duration_us: Option<i64>,
 }
-
 
 // Stage 4: test-only residual of legacy durable helper.
 #[cfg(test)]
@@ -1577,7 +1554,6 @@ pub(crate) async fn commit_mint_tx(
     Ok(())
 }
 
-
 // Stage 4: test-only residual of legacy durable helper.
 #[cfg(test)]
 /// Look up the current `status` value for a `pending_inscriptions` row
@@ -1611,7 +1587,6 @@ pub(crate) async fn pending_inscription_status_by_commit_txid(
             .await?;
     Ok(row.map(|(status,)| status))
 }
-
 
 // Stage 4: test-only residual of legacy durable helper.
 #[cfg(test)]

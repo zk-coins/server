@@ -420,7 +420,6 @@ pub struct Scanner {
     ancestor_walk_rpc_count: usize,
 }
 
-
 /// Outcome of [`Scanner::fold_verified_nullifiers`].
 type FoldVerifiedNullifiersOutcome = (Vec<(ChainPosition, u64)>, usize, Vec<DuplicateNullifier>);
 
@@ -664,8 +663,8 @@ impl Scanner {
 
             // Tip must match the accumulator: never report a live tip the
             // scanner has not fully reflected.
-            let live_tip =
-                self.rpc_get_block_count_post_commit(&acc, "getblockcount (post-scan tip re-read)")?;
+            let live_tip = self
+                .rpc_get_block_count_post_commit(&acc, "getblockcount (post-scan tip re-read)")?;
             if let Some((scanned_h, _)) = self.scanned_through {
                 if scanned_h < live_tip {
                     // New blocks appeared after the forward pass — continue.

@@ -1666,10 +1666,15 @@ async fn receive_coin_is_gone_and_does_not_mutate_accounts() {
 
     let after = {
         let node = state.account_node.lock().unwrap();
-        let a = node.get_account(&owner, &asset).expect("account still present");
+        let a = node
+            .get_account(&owner, &asset)
+            .expect("account still present");
         (a.balance, a.coin_queue.len(), a.num_sends)
     };
-    assert_eq!(before, after, "POST /api/receive must not mutate the account");
+    assert_eq!(
+        before, after,
+        "POST /api/receive must not mutate the account"
+    );
 }
 
 // -----------------------------------------------------------------
@@ -3231,9 +3236,7 @@ mod jobs_endpoint_tests {
 
     #[tokio::test]
     async fn jobs_sign_valid_v1_signature_accepted_through_route() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
 
         let _stack_guard = lock_v1_stack_for_test();
         set_process_stack_mode(ScanStackMode::V1);
@@ -3295,14 +3298,11 @@ mod jobs_endpoint_tests {
         assert_eq!(v["status"], "signature_accepted");
         // Staged material is kept until the dispatcher finalises.
         assert!(state.pending_sign_map.get(&job_id).is_some());
-
     }
 
     #[tokio::test]
     async fn jobs_sign_malformed_encoding_rejected_at_boundary() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
 
         let _stack_guard = lock_v1_stack_for_test();
         set_process_stack_mode(ScanStackMode::V1);
@@ -3348,12 +3348,10 @@ mod jobs_endpoint_tests {
                 || v["message"].as_str().unwrap_or("").contains("hex"),
             "message should describe the encoding rule: {resp}"
         );
-
     }
 
     #[tokio::test]
     async fn jobs_sign_flag_off_refuses_and_legacy_commit_still_works() {
-
         let _stack_guard = lock_v1_stack_for_test();
         // Flag / claim off (default).
 
@@ -3440,9 +3438,7 @@ mod jobs_endpoint_tests {
     /// progress float in [0,1], closed error codes.
     #[tokio::test]
     async fn v1_job_poll_and_sign_follow_section_7_5_envelope() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
 
         let _stack_guard = lock_v1_stack_for_test();
         set_process_stack_mode(ScanStackMode::V1);
@@ -3463,8 +3459,7 @@ mod jobs_endpoint_tests {
             _ => panic!(),
         };
 
-        let (entry, _) =
-            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let (entry, _) = crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
         let advertised = crate::v1::select_awaiting_signature_result(
             &"aa".repeat(32),
             &"bb".repeat(32),
@@ -3486,7 +3481,10 @@ mod jobs_endpoint_tests {
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["status"], "awaiting_signature");
         // Fields under `awaiting_signature`, NOT under `result`.
-        assert!(v.get("result").is_none(), "must not nest under result: {body}");
+        assert!(
+            v.get("result").is_none(),
+            "must not nest under result: {body}"
+        );
         let surface = v
             .get("awaiting_signature")
             .expect("awaiting_signature field required by §7.5");
@@ -3526,16 +3524,12 @@ mod jobs_endpoint_tests {
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["error"], "job_not_found");
         assert!(v.get("message").is_some());
-
     }
 
     /// Defect 2: an accepted signature drives finalise, not a bare status flip.
     #[tokio::test]
     async fn accepted_signature_drives_finalise_not_status_only() {
-        use crate::v1::{
-            set_process_stack_mode, FinaliseOutcome,
-            ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, FinaliseOutcome, ScanStackMode};
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let _stack_guard = lock_v1_stack_for_test();
@@ -3618,7 +3612,12 @@ mod jobs_endpoint_tests {
         // Simulate the dispatcher waking and driving finalise from the
         // durable capability (same path as wait_for_commit / drive_v1_finalise).
         let _ = commit_wake;
-        let job = state.job_store.load(job_id).await.expect("load").expect("row");
+        let job = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         let entry = crate::v1::rehydrate_pending_sign(&job.request_body)
             .expect("rehydrate")
             .expect("signed durable finalisation on row after /sign");
@@ -3656,19 +3655,19 @@ mod jobs_endpoint_tests {
         assert_eq!(status, StatusCode::OK, "body: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["status"], "completed");
-        assert!(v.get("phase").is_none(), "phase absent when terminal: {body}");
+        assert!(
+            v.get("phase").is_none(),
+            "phase absent when terminal: {body}"
+        );
         assert!(v["result"].get("new_account_state_hash").is_some());
         assert!(v["result"].get("signature_accepted").is_none());
-
     }
 
     /// Defect 1: acceptance without a parked dispatcher is failure, not
     /// success — no invented `dispatcher: "not_waiting"`.
     #[tokio::test]
     async fn jobs_sign_without_dispatcher_reports_failure_not_acceptance() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
 
         let _stack_guard = lock_v1_stack_for_test();
         set_process_stack_mode(ScanStackMode::V1);
@@ -3713,7 +3712,10 @@ mod jobs_endpoint_tests {
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["error"], "internal_error");
         assert_ne!(v["status"], "signature_accepted");
-        assert!(v.get("dispatcher").is_none(), "no invented dispatcher field: {resp}");
+        assert!(
+            v.get("dispatcher").is_none(),
+            "no invented dispatcher field: {resp}"
+        );
         assert!(
             v["message"]
                 .as_str()
@@ -3721,7 +3723,6 @@ mod jobs_endpoint_tests {
                 .contains("no dispatcher"),
             "message should describe the lifecycle failure: {resp}"
         );
-
     }
 
     /// Durable finalisation rehydrate carries a full capability (not a
@@ -3730,8 +3731,8 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn rehydrated_durable_finalisation_is_finalise_ready() {
         use crate::v1::{
-            ensure_completion_ready, ensure_finalise_ready,
-            set_process_stack_mode, DurableFinalisationPersist, ScanStackMode,
+            ensure_completion_ready, ensure_finalise_ready, set_process_stack_mode,
+            DurableFinalisationPersist, ScanStackMode,
         };
 
         let _stack_guard = lock_v1_stack_for_test();
@@ -3757,23 +3758,18 @@ mod jobs_endpoint_tests {
             ensure_completion_ready(&rehydrated).is_err(),
             "signed-only capability is not completion-ready without completion_result"
         );
-
     }
 
     /// Defect 4/5: success result carries output_coin_ids + publisher_pubkey.
     #[tokio::test]
     async fn completed_result_carries_output_coin_ids_and_publisher_pubkey() {
-        use crate::v1::{
-            set_process_stack_mode, FinaliseOutcome,
-            ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, FinaliseOutcome, ScanStackMode};
         use shared::spec_v1::{digest_from_bytes, digest_to_bytes, Coin, ZERO_HASH};
 
         let _stack_guard = lock_v1_stack_for_test();
         set_process_stack_mode(ScanStackMode::V1);
 
-        let (mut entry, _) =
-            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let (mut entry, _) = crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
         // Attach one synthetic output coin so the result is non-empty.
         let coin_id = [0x42u8; 32];
         entry.pending.witness_wip.output_coins.push(Coin {
@@ -3840,15 +3836,12 @@ mod jobs_endpoint_tests {
             v["result"]["publisher_pubkey"].as_str().unwrap(),
             hex::encode(publisher)
         );
-
     }
 
     /// Defect 5: malformed JSON and malformed UUID → 400 malformed_request.
     #[tokio::test]
     async fn v1_extractors_map_malformed_json_and_uuid_to_malformed_request() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
 
         let _stack_guard = lock_v1_stack_for_test();
         set_process_stack_mode(ScanStackMode::V1);
@@ -3892,16 +3885,13 @@ mod jobs_endpoint_tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "type body: {resp}");
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["error"], "malformed_request");
-
     }
 
     /// Defect 4: /sign still works after a simulated restart (map empty,
     /// rehydrate from request_body.pending_sign).
     #[tokio::test]
     async fn jobs_sign_works_after_simulated_restart() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
 
         let _stack_guard = lock_v1_stack_for_test();
         set_process_stack_mode(ScanStackMode::V1);
@@ -3970,7 +3960,6 @@ mod jobs_endpoint_tests {
             state.pending_sign_map.get(&job_id).is_some(),
             "rehydrate must re-stage the pending entry"
         );
-
     }
 
     /// Defect 1 (round 5): a job that reaches `awaiting_signature` through
@@ -3978,9 +3967,7 @@ mod jobs_endpoint_tests {
     /// → `stage_pending_sign`) can be signed via `/v1`.
     #[tokio::test]
     async fn dispatcher_staging_path_allows_v1_sign() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
 
         let _stack_guard = lock_v1_stack_for_test();
         set_process_stack_mode(ScanStackMode::V1);
@@ -4034,9 +4021,16 @@ mod jobs_endpoint_tests {
             "stage_pending_sign must populate pending_sign_map"
         );
         // Restart envelope persisted.
-        let row = state.job_store.load(job_id).await.expect("load").expect("row");
+        let row = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         assert!(
-            row.request_body.get(crate::v1::FINALISATION_BODY_KEY).is_some(),
+            row.request_body
+                .get(crate::v1::FINALISATION_BODY_KEY)
+                .is_some(),
             "pending_sign envelope must be on the job row"
         );
 
@@ -4060,16 +4054,13 @@ mod jobs_endpoint_tests {
         assert_eq!(status, StatusCode::OK, "body: {resp}");
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["status"], "signature_accepted");
-
     }
 
     /// Defect 2 (round 5): dispatcher disappearing between clone and wake
     /// (handoff CAS lost to timeout) yields rejection, not acceptance.
     #[tokio::test]
     async fn jobs_sign_rejects_when_dispatcher_handoff_already_timed_out() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
 
         let _stack_guard = lock_v1_stack_for_test();
         set_process_stack_mode(ScanStackMode::V1);
@@ -4127,10 +4118,7 @@ mod jobs_endpoint_tests {
                 .as_str()
                 .unwrap_or("")
                 .contains("no longer waiting")
-                || v["message"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("timed out"),
+                || v["message"].as_str().unwrap_or("").contains("timed out"),
             "message should describe the handoff race: {resp}"
         );
         // Persist-before-signal: even on a refused handoff the signed
@@ -4148,7 +4136,6 @@ mod jobs_endpoint_tests {
             entry.signature.is_some(),
             "persist-before-signal: signed capability must be durable even when CAS refuses"
         );
-
     }
 
     /// Defect 1: a job staged through the production registry
@@ -4156,10 +4143,7 @@ mod jobs_endpoint_tests {
     /// `stage_and_select_awaiting_signature`) can be signed via `/v1`.
     #[tokio::test]
     async fn production_begin_registry_staging_allows_v1_sign() {
-        use crate::v1::{
-            register_live_pending_after_begin,
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{register_live_pending_after_begin, set_process_stack_mode, ScanStackMode};
 
         let _stack_guard = lock_v1_stack_for_test();
         set_process_stack_mode(ScanStackMode::V1);
@@ -4184,19 +4168,15 @@ mod jobs_endpoint_tests {
         };
 
         // Production write site: begin_* registers the live pending here.
-        register_live_pending_after_begin(
-            &state.v1_live_pending_after_begin,
-            job_id,
-            entry,
-        );
+        register_live_pending_after_begin(&state.v1_live_pending_after_begin, job_id, entry);
 
         // No test hook — production resolve path only.
         state.v1_pending_after_prove = None;
-        let live = crate::job_dispatcher::resolve_live_pending_after_prove_for_test(
-            &state,
-            job_id,
+        let live = crate::job_dispatcher::resolve_live_pending_after_prove_for_test(&state, job_id);
+        assert!(
+            live.is_some(),
+            "production registry must supply the pending"
         );
-        assert!(live.is_some(), "production registry must supply the pending");
         let advertised = crate::job_dispatcher::stage_and_select_awaiting_signature(
             &state.job_store,
             &state,
@@ -4232,7 +4212,6 @@ mod jobs_endpoint_tests {
         assert_eq!(status, StatusCode::OK, "body: {resp}");
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["status"], "signature_accepted");
-
     }
 
     /// Defect 2: SIGNALED without durable state is unreachable.
@@ -4240,9 +4219,7 @@ mod jobs_endpoint_tests {
     /// the inverse (SIGNALED with no blob) cannot arise from /sign.
     #[tokio::test]
     async fn jobs_sign_persist_before_signal_invariant() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
 
         let _stack_guard = lock_v1_stack_for_test();
         set_process_stack_mode(ScanStackMode::V1);
@@ -4286,7 +4263,12 @@ mod jobs_endpoint_tests {
             .unwrap();
         let (status, _h, resp) = run(state.clone(), req).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {resp}");
-        let row = state.job_store.load(job_id).await.expect("load").expect("row");
+        let row = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         // Without a notifier we refuse before persist (no dispatcher to serve).
         // The invariant under test is: we never set SIGNALED without a durable
         // blob — and with no notifier there is no handoff to signal at all.
@@ -4295,7 +4277,6 @@ mod jobs_endpoint_tests {
             "no handoff exists to be left in SIGNALED"
         );
         let _ = row; // status stays awaiting_signature
-
     }
 
     /// Helper: plant a signed durable capability (optionally with completion
@@ -4384,9 +4365,7 @@ mod jobs_endpoint_tests {
         std::mem::forget(rx);
         AppState {
             account_node: Arc::new(Mutex::new(account_node)),
-            proof_store: Arc::new(ProofStore::new(
-                proofs_dir.to_str().expect("utf-8"),
-            )),
+            proof_store: Arc::new(ProofStore::new(proofs_dir.to_str().expect("utf-8"))),
             mint_store: Arc::new(crate::router::MintStore::new()),
             username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
             pool: Arc::clone(&pool),
@@ -4426,9 +4405,7 @@ mod jobs_endpoint_tests {
     /// incomplete test).
     #[tokio::test]
     async fn cold_fresh_appstate_drives_completion_from_durable_capability_alone() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
         use std::time::Duration;
 
         let _stack_guard = lock_v1_stack_for_test();
@@ -4443,7 +4420,10 @@ mod jobs_endpoint_tests {
 
         // Genuinely fresh AppState — new Arcs, empty maps, no hook.
         let state = fresh_app_state_from_pool(Arc::clone(&pool));
-        assert!(state.v1_finalise.is_none(), "cold test must not inject a hook");
+        assert!(
+            state.v1_finalise.is_none(),
+            "cold test must not inject a hook"
+        );
         assert!(state.pending_sign_map.is_empty());
         assert!(state.job_notify_map.is_empty());
 
@@ -4457,7 +4437,12 @@ mod jobs_endpoint_tests {
         .await
         .expect("cold resume process");
 
-        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         assert_eq!(
             after.status,
             crate::job_store::JobStatus::Completed,
@@ -4465,7 +4450,10 @@ mod jobs_endpoint_tests {
             after.status,
             after.error
         );
-        assert!(after.request_body.get(crate::v1::FINALISATION_BODY_KEY).is_none());
+        assert!(after
+            .request_body
+            .get(crate::v1::FINALISATION_BODY_KEY)
+            .is_none());
         assert!(after.response_body.is_some());
         let result = after.response_body.as_ref().unwrap();
         assert!(result.get("new_account_state_hash").is_some());
@@ -4477,9 +4465,7 @@ mod jobs_endpoint_tests {
     /// must **fail** rather than silently half-finish at broadcasting.
     #[tokio::test]
     async fn incomplete_capability_without_completion_fails_resume() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
         use std::time::Duration;
 
         let _stack_guard = lock_v1_stack_for_test();
@@ -4505,7 +4491,12 @@ mod jobs_endpoint_tests {
         .await
         .expect("process returns Ok after fail_v1");
 
-        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         assert_eq!(
             after.status,
             crate::job_store::JobStatus::Failed,
@@ -4551,10 +4542,7 @@ mod jobs_endpoint_tests {
     /// observes the loss and does not continue.
     #[tokio::test]
     async fn concurrent_resumers_exactly_one_wins_exclusive_claim() {
-        use crate::v1::{
-            set_process_stack_mode, FinaliseOutcome,
-            ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, FinaliseOutcome, ScanStackMode};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
@@ -4567,13 +4555,8 @@ mod jobs_endpoint_tests {
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
         let (mut state, pool, _scope) = jobs_test_state().await;
-        let (job_id, _) = plant_signed_finalisation_job(
-            &state.job_store,
-            0xE0,
-            "k-race-claim",
-            false,
-        )
-        .await;
+        let (job_id, _) =
+            plant_signed_finalisation_job(&state.job_store, 0xE0, "k-race-claim", false).await;
 
         let barrier_in_hook = Arc::clone(&barrier);
         state.v1_finalise = Some(Arc::new(move |pending, _sig, _fence| {
@@ -4627,7 +4610,12 @@ mod jobs_endpoint_tests {
             1,
             "exactly one resumer must run the finalise hook (exclusive claim)"
         );
-        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         assert_eq!(
             after.status,
             crate::job_store::JobStatus::Completed,
@@ -4660,9 +4648,7 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn losing_resumer_leaves_winner_notify_map_intact() {
         use crate::job_dispatcher::JobNotifier;
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
         use std::time::Duration;
 
         let _stack_guard = lock_v1_stack_for_test();
@@ -4710,7 +4696,12 @@ mod jobs_endpoint_tests {
         );
         // Job still broadcasting under the winner's claim — not failed/completed
         // by the loser.
-        let row = state.job_store.load(job_id).await.expect("load").expect("row");
+        let row = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         assert_eq!(
             row.status,
             crate::job_store::JobStatus::Broadcasting,
@@ -4719,7 +4710,6 @@ mod jobs_endpoint_tests {
             row.error
         );
         assert_eq!(row.phase, crate::job_store::FINALISE_CLAIM_PHASE);
-
     }
 
     /// Defect 1 (host edge): resume drives exactly to the documented host edge
@@ -4729,9 +4719,7 @@ mod jobs_endpoint_tests {
     /// (bitcoind); engine + `members_ready` are the durable handoff.
     #[tokio::test]
     async fn resume_drives_to_documented_host_edge_not_silent_stop() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
         use std::time::Duration;
 
         let _stack_guard = lock_v1_stack_for_test();
@@ -4765,7 +4753,12 @@ mod jobs_endpoint_tests {
         .await
         .expect("resume to host edge");
 
-        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         assert_eq!(
             after.status,
             crate::job_store::JobStatus::Completed,
@@ -4814,8 +4807,7 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn crash_at_edge_leaves_durable_job_resume_picks_up() {
         use crate::v1::{
-            claim_stack_scan_mode, set_process_stack_mode,
-            FinaliseOutcome, ScanStackMode,
+            claim_stack_scan_mode, set_process_stack_mode, FinaliseOutcome, ScanStackMode,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
@@ -4901,7 +4893,12 @@ mod jobs_endpoint_tests {
             0,
             "resume with durable completion must not re-run finalise hook"
         );
-        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         assert_eq!(
             after.status,
             crate::job_store::JobStatus::Completed,
@@ -4914,7 +4911,10 @@ mod jobs_endpoint_tests {
             .await
             .expect("load pending")
             .expect("members_ready must survive crash + resume");
-        assert_eq!(pending.status, crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY);
+        assert_eq!(
+            pending.status,
+            crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY
+        );
         assert_eq!(pending.owner, owner);
 
         drop(scope);
@@ -4926,8 +4926,7 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn finalise_hook_stages_pending_publish_for_durable_handoff() {
         use crate::v1::{
-            claim_stack_scan_mode, set_process_stack_mode,
-            FinaliseOutcome, ScanStackMode,
+            claim_stack_scan_mode, set_process_stack_mode, FinaliseOutcome, ScanStackMode,
         };
         use std::time::Duration;
 
@@ -4939,13 +4938,8 @@ mod jobs_endpoint_tests {
             .await
             .expect("claim stack_scan_mode v1");
 
-        let (job_id, entry) = plant_signed_finalisation_job(
-            &state.job_store,
-            0xE6,
-            "k-stage-pending",
-            false,
-        )
-        .await;
+        let (job_id, entry) =
+            plant_signed_finalisation_job(&state.job_store, 0xE6, "k-stage-pending", false).await;
         let pool_for_hook = Arc::clone(&pool);
         state.v1_finalise = Some(Arc::new(move |pending, signature, fence| {
             let pool_for_hook = Arc::clone(&pool_for_hook);
@@ -4953,28 +4947,29 @@ mod jobs_endpoint_tests {
                 // Mirror production: stage members_ready under the claim fence
                 // before returning the §7.5 outcome (real path also persists
                 // the engine under the same predicate).
-                let staged = crate::v1::db_v1::persist_engine_with_pending_members_ready_if_finalise_fence(
-                    &*pool_for_hook,
-                    &crate::v1::db_v1::EngineSnapshot {
-                        network: zkcoins_program::circuit::compliance::Network::Regtest,
-                        activation_height: 0,
-                        tip_height: 0,
-                        tip_hash: [0u8; 32],
-                        fold_seq: 0,
-                        nflog: vec![],
-                        accounts: vec![],
-                    },
-                    pending.owner,
-                    signature.pk_i,
-                    signature.signature_r(),
-                    signature.signature_s(),
-                    signature.r_prime,
-                    0,
-                    [0u8; 32],
-                    fence,
-                )
-                .await
-                .map_err(|e| format!("stage members_ready under fence: {e:#}"))?;
+                let staged =
+                    crate::v1::db_v1::persist_engine_with_pending_members_ready_if_finalise_fence(
+                        &*pool_for_hook,
+                        &crate::v1::db_v1::EngineSnapshot {
+                            network: zkcoins_program::circuit::compliance::Network::Regtest,
+                            activation_height: 0,
+                            tip_height: 0,
+                            tip_hash: [0u8; 32],
+                            fold_seq: 0,
+                            nflog: vec![],
+                            accounts: vec![],
+                        },
+                        pending.owner,
+                        signature.pk_i,
+                        signature.signature_r(),
+                        signature.signature_s(),
+                        signature.r_prime,
+                        0,
+                        [0u8; 32],
+                        fence,
+                    )
+                    .await
+                    .map_err(|e| format!("stage members_ready under fence: {e:#}"))?;
                 if !staged {
                     return Err(crate::job_store::FINALISE_FENCE_LOST.to_string());
                 }
@@ -4992,7 +4987,12 @@ mod jobs_endpoint_tests {
         .await
         .expect("process finalise with durable stage");
 
-        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         assert_eq!(after.status, crate::job_store::JobStatus::Completed);
         let sig = entry.signature.expect("signed");
         let pending = crate::v1::db_v1::load_pending_publish(&*pool, sig.pk_i)
@@ -5003,17 +5003,13 @@ mod jobs_endpoint_tests {
             pending.status,
             crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY
         );
-
     }
 
     /// Resuming finalise twice is harmless: second attempt is claim-lost or
     /// terminal no-op (job already completed; no double-credit / double-complete).
     #[tokio::test]
     async fn resume_finalise_twice_is_harmless() {
-        use crate::v1::{
-            set_process_stack_mode, FinaliseOutcome,
-            ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, FinaliseOutcome, ScanStackMode};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
@@ -5050,7 +5046,12 @@ mod jobs_endpoint_tests {
             .unwrap_or_else(|e| panic!("resume #{i}: {e:#}"));
         }
 
-        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         assert_eq!(after.status, crate::job_store::JobStatus::Completed);
         // First resume runs the hook; second is a terminal no-op (no second apply).
         assert_eq!(
@@ -5058,7 +5059,6 @@ mod jobs_endpoint_tests {
             1,
             "second resume must not re-run finalise after complete"
         );
-
     }
 
     /// Status-qualified request_body update fails when the job has moved on.
@@ -5120,9 +5120,7 @@ mod jobs_endpoint_tests {
     /// `awaiting_signature`.
     #[tokio::test]
     async fn failed_job_envelope_cannot_resurrect_on_resume() {
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
         use std::time::Duration;
 
         let _stack_guard = lock_v1_stack_for_test();
@@ -5144,8 +5142,7 @@ mod jobs_endpoint_tests {
             _ => panic!(),
         };
 
-        let (entry, _) =
-            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let (entry, _) = crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
         let persist = crate::v1::DurableFinalisationPersist::from_entry(&entry)
             .expect("encode durable finalisation");
         let mut req_body = serde_json::json!({});
@@ -5178,7 +5175,12 @@ mod jobs_endpoint_tests {
             .fail(job_id, "awaiting_signature timeout")
             .await
             .expect("fail");
-        let after_fail = state.job_store.load(job_id).await.expect("load").expect("row");
+        let after_fail = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         assert_eq!(after_fail.status, crate::job_store::JobStatus::Failed);
         assert!(
             after_fail
@@ -5201,13 +5203,17 @@ mod jobs_endpoint_tests {
         )
         .await
         .expect("process terminal is a no-op");
-        let after = state.job_store.load(job_id).await.expect("load").expect("row");
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
         assert_eq!(
             after.status,
             crate::job_store::JobStatus::Failed,
             "terminal failed job must not be resurrected"
         );
-
     }
 
     /// Defect 4: `/v1/.../stream` emits `event: error` with a closed
@@ -5322,7 +5328,11 @@ mod jobs_endpoint_tests {
             .body(Body::empty())
             .unwrap();
         let (status, _h, resp) = run(state, req).await;
-        assert_eq!(status, StatusCode::CONFLICT, "published cancel body: {resp}");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "published cancel body: {resp}"
+        );
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["error"], "wrong_phase");
     }
@@ -6462,7 +6472,6 @@ mod jobs_endpoint_tests {
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert!(v.get("job_id").and_then(|j| j.as_str()).is_some());
         assert!(v.get("status").is_none(), "§7.5 admit is {{ job_id }} only");
-
     }
 
     /// V1Json extractor: malformed / missing JSON → 400 malformed_request
@@ -6470,9 +6479,7 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn attest_balance_malformed_json_returns_malformed_request() {
         let _lock = lock_v1_stack_for_test();
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
 
         set_process_stack_mode(ScanStackMode::V1);
         let state = test_state();
@@ -6506,7 +6513,6 @@ mod jobs_endpoint_tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
         let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["error"], "malformed_request");
-
     }
 
     /// Root closed map advertises the §7.5 attest surface **only when the
@@ -6514,9 +6520,7 @@ mod jobs_endpoint_tests {
     #[tokio::test]
     async fn root_advertises_attest_balance_endpoints_when_flag_on() {
         let _lock = lock_v1_stack_for_test();
-        use crate::v1::{
-            set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
         set_process_stack_mode(ScanStackMode::V1);
 
         let state = test_state();
@@ -6628,12 +6632,7 @@ mod jobs_endpoint_tests {
             .expect("RootEndpoints.properties");
         // Derive from the live type via serde field names.
         let live = serde_json::to_value(crate::router::root_endpoints_always_on()).unwrap();
-        let type_keys: Vec<String> = live
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect();
+        let type_keys: Vec<String> = live.as_object().unwrap().keys().cloned().collect();
         assert_eq!(
             props.len(),
             type_keys.len(),
@@ -6702,12 +6701,9 @@ mod jobs_endpoint_tests {
         .expect("pinned mainnet digest must pass the production gate");
 
         // Production gate rejects a wrong live digest.
-        let err = accept_c_balance_network_binding(
-            &network_id_testnet(),
-            &[0u8; 32],
-            Network::Testnet,
-        )
-        .unwrap_err();
+        let err =
+            accept_c_balance_network_binding(&network_id_testnet(), &[0u8; 32], Network::Testnet)
+                .unwrap_err();
         assert_eq!(err.http_status_and_code(), (503, "circuit_digest_mismatch"));
 
         // Production gate rejects cross-network network_id.
@@ -6719,7 +6715,6 @@ mod jobs_endpoint_tests {
         .unwrap_err();
         assert!(matches!(err, crate::v1::AttestError::ProvingFailed(_)));
     }
-
 }
 
 // =======================================================================
@@ -6849,7 +6844,9 @@ mod inscriptions_endpoint_tests {
         let body_str = String::from_utf8_lossy(&body);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(
-            v.get("kind").is_none() && v.get("status").is_none() && v.get("commit_output_value").is_none(),
+            v.get("kind").is_none()
+                && v.get("status").is_none()
+                && v.get("commit_output_value").is_none(),
             "must not emit pending_inscriptions summary; got {body_str}"
         );
         let err = v["error"].as_str().unwrap_or("");
@@ -7334,16 +7331,6 @@ async fn history_item_missing_params_still_gone_not_422() {
 
 // --- Pure-function coverage for the helpers --------------------------------
 
-
-
-
-
-
-
-
-
-
-
 /// Covers the **settled-balance** shape of an `Account` blob: a post-send
 /// account whose `coin_queue` has been drained into `coin_history` and
 /// whose remaining funds sit in the `balance` field. The companion
@@ -7352,34 +7339,11 @@ async fn history_item_missing_params_still_gone_not_422() {
 /// `CoinProof` and is pinned in
 /// `account_node_tests::history_row_to_item_balance_from_coin_queue_only`
 /// where the prover fixtures live.
-
-
-
-
-
-
-
-
-
-
 // ── GET /api/history/{id} — TxDetail conversion (issue: tx-detail) ──────
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ===========================================================================
 // Milestone 2: neutral, permissionless multi-asset router surface.
 // ===========================================================================
-
 use bitcoin::secp256k1::{
     Keypair as TestKeypair, Secp256k1 as TestSecp, SecretKey as TestSecretKey,
 };
@@ -7427,8 +7391,6 @@ fn now_secs() -> u64 {
         .unwrap()
         .as_secs()
 }
-
-
 
 #[test]
 fn verify_mint_signature_accepts_valid_signature() {
@@ -7578,4 +7540,3 @@ async fn jobs_mint_stale_timestamp_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-

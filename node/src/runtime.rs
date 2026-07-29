@@ -115,20 +115,19 @@ pub async fn start_rest_node(
         // short-circuiting to "signature_accepted" alone.
         v1_finalise: v1_engine.as_ref().map(|adapter| {
             let adapter = Arc::clone(adapter);
-            let hook: crate::router::V1FinaliseHook =
-                Arc::new(move |pending, signature, fence| {
-                    let adapter = Arc::clone(&adapter);
-                    // publisher_pubkey is filled by the dispatcher from the job
-                    // request_body after the hook returns.
-                    // Durable + fenced: prove → apply → engine snapshot +
-                    // members_ready only while this claim epoch still holds.
-                    Box::pin(async move {
-                        crate::v1::finalise_accepted_prove_persist_and_stage(
-                            &adapter, pending, signature, None, fence,
-                        )
-                        .await
-                    })
-                });
+            let hook: crate::router::V1FinaliseHook = Arc::new(move |pending, signature, fence| {
+                let adapter = Arc::clone(&adapter);
+                // publisher_pubkey is filled by the dispatcher from the job
+                // request_body after the hook returns.
+                // Durable + fenced: prove → apply → engine snapshot +
+                // members_ready only while this claim epoch still holds.
+                Box::pin(async move {
+                    crate::v1::finalise_accepted_prove_persist_and_stage(
+                        &adapter, pending, signature, None, fence,
+                    )
+                    .await
+                })
+            });
             hook
         }),
         // Production post-begin registry: `StateEngine::begin_*` writes a
@@ -593,10 +592,7 @@ pub(crate) async fn boot_resume_jobs(
             // and be retried (next boot) — never half-process (e.g. release
             // then abort before enqueue via `?` on a subsequent load).
             // Decision table: [`boot_finalise_disposition`].
-            let release_result = match job_store
-                .release_stale_finalise_claim(job.public_id)
-                .await
-            {
+            let release_result = match job_store.release_stale_finalise_claim(job.public_id).await {
                 Ok(r) => Ok(r),
                 Err(e) => {
                     eprintln!(
@@ -636,22 +632,14 @@ pub(crate) async fn boot_resume_jobs(
 
             let disposition = boot_finalise_disposition(
                 release_result,
-                phase_reload
-                    .as_ref()
-                    .map(|o| o.as_deref())
-                    .map_err(|_| ()),
+                phase_reload.as_ref().map(|o| o.as_deref()).map_err(|_| ()),
             );
             match disposition {
                 BootRowDisposition::LeaveUntouchedForRetry => {
                     // Already logged; continue to next interrupted row.
                 }
                 BootRowDisposition::Act(BootFinaliseAction::EnqueueNow) => {
-                    rearm_and_enqueue_v1_finalise(
-                        job.public_id,
-                        job_notify_map,
-                        job_tx,
-                    )
-                    .await;
+                    rearm_and_enqueue_v1_finalise(job.public_id, job_notify_map, job_tx).await;
                 }
                 BootRowDisposition::Act(BootFinaliseAction::DeferUntilAbandoned) => {
                     let phase = phase_reload

@@ -63,8 +63,8 @@ use shared::spec_v1::{
 use zkcoins_program::circuit::compliance::Network;
 use zkcoins_prover::half_agg::verify_single;
 use zkcoins_prover::prover_bridge::{
-    AttestationWitness, BalanceAnchor, BalanceAttestationStatement, BalanceProof, ProvedAttestation,
-    ProverBridge,
+    AttestationWitness, BalanceAnchor, BalanceAttestationStatement, BalanceProof,
+    ProvedAttestation, ProverBridge,
 };
 
 use super::adapter::EngineAdapter;
@@ -176,7 +176,10 @@ impl<'de> Deserialize<'de> for U64Decimal {
                     .map_err(serde::de::Error::custom)
             }
 
-            fn visit_borrowed_str<E: serde::de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+            fn visit_borrowed_str<E: serde::de::Error>(
+                self,
+                v: &'de str,
+            ) -> Result<Self::Value, E> {
                 self.visit_str(v)
             }
 
@@ -378,7 +381,8 @@ pub(crate) fn attest_request_hash(
     asset_id: &[u8; 32],
     ceiling_enc: &[u8],
 ) -> [u8; 32] {
-    let mut pre = Vec::with_capacity(ATTEST_BALANCE_REQUEST_TAG.len() + 32 + 32 + ceiling_enc.len());
+    let mut pre =
+        Vec::with_capacity(ATTEST_BALANCE_REQUEST_TAG.len() + 32 + 32 + ceiling_enc.len());
     pre.extend_from_slice(ATTEST_BALANCE_REQUEST_TAG.as_bytes());
     pre.extend_from_slice(subject);
     pre.extend_from_slice(asset_id);
@@ -394,9 +398,7 @@ pub(crate) fn attest_challenge_message(
     expiry: u64,
     request_hash: &[u8; 32],
 ) -> [u8; 32] {
-    let mut pre = Vec::with_capacity(
-        ATTEST_BALANCE_CHALLENGE_DOMAIN.len() + 32 + 32 + 32 + 8 + 32,
-    );
+    let mut pre = Vec::with_capacity(ATTEST_BALANCE_CHALLENGE_DOMAIN.len() + 32 + 32 + 32 + 8 + 32);
     pre.extend_from_slice(ATTEST_BALANCE_CHALLENGE_DOMAIN.as_bytes());
     pre.extend_from_slice(nonce);
     pre.extend_from_slice(chan_bind);
@@ -446,9 +448,8 @@ pub(crate) fn issue_attest_challenge(
     subject_bech32: &str,
     now: u64,
 ) -> Result<([u8; 32], u64), AttestError> {
-    let subject = Address::from_bech32m(subject_bech32).map_err(|e| {
-        AttestError::Malformed(format!("subject: invalid zk Bech32m address: {e}"))
-    })?;
+    let subject = Address::from_bech32m(subject_bech32)
+        .map_err(|e| AttestError::Malformed(format!("subject: invalid zk Bech32m address: {e}")))?;
     // Two UUID v4 values (128-bit CSPRNG each) → 32-byte nonce.
     // No silent fixed-nonce fallback.
     let mut nonce = [0u8; 32];
@@ -490,9 +491,8 @@ pub(crate) fn authorise_attest_balance(
     let ceiling_enc = ceiling_encoding(nav_ceiling.as_ref(), size_ceiling)?;
 
     // Subject: Bech32m.
-    let subject_addr = Address::from_bech32m(&req.subject).map_err(|e| {
-        AttestError::Malformed(format!("subject: invalid zk Bech32m address: {e}"))
-    })?;
+    let subject_addr = Address::from_bech32m(&req.subject)
+        .map_err(|e| AttestError::Malformed(format!("subject: invalid zk Bech32m address: {e}")))?;
     let asset_id = parse_hex32(&req.asset_id, "asset_id")?;
     let nonce = parse_hex32(&req.challenge.nonce, "challenge.nonce")?;
 
@@ -513,15 +513,22 @@ pub(crate) fn authorise_attest_balance(
             "ownership_proof.subject does not match request subject".into(),
         ));
     }
-    let pk0 = parse_hex32(&req.ownership_proof.public_key, "ownership_proof.public_key")?;
-    let nk_commit_bytes =
-        parse_hex32(&req.ownership_proof.nk_commit, "ownership_proof.nk_commit")?;
+    let pk0 = parse_hex32(
+        &req.ownership_proof.public_key,
+        "ownership_proof.public_key",
+    )?;
+    let nk_commit_bytes = parse_hex32(&req.ownership_proof.nk_commit, "ownership_proof.nk_commit")?;
     let signature = parse_hex64(&req.ownership_proof.signature, "ownership_proof.signature")?;
 
     // Address binding: H(Pk₀ ‖ nk_commit) == subject.
-    let expected_addr = host::address(&pk0, host::digest_from_bytes(&nk_commit_bytes).map_err(
-        |e| AttestError::Malformed(format!("ownership_proof.nk_commit: non-canonical digest: {e}")),
-    )?);
+    let expected_addr = host::address(
+        &pk0,
+        host::digest_from_bytes(&nk_commit_bytes).map_err(|e| {
+            AttestError::Malformed(format!(
+                "ownership_proof.nk_commit: non-canonical digest: {e}"
+            ))
+        })?,
+    );
     if expected_addr != subject_addr.0 {
         return Err(AttestError::Unauthorized(
             "H(Pk0 ‖ nk_commit) does not equal subject address".into(),
@@ -575,13 +582,8 @@ pub(crate) fn authorise_attest_balance(
     let mut accepted = false;
     for host in public_hosts {
         let cb = chan_bind_for_host(host);
-        let chal = attest_challenge_message(
-            &nonce,
-            &cb,
-            &subject_addr.0,
-            record.expiry,
-            &request_hash,
-        );
+        let chal =
+            attest_challenge_message(&nonce, &cb, &subject_addr.0, record.expiry, &request_hash);
         if verify_single(&pk0, &r, &s, &chal).is_ok() {
             accepted = true;
             break;
@@ -680,12 +682,10 @@ pub(crate) fn require_resolved_anchor(
     txid: Option<[u8; 32]>,
     block_hash: Option<[u8; 32]>,
 ) -> Result<([u8; 32], [u8; 32]), AttestError> {
-    let txid = txid.ok_or_else(|| {
-        AttestError::ProvingFailed(ATTEST_ANCHOR_LOCATOR_EDGE.to_string())
-    })?;
-    let block_hash = block_hash.ok_or_else(|| {
-        AttestError::ProvingFailed(ATTEST_ANCHOR_LOCATOR_EDGE.to_string())
-    })?;
+    let txid =
+        txid.ok_or_else(|| AttestError::ProvingFailed(ATTEST_ANCHOR_LOCATOR_EDGE.to_string()))?;
+    let block_hash = block_hash
+        .ok_or_else(|| AttestError::ProvingFailed(ATTEST_ANCHOR_LOCATOR_EDGE.to_string()))?;
     Ok((txid, block_hash))
 }
 
@@ -946,19 +946,14 @@ pub(crate) fn collect_materials(
             .take(ceiling.size as usize)
             .map(|(_, e)| *e)
             .collect();
-        let consistency = host::consistency_proof(nav_opening.nav.size, &prefix_entries)
-            .map_err(|e| {
+        let consistency =
+            host::consistency_proof(nav_opening.nav.size, &prefix_entries).map_err(|e| {
                 AttestError::ProvingFailed(format!("nav consistency proof failed: {e}"))
             })?;
 
         // Balance from account state (fail if asset missing → balance 0 is
         // still a valid attestation of zero, so we do not reject).
-        let _balance = record
-            .state
-            .balances
-            .get(asset_id)
-            .copied()
-            .unwrap_or(0);
+        let _balance = record.state.balances.get(asset_id).copied().unwrap_or(0);
 
         Ok(AttestMaterials {
             account_state: record.state.clone(),
@@ -1070,11 +1065,7 @@ pub(crate) async fn prove_attestation_for_job(
                         mirror.len()
                     )));
                 }
-                let entries: Vec<_> = mirror
-                    .iter()
-                    .take(size as usize)
-                    .map(|(_, e)| *e)
-                    .collect();
+                let entries: Vec<_> = mirror.iter().take(size as usize).map(|(_, e)| *e).collect();
                 let mth = if size == 0 {
                     host::nflog_empty()
                 } else {
@@ -1100,9 +1091,12 @@ pub(crate) async fn prove_attestation_for_job(
     };
 
     let mut materials = collect_materials(adapter, &subject, &body.asset_id, requested)?;
-    let (txid, block_hash) =
-        resolve_anchor_locator(adapter, &materials.nullifier.public_key, materials.nullifier_height)
-            .await?;
+    let (txid, block_hash) = resolve_anchor_locator(
+        adapter,
+        &materials.nullifier.public_key,
+        materials.nullifier_height,
+    )
+    .await?;
     materials.anchor_txid = txid;
     materials.anchor_block_hash = block_hash;
 
@@ -1145,9 +1139,9 @@ pub(crate) async fn prove_attestation_for_job(
     let live = bridge.balance_circuit_digest_bytes();
     accept_c_balance_network_binding(&network_id_for(network), &live, network)?;
 
-    let proved = bridge.prove_attestation(&witness).map_err(|e| {
-        AttestError::ProvingFailed(format!("prove_attestation failed: {e}"))
-    })?;
+    let proved = bridge
+        .prove_attestation(&witness)
+        .map_err(|e| AttestError::ProvingFailed(format!("prove_attestation failed: {e}")))?;
     accept_attestation_for_network(&proved, network)?;
     let _ = materials.nullifier_pos; // retained for forensics / future locator index
     Ok(proved)
@@ -1542,8 +1536,7 @@ mod tests {
                 signature_r: [0x22; 32],
             },
         };
-        let bytes =
-            serialize_balance_attestation(&statement, Network::Testnet, &proof).unwrap();
+        let bytes = serialize_balance_attestation(&statement, Network::Testnet, &proof).unwrap();
         // Layout: 288-byte fixed header + u32-be len + proof payload.
         let len = u32::from_be_bytes(bytes[288..292].try_into().unwrap()) as usize;
         assert_eq!(len, canonical.len());
@@ -1588,24 +1581,21 @@ mod tests {
         );
 
         // First occurrence but not yet final (pos ≥ size_final) → refuse.
-        let err =
-            require_completed_anchor(5, 5, SpendClassification::ValidFirstSpend).unwrap_err();
+        let err = require_completed_anchor(5, 5, SpendClassification::ValidFirstSpend).unwrap_err();
         assert!(matches!(err, AttestError::ProvingFailed(_)));
         assert!(
             err.message().contains("size_final") || err.message().contains("completed"),
             "pos ≥ size_final must fail: {}",
             err.message()
         );
-        let err =
-            require_completed_anchor(0, 0, SpendClassification::ValidFirstSpend).unwrap_err();
+        let err = require_completed_anchor(0, 0, SpendClassification::ValidFirstSpend).unwrap_err();
         assert!(matches!(err, AttestError::ProvingFailed(_)));
         assert!(
             err.message().contains("size_final") || err.message().contains("completed"),
             "empty size_final must refuse any pos: {}",
             err.message()
         );
-        let err =
-            require_completed_anchor(9, 3, SpendClassification::ValidFirstSpend).unwrap_err();
+        let err = require_completed_anchor(9, 3, SpendClassification::ValidFirstSpend).unwrap_err();
         assert!(matches!(err, AttestError::ProvingFailed(_)));
     }
 
@@ -1678,10 +1668,7 @@ mod tests {
             Some(hist)
         );
         // Missing historical at non-tip → None (edge, no tip-hash guess).
-        assert_eq!(
-            block_hash_for_anchor_height(100, 105, tip_hash, None),
-            None
-        );
+        assert_eq!(block_hash_for_anchor_height(100, 105, tip_hash, None), None);
         // All-zero tip hash refused.
         assert_eq!(
             block_hash_for_anchor_height(105, 105, [0u8; 32], None),
@@ -1748,8 +1735,8 @@ mod tests {
         [u8; 32],
         [u8; 32],
     ) {
-        use shared::spec_v1::{AccountState, ChainPosition, CoinHistTree, PublishedNullifier};
         use sha2::{Digest, Sha256};
+        use shared::spec_v1::{AccountState, ChainPosition, CoinHistTree, PublishedNullifier};
         use std::collections::{BTreeMap, BTreeSet};
         use zkcoins_prover::prover_bridge::{NavOpening, NullifierOpening};
         use zkcoins_prover::state_engine::{AccountRecord, OpSecret, ScannedNullifier};
@@ -1800,15 +1787,9 @@ mod tests {
                 let mut balances = BTreeMap::new();
                 balances.insert(asset_id, 7u128);
                 let coinhist = CoinHistTree::new();
-                let state = AccountState::new(
-                    owner,
-                    host::ZERO_HASH,
-                    balances,
-                    pk,
-                    1,
-                    coinhist.root(),
-                )
-                .expect("AccountState");
+                let state =
+                    AccountState::new(owner, host::ZERO_HASH, balances, pk, 1, coinhist.root())
+                        .expect("AccountState");
                 // Real fixture op_secret (A/4'); nav_rand of the stored opening
                 // is derived from it so the operational bundle is consistent.
                 let op_secret =
@@ -1836,7 +1817,9 @@ mod tests {
                     }),
                     last_nullifier_pos: Some(0),
                 };
-                engine.insert_account(owner, record).expect("insert account");
+                engine
+                    .insert_account(owner, record)
+                    .expect("insert account");
                 // Advance tip well past the fold so size_final covers pos 0
                 // (FINALITY_CONFIRMATIONS = 6 → tip ≥ fold_height + 5).
                 engine.set_tip_height(tip_height);
@@ -1879,7 +1862,14 @@ mod tests {
         .await
         .expect("insert block_log at fold height");
 
-        (scope, adapter, owner, asset_id, [0x31u8; 32], inclusion_hash)
+        (
+            scope,
+            adapter,
+            owner,
+            asset_id,
+            [0x31u8; 32],
+            inclusion_hash,
+        )
     }
 
     /// Defect 1: a genuinely final anchor (tip well beyond fold height)
@@ -1909,10 +1899,13 @@ mod tests {
         assert_eq!(materials.nullifier_height, fold_height);
         assert_eq!(materials.nullifier_pos, 0);
 
-        let (txid, block_hash) =
-            resolve_anchor_locator(&adapter, &materials.nullifier.public_key, materials.nullifier_height)
-                .await
-                .expect("locator resolve");
+        let (txid, block_hash) = resolve_anchor_locator(
+            &adapter,
+            &materials.nullifier.public_key,
+            materials.nullifier_height,
+        )
+        .await
+        .expect("locator resolve");
         assert_eq!(txid, Some(reveal_txid), "txid from pending.reveal_txid");
         assert_eq!(
             block_hash,
@@ -1952,10 +1945,7 @@ mod tests {
 
         let err = collect_materials(&adapter, &owner, &asset_id, None)
             .expect_err("not-yet-final first occurrence must fail via production gate");
-        assert!(
-            matches!(err, AttestError::ProvingFailed(_)),
-            "got {err:?}"
-        );
+        assert!(matches!(err, AttestError::ProvingFailed(_)), "got {err:?}");
         assert!(
             err.message().contains("size_final") || err.message().contains("completed"),
             "production gate message: {}",

@@ -548,8 +548,7 @@ mod tests {
         assert_eq!(spk.len(), 34);
         assert_eq!(spk[0], 0x51);
         assert_eq!(spk[1], 0x20);
-        let output_key =
-            bitcoin::XOnlyPublicKey::from_slice(&spk[2..34]).expect("p2tr x-only key");
+        let output_key = bitcoin::XOnlyPublicKey::from_slice(&spk[2..34]).expect("p2tr x-only key");
         assert!(control.verify_taproot_commitment(
             &Secp256k1::verification_only(),
             output_key,

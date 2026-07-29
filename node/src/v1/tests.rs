@@ -15,13 +15,10 @@ use zkcoins_prover::state_engine::{
 };
 
 use super::db_v1::{self, EngineSnapshot};
-use super::mode::{
-    network_tag_for, resolve_v1_shadow_mode, validate_v1_boot_pins, V1ShadowMode,
-};
+use super::mode::{network_tag_for, resolve_v1_shadow_mode, validate_v1_boot_pins, V1ShadowMode};
 use super::separation::{
-    claim_stack_scan_mode, enforce_stack_scan_mode,
-    load_stack_scan_mode, set_process_stack_mode, ScanStackMode, STACK_CAPABILITY_REFUSAL,
-    STACK_SEPARATION_REFUSAL,
+    claim_stack_scan_mode, enforce_stack_scan_mode, load_stack_scan_mode, set_process_stack_mode,
+    ScanStackMode, STACK_CAPABILITY_REFUSAL, STACK_SEPARATION_REFUSAL,
 };
 use super::EngineAdapter;
 use crate::test_db::setup_pool;
@@ -219,8 +216,7 @@ async fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
     let (_, _, current_pubkey) =
         normalized_key(deterministic_secret(b"zkCoins/v1/req10/restore/pk0"));
     let (_, _, next_pubkey) = normalized_key(deterministic_secret(b"zkCoins/v1/req10/restore/pk1"));
-    let op_secret =
-        OpSecret::new(Sha256::digest(b"zkCoins/v1/req10/restore/op_secret").into());
+    let op_secret = OpSecret::new(Sha256::digest(b"zkCoins/v1/req10/restore/op_secret").into());
     let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
 
     // --- Live node issues an opening (genesis mint, entry send_counter = 0) ---
@@ -270,10 +266,8 @@ async fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
         coin_id,
         TrackedCoin {
             coin: minted.clone(),
-            creating_prev_ash: host::account_state_hash(
-                &pending.witness_wip.prev_account_state,
-            )
-            .expect("prev ash"),
+            creating_prev_ash: host::account_state_hash(&pending.witness_wip.prev_account_state)
+                .expect("prev ash"),
             coin_index: 0,
         },
     );
@@ -623,7 +617,7 @@ async fn tip_hash_survives_persist_reload() {
 use super::scan::{
     apply_canonical_survivors, first_boot_requires_full_replace, fold_survivors_into_engine,
     members_to_published, observation_tip_still_live, reconcile_persisted_tip, sort_canonical,
-    MAX_RECOVERABLE_REORG_DEPTH, PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome,
+    PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome, MAX_RECOVERABLE_REORG_DEPTH,
 };
 use super::separation::{
     claim_process_stack_from_shadow_mode, ensure_legacy_publisher_allowed,
@@ -655,10 +649,7 @@ fn mock_chain(len: usize, seed: u8) -> Vec<[u8; 32]> {
         .collect()
 }
 
-fn resolve_from_chain(
-    chain: &[[u8; 32]],
-    hash: [u8; 32],
-) -> anyhow::Result<Option<ResolvedBlock>> {
+fn resolve_from_chain(chain: &[[u8; 32]], hash: [u8; 32]) -> anyhow::Result<Option<ResolvedBlock>> {
     match chain.iter().position(|h| *h == hash) {
         None => Ok(None),
         Some(height) => {
@@ -1000,13 +991,8 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
         .await
         .expect("adapter");
-    let fork_survivors = members_to_published(
-        10,
-        0,
-        0,
-        &[(pk(1), r_val(1)), (pk(2), r_val(2))],
-    )
-    .expect("old fork members");
+    let fork_survivors = members_to_published(10, 0, 0, &[(pk(1), r_val(1)), (pk(2), r_val(2))])
+        .expect("old fork members");
     let mut orphaned = members_to_published(11, 0, 0, &[(pk(3), r_val(3))]).expect("orphan");
     let mut old_stream = fork_survivors.clone();
     old_stream.append(&mut orphaned);
@@ -1031,8 +1017,7 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     let cont_stats = fold_survivors_into_engine(&mut continuous_engine, &new_stream)
         .expect("continuous sequential fold");
     assert_eq!(cont_stats.appended, 3);
-    let continuous_root =
-        host::digest_to_bytes(&continuous_engine.nflog().nav().root());
+    let continuous_root = host::digest_to_bytes(&continuous_engine.nflog().nav().root());
     assert_eq!(continuous_engine.nflog().nav().size, 3);
     assert!(matches!(
         continuous_engine.nflog().lookup(pk(3)),
@@ -1042,20 +1027,17 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
         continuous_engine.nflog().lookup(pk(4)),
         LookupResult::Present { .. }
     ));
-    assert_ne!(continuous_root, old_root, "reorg must change the NfLog root");
+    assert_ne!(
+        continuous_root, old_root,
+        "reorg must change the NfLog root"
+    );
 
     // --- Restart path: reconciling the persisted tip sees a shallow reorg ---
     // Observation = new (scan) tip; classify against its immutable ancestry.
     let recon = expect_ready(
-        reconcile_persisted_tip(
-            11,
-            old_tip_hash,
-            0,
-            11,
-            new_tip_hash,
-            11,
-            |hash| resolve_from_chains(&[&old_chain, &new_chain], hash),
-        )
+        reconcile_persisted_tip(11, old_tip_hash, 0, 11, new_tip_hash, 11, |hash| {
+            resolve_from_chains(&[&old_chain, &new_chain], hash)
+        })
         .expect("shallow recon"),
     );
     match recon {
@@ -1098,15 +1080,9 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
 
     // Still-canonical tip: forward path is selected (no full replace).
     let recon_ok = expect_ready(
-        reconcile_persisted_tip(
-            11,
-            new_tip_hash,
-            0,
-            11,
-            new_tip_hash,
-            11,
-            |hash| resolve_from_chain(&new_chain, hash),
-        )
+        reconcile_persisted_tip(11, new_tip_hash, 0, 11, new_tip_hash, 11, |hash| {
+            resolve_from_chain(&new_chain, hash)
+        })
         .expect("still canonical"),
     );
     assert!(matches!(
@@ -1116,21 +1092,9 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     assert!(!first_boot_requires_full_replace(&recon_ok));
 
     // Ambiguous tip (height>0, zero hash) refuses.
-    let err = reconcile_persisted_tip(
-        5,
-        [0u8; 32],
-        0,
-        5,
-        [1u8; 32],
-        5,
-        |_| Ok(None),
-    )
-    .expect_err("zero hash with height must refuse");
-    assert!(
-        format!("{err:#}").contains("all-zero"),
-        "got: {err:#}"
-    );
-
+    let err = reconcile_persisted_tip(5, [0u8; 32], 0, 5, [1u8; 32], 5, |_| Ok(None))
+        .expect_err("zero hash with height must refuse");
+    assert!(format!("{err:#}").contains("all-zero"), "got: {err:#}");
 }
 
 /// Defect 1: offline reorg deeper than the recoverable limit (§3.9 ≥6)
@@ -1168,15 +1132,9 @@ fn offline_reorg_deeper_than_recoverable_limit_refuses() {
     }
     let old_tip = old_chain[20];
     let live_tip = live_chain[20];
-    let err = reconcile_persisted_tip(
-        20,
-        old_tip,
-        0,
-        20,
-        live_tip,
-        20,
-        |hash| resolve_from_chains(&[&old_chain, &live_chain], hash),
-    )
+    let err = reconcile_persisted_tip(20, old_tip, 0, 20, live_tip, 20, |hash| {
+        resolve_from_chains(&[&old_chain, &live_chain], hash)
+    })
     .expect_err("depth-6 offline reorg must refuse");
     let msg = format!("{err:#}");
     assert!(
@@ -1288,7 +1246,6 @@ async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v1_claim() {
 
 /// Defect 3: both unguarded-looking broadcast entry points refuse under a
 /// v1.1 process claim (structural guard at the Esplora choke point).
-
 
 /// Crate-internal `with_engine_mut` refuses without a v1.1 process claim.
 /// (The method is sealed from downstream crates; this covers the runtime gate.)
@@ -1445,15 +1402,9 @@ fn aba_race_caught_by_immutable_scan_tip_ancestry() {
     // on that ancestry → ShallowReorg. Mutable live tip may be B or A
     // mid-recon; classification does not consult it.
     let bound_to_scan_a = expect_ready(
-        reconcile_persisted_tip(
-            10,
-            persisted_b,
-            0,
-            10,
-            scan_tip_a,
-            10,
-            |hash| resolve_from_chains(&[&chain_a, &chain_b], hash),
-        )
+        reconcile_persisted_tip(10, persisted_b, 0, 10, scan_tip_a, 10, |hash| {
+            resolve_from_chains(&[&chain_a, &chain_b], hash)
+        })
         .expect("recon bound to scan tip A"),
     );
     assert!(
@@ -1472,15 +1423,9 @@ fn aba_race_caught_by_immutable_scan_tip_ancestry() {
     // if the scan had actually captured A). Boot never does this: it always
     // passes the scan tip as the observation.
     let free_standing_b = expect_ready(
-        reconcile_persisted_tip(
-            10,
-            persisted_b,
-            0,
-            10,
-            persisted_b,
-            10,
-            |hash| resolve_from_chain(&chain_b, hash),
-        )
+        reconcile_persisted_tip(10, persisted_b, 0, 10, persisted_b, 10, |hash| {
+            resolve_from_chain(&chain_b, hash)
+        })
         .expect("recon observation=B"),
     );
     assert!(
@@ -1551,9 +1496,7 @@ async fn reset_proof_dependent_state_tx_refuses_without_legacy_marker() {
         .expect_err("reset under v1 marker must refuse");
     let msg2 = err2.to_string();
     assert!(
-        msg2.contains(STACK_CAPABILITY_REFUSAL)
-            || msg2.contains("v1")
-            || msg2.contains("legacy"),
+        msg2.contains(STACK_CAPABILITY_REFUSAL) || msg2.contains("v1") || msg2.contains("legacy"),
         "got: {msg2}"
     );
 }
@@ -1664,15 +1607,9 @@ fn restored_node_behind_persisted_height_is_retryable_not_fatal() {
     // resolver still lacked the headers, unknown would be fatal — the
     // height gate is what makes restored nodes safe. Catch-up works:
     let caught_up = expect_ready(
-        reconcile_persisted_tip(
-            10,
-            tip_hash,
-            0,
-            10,
-            tip_hash,
-            10,
-            |hash| resolve_from_chain(&chain, hash),
-        )
+        reconcile_persisted_tip(10, tip_hash, 0, 10, tip_hash, 10, |hash| {
+            resolve_from_chain(&chain, hash)
+        })
         .expect("catch-up recon"),
     );
     assert!(matches!(
@@ -1699,13 +1636,9 @@ fn v1_scan_fold_canonical_order_first_occurrence_wins() {
 
     // Synthetic multi-member inscription at height 50, tx 3, vin 1:
     // members (A, B, C) then a later tx that republishes A with different R.
-    let mut members = members_to_published(
-        50,
-        3,
-        1,
-        &[(pk_a, r_a_first), (pk_b, r_b), (pk_c, r_c)],
-    )
-    .expect("members");
+    let mut members =
+        members_to_published(50, 3, 1, &[(pk_a, r_a_first), (pk_b, r_b), (pk_c, r_c)])
+            .expect("members");
     // Shuffle so the fold path must sort by ChainPosition, not input order.
     members.swap(0, 2); // C, B, A by member_index after swap of ends
     assert_eq!(members[0].pk, pk_c);

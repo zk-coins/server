@@ -87,9 +87,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use serde::Deserialize;
-use shared::spec_v1::{
-    digest_to_bytes, hash_proof_data, serialize_proof_data, ProofData,
-};
+use shared::spec_v1::{digest_to_bytes, hash_proof_data, serialize_proof_data, ProofData};
 use uuid::Uuid;
 use zkcoins_program::circuit::compliance::Network;
 use zkcoins_prover::half_agg::{comm_verify, verify_single};
@@ -419,11 +417,9 @@ pub(crate) fn ensure_completion_ready(entry: &PendingSignEntry) -> Result<(), St
                         ));
                     }
                     None => {
-                        return Err(
-                            "completion readiness: staged publisher_pubkey present but \
+                        return Err("completion readiness: staged publisher_pubkey present but \
                              completion_result omits publisher_pubkey"
-                                .to_string(),
-                        );
+                            .to_string());
                     }
                 }
             }
@@ -768,17 +764,15 @@ pub fn durable_finalisation_with_signature(
     request_body: &serde_json::Value,
     signature: &TransitionSignature,
 ) -> Result<serde_json::Value, TransitionSignatureError> {
-    let mut entry = rehydrate_pending_sign(request_body)?
-        .ok_or_else(|| {
-            TransitionSignatureError::new(
-                SignatureCheck::PendingEnvelope,
-                "no durable finalisation capability on job row to attach signature",
-            )
-        })?;
-    entry.install_signature(signature.clone())?;
-    let persist = DurableFinalisationPersist::from_entry(&entry).map_err(|e| {
-        TransitionSignatureError::new(SignatureCheck::PendingEnvelope, e)
+    let mut entry = rehydrate_pending_sign(request_body)?.ok_or_else(|| {
+        TransitionSignatureError::new(
+            SignatureCheck::PendingEnvelope,
+            "no durable finalisation capability on job row to attach signature",
+        )
     })?;
+    entry.install_signature(signature.clone())?;
+    let persist = DurableFinalisationPersist::from_entry(&entry)
+        .map_err(|e| TransitionSignatureError::new(SignatureCheck::PendingEnvelope, e))?;
     serde_json::to_value(persist).map_err(|e| {
         TransitionSignatureError::new(
             SignatureCheck::PendingEnvelope,
@@ -868,12 +862,10 @@ impl FinaliseOutcome {
                 .collect::<Vec<_>>(),
         });
         if let Some(pk) = &self.publisher_pubkey {
-            obj.as_object_mut()
-                .expect("object")
-                .insert(
-                    "publisher_pubkey".to_string(),
-                    serde_json::Value::String(hex_lower(pk)),
-                );
+            obj.as_object_mut().expect("object").insert(
+                "publisher_pubkey".to_string(),
+                serde_json::Value::String(hex_lower(pk)),
+            );
         }
         obj
     }
@@ -932,9 +924,7 @@ pub fn finalise_accepted_prove_outside_lock(
     let output_coin_ids = FinaliseOutcome::output_coin_ids_from_pending(&pending);
     let bridge = adapter.bridge();
     let proved = zkcoins_prover::state_engine::StateEngine::prove_pending_transition_detached(
-        &bridge,
-        pending,
-        signature,
+        &bridge, pending, signature,
     )
     .map_err(|e| format!("prove_pending_transition_detached failed: {e:#}"))?;
     let applied = adapter
@@ -1064,9 +1054,7 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     }
     if signature.signature_r() != r {
         let _ = adapter.restore_live(pre);
-        return Err(
-            "v1.1 finalise: signature R does not match applied nullifier R".to_string(),
-        );
+        return Err("v1.1 finalise: signature R does not match applied nullifier R".to_string());
     }
 
     let tip_hash = adapter.tip_hash();
@@ -1209,10 +1197,7 @@ pub(crate) fn publisher_pubkey_from_request_body(
     }
     let bytes = hex::decode(raw).map_err(|e| format!("publisher_pubkey hex decode failed: {e}"))?;
     let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-        format!(
-            "publisher_pubkey must decode to 32 bytes; got {}",
-            v.len()
-        )
+        format!("publisher_pubkey must decode to 32 bytes; got {}", v.len())
     })?;
     Ok(Some(arr))
 }
@@ -1271,9 +1256,9 @@ pub(crate) fn select_awaiting_signature_result(
                  so the job surfaces the §7.5 ProofData identity the wallet must sign",
             )),
         },
-        Some(ScanStackMode::Legacy) | None => {
-            Ok(legacy_awaiting_signature_result_json(legacy_ash, legacy_ocr))
-        }
+        Some(ScanStackMode::Legacy) | None => Ok(legacy_awaiting_signature_result_json(
+            legacy_ash, legacy_ocr,
+        )),
     }
 }
 
@@ -1296,9 +1281,9 @@ pub(crate) fn sign_rejection(err: &TransitionSignatureError) -> (u16, &'static s
     match err.check {
         SignatureCheck::Encoding => (400, "malformed_request"),
         SignatureCheck::S2cOpening => (409, "stale_message"),
-        SignatureCheck::Bip340
-        | SignatureCheck::PkMatch
-        | SignatureCheck::PendingEnvelope => (409, "invalid_signature"),
+        SignatureCheck::Bip340 | SignatureCheck::PkMatch | SignatureCheck::PendingEnvelope => {
+            (409, "invalid_signature")
+        }
         // Route inactive under this process claim — not a phase mismatch.
         SignatureCheck::ShadowFlag => (404, "feature_disabled"),
         // Residual legacy Commitment under a v1.1 claim: the job is on the
@@ -1364,7 +1349,10 @@ fn is_closed_outward_error_code(code: &str) -> bool {
 /// into the closed enumeration: default `proving_failed` for failed jobs,
 /// `internal_error` for cancelled / unclassifiable. Empty stored error still
 /// yields a body so the poll envelope never omits `error` on failed/cancelled.
-pub(crate) fn decode_job_error(raw: Option<&str>, status: crate::job_store::JobStatus) -> serde_json::Value {
+pub(crate) fn decode_job_error(
+    raw: Option<&str>,
+    status: crate::job_store::JobStatus,
+) -> serde_json::Value {
     if let Some(s) = raw {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
             if let Some(code) = v.get("error").and_then(|e| e.as_str()) {
@@ -1372,12 +1360,10 @@ pub(crate) fn decode_job_error(raw: Option<&str>, status: crate::job_store::JobS
                     // Ensure message is present.
                     if v.get("message").is_none() {
                         let mut obj = v;
-                        obj.as_object_mut()
-                            .expect("object")
-                            .insert(
-                                "message".to_string(),
-                                serde_json::Value::String(String::new()),
-                            );
+                        obj.as_object_mut().expect("object").insert(
+                            "message".to_string(),
+                            serde_json::Value::String(String::new()),
+                        );
                         return obj;
                     }
                     return v;
@@ -1647,19 +1633,18 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 pub mod test_fixtures {
     use super::*;
+    use sha2::{Digest, Sha256};
     use shared::spec_v1::{
         account_state_hash, address, asset_id_v1, coin_identifier, coinhist_empty_root,
         coinhist_root_after_first_insert, digest_to_bytes, hash_proof_data, merkle_root, name_hash,
         nav_commitment, nflog_empty, nflog_root, nk_commit, npk_commit, serialize_proof_data,
         AccountState, Address, CoinHistState, Nav, ProofData, TreeKind, GENESIS_TAG, ZERO_HASH,
     };
-    use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use zkcoins_prover::prover_bridge::{NavOpening, TransitionMode, TransitionWitness};
     use zkcoins_prover::state_engine::OpSecret;
 
-    const V2EXT_PK0: &str =
-        "7c9cdde9b8cb1e33a48a5c2b6ab1fa6fd753fa1762f56c0b3e8169e4f2d54630";
+    const V2EXT_PK0: &str = "7c9cdde9b8cb1e33a48a5c2b6ab1fa6fd753fa1762f56c0b3e8169e4f2d54630";
     const V5_R_PRIME_MAINNET: &str =
         "fafd5229e657311d934989a4bc8bdfc8f033b4d640d2eb27b9fdda316f5c9601";
     const V5_SIG_MAINNET: &str = "7db327f8ff4bb148f051a038d370c4213149fe3affeff5b7fb7e9f8e3cc4438532168b5fca622ba2fad6d72ed201e71cef1003df880d345ddbe2b89f1ce3d4e5";
@@ -1795,30 +1780,25 @@ pub mod test_fixtures {
             s2c_nonce: hex32(V5_R_PRIME_MAINNET),
         };
         let pending = pending_for(pk, proof_data_at_0());
-        (
-            PendingSignEntry::new(pending, Network::Mainnet),
-            submission,
-        )
+        (PendingSignEntry::new(pending, Network::Mainnet), submission)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use shared::spec_v1::{
         account_state_hash, address, asset_id_v1, coin_identifier, coinhist_empty_root,
         coinhist_root_after_first_insert, digest_to_bytes, hash_proof_data, merkle_root, name_hash,
         nav_commitment, nflog_empty, nflog_root, nk_commit, npk_commit, serialize_proof_data,
         AccountState, Address, CoinHistState, Nav, ProofData, TreeKind, GENESIS_TAG, ZERO_HASH,
     };
-    use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use zkcoins_prover::prover_bridge::{NavOpening, TransitionMode, TransitionWitness};
     use zkcoins_prover::state_engine::{OpSecret, PendingTransition};
 
-    use crate::v1::separation::{
-        set_process_stack_mode, ScanStackMode,
-    };
+    use crate::v1::separation::{set_process_stack_mode, ScanStackMode};
 
     // ── V.5 pins from the reference implementation fixture ─────────────────
     // Source: script-plonky2/tests/generated_sig_agg_vectors.txt
@@ -1827,10 +1807,8 @@ mod tests {
     // Not claimed as already normative in the published spec tree.
     // Read-only conformance anchors. Do not regenerate here.
 
-    const V2EXT_PK0: &str =
-        "7c9cdde9b8cb1e33a48a5c2b6ab1fa6fd753fa1762f56c0b3e8169e4f2d54630";
-    const H_PROOF_DATA_0: &str =
-        "db8c60533ba19eba14958f6ce44fd8df2e784d17dac28d8532e66fa938308de4";
+    const V2EXT_PK0: &str = "7c9cdde9b8cb1e33a48a5c2b6ab1fa6fd753fa1762f56c0b3e8169e4f2d54630";
+    const H_PROOF_DATA_0: &str = "db8c60533ba19eba14958f6ce44fd8df2e784d17dac28d8532e66fa938308de4";
 
     const V5_R_PRIME_MAINNET: &str =
         "fafd5229e657311d934989a4bc8bdfc8f033b4d640d2eb27b9fdda316f5c9601";
@@ -2033,9 +2011,7 @@ mod tests {
                 &submission,
             )
             .unwrap_or_else(|e| {
-                panic!(
-                    "reference V.5 signature fixture must verify under {network:?}: {e}"
-                );
+                panic!("reference V.5 signature fixture must verify under {network:?}: {e}");
             });
             assert_eq!(sig.pk_i, pk);
             assert_eq!(sig.signature, submission.signature);
@@ -2301,8 +2277,8 @@ mod tests {
         assert_eq!(parsed, submission);
 
         // Uppercase rejected (no silent case-fold).
-        let err = WalletSignSubmission::from_hex(&sig_hex.to_uppercase(), &r_hex)
-            .expect_err("uppercase");
+        let err =
+            WalletSignSubmission::from_hex(&sig_hex.to_uppercase(), &r_hex).expect_err("uppercase");
         assert_eq!(err.check, SignatureCheck::Encoding);
 
         // Wrong length rejected.
@@ -2322,8 +2298,8 @@ mod tests {
             .expect_err("0x prefix on s2c_nonce");
         assert_eq!(err.check, SignatureCheck::Encoding, "got: {err}");
 
-        let err = WalletSignSubmission::from_hex(&format!("0X{sig_hex}"), &r_hex)
-            .expect_err("0X prefix");
+        let err =
+            WalletSignSubmission::from_hex(&format!("0X{sig_hex}"), &r_hex).expect_err("0X prefix");
         assert_eq!(err.check, SignatureCheck::Encoding, "got: {err}");
 
         // Whitespace / mixed content rejected.
@@ -2358,8 +2334,12 @@ mod tests {
         let (_, pk) = v5_case(Network::Mainnet);
         let pending = pending_for(pk, pd);
         let entry = PendingSignEntry::new(pending, Network::Mainnet);
-        let result = select_awaiting_signature_result("aa".repeat(32).as_str(), "bb".repeat(32).as_str(), Some(&entry))
-            .expect("v1 with staged pending must advertise");
+        let result = select_awaiting_signature_result(
+            "aa".repeat(32).as_str(),
+            "bb".repeat(32).as_str(),
+            Some(&entry),
+        )
+        .expect("v1 with staged pending must advertise");
         assert!(
             result.get("account_state_hash").is_none(),
             "v1.1 job must not advertise legacy ash; got {result}"
@@ -2392,7 +2372,6 @@ mod tests {
         let err = select_awaiting_signature_result("aa", "bb", None)
             .expect_err("must not fall back to ash/ocr under v1.1");
         assert_eq!(err.check, SignatureCheck::LegacyCommitment);
-
     }
 
     #[test]
@@ -2436,15 +2415,9 @@ mod tests {
         let (_, pk) = v5_case(Network::Mainnet);
         // Build a pending whose prev_account_state.send_counter is 7.
         let mut pending = pending_for(pk, pd);
-        pending.witness_wip.prev_account_state = AccountState::new(
-            pending.owner,
-            ZERO_HASH,
-            BTreeMap::new(),
-            pk,
-            7,
-            ZERO_HASH,
-        )
-        .expect("account with send_counter=7");
+        pending.witness_wip.prev_account_state =
+            AccountState::new(pending.owner, ZERO_HASH, BTreeMap::new(), pk, 7, ZERO_HASH)
+                .expect("account with send_counter=7");
         let entry = PendingSignEntry::new(pending, Network::Mainnet);
         assert_eq!(entry.send_counter(), 7);
         let advertised = awaiting_signature_result_json(&entry);
@@ -2549,13 +2522,11 @@ mod tests {
         let mut persist = DurableFinalisationPersist::from_entry(&entry).expect("encode");
         persist.completion_result = Some(serde_json::json!({ "new_account_state_hash": "00" }));
         // completion_status deliberately omitted → incomplete pair.
-        let err = persist.into_entry().expect_err("split completion must refuse");
+        let err = persist
+            .into_entry()
+            .expect_err("split completion must refuse");
         assert_eq!(err.check, SignatureCheck::PendingEnvelope);
-        assert!(
-            err.message.contains("incomplete"),
-            "err={}",
-            err.message
-        );
+        assert!(err.message.contains("incomplete"), "err={}", err.message);
     }
 
     #[test]
@@ -2566,7 +2537,8 @@ mod tests {
         let err = rehydrate_pending_sign(&body).expect_err("legacy key must fail closed");
         assert_eq!(err.check, SignatureCheck::PendingEnvelope);
         assert!(
-            err.message.contains("legacy pending_sign") || err.message.contains("verification-grade"),
+            err.message.contains("legacy pending_sign")
+                || err.message.contains("verification-grade"),
             "err={}",
             err.message
         );

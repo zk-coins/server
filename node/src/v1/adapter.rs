@@ -198,10 +198,7 @@ impl EngineAdapter {
     ///
     /// **Crate-private mutation sink.** External crates cannot assemble
     /// engine mutations; use receive / scan orchestration.
-    pub(crate) fn with_engine_mut<R>(
-        &self,
-        f: impl FnOnce(&mut StateEngine) -> R,
-    ) -> Result<R> {
+    pub(crate) fn with_engine_mut<R>(&self, f: impl FnOnce(&mut StateEngine) -> R) -> Result<R> {
         require_v1_process_for_nflog_write()
             .context("EngineAdapter::with_engine_mut: stack claim required")?;
         let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");

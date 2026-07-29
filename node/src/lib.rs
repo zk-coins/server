@@ -251,7 +251,9 @@ where
         "Network config: {} ({}) ws={}",
         cfg.network_name,
         cfg.url,
-        cfg.ws_url.as_deref().expect("ESPLORA_WS_URL was required above"),
+        cfg.ws_url
+            .as_deref()
+            .expect("ESPLORA_WS_URL was required above"),
     );
     cfg
 }
@@ -337,4 +339,3 @@ mod tests;
 // to the test layer; module docs in `test_db.rs` explain the design.
 #[cfg(test)]
 pub(crate) mod test_db;
-

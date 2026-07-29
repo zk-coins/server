@@ -134,9 +134,9 @@ pub(crate) fn fold_survivors_into_engine(
             continue;
         }
 
-        match engine.append_nullifier(zkcoins_prover::state_engine::ScannedNullifier::from_survivor(
-            &nf,
-        )) {
+        match engine
+            .append_nullifier(zkcoins_prover::state_engine::ScannedNullifier::from_survivor(&nf))
+        {
             Ok(_) => {
                 stats.appended = stats
                     .appended
@@ -201,10 +201,7 @@ pub(crate) fn first_occurrence_nflog_pairs(
                 v.insert(nf.r);
                 nflog_pairs.push((
                     nf.chain_pos,
-                    shared::spec_v1::NfLogEntry {
-                        pk: nf.pk,
-                        r: nf.r,
-                    },
+                    shared::spec_v1::NfLogEntry { pk: nf.pk, r: nf.r },
                 ));
                 stats.appended = stats
                     .appended
@@ -381,10 +378,7 @@ pub enum PersistedTipReconciliation {
     Fresh,
     /// Persisted tip is still the live hash at that height. Seed folded
     /// keys from the engine and forward-append only new survivors.
-    StillCanonical {
-        tip_height: u64,
-        tip_hash: [u8; 32],
-    },
+    StillCanonical { tip_height: u64, tip_hash: [u8; 32] },
     /// Offline reorg within the ≤5-block recoverable window. First apply
     /// after the rescan **must** full-replace the NfLog from the survivor
     /// stream (equivalent to truncate-and-extend from the ancestor) —
@@ -413,10 +407,7 @@ pub enum TipReconcileOutcome {
     /// Caller must: leave `v1_scan` unready, leave `finality_ok` /
     /// `deep_reorg` untouched, back off, and re-run the full verification.
     /// Never assume canonical, never assume reorg.
-    RetryableIncompleteView {
-        queried_height: u64,
-        detail: String,
-    },
+    RetryableIncompleteView { queried_height: u64, detail: String },
 }
 
 /// Whether a scan tip is still the live main-chain hash at that height.
@@ -846,7 +837,6 @@ pub(crate) fn members_to_published(
     }
     Ok(out)
 }
-
 
 /// Env keys required to connect the script-plonky2 bitcoind scanner.
 /// Missing any of them fails loud under v1.1 mode — never fall back to

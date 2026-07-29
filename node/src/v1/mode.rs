@@ -324,10 +324,7 @@ mod unit_tests {
     #[test]
     fn unset_empty_and_off_disable_shadow() {
         assert_eq!(resolve_v1_shadow_mode(None).unwrap(), V1ShadowMode::Off);
-        assert_eq!(
-            resolve_v1_shadow_mode(Some("")).unwrap(),
-            V1ShadowMode::Off
-        );
+        assert_eq!(resolve_v1_shadow_mode(Some("")).unwrap(), V1ShadowMode::Off);
         assert_eq!(
             resolve_v1_shadow_mode(Some("off")).unwrap(),
             V1ShadowMode::Off
@@ -336,10 +333,7 @@ mod unit_tests {
 
     #[test]
     fn one_enables_shadow() {
-        assert_eq!(
-            resolve_v1_shadow_mode(Some("1")).unwrap(),
-            V1ShadowMode::On
-        );
+        assert_eq!(resolve_v1_shadow_mode(Some("1")).unwrap(), V1ShadowMode::On);
     }
 
     #[test]

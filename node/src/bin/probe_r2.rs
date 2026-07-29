@@ -96,9 +96,7 @@ use shared::spec_v1 as host;
 use shared::spec_v1::{
     AccountState, Address, Coin, CoinHistTree, CoinTemplate, HashDigest, Nav, ProofData, TreeKind,
 };
-use zkcoins_program::circuit::compliance::{
-    Network, MAX_RX_COINS, MAX_TX_INPUTS, MAX_TX_OUTPUTS,
-};
+use zkcoins_program::circuit::compliance::{Network, MAX_RX_COINS, MAX_TX_INPUTS, MAX_TX_OUTPUTS};
 // hash helpers are pulled in via shared::spec_v1 / host in the v1 fixtures.
 use zkcoins_prover::prover_bridge::test_signing::{
     deterministic_secret, normalized_key, sign_transition, TestSignature,
@@ -162,7 +160,8 @@ env:
   RUST_LOG             optional, log level (defaults to off here)
 
 v1 budgets come from sealed measurement samples in node::r2_budgets.
-");
+"
+    );
 }
 
 fn parse_args(argv: Vec<String>) -> Result<CliArgs, String> {
@@ -642,9 +641,7 @@ struct MeasureResult {
 }
 
 fn measure_v1(warm_calls: usize, network: Network) -> Result<MeasureResult, String> {
-    eprintln!(
-        "[probe_r2] mode=v1 — ProverBridge + prove_transition (network={network:?})"
-    );
+    eprintln!("[probe_r2] mode=v1 — ProverBridge + prove_transition (network={network:?})");
     eprintln!(
         "[probe_r2] shape MAX_TX_INPUTS={MAX_TX_INPUTS} MAX_TX_OUTPUTS={MAX_TX_OUTPUTS} \
          MAX_RX_COINS={MAX_RX_COINS}"
@@ -658,9 +655,7 @@ fn measure_v1(warm_calls: usize, network: Network) -> Result<MeasureResult, Stri
     let t = Instant::now();
     let gate_count = bridge.compliance_gate_count();
     let circuit_build_wall_ms = t.elapsed().as_millis() as i64;
-    eprintln!(
-        "[probe_r2] circuit_build_wall_ms = {circuit_build_wall_ms} (gates={gate_count})"
-    );
+    eprintln!("[probe_r2] circuit_build_wall_ms = {circuit_build_wall_ms} (gates={gate_count})");
 
     let genesis = v1_genesis_fixture(network);
 
@@ -683,7 +678,11 @@ fn measure_v1(warm_calls: usize, network: Network) -> Result<MeasureResult, Stri
 
     let mut prove_warm_wall_ms: Vec<i64> = Vec::with_capacity(warm_calls);
     for i in 0..warm_calls {
-        eprintln!("[probe_r2] warm prove_transition {} / {} ...", i + 1, warm_calls);
+        eprintln!(
+            "[probe_r2] warm prove_transition {} / {} ...",
+            i + 1,
+            warm_calls
+        );
         let t = Instant::now();
         let proved_send = bridge
             .prove_transition(&send)
@@ -731,11 +730,7 @@ fn measure_v1(warm_calls: usize, network: Network) -> Result<MeasureResult, Stri
 ///   silent fall-back to the legacy ROADMAP numbers for a partial
 ///   override (that would be the inverted false-red).
 fn resolve_run_budgets(mode: ProverMode, args: &CliArgs) -> Result<R2BudgetSet, String> {
-    match (
-        args.warm_budget_ms,
-        args.cold_budget_ms,
-        args.mem_budget_kb,
-    ) {
+    match (args.warm_budget_ms, args.cold_budget_ms, args.mem_budget_kb) {
         (Some(warm), Some(cold), Some(mem)) => Ok(R2BudgetSet {
             warm_prove_ms: warm,
             cold_start_ms: cold,
@@ -805,8 +800,18 @@ fn run() -> Result<(), String> {
     let warm_p50 = percentile_ms(&measured.prove_warm_wall_ms, 50.0);
     let warm_p90 = percentile_ms(&measured.prove_warm_wall_ms, 90.0);
     let warm_p99 = percentile_ms(&measured.prove_warm_wall_ms, 99.0);
-    let warm_min = measured.prove_warm_wall_ms.iter().min().copied().unwrap_or(0);
-    let warm_max = measured.prove_warm_wall_ms.iter().max().copied().unwrap_or(0);
+    let warm_min = measured
+        .prove_warm_wall_ms
+        .iter()
+        .min()
+        .copied()
+        .unwrap_or(0);
+    let warm_max = measured
+        .prove_warm_wall_ms
+        .iter()
+        .max()
+        .copied()
+        .unwrap_or(0);
     let warm_mean = if measured.prove_warm_wall_ms.is_empty() {
         0
     } else {

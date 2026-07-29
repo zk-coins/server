@@ -11,12 +11,12 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN;
 use zkcoins_program::hash::{digest_from_bytes, hash_concat, HashDigest, ZERO_HASH};
-use zkcoins_program::merkle::merkle_mountain_range::MerkleMountainRange;
 #[cfg(test)]
 use zkcoins_program::merkle::merkle_mountain_range::MMRProof;
-use zkcoins_program::merkle::sparse_merkle_tree::SparseMerkleTree;
+use zkcoins_program::merkle::merkle_mountain_range::MerkleMountainRange;
 #[cfg(test)]
 use zkcoins_program::merkle::sparse_merkle_tree::InclusionProof;
+use zkcoins_program::merkle::sparse_merkle_tree::SparseMerkleTree;
 
 use crate::db;
 
@@ -181,7 +181,10 @@ impl State {
     /// (Phase C: `db::insert_root_index`) read it back from `self`
     /// rather than threading a pool into this synchronous method, which
     /// would force every test caller to grow a Postgres dependency.
-    pub(crate) fn update(&mut self, commitments: &[Commitment]) -> Result<HashDigest, &'static str> {
+    pub(crate) fn update(
+        &mut self,
+        commitments: &[Commitment],
+    ) -> Result<HashDigest, &'static str> {
         // 1. Insert all commitments into the SMT
         for commitment in commitments {
             // Use the public key as the key for the tree (hashed)

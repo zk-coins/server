@@ -121,7 +121,9 @@ fn rustdoc_json(workspace: &Path, package: &str) -> PathBuf {
     // rustdoc writes `<crate_name>.json` under target/doc. Package names use
     // hyphens; crate names use underscores.
     let crate_file = package.replace('-', "_");
-    let path = workspace.join("target/doc").join(format!("{crate_file}.json"));
+    let path = workspace
+        .join("target/doc")
+        .join(format!("{crate_file}.json"));
     assert!(
         path.is_file(),
         "expected rustdoc JSON at {} after documenting {package}",
@@ -314,11 +316,13 @@ fn walk_impl(
 fn struct_field_ids(body: &Value) -> Vec<u64> {
     let kind = match body.get("kind") {
         Some(k) => k,
-        None => return body
-            .get("fields")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
-            .unwrap_or_default(),
+        None => {
+            return body
+                .get("fields")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
+                .unwrap_or_default()
+        }
     };
     if let Some(plain) = kind.get("plain") {
         return plain

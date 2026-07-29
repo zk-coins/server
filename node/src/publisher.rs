@@ -13,8 +13,8 @@ use bitcoin::{
     Transaction, TxIn, TxOut, Txid, Weight, Witness,
 };
 
-use std::str::FromStr;
 use sqlx::PgPool;
+use std::str::FromStr;
 
 use crate::db;
 use crate::esplora_bound::EsploraReadClient;
@@ -401,7 +401,6 @@ fn build_reveal_only_inner(
 
     (reveal_tx, stats)
 }
-
 
 /// Broadcast helper for a client that was already stack-checked at connect.
 async fn broadcast_raw_tx(

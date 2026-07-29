@@ -79,7 +79,10 @@ impl EsploraReadClient {
         Ok(self.inner.get_tx(txid).await?)
     }
 
-    pub async fn get_block_status(&self, block_hash: &BlockHash) -> Result<BlockStatusView, BoxError> {
+    pub async fn get_block_status(
+        &self,
+        block_hash: &BlockHash,
+    ) -> Result<BlockStatusView, BoxError> {
         let s = self.inner.get_block_status(block_hash).await?;
         Ok(BlockStatusView {
             height: s.height,
@@ -141,10 +144,7 @@ impl EsploraBroadcastClient {
 #[cfg(test)]
 mod policy_construction_tests {
     use super::*;
-    use stack_policy::{
-        set_process_stack_mode, ScanStackMode,
-        STACK_SEPARATION_REFUSAL,
-    };
+    use stack_policy::{set_process_stack_mode, ScanStackMode, STACK_SEPARATION_REFUSAL};
 
     /// A broadcast-capable client cannot be obtained under a v1.1 process
     /// claim — the policy check is inside `connect`, not a caller-side
@@ -198,14 +198,10 @@ mod policy_construction_tests {
 
         // Re-affirm does not open an unclaimed window.
         set_process_stack_mode(ScanStackMode::V1);
-        EsploraBroadcastClient::connect("http://127.0.0.1:1")
-            .expect_err("re-affirm still blocks");
+        EsploraBroadcastClient::connect("http://127.0.0.1:1").expect_err("re-affirm still blocks");
 
         // process_stack_mode still reports V1 — no public production path
         // withdrew the claim.
-        assert_eq!(
-            stack_policy::process_stack_mode(),
-            Some(ScanStackMode::V1)
-        );
+        assert_eq!(stack_policy::process_stack_mode(), Some(ScanStackMode::V1));
     }
 }

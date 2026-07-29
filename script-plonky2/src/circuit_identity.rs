@@ -118,14 +118,9 @@ mod tests {
         let built_b = [0x22u8; 32];
         let mut pin_c = built_c;
         pin_c[0] ^= 0xFF;
-        let err = require_live_digests_match_pins(
-            &built_c,
-            &built_b,
-            &pin_c,
-            &built_b,
-            Network::Regtest,
-        )
-        .expect_err("built/pin mismatch must refuse");
+        let err =
+            require_live_digests_match_pins(&built_c, &built_b, &pin_c, &built_b, Network::Regtest)
+                .expect_err("built/pin mismatch must refuse");
         assert!(
             err.contains("do not match") || err.contains("Refusing"),
             "error must name the refusal: {err}"
