@@ -1,5 +1,6 @@
 //! Generates / verifies `shared/tests/generated_poseidon_vectors.txt` from the
-//! live Poseidon/`Hc` primitives (V.4 `<REGEN>` table) and the V.12 NameConsent
+//! live Poseidon/`Hc` primitives (V.4 `<REGEN>` table), the V.10 note-encryption
+//! envelope preimages (`coin_bytes` / `coin_plain`), and the V.12 NameConsent
 //! framing vector.
 //!
 //! Values are **computed**, never hand-copied.
@@ -14,6 +15,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 use shared::spec_v1::{
@@ -21,8 +24,8 @@ use shared::spec_v1::{
     coinhist_root_after_first_insert, detect_tag, digest_to_bytes, hash_proof_data, merkle_root,
     name_consent_preimage, name_hash, name_message, nav_commitment, network_id_mainnet,
     network_id_regtest, network_id_testnet, nflog_empty, nflog_root, nk_commit, npk_commit,
-    nullifier, serialize_proof_data, terms_hash_v1, terms_hash_v2, AccountState, Address,
-    CoinHistState, ProofData, TreeKind, GENESIS_TAG,
+    nullifier, serialize_coin, serialize_proof_data, terms_hash_v1, terms_hash_v2, AccountState,
+    Address, Coin, CoinHistState, ProofData, TreeKind, GENESIS_TAG,
 };
 
 fn sha256_label(label: &str) -> [u8; 32] {
@@ -137,9 +140,9 @@ fn generate_poseidon_vectors_file() {
         "0xef56b9ac8dc7a119c9d2679164b91f341d785e9649470158c2661cfd4f71b61b",
         "V.4 anchor pin: ash_empty regressed"
     );
-    // 8
-    let coin_identifier_0 =
-        coin_identifier(ash_empty, &addr_bytes, asset_id, 1_000_000_000u128, 0u32);
+    // 8 — V.4 `coin.identifier@0`: amount is the V.3 supply (1_000_000_000).
+    let amount_0 = 1_000_000_000u128;
+    let coin_identifier_0 = coin_identifier(ash_empty, &addr_bytes, asset_id, amount_0, 0u32);
     // 9
     let coin_history_root_0 = coinhist_root_after_first_insert(
         &digest_to_bytes(&coin_identifier_0),
@@ -147,7 +150,7 @@ fn generate_poseidon_vectors_file() {
     );
     // 10 — account after first transition
     let mut balances = BTreeMap::new();
-    balances.insert(digest_to_bytes(&asset_id), 1_000_000_000u128);
+    balances.insert(digest_to_bytes(&asset_id), amount_0);
     let ash_0 = account_state_hash(
         &AccountState::new(
             addr,
@@ -245,6 +248,29 @@ fn generate_poseidon_vectors_file() {
     println!("name_consent_preimage = {}", hex_bytes(&v12_preimage));
     println!("name_message = {}", hex32(&v12_name_message));
 
+    // 23 — V.10 envelope preimages: fixture Coin is exactly V.4 coin.identifier@0
+    //      (same identifier, recipient=address, amount, asset_id). serialize_coin
+    //      is the sole layout source (32 ‖ 32 ‖ 16-be ‖ 32 = 112). coin_plain is
+    //      the NIP44Binary UTF-8 plaintext under K_tx (label "coin").
+    let fixture_coin = Coin {
+        identifier: coin_identifier_0,
+        recipient: addr,
+        amount: amount_0,
+        asset_id,
+    };
+    let coin_bytes = serialize_coin(&fixture_coin);
+    assert_eq!(
+        coin_bytes.len(),
+        112,
+        "serialize(Coin) must be 112 bytes (identifier32 ‖ recipient32 ‖ amount16 ‖ asset_id32)"
+    );
+    let coin_plain = format!(
+        "zkcoins-bin-v1:coin:{}",
+        URL_SAFE_NO_PAD.encode(coin_bytes)
+    );
+    println!("coin_bytes = {}", hex_bytes(&coin_bytes));
+    println!("coin_plain = {coin_plain}");
+
     let mut lines = Vec::new();
     lines.push(format!("nflog_empty = {}", hex_digest(&nflog_empty_v)));
     lines.push(format!(
@@ -301,6 +327,8 @@ fn generate_poseidon_vectors_file() {
         hex_bytes(&v12_preimage)
     ));
     lines.push(format!("name_message = {}", hex32(&v12_name_message)));
+    lines.push(format!("coin_bytes = {}", hex_bytes(&coin_bytes)));
+    lines.push(format!("coin_plain = {coin_plain}"));
     lines.push(String::new()); // trailing newline
 
     let generated = lines.join("\n");
@@ -362,6 +390,8 @@ fn generate_poseidon_vectors_file() {
         "terms_hash_v2",
         "name_consent_preimage",
         "name_message",
+        "coin_bytes",
+        "coin_plain",
     ] {
         assert!(
             written.contains(label),

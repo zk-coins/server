@@ -28,6 +28,10 @@ plonky2 = "1.1.0"
 # dependencies unless listed here.
 hex = "0.4.3"
 sha2 = { workspace = true }
+# base64url_no_pad for V.10 NIP44Binary envelope preimage (`coin_plain`).
+# Already present in the workspace lockfile (transitive); direct dev-dep so the
+# generator test can call URL_SAFE_NO_PAD without inventing an encoder.
+base64 = "0.22"
 # Self-path dep activates `test-fixtures` for this package's own test builds
 # (integration tests link the library without `cfg(test)`).
 shared = { path = ".", features = ["test-fixtures"] }

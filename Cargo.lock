@@ -3372,6 +3372,7 @@ dependencies = [
 name = "shared"
 version = "1.1.0"
 dependencies = [
+ "base64 0.22.1",
  "bech32",
  "bincode",
  "bitcoin",
