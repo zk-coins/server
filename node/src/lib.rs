@@ -113,6 +113,9 @@ pub(crate) mod esplora_bound;
 pub(crate) mod flow;
 pub(crate) mod job_dispatcher;
 pub(crate) mod job_store;
+/// Transport-free kernel domain (§6.1 / §7.8). Crate-private so the
+/// public-surface allowlist does not move.
+pub(crate) mod kernel;
 /// Stage-3 sealed legacy Commitment → SMT/MMR scan sink (Stage 4 deletes).
 /// Public only so compile-fail matrices can name the sealed cap type.
 pub mod legacy_commitment_scan;
@@ -125,6 +128,8 @@ pub mod router;
 pub mod runtime;
 pub mod self_heal;
 pub mod state;
+/// Shared transport error contract + (later) HTTP/gRPC adapters.
+pub(crate) mod transport;
 pub mod username;
 /// v1.1 StateEngine adapter + exclusive stack (Stage 2/3).
 pub mod v1;

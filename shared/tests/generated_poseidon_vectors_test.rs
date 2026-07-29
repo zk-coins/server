@@ -264,10 +264,7 @@ fn generate_poseidon_vectors_file() {
         112,
         "serialize(Coin) must be 112 bytes (identifier32 ‖ recipient32 ‖ amount16 ‖ asset_id32)"
     );
-    let coin_plain = format!(
-        "zkcoins-bin-v1:coin:{}",
-        URL_SAFE_NO_PAD.encode(coin_bytes)
-    );
+    let coin_plain = format!("zkcoins-bin-v1:coin:{}", URL_SAFE_NO_PAD.encode(coin_bytes));
     println!("coin_bytes = {}", hex_bytes(&coin_bytes));
     println!("coin_plain = {coin_plain}");
 

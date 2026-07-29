@@ -3014,6 +3014,114 @@ mod jobs_endpoint_tests {
         assert_eq!(v["result"]["output_coins_root"], ocr);
     }
 
+    /// Plant a `completed` row with SQL NULL `response_body` (corrupt).
+    ///
+    /// Against the pre-split handler this returned HTTP 200 without a
+    /// `result` field. Fail-closed behaviour must answer `500` instead.
+    async fn plant_completed_without_response_body(
+        pool: &sqlx::PgPool,
+        account: [u8; 32],
+        idem: &str,
+    ) -> uuid::Uuid {
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs \
+             (public_id, kind, status, phase, account_address, idempotency_key, request_body, \
+              progress, reset_generation) \
+             VALUES ($1, 'mint', 'completed', 'completed', $2, $3, '{}'::jsonb, 100, 0)",
+        )
+        .bind(job_id)
+        .bind(&account[..])
+        .bind(idem)
+        .execute(pool)
+        .await
+        .expect("plant corrupt completed row");
+        job_id
+    }
+
+    /// Would have been green (HTTP 200, no `result`) on the old handler;
+    /// must now fail closed with legacy 500 + free-text error.
+    #[tokio::test]
+    async fn get_job_completed_without_response_body_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let job_id =
+            plant_completed_without_response_body(pool.as_ref(), [0xC1u8; 32], "k-corrupt-legacy")
+                .await;
+
+        let req = Request::get(format!("/api/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "corrupt completed must not 200; body={body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "Failed to load job");
+        // Must not look like a successful poll envelope.
+        assert!(
+            v.get("status").is_none(),
+            "must not emit job status: {body}"
+        );
+        assert!(v.get("result").is_none(), "must not emit result: {body}");
+    }
+
+    /// Same corrupt row via `/v1/jobs/:id` → §7.5 `internal_error` (not 200).
+    #[tokio::test]
+    async fn v1_get_job_completed_without_response_body_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let job_id =
+            plant_completed_without_response_body(pool.as_ref(), [0xC2u8; 32], "k-corrupt-v1")
+                .await;
+
+        let req = Request::get(format!("/v1/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "corrupt completed must not 200; body={body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "internal_error");
+        assert_eq!(v["message"], "Failed to load job");
+        assert!(v.get("result").is_none(), "must not emit result: {body}");
+        assert!(
+            v.get("status").is_none(),
+            "must not emit job status: {body}"
+        );
+    }
+
+    /// Awaiting-signature without payload is likewise corrupt → 500.
+    #[tokio::test]
+    async fn get_job_awaiting_signature_without_payload_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs \
+             (public_id, kind, status, phase, account_address, idempotency_key, request_body, \
+              proof_id, reset_generation) \
+             VALUES ($1, 'send', 'awaiting_signature', 'awaiting_signature', $2, $3, '{}'::jsonb, \
+              7, 0)",
+        )
+        .bind(job_id)
+        .bind(&[0xC3u8; 32][..])
+        .bind("k-corrupt-sig")
+        .execute(pool.as_ref())
+        .await
+        .expect("plant corrupt awaiting_signature row");
+
+        let req = Request::get(format!("/api/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "Failed to load job");
+    }
+
     // ---- POST /api/jobs/:id/cancel ----
 
     #[tokio::test]

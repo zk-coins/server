@@ -38,7 +38,11 @@ use crate::db::InscriptionSummary;
 use crate::flow;
 use crate::job_dispatcher::{JobEnvelope, JobNotifier, JobNotifyMap, JobPhaseEvent};
 use crate::job_store::{CreateResult, Job, JobKind, JobStatus, JobStore};
+use crate::kernel::{
+    JobId, JobRequest, JobState, KernelError, KernelErrorCode, KernelService, NormativeJobStatus,
+};
 use crate::publisher::EsploraConfig;
+use crate::transport::error_contract;
 use crate::username::UsernameStore;
 use crate::{NETWORK_CONFIG, USERNAME_DOMAIN};
 
@@ -1446,63 +1450,73 @@ pub(crate) async fn get_job_handler(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> axum::response::Response {
-    let job = match state.job_store.load(id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(JobErrorResponse {
-                    error: "Job not found".to_string(),
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!("JobStore::load failed: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(JobErrorResponse {
-                    error: "Failed to load job".to_string(),
-                }),
-            )
-                .into_response();
-        }
+    let service = KernelService::new(Arc::clone(&state.job_store));
+    let job = match service.get_job(JobRequest { id: JobId(id) }).await {
+        Ok(j) => j,
+        Err(e) => return legacy_get_job_error(e),
     };
 
-    let response = JobStatusResponse {
-        job_id: job.public_id,
-        kind: job.kind.as_str().to_string(),
-        status: job.status.as_str().to_string(),
-        phase: job.phase.clone(),
-        progress: job.progress,
-        proof_id: if job.status == JobStatus::AwaitingSignature {
-            job.proof_id
-        } else {
-            None
-        },
-        // `awaiting_signature` carries the ash/ocr hex the wallet must
-        // sign (persisted in `response_body` by
-        // `JobStore::set_awaiting_signature`); `completed` carries the
-        // cached terminal body. Both live in `response_body`, so the
-        // same field surfaces on either status.
-        result: if job.status == JobStatus::Completed || job.status == JobStatus::AwaitingSignature
-        {
-            job.response_body.clone()
-        } else {
-            None
-        },
-        error: if job.status == JobStatus::Failed {
-            job.error.clone()
-        } else {
-            None
-        },
-    };
+    let response = project_job_legacy(&job);
 
-    if job.status.is_terminal() {
+    if job.state.is_terminal() {
         (StatusCode::OK, Json(response)).into_response()
     } else {
         (StatusCode::OK, [(header::RETRY_AFTER, "2")], Json(response)).into_response()
     }
+}
+
+/// Legacy `/api/jobs/:id` JSON projection from a typed domain job.
+///
+/// Field names, optionality, and wire status vocabulary match the pre-split
+/// handler for every well-formed state.
+fn project_job_legacy(job: &crate::kernel::Job) -> JobStatusResponse {
+    let status = job.normative_status();
+    let (proof_id, result, error) = match &job.state {
+        // `awaiting_signature` carries the ash/ocr (or v1 surface) the
+        // wallet must sign; `completed` carries the cached terminal body.
+        JobState::AwaitingSignature { payload, proof_id } => {
+            (*proof_id, Some(payload.0.clone()), None)
+        }
+        JobState::Completed { result } => (None, Some(result.0.clone()), None),
+        JobState::Failed { error } => (None, None, error.clone()),
+        // Legacy never projected `error` for cancelled; keep that shape.
+        JobState::Accepted
+        | JobState::Proving
+        | JobState::Publishing
+        | JobState::Cancelled { .. } => (None, None, None),
+    };
+
+    JobStatusResponse {
+        job_id: job.id.as_uuid(),
+        kind: job.kind.as_str().to_string(),
+        status: status.as_legacy_str().to_string(),
+        phase: job.phase.clone(),
+        progress: job.progress,
+        proof_id,
+        result,
+        error,
+    }
+}
+
+/// Map a domain error onto the legacy jobs error envelope.
+///
+/// Legacy bodies use free-text `error` strings (not §7.5 machine codes).
+fn legacy_get_job_error(err: KernelError) -> axum::response::Response {
+    let desc = error_contract::describe(err.code);
+    let status = StatusCode::from_u16(desc.http_status)
+        .expect("error_contract http_status values are valid HTTP codes");
+    if err.code == KernelErrorCode::InternalError {
+        if let Some(ctx) = &err.internal_context {
+            tracing::error!("GetJob internal_error: {}", ctx.detail);
+        }
+    }
+    (
+        status,
+        Json(JobErrorResponse {
+            error: err.public_message,
+        }),
+    )
+        .into_response()
 }
 
 /// `POST /api/jobs/:id/commit` — attach the wallet-signed
@@ -2028,16 +2042,12 @@ pub(crate) async fn jobs_sign_handler(
 }
 
 /// Map legacy job-store status to the §7.5 closed status set.
+///
+/// Aliases (`queued`→`accepted`, `broadcasting`→`publishing`) live only in
+/// [`NormativeJobStatus::from_store`] — this helper delegates there so SSE
+/// and poll cannot drift.
 fn v1_status_wire(status: JobStatus) -> &'static str {
-    match status {
-        JobStatus::Queued => "accepted",
-        JobStatus::Proving => "proving",
-        JobStatus::AwaitingSignature => "awaiting_signature",
-        JobStatus::Broadcasting => "publishing",
-        JobStatus::Completed => "completed",
-        JobStatus::Failed => "failed",
-        JobStatus::Cancelled => "cancelled",
-    }
+    NormativeJobStatus::from_store(status).as_v1_str()
 }
 
 /// `progress` as a float in `[0, 1]` (§7.5). The store keeps 0–100.
@@ -2233,28 +2243,36 @@ pub(crate) async fn get_job_v1_handler(
     State(state): State<AppState>,
     V1JobId(id): V1JobId,
 ) -> axum::response::Response {
-    let job = match state.job_store.load(id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(v1_error_body("job_not_found", "Job not found")),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!("JobStore::load failed: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v1_error_body("internal_error", "Failed to load job")),
-            )
-                .into_response();
-        }
+    let service = KernelService::new(Arc::clone(&state.job_store));
+    let job = match service.get_job(JobRequest { id: JobId(id) }).await {
+        Ok(j) => j,
+        Err(e) => return v1_get_job_error(e),
     };
 
-    let status_wire = v1_status_wire(job.status);
+    let body = project_job_v1(&job);
+
+    if job.state.is_terminal() {
+        (StatusCode::OK, Json(body)).into_response()
+    } else {
+        // §7.5: Retry-After; RECOMMENDED 0 while awaiting_signature.
+        let retry = if matches!(job.state, JobState::AwaitingSignature { .. }) {
+            "0"
+        } else {
+            "2"
+        };
+        (StatusCode::OK, [(header::RETRY_AFTER, retry)], Json(body)).into_response()
+    }
+}
+
+/// §7.5 `/v1/jobs/:id` JSON projection from a typed domain job.
+///
+/// Distinct from the legacy projection: status aliases, float progress,
+/// `awaiting_signature` key (not `result`), structured terminal errors.
+/// Well-formed states stay field-equal to the pre-split handler.
+fn project_job_v1(job: &crate::kernel::Job) -> serde_json::Value {
+    let status_wire = job.normative_status().as_v1_str();
     let mut body = serde_json::json!({
-        "job_id": job.public_id,
+        "job_id": job.id.as_uuid(),
         "kind": job.kind.as_str(),
         "status": status_wire,
         "progress": v1_progress_wire(job.progress),
@@ -2262,7 +2280,7 @@ pub(crate) async fn get_job_v1_handler(
     let obj = body.as_object_mut().expect("object");
 
     // phase: optional diagnostic; absent in terminal states (§7.5).
-    if !job.status.is_terminal() {
+    if !job.state.is_terminal() {
         let phase = job.phase.as_str();
         if !phase.is_empty()
             && phase
@@ -2277,39 +2295,49 @@ pub(crate) async fn get_job_v1_handler(
         }
     }
 
-    match job.status {
-        JobStatus::AwaitingSignature => {
-            if let Some(surface) = job.response_body.clone() {
-                obj.insert("awaiting_signature".to_string(), surface);
-            }
+    match &job.state {
+        // Payload presence is enforced by `project_job_row` (fail-closed).
+        // Backend-Korrektheit ist fail-closed: lieber ein Fehler als ein
+        // Wert, der Vollständigkeit vortäuscht — genau dieses Muster
+        // (halbe Antwort, die wie Erfolg aussieht) ist der Grund für den
+        // Kernel-Schnitt.
+        JobState::AwaitingSignature { payload, .. } => {
+            obj.insert("awaiting_signature".to_string(), payload.0.clone());
         }
-        JobStatus::Completed => {
-            if let Some(result) = job.response_body.clone() {
-                obj.insert("result".to_string(), result);
-            }
+        JobState::Completed { result } => {
+            obj.insert("result".to_string(), result.0.clone());
         }
-        JobStatus::Failed | JobStatus::Cancelled => {
+        JobState::Failed { error } => {
             // §7.5: always present on failed/cancelled; machine codes from
             // the closed enumeration (never invent, never omit).
             obj.insert(
                 "error".to_string(),
-                crate::v1::decode_job_error(job.error.as_deref(), job.status),
+                crate::v1::decode_job_error(error.as_deref(), JobStatus::Failed),
             );
         }
-        _ => {}
+        JobState::Cancelled { error } => {
+            obj.insert(
+                "error".to_string(),
+                crate::v1::decode_job_error(error.as_deref(), JobStatus::Cancelled),
+            );
+        }
+        JobState::Accepted | JobState::Proving | JobState::Publishing => {}
     }
 
-    if job.status.is_terminal() {
-        (StatusCode::OK, Json(body)).into_response()
-    } else {
-        // §7.5: Retry-After; RECOMMENDED 0 while awaiting_signature.
-        let retry = if job.status == JobStatus::AwaitingSignature {
-            "0"
-        } else {
-            "2"
-        };
-        (StatusCode::OK, [(header::RETRY_AFTER, retry)], Json(body)).into_response()
+    body
+}
+
+/// Map a domain error onto the §7.5 v1 error envelope via the shared contract.
+fn v1_get_job_error(err: KernelError) -> axum::response::Response {
+    let desc = error_contract::describe(err.code);
+    let status = StatusCode::from_u16(desc.http_status)
+        .expect("error_contract http_status values are valid HTTP codes");
+    if err.code == KernelErrorCode::InternalError {
+        if let Some(ctx) = &err.internal_context {
+            tracing::error!("GetJob internal_error: {}", ctx.detail);
+        }
     }
+    (status, Json(v1_error_body(desc.reason, err.public_message))).into_response()
 }
 
 /// `POST /api/jobs/:id/cancel` — cancel a still-queued job. Only
