@@ -1,6 +1,28 @@
 name: CI
 
 on:
+  # ---------------------------------------------------------------------
+  # PAUSED — manual dispatch only, on purpose.
+  #
+  # The v1 rebuild is being developed and verified locally; hosted CI is
+  # deliberately out of the loop until the rebuild is finished, and is then
+  # switched back on as the last step before the branch is offered for
+  # review. Running it in between spends self-hosted M3 Ultra slots on a
+  # tree that is known to be mid-flight, and its red/green says nothing
+  # anyone acts on.
+  #
+  # To bring it back: delete this block down to the marker below and
+  # restore the `pull_request:` trigger that follows it, which is left
+  # commented out verbatim so re-enabling is a deletion, not a rewrite.
+  # Nothing else in this file was changed for the pause — every job, guard
+  # and gate is untouched, so the first run after re-enabling exercises
+  # exactly what it did before.
+  #
+  # `workflow_dispatch` stays available: a run can still be started by
+  # hand from the Actions tab when a specific answer is wanted.
+  workflow_dispatch:
+
+  # --- restore from here ------------------------------------------------
   # CI runs on every pull request regardless of target branch. This
   # makes the default safe for stacked PRs (PR-A → PR-B → PR-C where
   # each PR's base is the previous PR's branch) and any other workflow
@@ -32,8 +54,9 @@ on:
   # `labeled` / `unlabeled` are added so toggling the `ci:full` label
   # triggers (or removes) the heavy self-hosted-runner gate on demand
   # — see the `test-and-coverage` job below.
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  # pull_request:
+  #   types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  # --- restore to here --------------------------------------------------
 
 concurrency:
   # Group by PR number so a new push to the same PR cancels the
