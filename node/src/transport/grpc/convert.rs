@@ -1,4 +1,4 @@
-//! Domain `Job` / `JobEvent` → `kernel.v1` proto messages.
+//! Domain `Job` / `JobEvent` / chain types → `kernel.v1` proto messages.
 //!
 //! Conversion is fail-closed: a domain job that cannot be projected into a
 //! **complete** proto `Job` (required digests for `awaiting_signature` /
@@ -8,6 +8,9 @@
 use uuid::Uuid;
 
 use crate::kernel::attestation::{AttestBalanceCommand, AttestCeiling};
+use crate::kernel::chain::{
+    BootstrapManifest as DomainBootstrapManifest, InscriptionCursor, InscriptionLimit,
+};
 use crate::kernel::grants::{GrantAssetScope, GrantScope, IssueViewGrantCommand};
 use crate::kernel::jobs::submit::parse_idempotency_key;
 use crate::kernel::types::{
@@ -15,14 +18,21 @@ use crate::kernel::types::{
     SubjectAddress, TransitionCommon, XOnlyKey,
 };
 use crate::kernel::{
+    AccumulatorTip as DomainAccumulatorTip, KernelInfo, ListInscriptions as DomainListInscriptions,
+    NullifierPath as DomainNullifierPath, NullifierPathRequest as DomainNullifierPathRequest,
+};
+use crate::kernel::{
     Job, JobEvent, JobId, JobState, KernelError, KernelErrorCode, KernelResult, SignTransition,
     TransitionCommand,
 };
 use crate::v1::{self, WalletSignSubmission};
 use kernel_proto::{
-    AttestRequest as ProtoAttestRequest, AwaitingSignature as ProtoAwaitingSignature,
-    GrantRequest as ProtoGrantRequest, Issuance as ProtoIssuance, Job as ProtoJob,
-    JobError as ProtoJobError, JobEvent as ProtoJobEvent, JobResult as ProtoJobResult,
+    AccumulatorTip as ProtoAccumulatorTip, AttestRequest as ProtoAttestRequest,
+    AwaitingSignature as ProtoAwaitingSignature, BootstrapManifest as ProtoBootstrapManifest,
+    GrantRequest as ProtoGrantRequest, Info as ProtoInfo, Issuance as ProtoIssuance,
+    Job as ProtoJob, JobError as ProtoJobError, JobEvent as ProtoJobEvent,
+    JobResult as ProtoJobResult, ListInscriptionsRequest as ProtoListInscriptionsRequest,
+    NullifierPath as ProtoNullifierPath, NullifierPathRequest as ProtoNullifierPathRequest,
     OutputTemplate as ProtoOutputTemplate, Scope as ProtoScope, SignRequest as ProtoSignRequest,
     TransitionRequest as ProtoTransitionRequest,
 };
@@ -141,6 +151,155 @@ fn parse_exact_32(bytes: &[u8], field: &str) -> KernelResult<[u8; 32]> {
             KernelErrorCode::MalformedRequest,
             format!("{field} must be exactly 32 bytes; got {}", bytes.len()),
         )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block 6 — chain read procedures
+// ---------------------------------------------------------------------------
+
+/// Parse proto `ListInscriptionsRequest` into a domain request.
+///
+/// Defaults (proto3 absence): `from_* = 0`, `limit = 100`. An explicit
+/// `limit = 0` or `limit > 1000` is `bounds_exceeded` — never silently
+/// clamped.
+pub(crate) fn parse_list_inscriptions_request(
+    req: ProtoListInscriptionsRequest,
+) -> KernelResult<DomainListInscriptions> {
+    // §7.5: each from_* is optional with default 0. The all-absent case
+    // is exactly the inclusive stream origin — one constructor, not three
+    // independent zeros that could drift from `InscriptionCursor::origin`.
+    let from = match (req.from_height, req.from_tx_index, req.from_vin_index) {
+        (None, None, None) => InscriptionCursor::origin(),
+        (h, t, v) => InscriptionCursor {
+            height: h.unwrap_or(0),
+            tx_index: t.unwrap_or(0),
+            vin_index: v.unwrap_or(0),
+        },
+    };
+    let limit_raw = match req.limit {
+        Some(n) => n,
+        None => InscriptionLimit::DEFAULT,
+    };
+    let limit = InscriptionLimit::new(limit_raw)?;
+    Ok(DomainListInscriptions { from, limit })
+}
+
+/// Parse proto `NullifierPathRequest` (pubkey width = 32).
+pub(crate) fn parse_nullifier_path_request(
+    req: ProtoNullifierPathRequest,
+) -> KernelResult<DomainNullifierPathRequest> {
+    let pubkey = XOnlyKey(parse_exact_32(&req.pubkey, "pubkey")?);
+    Ok(DomainNullifierPathRequest { pubkey })
+}
+
+/// Domain `AccumulatorTip` → proto.
+pub(crate) fn accumulator_tip_to_proto(tip: &DomainAccumulatorTip) -> ProtoAccumulatorTip {
+    ProtoAccumulatorTip {
+        root: tip.root.0.to_vec(),
+        tip_block_hash: tip.tip_block_hash.0.to_vec(),
+        tip_height: tip.tip_height,
+        size: tip.size,
+    }
+}
+
+/// Domain `NullifierPath` → proto (`present` bool + empty path when absent).
+///
+/// `present` is projected **only** via [`DomainNullifierPath::is_present`]
+/// so the wire bool and the domain discriminant cannot drift. Callers
+/// never pass an `Err` into this function — presence is never derived
+/// from a failure.
+pub(crate) fn nullifier_path_to_proto(path: &DomainNullifierPath) -> ProtoNullifierPath {
+    let present = path.is_present();
+    match path {
+        DomainNullifierPath::Present {
+            root,
+            tip_height,
+            tip_block_hash,
+            leaf,
+            position,
+            audit_path,
+            tree_size,
+        } => ProtoNullifierPath {
+            root: root.0.to_vec(),
+            tip_height: *tip_height,
+            present,
+            leaf: leaf.0.to_vec(),
+            position: *position,
+            audit_path: audit_path.iter().map(|d| d.0.to_vec()).collect(),
+            tree_size: *tree_size,
+            tip_block_hash: tip_block_hash.0.to_vec(),
+        },
+        DomainNullifierPath::Absent {
+            root,
+            tip_height,
+            tip_block_hash,
+            tree_size,
+        } => ProtoNullifierPath {
+            root: root.0.to_vec(),
+            tip_height: *tip_height,
+            present,
+            leaf: Vec::new(),
+            position: 0,
+            audit_path: Vec::new(),
+            tree_size: *tree_size,
+            tip_block_hash: tip_block_hash.0.to_vec(),
+        },
+    }
+}
+
+/// Domain `KernelInfo` → proto `Info`.
+pub(crate) fn kernel_info_to_proto(info: &KernelInfo) -> ProtoInfo {
+    let mut circuit_digests = std::collections::HashMap::new();
+    circuit_digests.insert("C".to_string(), info.circuit_digest_c.0.to_vec());
+    circuit_digests.insert(
+        "C_balance".to_string(),
+        info.circuit_digest_c_balance.0.to_vec(),
+    );
+    // Single source for both wire fields: `is_ready` + `reason` encode
+    // the structural invariant (ready ⇒ no reason; not-ready ⇒ exactly
+    // one). A parallel match here would be a second path to the same
+    // claim and a drift source.
+    let ready = info.readiness.is_ready();
+    let ready_reason = info.readiness.reason().map(|r| r.as_str().to_string());
+    ProtoInfo {
+        network: info.network.as_str().to_string(),
+        protocol_version: info.protocol_version.to_string(),
+        circuit_digests,
+        relay_url: info.relay_url.clone(),
+        blossom_url: info.blossom_url.clone(),
+        finality_confirmations: info.finality_confirmations,
+        max_tx_inputs: info.max_tx_inputs,
+        max_tx_outputs: info.max_tx_outputs,
+        max_rx_coins: info.max_rx_coins,
+        max_account_assets: info.max_account_assets,
+        ready,
+        bitcoin_tip_height: info.bitcoin_tip_height,
+        accumulator_root: info.accumulator_root.0.to_vec(),
+        scanner_lag: info.scanner_lag,
+        max_blob_bytes: info.max_blob_bytes,
+        activation_height: info.activation_height,
+        bootstrap: Some(bootstrap_manifest_to_proto(&info.bootstrap)),
+        kernel_parts: info
+            .kernel_parts
+            .iter()
+            .map(|p| p.as_str().to_string())
+            .collect(),
+        ready_reason,
+        bootstrap_pubkey: info.bootstrap_pubkey.0.to_vec(),
+    }
+}
+
+fn bootstrap_manifest_to_proto(m: &DomainBootstrapManifest) -> ProtoBootstrapManifest {
+    ProtoBootstrapManifest {
+        network: m.network.as_str().to_string(),
+        protocol_version: m.protocol_version.clone(),
+        seed_relays: m.seed_relays.clone(),
+        blob_stores: m.blob_stores.clone(),
+        operator_ids: m.operator_ids.iter().map(|k| k.0.to_vec()).collect(),
+        issued_at: m.issued_at,
+        expires_at: m.expires_at,
+        manifest_sig: m.manifest_sig.to_vec(),
     }
 }
 

@@ -36,8 +36,11 @@
 //!   started only from `start_rest_node` with the shared job store + notify
 //!   map + pending-sign map (no pool-only silent-stream boot). `GetJob` /
 //!   `StreamJob` / `CancelJob` / `SignTransition` / `SubmitTransition` /
-//!   `AttestBalance` / `IssueViewGrant` are wired; remaining procedures
-//!   stay unimplemented until a faithful §7.8 mapping exists.
+//!   `AttestBalance` / `IssueViewGrant` / `GetInfo` / `GetAccumulator` /
+//!   `GetNullifierPath` are wired; `ListInscriptions` waits on a
+//!   scanner-written inscription catalog (reveal txid + §3.5 format are
+//!   not on the NfLog). Remaining procedures stay unimplemented until a
+//!   faithful §7.8 mapping exists.
 //! - [`state`] — binary `State::load_from_pg` (+ `LoadStateError`). The
 //!   type is public so the binary can hold `Arc<Mutex<State>>`. **Not**
 //!   public: `new`, `update`, `serialize_for_persist`,

@@ -5,6 +5,7 @@
 
 pub(crate) mod attestation;
 pub(crate) mod bootstrap;
+pub(crate) mod chain;
 pub(crate) mod error;
 pub(crate) mod grants;
 pub(crate) mod job_events;
@@ -21,9 +22,13 @@ pub(crate) mod types;
 /// (`crate::kernel::error::…`, `crate::kernel::types::…`, …). A name used
 /// only from `#[cfg(test)]` code does not belong on this list — tests
 /// import it from the defining module when needed.
+pub(crate) use chain::{
+    AccumulatorTip, ChainIdentity, ChainReadinessFlags, ChainView, KernelInfo, KernelNetwork,
+    ListInscriptions, NullifierPath, NullifierPathRequest,
+};
 pub(crate) use error::{KernelError, KernelErrorCode, KernelResult};
 pub(crate) use job_events::JobEventHub;
-pub(crate) use service::KernelService;
+pub(crate) use service::{ChainHandle, KernelService};
 pub(crate) use types::{
     CancelPolicy, Job, JobEvent, JobId, JobRequest, JobState, KernelStream, SignTransition,
     TransitionCommand,

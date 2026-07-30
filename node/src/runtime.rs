@@ -67,11 +67,12 @@ pub struct RestNodeConfig {
 
 /// Bind REST + job dispatcher + kernel gRPC, sharing one job store and notify map.
 ///
-/// The normative error table is hand-written and both transports depend
-/// on it. [`crate::transport::error_contract::validate_table`] runs
-/// before the REST socket is bound so a release built without green
-/// tests cannot ship wrong codes for **every** failure. The check is
-/// microseconds once and fails closed.
+/// The normative error table and the closed §7.5 / §7.8 wire vocabularies
+/// are hand-written. [`crate::transport::error_contract::validate_table`]
+/// and [`crate::kernel::chain::validate_closed_sets`] run before the REST
+/// socket is bound so a release built without green tests cannot ship
+/// wrong codes or collapsed readiness/part/member tokens. The checks are
+/// microseconds once and fail closed.
 pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     let RestNodeConfig {
         account_node,
@@ -87,6 +88,11 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     // Fail closed on a drifted §7.8 error table before any listener binds.
     if let Err(e) = crate::transport::error_contract::validate_table() {
         anyhow::bail!("kernel error contract invalid: {e}");
+    }
+    // Same start edge: closed ReadyReason / NullifierMemberState / KernelPart
+    // wire strings must be non-empty and pairwise distinct.
+    if let Err(e) = crate::kernel::chain::validate_closed_sets() {
+        anyhow::bail!("kernel closed-set contract invalid: {e}");
     }
 
     let socket_addr = addr
@@ -291,13 +297,37 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     // Additive kernel.v1 gRPC edge (§7.8). Shares job store + notify map
     // with REST/dispatcher so StreamJob is live, not snapshot-only.
     // Fail-closed: domain façade is constructed with real state only.
+    // Block 6: when the exclusive v1.1 engine is present, install it on
+    // the façade so GetAccumulator / GetNullifierPath / GetInfo read the
+    // live NfLog — never a second derivation. ListInscriptions stays
+    // Unimplemented until a scanner-written catalog exists (NfLog has no
+    // reveal txid / §3.5 format).
     {
-        let domain = crate::kernel_rpc::domain_from_parts(
+        let mut domain = crate::kernel_rpc::domain_from_parts(
             Arc::clone(&job_store),
             Arc::clone(&job_notify_map),
             Arc::clone(&state.pending_sign_map),
             Arc::clone(&state.attest_challenges),
         );
+        if let Some(engine) = v1_engine.as_ref() {
+            use crate::kernel::{ChainHandle, ChainReadinessFlags, KernelNetwork};
+
+            // Engine + readiness + network pin. GetInfo also needs a
+            // complete ChainIdentity (relay/blossom/manifest/max_blob/
+            // digests); those sources are not yet a single boot object —
+            // leave identity = None so GetInfo fails closed rather than
+            // inventing empty infra URLs. Accumulator / path read the
+            // live NfLog from the engine alone.
+            domain = domain.with_chain(ChainHandle {
+                engine: Some(Arc::clone(engine)),
+                identity: None,
+                readiness: ChainReadinessFlags {
+                    scan_caught_up: state.v1_scan_caught_up.clone(),
+                    finality_ok: state.v1_finality_ok.clone(),
+                },
+                network: Some(KernelNetwork::from_v1(engine.network())),
+            });
+        }
         let job_tx_grpc = job_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::kernel_rpc::serve_kernel_grpc_with_domain(

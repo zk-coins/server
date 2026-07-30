@@ -6,10 +6,14 @@
 //! `Status::unimplemented("<Name>: not yet implemented")` — never an
 //! invented `Ok(...)` payload.
 //!
-//! Wired today (Block 4–5): `GetJob`, `StreamJob`, `CancelJob`,
-//! `SignTransition`, `SubmitTransition`, `AttestBalance`, `IssueViewGrant`.
-//! These call the transport-neutral domain façade and map through
-//! `transport/grpc/` converters + the shared error contract.
+//! Wired today (Block 4–6): `GetJob`, `StreamJob`, `CancelJob`,
+//! `SignTransition`, `SubmitTransition`, `AttestBalance`, `IssueViewGrant`,
+//! `GetInfo`, `GetAccumulator`, `GetNullifierPath`.
+//! `ListInscriptions` stays `Unimplemented` until a scanner-written
+//! inscription catalog supplies reveal txid and §3.5 format (NfLog has
+//! neither — see `kernel::chain` module docs). Wired procedures call the
+//! transport-neutral domain façade and map through `transport/grpc/`
+//! converters + the shared error contract.
 //!
 //! The existing HTTP router is untouched; this is an additive internal
 //! surface only (Kernel/API split is a later step).
@@ -40,8 +44,10 @@ use crate::kernel::{
     KernelService as DomainKernel,
 };
 use crate::transport::grpc::{
-    job_event_to_proto, job_to_proto, kernel_error_to_status, parse_attest_request,
-    parse_grant_request, parse_sign_request, parse_transition_request,
+    accumulator_tip_to_proto, job_event_to_proto, job_to_proto, kernel_error_to_status,
+    kernel_info_to_proto, nullifier_path_to_proto, parse_attest_request, parse_grant_request,
+    parse_list_inscriptions_request, parse_nullifier_path_request, parse_sign_request,
+    parse_transition_request,
 };
 use crate::v1::PendingSignMap;
 use tokio::sync::mpsc;
@@ -175,30 +181,49 @@ type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 #[tonic::async_trait]
 impl Kernel for GrpcKernelService {
     async fn get_info(&self, _request: Request<GetInfoRequest>) -> Result<Response<Info>, Status> {
-        Err(not_yet("GetInfo"))
+        let info = self.domain.get_info().map_err(map_domain_err)?;
+        Ok(Response::new(kernel_info_to_proto(&info)))
     }
 
     async fn get_accumulator(
         &self,
         _request: Request<GetAccumulatorRequest>,
     ) -> Result<Response<AccumulatorTip>, Status> {
-        Err(not_yet("GetAccumulator"))
+        let tip = self.domain.get_accumulator().map_err(map_domain_err)?;
+        Ok(Response::new(accumulator_tip_to_proto(&tip)))
     }
 
     type ListInscriptionsStream = BoxStream<Inscription>;
 
     async fn list_inscriptions(
         &self,
-        _request: Request<ListInscriptionsRequest>,
+        request: Request<ListInscriptionsRequest>,
     ) -> Result<Response<Self::ListInscriptionsStream>, Status> {
-        Err(not_yet("ListInscriptions"))
+        // Bounds/cursor normalisation still runs so an explicit limit=0
+        // is InvalidArgument, not a silent Unimplemented. After a
+        // well-formed request the answer is honest Unimplemented: proto
+        // `Inscription.txid` / `format` are non-optional scalars (absence
+        // is not representable), and the NfLog carries neither reveal
+        // txid nor §3.5 format. Inventing those fields is worse than no
+        // answer on a proof surface.
+        let _req = parse_list_inscriptions_request(request.into_inner()).map_err(map_domain_err)?;
+        Err(Status::unimplemented(
+            "ListInscriptions: not yet implemented — requires a scanner-written \
+             inscription catalog with reveal txid and §3.5 format (NfLog stores \
+             neither; nullifier membership remains available via GetNullifierPath)",
+        ))
     }
 
     async fn get_nullifier_path(
         &self,
-        _request: Request<NullifierPathRequest>,
+        request: Request<NullifierPathRequest>,
     ) -> Result<Response<NullifierPath>, Status> {
-        Err(not_yet("GetNullifierPath"))
+        let req = parse_nullifier_path_request(request.into_inner()).map_err(map_domain_err)?;
+        let path = self
+            .domain
+            .get_nullifier_path(req)
+            .map_err(map_domain_err)?;
+        Ok(Response::new(nullifier_path_to_proto(&path)))
     }
 
     async fn submit_transition(
@@ -566,26 +591,57 @@ mod tests {
             );
         }
 
-        expect_unimplemented(
-            "GetInfo",
-            svc.get_info(Request::new(GetInfoRequest::default())).await,
-        )
-        .await;
-        expect_unimplemented(
-            "GetAccumulator",
-            svc.get_accumulator(Request::new(GetAccumulatorRequest::default()))
+        // Block 6 chain procedures that are wired: without an EngineAdapter
+        // (or ChainIdentity for GetInfo) they fail closed as Internal,
+        // never as Unimplemented and never as invented Ok payloads.
+        // Request bodies must be well-formed so validation does not fire
+        // before the chain/engine check — otherwise the test measures
+        // InvalidArgument and not the missing-engine path it claims.
+        {
+            async fn expect_chain_unavailable<T>(name: &'static str, result: Result<T, Status>) {
+                let status = match result {
+                    Ok(_) => panic!("{name} without chain handle must not return Ok"),
+                    Err(status) => status,
+                };
+                assert_ne!(
+                    status.code(),
+                    Code::Unimplemented,
+                    "{name} is wired; missing engine is internal, not unimplemented"
+                );
+                assert_eq!(
+                    status.code(),
+                    Code::Internal,
+                    "{name}: expected Internal for missing chain view, got {:?}",
+                    status.code()
+                );
+            }
+            expect_chain_unavailable(
+                "GetInfo",
+                svc.get_info(Request::new(GetInfoRequest::default())).await,
+            )
+            .await;
+            expect_chain_unavailable(
+                "GetAccumulator",
+                svc.get_accumulator(Request::new(GetAccumulatorRequest::default()))
+                    .await,
+            )
+            .await;
+            // Well-formed 32-byte pubkey: empty pubkey fails width validation
+            // as InvalidArgument before require_chain_view is reached.
+            expect_chain_unavailable(
+                "GetNullifierPath",
+                svc.get_nullifier_path(Request::new(NullifierPathRequest {
+                    pubkey: vec![0u8; 32],
+                }))
                 .await,
-        )
-        .await;
+            )
+            .await;
+        }
+        // ListInscriptions is not wired: NfLog has no reveal txid / §3.5
+        // format; answers wait on a scanner-written inscription catalog.
         expect_unimplemented(
             "ListInscriptions",
             svc.list_inscriptions(Request::new(ListInscriptionsRequest::default()))
-                .await,
-        )
-        .await;
-        expect_unimplemented(
-            "GetNullifierPath",
-            svc.get_nullifier_path(Request::new(NullifierPathRequest::default()))
                 .await,
         )
         .await;

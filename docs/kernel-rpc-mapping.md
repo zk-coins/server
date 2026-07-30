@@ -4,7 +4,7 @@ Normative Quellen:
 
 - REST: `docs/specification.md` §7.5 / §7.6 / §7.7 (tag `spec-v1.2`)
 - Kernel: `docs/specification.md` §7.8 + `proto/kernel/v1/kernel.proto`
-- Code-Stand: Worktree `node` (Branch `feat/v1-spec-rebuild`, Block 3)
+- Code-Stand: Worktree `node` (Branch `feat/v1-spec-rebuild`)
 
 Spalte **gRPC verdrahtet?** meint die `tonic`-Implementierung in
 `node/src/kernel_rpc.rs` über die transportneutrale Domain-Fassade
@@ -22,12 +22,12 @@ Boot: gRPC startet **nur** aus `start_rest_node` via
 |---|---|---|---|---|
 | `GET /` | — (API-lokal; §7.5) | — | — | ja: `router.rs` `root_handler` — Form weicht ab (legacy endpoint map) |
 | `GET /health` | — (API-lokal; §7.5) | — | — | ja: `router.rs` `health_handler` |
-| `GET /health/ready` | `GetInfo` (Teilfeld `ready` / `ready_reason`) | unary | **nein** — fehlt Domain-`GetInfo` + closed `reason`-Mapping; REST-JSON ist eigenes Shape | teilweise: `ready_handler` |
-| `GET /v1/info` | `GetInfo` | unary | **nein** — fehlt Domain-Projektion (`circuit_digests`, `features`, `bootstrap`) und §7.5-Route | Legacy: `info_handler` (`/api/info`) |
-| `GET /v1/chain/accumulator` | `GetAccumulator` | unary | **nein** — fehlt öffentlicher Tip-Endpoint + Domain-Read über `StateEngine`/`nflog` | intern: `state_engine` tip/nflog, `shared` accumulator |
-| `GET /v1/chain/inscriptions` | `ListInscriptions` | server-stream | **nein** — fehlt paginierte Triple-Cursor-Liste + Domain-Stream | Legacy 410: `get_inscription_handler` |
-| `GET /v1/chain/nullifier/<pubkey>` | `GetNullifierPath` | unary | **nein** — fehlt Domain-Path-B-Fassade über Acc/NfLog | intern: `accumulator::lookup`, `nflog::inclusion_path` |
-| `POST /v1/tx` | `SubmitTransition` | unary | **nein** — fehlt unified Admit-Domain + gRPC-Request-Mapping (mint/send/receive) | Legacy-Admit: `jobs_mint_handler` / `jobs_send_handler`; Engine: `begin_v1_mint` / `begin_v1_send` / `execute_v1_receive` |
+| `GET /health/ready` | `GetInfo` (Teilfeld `ready` / `ready_reason`) | unary | **teilweise** — Domain-`GetInfo` + closed `reason`-Mapping existieren; Produktion setzt `ChainIdentity = None` → fail-closed `Internal` (kein erfundener Infra-Pin). REST-JSON ist eigenes Shape | teilweise: `ready_handler` |
+| `GET /v1/info` | `GetInfo` | unary | **teilweise** — Domain-Projektion vorhanden; Produktion ohne `ChainIdentity` → fail-closed. §7.5-Route noch Legacy `/api/info` | Legacy: `info_handler` (`/api/info`) |
+| `GET /v1/chain/accumulator` | `GetAccumulator` | unary | **ja** — `kernel_rpc::get_accumulator` → live NfLog tip via `ChainView` | intern: `state_engine` tip/nflog, `shared` accumulator |
+| `GET /v1/chain/inscriptions` | `ListInscriptions` | server-stream | **nein** — fehlt ein beim Falten geschriebener **Inschriften-Katalog** mit Reveal-Txid und §3.5-Format; NfLog speichert beides nicht. Proto-`txid`/`format` sind nicht-optional → Abwesenheit nicht darstellbar. gRPC: `Unimplemented` mit dieser Voraussetzung in der Meldung | Legacy 410: `get_inscription_handler` |
+| `GET /v1/chain/nullifier/<pubkey>` | `GetNullifierPath` | unary | **ja** — Path-B present/absent gegen live Index; Fehler nie als `present: false` | intern: `accumulator::lookup`, `nflog::inclusion_path` |
+| `POST /v1/tx` | `SubmitTransition` | unary | **ja** — Domain-Admit + gRPC-Request-Mapping (mint/send/receive) | Legacy-Admit: `jobs_mint_handler` / `jobs_send_handler`; Engine: `begin_v1_mint` / `begin_v1_send` / `execute_v1_receive` |
 | `GET /v1/jobs/<id>` | `GetJob` | unary | **ja** — `kernel_rpc::get_job` → `DomainKernel::get_job` → `job_to_proto` | ja: `get_job_v1_handler`; Store `JobStore::load` |
 | `GET /v1/jobs/<id>/stream` | `StreamJob` | server-stream | **ja** — `kernel_rpc::stream_job` → `DomainKernel::stream_job` / `JobEventHub` → `job_event_to_proto` (live nur mit shared Notify-Map) | ja: `stream_job_v1_handler` |
 | `POST /v1/jobs/<id>/sign` | `SignTransition` | unary | **ja** — `kernel_rpc::sign_transition` → `DomainKernel::sign_transition` → `job_to_proto` (Width 64/32 am gRPC-Rand). **Feature-Gate am gRPC-Rand** (vor Domäne): bei inaktivem V1-Claim (`!v1_sign_route_active()`) `Status::unimplemented` mit Meldung, die `ZKCOINS_V1_SHADOW` / `ScanStackMode::V1` nennt und **nicht** den Text `not yet implemented` der unverdrahteten Prozeduren — analog HTTP `feature_disabled` (kein `KernelErrorCode`) | ja: `jobs_sign_handler` → Flag-Gate `feature_disabled` / 404 → `kernel/jobs/sign`; `accept_wallet_transition_signature` |
@@ -43,9 +43,9 @@ Boot: gRPC startet **nur** aus `start_rest_node` via
 | `POST /v1/bootstrap/entrust` (§7.7) | `EntrustOperationalBundle` | unary | **nein** — fehlt Bundle-Persistenz-Domain unter §7.7 | intern Tests/Account-Rows, kein Endpoint |
 | `POST /v1/bootstrap/revoke` (§7.7) | `RevokeOperationalBundle` | unary | **nein** — fehlt Revoke-Domain | **nicht vorhanden** |
 | `POST /v1/attest/balance/challenge` | `OpenPullChallenge` (`action` = `attest_balance`) | unary | **nein** — generisches OpenPull fehlt; attest-Challenge nur REST | ja: `attest_balance_challenge_handler` |
-| `POST /v1/attest/balance` | `AttestBalance` | unary | **nein** — fehlt Domain-Attest-Fassade + Proto-Mapping (REST/Engine vorhanden) | ja: `attest_balance_handler`; `issue_attest_challenge` / `prove_attestation_for_job` |
+| `POST /v1/attest/balance` | `AttestBalance` | unary | **ja** — Domain-Attest-Fassade + Proto-Mapping | ja: `attest_balance_handler`; `issue_attest_challenge` / `prove_attestation_for_job` |
 | `POST /v1/grants/challenge` | `OpenPullChallenge` (`action` = `issue_grant`) | unary | **nein** — siehe `OpenPullChallenge` | **nicht vorhanden** |
-| `POST /v1/grants` | `IssueViewGrant` | unary | **nein** — fehlt Grant-Domain | **nicht vorhanden** |
+| `POST /v1/grants` | `IssueViewGrant` | unary | **ja** — Domain-Grant (ohne `op_sk` fail-closed vor Challenge-Consume) | **nicht vorhanden** (gRPC only heute) |
 
 ## Blossom (§7.4) — kein Kernel-RPC in §7.8
 
@@ -57,11 +57,10 @@ Die REST-Keys `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delet
 
 | Kriterium | Prozeduren | Zahl |
 |---|---|---|
-| **gRPC verdrahtet** (Domain + Proto, kein `unimplemented`) | `GetJob`, `StreamJob`, `CancelJob`, `SignTransition` | **4** |
-| REST/Engine vorhanden, gRPC noch `unimplemented` | `AttestBalance` (+ teilweise `GetInfo` / `OpenPullChallenge` nur attest) | **1+** |
-| Weder gRPC noch passende §7.5-Surface | Rest der 20 | **15** (inkl. nur-interne Bausteine) |
+| **gRPC verdrahtet** (Domain + Proto, kein `unimplemented` auf dem Happy-Path) | `GetJob`, `StreamJob`, `CancelJob`, `SignTransition`, `SubmitTransition`, `AttestBalance`, `IssueViewGrant`, `GetInfo`, `GetAccumulator`, `GetNullifierPath` | **10** |
+| gRPC `Unimplemented` mit benannter Voraussetzung | `ListInscriptions` (Inschriften-Katalog: Reveal-Txid + §3.5-Format; NfLog trägt beides nicht) + übrige unverdrahtete Prozeduren | **10** |
 
-**Kurzfassung:** **4 von 20** Kernel-Prozeduren sind gRPC-verdrahtet (`GetJob`, `StreamJob`, `CancelJob`, `SignTransition`). Die übrigen 16 antworten ehrlich mit `Status::unimplemented("<Name>: not yet implemented")`. `SignTransition` hat zusätzlich ein **API-Rand-Feature-Gate**: bei inaktivem V1-Claim `Unimplemented` mit `ZKCOINS_V1_SHADOW` in der Meldung (ohne `not yet implemented`) — nicht dasselbe wie unverdrahtet. Server-Boot nur über `start_rest_node` + shared Hub + pending-sign-Map — kein stummer pool-only-Stream-Pfad.
+**Kurzfassung:** **10 von 20** Kernel-Prozeduren sind gRPC-verdrahtet. `ListInscriptions` ist **nicht** verdrahtet, weil ein ehrlicher Answer den beim Scanner-Falten geschriebenen Inschriften-Katalog braucht (Reveal-Txid, §3.5-Format, Mitglieder). Platzhalter-Txids und heuristische Formate sind verboten. `SignTransition` hat zusätzlich ein **API-Rand-Feature-Gate**: bei inaktivem V1-Claim `Unimplemented` mit `ZKCOINS_V1_SHADOW` in der Meldung (ohne `not yet implemented`) — nicht dasselbe wie unverdrahtet. Server-Boot nur über `start_rest_node` + shared Hub + pending-sign-Map — kein stummer pool-only-Stream-Pfad.
 
 ## API-lokale Endpunkte (explizit ohne Kernel)
 
