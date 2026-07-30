@@ -12,11 +12,15 @@ use crate::kernel::access::{
     RecordBlob as DomainRecordBlob, RecordRef, SessionAuthority, SessionBoundRequest,
 };
 use crate::kernel::attestation::{AttestBalanceCommand, AttestCeiling};
+use crate::kernel::bootstrap::{EntrustCommand, RevokeCommand};
 use crate::kernel::chain::{
     BootstrapManifest as DomainBootstrapManifest, InscriptionCursor, InscriptionLimit,
 };
 use crate::kernel::grants::{GrantAssetScope, GrantScope, IssueViewGrantCommand};
 use crate::kernel::jobs::submit::parse_idempotency_key;
+use crate::kernel::publish::{
+    refuse_v1_fee_fields, PublishBlockAnchor, PublishCommand, PublishOutcome,
+};
 use crate::kernel::types::{
     ChanBind, Digest32, Issuance, JobKind, JobPayload, OutputTemplate, PublisherChoice,
     SubjectAddress, TransitionCommon, XOnlyKey,
@@ -34,13 +38,16 @@ use kernel_proto::{
     AccountStateResult as ProtoAccountStateResult, AccumulatorTip as ProtoAccumulatorTip,
     AttestRequest as ProtoAttestRequest, AwaitingSignature as ProtoAwaitingSignature,
     BootstrapManifest as ProtoBootstrapManifest, CoinProofBlob as ProtoCoinProofBlob,
-    CoinProofRequest as ProtoCoinProofRequest, GrantRequest as ProtoGrantRequest,
-    Info as ProtoInfo, Issuance as ProtoIssuance, Job as ProtoJob, JobError as ProtoJobError,
+    CoinProofRequest as ProtoCoinProofRequest, EntrustRequest as ProtoEntrustRequest,
+    EntrustResult as ProtoEntrustResult, GrantRequest as ProtoGrantRequest, Info as ProtoInfo,
+    Issuance as ProtoIssuance, Job as ProtoJob, JobError as ProtoJobError,
     JobEvent as ProtoJobEvent, JobResult as ProtoJobResult,
     ListInscriptionsRequest as ProtoListInscriptionsRequest, NullifierPath as ProtoNullifierPath,
     NullifierPathRequest as ProtoNullifierPathRequest, OutputTemplate as ProtoOutputTemplate,
+    PublishRequest as ProtoPublishRequest, PublishResult as ProtoPublishResult,
     PullRequest as ProtoPullRequest, PullResult as ProtoPullResult, RecordBlob as ProtoRecordBlob,
-    RecordRef as ProtoRecordRef, RecordRequest as ProtoRecordRequest, Scope as ProtoScope,
+    RecordRef as ProtoRecordRef, RecordRequest as ProtoRecordRequest,
+    RevokeRequest as ProtoRevokeRequest, RevokeResult as ProtoRevokeResult, Scope as ProtoScope,
     SignRequest as ProtoSignRequest, TransitionRequest as ProtoTransitionRequest,
 };
 use shared::spec_v1::Address;
@@ -1069,6 +1076,98 @@ fn decode_hex_exact(raw: &str, key: &str, expected_len: usize) -> KernelResult<V
         )));
     }
     Ok(bytes)
+}
+
+/// Parse proto `PublishRequest` into a fee-less domain [`PublishCommand`].
+///
+/// Any non-empty fee field → `malformed_request` (v1 fail-closed). Wrong
+/// widths for the four nullifier points/scalars or missing `block_anchor`
+/// → `malformed_request`.
+pub(crate) fn parse_publish_request(req: ProtoPublishRequest) -> KernelResult<PublishCommand> {
+    refuse_v1_fee_fields(&req.fee_blob_id, &req.fee_epk, &req.fee_blob_locators)?;
+    let public_key = parse_xonly(&req.public_key, "public_key")?;
+    let r = parse_xonly(&req.r, "r")?;
+    let s = parse_digest32(&req.s, "s")?;
+    let r_prime = parse_xonly(&req.r_prime, "r_prime")?;
+    let anchor = match req.block_anchor {
+        Some(a) => a,
+        None => {
+            return Err(KernelError::new(
+                KernelErrorCode::MalformedRequest,
+                "block_anchor is required",
+            ));
+        }
+    };
+    let block_hash = parse_digest32(&anchor.block_hash, "block_anchor.block_hash")?;
+    Ok(PublishCommand {
+        public_key,
+        r,
+        s,
+        r_prime,
+        block_anchor: PublishBlockAnchor {
+            block_hash,
+            height: anchor.height,
+        },
+    })
+}
+
+/// Project a domain [`PublishOutcome`] onto proto `PublishResult`.
+///
+/// Presence invariants: `reason` set iff rejected; `batch_eta` set iff accepted.
+pub(crate) fn publish_outcome_to_proto(outcome: PublishOutcome) -> ProtoPublishResult {
+    match outcome {
+        PublishOutcome::Accepted { batch_eta } => ProtoPublishResult {
+            accepted: true,
+            reason: None,
+            batch_eta: Some(batch_eta),
+        },
+        PublishOutcome::Rejected { reason } => ProtoPublishResult {
+            accepted: false,
+            reason: Some(reason.as_str().to_string()),
+            batch_eta: None,
+        },
+    }
+}
+
+/// Parse proto `EntrustRequest` (raw bundle bytes; length checked in domain).
+pub(crate) fn parse_entrust_request(req: ProtoEntrustRequest) -> KernelResult<EntrustCommand> {
+    let subject = parse_subject_address(&req.subject)?;
+    let nonce = parse_exact_32(&req.nonce, "nonce")?;
+    let chan_bind = ChanBind(parse_exact_32(&req.chan_bind, "chan_bind")?);
+    Ok(EntrustCommand {
+        subject,
+        nonce,
+        chan_bind,
+        bundle_bytes: req.bundle,
+    })
+}
+
+pub(crate) fn entrust_result_to_proto(
+    result: crate::kernel::bootstrap::EntrustResult,
+) -> ProtoEntrustResult {
+    ProtoEntrustResult {
+        accepted: result.accepted,
+    }
+}
+
+/// Parse proto `RevokeRequest`.
+pub(crate) fn parse_revoke_request(req: ProtoRevokeRequest) -> KernelResult<RevokeCommand> {
+    let subject = parse_subject_address(&req.subject)?;
+    let nonce = parse_exact_32(&req.nonce, "nonce")?;
+    let chan_bind = ChanBind(parse_exact_32(&req.chan_bind, "chan_bind")?);
+    Ok(RevokeCommand {
+        subject,
+        nonce,
+        chan_bind,
+    })
+}
+
+pub(crate) fn revoke_result_to_proto(
+    result: crate::kernel::bootstrap::RevokeResult,
+) -> ProtoRevokeResult {
+    ProtoRevokeResult {
+        revoked: result.revoked,
+    }
 }
 
 #[cfg(test)]

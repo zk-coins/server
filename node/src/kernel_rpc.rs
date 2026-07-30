@@ -6,10 +6,11 @@
 //! `Status::unimplemented("<Name>: not yet implemented")` — never an
 //! invented `Ok(...)` payload.
 //!
-//! Wired today (Block 4–7): `GetJob`, `StreamJob`, `CancelJob`,
+//! Wired today (Block 4–8): `GetJob`, `StreamJob`, `CancelJob`,
 //! `SignTransition`, `SubmitTransition`, `AttestBalance`, `IssueViewGrant`,
 //! `GetInfo`, `GetAccumulator`, `GetNullifierPath`, `OpenPullChallenge`,
-//! `Pull`, `GetRecord`, `GetCoinProof`, `GetAccountState`.
+//! `Pull`, `GetRecord`, `GetCoinProof`, `GetAccountState`, `Publish`,
+//! `EntrustOperationalBundle`, `RevokeOperationalBundle`.
 //! `ListInscriptions` stays `Unimplemented` until a scanner-written
 //! inscription catalog supplies reveal txid and §3.5 format (NfLog has
 //! neither — see `kernel::chain` module docs). `SubscribeReceipts` stays
@@ -53,12 +54,14 @@ use crate::kernel::{
     KernelService as DomainKernel,
 };
 use crate::transport::grpc::{
-    account_state_to_proto, accumulator_tip_to_proto, coin_proof_blob_to_proto, job_event_to_proto,
-    job_to_proto, kernel_error_to_status, kernel_info_to_proto, nullifier_path_to_proto,
-    parse_attest_request, parse_coin_proof_request, parse_grant_request,
-    parse_list_inscriptions_request, parse_nullifier_path_request, parse_pull_request,
-    parse_record_request, parse_session_authority, parse_session_bound, parse_sign_request,
-    parse_transition_request, pull_result_to_proto, record_blob_to_proto,
+    account_state_to_proto, accumulator_tip_to_proto, coin_proof_blob_to_proto,
+    entrust_result_to_proto, job_event_to_proto, job_to_proto, kernel_error_to_status,
+    kernel_info_to_proto, nullifier_path_to_proto, parse_attest_request, parse_coin_proof_request,
+    parse_entrust_request, parse_grant_request, parse_list_inscriptions_request,
+    parse_nullifier_path_request, parse_publish_request, parse_pull_request, parse_record_request,
+    parse_revoke_request, parse_session_authority, parse_session_bound, parse_sign_request,
+    parse_transition_request, publish_outcome_to_proto, pull_result_to_proto, record_blob_to_proto,
+    revoke_result_to_proto,
 };
 use crate::v1::PendingSignMap;
 use shared::spec_v1::Address;
@@ -156,10 +159,6 @@ impl GrpcKernelService {
     }
 }
 
-fn not_yet(procedure: &'static str) -> Status {
-    Status::unimplemented(format!("{procedure}: not yet implemented"))
-}
-
 /// Parsed `OpenPullChallenge` body (domain types only — no proto on kernel).
 struct OpenPullChallengeParsed {
     subject: SubjectAddress,
@@ -168,14 +167,8 @@ struct OpenPullChallengeParsed {
 }
 
 /// Parse outcome for `OpenPullChallenge`.
-///
-/// Block-8 actions are a distinct branch so the RPC can answer
-/// `Unimplemented` with a named prerequisite instead of minting a challenge
-/// or collapsing into `malformed_request`.
 enum OpenPullChallengeParse {
     Ready(OpenPullChallengeParsed),
-    /// `entrust` / `revoke` — ChallengeAction closed set has no variant yet.
-    ActionNotYet(&'static str),
     Err(KernelError),
 }
 
@@ -185,7 +178,8 @@ enum OpenPullChallengeParse {
 /// - `""` / `"pull"` → [`ChallengeAction::Pull`]
 /// - `"attest_balance"` → [`ChallengeAction::AttestBalance`]
 /// - `"issue_grant"` → [`ChallengeAction::IssueViewGrant`]
-/// - `"entrust"` / `"revoke"` → [`OpenPullChallengeParse::ActionNotYet`]
+/// - `"entrust"` → [`ChallengeAction::Entrust`]
+/// - `"revoke"` → [`ChallengeAction::Revoke`]
 /// - anything else → `malformed_request`
 ///
 /// Omitted `requested_scope` normalises to `*` / unbounded (§7.5) for pull.
@@ -214,14 +208,14 @@ fn parse_open_pull_challenge(req: PullChallengeRequest) -> OpenPullChallengePars
         "" | "pull" => ChallengeAction::Pull,
         "attest_balance" => ChallengeAction::AttestBalance,
         "issue_grant" => ChallengeAction::IssueViewGrant,
-        "entrust" => return OpenPullChallengeParse::ActionNotYet("entrust"),
-        "revoke" => return OpenPullChallengeParse::ActionNotYet("revoke"),
+        "entrust" => ChallengeAction::Entrust,
+        "revoke" => ChallengeAction::Revoke,
         other => {
             return OpenPullChallengeParse::Err(KernelError::new(
                 KernelErrorCode::MalformedRequest,
                 format!(
                     "action must be empty/\"pull\"|\"attest_balance\"|\"issue_grant\" \
-                     (or entrust/revoke when Block 8 lands); got {other:?}"
+                     or \"entrust\"|\"revoke\"; got {other:?}"
                 ),
             ));
         }
@@ -466,13 +460,6 @@ impl Kernel for GrpcKernelService {
     ) -> Result<Response<Challenge>, Status> {
         let parsed = match parse_open_pull_challenge(request.into_inner()) {
             OpenPullChallengeParse::Ready(p) => p,
-            OpenPullChallengeParse::ActionNotYet(action) => {
-                return Err(Status::unimplemented(format!(
-                    "OpenPullChallenge: not yet implemented — action={action:?} \
-                     requires operational-bundle entrust/revoke (Block 8); \
-                     ChallengeAction closed set is Pull|AttestBalance|IssueViewGrant only"
-                )));
-            }
             OpenPullChallengeParse::Err(e) => return Err(map_domain_err(e)),
         };
         let now = crate::v1::unix_now();
@@ -585,23 +572,51 @@ impl Kernel for GrpcKernelService {
 
     async fn publish(
         &self,
-        _request: Request<PublishRequest>,
+        request: Request<PublishRequest>,
     ) -> Result<Response<PublishResult>, Status> {
-        Err(not_yet("Publish"))
+        let command = parse_publish_request(request.into_inner()).map_err(map_domain_err)?;
+        let policy = crate::kernel::publish::PublishPolicy::AcceptFeeLess { batch_eta_secs: 60 };
+        let outcome = self
+            .domain
+            .publish(policy, command)
+            .map_err(map_domain_err)?;
+        Ok(Response::new(publish_outcome_to_proto(outcome)))
     }
 
     async fn entrust_operational_bundle(
         &self,
-        _request: Request<EntrustRequest>,
+        request: Request<EntrustRequest>,
     ) -> Result<Response<EntrustResult>, Status> {
-        Err(not_yet("EntrustOperationalBundle"))
+        let command = parse_entrust_request(request.into_inner()).map_err(map_domain_err)?;
+        let hosts = crate::v1::public_hosts_from_env();
+        let allowed: Vec<[u8; 32]> = hosts
+            .iter()
+            .map(|h| crate::v1::attest::chan_bind_for_host(h))
+            .collect();
+        let now = crate::v1::unix_now();
+        let result = self
+            .domain
+            .entrust_operational_bundle(&allowed, now, command)
+            .map_err(map_domain_err)?;
+        Ok(Response::new(entrust_result_to_proto(result)))
     }
 
     async fn revoke_operational_bundle(
         &self,
-        _request: Request<RevokeRequest>,
+        request: Request<RevokeRequest>,
     ) -> Result<Response<RevokeResult>, Status> {
-        Err(not_yet("RevokeOperationalBundle"))
+        let command = parse_revoke_request(request.into_inner()).map_err(map_domain_err)?;
+        let hosts = crate::v1::public_hosts_from_env();
+        let allowed: Vec<[u8; 32]> = hosts
+            .iter()
+            .map(|h| crate::v1::attest::chan_bind_for_host(h))
+            .collect();
+        let now = crate::v1::unix_now();
+        let result = self
+            .domain
+            .revoke_operational_bundle(&allowed, now, command)
+            .map_err(map_domain_err)?;
+        Ok(Response::new(revoke_result_to_proto(result)))
     }
 
     async fn attest_balance(
@@ -632,7 +647,7 @@ impl Kernel for GrpcKernelService {
         request: Request<GrantRequest>,
     ) -> Result<Response<GrantResult>, Status> {
         // OwnershipProof is API-layer only — this message carries none.
-        // op signing key is not loaded until Entrust (Block 8); missing
+        // op signing key is loaded from BundleStore (Entrust); missing
         // bundle fails closed inside the domain before challenge consume.
         let command = parse_grant_request(request.into_inner()).map_err(map_domain_err)?;
         let hosts = crate::v1::public_hosts_from_env();
@@ -643,7 +658,7 @@ impl Kernel for GrpcKernelService {
         let now = crate::v1::unix_now();
         let issued = self
             .domain
-            .issue_view_grant(&allowed, now, None, command)
+            .issue_view_grant(&allowed, now, command)
             .map_err(map_domain_err)?;
         Ok(Response::new(GrantResult {
             grant: issued.grant_bech32m,
@@ -964,23 +979,38 @@ mod tests {
                 .await,
         )
         .await;
-        expect_unimplemented(
-            "Publish",
-            svc.publish(Request::new(PublishRequest::default())).await,
-        )
-        .await;
-        expect_unimplemented(
-            "EntrustOperationalBundle",
-            svc.entrust_operational_bundle(Request::new(EntrustRequest::default()))
-                .await,
-        )
-        .await;
-        expect_unimplemented(
-            "RevokeOperationalBundle",
-            svc.revoke_operational_bundle(Request::new(RevokeRequest::default()))
-                .await,
-        )
-        .await;
+        {
+            let err = svc
+                .publish(Request::new(PublishRequest::default()))
+                .await
+                .expect_err("empty PublishRequest must fail closed");
+            assert_ne!(err.code(), Code::Unimplemented, "Publish is wired");
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
+        {
+            let err = svc
+                .entrust_operational_bundle(Request::new(EntrustRequest::default()))
+                .await
+                .expect_err("empty EntrustRequest must fail closed");
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "EntrustOperationalBundle is wired"
+            );
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
+        {
+            let err = svc
+                .revoke_operational_bundle(Request::new(RevokeRequest::default()))
+                .await
+                .expect_err("empty RevokeRequest must fail closed");
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "RevokeOperationalBundle is wired"
+            );
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
         // AttestBalance / IssueViewGrant are wired (Block 5): empty body
         // fails closed as malformed_request (InvalidArgument), not
         // unimplemented. OwnershipProof fields are absent from the proto.

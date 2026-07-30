@@ -5,13 +5,13 @@
 //! and the shared challenge-store issue helpers. Block 6: read-only chain
 //! (`get_info`, `get_accumulator`, `get_nullifier_path`).
 //! Block 7: `open_pull_challenge`, `pull`, `get_record`, `get_coin_proof`,
-//! `get_account_state`. `SubscribeReceipts` is not a façade method: there
-//! is no production credit writer after durable persist (§4.8 / §4.9), so
-//! gRPC answers `Unimplemented` (see `access::receipts` writer contract)
+//! `get_account_state`. Block 8: `publish`, `entrust_operational_bundle`,
+//! `revoke_operational_bundle`. `SubscribeReceipts` is not a façade method:
+//! there is no production credit writer after durable persist (§4.8 / §4.9),
+//! so gRPC answers `Unimplemented` (see `access::receipts` writer contract)
 //! rather than accepting a silent empty stream. `ListInscriptions` waits
 //! on a scanner-written inscription catalog (reveal txid + §3.5 format are
-//! not on the NfLog). Remaining §7.8 procedures land in later blocks on
-//! this same type — they are intentionally absent here rather than stubbed.
+//! not on the NfLog).
 
 use std::sync::Arc;
 
@@ -24,7 +24,10 @@ use crate::kernel::access::{
     PrivateIndex, PullCommand, PullResult, RecordBlob, SessionBoundRequest, SessionStore,
 };
 use crate::kernel::attestation::{self, AttestBalanceCommand, AttestBalanceDeps};
-use crate::kernel::bootstrap::{ChallengeAction, ChallengeStore, IssuedChallenge};
+use crate::kernel::bootstrap::{
+    self as bootstrap, BundleProcedureDeps, BundleStore, ChallengeAction, ChallengeStore,
+    EntrustCommand, EntrustResult, IssuedChallenge, RevokeCommand, RevokeResult,
+};
 use crate::kernel::chain;
 use crate::kernel::grants::{
     self, GrantScope, IssueViewGrantCommand, IssueViewGrantDeps, ViewGrantIssued,
@@ -32,6 +35,7 @@ use crate::kernel::grants::{
 use crate::kernel::jobs;
 use crate::kernel::jobs::sign::SignTransitionDeps;
 use crate::kernel::jobs::submit::SubmitTransitionDeps;
+use crate::kernel::publish::{self, PublishCommand, PublishConfig, PublishOutcome, PublishPolicy};
 use crate::kernel::types::SubjectAddress;
 use crate::kernel::{
     AccumulatorTip, CancelPolicy, ChainIdentity, ChainReadinessFlags, ChainView, Job, JobEvent,
@@ -71,8 +75,11 @@ pub(crate) struct KernelServiceConfig {
     /// Shared with the dispatcher / SSE path. Sign looks up a parked
     /// notifier without creating one; StreamJob may create on subscribe.
     pub notify_map: JobNotifyMap,
-    /// Shared action-bound challenge store (Pull / AttestBalance / IssueViewGrant).
+    /// Shared action-bound challenge store (Pull / AttestBalance / IssueViewGrant /
+    /// Entrust / Revoke).
     pub challenges: Arc<ChallengeStore>,
+    /// Process-local operational-bundle store (Block 8; no durable table yet).
+    pub bundles: Arc<BundleStore>,
     /// Pull sessions (process-local; no durable table yet).
     pub sessions: Arc<SessionStore>,
     /// Private-record + account-state index (empty in-memory until catalog).
@@ -90,8 +97,11 @@ pub(crate) struct KernelService {
     /// Shared with the dispatcher / SSE path. Sign looks up a parked
     /// notifier without creating one; StreamJob may create on subscribe.
     notify_map: JobNotifyMap,
-    /// Shared action-bound challenge store (Pull / AttestBalance / IssueViewGrant).
+    /// Shared action-bound challenge store (Pull / AttestBalance / IssueViewGrant /
+    /// Entrust / Revoke).
     challenges: Arc<ChallengeStore>,
+    /// Process-local operational-bundle store (Block 8).
+    bundles: Arc<BundleStore>,
     /// Pull sessions (process-local; no durable table yet).
     sessions: Arc<SessionStore>,
     /// Private-record + account-state index (empty in-memory until catalog).
@@ -108,6 +118,7 @@ impl KernelService {
             pending_sign_map,
             notify_map,
             challenges,
+            bundles,
             sessions,
             private_index,
             chain,
@@ -119,6 +130,7 @@ impl KernelService {
             pending_sign_map,
             notify_map,
             challenges,
+            bundles,
             sessions,
             private_index,
             chain,
@@ -135,6 +147,7 @@ impl KernelService {
             pending_sign_map: Arc::new(dashmap::DashMap::new()),
             notify_map,
             challenges: ChallengeStore::shared(),
+            bundles: BundleStore::shared(),
             sessions: SessionStore::shared(),
             private_index: InMemoryPrivateIndex::shared(),
             chain: ChainHandle::default(),
@@ -176,6 +189,7 @@ impl KernelService {
             pending_sign_map,
             notify_map,
             challenges,
+            bundles: BundleStore::shared(),
             sessions: SessionStore::shared(),
             private_index: InMemoryPrivateIndex::shared(),
             chain,
@@ -340,20 +354,22 @@ impl KernelService {
     /// `IssueViewGrant` — consume challenge, sign §5.2 grant with `op`.
     ///
     /// Caller has already verified the action-bound OwnershipProof.
-    /// `op_sk` is the account's operational BIP-340 secret when entrusted.
+    /// The operational signing key is loaded from the process-local
+    /// [`BundleStore`] (set by `EntrustOperationalBundle`). Missing bundle
+    /// fails closed inside the domain before challenge consume.
     pub(crate) fn issue_view_grant(
         &self,
         allowed_chan_binds: &[[u8; 32]],
         now: u64,
-        op_sk: Option<&[u8; 32]>,
         command: IssueViewGrantCommand,
     ) -> KernelResult<ViewGrantIssued> {
+        let op_owned = self.bundles.op_sk(&command.subject);
         grants::issue_view_grant(
             IssueViewGrantDeps {
                 challenges: self.challenges.as_ref(),
                 allowed_chan_binds,
                 now,
-                op_sk,
+                op_sk: op_owned.as_ref(),
             },
             command,
         )
@@ -435,5 +451,81 @@ impl KernelService {
         request: SessionBoundRequest,
     ) -> KernelResult<AccountStateView> {
         access::get_account_state(self.access_deps(&[], now), request)
+    }
+
+    /// `Publish` — fee-less publisher hand-off (§7.6 / §7.8).
+    ///
+    /// Policy/crypto rejections are [`PublishOutcome::Rejected`] (successful
+    /// domain result). Fee fields must already have been refused at the
+    /// transport edge via [`publish::refuse_v1_fee_fields`].
+    ///
+    /// `policy` is supplied by the caller (gRPC edge / tests) so a node that
+    /// is not acting as a publisher can decline without inventing acceptance.
+    pub(crate) fn publish(
+        &self,
+        policy: PublishPolicy,
+        command: PublishCommand,
+    ) -> KernelResult<PublishOutcome> {
+        let network = match self.chain.network {
+            Some(n) => n,
+            None => match self.chain.identity.as_ref() {
+                Some(id) => id.network,
+                None => {
+                    return Err(KernelError::with_internal(
+                        KernelErrorCode::InternalError,
+                        "Publish requires a network pin",
+                        "KernelService has no chain.network / identity.network",
+                    ));
+                }
+            },
+        };
+        let tip_height = match self.require_chain_view() {
+            Ok(view) => Some(view.tip_height),
+            Err(_) => None,
+        };
+        publish::publish(
+            PublishConfig {
+                network,
+                tip_height,
+                policy,
+            },
+            command,
+        )
+    }
+
+    /// `EntrustOperationalBundle` — store the §7.7 bundle after challenge consume.
+    pub(crate) fn entrust_operational_bundle(
+        &self,
+        allowed_chan_binds: &[[u8; 32]],
+        now: u64,
+        command: EntrustCommand,
+    ) -> KernelResult<EntrustResult> {
+        bootstrap::entrust_operational_bundle(
+            BundleProcedureDeps {
+                challenges: self.challenges.as_ref(),
+                bundles: self.bundles.as_ref(),
+                allowed_chan_binds,
+                now,
+            },
+            command,
+        )
+    }
+
+    /// `RevokeOperationalBundle` — irreversible erase + tombstone.
+    pub(crate) fn revoke_operational_bundle(
+        &self,
+        allowed_chan_binds: &[[u8; 32]],
+        now: u64,
+        command: RevokeCommand,
+    ) -> KernelResult<RevokeResult> {
+        bootstrap::revoke_operational_bundle(
+            BundleProcedureDeps {
+                challenges: self.challenges.as_ref(),
+                bundles: self.bundles.as_ref(),
+                allowed_chan_binds,
+                now,
+            },
+            command,
+        )
     }
 }

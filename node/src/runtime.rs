@@ -99,6 +99,10 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     if let Err(e) = crate::kernel::access::validate_closed_sets() {
         anyhow::bail!("kernel access closed-set contract invalid: {e}");
     }
+    // Publisher reject-reason vocabulary (§7.6 closed `reason` set).
+    if let Err(e) = crate::kernel::publish::validate_closed_sets() {
+        anyhow::bail!("kernel publish closed-set contract invalid: {e}");
+    }
 
     let socket_addr = addr
         .parse::<SocketAddr>()

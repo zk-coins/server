@@ -12,6 +12,7 @@ pub(crate) mod grants;
 pub(crate) mod job_events;
 pub(crate) mod job_projection;
 pub(crate) mod jobs;
+pub(crate) mod publish;
 pub(crate) mod service;
 pub(crate) mod types;
 

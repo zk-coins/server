@@ -38,8 +38,8 @@ pub(crate) const CHALLENGE_TTL_SECS: u64 = 60;
 
 /// Closed set of actions a challenge may authorise.
 ///
-/// Entrust / revoke land with Block 8; they are deliberately absent so an
-/// incomplete surface cannot issue them. Pull is present for Block 7.
+/// Pull, AttestBalance, IssueViewGrant, Entrust, and Revoke each own a
+/// separate map so cross-action nonce reuse is impossible by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ChallengeAction {
     /// `POST /v1/pull/challenge` — domain `zkCoins/v1/PullChallenge`.
@@ -48,14 +48,23 @@ pub(crate) enum ChallengeAction {
     AttestBalance,
     /// `POST /v1/grants` — domain `zkCoins/v1/IssueGrantChallenge`.
     IssueViewGrant,
+    /// `POST /v1/bootstrap/challenge` action=`entrust` — domain `zkCoins/v1/EntrustChallenge`.
+    Entrust,
+    /// `POST /v1/bootstrap/challenge` action=`revoke` — domain `zkCoins/v1/RevokeChallenge`.
+    Revoke,
 }
 
 impl ChallengeAction {
     /// Every action in declaration order. Length is the closed-set contract.
-    pub(crate) const ALL: [ChallengeAction; 3] =
-        [Self::Pull, Self::AttestBalance, Self::IssueViewGrant];
+    pub(crate) const ALL: [ChallengeAction; 5] = [
+        Self::Pull,
+        Self::AttestBalance,
+        Self::IssueViewGrant,
+        Self::Entrust,
+        Self::Revoke,
+    ];
 
-    /// §5.1 / §7.5 challenge domain string for this action.
+    /// §5.1 / §7.5 / §7.7 challenge domain string for this action.
     ///
     /// Sole definition of the action-bound OwnershipProof domain separators.
     /// Callers (HTTP challenge response, signed `chal` preimage) **must**
@@ -65,6 +74,8 @@ impl ChallengeAction {
             Self::Pull => "zkCoins/v1/PullChallenge",
             Self::AttestBalance => "zkCoins/v1/AttestBalanceChallenge",
             Self::IssueViewGrant => "zkCoins/v1/IssueGrantChallenge",
+            Self::Entrust => "zkCoins/v1/EntrustChallenge",
+            Self::Revoke => "zkCoins/v1/RevokeChallenge",
         }
     }
 }
@@ -176,6 +187,10 @@ pub(crate) struct ChallengeStore {
     attest_balance: DashMap<[u8; 32], ChallengeRecord>,
     /// Nonces issued for [`ChallengeAction::IssueViewGrant`] only.
     issue_view_grant: DashMap<[u8; 32], ChallengeRecord>,
+    /// Nonces issued for [`ChallengeAction::Entrust`] only.
+    entrust: DashMap<[u8; 32], ChallengeRecord>,
+    /// Nonces issued for [`ChallengeAction::Revoke`] only.
+    revoke: DashMap<[u8; 32], ChallengeRecord>,
 }
 
 impl ChallengeStore {
@@ -184,6 +199,8 @@ impl ChallengeStore {
             pull: DashMap::new(),
             attest_balance: DashMap::new(),
             issue_view_grant: DashMap::new(),
+            entrust: DashMap::new(),
+            revoke: DashMap::new(),
         }
     }
 
@@ -196,6 +213,8 @@ impl ChallengeStore {
         match action {
             ChallengeAction::AttestBalance => &self.attest_balance,
             ChallengeAction::IssueViewGrant => &self.issue_view_grant,
+            ChallengeAction::Entrust => &self.entrust,
+            ChallengeAction::Revoke => &self.revoke,
             ChallengeAction::Pull => {
                 unreachable!("pull challenges use pull map; issue_pull / redeem_pull")
             }
@@ -211,8 +230,8 @@ impl ChallengeStore {
         nonce
     }
 
-    /// Issue a fresh single-use challenge for an **owner-action** (`AttestBalance`
-    /// or `IssueViewGrant`) and `subject`.
+    /// Issue a fresh single-use challenge for an **owner-action**
+    /// (`AttestBalance` / `IssueViewGrant` / `Entrust` / `Revoke`) and `subject`.
     ///
     /// Pull challenges must use [`Self::issue_pull`] (they bind a requested
     /// scope). [`ChallengeAction::Pull`] is rejected by the type of the
@@ -229,6 +248,8 @@ impl ChallengeStore {
         let map = match action {
             ChallengeAction::AttestBalance => &self.attest_balance,
             ChallengeAction::IssueViewGrant => &self.issue_view_grant,
+            ChallengeAction::Entrust => &self.entrust,
+            ChallengeAction::Revoke => &self.revoke,
             // Pull binds a requested scope — always use [`Self::issue_pull`].
             ChallengeAction::Pull => {
                 unreachable!("ChallengeAction::Pull requires issue_pull (requested scope)")
@@ -359,9 +380,10 @@ impl ChallengeStore {
     pub(crate) fn contains(&self, action: ChallengeAction, nonce: &[u8; 32]) -> bool {
         match action {
             ChallengeAction::Pull => self.pull.contains_key(nonce),
-            ChallengeAction::AttestBalance | ChallengeAction::IssueViewGrant => {
-                self.owner_map_for(action).contains_key(nonce)
-            }
+            ChallengeAction::AttestBalance
+            | ChallengeAction::IssueViewGrant
+            | ChallengeAction::Entrust
+            | ChallengeAction::Revoke => self.owner_map_for(action).contains_key(nonce),
         }
     }
 
@@ -370,9 +392,10 @@ impl ChallengeStore {
     pub(crate) fn len(&self, action: ChallengeAction) -> usize {
         match action {
             ChallengeAction::Pull => self.pull.len(),
-            ChallengeAction::AttestBalance | ChallengeAction::IssueViewGrant => {
-                self.owner_map_for(action).len()
-            }
+            ChallengeAction::AttestBalance
+            | ChallengeAction::IssueViewGrant
+            | ChallengeAction::Entrust
+            | ChallengeAction::Revoke => self.owner_map_for(action).len(),
         }
     }
 }
@@ -406,7 +429,15 @@ mod tests {
             ChallengeAction::IssueViewGrant.domain(),
             "zkCoins/v1/IssueGrantChallenge"
         );
-        assert_eq!(ChallengeAction::ALL.len(), 3);
+        assert_eq!(ChallengeAction::ALL.len(), 5);
+        assert_eq!(
+            ChallengeAction::Entrust.domain(),
+            "zkCoins/v1/EntrustChallenge"
+        );
+        assert_eq!(
+            ChallengeAction::Revoke.domain(),
+            "zkCoins/v1/RevokeChallenge"
+        );
         let mut seen = std::collections::HashSet::new();
         for a in ChallengeAction::ALL {
             assert!(seen.insert(a.domain()), "duplicate domain {}", a.domain());

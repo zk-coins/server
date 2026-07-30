@@ -544,12 +544,10 @@ fn lookup_session(
 /// Issue a single-use challenge for `action` + `subject`.
 ///
 /// - [`ChallengeAction::Pull`]: binds `requested_scope` (§7.5 stores it).
-/// - [`ChallengeAction::AttestBalance`] / [`ChallengeAction::IssueViewGrant`]:
-///   scope is unused (owner-action challenges); still accepted so the RPC
-///   can forward a defaulted body without inventing a second path.
-///
-/// Entrust / revoke are not in [`ChallengeAction`] (Block 8); the gRPC
-/// edge rejects those action strings before reaching this function.
+/// - Owner-actions ([`ChallengeAction::AttestBalance`],
+///   [`ChallengeAction::IssueViewGrant`], [`ChallengeAction::Entrust`],
+///   [`ChallengeAction::Revoke`]): scope is unused; still accepted so the
+///   RPC can forward a defaulted body without inventing a second path.
 pub(crate) fn open_pull_challenge(
     challenges: &ChallengeStore,
     action: ChallengeAction,
@@ -559,7 +557,10 @@ pub(crate) fn open_pull_challenge(
 ) -> IssuedChallenge {
     match action {
         ChallengeAction::Pull => challenges.issue_pull(subject, requested_scope, now),
-        ChallengeAction::AttestBalance | ChallengeAction::IssueViewGrant => {
+        ChallengeAction::AttestBalance
+        | ChallengeAction::IssueViewGrant
+        | ChallengeAction::Entrust
+        | ChallengeAction::Revoke => {
             // Owner-action maps do not store scope; drop it deliberately.
             let _ = requested_scope;
             challenges.issue(action, subject, now)
@@ -719,11 +720,13 @@ pub(crate) fn validate_closed_sets() -> Result<(), String> {
     // emitted until a credit writer exists (see `receipts` module docs).
     // Re-introduce the closed-set check with the SubscribeReceipts writer.
 
-    let actions: [WireEntry; 3] = ChallengeAction::ALL.map(|a| WireEntry {
+    let actions: [WireEntry; 5] = ChallengeAction::ALL.map(|a| WireEntry {
         label: match a {
             ChallengeAction::Pull => "Pull",
             ChallengeAction::AttestBalance => "AttestBalance",
             ChallengeAction::IssueViewGrant => "IssueViewGrant",
+            ChallengeAction::Entrust => "Entrust",
+            ChallengeAction::Revoke => "Revoke",
         },
         wire: a.domain(),
     });
