@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
+use crate::kernel::grants::GrantScope;
 use crate::kernel::types::{ChanBind, SubjectAddress};
 use crate::kernel::{KernelError, KernelErrorCode};
 
@@ -37,10 +38,12 @@ pub(crate) const CHALLENGE_TTL_SECS: u64 = 60;
 
 /// Closed set of actions a challenge may authorise.
 ///
-/// New actions (pull, entrust, revoke) land with their own blocks; they are
-/// deliberately absent here so an incomplete surface cannot issue them.
+/// Entrust / revoke land with Block 8; they are deliberately absent so an
+/// incomplete surface cannot issue them. Pull is present for Block 7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ChallengeAction {
+    /// `POST /v1/pull/challenge` — domain `zkCoins/v1/PullChallenge`.
+    Pull,
     /// `POST /v1/attest/balance` — domain `zkCoins/v1/AttestBalanceChallenge`.
     AttestBalance,
     /// `POST /v1/grants` — domain `zkCoins/v1/IssueGrantChallenge`.
@@ -48,6 +51,10 @@ pub(crate) enum ChallengeAction {
 }
 
 impl ChallengeAction {
+    /// Every action in declaration order. Length is the closed-set contract.
+    pub(crate) const ALL: [ChallengeAction; 3] =
+        [Self::Pull, Self::AttestBalance, Self::IssueViewGrant];
+
     /// §5.1 / §7.5 challenge domain string for this action.
     ///
     /// Sole definition of the action-bound OwnershipProof domain separators.
@@ -55,13 +62,14 @@ impl ChallengeAction {
     /// take the string from here — never re-declare it beside this enum.
     pub(crate) const fn domain(self) -> &'static str {
         match self {
+            Self::Pull => "zkCoins/v1/PullChallenge",
             Self::AttestBalance => "zkCoins/v1/AttestBalanceChallenge",
             Self::IssueViewGrant => "zkCoins/v1/IssueGrantChallenge",
         }
     }
 }
 
-/// Server-side record for one issued challenge.
+/// Server-side record for owner-action challenges (attest / issue-grant).
 ///
 /// `action` is **not** stored here: the map identity is the action. That is
 /// the structural binding.
@@ -69,6 +77,15 @@ impl ChallengeAction {
 struct ChallengeRecord {
     subject: SubjectAddress,
     expiry: u64,
+}
+
+/// Server-side record for a pull challenge (§7.5 stores requested scope).
+#[derive(Clone, Debug)]
+struct PullChallengeRecord {
+    subject: SubjectAddress,
+    expiry: u64,
+    /// Scope the requester asked for at `OpenPullChallenge` time.
+    requested_scope: GrantScope,
 }
 
 /// Outcome of a successful issue.
@@ -79,12 +96,20 @@ pub(crate) struct IssuedChallenge {
     pub action: ChallengeAction,
 }
 
-/// Outcome of a successful single-use redeem.
+/// Outcome of a successful single-use redeem (owner-action challenges).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RedeemedChallenge {
     pub subject: SubjectAddress,
     pub expiry: u64,
     pub action: ChallengeAction,
+}
+
+/// Outcome of a successful single-use pull-challenge redeem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RedeemedPullChallenge {
+    pub subject: SubjectAddress,
+    pub expiry: u64,
+    pub requested_scope: GrantScope,
 }
 
 /// Typed consume failure — cause identity, never message-text parsing.
@@ -145,6 +170,8 @@ impl std::error::Error for ChallengeConsumeError {}
 /// migration and is out of scope for this block.
 #[derive(Debug, Default)]
 pub(crate) struct ChallengeStore {
+    /// Nonces issued for [`ChallengeAction::Pull`] only (carry requested scope).
+    pull: DashMap<[u8; 32], PullChallengeRecord>,
     /// Nonces issued for [`ChallengeAction::AttestBalance`] only.
     attest_balance: DashMap<[u8; 32], ChallengeRecord>,
     /// Nonces issued for [`ChallengeAction::IssueViewGrant`] only.
@@ -154,6 +181,7 @@ pub(crate) struct ChallengeStore {
 impl ChallengeStore {
     pub(crate) fn new() -> Self {
         Self {
+            pull: DashMap::new(),
             attest_balance: DashMap::new(),
             issue_view_grant: DashMap::new(),
         }
@@ -164,14 +192,31 @@ impl ChallengeStore {
         Arc::new(Self::new())
     }
 
-    fn map_for(&self, action: ChallengeAction) -> &DashMap<[u8; 32], ChallengeRecord> {
+    fn owner_map_for(&self, action: ChallengeAction) -> &DashMap<[u8; 32], ChallengeRecord> {
         match action {
             ChallengeAction::AttestBalance => &self.attest_balance,
             ChallengeAction::IssueViewGrant => &self.issue_view_grant,
+            ChallengeAction::Pull => {
+                unreachable!("pull challenges use pull map; issue_pull / redeem_pull")
+            }
         }
     }
 
-    /// Issue a fresh single-use challenge for `action` and `subject`.
+    fn fresh_nonce() -> [u8; 32] {
+        let mut nonce = [0u8; 32];
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        nonce[..16].copy_from_slice(a.as_bytes());
+        nonce[16..].copy_from_slice(b.as_bytes());
+        nonce
+    }
+
+    /// Issue a fresh single-use challenge for an **owner-action** (`AttestBalance`
+    /// or `IssueViewGrant`) and `subject`.
+    ///
+    /// Pull challenges must use [`Self::issue_pull`] (they bind a requested
+    /// scope). [`ChallengeAction::Pull`] is rejected by the type of the
+    /// owner-action map path and must never be passed here.
     ///
     /// `expiry = now + CHALLENGE_TTL_SECS` (§5.1 RECOMMENDED 60s). Nonce is
     /// 32 CSPRNG bytes (two UUID v4 values) — no fixed-nonce fallback.
@@ -181,15 +226,18 @@ impl ChallengeStore {
         subject: SubjectAddress,
         now: u64,
     ) -> IssuedChallenge {
-        let mut nonce = [0u8; 32];
-        let a = uuid::Uuid::new_v4();
-        let b = uuid::Uuid::new_v4();
-        nonce[..16].copy_from_slice(a.as_bytes());
-        nonce[16..].copy_from_slice(b.as_bytes());
+        let map = match action {
+            ChallengeAction::AttestBalance => &self.attest_balance,
+            ChallengeAction::IssueViewGrant => &self.issue_view_grant,
+            // Pull binds a requested scope — always use [`Self::issue_pull`].
+            ChallengeAction::Pull => {
+                unreachable!("ChallengeAction::Pull requires issue_pull (requested scope)")
+            }
+        };
+        let nonce = Self::fresh_nonce();
         // Saturating: a clock near u64::MAX must not wrap expiry into the past.
         let expiry = now.saturating_add(CHALLENGE_TTL_SECS);
-        self.map_for(action)
-            .insert(nonce, ChallengeRecord { subject, expiry });
+        map.insert(nonce, ChallengeRecord { subject, expiry });
         IssuedChallenge {
             nonce,
             expiry,
@@ -197,7 +245,31 @@ impl ChallengeStore {
         }
     }
 
-    /// Atomically consume a challenge for **exactly** `action`.
+    /// Issue a pull challenge bound to `subject` + `requested_scope` (§7.5).
+    pub(crate) fn issue_pull(
+        &self,
+        subject: SubjectAddress,
+        requested_scope: GrantScope,
+        now: u64,
+    ) -> IssuedChallenge {
+        let nonce = Self::fresh_nonce();
+        let expiry = now.saturating_add(CHALLENGE_TTL_SECS);
+        self.pull.insert(
+            nonce,
+            PullChallengeRecord {
+                subject,
+                expiry,
+                requested_scope,
+            },
+        );
+        IssuedChallenge {
+            nonce,
+            expiry,
+            action: ChallengeAction::Pull,
+        }
+    }
+
+    /// Atomically consume an owner-action challenge for **exactly** `action`.
     ///
     /// # Checks (after the atomic take)
     ///
@@ -212,6 +284,8 @@ impl ChallengeStore {
     /// `DashMap::remove` is one atomic map operation. Concurrent redeems of
     /// the same `(action, nonce)`: exactly one returns `Ok`; every other
     /// returns [`UnknownOrConsumed`]. No separate read/check/write steps.
+    ///
+    /// Pull nonces are unfindable here — use [`Self::redeem_pull`].
     pub(crate) fn redeem(
         &self,
         action: ChallengeAction,
@@ -221,9 +295,13 @@ impl ChallengeStore {
         allowed_chan_binds: &[[u8; 32]],
         now: u64,
     ) -> Result<RedeemedChallenge, ChallengeConsumeError> {
+        if matches!(action, ChallengeAction::Pull) {
+            // Structural: pull map is never consulted by owner-action redeem.
+            return Err(ChallengeConsumeError::UnknownOrConsumed);
+        }
         // Atomic take — structural action binding: wrong-action maps are
         // never consulted, so a foreign-action nonce is unfindable here.
-        let record = match self.map_for(action).remove(nonce) {
+        let record = match self.owner_map_for(action).remove(nonce) {
             Some((_, r)) => r,
             None => return Err(ChallengeConsumeError::UnknownOrConsumed),
         };
@@ -245,16 +323,57 @@ impl ChallengeStore {
         })
     }
 
+    /// Atomically consume a pull challenge. Returns the stored requested scope.
+    pub(crate) fn redeem_pull(
+        &self,
+        nonce: &[u8; 32],
+        subject: &SubjectAddress,
+        chan_bind: &ChanBind,
+        allowed_chan_binds: &[[u8; 32]],
+        now: u64,
+    ) -> Result<RedeemedPullChallenge, ChallengeConsumeError> {
+        let record = match self.pull.remove(nonce) {
+            Some((_, r)) => r,
+            None => return Err(ChallengeConsumeError::UnknownOrConsumed),
+        };
+
+        if record.expiry < now {
+            return Err(ChallengeConsumeError::Expired);
+        }
+        if record.subject != *subject {
+            return Err(ChallengeConsumeError::SubjectMismatch);
+        }
+        if !chan_bind_allowed(chan_bind, allowed_chan_binds) {
+            return Err(ChallengeConsumeError::ChanBindMismatch);
+        }
+
+        Ok(RedeemedPullChallenge {
+            subject: record.subject,
+            expiry: record.expiry,
+            requested_scope: record.requested_scope,
+        })
+    }
+
     /// Test / diagnostics: whether `nonce` is still live for `action`.
     #[cfg(test)]
     pub(crate) fn contains(&self, action: ChallengeAction, nonce: &[u8; 32]) -> bool {
-        self.map_for(action).contains_key(nonce)
+        match action {
+            ChallengeAction::Pull => self.pull.contains_key(nonce),
+            ChallengeAction::AttestBalance | ChallengeAction::IssueViewGrant => {
+                self.owner_map_for(action).contains_key(nonce)
+            }
+        }
     }
 
     /// Test: number of live challenges for `action`.
     #[cfg(test)]
     pub(crate) fn len(&self, action: ChallengeAction) -> usize {
-        self.map_for(action).len()
+        match action {
+            ChallengeAction::Pull => self.pull.len(),
+            ChallengeAction::AttestBalance | ChallengeAction::IssueViewGrant => {
+                self.owner_map_for(action).len()
+            }
+        }
     }
 }
 
@@ -278,6 +397,7 @@ mod tests {
 
     #[test]
     fn action_domains_are_distinct_and_closed() {
+        assert_eq!(ChallengeAction::Pull.domain(), "zkCoins/v1/PullChallenge");
         assert_eq!(
             ChallengeAction::AttestBalance.domain(),
             "zkCoins/v1/AttestBalanceChallenge"
@@ -286,10 +406,12 @@ mod tests {
             ChallengeAction::IssueViewGrant.domain(),
             "zkCoins/v1/IssueGrantChallenge"
         );
-        assert_ne!(
-            ChallengeAction::AttestBalance.domain(),
-            ChallengeAction::IssueViewGrant.domain()
-        );
+        assert_eq!(ChallengeAction::ALL.len(), 3);
+        let mut seen = std::collections::HashSet::new();
+        for a in ChallengeAction::ALL {
+            assert!(seen.insert(a.domain()), "duplicate domain {}", a.domain());
+            assert!(!a.domain().is_empty());
+        }
     }
 
     #[test]
@@ -577,5 +699,77 @@ mod tests {
             !store.contains(ChallengeAction::AttestBalance, &issued.nonce),
             "nonce must not remain findable after redeem"
         );
+    }
+
+    #[test]
+    fn issue_pull_binds_requested_scope_and_is_single_use() {
+        let store = ChallengeStore::new();
+        let now = 100u64;
+        let scope = GrantScope {
+            assets: crate::kernel::grants::GrantAssetScope::Selected(vec![
+                crate::kernel::types::Digest32([0x11; 32]),
+            ]),
+            not_before: 10,
+            not_after: 99,
+        };
+        let issued = store.issue_pull(subject(0x42), scope.clone(), now);
+        assert_eq!(issued.action, ChallengeAction::Pull);
+        assert_eq!(issued.expiry, now + CHALLENGE_TTL_SECS);
+        assert!(store.contains(ChallengeAction::Pull, &issued.nonce));
+        assert_eq!(store.len(ChallengeAction::Pull), 1);
+
+        let allowed = [[0xCBu8; 32]];
+        let redeemed = store
+            .redeem_pull(
+                &issued.nonce,
+                &subject(0x42),
+                &ChanBind(allowed[0]),
+                &allowed,
+                now,
+            )
+            .expect("redeem_pull");
+        assert_eq!(redeemed.requested_scope, scope);
+        assert_eq!(redeemed.subject, subject(0x42));
+
+        // Single-use: second redeem is unknown/consumed.
+        let err = store
+            .redeem_pull(
+                &issued.nonce,
+                &subject(0x42),
+                &ChanBind(allowed[0]),
+                &allowed,
+                now,
+            )
+            .expect_err("second redeem");
+        assert_eq!(err, ChallengeConsumeError::UnknownOrConsumed);
+        assert!(!store.contains(ChallengeAction::Pull, &issued.nonce));
+        assert_eq!(store.len(ChallengeAction::Pull), 0);
+    }
+
+    #[test]
+    fn issue_pull_nonce_is_unfindable_via_owner_redeem() {
+        let store = ChallengeStore::new();
+        let now = 50u64;
+        let scope = GrantScope {
+            assets: crate::kernel::grants::GrantAssetScope::All,
+            not_before: 0,
+            not_after: crate::kernel::grants::SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        let issued = store.issue_pull(subject(1), scope, now);
+        let allowed = [[1u8; 32]];
+        // Structural action binding: pull nonce is not in owner maps.
+        let err = store
+            .redeem(
+                ChallengeAction::AttestBalance,
+                &issued.nonce,
+                &subject(1),
+                &ChanBind(allowed[0]),
+                &allowed,
+                now,
+            )
+            .expect_err("pull nonce must not redeem as attest");
+        assert_eq!(err, ChallengeConsumeError::UnknownOrConsumed);
+        // Pull nonce still live.
+        assert!(store.contains(ChallengeAction::Pull, &issued.nonce));
     }
 }

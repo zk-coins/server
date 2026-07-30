@@ -5,21 +5,22 @@
 //! API-layer only; this module consumes nonce/`chan_bind` and signs a
 //! §5.2 view grant with the account's operational key `op`.
 //!
-//! ## What a grant unlocks today
+//! ## What a grant unlocks
 //!
 //! Reading procedures that honour a grant (`Pull`, `GetRecord`,
-//! `GetCoinProof`, `SubscribeReceipts`) land in Block 7. Until then a
-//! successfully issued grant **unlocks nothing** on this node: there is
-//! no pull-session store and no scope interceptor. That is intentional
-//! fail-closed — not an accidental full-account open.
+//! `GetCoinProof`) live in [`crate::kernel::access`]. (`SubscribeReceipts`
+//! will join them once a credit writer exists — see `access::receipts`.)
+//! A grant session is issued at `Pull` with
+//! [`SessionAuthority::Grant`](crate::kernel::access::SessionAuthority::Grant);
+//! scope is enforced there. This module only **issues** the Bech32m grant.
 //!
 //! ## Scope / revocation
 //!
 //! - Scope shape and unbounded sentinels are taken from §5.1 / §5.2.
-//! - Revocation is a node-local set (§5.2); no revocation API is wired in
-//!   this block (reported as a GAP). Issued grants carry `expiry`.
+//! - Revocation is a node-local set (§5.2); no revocation API is wired
+//!   (reported as a GAP). Issued grants carry `expiry`.
 //! - `scope_exceeded` (403) applies when a grant is **used** beyond its
-//!   scope; use-time enforcement is Block 7. This module only **issues**.
+//!   scope — enforced in `kernel::access`, not here.
 //!
 //! No `axum`, no `tonic`.
 
@@ -422,7 +423,7 @@ mod tests {
                 chan_bind: ChanBind(allowed[0]),
             },
         )
-        .expect("issue");
+        .expect("issue_view_grant");
 
         assert!(
             out.grant_bech32m.starts_with("zkgrant1"),

@@ -32,19 +32,19 @@ Boot: gRPC startet **nur** aus `start_rest_node` via
 | `GET /v1/jobs/<id>/stream` | `StreamJob` | server-stream | **ja** — `kernel_rpc::stream_job` → `DomainKernel::stream_job` / `JobEventHub` → `job_event_to_proto` (live nur mit shared Notify-Map) | ja: `stream_job_v1_handler` |
 | `POST /v1/jobs/<id>/sign` | `SignTransition` | unary | **ja** — `kernel_rpc::sign_transition` → `DomainKernel::sign_transition` → `job_to_proto` (Width 64/32 am gRPC-Rand). **Feature-Gate am gRPC-Rand** (vor Domäne): bei inaktivem V1-Claim (`!v1_sign_route_active()`) `Status::unimplemented` mit Meldung, die `ZKCOINS_V1_SHADOW` / `ScanStackMode::V1` nennt und **nicht** den Text `not yet implemented` der unverdrahteten Prozeduren — analog HTTP `feature_disabled` (kein `KernelErrorCode`) | ja: `jobs_sign_handler` → Flag-Gate `feature_disabled` / 404 → `kernel/jobs/sign`; `accept_wallet_transition_signature` |
 | `POST /v1/jobs/<id>/cancel` | `CancelJob` | unary | **ja** — `kernel_rpc::cancel_job` → `DomainKernel::cancel_job` (`CancelPolicy::NotYetPublished`) → `job_to_proto` | ja: `jobs_cancel_v1_handler` |
-| `POST /v1/pull/challenge` | `OpenPullChallenge` | unary | **nein** — fehlt Challenge-Domain + generisches OpenPull | **nicht vorhanden** |
-| `POST /v1/pull` | `Pull` | unary | **nein** — fehlt Pull-Domain | **nicht vorhanden** |
-| `GET /v1/record/<record_id>` | `GetRecord` | unary | **nein** — fehlt Record-Lookup-Domain | **nicht vorhanden** |
-| `GET /v1/proof/<coin_id>` | `GetCoinProof` | unary | **nein** — fehlt session-gated proof Domain (§7.5) | Legacy 410: `get_proof_handler` |
-| `GET /v1/account/state` | `GetAccountState` | unary | **nein** — fehlt ownership-gated Domain über Engine-Accounts | Engine: `state_engine::account` |
-| `GET /v1/receipts/stream` | `SubscribeReceipts` | server-stream | **nein** — fehlt Receipt-Hub/Domain-Stream | **nicht vorhanden** |
+| `POST /v1/pull/challenge` | `OpenPullChallenge` | unary | **ja** — Domain `open_pull_challenge` / `ChallengeStore::issue_pull` (Pull) bzw. `issue` (AttestBalance / IssueViewGrant). `entrust`/`revoke` → `Unimplemented` (Block 8, ChallengeAction-Menge hat sie nicht) | **nicht vorhanden** (gRPC only heute) |
+| `POST /v1/pull` | `Pull` | unary | **ja** — Domain-Pull (Challenge-Consume + Session-Issue); Authority via Metadata `x-zkcoins-session-authority` (Proto-GAP) | **nicht vorhanden** |
+| `GET /v1/record/<record_id>` | `GetRecord` | unary | **ja** — session-gated Domain; Index process-local/leer bis Katalog | **nicht vorhanden** |
+| `GET /v1/proof/<coin_id>` | `GetCoinProof` | unary | **ja** — session-gated Domain | Legacy 410: `get_proof_handler` |
+| `GET /v1/account/state` | `GetAccountState` | unary | **ja** — ownership-only via `ActiveSession::require_ownership` (enum-Diskriminante) | Engine: `state_engine::account` |
+| `GET /v1/receipts/stream` | `SubscribeReceipts` | server-stream | **nein** — fehlt ein **Receive/Decrypt-Index-Writer**, der nach dauerhaftem Persist (§4.8) verifizierte Credits veröffentlicht (§4.9). Ohne Writer darf kein Abonnement angenommen werden (kein leerer Stream). Domain-Fan-out existiert bewusst nicht. gRPC: `Unimplemented` mit dieser Voraussetzung | **nicht vorhanden** |
 | `POST /v1/publish/spendrecord` (§7.6) | `Publish` | unary | **nein** — fehlt permissionless SpendRecord-Hand-off Domain | intern: `publish_v1_batch` (crate-private self-publish) |
-| `POST /v1/bootstrap/challenge` (§7.7) | `OpenPullChallenge` (`action` = entrust/revoke) | unary | **nein** — siehe `OpenPullChallenge` | **nicht vorhanden** |
+| `POST /v1/bootstrap/challenge` (§7.7) | `OpenPullChallenge` (`action` = entrust/revoke) | unary | **nein** — `entrust`/`revoke` am `OpenPullChallenge`-Rand: `Unimplemented` (Block 8) | **nicht vorhanden** |
 | `POST /v1/bootstrap/entrust` (§7.7) | `EntrustOperationalBundle` | unary | **nein** — fehlt Bundle-Persistenz-Domain unter §7.7 | intern Tests/Account-Rows, kein Endpoint |
 | `POST /v1/bootstrap/revoke` (§7.7) | `RevokeOperationalBundle` | unary | **nein** — fehlt Revoke-Domain | **nicht vorhanden** |
-| `POST /v1/attest/balance/challenge` | `OpenPullChallenge` (`action` = `attest_balance`) | unary | **nein** — generisches OpenPull fehlt; attest-Challenge nur REST | ja: `attest_balance_challenge_handler` |
+| `POST /v1/attest/balance/challenge` | `OpenPullChallenge` (`action` = `attest_balance`) | unary | **ja** — siehe `OpenPullChallenge` | ja: `attest_balance_challenge_handler` |
 | `POST /v1/attest/balance` | `AttestBalance` | unary | **ja** — Domain-Attest-Fassade + Proto-Mapping | ja: `attest_balance_handler`; `issue_attest_challenge` / `prove_attestation_for_job` |
-| `POST /v1/grants/challenge` | `OpenPullChallenge` (`action` = `issue_grant`) | unary | **nein** — siehe `OpenPullChallenge` | **nicht vorhanden** |
+| `POST /v1/grants/challenge` | `OpenPullChallenge` (`action` = `issue_grant`) | unary | **ja** — siehe `OpenPullChallenge` | **nicht vorhanden** (gRPC only heute) |
 | `POST /v1/grants` | `IssueViewGrant` | unary | **ja** — Domain-Grant (ohne `op_sk` fail-closed vor Challenge-Consume) | **nicht vorhanden** (gRPC only heute) |
 
 ## Blossom (§7.4) — kein Kernel-RPC in §7.8
@@ -57,10 +57,10 @@ Die REST-Keys `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delet
 
 | Kriterium | Prozeduren | Zahl |
 |---|---|---|
-| **gRPC verdrahtet** (Domain + Proto, kein `unimplemented` auf dem Happy-Path) | `GetJob`, `StreamJob`, `CancelJob`, `SignTransition`, `SubmitTransition`, `AttestBalance`, `IssueViewGrant`, `GetInfo`, `GetAccumulator`, `GetNullifierPath` | **10** |
-| gRPC `Unimplemented` mit benannter Voraussetzung | `ListInscriptions` (Inschriften-Katalog: Reveal-Txid + §3.5-Format; NfLog trägt beides nicht) + übrige unverdrahtete Prozeduren | **10** |
+| **gRPC verdrahtet** (Domain + Proto, kein `unimplemented` auf dem Happy-Path) | `GetJob`, `StreamJob`, `CancelJob`, `SignTransition`, `SubmitTransition`, `AttestBalance`, `IssueViewGrant`, `GetInfo`, `GetAccumulator`, `GetNullifierPath`, `OpenPullChallenge`, `Pull`, `GetRecord`, `GetCoinProof`, `GetAccountState` | **15** |
+| gRPC `Unimplemented` mit benannter Voraussetzung | `ListInscriptions` (Inschriften-Katalog), `SubscribeReceipts` (Credit-Writer nach Persist), `Publish`, `EntrustOperationalBundle`, `RevokeOperationalBundle` | **5** |
 
-**Kurzfassung:** **10 von 20** Kernel-Prozeduren sind gRPC-verdrahtet. `ListInscriptions` ist **nicht** verdrahtet, weil ein ehrlicher Answer den beim Scanner-Falten geschriebenen Inschriften-Katalog braucht (Reveal-Txid, §3.5-Format, Mitglieder). Platzhalter-Txids und heuristische Formate sind verboten. `SignTransition` hat zusätzlich ein **API-Rand-Feature-Gate**: bei inaktivem V1-Claim `Unimplemented` mit `ZKCOINS_V1_SHADOW` in der Meldung (ohne `not yet implemented`) — nicht dasselbe wie unverdrahtet. Server-Boot nur über `start_rest_node` + shared Hub + pending-sign-Map — kein stummer pool-only-Stream-Pfad.
+**Kurzfassung:** **15 von 20** Kernel-Prozeduren sind gRPC-verdrahtet. `SubscribeReceipts` ist **nicht** verdrahtet, weil ein ehrlicher Stream einen Producer braucht, der nach §4.8-Persist und §2.3.3-Verifikation verifizierte Credits publiziert — der existiert heute nicht; ein leeres Abonnement wäre die freundliche Lüge von Block 2. Writer-Vertrag: `kernel::access::receipts`. `OpenPullChallenge` ist verdrahtet, damit die Pull-Kette erreichbar ist (`issue_pull` → `Pull` → Session). `SignTransition` hat zusätzlich ein **API-Rand-Feature-Gate**: bei inaktivem V1-Claim `Unimplemented` mit `ZKCOINS_V1_SHADOW` in der Meldung (ohne `not yet implemented`) — nicht dasselbe wie unverdrahtet. Server-Boot nur über `start_rest_node` + shared Hub + pending-sign-Map — kein stummer pool-only-Stream-Pfad.
 
 ## API-lokale Endpunkte (explizit ohne Kernel)
 

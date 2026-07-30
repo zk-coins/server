@@ -1,7 +1,7 @@
 //! Transport-free kernel types for job procedures (Block 1–4).
 //!
 //! [`TransitionCommand`] / [`SignTransition`] / job projection types live
-//! here. Challenge / Pull types land with later blocks.
+//! here. Pull / session / record types live in [`crate::kernel::access`].
 //! This module must not import `axum` or `tonic`.
 
 use std::pin::Pin;

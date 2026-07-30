@@ -3,6 +3,7 @@
 //! Visibility is `pub(crate)` throughout so the public-surface allowlist
 //! does not move. This tree must not depend on `axum` or `tonic`.
 
+pub(crate) mod access;
 pub(crate) mod attestation;
 pub(crate) mod bootstrap;
 pub(crate) mod chain;

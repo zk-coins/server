@@ -6,14 +6,20 @@
 //! `Status::unimplemented("<Name>: not yet implemented")` — never an
 //! invented `Ok(...)` payload.
 //!
-//! Wired today (Block 4–6): `GetJob`, `StreamJob`, `CancelJob`,
+//! Wired today (Block 4–7): `GetJob`, `StreamJob`, `CancelJob`,
 //! `SignTransition`, `SubmitTransition`, `AttestBalance`, `IssueViewGrant`,
-//! `GetInfo`, `GetAccumulator`, `GetNullifierPath`.
+//! `GetInfo`, `GetAccumulator`, `GetNullifierPath`, `OpenPullChallenge`,
+//! `Pull`, `GetRecord`, `GetCoinProof`, `GetAccountState`.
 //! `ListInscriptions` stays `Unimplemented` until a scanner-written
 //! inscription catalog supplies reveal txid and §3.5 format (NfLog has
-//! neither — see `kernel::chain` module docs). Wired procedures call the
-//! transport-neutral domain façade and map through `transport/grpc/`
-//! converters + the shared error contract.
+//! neither — see `kernel::chain` module docs). `SubscribeReceipts` stays
+//! `Unimplemented` until a receive/decrypt-index writer exists that emits
+//! verified credits **after** durable persist (§4.8 / §4.9) — accepting a
+//! subscription with no producer is a silent empty stream (worse than
+//! naming the missing prerequisite; full writer contract in
+//! `kernel::access::receipts`). Wired procedures call the transport-neutral
+//! domain façade and map through `transport/grpc/` converters + the shared
+//! error contract.
 //!
 //! The existing HTTP router is untouched; this is an additive internal
 //! surface only (Kernel/API split is a later step).
@@ -39,17 +45,23 @@ use uuid::Uuid;
 
 use crate::job_dispatcher::JobEnvelope;
 use crate::job_store::JobStore;
+use crate::kernel::bootstrap::ChallengeAction;
+use crate::kernel::grants::{GrantAssetScope, GrantScope, SCOPE_NOT_AFTER_UNBOUNDED};
+use crate::kernel::types::{Digest32, SubjectAddress};
 use crate::kernel::{
     CancelPolicy, JobId, JobRequest as DomainJobRequest, KernelError, KernelErrorCode,
     KernelService as DomainKernel,
 };
 use crate::transport::grpc::{
-    accumulator_tip_to_proto, job_event_to_proto, job_to_proto, kernel_error_to_status,
-    kernel_info_to_proto, nullifier_path_to_proto, parse_attest_request, parse_grant_request,
-    parse_list_inscriptions_request, parse_nullifier_path_request, parse_sign_request,
-    parse_transition_request,
+    account_state_to_proto, accumulator_tip_to_proto, coin_proof_blob_to_proto, job_event_to_proto,
+    job_to_proto, kernel_error_to_status, kernel_info_to_proto, nullifier_path_to_proto,
+    parse_attest_request, parse_coin_proof_request, parse_grant_request,
+    parse_list_inscriptions_request, parse_nullifier_path_request, parse_pull_request,
+    parse_record_request, parse_session_authority, parse_session_bound, parse_sign_request,
+    parse_transition_request, pull_result_to_proto, record_blob_to_proto,
 };
 use crate::v1::PendingSignMap;
+use shared::spec_v1::Address;
 use tokio::sync::mpsc;
 
 /// Environment variable that selects the kernel gRPC listen address.
@@ -146,6 +158,129 @@ impl GrpcKernelService {
 
 fn not_yet(procedure: &'static str) -> Status {
     Status::unimplemented(format!("{procedure}: not yet implemented"))
+}
+
+/// Parsed `OpenPullChallenge` body (domain types only — no proto on kernel).
+struct OpenPullChallengeParsed {
+    subject: SubjectAddress,
+    action: ChallengeAction,
+    requested_scope: GrantScope,
+}
+
+/// Parse outcome for `OpenPullChallenge`.
+///
+/// Block-8 actions are a distinct branch so the RPC can answer
+/// `Unimplemented` with a named prerequisite instead of minting a challenge
+/// or collapsing into `malformed_request`.
+enum OpenPullChallengeParse {
+    Ready(OpenPullChallengeParsed),
+    /// `entrust` / `revoke` — ChallengeAction closed set has no variant yet.
+    ActionNotYet(&'static str),
+    Err(KernelError),
+}
+
+/// Parse `PullChallengeRequest` into domain types.
+///
+/// Action strings:
+/// - `""` / `"pull"` → [`ChallengeAction::Pull`]
+/// - `"attest_balance"` → [`ChallengeAction::AttestBalance`]
+/// - `"issue_grant"` → [`ChallengeAction::IssueViewGrant`]
+/// - `"entrust"` / `"revoke"` → [`OpenPullChallengeParse::ActionNotYet`]
+/// - anything else → `malformed_request`
+///
+/// Omitted `requested_scope` normalises to `*` / unbounded (§7.5) for pull.
+fn parse_open_pull_challenge(req: PullChallengeRequest) -> OpenPullChallengeParse {
+    let subject = {
+        let trimmed = req.subject.trim();
+        if trimmed.is_empty() {
+            return OpenPullChallengeParse::Err(KernelError::new(
+                KernelErrorCode::MalformedRequest,
+                "subject is required",
+            ));
+        }
+        match Address::from_bech32m(trimmed) {
+            Ok(addr) => SubjectAddress(addr.0),
+            Err(e) => {
+                return OpenPullChallengeParse::Err(KernelError::new(
+                    KernelErrorCode::MalformedRequest,
+                    format!("subject must be a Bech32m zk-address: {e}"),
+                ));
+            }
+        }
+    };
+
+    let action_raw = req.action.trim();
+    let action = match action_raw {
+        "" | "pull" => ChallengeAction::Pull,
+        "attest_balance" => ChallengeAction::AttestBalance,
+        "issue_grant" => ChallengeAction::IssueViewGrant,
+        "entrust" => return OpenPullChallengeParse::ActionNotYet("entrust"),
+        "revoke" => return OpenPullChallengeParse::ActionNotYet("revoke"),
+        other => {
+            return OpenPullChallengeParse::Err(KernelError::new(
+                KernelErrorCode::MalformedRequest,
+                format!(
+                    "action must be empty/\"pull\"|\"attest_balance\"|\"issue_grant\" \
+                     (or entrust/revoke when Block 8 lands); got {other:?}"
+                ),
+            ));
+        }
+    };
+
+    let requested_scope = match req.requested_scope {
+        None => GrantScope {
+            // §7.5: omitted scope = "*" / unbounded.
+            assets: GrantAssetScope::All,
+            not_before: 0,
+            not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+        },
+        Some(scope) => {
+            let assets = if scope.all_assets {
+                if !scope.asset_ids.is_empty() {
+                    return OpenPullChallengeParse::Err(KernelError::new(
+                        KernelErrorCode::MalformedRequest,
+                        "scope.all_assets=true must not carry asset_ids",
+                    ));
+                }
+                GrantAssetScope::All
+            } else if scope.asset_ids.is_empty() {
+                return OpenPullChallengeParse::Err(KernelError::new(
+                    KernelErrorCode::MalformedRequest,
+                    "scope must set all_assets or a non-empty asset_ids list",
+                ));
+            } else {
+                let mut ids = Vec::with_capacity(scope.asset_ids.len());
+                for (i, raw) in scope.asset_ids.iter().enumerate() {
+                    let arr = match <[u8; 32]>::try_from(raw.as_slice()) {
+                        Ok(a) => a,
+                        Err(_) => {
+                            return OpenPullChallengeParse::Err(KernelError::new(
+                                KernelErrorCode::MalformedRequest,
+                                format!(
+                                    "scope.asset_ids[{i}] must be exactly 32 bytes; got {}",
+                                    raw.len()
+                                ),
+                            ));
+                        }
+                    };
+                    ids.push(Digest32(arr));
+                }
+                GrantAssetScope::Selected(ids)
+            };
+            GrantScope {
+                assets,
+                not_before: scope.not_before,
+                // Proto3 zero default for not_after is a closed epoch window.
+                not_after: scope.not_after,
+            }
+        }
+    };
+
+    OpenPullChallengeParse::Ready(OpenPullChallengeParsed {
+        subject,
+        action,
+        requested_scope,
+    })
 }
 
 /// Parse proto `JobRequest.job_id` into a domain request.
@@ -327,34 +462,105 @@ impl Kernel for GrpcKernelService {
 
     async fn open_pull_challenge(
         &self,
-        _request: Request<PullChallengeRequest>,
+        request: Request<PullChallengeRequest>,
     ) -> Result<Response<Challenge>, Status> {
-        Err(not_yet("OpenPullChallenge"))
+        let parsed = match parse_open_pull_challenge(request.into_inner()) {
+            OpenPullChallengeParse::Ready(p) => p,
+            OpenPullChallengeParse::ActionNotYet(action) => {
+                return Err(Status::unimplemented(format!(
+                    "OpenPullChallenge: not yet implemented — action={action:?} \
+                     requires operational-bundle entrust/revoke (Block 8); \
+                     ChallengeAction closed set is Pull|AttestBalance|IssueViewGrant only"
+                )));
+            }
+            OpenPullChallengeParse::Err(e) => return Err(map_domain_err(e)),
+        };
+        let now = crate::v1::unix_now();
+        let issued = self.domain.open_pull_challenge(
+            now,
+            parsed.action,
+            parsed.subject,
+            parsed.requested_scope,
+        );
+        Ok(Response::new(Challenge {
+            nonce: issued.nonce.to_vec(),
+            expiry: issued.expiry,
+            domain: issued.action.domain().to_string(),
+        }))
     }
 
-    async fn pull(&self, _request: Request<PullRequest>) -> Result<Response<PullResult>, Status> {
-        Err(not_yet("Pull"))
+    async fn pull(&self, request: Request<PullRequest>) -> Result<Response<PullResult>, Status> {
+        // Proto GAP: PullRequest has no ownership/grant field. The trusted
+        // API layer supplies it via metadata key `x-zkcoins-session-authority`
+        // (`ownership` | `grant`). Missing → malformed_request (fail-closed;
+        // never invent Ownership).
+        let authority_raw = match request.metadata().get("x-zkcoins-session-authority") {
+            Some(v) => match v.to_str() {
+                Ok(s) => s,
+                Err(_) => {
+                    return Err(map_domain_err(KernelError::new(
+                        KernelErrorCode::MalformedRequest,
+                        "x-zkcoins-session-authority metadata is not valid UTF-8",
+                    )));
+                }
+            },
+            None => "",
+        };
+        let authority = parse_session_authority(authority_raw).map_err(map_domain_err)?;
+        let command =
+            parse_pull_request(request.into_inner(), authority).map_err(map_domain_err)?;
+        let hosts = crate::v1::public_hosts_from_env();
+        let allowed: Vec<[u8; 32]> = hosts
+            .iter()
+            .map(|h| crate::v1::attest::chan_bind_for_host(h))
+            .collect();
+        let now = crate::v1::unix_now();
+        let result = self
+            .domain
+            .pull(&allowed, now, command)
+            .map_err(map_domain_err)?;
+        Ok(Response::new(pull_result_to_proto(&result)))
     }
 
     async fn get_record(
         &self,
-        _request: Request<RecordRequest>,
+        request: Request<RecordRequest>,
     ) -> Result<Response<RecordBlob>, Status> {
-        Err(not_yet("GetRecord"))
+        let command = parse_record_request(request.into_inner()).map_err(map_domain_err)?;
+        let now = crate::v1::unix_now();
+        let blob = self
+            .domain
+            .get_record(now, command)
+            .map_err(map_domain_err)?;
+        Ok(Response::new(record_blob_to_proto(&blob)))
     }
 
     async fn get_coin_proof(
         &self,
-        _request: Request<CoinProofRequest>,
+        request: Request<CoinProofRequest>,
     ) -> Result<Response<CoinProofBlob>, Status> {
-        Err(not_yet("GetCoinProof"))
+        let command = parse_coin_proof_request(request.into_inner()).map_err(map_domain_err)?;
+        let now = crate::v1::unix_now();
+        let canonical = self
+            .domain
+            .get_coin_proof(now, command)
+            .map_err(map_domain_err)?;
+        Ok(Response::new(coin_proof_blob_to_proto(canonical)))
     }
 
     async fn get_account_state(
         &self,
-        _request: Request<AccountStateRequest>,
+        request: Request<AccountStateRequest>,
     ) -> Result<Response<AccountStateResult>, Status> {
-        Err(not_yet("GetAccountState"))
+        let inner = request.into_inner();
+        let req = parse_session_bound(inner.session, inner.chan_bind).map_err(map_domain_err)?;
+        let now = crate::v1::unix_now();
+        let view = self
+            .domain
+            .get_account_state(now, req)
+            .map_err(map_domain_err)?;
+        let proto = account_state_to_proto(&view).map_err(map_domain_err)?;
+        Ok(Response::new(proto))
     }
 
     type SubscribeReceiptsStream = BoxStream<Receipt>;
@@ -363,7 +569,18 @@ impl Kernel for GrpcKernelService {
         &self,
         _request: Request<SubscribeReceiptsRequest>,
     ) -> Result<Response<Self::SubscribeReceiptsStream>, Status> {
-        Err(not_yet("SubscribeReceipts"))
+        // Honest Unimplemented: a subscription that can never deliver is
+        // worse than naming the missing producer. Spec §4.9 / §7.8 requires
+        // a push on verified credit after durable persist (§4.8). No
+        // production writer exists; domain fan-out is not built until one
+        // does (see `kernel::access::receipts` writer contract). Accepting
+        // the session and yielding silence would repeat the Block-2
+        // empty-Notify-Map failure mode.
+        Err(Status::unimplemented(
+            "SubscribeReceipts: not yet implemented — requires a receive/decrypt-index \
+             writer that publishes verified credits after durable persist (§4.8/§4.9); \
+             without that writer a subscription must not be accepted",
+        ))
     }
 
     async fn publish(
@@ -676,30 +893,71 @@ mod tests {
             );
             assert_eq!(err.code(), Code::InvalidArgument);
         }
-        expect_unimplemented(
-            "OpenPullChallenge",
-            svc.open_pull_challenge(Request::new(PullChallengeRequest::default()))
-                .await,
-        )
-        .await;
-        expect_unimplemented("Pull", svc.pull(Request::new(PullRequest::default())).await).await;
-        expect_unimplemented(
-            "GetRecord",
-            svc.get_record(Request::new(RecordRequest::default())).await,
-        )
-        .await;
-        expect_unimplemented(
-            "GetCoinProof",
-            svc.get_coin_proof(Request::new(CoinProofRequest::default()))
-                .await,
-        )
-        .await;
-        expect_unimplemented(
-            "GetAccountState",
-            svc.get_account_state(Request::new(AccountStateRequest::default()))
-                .await,
-        )
-        .await;
+        // OpenPullChallenge is wired: empty body fails closed as
+        // malformed_request (subject required), not Unimplemented.
+        {
+            let err = svc
+                .open_pull_challenge(Request::new(PullChallengeRequest::default()))
+                .await
+                .expect_err("empty PullChallengeRequest must fail closed");
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "OpenPullChallenge is wired; empty body is malformed, not unimplemented"
+            );
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
+        // Block 7 procedures are wired: empty / missing-authority bodies
+        // fail closed (not Unimplemented).
+        {
+            let err = svc
+                .pull(Request::new(PullRequest::default()))
+                .await
+                .expect_err("Pull without authority metadata must fail closed");
+            assert_ne!(err.code(), Code::Unimplemented, "Pull is wired");
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
+        {
+            let err = svc
+                .get_record(Request::new(RecordRequest::default()))
+                .await
+                .expect_err("empty RecordRequest must fail closed");
+            assert_ne!(err.code(), Code::Unimplemented, "GetRecord is wired");
+            // empty session → unauthorized (Unauthenticated); empty
+            // chan_bind width → InvalidArgument. Either is fail-closed.
+            assert!(
+                matches!(err.code(), Code::InvalidArgument | Code::Unauthenticated),
+                "GetRecord empty body: {:?}",
+                err.code()
+            );
+        }
+        {
+            let err = svc
+                .get_coin_proof(Request::new(CoinProofRequest::default()))
+                .await
+                .expect_err("empty CoinProofRequest must fail closed");
+            assert_ne!(err.code(), Code::Unimplemented, "GetCoinProof is wired");
+            assert!(
+                matches!(err.code(), Code::InvalidArgument | Code::Unauthenticated),
+                "GetCoinProof empty body: {:?}",
+                err.code()
+            );
+        }
+        {
+            let err = svc
+                .get_account_state(Request::new(AccountStateRequest::default()))
+                .await
+                .expect_err("empty AccountStateRequest must fail closed");
+            assert_ne!(err.code(), Code::Unimplemented, "GetAccountState is wired");
+            assert!(
+                matches!(err.code(), Code::InvalidArgument | Code::Unauthenticated),
+                "GetAccountState empty body: {:?}",
+                err.code()
+            );
+        }
+        // SubscribeReceipts is not wired: no production credit writer after
+        // durable persist (§4.8/§4.9). Silent empty streams are forbidden —
+        // same posture as ListInscriptions.
         expect_unimplemented(
             "SubscribeReceipts",
             svc.subscribe_receipts(Request::new(SubscribeReceiptsRequest::default()))

@@ -7,6 +7,10 @@
 
 use uuid::Uuid;
 
+use crate::kernel::access::{
+    AccountStateView, GetCoinProofCommand, GetRecordCommand, PullCommand, PullResult,
+    RecordBlob as DomainRecordBlob, RecordRef, SessionAuthority, SessionBoundRequest,
+};
 use crate::kernel::attestation::{AttestBalanceCommand, AttestCeiling};
 use crate::kernel::chain::{
     BootstrapManifest as DomainBootstrapManifest, InscriptionCursor, InscriptionLimit,
@@ -27,14 +31,17 @@ use crate::kernel::{
 };
 use crate::v1::{self, WalletSignSubmission};
 use kernel_proto::{
-    AccumulatorTip as ProtoAccumulatorTip, AttestRequest as ProtoAttestRequest,
-    AwaitingSignature as ProtoAwaitingSignature, BootstrapManifest as ProtoBootstrapManifest,
-    GrantRequest as ProtoGrantRequest, Info as ProtoInfo, Issuance as ProtoIssuance,
-    Job as ProtoJob, JobError as ProtoJobError, JobEvent as ProtoJobEvent,
-    JobResult as ProtoJobResult, ListInscriptionsRequest as ProtoListInscriptionsRequest,
-    NullifierPath as ProtoNullifierPath, NullifierPathRequest as ProtoNullifierPathRequest,
-    OutputTemplate as ProtoOutputTemplate, Scope as ProtoScope, SignRequest as ProtoSignRequest,
-    TransitionRequest as ProtoTransitionRequest,
+    AccountStateResult as ProtoAccountStateResult, AccumulatorTip as ProtoAccumulatorTip,
+    AttestRequest as ProtoAttestRequest, AwaitingSignature as ProtoAwaitingSignature,
+    BootstrapManifest as ProtoBootstrapManifest, CoinProofBlob as ProtoCoinProofBlob,
+    CoinProofRequest as ProtoCoinProofRequest, GrantRequest as ProtoGrantRequest,
+    Info as ProtoInfo, Issuance as ProtoIssuance, Job as ProtoJob, JobError as ProtoJobError,
+    JobEvent as ProtoJobEvent, JobResult as ProtoJobResult,
+    ListInscriptionsRequest as ProtoListInscriptionsRequest, NullifierPath as ProtoNullifierPath,
+    NullifierPathRequest as ProtoNullifierPathRequest, OutputTemplate as ProtoOutputTemplate,
+    PullRequest as ProtoPullRequest, PullResult as ProtoPullResult, RecordBlob as ProtoRecordBlob,
+    RecordRef as ProtoRecordRef, RecordRequest as ProtoRecordRequest, Scope as ProtoScope,
+    SignRequest as ProtoSignRequest, TransitionRequest as ProtoTransitionRequest,
 };
 use shared::spec_v1::Address;
 
@@ -142,6 +149,169 @@ fn parse_grant_scope(scope: ProtoScope) -> KernelResult<GrantScope> {
         // (§5.1). We do not rewrite 0 → SCOPE_NOT_AFTER_UNBOUNDED here.
         not_after: scope.not_after,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Block 7 — Pull / Record / CoinProof / AccountState / Receipts
+// ---------------------------------------------------------------------------
+
+/// Parse proto `PullRequest` into a domain [`PullCommand`].
+///
+/// # Authority (proto GAP)
+///
+/// Normative `PullRequest` has no ownership/grant discriminator. The trusted
+/// API layer that verified the proof **must** pass [`SessionAuthority`] as a
+/// separate argument (same trust class as `subject` / `resolved_scope`).
+/// This function never invents an authority.
+pub(crate) fn parse_pull_request(
+    req: ProtoPullRequest,
+    authority: SessionAuthority,
+) -> KernelResult<PullCommand> {
+    let nonce = parse_exact_32(&req.nonce, "nonce")?;
+    let subject = parse_subject_address(&req.subject)?;
+    let chan_bind = ChanBind(parse_exact_32(&req.chan_bind, "chan_bind")?);
+    let resolved_scope = match req.resolved_scope {
+        Some(s) => parse_grant_scope(s)?,
+        None => {
+            return Err(KernelError::new(
+                KernelErrorCode::MalformedRequest,
+                "resolved_scope is required",
+            ));
+        }
+    };
+    Ok(PullCommand {
+        nonce,
+        subject,
+        resolved_scope,
+        chan_bind,
+        authority,
+    })
+}
+
+/// Domain [`PullResult`] → proto.
+pub(crate) fn pull_result_to_proto(result: &PullResult) -> ProtoPullResult {
+    ProtoPullResult {
+        records: result.records.iter().map(record_ref_to_proto).collect(),
+        session: result.session.as_str().to_string(),
+        session_expiry: result.session_expiry,
+    }
+}
+
+fn record_ref_to_proto(r: &RecordRef) -> ProtoRecordRef {
+    ProtoRecordRef {
+        record_id: r.record_id.0.to_vec(),
+        record_type: r.record_type.as_str().to_string(),
+        transition_kind: r
+            .transition_kind
+            .map(|k| k.as_str().to_string())
+            .unwrap_or_default(),
+        blob_id: r.blob_id.0.to_vec(),
+        occurred_at: r.occurred_at,
+    }
+}
+
+/// Parse proto `RecordRequest`.
+pub(crate) fn parse_record_request(req: ProtoRecordRequest) -> KernelResult<GetRecordCommand> {
+    Ok(GetRecordCommand {
+        record_id: Digest32(parse_exact_32(&req.record_id, "record_id")?),
+        session: req.session,
+        chan_bind: ChanBind(parse_exact_32(&req.chan_bind, "chan_bind")?),
+    })
+}
+
+/// Domain record blob → proto.
+pub(crate) fn record_blob_to_proto(blob: &DomainRecordBlob) -> ProtoRecordBlob {
+    ProtoRecordBlob {
+        canonical: blob.canonical.clone(),
+        record_type: blob.record_type.as_str().to_string(),
+        transition_kind: blob
+            .transition_kind
+            .map(|k| k.as_str().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+/// Parse proto `CoinProofRequest`.
+pub(crate) fn parse_coin_proof_request(
+    req: ProtoCoinProofRequest,
+) -> KernelResult<GetCoinProofCommand> {
+    Ok(GetCoinProofCommand {
+        coin_id: Digest32(parse_exact_32(&req.coin_id, "coin_id")?),
+        session: req.session,
+        chan_bind: ChanBind(parse_exact_32(&req.chan_bind, "chan_bind")?),
+    })
+}
+
+/// Canonical coin-proof bytes → proto.
+pub(crate) fn coin_proof_blob_to_proto(canonical: Vec<u8>) -> ProtoCoinProofBlob {
+    ProtoCoinProofBlob { canonical }
+}
+
+/// Parse proto `AccountStateRequest` / `SubscribeReceiptsRequest` shape.
+///
+/// `SubscribeReceipts` itself is `Unimplemented` until a credit writer
+/// exists; this parser remains for the shared session-bound request shape
+/// used by `GetAccountState` (and later by a real subscribe path).
+pub(crate) fn parse_session_bound(
+    session: String,
+    chan_bind: Vec<u8>,
+) -> KernelResult<SessionBoundRequest> {
+    Ok(SessionBoundRequest {
+        session,
+        chan_bind: ChanBind(parse_exact_32(&chan_bind, "chan_bind")?),
+    })
+}
+
+/// Domain account-state view → proto.
+///
+/// Optional fields that are unknown stay **empty bytes** — never a
+/// fabricated 32-byte zero nullifier. Spec: empty iff no prior
+/// state-advancing transition.
+pub(crate) fn account_state_to_proto(
+    view: &AccountStateView,
+) -> KernelResult<ProtoAccountStateResult> {
+    let (pk, r) = match (view.last_nullifier_pk, view.last_nullifier_r) {
+        (Some(pk), Some(r)) => (pk.to_vec(), r.to_vec()),
+        (None, None) => (Vec::new(), Vec::new()),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(KernelError::with_internal(
+                KernelErrorCode::InternalError,
+                "Corrupt account state",
+                "last_nullifier_pk and last_nullifier_r must both be present or both absent",
+            ));
+        }
+    };
+    Ok(ProtoAccountStateResult {
+        account_state: view.account_state.clone(),
+        state_head: view.state_head.0.to_vec(),
+        head_record_id: view
+            .head_record_id
+            .map(|d| d.0.to_vec())
+            .unwrap_or_default(),
+        send_counter: view.send_counter,
+        current_pubkey: view.current_pubkey.to_vec(),
+        last_nullifier_pk: pk,
+        last_nullifier_r: r,
+    })
+}
+
+/// Parse session authority wire token (trusted API → kernel).
+///
+/// Used until the frozen `PullRequest` message gains an authority field.
+pub(crate) fn parse_session_authority(raw: &str) -> KernelResult<SessionAuthority> {
+    match raw.trim() {
+        "ownership" => Ok(SessionAuthority::Ownership),
+        "grant" => Ok(SessionAuthority::Grant),
+        "" => Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            "session authority is required (ownership|grant); normative \
+             PullRequest has no field — trusted API must supply it",
+        )),
+        other => Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("session authority must be ownership|grant; got {other:?}"),
+        )),
+    }
 }
 
 fn parse_exact_32(bytes: &[u8], field: &str) -> KernelResult<[u8; 32]> {

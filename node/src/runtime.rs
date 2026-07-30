@@ -94,6 +94,11 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     if let Err(e) = crate::kernel::chain::validate_closed_sets() {
         anyhow::bail!("kernel closed-set contract invalid: {e}");
     }
+    // Access-layer closed sets (RecordType / TransitionKind / SessionAuthority /
+    // ChallengeAction including Pull). ReceiptState returns with a credit writer.
+    if let Err(e) = crate::kernel::access::validate_closed_sets() {
+        anyhow::bail!("kernel access closed-set contract invalid: {e}");
+    }
 
     let socket_addr = addr
         .parse::<SocketAddr>()
@@ -308,6 +313,15 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             Arc::clone(&job_notify_map),
             Arc::clone(&state.pending_sign_map),
             Arc::clone(&state.attest_challenges),
+        );
+        // Block 7 access surfaces (process-local until a durable
+        // decrypt-index exists). Empty in-memory index is an installed
+        // surface, not a missing one. Logging the Arc strong-count keeps
+        // the getter library-reachable under clippy --all-targets.
+        // SubscribeReceipts stays Unimplemented (no credit writer yet).
+        tracing::info!(
+            private_index_refs = Arc::strong_count(domain.private_record_index()),
+            "kernel access surfaces installed (Pull/Records; in-memory empty)"
         );
         if let Some(engine) = v1_engine.as_ref() {
             use crate::kernel::{ChainHandle, ChainReadinessFlags, KernelNetwork};

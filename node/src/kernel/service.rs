@@ -4,11 +4,14 @@
 //! `submit_transition`. Block 5: `attest_balance`, `issue_view_grant`,
 //! and the shared challenge-store issue helpers. Block 6: read-only chain
 //! (`get_info`, `get_accumulator`, `get_nullifier_path`).
-//! `ListInscriptions` waits on a scanner-written inscription catalog
-//! (reveal txid + §3.5 format are not on the NfLog) — gRPC answers
-//! `Unimplemented`; there is no domain projection that invents those
-//! fields. Remaining §7.8 procedures land in later blocks on this same
-//! type — they are intentionally absent here rather than stubbed.
+//! Block 7: `open_pull_challenge`, `pull`, `get_record`, `get_coin_proof`,
+//! `get_account_state`. `SubscribeReceipts` is not a façade method: there
+//! is no production credit writer after durable persist (§4.8 / §4.9), so
+//! gRPC answers `Unimplemented` (see `access::receipts` writer contract)
+//! rather than accepting a silent empty stream. `ListInscriptions` waits
+//! on a scanner-written inscription catalog (reveal txid + §3.5 format are
+//! not on the NfLog). Remaining §7.8 procedures land in later blocks on
+//! this same type — they are intentionally absent here rather than stubbed.
 
 use std::sync::Arc;
 
@@ -16,13 +19,20 @@ use tokio::sync::mpsc;
 
 use crate::job_dispatcher::{JobEnvelope, JobNotifyMap};
 use crate::job_store::JobStore;
+use crate::kernel::access::{
+    self, AccountStateView, GetCoinProofCommand, GetRecordCommand, InMemoryPrivateIndex,
+    PrivateIndex, PullCommand, PullResult, RecordBlob, SessionBoundRequest, SessionStore,
+};
 use crate::kernel::attestation::{self, AttestBalanceCommand, AttestBalanceDeps};
-use crate::kernel::bootstrap::ChallengeStore;
+use crate::kernel::bootstrap::{ChallengeAction, ChallengeStore, IssuedChallenge};
 use crate::kernel::chain;
-use crate::kernel::grants::{self, IssueViewGrantCommand, IssueViewGrantDeps, ViewGrantIssued};
+use crate::kernel::grants::{
+    self, GrantScope, IssueViewGrantCommand, IssueViewGrantDeps, ViewGrantIssued,
+};
 use crate::kernel::jobs;
 use crate::kernel::jobs::sign::SignTransitionDeps;
 use crate::kernel::jobs::submit::SubmitTransitionDeps;
+use crate::kernel::types::SubjectAddress;
 use crate::kernel::{
     AccumulatorTip, CancelPolicy, ChainIdentity, ChainReadinessFlags, ChainView, Job, JobEvent,
     JobEventHub, JobRequest, KernelError, KernelErrorCode, KernelInfo, KernelNetwork, KernelResult,
@@ -46,6 +56,31 @@ pub(crate) struct ChainHandle {
     pub network: Option<KernelNetwork>,
 }
 
+/// Construction inputs for [`KernelService::new`].
+///
+/// Bundled (and destructured at the call site) so a new field is a compile
+/// error at every construction site — same discipline as
+/// [`crate::runtime::RestNodeConfig`].
+pub(crate) struct KernelServiceConfig {
+    /// Durable job store for GetJob / StreamJob / admit paths.
+    pub job_store: Arc<JobStore>,
+    /// Phase-event fan-out shared with the dispatcher (`StreamJob` live path).
+    pub job_events: JobEventHub,
+    /// Parked wallet-sign waiters keyed by job id.
+    pub pending_sign_map: PendingSignMap,
+    /// Shared with the dispatcher / SSE path. Sign looks up a parked
+    /// notifier without creating one; StreamJob may create on subscribe.
+    pub notify_map: JobNotifyMap,
+    /// Shared action-bound challenge store (Pull / AttestBalance / IssueViewGrant).
+    pub challenges: Arc<ChallengeStore>,
+    /// Pull sessions (process-local; no durable table yet).
+    pub sessions: Arc<SessionStore>,
+    /// Private-record + account-state index (empty in-memory until catalog).
+    pub private_index: Arc<InMemoryPrivateIndex>,
+    /// Live NfLog / tip / identity for read-only chain procedures.
+    pub chain: ChainHandle,
+}
+
 /// Crate-private kernel façade.
 #[derive(Clone)]
 pub(crate) struct KernelService {
@@ -55,20 +90,28 @@ pub(crate) struct KernelService {
     /// Shared with the dispatcher / SSE path. Sign looks up a parked
     /// notifier without creating one; StreamJob may create on subscribe.
     notify_map: JobNotifyMap,
-    /// Shared action-bound challenge store (AttestBalance / IssueViewGrant).
+    /// Shared action-bound challenge store (Pull / AttestBalance / IssueViewGrant).
     challenges: Arc<ChallengeStore>,
+    /// Pull sessions (process-local; no durable table yet).
+    sessions: Arc<SessionStore>,
+    /// Private-record + account-state index (empty in-memory until catalog).
+    private_index: Arc<InMemoryPrivateIndex>,
     /// Live NfLog / tip / identity for read-only chain procedures.
     chain: ChainHandle,
 }
 
 impl KernelService {
     pub(crate) fn new(
-        job_store: Arc<JobStore>,
-        job_events: JobEventHub,
-        pending_sign_map: PendingSignMap,
-        notify_map: JobNotifyMap,
-        challenges: Arc<ChallengeStore>,
-        chain: ChainHandle,
+        KernelServiceConfig {
+            job_store,
+            job_events,
+            pending_sign_map,
+            notify_map,
+            challenges,
+            sessions,
+            private_index,
+            chain,
+        }: KernelServiceConfig,
     ) -> Self {
         Self {
             job_store,
@@ -76,6 +119,8 @@ impl KernelService {
             pending_sign_map,
             notify_map,
             challenges,
+            sessions,
+            private_index,
             chain,
         }
     }
@@ -84,14 +129,16 @@ impl KernelService {
     /// and the caller has no sign/stream maps (or empty ones for pure load).
     pub(crate) fn from_store(job_store: Arc<JobStore>) -> Self {
         let notify_map: JobNotifyMap = Arc::new(dashmap::DashMap::new());
-        Self::new(
+        Self::new(KernelServiceConfig {
             job_store,
-            JobEventHub::new(Arc::clone(&notify_map)),
-            Arc::new(dashmap::DashMap::new()),
+            job_events: JobEventHub::new(Arc::clone(&notify_map)),
+            pending_sign_map: Arc::new(dashmap::DashMap::new()),
             notify_map,
-            ChallengeStore::shared(),
-            ChainHandle::default(),
-        )
+            challenges: ChallengeStore::shared(),
+            sessions: SessionStore::shared(),
+            private_index: InMemoryPrivateIndex::shared(),
+            chain: ChainHandle::default(),
+        })
     }
 
     /// Production / gRPC boot: store + shared notify map + pending-sign map
@@ -123,20 +170,29 @@ impl KernelService {
         challenges: Arc<ChallengeStore>,
         chain: ChainHandle,
     ) -> Self {
-        Self::new(
+        Self::new(KernelServiceConfig {
             job_store,
-            JobEventHub::new(Arc::clone(&notify_map)),
+            job_events: JobEventHub::new(Arc::clone(&notify_map)),
             pending_sign_map,
             notify_map,
             challenges,
+            sessions: SessionStore::shared(),
+            private_index: InMemoryPrivateIndex::shared(),
             chain,
-        )
+        })
     }
 
     /// Attach / replace the chain handle (tests and late wiring).
     pub(crate) fn with_chain(mut self, chain: ChainHandle) -> Self {
         self.chain = chain;
         self
+    }
+
+    /// Private-record index handle for the production decrypt-index writer
+    /// (when wired). Empty until a catalog exists; still reachable so the
+    /// Arc field is not library-dead.
+    pub(crate) fn private_record_index(&self) -> &Arc<InMemoryPrivateIndex> {
+        &self.private_index
     }
 
     fn require_chain_view(&self) -> KernelResult<ChainView> {
@@ -301,5 +357,83 @@ impl KernelService {
             },
             command,
         )
+    }
+
+    fn access_deps<'a>(
+        &'a self,
+        allowed_chan_binds: &'a [[u8; 32]],
+        now: u64,
+    ) -> access::AccessDeps<'a> {
+        access::AccessDeps {
+            challenges: self.challenges.as_ref(),
+            sessions: self.sessions.as_ref(),
+            index: self.private_index.as_ref() as &dyn PrivateIndex,
+            allowed_chan_binds,
+            now,
+        }
+    }
+
+    /// `OpenPullChallenge` — issue a single-use challenge for `action`.
+    ///
+    /// For [`ChallengeAction::Pull`] the challenge binds `requested_scope`.
+    /// Owner-action challenges ignore scope (attest / issue-grant).
+    pub(crate) fn open_pull_challenge(
+        &self,
+        now: u64,
+        action: ChallengeAction,
+        subject: SubjectAddress,
+        requested_scope: GrantScope,
+    ) -> IssuedChallenge {
+        access::open_pull_challenge(
+            self.challenges.as_ref(),
+            action,
+            subject,
+            requested_scope,
+            now,
+        )
+    }
+
+    /// `Pull` — consume pull challenge, list in-scope refs, issue session.
+    ///
+    /// Caller has already verified OwnershipProof or GrantProof and set
+    /// [`PullCommand::authority`] accordingly.
+    pub(crate) fn pull(
+        &self,
+        allowed_chan_binds: &[[u8; 32]],
+        now: u64,
+        command: PullCommand,
+    ) -> KernelResult<PullResult> {
+        access::pull(self.access_deps(allowed_chan_binds, now), command)
+    }
+
+    /// `GetRecord` — one Private record within a still-valid pull session.
+    ///
+    /// Session `chan_bind` equality is checked against the session record
+    /// (not the node's host set); the host set is only used when redeeming
+    /// challenges.
+    pub(crate) fn get_record(
+        &self,
+        now: u64,
+        command: GetRecordCommand,
+    ) -> KernelResult<RecordBlob> {
+        access::get_record(self.access_deps(&[], now), command)
+    }
+
+    /// `GetCoinProof` — one CoinProof within a still-valid pull session.
+    pub(crate) fn get_coin_proof(
+        &self,
+        now: u64,
+        command: GetCoinProofCommand,
+    ) -> KernelResult<Vec<u8>> {
+        access::get_coin_proof(self.access_deps(&[], now), command)
+    }
+
+    /// `GetAccountState` — ownership pull session only.
+    pub(crate) fn get_account_state(
+        &self,
+        now: u64,
+        request: SessionBoundRequest,
+    ) -> KernelResult<AccountStateView> {
+        access::get_account_state(self.access_deps(&[], now), request)
     }
 }

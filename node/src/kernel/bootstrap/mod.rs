@@ -15,5 +15,5 @@ pub(crate) mod challenges;
 /// `#[cfg(test)]` code does not belong on this list — tests import it
 /// from the defining module when needed.
 pub(crate) use challenges::{
-    ChallengeAction, ChallengeConsumeError, ChallengeStore, IssuedChallenge,
+    ChallengeAction, ChallengeConsumeError, ChallengeStore, IssuedChallenge, RedeemedPullChallenge,
 };
