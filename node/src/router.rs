@@ -39,7 +39,7 @@ use crate::flow;
 use crate::job_dispatcher::{JobEnvelope, JobNotifyMap, JobPhaseEvent};
 use crate::job_store::{CreateResult, JobKind, JobStatus, JobStore};
 use crate::kernel::{
-    CancelPolicy, JobEvent, JobEventHub, JobId, JobRequest, JobState, KernelError, KernelErrorCode,
+    CancelPolicy, JobEvent, JobId, JobRequest, JobState, KernelError, KernelErrorCode,
     KernelService,
 };
 use crate::publisher::EsploraConfig;
@@ -1575,113 +1575,46 @@ pub(crate) async fn jobs_commit_handler(
     Path(id): Path<Uuid>,
     Json(commit_request): Json<CommitRequest>,
 ) -> axum::response::Response {
-    // Gap G4: under a v1.1 process claim the residual ash‖ocr
-    // CommitRequest is the wrong signing protocol. Refuse before
-    // persisting or waking the dispatcher so a v1.1 boot cannot
-    // finalise via the legacy commit route.
-    if let Err(e) = crate::v1::refuse_legacy_commitment_under_v1() {
-        return (
-            StatusCode::CONFLICT,
-            Json(JobErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    let job = match state.job_store.load(id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(JobErrorResponse {
-                    error: "Job not found".to_string(),
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!("JobStore::load failed: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(JobErrorResponse {
-                    error: "Failed to load job".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    if job.status != JobStatus::AwaitingSignature {
-        return (
-            StatusCode::CONFLICT,
-            Json(JobErrorResponse {
-                error: format!(
-                    "Job is in status `{}`, not `awaiting_signature`",
-                    job.status.as_str()
-                ),
-            }),
-        )
-            .into_response();
-    }
-
-    // Merge the commit payload into the existing request_body so
-    // the dispatcher can pull both halves out on wake. Persist via
-    // a direct SQL write — we cannot expose every field through a
-    // narrower JobStore method without burning a per-field
-    // helper for each commit-leg shape.
-    let mut merged = job.request_body.clone();
-    // `CommitMintTxRequest` derives `Serialize` over fixed primitives;
-    // see `jobs_mint_handler` above for the dead-arm rationale.
+    // Quarantined legacy ash‖ocr path — not normative SignTransition.
+    // `CommitRequest` derives `Serialize` over fixed primitives.
     let commit_value = serde_json::to_value(&commit_request)
-        .expect("CommitMintTxRequest with derived Serialize always encodes");
-    // `request_body` is always a JSON object: the admit handlers
-    // (`jobs_mint_handler`, `jobs_send_handler`) only ever insert a
-    // value produced by `serde_json::to_value(&MintRequest|SendCoinRequest)`,
-    // both of which derive `Serialize` over fixed-field structs that
-    // serialise as `{...}`. Collapsing the previous `if let
-    // Some(obj) = ... else { merged = json!({"commit": ...}) }` into a
-    // single `.expect` keeps the 100%-line/function coverage gate
-    // honest without weakening the contract — an unexpected
-    // non-object would surface here as a panic at the call site,
-    // exactly like every other defensive `.expect` in this file.
-    let obj = merged
-        .as_object_mut()
-        .expect("jobs.request_body is always a JSON object (admit handlers enforce)");
-    obj.insert("commit".to_string(), commit_value);
-
-    if let Err(e) =
-        sqlx::query("UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2")
-            .bind(&merged)
-            .bind(id)
-            .execute(state.job_store.pool())
-            .await
+        .expect("CommitRequest with derived Serialize always encodes");
+    match crate::application::legacy_jobs::commit_legacy(
+        state.job_store.as_ref(),
+        &state.job_notify_map,
+        id,
+        commit_value,
+    )
+    .await
     {
-        tracing::error!("Failed to merge commit payload into job row: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(crate::application::legacy_jobs::LegacyCommitAccepted) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "broadcasting"})),
+        )
+            .into_response(),
+        Err(crate::application::legacy_jobs::LegacyCommitError::RefusedUnderV1 { message }) => (
+            StatusCode::CONFLICT,
+            Json(JobErrorResponse { error: message }),
+        )
+            .into_response(),
+        Err(crate::application::legacy_jobs::LegacyCommitError::NotFound) => (
+            StatusCode::NOT_FOUND,
             Json(JobErrorResponse {
-                error: "Failed to persist commit payload".to_string(),
+                error: "Job not found".to_string(),
             }),
         )
-            .into_response();
-    }
-
-    // Wake the dispatcher's `wait_for_commit` task. If no entry
-    // exists in the notify_map — or the handoff CAS fails because the
-    // dispatcher already timed out — surface 409 so the wallet does
-    // not silently spin.
-    let notifier = state.job_notify_map.get(&id).map(|e| e.value().clone());
-    match notifier {
-        Some(n) if n.try_signal_accept() => {
-            n.commit_wake.notify_one();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "broadcasting"})),
-            )
-                .into_response()
-        }
-        Some(_) | None => (
+            .into_response(),
+        Err(crate::application::legacy_jobs::LegacyCommitError::Conflict { message }) => (
+            StatusCode::CONFLICT,
+            Json(JobErrorResponse { error: message }),
+        )
+            .into_response(),
+        Err(crate::application::legacy_jobs::LegacyCommitError::Internal { message }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(JobErrorResponse { error: message }),
+        )
+            .into_response(),
+        Err(crate::application::legacy_jobs::LegacyCommitError::NoDispatcherWaiting) => (
             StatusCode::CONFLICT,
             Json(JobErrorResponse {
                 error: "Job is no longer waiting for a signature".to_string(),
@@ -1822,7 +1755,7 @@ pub(crate) async fn jobs_sign_handler(
     // Flag gate: refuse the v1.1 path when the process is not on the v1.1 claim.
     // Legacy `/commit` remains the only active authorisation surface.
     // §7.5: this is a disabled surface (`feature_disabled`), not a job
-    // phase mismatch (`wrong_phase`).
+    // phase mismatch (`wrong_phase`). API-layer only — not a kernel code.
     if !crate::v1::v1_sign_route_active() {
         let err = crate::v1::TransitionSignatureError {
             check: crate::v1::SignatureCheck::ShadowFlag,
@@ -1851,217 +1784,45 @@ pub(crate) async fn jobs_sign_handler(
         }
     };
 
-    let job = match state.job_store.load(id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(v1_error_body("job_not_found", "Job not found")),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!("JobStore::load failed: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v1_error_body("internal_error", "Failed to load job")),
-            )
-                .into_response();
-        }
-    };
-
-    // §7.5 wrong_phase: only when the job is not in the status that accepts
-    // /sign. Missing staging while status is correct is an internal
-    // lifecycle failure, not a phase mismatch.
-    if job.status != JobStatus::AwaitingSignature {
-        return (
-            StatusCode::CONFLICT,
-            Json(v1_error_body(
-                "wrong_phase",
-                format!(
-                    "Job is in status `{}`, not `awaiting_signature`",
-                    job.status.as_str()
-                ),
-            )),
-        )
-            .into_response();
-    }
-
-    // Prefer the in-memory map; after a restart rehydrate from the
-    // persisted envelope under request_body.pending_sign.
-    let entry = match state.pending_sign_map.get(&id).map(|e| e.clone()) {
-        Some(e) => e,
-        None => match crate::v1::rehydrate_pending_sign(&job.request_body) {
-            Ok(Some(e)) => {
-                state.pending_sign_map.insert(id, e.clone());
-                e
-            }
-            Ok(None) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(v1_error_body(
-                        "internal_error",
-                        "no PendingTransition staged for this job \
-                         (awaiting_signature under v1.1 requires a staged entry)",
-                    )),
-                )
-                    .into_response();
-            }
-            Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(v1_error_body("internal_error", err.message)),
-                )
-                    .into_response();
-            }
-        },
-    };
-
-    let accepted = match crate::v1::accept_wallet_transition_signature(
-        crate::v1::V1ShadowMode::On,
-        entry.network,
-        &entry.pending,
-        &submission,
-    ) {
-        Ok(sig) => sig,
-        Err(err) => {
-            let (status, code) = crate::v1::sign_rejection(&err);
-            return (
-                StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT),
-                Json(v1_error_body(code, err.message)),
-            )
-                .into_response();
-        }
-    };
-
-    // Ordering: **install the signature into the durable FinalisationCapability
-    // before** claiming the handoff as SIGNALED. A crash between signal and
-    // persist must not leave a job marked signalled with nothing durable.
-    //
-    // The write is status-qualified on `awaiting_signature`: if cancel or
-    // timeout already moved the row, the update fails rather than applying.
-    //
-    // Acceptance still requires a parked dispatcher: reporting
-    // signature_accepted when nothing will finalise is worse than failing.
-    // §7.5 has no dedicated "dispatcher down" code → internal_error.
-    let Some(notifier) = state.job_notify_map.get(&id).map(|e| e.value().clone()) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(v1_error_body(
-                "internal_error",
-                "signature verified but no dispatcher is waiting to finalise this job; \
-                 refusing acceptance so the wallet does not treat the work as done",
-            )),
-        )
-            .into_response();
-    };
-
-    // Install signature on the in-memory entry and on the durable capability.
-    let mut entry = entry;
-    if let Err(err) = entry.install_signature(accepted.clone()) {
-        return (
-            StatusCode::CONFLICT,
-            Json(v1_error_body("invalid_signature", err.message)),
-        )
-            .into_response();
-    }
-    state.pending_sign_map.insert(id, entry.clone());
-
-    let finalisation_value = match crate::v1::DurableFinalisationPersist::from_entry(&entry) {
-        Ok(p) => match serde_json::to_value(p) {
-            Ok(v) => v,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(v1_error_body(
-                        "internal_error",
-                        format!("encode durable finalisation: {e}"),
-                    )),
-                )
-                    .into_response();
-            }
-        },
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v1_error_body(
-                    "internal_error",
-                    format!("encode durable finalisation: {e}"),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    let mut merged = job.request_body.clone();
-    let obj = merged
-        .as_object_mut()
-        .expect("jobs.request_body is always a JSON object (admit handlers enforce)");
-    obj.insert(
-        crate::v1::FINALISATION_BODY_KEY.to_string(),
-        finalisation_value,
+    let service = KernelService::from_parts(
+        Arc::clone(&state.job_store),
+        Arc::clone(&state.job_notify_map),
+        Arc::clone(&state.pending_sign_map),
     );
-    // Drop legacy split keys if present.
-    obj.remove(crate::v1::PENDING_SIGN_BODY_KEY);
-    obj.remove("sign");
-
-    match state
-        .job_store
-        .replace_request_body_if_status(id, JobStatus::AwaitingSignature, &merged)
+    match service
+        .sign_transition(crate::kernel::SignTransition {
+            id: JobId(id),
+            submission,
+        })
         .await
     {
-        Ok(true) => {}
-        Ok(false) => {
-            // Status moved (cancel / timeout / concurrent finalise).
-            return (
-                StatusCode::CONFLICT,
-                Json(v1_error_body(
-                    "wrong_phase",
-                    "signature verified but job is no longer awaiting_signature; \
-                     status-qualified persist refused",
-                )),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!("Failed to persist durable finalisation signature: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(v1_error_body(
-                    "internal_error",
-                    "Failed to persist durable finalisation signature",
-                )),
-            )
-                .into_response();
-        }
-    }
-
-    // Durable first, then CAS. If the dispatcher already timed out, refuse
-    // acceptance even though the capability is signed (wallet must not
-    // treat the work as done when nothing will finalise).
-    if !notifier.try_signal_accept() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(v1_error_body(
-                "internal_error",
-                "signature verified and persisted but the dispatcher is no longer waiting \
-                 to finalise this job (timed out or already signaled); refusing acceptance \
-                 so the wallet does not treat the work as done",
-            )),
+        Ok(_job) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "signature_accepted",
+                "job_id": id,
+            })),
         )
-            .into_response();
+            .into_response(),
+        Err(e) => v1_sign_error(e),
     }
+}
 
-    // Wake only after durable persist + successful CAS.
-    notifier.commit_wake.notify_one();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "signature_accepted",
-            "job_id": id,
-        })),
-    )
-        .into_response()
+/// Map a domain `SignTransition` error onto the §7.5 `{error, message}` body.
+fn v1_sign_error(err: KernelError) -> axum::response::Response {
+    let desc = error_contract::describe(err.code);
+    // `error_contract::describe` only emits real HTTP statuses; a failure
+    // here is a programming error in the table, not a request-shape issue.
+    let status = StatusCode::from_u16(desc.http_status)
+        .expect("error_contract http_status is a valid HTTP status code");
+    if err.code == KernelErrorCode::InternalError {
+        if let Some(ctx) = &err.internal_context {
+            tracing::error!("SignTransition internal_error: {}", ctx.detail);
+        } else {
+            tracing::error!("SignTransition internal_error: {}", err.public_message);
+        }
+    }
+    (status, Json(v1_error_body(desc.reason, err.public_message))).into_response()
 }
 
 /// `progress` as a float in `[0, 1]` (§7.5). The store keeps 0–100.
@@ -2570,9 +2331,10 @@ pub(crate) async fn stream_job_v1_handler(
     use axum::response::IntoResponse;
     use futures_util::StreamExt;
 
-    let service = KernelService::new(
+    let service = KernelService::from_parts(
         Arc::clone(&state.job_store),
-        JobEventHub::new(Arc::clone(&state.job_notify_map)),
+        Arc::clone(&state.job_notify_map),
+        Arc::clone(&state.pending_sign_map),
     );
     let domain_stream = match service.stream_job(JobRequest { id: JobId(id) }).await {
         Ok(s) => s,
@@ -2871,9 +2633,10 @@ pub(crate) async fn stream_job_handler(
 
     // Domain StreamJob: load + project snapshot, then phase changes.
     // 404 / 500 surface as plain status codes (legacy contract — no JSON body).
-    let service = KernelService::new(
+    let service = KernelService::from_parts(
         Arc::clone(&state.job_store),
-        JobEventHub::new(Arc::clone(&state.job_notify_map)),
+        Arc::clone(&state.job_notify_map),
+        Arc::clone(&state.pending_sign_map),
     );
     let domain_stream = match service.stream_job(JobRequest { id: JobId(id) }).await {
         Ok(s) => s,

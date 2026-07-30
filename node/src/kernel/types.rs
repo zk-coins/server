@@ -1,4 +1,4 @@
-//! Transport-free kernel types for job procedures (Block 1–2).
+//! Transport-free kernel types for job procedures (Block 1–3).
 //!
 //! Full TransitionCommand / Challenge / Pull types land with later blocks.
 //! This module must not import `axum` or `tonic`.
@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::job_store;
 use crate::kernel::error::KernelResult;
+use crate::v1::WalletSignSubmission;
 
 /// Server-stream item type for kernel procedures (`StreamJob`, …).
 pub(crate) type KernelStream<T> = Pin<Box<dyn Stream<Item = KernelResult<T>> + Send + 'static>>;
@@ -261,4 +262,15 @@ pub(crate) enum CancelPolicy {
     /// before `publishing` (i.e. while still `accepted`/`queued`, `proving`,
     /// or `awaiting_signature`).
     NotYetPublished,
+}
+
+/// Request for `SignTransition` (§7.8 / §3.2).
+///
+/// Binary widths are already checked at the transport boundary
+/// (`signature` = 64 bytes, `s2c_nonce` = 32 bytes). The domain does not
+/// re-parse hex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SignTransition {
+    pub id: JobId,
+    pub submission: WalletSignSubmission,
 }

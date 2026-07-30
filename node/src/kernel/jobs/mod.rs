@@ -1,14 +1,16 @@
-//! Job-family kernel operations (`GetJob`, `StreamJob`, `CancelJob`).
+//! Job-family kernel operations (`GetJob`, `StreamJob`, `CancelJob`, `SignTransition`).
 
 use std::sync::Arc;
 
 use crate::job_store::{JobStatus, JobStore};
-use crate::kernel::error::{KernelError, KernelResult};
-use crate::kernel::job_events::JobEventHub;
+use crate::kernel::error::KernelResult;
 use crate::kernel::job_projection::project_job_row;
-use crate::kernel::types::{
-    CancelPolicy, Job, JobEvent, JobRequest, KernelStream, NormativeJobStatus,
-};
+use crate::kernel::types::{KernelStream, NormativeJobStatus};
+use crate::kernel::{CancelPolicy, Job, JobEvent, JobEventHub, JobRequest, KernelError};
+
+pub(crate) mod sign;
+
+pub(crate) use sign::sign_transition;
 
 /// Load and strictly project a single job (`GetJob`, §7.8).
 ///
@@ -164,8 +166,7 @@ pub(crate) async fn cancel_job_arc(
 mod cancel_tests {
     use super::*;
     use crate::job_store::JobKind as StoreKind;
-    use crate::kernel::error::KernelErrorCode;
-    use crate::kernel::types::{JobId, JobState};
+    use crate::kernel::{JobId, JobState, KernelErrorCode};
     use crate::test_db::{setup_pool, SchemaScope};
     use std::sync::Arc;
 

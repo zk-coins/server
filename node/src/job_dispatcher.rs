@@ -1558,25 +1558,58 @@ async fn wait_for_commit(
     // Signed durable capability already on the row (crash after persist /
     // CAS / notify, or boot resume of a signed job). Drive finalise without
     // waiting for another wallet round-trip.
+    //
+    // Load / rehydrate errors must **not** fall through to the legacy
+    // commit path: a transient DB fault is not "no signature present".
     if crate::v1::v1_sign_route_active() {
-        if let Ok(Some(job)) = job_store.load(public_id).await {
-            if matches!(
-                job.status,
-                JobStatus::AwaitingSignature | JobStatus::Broadcasting
-            ) {
-                if let Ok(Some(entry)) = crate::v1::rehydrate_pending_sign(&job.request_body) {
-                    if entry.signature.is_some() {
-                        tracing::info!(
-                            "Job dispatcher: job {} has signed durable finalisation on resume \
-                             — driving finalise",
-                            public_id
-                        );
-                        return drive_v1_finalise(
-                            job_store, app_state, notify_map, public_id, &job,
-                        )
-                        .await;
+        match job_store.load(public_id).await {
+            Ok(Some(job)) => {
+                if matches!(
+                    job.status,
+                    JobStatus::AwaitingSignature | JobStatus::Broadcasting
+                ) {
+                    match crate::v1::rehydrate_pending_sign(&job.request_body) {
+                        Ok(Some(entry)) if entry.signature.is_some() => {
+                            tracing::info!(
+                                "Job dispatcher: job {} has signed durable finalisation on resume \
+                                 — driving finalise",
+                                public_id
+                            );
+                            return drive_v1_finalise(
+                                job_store, app_state, notify_map, public_id, &job,
+                            )
+                            .await;
+                        }
+                        Ok(Some(_)) => {
+                            // Durable entry present but unsigned — normal
+                            // pre-sign handoff; park below.
+                        }
+                        Ok(None) => {
+                            // No durable finalisation on the row — normal
+                            // before the wallet has signed (or legacy shape).
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "Job dispatcher: could not rehydrate pending sign for job \
+                                 {public_id} during signed-capability resume check: {e}"
+                            ));
+                        }
                     }
                 }
+            }
+            Ok(None) => {
+                // Job row genuinely absent — resume cannot drive finalise
+                // from durable state; park path below will re-load and exit.
+                tracing::warn!(
+                    "Job dispatcher: job {} missing during signed-capability resume check",
+                    public_id
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Job dispatcher: could not load job {public_id} for signed-capability \
+                     resume check: {e}"
+                ));
             }
         }
     }
@@ -1678,10 +1711,23 @@ async fn wait_for_commit(
     // v1.1 path: `/v1/jobs/{id}/sign` already verified and installed the
     // signature into the durable FinalisationCapability. Drive finalise —
     // never complete the job with the signature material alone.
+    // Rehydrate Err must not fall through into the legacy commit branch.
     if crate::v1::v1_sign_route_active() {
-        if let Ok(Some(entry)) = crate::v1::rehydrate_pending_sign(&job.request_body) {
-            if entry.signature.is_some() {
+        match crate::v1::rehydrate_pending_sign(&job.request_body) {
+            Ok(Some(entry)) if entry.signature.is_some() => {
                 return drive_v1_finalise(job_store, app_state, notify_map, public_id, &job).await;
+            }
+            Ok(Some(_)) => {
+                // Unsigned durable entry — check warm map, else no v1 sign yet.
+            }
+            Ok(None) => {
+                // No durable finalisation — check warm map below.
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Job dispatcher: could not rehydrate pending sign for job \
+                     {public_id} after handoff wake: {e}"
+                ));
             }
         }
         // In-memory map may hold the signature if persist rehydrate raced.
@@ -1696,6 +1742,7 @@ async fn wait_for_commit(
     // `CommitRequest` into the job's `request_body` under a
     // `commit` key alongside the original send body. Pull it out
     // and feed it to `commit_flow`.
+    // Missing `commit` key → Null (parse fails loud below); not a Result mask.
     let commit_value = job
         .request_body
         .get("commit")
@@ -3331,6 +3378,146 @@ mod finalise_publish_handoff_tests {
             Some(409),
             "RPC table for dependency_not_final stays 409"
         );
+    }
+}
+
+/// `wait_for_commit` must fail closed on store load errors under V1 —
+/// never treat a load fault as "no signed capability" and fall through
+/// into the legacy commit branch.
+#[cfg(test)]
+mod wait_for_commit_fail_closed_tests {
+    use super::*;
+    use crate::job_store::{CreateResult, JobKind, JobStatus, JobStore};
+    use crate::publisher::EsploraConfig;
+    use crate::router::{AppState, ProofStore};
+    use crate::v1::{claim_stack_scan_mode, set_process_stack_mode, ScanStackMode};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn test_app_state(pool: Arc<sqlx::PgPool>, job_store: Arc<JobStore>) -> AppState {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let proof_dir = tmp.path().to_str().expect("utf8").to_string();
+        std::mem::forget(tmp);
+        let state_arc = Arc::new(Mutex::new(crate::state::State::new()));
+        AppState {
+            account_node: Arc::new(Mutex::new(crate::account_node::AccountNode::new(state_arc))),
+            proof_store: Arc::new(ProofStore::new(&proof_dir)),
+            mint_store: Arc::new(crate::router::MintStore::new()),
+            username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
+            pool: Arc::clone(&pool),
+            esplora_config: Arc::new(EsploraConfig {
+                url: "http://127.0.0.1:1".to_string(),
+                is_mainnet: false,
+                network_name: "Regtest".to_string(),
+                ws_url: None,
+            }),
+            prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            prover_health: Arc::new(crate::prover_health::ProverHealth::new()),
+            job_store,
+            job_tx: tokio::sync::mpsc::channel::<JobEnvelope>(8).0,
+            job_notify_map: Arc::new(dashmap::DashMap::new()),
+            v1_scan_caught_up: None,
+            v1_finality_ok: None,
+            pending_sign_map: Arc::new(dashmap::DashMap::new()),
+            v1_finalise: None,
+            v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
+            v1_pending_after_prove: None,
+            v1_engine: None,
+            attest_challenges: Arc::new(dashmap::DashMap::new()),
+            public_hosts: Arc::new(vec!["node.test".to_string()]),
+        }
+    }
+
+    /// Injected load failure at the signed-capability resume check must
+    /// abort loudly. Against the previous `if let Ok(Some(_))` mask this
+    /// was green only after parking / timeout (or, after a wake, the
+    /// legacy commit branch) — never a fail-closed Err at the gate.
+    #[tokio::test]
+    async fn load_failure_under_v1_fails_closed_without_legacy_commit() {
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim v1");
+
+        let store = Arc::new(JobStore::new((*pool).clone()));
+        let created = store
+            .create(
+                JobKind::Send,
+                &[0xF1u8; 32],
+                Some("k-wait-load-fail"),
+                serde_json::json!({
+                    // No `commit` key: if the legacy branch were entered it
+                    // would parse Null and fail the job with "invalid commit body".
+                }),
+            )
+            .await
+            .expect("create");
+        let job_id = match created {
+            CreateResult::Fresh(j) => j.public_id,
+            _ => panic!("expected Fresh"),
+        };
+        store
+            .set_awaiting_signature(
+                job_id,
+                1,
+                serde_json::json!({
+                    "account_state_hash": "aa".repeat(32),
+                    "output_coins_root": "bb".repeat(32),
+                }),
+            )
+            .await
+            .expect("awaiting_signature");
+
+        let state = test_app_state(Arc::clone(&pool), Arc::clone(&store));
+
+        // `process_envelope` load succeeds (budget 1); `wait_for_commit`
+        // signed-capability check load fails (budget 0). Reuses the
+        // cancel-path `cfg(test)` load-fail budget — no new harness.
+        store.arm_load_failures_after_ok_count(1);
+
+        let err = process_envelope_for_test(
+            store.as_ref(),
+            &state,
+            &state.job_notify_map,
+            // Short timeout would only matter if the old mask parked;
+            // fail-closed must return before parking.
+            Duration::from_millis(50),
+            JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect_err("load failure under v1 must fail closed");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("could not load job") && msg.contains("signed-capability resume"),
+            "error must name the load failure cause, got {msg}"
+        );
+        assert!(
+            !msg.contains("invalid commit body"),
+            "legacy commit branch must not be entered; got {msg}"
+        );
+
+        store.disarm_load_failures();
+        let after = store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(
+            after.status,
+            JobStatus::AwaitingSignature,
+            "load failure must not advance or fail the job via legacy/timeout; got {:?}",
+            after.status
+        );
+        assert_ne!(
+            after.status,
+            JobStatus::Broadcasting,
+            "legacy path set_status(awaiting_signature→broadcasting) must not run"
+        );
+        assert!(
+            after.error.is_none(),
+            "legacy invalid-commit fail must not write error; got {:?}",
+            after.error
+        );
+        drop(scope);
     }
 }
 

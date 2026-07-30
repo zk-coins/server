@@ -5,13 +5,66 @@
 //! `completed`) yields `KernelError::internal_error` rather than an `Ok`
 //! with empty optional fields that pretend the payload is absent.
 
-use crate::kernel::error::{KernelError, KernelResult};
-use crate::kernel::types::{Job, JobEvent, JobKind, JobPayload, JobState};
-use crate::v1;
+use uuid::Uuid;
+
+use crate::kernel::error::{KernelError, KernelErrorCode, KernelResult};
+use crate::kernel::types::{Job, JobEvent, JobId, JobKind, JobPayload, JobState, SignTransition};
+use crate::v1::{self, WalletSignSubmission};
 use kernel_proto::{
     AwaitingSignature as ProtoAwaitingSignature, Job as ProtoJob, JobError as ProtoJobError,
-    JobEvent as ProtoJobEvent, JobResult as ProtoJobResult,
+    JobEvent as ProtoJobEvent, JobResult as ProtoJobResult, SignRequest as ProtoSignRequest,
 };
+
+/// Parse proto `SignRequest` into a domain [`SignTransition`].
+///
+/// Width checks (proto comment): `signature` **must** be 64 bytes,
+/// `s2c_nonce` **must** be 32 bytes — otherwise `malformed_request`.
+/// Empty / non-UUID `job_id` is also `malformed_request`.
+pub(crate) fn parse_sign_request(req: ProtoSignRequest) -> KernelResult<SignTransition> {
+    let raw = req.job_id.trim();
+    if raw.is_empty() {
+        return Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            "job_id is required",
+        ));
+    }
+    let id = Uuid::parse_str(raw).map_err(|_| {
+        KernelError::new(KernelErrorCode::MalformedRequest, "job_id must be a UUID")
+    })?;
+
+    let signature: [u8; 64] = match req.signature.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => {
+            return Err(KernelError::new(
+                KernelErrorCode::MalformedRequest,
+                format!(
+                    "signature must be exactly 64 bytes; got {}",
+                    req.signature.len()
+                ),
+            ));
+        }
+    };
+    let s2c_nonce: [u8; 32] = match req.s2c_nonce.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => {
+            return Err(KernelError::new(
+                KernelErrorCode::MalformedRequest,
+                format!(
+                    "s2c_nonce must be exactly 32 bytes; got {}",
+                    req.s2c_nonce.len()
+                ),
+            ));
+        }
+    };
+
+    Ok(SignTransition {
+        id: JobId(id),
+        submission: WalletSignSubmission {
+            signature,
+            s2c_nonce,
+        },
+    })
+}
 
 /// Map a domain event to `kernel.v1.JobEvent`.
 pub(crate) fn job_event_to_proto(event: &JobEvent) -> KernelResult<ProtoJobEvent> {
@@ -494,5 +547,62 @@ mod tests {
         assert_eq!(result.attestation, vec![0xCD; 16]);
         assert!(result.new_account_state_hash.is_empty());
         assert!(result.output_coin_ids.is_empty());
+    }
+
+    #[test]
+    fn parse_sign_request_accepts_exact_64_and_32() {
+        let id = Uuid::from_u128(0x91);
+        let req = ProtoSignRequest {
+            job_id: id.to_string(),
+            signature: vec![0xABu8; 64],
+            s2c_nonce: vec![0xCDu8; 32],
+        };
+        let st = parse_sign_request(req).expect("widths ok");
+        assert_eq!(st.id.as_uuid(), id);
+        assert_eq!(st.submission.signature, [0xABu8; 64]);
+        assert_eq!(st.submission.s2c_nonce, [0xCDu8; 32]);
+    }
+
+    #[test]
+    fn parse_sign_request_rejects_wrong_signature_width() {
+        let req = ProtoSignRequest {
+            job_id: Uuid::from_u128(1).to_string(),
+            signature: vec![0u8; 32], // 32 ≠ 64
+            s2c_nonce: vec![0u8; 32],
+        };
+        let err = parse_sign_request(req).expect_err("32-byte sig");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(
+            err.public_message.contains("64"),
+            "must name required width: {}",
+            err.public_message
+        );
+    }
+
+    #[test]
+    fn parse_sign_request_rejects_wrong_s2c_nonce_width() {
+        let req = ProtoSignRequest {
+            job_id: Uuid::from_u128(1).to_string(),
+            signature: vec![0u8; 64],
+            s2c_nonce: vec![0u8; 16], // 16 ≠ 32
+        };
+        let err = parse_sign_request(req).expect_err("16-byte nonce");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(
+            err.public_message.contains("32"),
+            "must name required width: {}",
+            err.public_message
+        );
+    }
+
+    #[test]
+    fn parse_sign_request_rejects_empty_job_id() {
+        let req = ProtoSignRequest {
+            job_id: "  ".to_string(),
+            signature: vec![0u8; 64],
+            s2c_nonce: vec![0u8; 32],
+        };
+        let err = parse_sign_request(req).expect_err("blank id");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
     }
 }

@@ -295,6 +295,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         let domain = crate::kernel_rpc::domain_from_parts(
             Arc::clone(&job_store),
             Arc::clone(&job_notify_map),
+            Arc::clone(&state.pending_sign_map),
         );
         tokio::spawn(async move {
             if let Err(e) =

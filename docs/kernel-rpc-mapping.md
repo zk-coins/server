@@ -4,7 +4,7 @@ Normative Quellen:
 
 - REST: `docs/specification.md` §7.5 / §7.6 / §7.7 (tag `spec-v1.2`)
 - Kernel: `docs/specification.md` §7.8 + `proto/kernel/v1/kernel.proto`
-- Code-Stand: Worktree `node` (Branch `feat/v1-spec-rebuild`, Block 2)
+- Code-Stand: Worktree `node` (Branch `feat/v1-spec-rebuild`, Block 3)
 
 Spalte **gRPC verdrahtet?** meint die `tonic`-Implementierung in
 `node/src/kernel_rpc.rs` über die transportneutrale Domain-Fassade
@@ -30,7 +30,7 @@ Boot: gRPC startet **nur** aus `start_rest_node` via
 | `POST /v1/tx` | `SubmitTransition` | unary | **nein** — fehlt unified Admit-Domain + gRPC-Request-Mapping (mint/send/receive) | Legacy-Admit: `jobs_mint_handler` / `jobs_send_handler`; Engine: `begin_v1_mint` / `begin_v1_send` / `execute_v1_receive` |
 | `GET /v1/jobs/<id>` | `GetJob` | unary | **ja** — `kernel_rpc::get_job` → `DomainKernel::get_job` → `job_to_proto` | ja: `get_job_v1_handler`; Store `JobStore::load` |
 | `GET /v1/jobs/<id>/stream` | `StreamJob` | server-stream | **ja** — `kernel_rpc::stream_job` → `DomainKernel::stream_job` / `JobEventHub` → `job_event_to_proto` (live nur mit shared Notify-Map) | ja: `stream_job_v1_handler` |
-| `POST /v1/jobs/<id>/sign` | `SignTransition` | unary | **nein** — fehlt Domain-Sign-Fassade + Proto-`SignRequest`-Mapping (REST/Wallet-Sign existiert) | ja: `jobs_sign_handler`; `accept_wallet_transition_signature` |
+| `POST /v1/jobs/<id>/sign` | `SignTransition` | unary | **ja** — `kernel_rpc::sign_transition` → `DomainKernel::sign_transition` → `job_to_proto` (Width 64/32 am gRPC-Rand). **Feature-Gate am gRPC-Rand** (vor Domäne): bei inaktivem V1-Claim (`!v1_sign_route_active()`) `Status::unimplemented` mit Meldung, die `ZKCOINS_V1_SHADOW` / `ScanStackMode::V1` nennt und **nicht** den Text `not yet implemented` der unverdrahteten Prozeduren — analog HTTP `feature_disabled` (kein `KernelErrorCode`) | ja: `jobs_sign_handler` → Flag-Gate `feature_disabled` / 404 → `kernel/jobs/sign`; `accept_wallet_transition_signature` |
 | `POST /v1/jobs/<id>/cancel` | `CancelJob` | unary | **ja** — `kernel_rpc::cancel_job` → `DomainKernel::cancel_job` (`CancelPolicy::NotYetPublished`) → `job_to_proto` | ja: `jobs_cancel_v1_handler` |
 | `POST /v1/pull/challenge` | `OpenPullChallenge` | unary | **nein** — fehlt Challenge-Domain + generisches OpenPull | **nicht vorhanden** |
 | `POST /v1/pull` | `Pull` | unary | **nein** — fehlt Pull-Domain | **nicht vorhanden** |
@@ -57,11 +57,11 @@ Die REST-Keys `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delet
 
 | Kriterium | Prozeduren | Zahl |
 |---|---|---|
-| **gRPC verdrahtet** (Domain + Proto, kein `unimplemented`) | `GetJob`, `StreamJob`, `CancelJob` | **3** |
-| REST/Engine vorhanden, gRPC noch `unimplemented` | `SignTransition`, `AttestBalance` (+ teilweise `GetInfo` / `OpenPullChallenge` nur attest) | **2+** |
+| **gRPC verdrahtet** (Domain + Proto, kein `unimplemented`) | `GetJob`, `StreamJob`, `CancelJob`, `SignTransition` | **4** |
+| REST/Engine vorhanden, gRPC noch `unimplemented` | `AttestBalance` (+ teilweise `GetInfo` / `OpenPullChallenge` nur attest) | **1+** |
 | Weder gRPC noch passende §7.5-Surface | Rest der 20 | **15** (inkl. nur-interne Bausteine) |
 
-**Kurzfassung:** **3 von 20** Kernel-Prozeduren sind gRPC-verdrahtet (`GetJob`, `StreamJob`, `CancelJob`). Die übrigen 17 antworten ehrlich mit `Status::unimplemented("<Name>: not yet implemented")`. Server-Boot nur über `start_rest_node` + shared Hub — kein stummer pool-only-Stream-Pfad.
+**Kurzfassung:** **4 von 20** Kernel-Prozeduren sind gRPC-verdrahtet (`GetJob`, `StreamJob`, `CancelJob`, `SignTransition`). Die übrigen 16 antworten ehrlich mit `Status::unimplemented("<Name>: not yet implemented")`. `SignTransition` hat zusätzlich ein **API-Rand-Feature-Gate**: bei inaktivem V1-Claim `Unimplemented` mit `ZKCOINS_V1_SHADOW` in der Meldung (ohne `not yet implemented`) — nicht dasselbe wie unverdrahtet. Server-Boot nur über `start_rest_node` + shared Hub + pending-sign-Map — kein stummer pool-only-Stream-Pfad.
 
 ## API-lokale Endpunkte (explizit ohne Kernel)
 

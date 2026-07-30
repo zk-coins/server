@@ -6,9 +6,9 @@
 //! `Status::unimplemented("<Name>: not yet implemented")` — never an
 //! invented `Ok(...)` payload.
 //!
-//! Wired today (Block 2): `GetJob`, `StreamJob`, `CancelJob`. These call
-//! the transport-neutral domain façade and map through
-//! `transport/grpc/` converters + the shared error contract.
+//! Wired today (Block 3): `GetJob`, `StreamJob`, `CancelJob`,
+//! `SignTransition`. These call the transport-neutral domain façade and
+//! map through `transport/grpc/` converters + the shared error contract.
 //!
 //! The existing HTTP router is untouched; this is an additive internal
 //! surface only (Kernel/API split is a later step).
@@ -33,11 +33,14 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::job_store::JobStore;
-use crate::kernel::error::{KernelError, KernelErrorCode};
-use crate::kernel::job_events::JobEventHub;
-use crate::kernel::types::{CancelPolicy, JobId, JobRequest as DomainJobRequest};
-use crate::kernel::KernelService as DomainKernel;
-use crate::transport::grpc::{job_event_to_proto, job_to_proto, kernel_error_to_status};
+use crate::kernel::{
+    CancelPolicy, JobId, JobRequest as DomainJobRequest, KernelError, KernelErrorCode,
+    KernelService as DomainKernel,
+};
+use crate::transport::grpc::{
+    job_event_to_proto, job_to_proto, kernel_error_to_status, parse_sign_request,
+};
+use crate::v1::PendingSignMap;
 
 /// Environment variable that selects the kernel gRPC listen address.
 ///
@@ -243,9 +246,29 @@ impl Kernel for GrpcKernelService {
 
     async fn sign_transition(
         &self,
-        _request: Request<SignRequest>,
+        request: Request<SignRequest>,
     ) -> Result<Response<Job>, Status> {
-        Err(not_yet("SignTransition"))
+        // API-edge feature gate (same surface as HTTP `feature_disabled`):
+        // not a KernelErrorCode. Refuse before domain so a legacy stack
+        // never sees a missing-staging `internal_error` for a surface that
+        // is simply off. Unimplemented + flag name distinguishes this from
+        // unwired procedures (`"<Name>: not yet implemented"`).
+        if !crate::v1::v1_sign_route_active() {
+            return Err(Status::unimplemented(
+                "SignTransition: disabled — requires ZKCOINS_V1_SHADOW=1 / \
+                 ScanStackMode::V1 (surface inactive in this configuration; \
+                 not an unimplemented procedure)",
+            ));
+        }
+        // Width / UUID checks at the transport edge (64 / 32 bytes).
+        let req = parse_sign_request(request.into_inner()).map_err(map_domain_err)?;
+        let job = self
+            .domain
+            .sign_transition(req)
+            .await
+            .map_err(map_domain_err)?;
+        let proto = job_to_proto(&job).map_err(map_domain_err)?;
+        Ok(Response::new(proto))
     }
 
     async fn cancel_job(&self, request: Request<JobRequest>) -> Result<Response<Job>, Status> {
@@ -337,12 +360,14 @@ impl Kernel for GrpcKernelService {
     }
 }
 
-/// Build a domain façade from store + notify map (production / tests).
+/// Build a domain façade from store + notify map + pending-sign map
+/// (production / tests). Sign and stream share the dispatcher's maps.
 pub(crate) fn domain_from_parts(
     job_store: Arc<JobStore>,
     notify_map: crate::job_dispatcher::JobNotifyMap,
+    pending_sign_map: PendingSignMap,
 ) -> DomainKernel {
-    DomainKernel::new(job_store, JobEventHub::new(notify_map))
+    DomainKernel::from_parts(job_store, notify_map, pending_sign_map)
 }
 
 #[cfg(test)]
@@ -367,8 +392,14 @@ mod tests {
     async fn test_domain() -> (DomainKernel, SchemaScope) {
         let scope = setup_pool().await;
         let store = Arc::new(JobStore::new(scope.pool.clone()));
-        let hub = JobEventHub::new(Arc::new(dashmap::DashMap::new()));
-        (DomainKernel::new(store, hub), scope)
+        (
+            DomainKernel::from_parts(
+                store,
+                Arc::new(dashmap::DashMap::new()),
+                Arc::new(dashmap::DashMap::new()),
+            ),
+            scope,
+        )
     }
 
     fn grpc_svc(domain: DomainKernel) -> GrpcKernelService {
@@ -509,12 +540,23 @@ mod tests {
                 .await,
         )
         .await;
-        expect_unimplemented(
-            "SignTransition",
-            svc.sign_transition(Request::new(SignRequest::default()))
-                .await,
-        )
-        .await;
+        // SignTransition is wired **and active** under V1: empty request
+        // fails at the width/UUID boundary as malformed_request, not as
+        // the feature gate (Unimplemented) and not as "not yet implemented".
+        // Process claim is monotonic; nextest isolates per test.
+        {
+            crate::v1::set_process_stack_mode(crate::v1::ScanStackMode::V1);
+            let err = svc
+                .sign_transition(Request::new(SignRequest::default()))
+                .await
+                .expect_err("empty SignRequest must fail closed");
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "SignTransition is wired and active; empty body is malformed, not unimplemented"
+            );
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
         expect_unimplemented(
             "OpenPullChallenge",
             svc.open_pull_challenge(Request::new(PullChallengeRequest::default()))
@@ -576,6 +618,102 @@ mod tests {
         .await;
     }
 
+    /// Flag/claim off: SignTransition is refused at the gRPC edge with
+    /// `Unimplemented` naming `ZKCOINS_V1_SHADOW` — never a domain call
+    /// (no job mutation). Distinct from unwired procedures' "not yet
+    /// implemented" wording.
+    #[tokio::test]
+    async fn sign_transition_flag_off_is_unimplemented_naming_flag_without_domain() {
+        // Default process claim is unset → `v1_sign_route_active()` is false
+        // (nextest process isolation; do not claim V1 in this test).
+        let scope = setup_pool().await;
+        let store = Arc::new(JobStore::new(scope.pool.clone()));
+        let created = store
+            .create(
+                StoreKind::Send,
+                &[0x51u8; 32],
+                Some("grpc-sign-flag-off"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let id = match created {
+            CreateResult::Fresh(j) => j.public_id,
+            _ => panic!("fresh"),
+        };
+        store
+            .set_awaiting_signature(
+                id,
+                1,
+                serde_json::json!({
+                    "account_state_hash": "aa".repeat(32),
+                    "output_coins_root": "bb".repeat(32),
+                }),
+            )
+            .await
+            .expect("awaiting_signature");
+        let before = store.load(id).await.expect("load").expect("row");
+        assert_eq!(
+            before.status,
+            crate::job_store::JobStatus::AwaitingSignature
+        );
+
+        let domain = DomainKernel::from_parts(
+            Arc::clone(&store),
+            Arc::new(dashmap::DashMap::new()),
+            Arc::new(dashmap::DashMap::new()),
+        );
+        let svc = grpc_svc(domain);
+
+        // Well-formed widths so a missing gate would reach the domain and
+        // mutate or fail on staging — not the width check.
+        let err = svc
+            .sign_transition(Request::new(SignRequest {
+                job_id: id.to_string(),
+                signature: vec![0u8; 64],
+                s2c_nonce: vec![0u8; 32],
+            }))
+            .await
+            .expect_err("flag-off SignTransition must refuse");
+
+        assert_eq!(
+            err.code(),
+            Code::Unimplemented,
+            "disabled surface uses Unimplemented (not a domain KernelError); got {:?}",
+            err.code()
+        );
+        let msg = err.message();
+        assert!(
+            msg.contains("ZKCOINS_V1_SHADOW"),
+            "message must name the feature flag, got {msg:?}"
+        );
+        assert!(
+            msg.contains("disabled") || msg.contains("inactive"),
+            "message must state the surface is off, got {msg:?}"
+        );
+        assert!(
+            !msg.contains("not yet implemented"),
+            "must distinguish disabled from unwired procedures, got {msg:?}"
+        );
+
+        // Domain not entered: row still awaiting_signature, body untouched.
+        let after = store.load(id).await.expect("load").expect("row");
+        assert_eq!(
+            after.status,
+            crate::job_store::JobStatus::AwaitingSignature,
+            "flag-off gate must not touch the job"
+        );
+        assert_eq!(
+            after.phase, before.phase,
+            "flag-off gate must not rewrite phase"
+        );
+        assert_eq!(
+            after.request_body, before.request_body,
+            "flag-off gate must not rewrite request_body (no durable sign install)"
+        );
+        assert_eq!(after.error, before.error);
+    }
+
     #[tokio::test]
     async fn get_job_returns_complete_proving_snapshot() {
         let scope = setup_pool().await;
@@ -602,9 +740,10 @@ mod tests {
             )
             .await
             .expect("proving");
-        let domain = DomainKernel::new(
+        let domain = DomainKernel::from_parts(
             Arc::clone(&store),
-            JobEventHub::new(Arc::new(dashmap::DashMap::new())),
+            Arc::new(dashmap::DashMap::new()),
+            Arc::new(dashmap::DashMap::new()),
         );
         let svc = grpc_svc(domain);
         let resp = svc
@@ -688,9 +827,10 @@ mod tests {
         };
         assert!(store.cancel(id).await.expect("cancel"));
 
-        let domain = DomainKernel::new(
+        let domain = DomainKernel::from_parts(
             Arc::clone(&store),
-            JobEventHub::new(Arc::new(dashmap::DashMap::new())),
+            Arc::new(dashmap::DashMap::new()),
+            Arc::new(dashmap::DashMap::new()),
         );
         let svc = grpc_svc(domain);
         let resp = svc
@@ -741,9 +881,10 @@ mod tests {
             .await
             .expect("proving");
 
-        let domain = DomainKernel::new(
+        let domain = DomainKernel::from_parts(
             Arc::clone(&store),
-            JobEventHub::new(Arc::new(dashmap::DashMap::new())),
+            Arc::new(dashmap::DashMap::new()),
+            Arc::new(dashmap::DashMap::new()),
         );
         let svc = grpc_svc(domain);
         let resp = svc

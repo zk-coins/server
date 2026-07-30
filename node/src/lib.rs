@@ -34,9 +34,9 @@
 //!   `kernel_grpc_addr_from_env` / `KernelGrpcStartError`. The gRPC server
 //!   itself is crate-private (`serve_kernel_grpc_with_domain`) and is
 //!   started only from `start_rest_node` with the shared job store + notify
-//!   map (no pool-only silent-stream boot). `GetJob` / `StreamJob` /
-//!   `CancelJob` are wired; remaining procedures stay unimplemented until
-//!   a faithful §7.8 mapping exists.
+//!   map + pending-sign map (no pool-only silent-stream boot). `GetJob` /
+//!   `StreamJob` / `CancelJob` / `SignTransition` are wired; remaining
+//!   procedures stay unimplemented until a faithful §7.8 mapping exists.
 //! - [`state`] — binary `State::load_from_pg` (+ `LoadStateError`). The
 //!   type is public so the binary can hold `Arc<Mutex<State>>`. **Not**
 //!   public: `new`, `update`, `serialize_for_persist`,
@@ -110,6 +110,8 @@
 #![allow(clippy::new_without_default)]
 
 pub mod account_node;
+/// Quarantined legacy job façades (ash‖ocr commit, …). Not §7.8 procedures.
+pub(crate) mod application;
 pub(crate) mod audit;
 pub mod db;
 /// Node-side Esplora boundary: re-exports the `esplora-bound` facade
