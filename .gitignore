@@ -7,3 +7,7 @@ target/
 
 # accidentally-tracked tmp file
 .tmp
+
+# rustc internal-compiler-error dumps (written into the workspace root on an
+# ICE; never part of the tree).
+rustc-ice-*.txt
