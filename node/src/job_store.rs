@@ -174,6 +174,9 @@ impl JobStatus {
 }
 
 /// Kind enum persisted in `jobs.kind`.
+///
+/// Closed set matches the CHECK constraint (migration 0029):
+/// `mint | send | attest_balance | receive`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
@@ -181,6 +184,8 @@ pub enum JobKind {
     Send,
     /// §7.5 `POST /v1/attest/balance` — `C_balance` proving job (Gap G6).
     AttestBalance,
+    /// §7.8 / §7.5 `kind == "receive"` — fold-in transition (migration 0029).
+    Receive,
 }
 
 impl JobKind {
@@ -189,6 +194,7 @@ impl JobKind {
             JobKind::Mint => "mint",
             JobKind::Send => "send",
             JobKind::AttestBalance => "attest_balance",
+            JobKind::Receive => "receive",
         }
     }
 
@@ -197,6 +203,7 @@ impl JobKind {
             "mint" => Some(JobKind::Mint),
             "send" => Some(JobKind::Send),
             "attest_balance" => Some(JobKind::AttestBalance),
+            "receive" => Some(JobKind::Receive),
             _ => None,
         }
     }
@@ -349,17 +356,70 @@ impl Job {
 /// Stripe-style idempotency: if the caller supplied an
 /// `Idempotency-Key` and the `(account, key)` pair already exists,
 /// the existing row is returned via the `IdempotentReplay` variant
-/// without inserting a second one. The admit handler responds with
-/// the cached body so the wallet's retry semantics drive progress
-/// without amplifying the prove cost.
+/// without inserting a second one **only when the admit body matches**
+/// (see [`admit_bodies_equal_for_idempotency`]). A same-key request
+/// with a **different** body is [`CreateResult::IdempotencyConflict`]
+/// (§7.5 `409 idempotency_conflict`) — never a silent replay of the
+/// first request's job.
 #[derive(Debug, Clone)]
 pub enum CreateResult {
     /// A brand-new row was inserted; the dispatcher should pick it up.
     Fresh(Job),
-    /// An existing row matched the `(account, idempotency_key)`
-    /// pair. The caller MUST return the cached response (if any)
-    /// instead of enqueuing a second copy.
+    /// An existing row matched the `(account, idempotency_key)` pair
+    /// **and** the admit body (after stripping server-owned keys).
+    /// The caller MUST return the cached response (if any) instead of
+    /// enqueuing a second copy.
     IdempotentReplay(Job),
+    /// Same `(account, idempotency_key)` as an existing row, but the
+    /// admit body is not equal under
+    /// [`admit_bodies_equal_for_idempotency`]. No row was inserted.
+    /// Map to §7.5 `idempotency_conflict` (HTTP 409).
+    IdempotencyConflict,
+}
+
+/// Server-owned keys merged into `jobs.request_body` **after** admit.
+///
+/// Cancel / complete / finalise paths strip these
+/// (`finalisation`, `pending_sign`, `sign`, `finalise_claim`). An
+/// idempotency retry must not treat their absence (or transient
+/// presence) as a different client body.
+pub const REQUEST_BODY_SERVER_KEYS: &[&str] =
+    &["finalisation", "pending_sign", "sign", "finalise_claim"];
+
+/// Strip server-owned keys from a stored or inbound `request_body` so
+/// idempotency compares the **client admit payload** only.
+///
+/// # Equality procedure (normative for this node)
+///
+/// 1. Clone the JSON value.
+/// 2. If it is a JSON object, remove every key in
+///    [`REQUEST_BODY_SERVER_KEYS`] (no-op when already absent).
+/// 3. Compare the resulting [`serde_json::Value`] with `==`
+///    (object key order independent; array order and scalar values
+///    matter; unknown client fields are retained).
+///
+/// This is **not** a raw HTTP-byte compare (whitespace / key order would
+/// false-conflict) and **not** a typed re-parse that drops unknown
+/// fields. What is stored is the admit-time `jsonb`; equality is the
+/// structural JSON value after removing only the documented
+/// server-owned keys.
+pub fn strip_server_keys_from_request_body(body: &serde_json::Value) -> serde_json::Value {
+    let mut stripped = body.clone();
+    if let Some(obj) = stripped.as_object_mut() {
+        for key in REQUEST_BODY_SERVER_KEYS {
+            obj.remove(*key);
+        }
+    }
+    stripped
+}
+
+/// `true` when two admit bodies are the same client payload under
+/// [`strip_server_keys_from_request_body`].
+pub fn admit_bodies_equal_for_idempotency(
+    stored: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> bool {
+    strip_server_keys_from_request_body(stored) == strip_server_keys_from_request_body(incoming)
 }
 
 /// Postgres-backed handle on the `jobs` table.
@@ -462,15 +522,24 @@ impl JobStore {
     /// Admit a fresh job.
     ///
     /// Stripe-style idempotency: when `idem_key` is `Some` and the
-    /// `(account, key)` pair already exists, the existing row is
-    /// returned as `CreateResult::IdempotentReplay` — no second row
-    /// is inserted. When `idem_key` is `None` (boot-time resumer's
-    /// hypothetical caller), every call inserts a fresh row.
+    /// `(account, key)` pair already exists:
+    /// - **same body** (see [`admit_bodies_equal_for_idempotency`]) →
+    ///   `CreateResult::IdempotentReplay` (no second row);
+    /// - **different body** → `CreateResult::IdempotencyConflict`
+    ///   (§7.5; no second row, no silent reuse of the first job).
+    ///
+    /// When `idem_key` is `None`, every call inserts a fresh row.
     ///
     /// The INSERT uses `ON CONFLICT (account_address, idempotency_key)
     /// DO NOTHING` — the partial UNIQUE index from migration 0014
     /// only fires when the key column is present, so the conflict
     /// arm is reachable only for caller-supplied keys.
+    ///
+    /// Body comparison runs **inside the same transaction** that holds
+    /// the self-heal generation lock and `SELECT … FOR UPDATE` on the
+    /// existing jobs row, so there is no window between "read stored
+    /// body" and "decide replay vs conflict" under concurrent
+    /// finalisation-key rewrites.
     pub async fn create(
         &self,
         kind: JobKind,
@@ -511,18 +580,25 @@ impl JobStore {
 
         // Conflict path: an existing row with the same
         // `(account_address, idempotency_key)` already exists. The
-        // INSERT's `DO NOTHING` swallowed the second insert; fetch
-        // the original and surface it to the caller.
+        // INSERT's `DO NOTHING` swallowed the second insert; lock the
+        // original row, compare admit bodies, then surface replay or
+        // idempotency_conflict.
         let existing = sqlx::query(
             "SELECT * FROM jobs \
-             WHERE account_address = $1 AND idempotency_key = $2",
+             WHERE account_address = $1 AND idempotency_key = $2 \
+             FOR UPDATE",
         )
         .bind(&account[..])
         .bind(idem_key)
         .fetch_one(&mut *tx)
         .await?;
+        let existing_job = Job::from_row(&existing)?;
+        if !admit_bodies_equal_for_idempotency(&existing_job.request_body, &request_body) {
+            tx.commit().await?;
+            return Ok(CreateResult::IdempotencyConflict);
+        }
         tx.commit().await?;
-        Job::from_row(&existing).map(CreateResult::IdempotentReplay)
+        Ok(CreateResult::IdempotentReplay(existing_job))
     }
 
     /// Load a single job by its public UUID. Returns `Ok(None)` if

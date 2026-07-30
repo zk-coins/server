@@ -1,6 +1,7 @@
-//! Transport-free kernel types for job procedures (Block 1–3).
+//! Transport-free kernel types for job procedures (Block 1–4).
 //!
-//! Full TransitionCommand / Challenge / Pull types land with later blocks.
+//! [`TransitionCommand`] / [`SignTransition`] / job projection types live
+//! here. Challenge / Pull types land with later blocks.
 //! This module must not import `axum` or `tonic`.
 
 use std::pin::Pin;
@@ -31,16 +32,18 @@ pub(crate) struct JobRequest {
     pub id: JobId,
 }
 
-/// Job kind as persisted today (`mint` | `send` | `attest_balance`).
+/// Job kind as persisted (`mint` | `send` | `attest_balance` | `receive`).
 ///
-/// Normative `receive` is not yet admitted by the store; Block 4 introduces
-/// it with `SubmitTransition`. Inventing a `Receive` variant without a
-/// write path would only paper over the gap.
+/// Wire `kind` is the same string set as §7.5 / §7.8 (`"receive"` for the
+/// fold-in transition). Store kind includes `receive` since migration 0029.
+/// Projection maps 1:1 from [`job_store::JobKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JobKind {
     Mint,
     Send,
     AttestBalance,
+    /// §7.5 / §7.8 `kind == "receive"`.
+    Receive,
 }
 
 impl JobKind {
@@ -49,6 +52,7 @@ impl JobKind {
             Self::Mint => "mint",
             Self::Send => "send",
             Self::AttestBalance => "attest_balance",
+            Self::Receive => "receive",
         }
     }
 
@@ -57,6 +61,142 @@ impl JobKind {
             job_store::JobKind::Mint => Self::Mint,
             job_store::JobKind::Send => Self::Send,
             job_store::JobKind::AttestBalance => Self::AttestBalance,
+            job_store::JobKind::Receive => Self::Receive,
+        }
+    }
+}
+
+/// 32-byte digest (coin id, asset id, `npk_rand`, …) already decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Digest32(pub [u8; 32]);
+
+/// x-only BIP-340 public key (32 bytes), already decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct XOnlyKey(pub [u8; 32]);
+
+/// Account address as 32 raw bytes (Bech32m decode is transport-side).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SubjectAddress(pub [u8; 32]);
+
+/// Opaque client idempotency key (≤ 64 bytes per §7.5).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct IdempotencyKey(pub String);
+
+impl IdempotencyKey {
+    /// Construct from a non-empty key already checked for length ≤ 64.
+    pub(crate) fn from_validated(key: String) -> Self {
+        Self(key)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Closed publisher / fee-address presence for v1 (§7.5 matrix).
+///
+/// Case (b) (publisher + fee_address) is **not representable**: v1 forbids
+/// `fee_address`. Transport that sees `fee_address` present must reject
+/// with `malformed_request` before building this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PublisherChoice {
+    /// Case (a): self-publish — no `publisher_pubkey`, no `fee_address`.
+    SelfPublish,
+    /// Case (c): fee-less external hand-off — `publisher_pubkey` present,
+    /// `fee_address` absent.
+    FeeLessHandOff { publisher_pubkey: XOnlyKey },
+}
+
+/// One output template (§7.5 `OutputTemplate`); amount is a decoded `u128`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutputTemplate {
+    pub recipient: SubjectAddress,
+    pub asset_id: Digest32,
+    pub amount: u128,
+}
+
+/// Issuance block for `kind == mint` (§7.5 / §6.5).
+///
+/// Closed: version 1 has no cap/salt; version 2 requires both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Issuance {
+    /// `issuance_version == 1` — no `cap_total` / `terms_salt`.
+    V1 {
+        name: String,
+        decimals: u8,
+        amount: u128,
+    },
+    /// `issuance_version == 2` — `cap_total` and `terms_salt` required.
+    V2 {
+        name: String,
+        decimals: u8,
+        amount: u128,
+        cap_total: u128,
+        terms_salt: Digest32,
+    },
+}
+
+/// Fields common to every transition kind (decoded, required).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransitionCommon {
+    pub subject: SubjectAddress,
+    pub next_pubkey: XOnlyKey,
+    pub npk_rand: Digest32,
+    pub publisher: PublisherChoice,
+    pub idempotency_key: IdempotencyKey,
+}
+
+/// Closed `TransitionCommand` for `SubmitTransition` (§7.8 / §7.5).
+///
+/// Presence matrix is **structural**: forbidden fields for a kind are not
+/// members of that variant. Bounds and remaining shape checks live in
+/// [`crate::kernel::jobs::submit::validate_transition_command`].
+///
+/// This is not a `serde_json::Value` deferred check — a send without
+/// `input_coins` cannot be constructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TransitionCommand {
+    /// `kind == "mint"`: `issuance` + `output_templates` required;
+    /// `input_coins` / `fold_coin_ids` absent by construction.
+    Mint {
+        common: TransitionCommon,
+        issuance: Issuance,
+        output_templates: Vec<OutputTemplate>,
+    },
+    /// `kind == "send"`: `input_coins` + `output_templates` required;
+    /// `issuance` / `fold_coin_ids` absent by construction.
+    Send {
+        common: TransitionCommon,
+        input_coins: Vec<Digest32>,
+        output_templates: Vec<OutputTemplate>,
+    },
+    /// `kind == "receive"`: `fold_coin_ids` required;
+    /// `input_coins` / `output_templates` / `issuance` absent by construction.
+    ///
+    /// Shape validation runs; **job admission is refused** until the
+    /// dispatcher can drive §2.3.3 from the command payload alone (it
+    /// cannot: clause-10 slots, operational bundle, and wallet signature
+    /// are absent — see `submit_transition` / `ReceiveJobPathNotWired`).
+    Receive {
+        common: TransitionCommon,
+        fold_coin_ids: Vec<Digest32>,
+    },
+}
+
+impl TransitionCommand {
+    pub(crate) fn common(&self) -> &TransitionCommon {
+        match self {
+            Self::Mint { common, .. }
+            | Self::Send { common, .. }
+            | Self::Receive { common, .. } => common,
+        }
+    }
+
+    pub(crate) fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Mint { .. } => "mint",
+            Self::Send { .. } => "send",
+            Self::Receive { .. } => "receive",
         }
     }
 }

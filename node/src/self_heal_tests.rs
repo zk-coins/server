@@ -569,6 +569,9 @@ async fn heal_v1_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
     let job_id = match created {
         crate::job_store::CreateResult::Fresh(j) => j.public_id,
         crate::job_store::CreateResult::IdempotentReplay(j) => j.public_id,
+        crate::job_store::CreateResult::IdempotencyConflict => {
+            panic!("unexpected IdempotencyConflict")
+        }
     };
     store
         .set_status(
@@ -668,6 +671,9 @@ async fn heal_v1_reset_fences_pre_loaded_job_resurrection() {
     let job = match created {
         crate::job_store::CreateResult::Fresh(j) => j,
         crate::job_store::CreateResult::IdempotentReplay(j) => j,
+        crate::job_store::CreateResult::IdempotencyConflict => {
+            panic!("unexpected IdempotencyConflict")
+        }
     };
     let job_id = job.public_id;
     let gen_before = job.reset_generation;
@@ -845,6 +851,9 @@ async fn heal_v1_reset_fences_stale_generation_admit() {
     let fresh_job = match fresh {
         crate::job_store::CreateResult::Fresh(j) => j,
         crate::job_store::CreateResult::IdempotentReplay(j) => j,
+        crate::job_store::CreateResult::IdempotencyConflict => {
+            panic!("unexpected IdempotencyConflict")
+        }
     };
     assert_eq!(fresh_job.reset_generation, live_gen);
     let advanced_ok = store
@@ -892,6 +901,9 @@ async fn heal_legacy_reset_fences_pre_loaded_job_resurrection() {
     let job = match created {
         crate::job_store::CreateResult::Fresh(j) => j,
         crate::job_store::CreateResult::IdempotentReplay(j) => j,
+        crate::job_store::CreateResult::IdempotencyConflict => {
+            panic!("unexpected IdempotencyConflict")
+        }
     };
     let job_id = job.public_id;
     let gen_before = job.reset_generation;
@@ -1004,6 +1016,9 @@ async fn heal_admit_blocks_until_open_generation_bump_commits() {
     let job = match created {
         crate::job_store::CreateResult::Fresh(j) => j,
         crate::job_store::CreateResult::IdempotentReplay(j) => j,
+        crate::job_store::CreateResult::IdempotencyConflict => {
+            panic!("unexpected IdempotencyConflict")
+        }
     };
     assert_eq!(
         job.reset_generation, bumped,
@@ -1042,6 +1057,9 @@ async fn heal_set_status_blocks_until_open_generation_bump_commits() {
     let job = match created {
         crate::job_store::CreateResult::Fresh(j) => j,
         crate::job_store::CreateResult::IdempotentReplay(j) => j,
+        crate::job_store::CreateResult::IdempotencyConflict => {
+            panic!("unexpected IdempotencyConflict")
+        }
     };
     let job_id = job.public_id;
     let gen_before = job.reset_generation;
@@ -1121,6 +1139,9 @@ async fn heal_complete_reports_zero_rows_and_no_completed_event() {
     let job = match created {
         crate::job_store::CreateResult::Fresh(j) => j,
         crate::job_store::CreateResult::IdempotentReplay(j) => j,
+        crate::job_store::CreateResult::IdempotencyConflict => {
+            panic!("unexpected IdempotencyConflict")
+        }
     };
     let job_id = job.public_id;
 
@@ -1219,6 +1240,9 @@ async fn heal_set_status_reports_zero_rows_on_generation_fence() {
     let job = match created {
         crate::job_store::CreateResult::Fresh(j) => j,
         crate::job_store::CreateResult::IdempotentReplay(j) => j,
+        crate::job_store::CreateResult::IdempotencyConflict => {
+            panic!("unexpected IdempotencyConflict")
+        }
     };
 
     // Bump generation without failing the job — isolates the fence from the

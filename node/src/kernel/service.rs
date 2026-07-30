@@ -1,18 +1,24 @@
 //! Kernel service façade.
 //!
-//! Block 1–3 expose `get_job`, `stream_job`, `cancel_job`, and
-//! `sign_transition`. The remaining §7.8 procedures land in later blocks
-//! on this same type — they are intentionally absent here rather than stubbed.
+//! Block 1–4 expose `get_job`, `stream_job`, `cancel_job`,
+//! `sign_transition`, and `submit_transition`. The remaining §7.8
+//! procedures land in later blocks on this same type — they are
+//! intentionally absent here rather than stubbed.
 
 use std::sync::Arc;
 
-use crate::job_dispatcher::JobNotifyMap;
+use tokio::sync::mpsc;
+
+use crate::job_dispatcher::{JobEnvelope, JobNotifyMap};
 use crate::job_store::JobStore;
 use crate::kernel::error::KernelResult;
 use crate::kernel::jobs;
 use crate::kernel::jobs::sign::SignTransitionDeps;
+use crate::kernel::jobs::submit::SubmitTransitionDeps;
 use crate::kernel::types::KernelStream;
-use crate::kernel::{CancelPolicy, Job, JobEvent, JobEventHub, JobRequest, SignTransition};
+use crate::kernel::{
+    CancelPolicy, Job, JobEvent, JobEventHub, JobRequest, SignTransition, TransitionCommand,
+};
 use crate::v1::PendingSignMap;
 
 /// Crate-private kernel façade.
@@ -96,6 +102,26 @@ impl KernelService {
                 store: self.job_store.as_ref(),
                 pending_sign_map: &self.pending_sign_map,
                 notify_map: &self.notify_map,
+            },
+            request,
+        )
+        .await
+    }
+
+    /// `SubmitTransition` — presence/bounds validate, admit, dispatcher handoff.
+    ///
+    /// `job_tx` is the same admit queue the legacy mint/send routes use.
+    /// Kept as a method argument (not stored on the service) so read-only
+    /// `from_store` constructions stay free of a channel.
+    pub(crate) async fn submit_transition(
+        &self,
+        job_tx: &mpsc::Sender<JobEnvelope>,
+        request: TransitionCommand,
+    ) -> KernelResult<Job> {
+        jobs::submit_transition(
+            SubmitTransitionDeps {
+                store: self.job_store.as_ref(),
+                job_tx,
             },
             request,
         )

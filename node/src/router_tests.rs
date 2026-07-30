@@ -2713,6 +2713,49 @@ mod jobs_endpoint_tests {
         );
     }
 
+    /// §7.5: same Idempotency-Key with a **different** body is
+    /// `409 idempotency_conflict` — not a silent 202 replaying the first job.
+    /// Would be red against the pre-Block-4 store (same key always replayed).
+    #[tokio::test]
+    async fn jobs_mint_same_idem_key_different_body_returns_409_idempotency_conflict() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let body_a = signed_mint_body(1);
+        let body_b = signed_mint_body(2);
+        let key = "k-conflict";
+        let first = run(
+            state.clone(),
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", key)
+                .body(Body::from(body_a.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(first.0, StatusCode::ACCEPTED);
+
+        let second = run(
+            state,
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", key)
+                .body(Body::from(body_b.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            second.0,
+            StatusCode::CONFLICT,
+            "different body under same key must be 409, got body {}",
+            second.2
+        );
+        let v: serde_json::Value = serde_json::from_str(&second.2).expect("json");
+        assert_eq!(
+            v["error"], "idempotency_conflict",
+            "machine code must be the closed §7.5 reason, got {}",
+            second.2
+        );
+    }
+
     #[tokio::test]
     async fn jobs_mint_idempotent_replay_after_completion_returns_cached_body() {
         let (state, _pool, _c) = jobs_test_state().await;

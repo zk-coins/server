@@ -297,9 +297,14 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             Arc::clone(&job_notify_map),
             Arc::clone(&state.pending_sign_map),
         );
+        let job_tx_grpc = job_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                crate::kernel_rpc::serve_kernel_grpc_with_domain(kernel_grpc_addr, domain).await
+            if let Err(e) = crate::kernel_rpc::serve_kernel_grpc_with_domain(
+                kernel_grpc_addr,
+                domain,
+                job_tx_grpc,
+            )
+            .await
             {
                 eprintln!("Kernel gRPC error: {}", e);
                 std::process::exit(1);

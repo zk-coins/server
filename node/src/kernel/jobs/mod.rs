@@ -1,4 +1,5 @@
-//! Job-family kernel operations (`GetJob`, `StreamJob`, `CancelJob`, `SignTransition`).
+//! Job-family kernel operations
+//! (`GetJob`, `StreamJob`, `CancelJob`, `SignTransition`, `SubmitTransition`).
 
 use std::sync::Arc;
 
@@ -9,8 +10,13 @@ use crate::kernel::types::{KernelStream, NormativeJobStatus};
 use crate::kernel::{CancelPolicy, Job, JobEvent, JobEventHub, JobRequest, KernelError};
 
 pub(crate) mod sign;
+pub(crate) mod submit;
 
 pub(crate) use sign::sign_transition;
+// `admit_job` / `validate_transition_command` stay in `submit` and are
+// imported via `jobs::submit::…` where needed (router, tests). Re-exporting
+// them here was unused and hid whether callers had wired the admit path.
+pub(crate) use submit::submit_transition;
 
 /// Load and strictly project a single job (`GetJob`, §7.8).
 ///

@@ -6,9 +6,10 @@
 //! `Status::unimplemented("<Name>: not yet implemented")` — never an
 //! invented `Ok(...)` payload.
 //!
-//! Wired today (Block 3): `GetJob`, `StreamJob`, `CancelJob`,
-//! `SignTransition`. These call the transport-neutral domain façade and
-//! map through `transport/grpc/` converters + the shared error contract.
+//! Wired today (Block 4): `GetJob`, `StreamJob`, `CancelJob`,
+//! `SignTransition`, `SubmitTransition`. These call the transport-neutral
+//! domain façade and map through `transport/grpc/` converters + the shared
+//! error contract.
 //!
 //! The existing HTTP router is untouched; this is an additive internal
 //! surface only (Kernel/API split is a later step).
@@ -32,6 +33,7 @@ use kernel_proto::{
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+use crate::job_dispatcher::JobEnvelope;
 use crate::job_store::JobStore;
 use crate::kernel::{
     CancelPolicy, JobId, JobRequest as DomainJobRequest, KernelError, KernelErrorCode,
@@ -39,8 +41,10 @@ use crate::kernel::{
 };
 use crate::transport::grpc::{
     job_event_to_proto, job_to_proto, kernel_error_to_status, parse_sign_request,
+    parse_transition_request,
 };
 use crate::v1::PendingSignMap;
+use tokio::sync::mpsc;
 
 /// Environment variable that selects the kernel gRPC listen address.
 ///
@@ -106,8 +110,9 @@ pub fn kernel_grpc_addr_from_env() -> Result<SocketAddr, KernelGrpcStartError> {
 pub(crate) async fn serve_kernel_grpc_with_domain(
     addr: SocketAddr,
     domain: DomainKernel,
+    job_tx: mpsc::Sender<JobEnvelope>,
 ) -> Result<(), KernelGrpcStartError> {
-    let service = GrpcKernelService::new(domain);
+    let service = GrpcKernelService::new(domain, job_tx);
     tracing::info!(%addr, "kernel.v1 gRPC listening");
     tonic::transport::Server::builder()
         .add_service(KernelServer::new(service))
@@ -118,16 +123,18 @@ pub(crate) async fn serve_kernel_grpc_with_domain(
 
 /// gRPC adapter over the transport-neutral domain façade.
 ///
-/// Constructed only with a real [`DomainKernel`] (store + event hub).
-/// No `Default` — an empty service would invent a silent no-data edge.
+/// Constructed only with a real [`DomainKernel`] (store + event hub) and
+/// the same admit channel REST uses. No `Default` — an empty service
+/// would invent a silent no-data edge.
 #[derive(Clone)]
 struct GrpcKernelService {
     domain: DomainKernel,
+    job_tx: mpsc::Sender<JobEnvelope>,
 }
 
 impl GrpcKernelService {
-    fn new(domain: DomainKernel) -> Self {
-        Self { domain }
+    fn new(domain: DomainKernel, job_tx: mpsc::Sender<JobEnvelope>) -> Self {
+        Self { domain, job_tx }
     }
 }
 
@@ -196,9 +203,19 @@ impl Kernel for GrpcKernelService {
 
     async fn submit_transition(
         &self,
-        _request: Request<TransitionRequest>,
+        request: Request<TransitionRequest>,
     ) -> Result<Response<JobHandle>, Status> {
-        Err(not_yet("SubmitTransition"))
+        let cmd = parse_transition_request(request.into_inner()).map_err(map_domain_err)?;
+        let job = self
+            .domain
+            .submit_transition(&self.job_tx, cmd)
+            .await
+            .map_err(map_domain_err)?;
+        Ok(Response::new(JobHandle {
+            job_id: job.id.as_uuid().to_string(),
+            // §7.5 / §7.8: success status is `accepted` (store row is `queued`).
+            status: job.normative_status().as_v1_str().to_string(),
+        }))
     }
 
     async fn get_job(&self, request: Request<JobRequest>) -> Result<Response<Job>, Status> {
@@ -403,7 +420,8 @@ mod tests {
     }
 
     fn grpc_svc(domain: DomainKernel) -> GrpcKernelService {
-        GrpcKernelService::new(domain)
+        let (job_tx, _rx) = mpsc::channel::<JobEnvelope>(8);
+        GrpcKernelService::new(domain, job_tx)
     }
 
     #[test]
@@ -463,7 +481,9 @@ mod tests {
         drop(probe);
 
         let (domain, _scope) = test_domain().await;
-        let handle = tokio::spawn(async move { serve_kernel_grpc_with_domain(addr, domain).await });
+        let (job_tx, _rx) = mpsc::channel::<JobEnvelope>(8);
+        let handle =
+            tokio::spawn(async move { serve_kernel_grpc_with_domain(addr, domain, job_tx).await });
 
         let mut last_err = None;
         for _ in 0..50 {
@@ -534,12 +554,20 @@ mod tests {
                 .await,
         )
         .await;
-        expect_unimplemented(
-            "SubmitTransition",
-            svc.submit_transition(Request::new(TransitionRequest::default()))
-                .await,
-        )
-        .await;
+        // SubmitTransition is wired: empty body fails closed as
+        // malformed_request (InvalidArgument), not unimplemented.
+        {
+            let err = svc
+                .submit_transition(Request::new(TransitionRequest::default()))
+                .await
+                .expect_err("empty TransitionRequest must fail closed");
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "SubmitTransition is wired; empty body is malformed, not unimplemented"
+            );
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
         // SignTransition is wired **and active** under V1: empty request
         // fails at the width/UUID boundary as malformed_request, not as
         // the feature gate (Unimplemented) and not as "not yet implemented".

@@ -319,6 +319,101 @@ pub(crate) async fn process_envelope_for_test(
     .await
 }
 
+/// Typed cause: a `receive` job reached the dispatcher, but the job path
+/// cannot drive §2.3.3.
+///
+/// [`crate::v1::receive::V1ReceiveRequest`] needs full clause-10
+/// [`crate::v1::receive::ReceivedCoinSlot`] bindings, the operational
+/// bundle, and a wallet [`zkcoins_prover::prover_bridge::TransitionSignature`].
+/// `SubmitTransition` only carries `fold_coin_ids` digests plus common
+/// fields — reconstituting slots from digests alone is not possible.
+/// Outward machine code is `internal_error` (closed set); classification
+/// is by downcast of this type, never by parsing the Display text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReceiveJobPathNotWired;
+
+impl std::fmt::Display for ReceiveJobPathNotWired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "receive job path not wired: SubmitTransition carries fold_coin_ids only; \
+             §2.3.3 needs clause-10 ReceivedCoinSlot bindings, operational bundle, and \
+             a wallet TransitionSignature (direct path: v1::receive::execute_v1_receive)",
+        )
+    }
+}
+
+impl std::error::Error for ReceiveJobPathNotWired {}
+
+/// Machine code stored when a receive job is terminal-failed as not wired.
+pub(crate) const RECEIVE_JOB_PATH_NOT_WIRED_CODE: &str = "internal_error";
+
+/// Pure decision for one non-terminal dispatcher envelope.
+///
+/// Terminal statuses are filtered before this is consulted. The table is
+/// exhaustive over `(JobKind, JobStatus)` so a future kind/status cannot
+/// silently become `Ok(())`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatcherEnvelopeAction {
+    ProcessMintQueued,
+    ProcessMintAwaitingSignature,
+    ProcessSendQueued,
+    ProcessSendAwaitingSignature,
+    ProcessAttest,
+    DriveV1Finalise,
+    /// Receive cannot be executed on the job path — terminal fail.
+    RejectReceiveNotWired,
+    /// Prove already in flight (re-delivered envelope / concurrent owner).
+    SkipConcurrentProving,
+    /// Broadcast/finalise already in flight without v1 re-entry.
+    SkipConcurrentBroadcasting,
+    /// Non-terminal combo that must not hang — terminal fail.
+    FailUnexpectedNonTerminal,
+}
+
+/// Decision table for [`process_envelope`]. Pure; no I/O.
+///
+/// `v1_sign_route_active` gates the mint/send broadcasting re-entry that
+/// drives durable finalise without re-parking on `/sign`.
+pub(crate) fn dispatcher_envelope_action(
+    kind: JobKind,
+    status: JobStatus,
+    v1_sign_route_active: bool,
+) -> DispatcherEnvelopeAction {
+    use DispatcherEnvelopeAction::*;
+    match (kind, status) {
+        (JobKind::Mint, JobStatus::Queued) => ProcessMintQueued,
+        (JobKind::Mint, JobStatus::AwaitingSignature) => ProcessMintAwaitingSignature,
+        (JobKind::Send, JobStatus::Queued) => ProcessSendQueued,
+        (JobKind::Send, JobStatus::AwaitingSignature) => ProcessSendAwaitingSignature,
+        // Gap G6: attest_balance has no awaiting_signature phase (§7.5).
+        (JobKind::AttestBalance, JobStatus::Queued | JobStatus::Proving) => ProcessAttest,
+        // Mid-finalise crash: durable signed capability + broadcasting.
+        (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting) if v1_sign_route_active => {
+            DriveV1Finalise
+        }
+        // Job path cannot drive §2.3.3 from fold_coin_ids alone.
+        (JobKind::Receive, JobStatus::Queued)
+        | (JobKind::Receive, JobStatus::Proving)
+        | (JobKind::Receive, JobStatus::AwaitingSignature)
+        | (JobKind::Receive, JobStatus::Broadcasting) => RejectReceiveNotWired,
+        // Re-delivered envelope while prove owns the row — do not re-start.
+        (JobKind::Mint | JobKind::Send, JobStatus::Proving) => SkipConcurrentProving,
+        // Legacy in-process commit continues from AwaitingSignature; an
+        // orphaned broadcasting envelope is concurrent mid-commit.
+        (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting) => SkipConcurrentBroadcasting,
+        // Terminal statuses are filtered before this function; named so a
+        // caller that forgets the filter still does not invent work.
+        (
+            JobKind::Mint | JobKind::Send | JobKind::AttestBalance | JobKind::Receive,
+            JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled,
+        ) => FailUnexpectedNonTerminal,
+        // Attest never enters signature/broadcast; silent skip would hang.
+        (JobKind::AttestBalance, JobStatus::AwaitingSignature | JobStatus::Broadcasting) => {
+            FailUnexpectedNonTerminal
+        }
+    }
+}
+
 async fn process_envelope(
     job_store: &JobStore,
     app_state: &AppState,
@@ -346,8 +441,10 @@ async fn process_envelope(
         return Ok(());
     }
 
-    match (job.kind, job.status) {
-        (JobKind::Mint, JobStatus::Queued) => {
+    let action =
+        dispatcher_envelope_action(job.kind, job.status, crate::v1::v1_sign_route_active());
+    match action {
+        DispatcherEnvelopeAction::ProcessMintQueued => {
             process_mint(
                 job_store,
                 app_state,
@@ -357,7 +454,7 @@ async fn process_envelope(
             )
             .await
         }
-        (JobKind::Mint, JobStatus::AwaitingSignature) => {
+        DispatcherEnvelopeAction::ProcessMintAwaitingSignature => {
             process_mint_resume(
                 job_store,
                 app_state,
@@ -367,7 +464,7 @@ async fn process_envelope(
             )
             .await
         }
-        (JobKind::Send, JobStatus::Queued) => {
+        DispatcherEnvelopeAction::ProcessSendQueued => {
             process_send_initial(
                 job_store,
                 app_state,
@@ -377,7 +474,7 @@ async fn process_envelope(
             )
             .await
         }
-        (JobKind::Send, JobStatus::AwaitingSignature) => {
+        DispatcherEnvelopeAction::ProcessSendAwaitingSignature => {
             process_send_resume(
                 job_store,
                 app_state,
@@ -387,26 +484,133 @@ async fn process_envelope(
             )
             .await
         }
-        // Gap G6: attest_balance has no awaiting_signature phase (§7.5).
-        (JobKind::AttestBalance, JobStatus::Queued | JobStatus::Proving) => {
+        DispatcherEnvelopeAction::ProcessAttest => {
             process_attest_balance(job_store, app_state, notify_map, job).await
         }
-        // Mid-finalise crash: durable signed capability + broadcasting.
-        // Resume finalise without re-parking on /sign.
-        (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting)
-            if crate::v1::v1_sign_route_active() =>
-        {
+        DispatcherEnvelopeAction::DriveV1Finalise => {
             drive_v1_finalise(job_store, app_state, notify_map, env.public_id, &job).await
         }
-        _ => {
+        DispatcherEnvelopeAction::RejectReceiveNotWired => {
+            reject_receive_job_path_not_wired(job_store, notify_map, job).await
+        }
+        DispatcherEnvelopeAction::SkipConcurrentProving => {
+            // Named intentional skip: prove CAS already advanced the row.
             tracing::debug!(
-                "Job dispatcher: envelope for {} in unexpected state {:?}; skipping",
+                "Job dispatcher: envelope for {} kind={} status=proving \
+                 (concurrent mid-flight prove); skipping without re-start",
                 env.public_id,
-                job.status
+                job.kind.as_str()
             );
             Ok(())
         }
+        DispatcherEnvelopeAction::SkipConcurrentBroadcasting => {
+            // Named intentional skip: broadcast/commit owns the row
+            // in-process (legacy) or another resumer holds finalise.
+            tracing::debug!(
+                "Job dispatcher: envelope for {} kind={} status=broadcasting \
+                 (concurrent mid-flight broadcast; v1 finalise re-entry inactive); \
+                 skipping",
+                env.public_id,
+                job.kind.as_str()
+            );
+            Ok(())
+        }
+        DispatcherEnvelopeAction::FailUnexpectedNonTerminal => {
+            fail_unexpected_non_terminal_envelope(job_store, notify_map, job).await
+        }
     }
+}
+
+/// Terminal-fail a receive job that the job path cannot execute.
+///
+/// `from` is the observed non-terminal status; a CAS miss means another
+/// actor already advanced the row — no failed event, no invented success.
+async fn reject_receive_job_path_not_wired(
+    job_store: &JobStore,
+    notify_map: &JobNotifyMap,
+    job: Job,
+) -> anyhow::Result<()> {
+    let public_id = job.public_id;
+    let from = job.status;
+    let cause = ReceiveJobPathNotWired;
+    let msg = crate::v1::encode_job_error(RECEIVE_JOB_PATH_NOT_WIRED_CODE, cause.to_string());
+    tracing::error!(
+        "Job dispatcher: receive job {} status={:?} refused — {}",
+        public_id,
+        from,
+        cause
+    );
+    if !job_store.fail(public_id, from, &msg).await? {
+        tracing::warn!(
+            "Job dispatcher: receive job {} fail({:?}→failed) matched 0 rows; \
+             not publishing failed event",
+            public_id,
+            from
+        );
+        notify_map.remove(&public_id);
+        return Ok(());
+    }
+    publish_phase(
+        notify_map,
+        public_id,
+        JobPhaseEvent {
+            status: JobStatus::Failed,
+            phase: "failed".to_string(),
+            proof_id: None,
+            result: None,
+            error: Some(msg),
+        },
+    );
+    notify_map.remove(&public_id);
+    Ok(())
+}
+
+/// Terminal-fail a non-terminal `(kind, status)` that has no named skip.
+async fn fail_unexpected_non_terminal_envelope(
+    job_store: &JobStore,
+    notify_map: &JobNotifyMap,
+    job: Job,
+) -> anyhow::Result<()> {
+    let public_id = job.public_id;
+    let from = job.status;
+    let msg = crate::v1::encode_job_error(
+        "internal_error",
+        format!(
+            "Job dispatcher: unexpected non-terminal state kind={} status={:?}; \
+             refusing silent skip (would leave job hung)",
+            job.kind.as_str(),
+            from
+        ),
+    );
+    tracing::error!(
+        "Job dispatcher: job {} unexpected non-terminal kind={} status={:?}; failing",
+        public_id,
+        job.kind.as_str(),
+        from
+    );
+    if !job_store.fail(public_id, from, &msg).await? {
+        tracing::warn!(
+            "Job dispatcher: job {} fail({:?}→failed) for unexpected state matched 0 rows; \
+             not publishing failed event",
+            public_id,
+            from
+        );
+        notify_map.remove(&public_id);
+        return Ok(());
+    }
+    publish_phase(
+        notify_map,
+        public_id,
+        JobPhaseEvent {
+            status: JobStatus::Failed,
+            phase: "failed".to_string(),
+            proof_id: None,
+            result: None,
+            error: Some(msg),
+        },
+    );
+    notify_map.remove(&public_id);
+    Ok(())
 }
 
 /// Drive an `attest_balance` job: `proving → completed` with
@@ -1819,6 +2023,15 @@ async fn wait_for_commit(
         JobKind::AttestBalance => {
             return Err(anyhow::anyhow!(
                 "Job dispatcher: attest_balance has no commit/broadcast leg"
+            ));
+        }
+        // Receive never enters wait_for_commit: admission refuses the kind,
+        // and any queued receive is terminal-failed as path-not-wired.
+        // This arm is structural exhaustiveness — reaching it is a bug.
+        JobKind::Receive => {
+            return Err(anyhow::anyhow!(
+                "Job dispatcher: receive has no commit/broadcast leg \
+                 (job path not wired; refuse rather than invent a commit outcome)"
             ));
         }
     };
@@ -3623,6 +3836,215 @@ mod from_cas_no_event_tests {
         let after = store.load(job_id).await.expect("load").expect("row");
         assert_eq!(after.status, JobStatus::Broadcasting);
         assert_eq!(after.phase, FINALISE_CLAIM_PHASE);
+        drop(scope);
+    }
+}
+
+/// Receive job-path wiring + dispatcher decision table (no Plonky2).
+#[cfg(test)]
+mod receive_job_path_and_decision_table_tests {
+    use super::*;
+    use crate::job_store::{CreateResult, JobKind, JobStatus, JobStore};
+    use std::time::Duration;
+
+    /// Pure decision table: every `(kind, status)` is named — none falls
+    /// through a silent catch-all. Pattern mirrors
+    /// `boot_finalise_action_decision_table`.
+    #[test]
+    fn dispatcher_envelope_action_decision_table() {
+        use DispatcherEnvelopeAction::*;
+
+        let kinds = [
+            JobKind::Mint,
+            JobKind::Send,
+            JobKind::AttestBalance,
+            JobKind::Receive,
+        ];
+        let statuses = [
+            JobStatus::Queued,
+            JobStatus::Proving,
+            JobStatus::AwaitingSignature,
+            JobStatus::Broadcasting,
+            JobStatus::Completed,
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+        ];
+
+        for kind in kinds {
+            for status in statuses {
+                for v1 in [false, true] {
+                    let action = dispatcher_envelope_action(kind, status, v1);
+                    let expected = match (kind, status, v1) {
+                        (JobKind::Mint, JobStatus::Queued, _) => ProcessMintQueued,
+                        (JobKind::Mint, JobStatus::AwaitingSignature, _) => {
+                            ProcessMintAwaitingSignature
+                        }
+                        (JobKind::Send, JobStatus::Queued, _) => ProcessSendQueued,
+                        (JobKind::Send, JobStatus::AwaitingSignature, _) => {
+                            ProcessSendAwaitingSignature
+                        }
+                        (JobKind::AttestBalance, JobStatus::Queued | JobStatus::Proving, _) => {
+                            ProcessAttest
+                        }
+                        (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting, true) => {
+                            DriveV1Finalise
+                        }
+                        (JobKind::Receive, s, _) if !s.is_terminal() => RejectReceiveNotWired,
+                        (JobKind::Mint | JobKind::Send, JobStatus::Proving, _) => {
+                            SkipConcurrentProving
+                        }
+                        (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting, false) => {
+                            SkipConcurrentBroadcasting
+                        }
+                        (_, s, _) if s.is_terminal() => FailUnexpectedNonTerminal,
+                        (JobKind::AttestBalance, _, _) => FailUnexpectedNonTerminal,
+                        // Exhaustive over the closed product above.
+                        _ => panic!("decision table missing arm for {kind:?} {status:?} v1={v1}"),
+                    };
+                    assert_eq!(
+                        action, expected,
+                        "kind={kind:?} status={status:?} v1={v1}: got {action:?}, want {expected:?}"
+                    );
+                }
+            }
+        }
+
+        // Named intentional skips stay skips (not Fail / not Process).
+        assert_eq!(
+            dispatcher_envelope_action(JobKind::Mint, JobStatus::Proving, false),
+            SkipConcurrentProving
+        );
+        assert_eq!(
+            dispatcher_envelope_action(JobKind::Send, JobStatus::Broadcasting, false),
+            SkipConcurrentBroadcasting
+        );
+        // Receive never silently skips while non-terminal.
+        assert_eq!(
+            dispatcher_envelope_action(JobKind::Receive, JobStatus::Queued, false),
+            RejectReceiveNotWired
+        );
+        assert_eq!(
+            dispatcher_envelope_action(JobKind::Receive, JobStatus::Proving, true),
+            RejectReceiveNotWired
+        );
+    }
+
+    /// Typed cause identity (downcast), not message parsing.
+    #[test]
+    fn receive_job_path_not_wired_is_downcastable() {
+        let err = anyhow::Error::new(ReceiveJobPathNotWired);
+        assert!(
+            err.downcast_ref::<ReceiveJobPathNotWired>().is_some(),
+            "ReceiveJobPathNotWired must be recoverable via downcast"
+        );
+        let display = ReceiveJobPathNotWired.to_string();
+        assert!(
+            display.contains("receive job path not wired"),
+            "Display must name the cause; got {display}"
+        );
+    }
+
+    /// An admitted (store-created) receive job is terminal-failed with the
+    /// typed path-not-wired cause — never left `queued`.
+    #[tokio::test]
+    async fn admitted_receive_job_is_terminal_failed_not_silently_skipped() {
+        let scope = crate::test_db::setup_pool().await;
+        let store = JobStore::new(scope.pool.clone());
+        let fold_hex = "22".repeat(32);
+        let CreateResult::Fresh(job) = store
+            .create(
+                JobKind::Receive,
+                &[0xCEu8; 32],
+                Some("k-rx-dispatch"),
+                serde_json::json!({
+                    "kind": "receive",
+                    "fold_coin_ids": [fold_hex],
+                }),
+            )
+            .await
+            .expect("create receive row (store path; admission refuses)")
+        else {
+            panic!("expected Fresh");
+        };
+        let job_id = job.public_id;
+        assert_eq!(job.status, JobStatus::Queued);
+
+        // Minimal AppState is not required: reject path only needs store + notify.
+        // process_envelope_for_test still takes AppState — build a cheap one.
+        let pool = std::sync::Arc::new(scope.pool.clone());
+        let job_store = std::sync::Arc::new(store);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let proof_dir = tmp.path().to_str().expect("utf8").to_string();
+        std::mem::forget(tmp);
+        let state_arc = std::sync::Arc::new(std::sync::Mutex::new(crate::state::State::new()));
+        let app_state = crate::router::AppState {
+            account_node: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::account_node::AccountNode::new(state_arc),
+            )),
+            proof_store: std::sync::Arc::new(crate::router::ProofStore::new(&proof_dir)),
+            mint_store: std::sync::Arc::new(crate::router::MintStore::new()),
+            username_store: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::username::UsernameStore::new(),
+            )),
+            pool: std::sync::Arc::clone(&pool),
+            esplora_config: std::sync::Arc::new(crate::publisher::EsploraConfig {
+                url: "http://127.0.0.1:1".to_string(),
+                is_mainnet: false,
+                network_name: "Regtest".to_string(),
+                ws_url: None,
+            }),
+            prover_warm: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            prover_health: std::sync::Arc::new(crate::prover_health::ProverHealth::new()),
+            job_store: std::sync::Arc::clone(&job_store),
+            job_tx: tokio::sync::mpsc::channel::<JobEnvelope>(8).0,
+            job_notify_map: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_scan_caught_up: None,
+            v1_finality_ok: None,
+            pending_sign_map: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_finalise: None,
+            v1_live_pending_after_begin: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_pending_after_prove: None,
+            v1_engine: None,
+            attest_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
+            public_hosts: std::sync::Arc::new(vec!["node.test".to_string()]),
+        };
+
+        process_envelope_for_test(
+            job_store.as_ref(),
+            &app_state,
+            &app_state.job_notify_map,
+            Duration::from_millis(50),
+            JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("reject path returns Ok after terminal fail");
+
+        let after = job_store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(
+            after.status,
+            JobStatus::Failed,
+            "receive must be terminal-failed, not left queued; got {:?}",
+            after.status
+        );
+        let err = after.error.as_deref().expect("failed row must store error");
+        let outward = crate::v1::decode_job_error(Some(err), JobStatus::Failed);
+        assert_eq!(
+            outward["error"], RECEIVE_JOB_PATH_NOT_WIRED_CODE,
+            "stored machine code must be the typed path-not-wired code; got {err}"
+        );
+        let message = outward["message"].as_str().expect("message field present");
+        // Cause identity: Display of the typed error is what we stored.
+        assert_eq!(
+            message,
+            ReceiveJobPathNotWired.to_string(),
+            "stored message must be the typed ReceiveJobPathNotWired Display"
+        );
+        // Downcast path: chain carrying the same typed cause.
+        let chained = anyhow::Error::new(ReceiveJobPathNotWired);
+        assert!(
+            chained.downcast_ref::<ReceiveJobPathNotWired>().is_some(),
+            "tests recover the cause via downcast, not substring on is_err()"
+        );
         drop(scope);
     }
 }

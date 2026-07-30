@@ -496,6 +496,9 @@ mod genesis_fence_tests {
             .expect("admit job before reset")
         {
             CreateResult::Fresh(j) | CreateResult::IdempotentReplay(j) => j,
+            CreateResult::IdempotencyConflict => {
+                panic!("unexpected IdempotencyConflict without body change")
+            }
         };
         assert_eq!(job.status, JobStatus::Queued);
         let gen_before = job.reset_generation;
@@ -568,6 +571,9 @@ mod genesis_fence_tests {
             .expect("admit after reset")
         {
             CreateResult::Fresh(j) | CreateResult::IdempotentReplay(j) => j,
+            CreateResult::IdempotencyConflict => {
+                panic!("unexpected IdempotencyConflict without body change")
+            }
         };
         assert_eq!(fresh.reset_generation, gen_after);
         assert_eq!(fresh.status, JobStatus::Queued);
@@ -598,6 +604,9 @@ mod genesis_fence_tests {
             .expect("admit before open reset")
         {
             CreateResult::Fresh(j) | CreateResult::IdempotentReplay(j) => j,
+            CreateResult::IdempotencyConflict => {
+                panic!("unexpected IdempotencyConflict without body change")
+            }
         };
         let job_id = job.public_id;
         let gen_before = job.reset_generation;

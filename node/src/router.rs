@@ -1327,9 +1327,12 @@ pub(crate) async fn jobs_send_handler(
 }
 
 /// Shared admit-then-enqueue glue used by `jobs_mint_handler` and
-/// `jobs_send_handler`. Hides the `(create → idempotent-replay
-/// branch → enqueue)` sequence from the kind-specific handler so the
-/// two route handlers stay short and obviously equivalent.
+/// `jobs_send_handler`. Domain admission lives in
+/// [`crate::kernel::jobs::admit_job`] (body-aware idempotency +
+/// dispatcher handoff). This function only projects the HTTP envelope
+/// so well-formed mint/send responses stay byte-equal to the pre-split
+/// surface; the sole deliberate delta is `409` on
+/// `idempotency_conflict` (§7.5).
 async fn admit_and_enqueue(
     state: &AppState,
     kind: JobKind,
@@ -1337,14 +1340,43 @@ async fn admit_and_enqueue(
     idem_key: &str,
     request_body: serde_json::Value,
 ) -> axum::response::Response {
-    let create_result = match state
-        .job_store
-        .create(kind, account, Some(idem_key), request_body)
-        .await
+    use crate::kernel::error::KernelErrorCode;
+    use crate::kernel::jobs::submit::{admit_job, AdmitError, AdmitOutcome, SubmitTransitionDeps};
+
+    let outcome = match admit_job(
+        SubmitTransitionDeps {
+            store: state.job_store.as_ref(),
+            job_tx: &state.job_tx,
+        },
+        kind,
+        account,
+        idem_key,
+        request_body,
+    )
+    .await
     {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("JobStore::create failed: {}", e);
+        Ok(o) => o,
+        Err(AdmitError::DispatcherUnavailable) => {
+            // Preserve the pre-split 503 when the admit channel is down.
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(JobErrorResponse {
+                    error: "Dispatcher unavailable".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Err(AdmitError::Domain(e)) if e.code == KernelErrorCode::IdempotencyConflict => {
+            return (
+                StatusCode::CONFLICT,
+                Json(JobErrorResponse {
+                    error: "idempotency_conflict".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Err(AdmitError::Domain(e)) => {
+            tracing::error!("admit_job failed: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(JobErrorResponse {
@@ -1355,98 +1387,51 @@ async fn admit_and_enqueue(
         }
     };
 
-    let (job, fresh) = match create_result {
-        CreateResult::Fresh(j) => (j, true),
-        CreateResult::IdempotentReplay(j) => (j, false),
-    };
-
-    if !fresh {
-        // Replay: if the original job already completed, surface the
-        // cached body + status verbatim. Otherwise return the
-        // current snapshot so the wallet sees the same job_id.
-        if job.status == JobStatus::Completed {
-            let status_code = StatusCode::from_u16(job.response_status.unwrap_or(200) as u16)
-                .unwrap_or(StatusCode::OK);
-            // `JobStore::complete` always sets `response_body` on the row before
-            // flipping the status to `Completed`; the matching INSERT in
-            // `complete()` is non-nullable on the value side. A `None` here
-            // would mean the row was hand-edited or the schema invariant
-            // broke — the `.expect()` surfaces that immediately instead of
-            // hiding behind a defensive empty-object fallback (which would
-            // also cost the 100% line-coverage gate a never-reached closure).
-            let body = job
-                .response_body
-                .clone()
-                .expect("response_body is set on every Completed job by JobStore::complete");
-            return (status_code, Json(body)).into_response();
-        }
-        return (
-            StatusCode::ACCEPTED,
-            [(header::LOCATION, format!("/api/jobs/{}", job.public_id))],
-            Json(JobAcceptedResponse {
-                job_id: job.public_id,
-                status: job.status.as_str(),
-            }),
-        )
-            .into_response();
-    }
-
-    if let Err(e) = state
-        .job_tx
-        .send(JobEnvelope {
-            public_id: job.public_id,
-        })
-        .await
-    {
-        tracing::error!("Job dispatcher channel send failed: {}", e);
-        // The row exists but the dispatcher cannot be reached —
-        // mark the job failed so the wallet observes a terminal
-        // status on its next poll. Allowed: queued → failed. A CAS
-        // miss means another writer already advanced the job — do not
-        // invent success, still refuse the admit response.
-        match state
-            .job_store
-            .fail(
-                job.public_id,
-                crate::job_store::JobStatus::Queued,
-                "dispatcher unavailable",
+    match outcome {
+        AdmitOutcome::Replay(job) => {
+            // Replay: if the original job already completed, surface the
+            // cached body + status verbatim. Otherwise return the
+            // current snapshot so the wallet sees the same job_id.
+            if job.status == JobStatus::Completed {
+                let status_code = StatusCode::from_u16(job.response_status.unwrap_or(200) as u16)
+                    .unwrap_or(StatusCode::OK);
+                // `JobStore::complete` always sets `response_body` on the row before
+                // flipping the status to `Completed`; the matching INSERT in
+                // `complete()` is non-nullable on the value side. A `None` here
+                // would mean the row was hand-edited or the schema invariant
+                // broke — the `.expect()` surfaces that immediately instead of
+                // hiding behind a defensive empty-object fallback (which would
+                // also cost the 100% line-coverage gate a never-reached closure).
+                let body = job
+                    .response_body
+                    .clone()
+                    .expect("response_body is set on every Completed job by JobStore::complete");
+                return (status_code, Json(body)).into_response();
+            }
+            (
+                StatusCode::ACCEPTED,
+                [(header::LOCATION, format!("/api/jobs/{}", job.public_id))],
+                Json(JobAcceptedResponse {
+                    job_id: job.public_id,
+                    status: job.status.as_str(),
+                }),
             )
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::warn!(
-                    "enqueue-fail path: fail(queued) matched 0 rows for job {} \
-                     (concurrent advance); not inventing success",
-                    job.public_id
-                );
-            }
-            Err(store_err) => {
-                tracing::error!(
-                    "enqueue-fail path: fail(queued) store error for job {}: {}",
-                    job.public_id,
-                    store_err
-                );
-            }
+                .into_response()
         }
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(JobErrorResponse {
-                error: "Dispatcher unavailable".to_string(),
-            }),
-        )
-            .into_response();
+        AdmitOutcome::Fresh(job) => {
+            // Fresh: dispatcher already notified inside admit_job.
+            (
+                StatusCode::ACCEPTED,
+                [(header::LOCATION, format!("/api/jobs/{}", job.public_id))],
+                Json(JobAcceptedResponse {
+                    job_id: job.public_id,
+                    status: job.status.as_str(),
+                }),
+            )
+                .into_response()
+        }
     }
-
-    (
-        StatusCode::ACCEPTED,
-        [(header::LOCATION, format!("/api/jobs/{}", job.public_id))],
-        Json(JobAcceptedResponse {
-            job_id: job.public_id,
-            status: job.status.as_str(),
-        }),
-    )
-        .into_response()
+    .into_response()
 }
 
 /// `GET /api/jobs/:id` — poll handler. Returns the current row
@@ -1959,6 +1944,13 @@ pub(crate) async fn attest_balance_handler(
 
     let job = match create_result {
         CreateResult::Fresh(j) | CreateResult::IdempotentReplay(j) => j,
+        CreateResult::IdempotencyConflict => {
+            // Attest admits without an Idempotency-Key, so the conflict
+            // arm is unreachable for this path.
+            return attest_error_response(crate::v1::AttestError::Internal(
+                "unexpected idempotency_conflict on attest admit".into(),
+            ));
+        }
     };
 
     // Enqueue for the dispatcher (same channel as mint/send).

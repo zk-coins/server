@@ -62,6 +62,7 @@ async fn create_fresh_returns_queued_row() {
             assert!(job.completed_at.is_none());
         }
         CreateResult::IdempotentReplay(_) => panic!("expected Fresh, got IdempotentReplay"),
+        CreateResult::IdempotencyConflict => panic!("expected Fresh, got IdempotencyConflict"),
     }
 }
 
@@ -76,6 +77,7 @@ async fn create_with_same_idem_key_returns_replay() {
     let first_id = match &first {
         CreateResult::Fresh(j) => j.public_id,
         CreateResult::IdempotentReplay(_) => panic!("first call must be Fresh"),
+        CreateResult::IdempotencyConflict => panic!("first call must be Fresh"),
     };
 
     let second = store
@@ -87,7 +89,98 @@ async fn create_with_same_idem_key_returns_replay() {
             assert_eq!(j.public_id, first_id, "must return the original row");
         }
         CreateResult::Fresh(_) => panic!("second call must be IdempotentReplay"),
+        CreateResult::IdempotencyConflict => panic!("second call must be IdempotentReplay"),
     }
+}
+
+#[tokio::test]
+async fn create_same_idem_key_different_body_is_conflict() {
+    // §7.5: same key + different body → idempotency_conflict (not silent replay).
+    let (store, _c) = setup_store().await;
+    let account = account_addr(0x1D);
+    let a = serde_json::json!({"amount": 1u64, "name": "a"});
+    let b = serde_json::json!({"amount": 2u64, "name": "b"});
+    match store
+        .create(JobKind::Mint, &account, Some("idem-conflict"), a)
+        .await
+        .expect("first")
+    {
+        CreateResult::Fresh(_) => {}
+        other => panic!("expected Fresh, got {other:?}"),
+    }
+    match store
+        .create(JobKind::Mint, &account, Some("idem-conflict"), b)
+        .await
+        .expect("second")
+    {
+        CreateResult::IdempotencyConflict => {}
+        other => panic!("expected IdempotencyConflict, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn create_idempotency_ignores_server_owned_request_body_keys() {
+    // Cancel strips finalisation/pending_sign/sign/finalise_claim; a retry
+    // with the original client body must still Replay, not Conflict.
+    let (store, _c) = setup_store().await;
+    let account = account_addr(0x1E);
+    let client_body = serde_json::json!({"amount": 7u64, "name": "strip"});
+    let CreateResult::Fresh(job) = store
+        .create(
+            JobKind::Mint,
+            &account,
+            Some("idem-strip"),
+            client_body.clone(),
+        )
+        .await
+        .expect("first")
+    else {
+        panic!("expected Fresh");
+    };
+    let mut with_server = client_body.clone();
+    with_server.as_object_mut().unwrap().insert(
+        "finalisation".to_string(),
+        serde_json::json!({"capability_bincode_hex": "aa"}),
+    );
+    with_server.as_object_mut().unwrap().insert(
+        "finalise_claim".to_string(),
+        serde_json::json!({"owner": "x", "fence": 1}),
+    );
+    store
+        .replace_request_body_if_status(job.public_id, JobStatus::Queued, &with_server)
+        .await
+        .expect("plant server keys");
+    assert!(
+        store.cancel(job.public_id).await.expect("cancel"),
+        "cancel queued"
+    );
+    let after = store.load(job.public_id).await.expect("load").expect("row");
+    assert!(
+        after.request_body.get("finalisation").is_none(),
+        "cancel must strip finalisation"
+    );
+    match store
+        .create(JobKind::Mint, &account, Some("idem-strip"), client_body)
+        .await
+        .expect("retry")
+    {
+        CreateResult::IdempotentReplay(j) => {
+            assert_eq!(j.public_id, job.public_id);
+        }
+        other => panic!("expected Replay after strip, got {other:?}"),
+    }
+}
+
+#[test]
+fn admit_body_equality_strips_server_keys_and_is_key_order_independent() {
+    let a = serde_json::json!({"amount": 1, "name": "n", "finalisation": {"x": 1}});
+    let b = serde_json::json!({"name": "n", "amount": 1}); // different key order, no server key
+    assert!(
+        admit_bodies_equal_for_idempotency(&a, &b),
+        "server keys stripped; object key order irrelevant"
+    );
+    let c = serde_json::json!({"name": "n", "amount": 2});
+    assert!(!admit_bodies_equal_for_idempotency(&a, &c));
 }
 
 #[tokio::test]

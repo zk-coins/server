@@ -8,12 +8,19 @@
 use uuid::Uuid;
 
 use crate::kernel::error::{KernelError, KernelErrorCode, KernelResult};
-use crate::kernel::types::{Job, JobEvent, JobId, JobKind, JobPayload, JobState, SignTransition};
+use crate::kernel::jobs::submit::parse_idempotency_key;
+use crate::kernel::types::{
+    Digest32, Issuance, Job, JobEvent, JobId, JobKind, JobPayload, JobState, OutputTemplate,
+    PublisherChoice, SignTransition, SubjectAddress, TransitionCommand, TransitionCommon, XOnlyKey,
+};
 use crate::v1::{self, WalletSignSubmission};
 use kernel_proto::{
-    AwaitingSignature as ProtoAwaitingSignature, Job as ProtoJob, JobError as ProtoJobError,
-    JobEvent as ProtoJobEvent, JobResult as ProtoJobResult, SignRequest as ProtoSignRequest,
+    AwaitingSignature as ProtoAwaitingSignature, Issuance as ProtoIssuance, Job as ProtoJob,
+    JobError as ProtoJobError, JobEvent as ProtoJobEvent, JobResult as ProtoJobResult,
+    OutputTemplate as ProtoOutputTemplate, SignRequest as ProtoSignRequest,
+    TransitionRequest as ProtoTransitionRequest,
 };
+use shared::spec_v1::Address;
 
 /// Parse proto `SignRequest` into a domain [`SignTransition`].
 ///
@@ -63,6 +70,262 @@ pub(crate) fn parse_sign_request(req: ProtoSignRequest) -> KernelResult<SignTran
             signature,
             s2c_nonce,
         },
+    })
+}
+
+/// Parse proto `TransitionRequest` into a closed domain [`TransitionCommand`].
+///
+/// Width / presence failures are `malformed_request`. Bounds
+/// (list lengths over max) are left to
+/// [`crate::kernel::jobs::submit::validate_transition_command`].
+///
+/// v1: non-empty `fee_address` is always malformed (§7.5 matrix — case (b)
+/// is deferred).
+pub(crate) fn parse_transition_request(
+    req: ProtoTransitionRequest,
+) -> KernelResult<TransitionCommand> {
+    let kind = req.kind.trim();
+    if kind.is_empty() {
+        return Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            "kind is required (mint|send|receive)",
+        ));
+    }
+
+    let idempotency_key = parse_idempotency_key(req.idempotency_key.trim())?;
+    let subject = parse_subject_address(&req.subject)?;
+    let next_pubkey = parse_xonly(&req.next_pubkey, "next_pubkey")?;
+    let npk_rand = parse_digest32(&req.npk_rand, "npk_rand")?;
+    let publisher = parse_publisher_choice(&req.publisher_pubkey, &req.fee_address)?;
+
+    let common = TransitionCommon {
+        subject,
+        next_pubkey,
+        npk_rand,
+        publisher,
+        idempotency_key,
+    };
+
+    match kind {
+        "mint" => {
+            refuse_nonempty_digests(&req.input_coins, "input_coins", "mint")?;
+            refuse_nonempty_digests(&req.fold_coin_ids, "fold_coin_ids", "mint")?;
+            let issuance = match req.issuance {
+                Some(i) => parse_issuance(i)?,
+                None => {
+                    return Err(KernelError::new(
+                        KernelErrorCode::MalformedRequest,
+                        "kind=mint requires issuance",
+                    ));
+                }
+            };
+            let output_templates = parse_output_templates(&req.output_templates)?;
+            Ok(TransitionCommand::Mint {
+                common,
+                issuance,
+                output_templates,
+            })
+        }
+        "send" => {
+            refuse_nonempty_digests(&req.fold_coin_ids, "fold_coin_ids", "send")?;
+            if req.issuance.is_some() {
+                return Err(KernelError::new(
+                    KernelErrorCode::MalformedRequest,
+                    "kind=send must not carry issuance",
+                ));
+            }
+            let input_coins = parse_digest_list(&req.input_coins, "input_coins")?;
+            let output_templates = parse_output_templates(&req.output_templates)?;
+            Ok(TransitionCommand::Send {
+                common,
+                input_coins,
+                output_templates,
+            })
+        }
+        "receive" => {
+            refuse_nonempty_digests(&req.input_coins, "input_coins", "receive")?;
+            if !req.output_templates.is_empty() {
+                return Err(KernelError::new(
+                    KernelErrorCode::MalformedRequest,
+                    "kind=receive must not carry output_templates",
+                ));
+            }
+            if req.issuance.is_some() {
+                return Err(KernelError::new(
+                    KernelErrorCode::MalformedRequest,
+                    "kind=receive must not carry issuance",
+                ));
+            }
+            let fold_coin_ids = parse_digest_list(&req.fold_coin_ids, "fold_coin_ids")?;
+            Ok(TransitionCommand::Receive {
+                common,
+                fold_coin_ids,
+            })
+        }
+        other => Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("kind must be mint|send|receive; got {other:?}"),
+        )),
+    }
+}
+
+fn refuse_nonempty_digests(list: &[Vec<u8>], field: &str, kind: &str) -> KernelResult<()> {
+    if list.is_empty() {
+        return Ok(());
+    }
+    Err(KernelError::new(
+        KernelErrorCode::MalformedRequest,
+        format!("kind={kind} must not carry {field}"),
+    ))
+}
+
+fn parse_subject_address(raw: &str) -> KernelResult<SubjectAddress> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            "subject is required",
+        ));
+    }
+    match Address::from_bech32m(trimmed) {
+        Ok(addr) => Ok(SubjectAddress(addr.0)),
+        Err(e) => Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("subject must be a Bech32m zk-address: {e}"),
+        )),
+    }
+}
+
+fn parse_xonly(bytes: &[u8], field: &str) -> KernelResult<XOnlyKey> {
+    match <[u8; 32]>::try_from(bytes) {
+        Ok(a) => Ok(XOnlyKey(a)),
+        Err(_) => Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("{field} must be exactly 32 bytes; got {}", bytes.len()),
+        )),
+    }
+}
+
+fn parse_digest32(bytes: &[u8], field: &str) -> KernelResult<Digest32> {
+    match <[u8; 32]>::try_from(bytes) {
+        Ok(a) => Ok(Digest32(a)),
+        Err(_) => Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("{field} must be exactly 32 bytes; got {}", bytes.len()),
+        )),
+    }
+}
+
+fn parse_publisher_choice(
+    publisher_pubkey: &[u8],
+    fee_address: &str,
+) -> KernelResult<PublisherChoice> {
+    if !fee_address.trim().is_empty() {
+        return Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            "fee_address must be absent in v1 (publisher presence matrix case (b) is deferred)",
+        ));
+    }
+    if publisher_pubkey.is_empty() {
+        return Ok(PublisherChoice::SelfPublish);
+    }
+    let key = parse_xonly(publisher_pubkey, "publisher_pubkey")?;
+    Ok(PublisherChoice::FeeLessHandOff {
+        publisher_pubkey: key,
+    })
+}
+
+fn parse_digest_list(list: &[Vec<u8>], field: &str) -> KernelResult<Vec<Digest32>> {
+    let mut out = Vec::with_capacity(list.len());
+    for (i, item) in list.iter().enumerate() {
+        out.push(parse_digest32(item, &format!("{field}[{i}]"))?);
+    }
+    Ok(out)
+}
+
+fn parse_output_templates(list: &[ProtoOutputTemplate]) -> KernelResult<Vec<OutputTemplate>> {
+    let mut out = Vec::with_capacity(list.len());
+    for (i, t) in list.iter().enumerate() {
+        let recipient = parse_subject_address(&t.recipient).map_err(|e| {
+            KernelError::new(
+                e.code,
+                format!("output_templates[{i}].recipient: {}", e.public_message),
+            )
+        })?;
+        let asset_id = parse_digest32(&t.asset_id, &format!("output_templates[{i}].asset_id"))?;
+        let amount = parse_u128_decimal(&t.amount, &format!("output_templates[{i}].amount"))?;
+        out.push(OutputTemplate {
+            recipient,
+            asset_id,
+            amount,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_issuance(i: ProtoIssuance) -> KernelResult<Issuance> {
+    let name = i.name;
+    let decimals = match u8::try_from(i.decimals) {
+        Ok(d) => d,
+        Err(_) => {
+            return Err(KernelError::new(
+                KernelErrorCode::MalformedRequest,
+                format!("issuance.decimals must fit u8; got {}", i.decimals),
+            ));
+        }
+    };
+    let amount = parse_u128_decimal(&i.amount, "issuance.amount")?;
+    match i.issuance_version {
+        1 => {
+            if !i.cap_total.trim().is_empty() || !i.terms_salt.is_empty() {
+                return Err(KernelError::new(
+                    KernelErrorCode::MalformedRequest,
+                    "issuance_version=1 must not carry cap_total or terms_salt",
+                ));
+            }
+            Ok(Issuance::V1 {
+                name,
+                decimals,
+                amount,
+            })
+        }
+        2 => {
+            if i.cap_total.trim().is_empty() {
+                return Err(KernelError::new(
+                    KernelErrorCode::MalformedRequest,
+                    "issuance_version=2 requires cap_total",
+                ));
+            }
+            let cap_total = parse_u128_decimal(&i.cap_total, "issuance.cap_total")?;
+            let terms_salt = parse_digest32(&i.terms_salt, "issuance.terms_salt")?;
+            Ok(Issuance::V2 {
+                name,
+                decimals,
+                amount,
+                cap_total,
+                terms_salt,
+            })
+        }
+        other => Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("issuance_version must be 1 or 2; got {other}"),
+        )),
+    }
+}
+
+fn parse_u128_decimal(raw: &str, field: &str) -> KernelResult<u128> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("{field} is required as a decimal string"),
+        ));
+    }
+    trimmed.parse::<u128>().map_err(|_| {
+        KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("{field} must be a decimal u128 string; got {trimmed:?}"),
+        )
     })
 }
 
@@ -194,7 +457,11 @@ fn decode_job_result(kind: JobKind, payload: &JobPayload) -> KernelResult<ProtoJ
                 attestation,
             })
         }
-        JobKind::Mint | JobKind::Send => {
+        // Receive is a state-advancing transition; completed result digests
+        // share the mint/send shape (§7.5 `JobResult`). SubmitTransition
+        // currently refuses receive at admission, but projection must stay
+        // exhaustive for store-kind round-trips.
+        JobKind::Mint | JobKind::Send | JobKind::Receive => {
             let output_coin_ids = require_hex_bytes_array(obj, "output_coin_ids", 32)?;
             let publisher_pubkey = optional_hex_bytes(obj, "publisher_pubkey", 32)?;
             Ok(ProtoJobResult {
