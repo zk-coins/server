@@ -1340,7 +1340,6 @@ async fn admit_and_enqueue(
     idem_key: &str,
     request_body: serde_json::Value,
 ) -> axum::response::Response {
-    use crate::kernel::error::KernelErrorCode;
     use crate::kernel::jobs::submit::{admit_job, AdmitError, AdmitOutcome, SubmitTransitionDeps};
 
     let outcome = match admit_job(
@@ -1773,6 +1772,7 @@ pub(crate) async fn jobs_sign_handler(
         Arc::clone(&state.job_store),
         Arc::clone(&state.job_notify_map),
         Arc::clone(&state.pending_sign_map),
+        Arc::clone(&state.attest_challenges),
     );
     match service
         .sign_transition(crate::kernel::SignTransition {
@@ -2327,6 +2327,7 @@ pub(crate) async fn stream_job_v1_handler(
         Arc::clone(&state.job_store),
         Arc::clone(&state.job_notify_map),
         Arc::clone(&state.pending_sign_map),
+        Arc::clone(&state.attest_challenges),
     );
     let domain_stream = match service.stream_job(JobRequest { id: JobId(id) }).await {
         Ok(s) => s,
@@ -2629,6 +2630,7 @@ pub(crate) async fn stream_job_handler(
         Arc::clone(&state.job_store),
         Arc::clone(&state.job_notify_map),
         Arc::clone(&state.pending_sign_map),
+        Arc::clone(&state.attest_challenges),
     );
     let domain_stream = match service.stream_job(JobRequest { id: JobId(id) }).await {
         Ok(s) => s,

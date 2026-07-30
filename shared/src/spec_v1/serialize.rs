@@ -228,30 +228,49 @@ pub fn deserialize_spend_record(bytes: &[u8]) -> Result<SpendRecord, SpecError> 
 }
 
 // ---------------------------------------------------------------------------
-// Bech32m address encoding (§1.7.7)
+// Bech32m encoding (§1.7.7) — generic + address helpers
 // ---------------------------------------------------------------------------
+
+/// Encode `payload` as Bech32m under `hrp` (§1.7.7). Payload length is not
+/// constrained — the 90-character BIP-173 limit is deliberately not enforced,
+/// exactly as the address helpers below.
+pub fn encode_bech32m(hrp: &str, payload: &[u8]) -> Result<String, SpecError> {
+    let hrp = Hrp::parse(hrp).map_err(|e| SpecError::Bech32DecodeError(e.to_string()))?;
+    bech32::encode::<Bech32m>(hrp, payload).map_err(|e| SpecError::Bech32DecodeError(e.to_string()))
+}
+
+/// Decode a Bech32m string, requiring `expected_hrp`. Rejects a wrong HRP and
+/// legacy (non-m) Bech32 checksums. Returns the raw payload; the caller checks
+/// its length against what it expects.
+///
+/// `expected_hrp` is `&'static str` so a mismatch can populate
+/// [`SpecError::Bech32WrongHrp`] without a new error variant (its `expected`
+/// field is `&'static str`).
+pub fn decode_bech32m(expected_hrp: &'static str, s: &str) -> Result<Vec<u8>, SpecError> {
+    let checked = CheckedHrpstring::new::<Bech32m>(s)
+        .map_err(|e| SpecError::Bech32DecodeError(e.to_string()))?;
+    let hrp = checked.hrp();
+    if hrp.as_str() != expected_hrp {
+        return Err(SpecError::Bech32WrongHrp {
+            expected: expected_hrp,
+            actual: hrp.to_string(),
+        });
+    }
+    Ok(checked.byte_iter().collect())
+}
 
 impl Address {
     /// Encode as Bech32m with HRP `"zk"`. Does **not** enforce the 90-char BIP-173 limit.
     pub fn to_bech32m(&self) -> String {
-        let hrp = Hrp::parse(ADDRESS_HRP).expect("HRP \"zk\" is valid");
-        bech32::encode::<Bech32m>(hrp, &self.0).expect("32-byte payload always encodes")
+        // Fixed 32-byte address payload always encodes under the constant HRP.
+        encode_bech32m(ADDRESS_HRP, &self.0).expect("32-byte payload always encodes")
     }
 
     /// Decode a Bech32m address. Rejects wrong HRP, non-32-byte payloads, and
     /// legacy Bech32 (non-m) checksums. Does **not** reject solely for
     /// exceeding 90 characters.
     pub fn from_bech32m(s: &str) -> Result<Self, SpecError> {
-        let checked = CheckedHrpstring::new::<Bech32m>(s)
-            .map_err(|e| SpecError::Bech32DecodeError(e.to_string()))?;
-        let hrp = checked.hrp();
-        if hrp.as_str() != ADDRESS_HRP {
-            return Err(SpecError::Bech32WrongHrp {
-                expected: ADDRESS_HRP,
-                actual: hrp.to_string(),
-            });
-        }
-        let data: Vec<u8> = checked.byte_iter().collect();
+        let data = decode_bech32m(ADDRESS_HRP, s)?;
         if data.len() != 32 {
             return Err(SpecError::WrongLength {
                 expected: 32,

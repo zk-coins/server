@@ -12,11 +12,9 @@ use tokio::sync::mpsc;
 
 use crate::job_dispatcher::JobEnvelope;
 use crate::job_store::{self, CreateResult, JobStore};
-use crate::kernel::error::{KernelError, KernelErrorCode, KernelResult};
 use crate::kernel::job_projection::project_job_row;
-use crate::kernel::types::{
-    Digest32, IdempotencyKey, Issuance, Job, OutputTemplate, PublisherChoice, TransitionCommand,
-};
+use crate::kernel::types::{Digest32, IdempotencyKey, Issuance, OutputTemplate, PublisherChoice};
+use crate::kernel::{Job, KernelError, KernelErrorCode, KernelResult, TransitionCommand};
 
 /// §2.5 / §7.5 circuit bounds used at admit time (must match the sealed
 /// circuit shape: `MAX_TX_INPUTS=8`, `MAX_TX_OUTPUTS=8`, `MAX_RX_COINS=4`).
@@ -558,7 +556,7 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
-    use crate::kernel::types::JobState;
+    use crate::kernel::JobState;
     use crate::test_db::{setup_pool, SchemaScope};
     use std::sync::Arc;
 

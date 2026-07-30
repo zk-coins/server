@@ -10,7 +10,7 @@ use futures_util::Stream;
 use uuid::Uuid;
 
 use crate::job_store;
-use crate::kernel::error::KernelResult;
+use crate::kernel::KernelResult;
 use crate::v1::WalletSignSubmission;
 
 /// Server-stream item type for kernel procedures (`StreamJob`, …).
@@ -77,6 +77,15 @@ pub(crate) struct XOnlyKey(pub [u8; 32]);
 /// Account address as 32 raw bytes (Bech32m decode is transport-side).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SubjectAddress(pub [u8; 32]);
+
+/// Opaque 32-byte channel-binding token (§5.1 `chan_bind`).
+///
+/// The kernel never derives this from request metadata; the API layer
+/// (or a trusted gRPC caller) supplies it as an equality token. Clearnet
+/// form is `H("zkCoins/v1/PullHost" ‖ host)`; Tor form is the v3 onion
+/// Ed25519 public key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ChanBind(pub [u8; 32]);
 
 /// Opaque client idempotency key (≤ 64 bytes per §7.5).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

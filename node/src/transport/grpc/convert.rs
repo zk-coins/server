@@ -7,20 +7,142 @@
 
 use uuid::Uuid;
 
-use crate::kernel::error::{KernelError, KernelErrorCode, KernelResult};
+use crate::kernel::attestation::{AttestBalanceCommand, AttestCeiling};
+use crate::kernel::grants::{GrantAssetScope, GrantScope, IssueViewGrantCommand};
 use crate::kernel::jobs::submit::parse_idempotency_key;
 use crate::kernel::types::{
-    Digest32, Issuance, Job, JobEvent, JobId, JobKind, JobPayload, JobState, OutputTemplate,
-    PublisherChoice, SignTransition, SubjectAddress, TransitionCommand, TransitionCommon, XOnlyKey,
+    ChanBind, Digest32, Issuance, JobKind, JobPayload, OutputTemplate, PublisherChoice,
+    SubjectAddress, TransitionCommon, XOnlyKey,
+};
+use crate::kernel::{
+    Job, JobEvent, JobId, JobState, KernelError, KernelErrorCode, KernelResult, SignTransition,
+    TransitionCommand,
 };
 use crate::v1::{self, WalletSignSubmission};
 use kernel_proto::{
-    AwaitingSignature as ProtoAwaitingSignature, Issuance as ProtoIssuance, Job as ProtoJob,
+    AttestRequest as ProtoAttestRequest, AwaitingSignature as ProtoAwaitingSignature,
+    GrantRequest as ProtoGrantRequest, Issuance as ProtoIssuance, Job as ProtoJob,
     JobError as ProtoJobError, JobEvent as ProtoJobEvent, JobResult as ProtoJobResult,
-    OutputTemplate as ProtoOutputTemplate, SignRequest as ProtoSignRequest,
+    OutputTemplate as ProtoOutputTemplate, Scope as ProtoScope, SignRequest as ProtoSignRequest,
     TransitionRequest as ProtoTransitionRequest,
 };
 use shared::spec_v1::Address;
+
+/// Parse proto `AttestRequest` into a domain [`AttestBalanceCommand`].
+///
+/// No OwnershipProof fields exist on the proto message (API-layer gate).
+/// Width failures → `malformed_request`. Ceiling pair: both empty ⇒
+/// node default; both set ⇒ explicit; mixed ⇒ malformed.
+pub(crate) fn parse_attest_request(req: ProtoAttestRequest) -> KernelResult<AttestBalanceCommand> {
+    let subject = parse_subject_address(&req.subject)?;
+    let asset_id = parse_digest32(&req.asset_id, "asset_id")?;
+    let nonce = parse_exact_32(&req.nonce, "nonce")?;
+    let chan_bind = ChanBind(parse_exact_32(&req.chan_bind, "chan_bind")?);
+
+    // Proto3: empty `nav_ceiling` + `size_ceiling == 0` ⇒ node default.
+    // Non-empty nav ⇒ explicit pair (size may be 0). Size without nav is
+    // mixed and malformed (§7.5 both-or-neither).
+    let ceiling = if req.nav_ceiling.is_empty() {
+        if req.size_ceiling != 0 {
+            return Err(KernelError::new(
+                KernelErrorCode::MalformedRequest,
+                "nav_ceiling and size_ceiling must both be present or both omitted",
+            ));
+        }
+        AttestCeiling::NodeDefault
+    } else {
+        let nav_ceiling = Digest32(parse_exact_32(&req.nav_ceiling, "nav_ceiling")?);
+        AttestCeiling::Explicit {
+            nav_ceiling,
+            size_ceiling: req.size_ceiling,
+        }
+    };
+
+    Ok(AttestBalanceCommand {
+        subject,
+        asset_id,
+        ceiling,
+        nonce,
+        chan_bind,
+    })
+}
+
+/// Parse proto `GrantRequest` into a domain [`IssueViewGrantCommand`].
+///
+/// No OwnershipProof fields on the proto. Scope sentinels follow §5.1:
+/// `all_assets` / empty list, `not_after = 0` is epoch-closed (not
+/// unbounded — unbounded is `2⁶³−1`).
+pub(crate) fn parse_grant_request(req: ProtoGrantRequest) -> KernelResult<IssueViewGrantCommand> {
+    let subject = parse_subject_address(&req.subject)?;
+    let grantee_pk = parse_xonly(&req.grantee_pk, "grantee_pk")?;
+    let nonce = parse_exact_32(&req.nonce, "nonce")?;
+    let chan_bind = ChanBind(parse_exact_32(&req.chan_bind, "chan_bind")?);
+    let scope = match req.scope {
+        Some(s) => parse_grant_scope(s)?,
+        None => {
+            return Err(KernelError::new(
+                KernelErrorCode::MalformedRequest,
+                "scope is required",
+            ));
+        }
+    };
+
+    Ok(IssueViewGrantCommand {
+        subject,
+        grantee_pk,
+        scope,
+        expiry: req.expiry,
+        nonce,
+        chan_bind,
+    })
+}
+
+fn parse_grant_scope(scope: ProtoScope) -> KernelResult<GrantScope> {
+    let assets = if scope.all_assets {
+        if !scope.asset_ids.is_empty() {
+            return Err(KernelError::new(
+                KernelErrorCode::MalformedRequest,
+                "scope.all_assets=true must not carry asset_ids",
+            ));
+        }
+        GrantAssetScope::All
+    } else if scope.asset_ids.is_empty() {
+        // Proto default: empty list without all_assets — treat as malformed
+        // rather than inventing "*".
+        return Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            "scope must set all_assets or a non-empty asset_ids list",
+        ));
+    } else {
+        let mut ids = Vec::with_capacity(scope.asset_ids.len());
+        for (i, raw) in scope.asset_ids.iter().enumerate() {
+            ids.push(Digest32(parse_exact_32(
+                raw,
+                &format!("scope.asset_ids[{i}]"),
+            )?));
+        }
+        GrantAssetScope::Selected(ids)
+    };
+
+    Ok(GrantScope {
+        assets,
+        not_before: scope.not_before,
+        // Proto3 zero default for not_after is a closed epoch window, not
+        // unbounded. Callers that want unbounded must send 2⁶³−1 explicitly
+        // (§5.1). We do not rewrite 0 → SCOPE_NOT_AFTER_UNBOUNDED here.
+        not_after: scope.not_after,
+    })
+}
+
+fn parse_exact_32(bytes: &[u8], field: &str) -> KernelResult<[u8; 32]> {
+    match bytes.try_into() {
+        Ok(a) => Ok(a),
+        Err(_) => Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("{field} must be exactly 32 bytes; got {}", bytes.len()),
+        )),
+    }
+}
 
 /// Parse proto `SignRequest` into a domain [`SignTransition`].
 ///
@@ -623,10 +745,7 @@ fn decode_hex_exact(raw: &str, key: &str, expected_len: usize) -> KernelResult<V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::error::KernelErrorCode;
-    use crate::kernel::types::{
-        JobEventKind, JobId, JobKind, JobPayload, JobState, NormativeJobStatus,
-    };
+    use crate::kernel::types::{JobEventKind, JobKind, JobPayload, NormativeJobStatus};
     use uuid::Uuid;
 
     fn hex32(byte: u8) -> String {

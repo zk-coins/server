@@ -35,9 +35,9 @@
 //!   itself is crate-private (`serve_kernel_grpc_with_domain`) and is
 //!   started only from `start_rest_node` with the shared job store + notify
 //!   map + pending-sign map (no pool-only silent-stream boot). `GetJob` /
-//!   `StreamJob` / `CancelJob` / `SignTransition` / `SubmitTransition`
-//!   are wired; remaining procedures stay unimplemented until a faithful
-//!   §7.8 mapping exists.
+//!   `StreamJob` / `CancelJob` / `SignTransition` / `SubmitTransition` /
+//!   `AttestBalance` / `IssueViewGrant` are wired; remaining procedures
+//!   stay unimplemented until a faithful §7.8 mapping exists.
 //! - [`state`] — binary `State::load_from_pg` (+ `LoadStateError`). The
 //!   type is public so the binary can hold `Arc<Mutex<State>>`. **Not**
 //!   public: `new`, `update`, `serialize_for_persist`,

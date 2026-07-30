@@ -7,7 +7,7 @@
 //! gRPC adapter converts [`GrpcStatusCode`] into `tonic::Code`; the HTTP
 //! adapter uses [`ErrorDescriptor::http_status`] as `u16`.
 
-use crate::kernel::error::KernelErrorCode;
+use crate::kernel::KernelErrorCode;
 
 /// Normative `ErrorInfo.domain` for every kernel.v1 failure (§7.8).
 pub(crate) const ERROR_INFO_DOMAIN: &str = "kernel.v1";
@@ -308,7 +308,6 @@ fn code_label(code: KernelErrorCode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::error::KernelErrorCode;
 
     #[test]
     fn mapping_is_total_and_reason_matches_code() {

@@ -3171,7 +3171,7 @@ mod finalise_publish_handoff_tests {
             v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
             v1_pending_after_prove: None,
             v1_engine: None,
-            attest_challenges: Arc::new(dashmap::DashMap::new()),
+            attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
             public_hosts: Arc::new(vec!["node.test".to_string()]),
         }
     }
@@ -3636,7 +3636,7 @@ mod wait_for_commit_fail_closed_tests {
             v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
             v1_pending_after_prove: None,
             v1_engine: None,
-            attest_challenges: Arc::new(dashmap::DashMap::new()),
+            attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
             public_hosts: Arc::new(vec!["node.test".to_string()]),
         }
     }
@@ -4005,7 +4005,7 @@ mod receive_job_path_and_decision_table_tests {
             v1_live_pending_after_begin: std::sync::Arc::new(dashmap::DashMap::new()),
             v1_pending_after_prove: None,
             v1_engine: None,
-            attest_challenges: std::sync::Arc::new(dashmap::DashMap::new()),
+            attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
             public_hosts: std::sync::Arc::new(vec!["node.test".to_string()]),
         };
 

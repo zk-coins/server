@@ -4,10 +4,11 @@
 use std::sync::Arc;
 
 use crate::job_store::{JobStatus, JobStore};
-use crate::kernel::error::KernelResult;
 use crate::kernel::job_projection::project_job_row;
-use crate::kernel::types::{KernelStream, NormativeJobStatus};
-use crate::kernel::{CancelPolicy, Job, JobEvent, JobEventHub, JobRequest, KernelError};
+use crate::kernel::types::NormativeJobStatus;
+use crate::kernel::{
+    CancelPolicy, Job, JobEvent, JobEventHub, JobRequest, KernelError, KernelResult, KernelStream,
+};
 
 pub(crate) mod sign;
 pub(crate) mod submit;

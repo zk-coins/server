@@ -414,7 +414,11 @@ async fn insert_run_persists_v1_shape_columns() {
     run.max_tx_inputs = Some(8);
     run.max_tx_outputs = Some(8);
     run.max_rx_coins = Some(4);
-    run.compliance_gate_count = Some(1_403_783);
+    // Arbitrary fixture for the DB round-trip only — not the live C gate
+    // count (that is measured by the probe / asserted against the pinned
+    // digests file elsewhere). Any non-null i32 exercises the column.
+    const FIXTURE_COMPLIANCE_GATE_COUNT: i32 = 42;
+    run.compliance_gate_count = Some(FIXTURE_COMPLIANCE_GATE_COUNT);
     // v1 budgets are larger; persist what the probe would have checked.
     run.r2_warm_budget_ms = 600_000;
     run.r2_cold_budget_ms = 900_000;
@@ -436,7 +440,7 @@ async fn insert_run_persists_v1_shape_columns() {
     assert_eq!(row.get::<Option<i32>, _>("max_rx_coins"), Some(4));
     assert_eq!(
         row.get::<Option<i32>, _>("compliance_gate_count"),
-        Some(1_403_783)
+        Some(FIXTURE_COMPLIANCE_GATE_COUNT)
     );
     assert_eq!(row.get::<i64, _>("r2_warm_budget_ms"), 600_000);
 

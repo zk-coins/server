@@ -2499,10 +2499,37 @@ mod tests {
         }
     }
 
+    /// Shape metrics from the committed digests file — the same file
+    /// `tests/generated_circuit_digests_test.rs` regenerates and verifies.
+    /// That integration test has no shared parse helper (it rebuilds the
+    /// whole file and does string equality), so unit tests here cannot
+    /// import it; look up the key instead of hard-coding a second number.
+    fn pinned_circuit_metric(key: &str) -> usize {
+        const PINNED_DIGESTS: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/generated_circuit_digests.txt"
+        ));
+        for line in PINNED_DIGESTS.lines() {
+            let Some((k, v)) = line.split_once(" = ") else {
+                continue;
+            };
+            if k == key {
+                return v.parse::<usize>().unwrap_or_else(|e| {
+                    panic!("pinned digests: key `{key}` has non-usize value `{v}`: {e}");
+                });
+            }
+        }
+        panic!("pinned digests file missing required key `{key}`");
+    }
+
     #[test]
+    #[ignore = "heavy: real Plonky2 prove end-to-end (minutes); run with --ignored --release"]
     fn prover_bridge_real_end_to_end() {
         let bridge = ProverBridge::new(Network::Testnet);
-        assert_eq!(bridge.compliance_gate_count(), 1_403_783);
+        assert_eq!(
+            bridge.compliance_gate_count(),
+            pinned_circuit_metric("circuit_c_gates"),
+        );
 
         let genesis = genesis_fixture();
         let proved_genesis = bridge
@@ -2538,7 +2565,10 @@ mod tests {
         bridge
             .verify_attestation(&proved_attestation.proof)
             .expect("valid C_balance proof");
-        assert_eq!(bridge.balance_gate_count(), 193_437);
+        assert_eq!(
+            bridge.balance_gate_count(),
+            pinned_circuit_metric("circuit_c_balance_gates"),
+        );
         println!("prover bridge balance attestation: PASS (proved and verified)");
         println!(
             "prover bridge gates: C={} C_balance={}",

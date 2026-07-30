@@ -10,8 +10,8 @@
 
 use crate::job_dispatcher::JobPhaseEvent;
 use crate::job_store;
-use crate::kernel::error::{KernelError, KernelResult};
-use crate::kernel::types::{Job, JobId, JobKind, JobPayload, JobState, NormativeJobStatus};
+use crate::kernel::types::{JobKind, JobPayload, NormativeJobStatus};
+use crate::kernel::{Job, JobId, JobState, KernelError, KernelResult};
 
 /// Project a persistence row into a typed domain job.
 ///
@@ -122,7 +122,7 @@ fn require_response_payload(
 mod tests {
     use super::*;
     use crate::job_store::{Job as StoreJob, JobKind as StoreKind, JobStatus as StoreStatus};
-    use crate::kernel::error::KernelErrorCode;
+    use crate::kernel::KernelErrorCode;
     use chrono::Utc;
     use uuid::Uuid;
 

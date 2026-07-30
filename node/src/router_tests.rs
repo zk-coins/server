@@ -102,7 +102,7 @@ fn test_state() -> AppState {
         v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
         v1_pending_after_prove: None,
         v1_engine: None,
-        attest_challenges: Arc::new(dashmap::DashMap::new()),
+        attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
         public_hosts: Arc::new(vec!["node.test".to_string()]),
     }
 }
@@ -2393,7 +2393,7 @@ fn mint_test_state() -> AppState {
         v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
         v1_pending_after_prove: None,
         v1_engine: None,
-        attest_challenges: Arc::new(dashmap::DashMap::new()),
+        attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
         public_hosts: Arc::new(vec!["node.test".to_string()]),
     }
 }
@@ -4572,7 +4572,7 @@ mod jobs_endpoint_tests {
             v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
             v1_pending_after_prove: None,
             v1_engine: None,
-            attest_challenges: Arc::new(dashmap::DashMap::new()),
+            attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
             public_hosts: Arc::new(vec!["node.test".to_string()]),
         }
     }

@@ -7,9 +7,8 @@
 
 use crate::job_dispatcher::JobNotifyMap;
 use crate::job_store::{JobStatus, JobStore};
-use crate::kernel::error::{KernelError, KernelErrorCode, KernelResult};
 use crate::kernel::job_projection::project_job_row;
-use crate::kernel::types::{Job, SignTransition};
+use crate::kernel::{Job, KernelError, KernelErrorCode, KernelResult, SignTransition};
 use crate::v1::{
     self, PendingSignEntry, PendingSignMap, SignatureCheck, TransitionSignatureError, V1ShadowMode,
 };
@@ -252,7 +251,7 @@ mod sign_tests {
     use super::*;
     use crate::job_dispatcher::JobNotifier;
     use crate::job_store::JobKind as StoreKind;
-    use crate::kernel::types::{JobId, JobState};
+    use crate::kernel::{JobId, JobState};
     use crate::test_db::{setup_pool, SchemaScope};
     use crate::v1;
     use std::sync::Arc;

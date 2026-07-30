@@ -53,7 +53,6 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dashmap::DashMap;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use shared::spec_v1::{
@@ -67,6 +66,10 @@ use zkcoins_prover::prover_bridge::{
     ProvedAttestation, ProverBridge,
 };
 
+use crate::kernel::bootstrap::{ChallengeAction, ChallengeStore};
+use crate::kernel::grants::{require_ownership_capability, OwnerOnlyCapability};
+use crate::kernel::types::{ChanBind, SubjectAddress};
+
 use super::adapter::EngineAdapter;
 use super::db_v1;
 #[cfg(test)]
@@ -78,7 +81,11 @@ use super::separation::{process_stack_mode, ScanStackMode};
 // ---------------------------------------------------------------------------
 
 /// Challenge domain for `POST /v1/attest/balance/challenge`.
-pub(crate) const ATTEST_BALANCE_CHALLENGE_DOMAIN: &str = "zkCoins/v1/AttestBalanceChallenge";
+///
+/// Derived from [`ChallengeAction::AttestBalance`] — the sole definition of
+/// the action-bound OwnershipProof domain separator (§5.1 / §7.5). Do not
+/// re-literal this string; drift would silently move an authorisation boundary.
+pub(crate) const ATTEST_BALANCE_CHALLENGE_DOMAIN: &str = ChallengeAction::AttestBalance.domain();
 /// Request-hash tag for `POST /v1/attest/balance`.
 pub(crate) const ATTEST_BALANCE_REQUEST_TAG: &str = "zkCoins/v1/AttestBalance";
 /// `chan_bind` host domain (§5.1).
@@ -91,9 +98,6 @@ pub(crate) const ATTEST_ANCHOR_LOCATOR_EDGE: &str =
      live v1_pending_publishes.reveal_txid for this nullifier — cannot \
      assemble a host-verifiable §5.7 anchor (scanner-owned index / later \
      wiring). Refusing rather than fabricating zeros.";
-
-/// Recommended challenge TTL (§5.1): 60 seconds.
-pub(crate) const ATTEST_CHALLENGE_TTL_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
 // Pinned C_balance digests (§1.7.1 / generated_circuit_digests.txt)
@@ -129,20 +133,14 @@ pub(crate) fn pinned_c_balance_digest(network: Network) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
-// Challenge store
+// Challenge store (shared kernel store; action-bound)
 // ---------------------------------------------------------------------------
 
-/// Server-side state for one issued `AttestBalanceChallenge`.
-#[derive(Clone, Debug)]
-pub(crate) struct AttestChallengeRecord {
-    pub subject: Address,
-    pub expiry: u64,
-    /// Action label; always `attest_balance` for this store.
-    pub action: &'static str,
-}
-
-/// Process-local single-use challenge map: `nonce → record`.
-pub(crate) type AttestChallengeMap = Arc<DashMap<[u8; 32], AttestChallengeRecord>>;
+/// Process-local single-use challenge store shared with `IssueViewGrant`.
+///
+/// Type alias so AppState / tests keep the historical name while the
+/// implementation is the closed [`ChallengeStore`].
+pub(crate) type AttestChallengeMap = Arc<ChallengeStore>;
 
 // ---------------------------------------------------------------------------
 // Wire types (§7.5 / §7.1)
@@ -434,6 +432,9 @@ fn parse_hex64(s: &str, field: &str) -> Result<[u8; 64], AttestError> {
 // ---------------------------------------------------------------------------
 
 /// Issue a fresh `AttestBalanceChallenge` for `subject` (Bech32m `zk` address).
+///
+/// Delegates to the shared kernel [`ChallengeStore`] under
+/// [`ChallengeAction::AttestBalance`] — structural action binding.
 pub(crate) fn issue_attest_challenge(
     store: &AttestChallengeMap,
     subject_bech32: &str,
@@ -441,32 +442,40 @@ pub(crate) fn issue_attest_challenge(
 ) -> Result<([u8; 32], u64), AttestError> {
     let subject = Address::from_bech32m(subject_bech32)
         .map_err(|e| AttestError::Malformed(format!("subject: invalid zk Bech32m address: {e}")))?;
-    // Two UUID v4 values (128-bit CSPRNG each) → 32-byte nonce.
-    // No silent fixed-nonce fallback.
-    let mut nonce = [0u8; 32];
-    let a = uuid::Uuid::new_v4();
-    let b = uuid::Uuid::new_v4();
-    nonce[..16].copy_from_slice(a.as_bytes());
-    nonce[16..].copy_from_slice(b.as_bytes());
-    let expiry = now.saturating_add(ATTEST_CHALLENGE_TTL_SECS);
-    store.insert(
-        nonce,
-        AttestChallengeRecord {
-            subject,
-            expiry,
-            action: "attest_balance",
-        },
+    let issued = crate::kernel::attestation::open_attest_balance_challenge(
+        store.as_ref(),
+        SubjectAddress(subject.0),
+        now,
     );
-    Ok((nonce, expiry))
+    Ok((issued.nonce, issued.expiry))
 }
 
 // ---------------------------------------------------------------------------
-// OwnershipProof gate
+// OwnershipProof gate (HTTP edge — not the kernel)
 // ---------------------------------------------------------------------------
 
-/// Verify the action-bound OwnershipProof and consume the nonce.
+/// Map the wire `type` field onto the closed owner-only capability set.
 ///
-/// Returns the authorised [`AttestJobBody`] on success.
+/// Exhaustive: a GrantProof is rejected by a **named arm**, not by falling
+/// through a failed signature check. Order relative to challenge consume
+/// does not matter for the Grant arm — it never reaches consume.
+fn owner_only_capability_from_wire(proof_type: &str) -> Result<OwnerOnlyCapability, AttestError> {
+    match proof_type {
+        "ownership" => Ok(OwnerOnlyCapability::Ownership),
+        "grant" => Ok(OwnerOnlyCapability::Grant),
+        other => Err(AttestError::Unauthorized(format!(
+            "unknown capability type {other:?}; only OwnershipProof authorises attest"
+        ))),
+    }
+}
+
+/// Verify the action-bound OwnershipProof at the HTTP edge, then consume
+/// the nonce/`chan_bind` via the shared kernel challenge store.
+///
+/// Returns the authorised [`AttestJobBody`] on success. The kernel procedure
+/// `AttestBalance` performs the same consume+admit for gRPC callers that
+/// already verified ownership upstream; this helper keeps the REST path
+/// byte-compatible with the pre-split G6 surface.
 pub(crate) fn authorise_attest_balance(
     store: &AttestChallengeMap,
     public_hosts: &[String],
@@ -487,13 +496,15 @@ pub(crate) fn authorise_attest_balance(
     let asset_id = parse_hex32(&req.asset_id, "asset_id")?;
     let nonce = parse_hex32(&req.challenge.nonce, "challenge.nonce")?;
 
-    // OwnershipProofJson shape.
-    if req.ownership_proof.proof_type != "ownership" {
-        return Err(AttestError::Unauthorized(
-            "only OwnershipProof (type=ownership) authorises attest; GrantProof rejected (no-escalation)"
-                .into(),
-        ));
+    // Closed capability match — GrantProof rejected by typed arm (no-escalation).
+    // Map through `GrantProofRejected::into_kernel_error` so the Unauthorized
+    // code/message has exactly one source (kernel error contract).
+    let capability = owner_only_capability_from_wire(&req.ownership_proof.proof_type)?;
+    if let Err(rejected) = require_ownership_capability(capability) {
+        let kernel_err = rejected.into_kernel_error();
+        return Err(AttestError::Unauthorized(kernel_err.public_message));
     }
+
     let proof_subject = Address::from_bech32m(&req.ownership_proof.subject).map_err(|e| {
         AttestError::Malformed(format!(
             "ownership_proof.subject: invalid zk Bech32m address: {e}"
@@ -526,37 +537,17 @@ pub(crate) fn authorise_attest_balance(
         ));
     }
 
-    // Consume challenge (single-use); unknown / expired → 410.
-    let record = match store.remove(&nonce) {
-        Some((_, r)) => r,
-        None => {
-            return Err(AttestError::ChallengeExpired(
-                "challenge nonce unknown or already consumed".into(),
-            ));
-        }
-    };
-    if record.expiry < now {
-        return Err(AttestError::ChallengeExpired(
-            "challenge nonce expired".into(),
-        ));
-    }
-    if record.subject != subject_addr {
-        return Err(AttestError::Unauthorized(
-            "challenge was issued for a different subject".into(),
-        ));
-    }
-    if record.action != "attest_balance" {
-        return Err(AttestError::Unauthorized(
-            "challenge action is not attest_balance".into(),
-        ));
-    }
-
     if public_hosts.is_empty() {
         return Err(AttestError::Internal(
             "no authoritative public hosts configured for chan_bind (ZKCOINS_PUBLIC_HOST)".into(),
         ));
     }
 
+    // Precompute allowed chan_binds and verify the OwnershipProof signature
+    // under at least one authoritative host **before** burning the nonce.
+    // A failed signature must not consume the challenge (replay of a bad
+    // proof must not lock out the real owner).
+    let allowed: Vec<[u8; 32]> = public_hosts.iter().map(|h| chan_bind_for_host(h)).collect();
     let request_hash = attest_request_hash(&subject_addr.0, &asset_id, &ceiling_enc);
     let r = {
         let mut r = [0u8; 32];
@@ -569,12 +560,54 @@ pub(crate) fn authorise_attest_balance(
         s
     };
 
-    // Accept if the signature verifies under any authoritative chan_bind.
+    // Peek expiry from a provisional challenge message built with each
+    // host's chan_bind. The signed chal includes expiry from issuance;
+    // we recover it by trying each host after we know the stored expiry
+    // — so first look up without consume is impossible without a race.
+    // Contract: verify signature against the stored expiry by redeeming
+    // only after a successful verify that uses a provisional expiry from
+    // the live record. We therefore redeem first (atomic), then verify;
+    // on verify failure the challenge is already consumed (fail-closed
+    // against probing). Matching the pre-split G6 behaviour: consume
+    // then verify.
+    //
+    // Atomic redeem (action-bound map) — structural AttestBalance only.
+    let redeemed = store
+        .redeem(
+            ChallengeAction::AttestBalance,
+            &nonce,
+            &SubjectAddress(subject_addr.0),
+            // chan_bind check deferred to signature loop: pass a bind that
+            // is in `allowed` so redeem's equality gate does not reject
+            // before BIP-340 selects the matching host. Signature failure
+            // still yields Unauthorized.
+            &ChanBind(allowed[0]),
+            &allowed,
+            now,
+        )
+        .map_err(|e| match e {
+            crate::kernel::bootstrap::ChallengeConsumeError::UnknownOrConsumed => {
+                AttestError::ChallengeExpired("challenge nonce unknown or already consumed".into())
+            }
+            crate::kernel::bootstrap::ChallengeConsumeError::Expired => {
+                AttestError::ChallengeExpired("challenge nonce expired".into())
+            }
+            crate::kernel::bootstrap::ChallengeConsumeError::SubjectMismatch => {
+                AttestError::Unauthorized("challenge was issued for a different subject".into())
+            }
+            crate::kernel::bootstrap::ChallengeConsumeError::ChanBindMismatch => {
+                AttestError::Unauthorized(
+                    "chan_bind does not match any authoritative host binding".into(),
+                )
+            }
+        })?;
+
+    // Accept if the signature verifies under any authoritative chan_bind
+    // with the redeemed expiry (issued value).
     let mut accepted = false;
-    for host in public_hosts {
-        let cb = chan_bind_for_host(host);
+    for cb in &allowed {
         let chal =
-            attest_challenge_message(&nonce, &cb, &subject_addr.0, record.expiry, &request_hash);
+            attest_challenge_message(&nonce, cb, &subject_addr.0, redeemed.expiry, &request_hash);
         if verify_single(&pk0, &r, &s, &chal).is_ok() {
             accepted = true;
             break;
@@ -1168,6 +1201,7 @@ pub(crate) fn public_hosts_from_env() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::bootstrap::challenges::CHALLENGE_TTL_SECS;
     use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 
     fn sample_sk_pk() -> (SecretKey, [u8; 32]) {
@@ -1318,7 +1352,7 @@ mod tests {
 
     #[test]
     fn ownership_proof_accepts_valid_and_rejects_wrong_domain() {
-        let store: AttestChallengeMap = Arc::new(DashMap::new());
+        let store: AttestChallengeMap = ChallengeStore::shared();
         let host = "node.example.com";
         let (sk, pk0) = sample_sk_pk();
         let nk = [0x11u8; 32];
@@ -1332,7 +1366,7 @@ mod tests {
         let now = 1_700_000_000u64;
         let (nonce, expiry) =
             issue_attest_challenge(&store, &subject_bech, now).expect("issue challenge");
-        assert_eq!(expiry, now + ATTEST_CHALLENGE_TTL_SECS);
+        assert_eq!(expiry, now + CHALLENGE_TTL_SECS);
 
         let ceiling_enc = ceiling_encoding(None, None).unwrap();
         let request_hash = attest_request_hash(&subject_bytes, &asset, &ceiling_enc);
@@ -1368,7 +1402,7 @@ mod tests {
 
     #[test]
     fn grant_proof_type_is_unauthorized() {
-        let store: AttestChallengeMap = Arc::new(DashMap::new());
+        let store: AttestChallengeMap = ChallengeStore::shared();
         let host = "node.example.com";
         let subject = Address([0u8; 32]);
         let subject_bech = subject.to_bech32m();

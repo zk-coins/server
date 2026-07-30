@@ -6,10 +6,10 @@
 //! `Status::unimplemented("<Name>: not yet implemented")` — never an
 //! invented `Ok(...)` payload.
 //!
-//! Wired today (Block 4): `GetJob`, `StreamJob`, `CancelJob`,
-//! `SignTransition`, `SubmitTransition`. These call the transport-neutral
-//! domain façade and map through `transport/grpc/` converters + the shared
-//! error contract.
+//! Wired today (Block 4–5): `GetJob`, `StreamJob`, `CancelJob`,
+//! `SignTransition`, `SubmitTransition`, `AttestBalance`, `IssueViewGrant`.
+//! These call the transport-neutral domain façade and map through
+//! `transport/grpc/` converters + the shared error contract.
 //!
 //! The existing HTTP router is untouched; this is an additive internal
 //! surface only (Kernel/API split is a later step).
@@ -40,8 +40,8 @@ use crate::kernel::{
     KernelService as DomainKernel,
 };
 use crate::transport::grpc::{
-    job_event_to_proto, job_to_proto, kernel_error_to_status, parse_sign_request,
-    parse_transition_request,
+    job_event_to_proto, job_to_proto, kernel_error_to_status, parse_attest_request,
+    parse_grant_request, parse_sign_request, parse_transition_request,
 };
 use crate::v1::PendingSignMap;
 use tokio::sync::mpsc;
@@ -364,27 +364,61 @@ impl Kernel for GrpcKernelService {
 
     async fn attest_balance(
         &self,
-        _request: Request<AttestRequest>,
+        request: Request<AttestRequest>,
     ) -> Result<Response<JobHandle>, Status> {
-        Err(not_yet("AttestBalance"))
+        // OwnershipProof is API-layer only — this message carries none.
+        let command = parse_attest_request(request.into_inner()).map_err(map_domain_err)?;
+        let hosts = crate::v1::public_hosts_from_env();
+        let allowed: Vec<[u8; 32]> = hosts
+            .iter()
+            .map(|h| crate::v1::attest::chan_bind_for_host(h))
+            .collect();
+        let now = crate::v1::unix_now();
+        let job = self
+            .domain
+            .attest_balance(&self.job_tx, &allowed, now, command)
+            .await
+            .map_err(map_domain_err)?;
+        Ok(Response::new(JobHandle {
+            job_id: job.id.as_uuid().to_string(),
+            status: job.normative_status().as_v1_str().to_string(),
+        }))
     }
 
     async fn issue_view_grant(
         &self,
-        _request: Request<GrantRequest>,
+        request: Request<GrantRequest>,
     ) -> Result<Response<GrantResult>, Status> {
-        Err(not_yet("IssueViewGrant"))
+        // OwnershipProof is API-layer only — this message carries none.
+        // op signing key is not loaded until Entrust (Block 8); missing
+        // bundle fails closed inside the domain before challenge consume.
+        let command = parse_grant_request(request.into_inner()).map_err(map_domain_err)?;
+        let hosts = crate::v1::public_hosts_from_env();
+        let allowed: Vec<[u8; 32]> = hosts
+            .iter()
+            .map(|h| crate::v1::attest::chan_bind_for_host(h))
+            .collect();
+        let now = crate::v1::unix_now();
+        let issued = self
+            .domain
+            .issue_view_grant(&allowed, now, None, command)
+            .map_err(map_domain_err)?;
+        Ok(Response::new(GrantResult {
+            grant: issued.grant_bech32m,
+        }))
     }
 }
 
-/// Build a domain façade from store + notify map + pending-sign map
-/// (production / tests). Sign and stream share the dispatcher's maps.
+/// Build a domain façade from store + notify map + pending-sign map +
+/// shared challenge store (production / tests). Sign and stream share
+/// the dispatcher's maps; challenges are shared with HTTP AppState.
 pub(crate) fn domain_from_parts(
     job_store: Arc<JobStore>,
     notify_map: crate::job_dispatcher::JobNotifyMap,
     pending_sign_map: PendingSignMap,
+    challenges: Arc<crate::kernel::bootstrap::ChallengeStore>,
 ) -> DomainKernel {
-    DomainKernel::from_parts(job_store, notify_map, pending_sign_map)
+    DomainKernel::from_parts(job_store, notify_map, pending_sign_map, challenges)
 }
 
 #[cfg(test)]
@@ -414,6 +448,7 @@ mod tests {
                 store,
                 Arc::new(dashmap::DashMap::new()),
                 Arc::new(dashmap::DashMap::new()),
+                crate::kernel::bootstrap::ChallengeStore::shared(),
             ),
             scope,
         )
@@ -632,18 +667,190 @@ mod tests {
                 .await,
         )
         .await;
-        expect_unimplemented(
-            "AttestBalance",
-            svc.attest_balance(Request::new(AttestRequest::default()))
-                .await,
-        )
-        .await;
-        expect_unimplemented(
-            "IssueViewGrant",
-            svc.issue_view_grant(Request::new(GrantRequest::default()))
-                .await,
-        )
-        .await;
+        // AttestBalance / IssueViewGrant are wired (Block 5): empty body
+        // fails closed as malformed_request (InvalidArgument), not
+        // unimplemented. OwnershipProof fields are absent from the proto.
+        {
+            let err = svc
+                .attest_balance(Request::new(AttestRequest::default()))
+                .await
+                .expect_err("empty AttestRequest must fail closed");
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "AttestBalance is wired; empty body is malformed, not unimplemented"
+            );
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
+        {
+            let err = svc
+                .issue_view_grant(Request::new(GrantRequest::default()))
+                .await
+                .expect_err("empty GrantRequest must fail closed");
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "IssueViewGrant is wired; empty body is malformed, not unimplemented"
+            );
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
+    }
+
+    /// Names that must not appear as field/type tokens on the kernel gRPC
+    /// surface (API verifies OwnershipProof; kernel receives proven identity).
+    const FORBIDDEN_OWNERSHIP_PROOF_TOKENS: &[&str] = &[
+        "ownership_proof",
+        "OwnershipProof",
+        "grant_proof",
+        "GrantProof",
+    ];
+
+    /// Strip proto3 `// …` line comments. This is the only comment form present
+    /// in `proto/kernel/v1/kernel.proto` (no `/* … */` block comments).
+    ///
+    /// Line structure is preserved so 1-based line numbers still match the
+    /// original source after stripping trailing comment text per line.
+    fn strip_proto3_line_comments(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        for line in src.lines() {
+            match line.find("//") {
+                Some(idx) => out.push_str(&line[..idx]),
+                None => out.push_str(line),
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// First forbidden token in `proto` after stripping `//` comments, with
+    /// 1-based line number and the comment-free line text.
+    fn find_ownership_proof_field_in_proto(proto: &str) -> Option<(&'static str, usize, String)> {
+        let stripped = strip_proto3_line_comments(proto);
+        for (i, line) in stripped.lines().enumerate() {
+            for &token in FORBIDDEN_OWNERSHIP_PROOF_TOKENS {
+                if line.contains(token) {
+                    return Some((token, i + 1, line.to_string()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Check that `proto` declares neither OwnershipProof nor GrantProof fields.
+    ///
+    /// Comments are ignored: only the comment-free text is scanned. On failure
+    /// the error states the violated rule and the hit location.
+    fn check_kernel_proto_has_no_ownership_proof_fields(proto: &str) -> Result<(), String> {
+        match find_ownership_proof_field_in_proto(proto) {
+            None => Ok(()),
+            Some((token, line, text)) => {
+                let trimmed = text.trim();
+                let rule = if token == "ownership_proof" || token == "OwnershipProof" {
+                    "kernel.proto must not carry OwnershipProof fields on AttestRequest/GrantRequest"
+                } else if token == "grant_proof" || token == "GrantProof" {
+                    "kernel.proto must not carry GrantProof fields on AttestRequest/GrantRequest"
+                } else {
+                    panic!(
+                        "FORBIDDEN_OWNERSHIP_PROOF_TOKENS and rule mapping out of sync: {token}"
+                    );
+                };
+                Err(format!(
+                    "{rule} (found `{token}` at line {line}: {trimmed})"
+                ))
+            }
+        }
+    }
+
+    /// gRPC `AttestRequest` / `GrantRequest` carry no OwnershipProof fields
+    /// (API-layer gate). This pins the proto surface so a regression that
+    /// re-introduces ownership_proof / grant_proof on the kernel messages
+    /// is visible as a compile or field-presence failure.
+    #[test]
+    fn grpc_attest_and_grant_requests_have_no_ownership_proof_fields() {
+        // Field inventory from the generated prost types / Default shape.
+        // If someone adds an ownership_proof field, these bindings fail to
+        // compile or the default struct gains a non-empty field name below.
+        let attest = AttestRequest {
+            subject: String::new(),
+            asset_id: vec![],
+            nav_ceiling: vec![],
+            size_ceiling: 0,
+            nonce: vec![],
+            chan_bind: vec![],
+        };
+        let grant = GrantRequest {
+            subject: String::new(),
+            grantee_pk: vec![],
+            scope: None,
+            expiry: 0,
+            nonce: vec![],
+            chan_bind: vec![],
+        };
+        // Reflective check against the normative proto source text: the
+        // checked-in kernel.proto must not declare ownership_proof / grant_proof
+        // (comment documentation of the rule is not a violation).
+        let proto = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../proto/kernel/v1/kernel.proto"
+        ));
+        if let Err(msg) = check_kernel_proto_has_no_ownership_proof_fields(proto) {
+            panic!("{msg}");
+        }
+        // Touch the structs so field renames/additions force this test to update.
+        assert!(attest.nonce.is_empty());
+        assert!(grant.nonce.is_empty());
+        assert!(attest.chan_bind.is_empty());
+        assert!(grant.chan_bind.is_empty());
+    }
+
+    /// The checker must fail closed on a real field declaration — not only
+    /// stay green on the checked-in proto.
+    #[test]
+    fn ownership_proof_field_declaration_is_detected() {
+        let dirty = r#"
+message AttestRequest {
+  string subject = 1;
+  bytes ownership_proof = 9;
+}
+"#;
+        let err = match check_kernel_proto_has_no_ownership_proof_fields(dirty) {
+            Ok(()) => panic!("declared ownership_proof field must be reported as a violation"),
+            Err(msg) => msg,
+        };
+        assert!(
+            err.contains("ownership_proof"),
+            "error must name the forbidden token: {err}"
+        );
+        assert!(
+            err.contains(
+                "kernel.proto must not carry OwnershipProof fields on AttestRequest/GrantRequest"
+            ),
+            "error must keep the OwnershipProof rule wording: {err}"
+        );
+        assert!(
+            err.contains("line "),
+            "error must include a line location: {err}"
+        );
+    }
+
+    /// Names that appear only in `//` comments document the rule; they are
+    /// not field declarations and must not trip the checker.
+    #[test]
+    fn ownership_proof_name_only_in_comment_is_clean() {
+        let comment_only = r#"
+// API layer has already verified the action-bound OwnershipProof (§5.1 / §7.5);
+// kernel trusts the caller. No ownership_proof / grant_proof / GrantProof fields.
+message AttestRequest {
+  string subject = 1;                       // OwnershipProof stays at the API edge
+  bytes nonce = 5;
+}
+message GrantRequest {
+  string subject = 1;                       // GrantProof is also API-only
+}
+"#;
+        if let Err(msg) = check_kernel_proto_has_no_ownership_proof_fields(comment_only) {
+            panic!("names only in // comments must be treated as clean: {msg}");
+        }
     }
 
     /// Flag/claim off: SignTransition is refused at the gRPC edge with
@@ -690,6 +897,7 @@ mod tests {
             Arc::clone(&store),
             Arc::new(dashmap::DashMap::new()),
             Arc::new(dashmap::DashMap::new()),
+            crate::kernel::bootstrap::ChallengeStore::shared(),
         );
         let svc = grpc_svc(domain);
 
@@ -772,6 +980,7 @@ mod tests {
             Arc::clone(&store),
             Arc::new(dashmap::DashMap::new()),
             Arc::new(dashmap::DashMap::new()),
+            crate::kernel::bootstrap::ChallengeStore::shared(),
         );
         let svc = grpc_svc(domain);
         let resp = svc
@@ -859,6 +1068,7 @@ mod tests {
             Arc::clone(&store),
             Arc::new(dashmap::DashMap::new()),
             Arc::new(dashmap::DashMap::new()),
+            crate::kernel::bootstrap::ChallengeStore::shared(),
         );
         let svc = grpc_svc(domain);
         let resp = svc
@@ -913,6 +1123,7 @@ mod tests {
             Arc::clone(&store),
             Arc::new(dashmap::DashMap::new()),
             Arc::new(dashmap::DashMap::new()),
+            crate::kernel::bootstrap::ChallengeStore::shared(),
         );
         let svc = grpc_svc(domain);
         let resp = svc

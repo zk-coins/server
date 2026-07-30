@@ -11,9 +11,8 @@ use uuid::Uuid;
 
 use crate::job_dispatcher::{JobNotifier, JobNotifyMap, JobPhaseEvent};
 use crate::job_store::JobStore;
-use crate::kernel::error::{KernelError, KernelResult};
 use crate::kernel::job_projection::{project_job_row, project_phase_event};
-use crate::kernel::types::{JobEvent, JobRequest, KernelStream};
+use crate::kernel::{JobEvent, JobRequest, KernelError, KernelResult, KernelStream};
 
 /// Fan-out hub over the per-job phase broadcast channels.
 ///
@@ -145,8 +144,8 @@ mod tests {
     use super::*;
     use crate::job_dispatcher::{publish_phase, JobPhaseEvent};
     use crate::job_store::{JobKind as StoreKind, JobStatus as StoreStatus};
-    use crate::kernel::error::KernelErrorCode;
-    use crate::kernel::types::{JobEventKind, JobId, JobKind, JobState};
+    use crate::kernel::types::{JobEventKind, JobKind};
+    use crate::kernel::{JobId, JobState, KernelErrorCode};
     use crate::test_db::{setup_pool, SchemaScope};
     use futures_util::StreamExt;
     use std::sync::Arc;

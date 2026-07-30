@@ -3,7 +3,7 @@
 //! Uses the shared [`crate::transport::error_contract`] table — no second
 //! reason/HTTP/gRPC vocabulary.
 
-use crate::kernel::error::KernelError;
+use crate::kernel::KernelError;
 use crate::transport::error_contract::{self, GrpcStatusCode, ERROR_INFO_DOMAIN};
 use tonic::{Code, Status};
 
@@ -62,7 +62,7 @@ fn grpc_code(code: GrpcStatusCode) -> Code {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::error::{KernelError, KernelErrorCode};
+    use crate::kernel::KernelErrorCode;
 
     #[test]
     fn stream_job_not_found_is_not_found_404() {

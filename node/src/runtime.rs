@@ -212,7 +212,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         #[cfg(test)]
         v1_pending_after_prove: None,
         v1_engine: v1_engine.clone(),
-        attest_challenges: Arc::new(DashMap::new()),
+        attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
         public_hosts: Arc::new(crate::v1::public_hosts_from_env()),
     };
 
@@ -296,6 +296,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             Arc::clone(&job_store),
             Arc::clone(&job_notify_map),
             Arc::clone(&state.pending_sign_map),
+            Arc::clone(&state.attest_challenges),
         );
         let job_tx_grpc = job_tx.clone();
         tokio::spawn(async move {

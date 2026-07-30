@@ -159,7 +159,7 @@ async fn build_state_with_pool() -> (AppState, SchemaScope) {
         v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
         v1_pending_after_prove: None,
         v1_engine: None,
-        attest_challenges: Arc::new(dashmap::DashMap::new()),
+        attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
         public_hosts: Arc::new(vec!["node.test".to_string()]),
     };
     // tempdir lives until the test ends (Drop on test exit).
