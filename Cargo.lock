@@ -2179,6 +2179,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tonic 0.13.1",
+ "tonic-types",
  "tower",
  "tower-http 0.5.2",
  "tracing",
@@ -4354,6 +4355,17 @@ dependencies = [
  "bytes",
  "prost 0.14.3",
  "tonic 0.14.6",
+]
+
+[[package]]
+name = "tonic-types"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07439468da24d5f211d3f3bd7b63665d8f45072804457e838a87414a478e2db8"
+dependencies = [
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "tonic 0.13.1",
 ]
 
 [[package]]

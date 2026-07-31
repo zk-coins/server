@@ -687,6 +687,36 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
     use tonic::Code;
+    use tonic_types::{ErrorDetail, StatusExt};
+
+    /// Assert the normative §7.8 ErrorInfo shape on a failed Status
+    /// (exactly one detail; reason / domain / http_status).
+    fn assert_error_info(status: &Status, reason: &str, http_status: &str) {
+        let details = status
+            .check_error_details_vec()
+            .expect("Status.details must decode as google.rpc.Status details");
+        assert_eq!(
+            details.len(),
+            1,
+            "Status.details must carry exactly one ErrorDetail, got {details:?}"
+        );
+        let ErrorDetail::ErrorInfo(info) = &details[0] else {
+            panic!("sole detail must be ErrorInfo, got {:?}", details[0]);
+        };
+        assert_eq!(info.reason, reason);
+        assert_eq!(
+            info.domain,
+            crate::transport::error_contract::ERROR_INFO_DOMAIN
+        );
+        assert_eq!(
+            info.metadata.get("http_status").map(String::as_str),
+            Some(http_status)
+        );
+        // Dual-channel headers must stay absent (Spec names only ErrorInfo).
+        assert!(status.metadata().get("error-reason").is_none());
+        assert!(status.metadata().get("error-domain").is_none());
+        assert!(status.metadata().get("error-http-status").is_none());
+    }
 
     /// Serialise env mutations: `KERNEL_GRPC_ADDR` is process-wide and
     /// tests run under `--test-threads=8`.
@@ -1360,33 +1390,28 @@ message GrantRequest {
         };
         assert_eq!(status.code(), Code::NotFound);
         assert_eq!(status.message(), "Job not found");
-        assert_eq!(
-            status
-                .metadata()
-                .get("error-reason")
-                .expect("error-reason")
-                .to_str()
-                .expect("str"),
-            "job_not_found"
-        );
-        assert_eq!(
-            status
-                .metadata()
-                .get("error-domain")
-                .expect("error-domain")
-                .to_str()
-                .expect("str"),
-            crate::transport::error_contract::ERROR_INFO_DOMAIN
-        );
-        assert_eq!(
-            status
-                .metadata()
-                .get("error-http-status")
-                .expect("http")
-                .to_str()
-                .expect("str"),
-            "404"
-        );
+        assert_error_info(&status, "job_not_found", "404");
+    }
+
+    #[tokio::test]
+    async fn stream_job_unknown_ends_with_same_error_info_form() {
+        // Stream open failure must use the same Status + ErrorInfo as unary
+        // GetJob — no stream-only vocabulary (§7.8 server-stream rule).
+        let (domain, _scope) = test_domain().await;
+        let svc = grpc_svc(domain);
+        let missing = Uuid::new_v4();
+        let status = match svc
+            .stream_job(Request::new(JobRequest {
+                job_id: missing.to_string(),
+            }))
+            .await
+        {
+            Ok(_) => panic!("unknown job StreamJob must not return Ok stream"),
+            Err(s) => s,
+        };
+        assert_eq!(status.code(), Code::NotFound);
+        assert_eq!(status.message(), "Job not found");
+        assert_error_info(&status, "job_not_found", "404");
     }
 
     #[tokio::test]
@@ -1502,33 +1527,7 @@ message GrantRequest {
         };
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(status.message(), "job_id is required");
-        assert_eq!(
-            status
-                .metadata()
-                .get("error-reason")
-                .expect("reason")
-                .to_str()
-                .expect("str"),
-            "malformed_request"
-        );
-        assert_eq!(
-            status
-                .metadata()
-                .get("error-http-status")
-                .expect("http")
-                .to_str()
-                .expect("str"),
-            "400"
-        );
-        assert_eq!(
-            status
-                .metadata()
-                .get("error-domain")
-                .expect("domain")
-                .to_str()
-                .expect("str"),
-            crate::transport::error_contract::ERROR_INFO_DOMAIN
-        );
+        assert_error_info(&status, "malformed_request", "400");
     }
 
     #[tokio::test]
@@ -1546,32 +1545,6 @@ message GrantRequest {
         };
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(status.message(), "job_id must be a UUID");
-        assert_eq!(
-            status
-                .metadata()
-                .get("error-reason")
-                .expect("reason")
-                .to_str()
-                .expect("str"),
-            "malformed_request"
-        );
-        assert_eq!(
-            status
-                .metadata()
-                .get("error-http-status")
-                .expect("http")
-                .to_str()
-                .expect("str"),
-            "400"
-        );
-        assert_eq!(
-            status
-                .metadata()
-                .get("error-domain")
-                .expect("domain")
-                .to_str()
-                .expect("str"),
-            crate::transport::error_contract::ERROR_INFO_DOMAIN
-        );
+        assert_error_info(&status, "malformed_request", "400");
     }
 }

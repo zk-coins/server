@@ -221,6 +221,12 @@ tonic = { version = "0.13.1", default-features = false, features = [
     "transport",
     "router",
 ] }
+# gRPC richer-error packing for `google.rpc.ErrorInfo` in `Status.details`
+# (§7.8). Same major line as `tonic` above (0.13) so `StatusExt` links
+# against this crate's `tonic::Status` without a second tonic graph.
+# Not transitive today — declared direct because the transport error
+# contract depends on it explicitly.
+tonic-types = "0.13.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
