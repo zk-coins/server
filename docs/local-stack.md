@@ -99,6 +99,22 @@ PY
 export ZKCOINS_EXPECTED_PARAMS_IDENTIFIER="$(…output…)"
 ```
 
+### GetInfo / ChainIdentity operational pins
+
+Required by `require_chain_identity_ops_from_env` (`runtime.rs` / `kernel/chain.rs`) and re-checked when the exclusive v1 engine is installed. **No defaults** — missing or blank aborts at compose parse or process start and names the variable.
+
+| Variable | Fail site | Notes |
+| --- | --- | --- |
+| `ZKCOINS_RELAY_URL` | `chain_identity_ops_from_env` | This node's advertised Nostr relay URL (`Info.relay_url`). Non-empty; max 2048 bytes. |
+| `ZKCOINS_BLOSSOM_URL` | same | This node's advertised Blossom base URL (`Info.blossom_url`). |
+| `ZKCOINS_MAX_BLOB_BYTES` | same | Advertised Blossom upload limit (`Info.max_blob_bytes`); integer **> 0**. |
+| `ZKCOINS_KERNEL_PARTS` | same | Comma-separated closed set: `scanner`, `prover`, `publisher` (at least one; no duplicates). |
+| `KERNEL_GRPC_ADDR` | `kernel_grpc_addr_from_env` | gRPC bind address (e.g. `0.0.0.0:50051`); no default host/port. |
+
+**Not from env (protocol / node-owned):** `protocol_version` (`"v1"`), `finality_confirmations` (`6`), `max_tx_inputs` / `max_tx_outputs` / `max_rx_coins` / `max_account_assets` (circuit constants), circuit digests (from §3.6 pins after the live digest gate), tip / NAV / readiness (running engine).
+
+**Still fail-closed for `GetInfo`:** the signed §4.3 `BootstrapManifest`. This tree has no BMF1 loader and must not invent `manifest_sig`. Operational pins above are still required so a future signed-manifest loader has a complete identity to install; until then `ChainIdentity` stays unset and `GetInfo` fails closed.
+
 ### Optional (publish path)
 
 Required by `v1_publisher_env_from_env` (`v1/publish.rs`) when you publish or when resumable pending rows exist:
@@ -141,7 +157,14 @@ export ZKCOINS_CIRCUIT_DIGEST_C_BALANCE=bd696087e0e0f47b556a6803ef4fb5b9ebae2327
 export ZKCOINS_BOOTSTRAP_PUBKEY=…    # 64 hex
 export ZKCOINS_EXPECTED_PARAMS_IDENTIFIER=…  # see computation above
 
-# 4. Optional publish wallet
+# 4. GetInfo operational pins (no invented relay/blossom; BootstrapManifest still fail-closed)
+export ZKCOINS_RELAY_URL=ws://host.docker.internal:7777
+export ZKCOINS_BLOSSOM_URL=http://host.docker.internal:3000
+export ZKCOINS_MAX_BLOB_BYTES=1048576
+export ZKCOINS_KERNEL_PARTS=scanner,prover,publisher
+export KERNEL_GRPC_ADDR=0.0.0.0:50051
+
+# 5. Optional publish wallet
 # export ZKCOINS_V1_BITCOIND_WALLET=…
 # export ZKCOINS_V1_FEE_RATE_SAT_PER_VB=1
 # export ZKCOINS_V1_REVEAL_OUTPUT_SATS=546
@@ -174,10 +197,11 @@ curl -sS http://127.0.0.1:4242/health/ready
 
 1. **No public API layer** — wallets that expect the §7.5 API service must wait for `zk-coins/api`.
 2. **No bundled Bitcoin / Esplora** — you must already have (or run separately) bitcoind + Esplora; this compose only wires the node and Postgres.
-3. **Node speaks HTTP, not gRPC** — the kernel/API split is parallel work; this binary is still the HTTP node.
+3. **Node speaks HTTP, not gRPC** — the kernel/API split is parallel work; this binary is still the HTTP node (kernel gRPC binds when `KERNEL_GRPC_ADDR` is set).
 4. **Legacy residual config** — `IS_MAINNET=false` still maps residual `EsploraConfig::network()` to **Signet** for Taproot address derivation (`publisher.rs`), while v1 pins use `regtest`. That is existing node behaviour, not introduced by compose.
 5. **Publish path incomplete without wallet env** — scan can run without `ZKCOINS_V1_BITCOIND_WALLET` / fee / reveal; publishing and mid-flight resume need them.
 6. **No warm-prove guarantee on first request** unless you wait for `/health/ready` (`prover` not `warming`).
+7. **Signed §4.3 BootstrapManifest not loadable** — operational GetInfo env is required, but `GetInfo` / complete `ChainIdentity` stays fail-closed until a BMF1 (or equivalent) loader accepts a **real** network-signed manifest (no invented `manifest_sig`).
 
 ## Policy reminders
 

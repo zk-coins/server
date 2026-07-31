@@ -21,7 +21,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use node::account_node;
 use node::db;
 use node::kernel_rpc;
-use node::runtime::{start_rest_node, RestNodeConfig, V1Readiness};
+use node::runtime::{
+    require_chain_identity_ops_from_env, start_rest_node, RestNodeConfig, V1Readiness,
+};
 use node::state::State;
 use node::username;
 use node::v1::{self, ScanStackMode, V1ShadowMode};
@@ -91,6 +93,15 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // (same posture as `DATABASE_URL` / `PUBLISHER_KEY`). The listener
     // itself is spawned later next to the REST router.
     let kernel_grpc_addr = kernel_rpc::kernel_grpc_addr_from_env().unwrap_or_else(|e| {
+        panic!("{e}");
+    });
+
+    // GetInfo operational pins (relay / blossom / max_blob_bytes /
+    // kernel_parts): required, no defaults — same posture as the gRPC
+    // addr. Missing variable names itself. A complete ChainIdentity still
+    // needs a signed §4.3 BootstrapManifest (not loadable yet); that one
+    // field keeps GetInfo fail-closed after boot, without inventing URLs.
+    require_chain_identity_ops_from_env().unwrap_or_else(|e| {
         panic!("{e}");
     });
 

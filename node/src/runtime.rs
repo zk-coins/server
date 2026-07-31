@@ -65,6 +65,22 @@ pub struct RestNodeConfig {
     pub kernel_grpc_addr: SocketAddr,
 }
 
+/// Fail-loud check of operational GetInfo env vars at the binary edge.
+///
+/// Requires `ZKCOINS_RELAY_URL`, `ZKCOINS_BLOSSOM_URL`,
+/// `ZKCOINS_MAX_BLOB_BYTES`, `ZKCOINS_KERNEL_PARTS` — each non-empty, no
+/// defaults. A missing or invalid value names the variable. Does **not**
+/// load or invent a §4.3 `BootstrapManifest` (that remains the GetInfo
+/// fail-closed gap until a signed-artifact loader exists).
+///
+/// Call before expensive bootstrap so a misconfigured deployment fails
+/// before circuit construction / DB work completes unused.
+pub fn require_chain_identity_ops_from_env() -> Result<(), String> {
+    crate::kernel::chain::chain_identity_ops_from_env()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Bind REST + job dispatcher + kernel gRPC, sharing one job store and notify map.
 ///
 /// The normative error table and the closed §7.5 / §7.8 wire vocabularies
@@ -328,22 +344,91 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             "kernel access surfaces installed (Pull/Records; in-memory empty)"
         );
         if let Some(engine) = v1_engine.as_ref() {
+            use crate::kernel::chain::{
+                chain_identity_ops_from_env, resolve_chain_identity, ChainIdentityError,
+            };
+            use crate::kernel::types::{Digest32, XOnlyKey};
             use crate::kernel::{ChainHandle, ChainReadinessFlags, KernelNetwork};
 
-            // Engine + readiness + network pin. GetInfo also needs a
-            // complete ChainIdentity (relay/blossom/manifest/max_blob/
-            // digests); those sources are not yet a single boot object —
-            // leave identity = None so GetInfo fails closed rather than
-            // inventing empty infra URLs. Accumulator / path read the
-            // live NfLog from the engine alone.
+            // Operational infra (relay / blossom / max_blob / parts): required
+            // at boot — missing var aborts before the listener binds.
+            let ops = chain_identity_ops_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            // Digests, activation_height, bootstrap_pubkey, network: §3.6 pins
+            // already validated against the just-built circuits at the binary
+            // edge. Re-read here so GetInfo reports the same digests the
+            // digest-gate knows — never a second free-form env pair.
+            let pins = crate::v1::mode::v1_boot_pins_from_env()
+                .map_err(|e| anyhow::anyhow!("v1 boot pins for ChainIdentity: {e}"))?;
+            let network = KernelNetwork::from_v1(engine.network());
+            let pins_network = KernelNetwork::from_v1(pins.network);
+            if pins_network != network {
+                anyhow::bail!(
+                    "ChainIdentity network pin {} disagrees with engine network {} — \
+                     refusing to install identity",
+                    pins_network.as_str(),
+                    network.as_str()
+                );
+            }
+            if pins.activation_height != engine.activation_height() {
+                anyhow::bail!(
+                    "ChainIdentity activation_height {} disagrees with engine {} — \
+                     refusing to install identity",
+                    pins.activation_height,
+                    engine.activation_height()
+                );
+            }
+
+            let digest_c = Digest32(pins.network_params.circuit_digest_c());
+            let digest_b = Digest32(pins.network_params.circuit_digest_c_balance());
+            let bootstrap_pubkey = XOnlyKey(pins.network_params.bootstrap_pubkey());
+
+            // BootstrapManifest (§4.3): no BMF1 loader / no signed artifact
+            // source in this tree — do not invent. Operational ops stay
+            // validated; identity stays None so GetInfo remains fail-closed
+            // until a real signed manifest can be loaded into
+            // `resolve_chain_identity(..., Some(manifest))`.
+            let identity = match resolve_chain_identity(
+                network,
+                digest_c,
+                digest_b,
+                pins.activation_height,
+                bootstrap_pubkey,
+                ops.clone(),
+                None,
+            ) {
+                Ok(id) => Some(id),
+                Err(ChainIdentityError::BootstrapUnavailable { reason }) => {
+                    tracing::warn!(
+                        %reason,
+                        relay = %ops.relay_url,
+                        blossom = %ops.blossom_url,
+                        max_blob_bytes = ops.max_blob_bytes,
+                        kernel_parts = ?ops
+                            .kernel_parts
+                            .iter()
+                            .map(|p| p.as_str())
+                            .collect::<Vec<_>>(),
+                        digest_c = %hex::encode(digest_c.0),
+                        digest_c_balance = %hex::encode(digest_b.0),
+                        "ChainIdentity: operational config + circuit digests ready; \
+                         signed BootstrapManifest missing — GetInfo stays fail-closed"
+                    );
+                    None
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("{e}"));
+                }
+            };
+
             domain = domain.with_chain(ChainHandle {
                 engine: Some(Arc::clone(engine)),
-                identity: None,
+                identity,
                 readiness: ChainReadinessFlags {
                     scan_caught_up: state.v1_scan_caught_up.clone(),
                     finality_ok: state.v1_finality_ok.clone(),
                 },
-                network: Some(KernelNetwork::from_v1(engine.network())),
+                network: Some(network),
             });
         }
         let job_tx_grpc = job_tx.clone();

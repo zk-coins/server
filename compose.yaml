@@ -111,6 +111,18 @@ services:
       # (node/src/v1/attest.rs public_hosts_from_env — empty is OK, fails loud on use).
       ZKCOINS_PUBLIC_HOST: ${ZKCOINS_PUBLIC_HOST:-}
 
+      # GetInfo / ChainIdentity operational pins (node/src/kernel/chain.rs +
+      # runtime::require_chain_identity_ops_from_env). No defaults — missing
+      # aborts at parse or binary edge. Does not invent a BootstrapManifest
+      # (§4.3 still fail-closed for GetInfo until a signed artifact loader exists).
+      ZKCOINS_RELAY_URL: ${ZKCOINS_RELAY_URL:?set ZKCOINS_RELAY_URL e.g. ws://host.docker.internal:7777}
+      ZKCOINS_BLOSSOM_URL: ${ZKCOINS_BLOSSOM_URL:?set ZKCOINS_BLOSSOM_URL e.g. http://host.docker.internal:3000}
+      ZKCOINS_MAX_BLOB_BYTES: ${ZKCOINS_MAX_BLOB_BYTES:?set ZKCOINS_MAX_BLOB_BYTES e.g. 1048576}
+      ZKCOINS_KERNEL_PARTS: ${ZKCOINS_KERNEL_PARTS:?set ZKCOINS_KERNEL_PARTS e.g. scanner,prover,publisher}
+
+      # Kernel gRPC bind (node/src/kernel_rpc.rs KERNEL_GRPC_ADDR — no default).
+      KERNEL_GRPC_ADDR: ${KERNEL_GRPC_ADDR:?set KERNEL_GRPC_ADDR e.g. 0.0.0.0:50051}
+
       PROOFS_DIR: /data/proofs
       RUST_LOG: ${RUST_LOG:-info}
     healthcheck:

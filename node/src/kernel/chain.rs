@@ -500,6 +500,278 @@ pub(crate) struct ChainIdentity {
     pub bootstrap_pubkey: XOnlyKey,
 }
 
+// ---------------------------------------------------------------------------
+// Operational GetInfo config (env) + assembly from pins / live digests
+// ---------------------------------------------------------------------------
+
+/// Env: this node's advertised Nostr relay URL (`Info.relay_url`).
+pub(crate) const RELAY_URL_ENV: &str = "ZKCOINS_RELAY_URL";
+/// Env: this node's advertised Blossom base URL (`Info.blossom_url`).
+pub(crate) const BLOSSOM_URL_ENV: &str = "ZKCOINS_BLOSSOM_URL";
+/// Env: Blossom upload size limit this node advertises (`Info.max_blob_bytes`).
+pub(crate) const MAX_BLOB_BYTES_ENV: &str = "ZKCOINS_MAX_BLOB_BYTES";
+/// Env: comma-separated kernel parts (`scanner`/`prover`/`publisher`).
+pub(crate) const KERNEL_PARTS_ENV: &str = "ZKCOINS_KERNEL_PARTS";
+
+/// §4.3 / §7.4 URL length bound (bootstrap seed / blob-store URLs).
+const URL_MAX_BYTES: usize = 2048;
+
+/// Operator-chosen GetInfo infrastructure (not protocol constants, not digests).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChainIdentityOps {
+    pub relay_url: String,
+    pub blossom_url: String,
+    pub max_blob_bytes: u64,
+    pub kernel_parts: Vec<KernelPart>,
+}
+
+/// Fail-loud errors when building or loading chain identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChainIdentityError {
+    /// Required operational env var unset, empty, or whitespace-only.
+    MissingVar { name: &'static str },
+    /// Present but unparseable / out of bounds / closed-set violation.
+    InvalidVar { name: &'static str, detail: String },
+    /// Signed §4.3 `BootstrapManifest` cannot be supplied by this binary yet.
+    ///
+    /// Operational env may already be complete; GetInfo stays fail-closed
+    /// until a loader for a real signed manifest exists. Never invent one.
+    BootstrapUnavailable { reason: &'static str },
+}
+
+impl std::fmt::Display for ChainIdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingVar { name } => write!(
+                f,
+                "{name} is unset or empty — required for GetInfo / ChainIdentity \
+                 (no silent default, no invented URL)"
+            ),
+            Self::InvalidVar { name, detail } => {
+                write!(f, "{name} is invalid: {detail} — refusing to start")
+            }
+            Self::BootstrapUnavailable { reason } => write!(
+                f,
+                "signed BootstrapManifest (§4.3) unavailable: {reason} — \
+                 GetInfo remains fail-closed (no invented manifest)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChainIdentityError {}
+
+/// Why production cannot yet install a complete [`ChainIdentity`].
+///
+/// The tree has the domain type and the wire echo path, but no BMF1
+/// decoder, no path/env load of a signed artifact, and no bootstrap
+/// signing key material (correct: the node must not invent signatures).
+pub(crate) const BOOTSTRAP_MANIFEST_UNAVAILABLE_REASON: &str = "\
+no BootstrapManifestV1 (BMF1) loader and no source of a network-signed \
+manifest artifact — shared has no serialize/deserialize for §4.3, the \
+node does not fetch kind-30423, and the process must not invent \
+manifest_sig or bootstrap key material";
+
+/// Parse one non-empty URL (trim; length 1..=2048). No scheme allow-list
+/// beyond non-emptiness — inventing a URL is forbidden; the operator supplies it.
+pub(crate) fn parse_required_url(
+    name: &'static str,
+    raw: Option<&str>,
+) -> Result<String, ChainIdentityError> {
+    let Some(raw) = raw else {
+        return Err(ChainIdentityError::MissingVar { name });
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ChainIdentityError::MissingVar { name });
+    }
+    if trimmed.len() > URL_MAX_BYTES {
+        return Err(ChainIdentityError::InvalidVar {
+            name,
+            detail: format!(
+                "URL length {} exceeds max {URL_MAX_BYTES} bytes (§4.3 bound)",
+                trimmed.len()
+            ),
+        });
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Parse `max_blob_bytes`: non-empty decimal `u64`, strictly greater than zero.
+pub(crate) fn parse_max_blob_bytes(raw: Option<&str>) -> Result<u64, ChainIdentityError> {
+    let Some(raw) = raw else {
+        return Err(ChainIdentityError::MissingVar {
+            name: MAX_BLOB_BYTES_ENV,
+        });
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ChainIdentityError::MissingVar {
+            name: MAX_BLOB_BYTES_ENV,
+        });
+    }
+    let value: u64 = trimmed
+        .parse()
+        .map_err(|_| ChainIdentityError::InvalidVar {
+            name: MAX_BLOB_BYTES_ENV,
+            detail: format!("{raw:?} is not a non-negative integer"),
+        })?;
+    if value == 0 {
+        return Err(ChainIdentityError::InvalidVar {
+            name: MAX_BLOB_BYTES_ENV,
+            detail: "must be > 0 (zero is not an advertised Blossom limit)".into(),
+        });
+    }
+    Ok(value)
+}
+
+/// Parse closed `kernel_parts`: comma-separated `scanner`|`prover`|`publisher`.
+///
+/// At least one part; no empties; no duplicates; unknown tokens fail loud.
+pub(crate) fn parse_kernel_parts(raw: Option<&str>) -> Result<Vec<KernelPart>, ChainIdentityError> {
+    let Some(raw) = raw else {
+        return Err(ChainIdentityError::MissingVar {
+            name: KERNEL_PARTS_ENV,
+        });
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ChainIdentityError::MissingVar {
+            name: KERNEL_PARTS_ENV,
+        });
+    }
+    let mut parts = Vec::new();
+    for token in trimmed.split(',') {
+        let t = token.trim();
+        if t.is_empty() {
+            return Err(ChainIdentityError::InvalidVar {
+                name: KERNEL_PARTS_ENV,
+                detail: format!("empty token in {raw:?} (no trailing/duplicate commas)"),
+            });
+        }
+        let part = match t {
+            "scanner" => KernelPart::Scanner,
+            "prover" => KernelPart::Prover,
+            "publisher" => KernelPart::Publisher,
+            other => {
+                return Err(ChainIdentityError::InvalidVar {
+                    name: KERNEL_PARTS_ENV,
+                    detail: format!(
+                        "unknown part {other:?}; each element must be exactly one of \
+                         scanner, prover, publisher"
+                    ),
+                });
+            }
+        };
+        if parts.contains(&part) {
+            return Err(ChainIdentityError::InvalidVar {
+                name: KERNEL_PARTS_ENV,
+                detail: format!("duplicate part {:?} in {raw:?}", part.as_str()),
+            });
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return Err(ChainIdentityError::MissingVar {
+            name: KERNEL_PARTS_ENV,
+        });
+    }
+    Ok(parts)
+}
+
+/// Build operational identity pieces from optional raw env strings (testable).
+pub(crate) fn parse_chain_identity_ops(
+    relay_url: Option<&str>,
+    blossom_url: Option<&str>,
+    max_blob_bytes: Option<&str>,
+    kernel_parts: Option<&str>,
+) -> Result<ChainIdentityOps, ChainIdentityError> {
+    Ok(ChainIdentityOps {
+        relay_url: parse_required_url(RELAY_URL_ENV, relay_url)?,
+        blossom_url: parse_required_url(BLOSSOM_URL_ENV, blossom_url)?,
+        max_blob_bytes: parse_max_blob_bytes(max_blob_bytes)?,
+        kernel_parts: parse_kernel_parts(kernel_parts)?,
+    })
+}
+
+/// Read operational GetInfo env vars. No defaults; missing names the variable.
+pub(crate) fn chain_identity_ops_from_env() -> Result<ChainIdentityOps, ChainIdentityError> {
+    fn var(name: &'static str) -> Result<Option<String>, ChainIdentityError> {
+        match std::env::var(name) {
+            Ok(v) => Ok(Some(v)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(ChainIdentityError::InvalidVar {
+                name,
+                detail: "value is not valid UTF-8".into(),
+            }),
+        }
+    }
+    let relay = var(RELAY_URL_ENV)?;
+    let blossom = var(BLOSSOM_URL_ENV)?;
+    let max_blob = var(MAX_BLOB_BYTES_ENV)?;
+    let parts = var(KERNEL_PARTS_ENV)?;
+    parse_chain_identity_ops(
+        relay.as_deref(),
+        blossom.as_deref(),
+        max_blob.as_deref(),
+        parts.as_deref(),
+    )
+}
+
+/// Assemble a complete [`ChainIdentity`]. Digests and network pins come from
+/// the caller (live node / §3.6 pins) — never re-parsed as free-form operator
+/// overrides of protocol identity.
+pub(crate) fn assemble_chain_identity(
+    network: KernelNetwork,
+    circuit_digest_c: Digest32,
+    circuit_digest_c_balance: Digest32,
+    activation_height: u64,
+    bootstrap_pubkey: XOnlyKey,
+    ops: ChainIdentityOps,
+    bootstrap: BootstrapManifest,
+) -> ChainIdentity {
+    ChainIdentity {
+        network,
+        circuit_digest_c,
+        circuit_digest_c_balance,
+        relay_url: ops.relay_url,
+        blossom_url: ops.blossom_url,
+        max_blob_bytes: ops.max_blob_bytes,
+        activation_height,
+        bootstrap,
+        kernel_parts: ops.kernel_parts,
+        bootstrap_pubkey,
+    }
+}
+
+/// Production resolve: require operational env; complete identity only when a
+/// real signed bootstrap is provided. `bootstrap == None` →
+/// [`ChainIdentityError::BootstrapUnavailable`] (GetInfo stays fail-closed).
+pub(crate) fn resolve_chain_identity(
+    network: KernelNetwork,
+    circuit_digest_c: Digest32,
+    circuit_digest_c_balance: Digest32,
+    activation_height: u64,
+    bootstrap_pubkey: XOnlyKey,
+    ops: ChainIdentityOps,
+    bootstrap: Option<BootstrapManifest>,
+) -> Result<ChainIdentity, ChainIdentityError> {
+    let Some(bootstrap) = bootstrap else {
+        return Err(ChainIdentityError::BootstrapUnavailable {
+            reason: BOOTSTRAP_MANIFEST_UNAVAILABLE_REASON,
+        });
+    };
+    Ok(assemble_chain_identity(
+        network,
+        circuit_digest_c,
+        circuit_digest_c_balance,
+        activation_height,
+        bootstrap_pubkey,
+        ops,
+        bootstrap,
+    ))
+}
+
 /// Live readiness flags shared with `/health/ready` under the v1.1 claim.
 #[derive(Clone, Default)]
 pub(crate) struct ChainReadinessFlags {
@@ -1040,39 +1312,272 @@ mod tests {
         );
     }
 
-    #[test]
-    fn get_info_binds_nav_root_from_view() {
-        let view = fold_view(&[(pos(5, 0, 0, 0), pk(1), r(1))], 12);
-        let identity = ChainIdentity {
-            network: KernelNetwork::Regtest,
-            circuit_digest_c: Digest32([0xC1; 32]),
-            circuit_digest_c_balance: Digest32([0xC2; 32]),
+    fn test_ops() -> ChainIdentityOps {
+        ChainIdentityOps {
             relay_url: "wss://relay.example".into(),
             blossom_url: "https://blossom.example".into(),
             max_blob_bytes: 1_048_576,
-            activation_height: 0,
-            bootstrap: BootstrapManifest {
-                network: KernelNetwork::Regtest,
-                protocol_version: "v1".into(),
-                seed_relays: vec!["wss://seed.example".into()],
-                blob_stores: vec!["https://blob.example".into()],
-                operator_ids: vec![XOnlyKey([0x0B; 32])],
-                issued_at: 1,
-                expires_at: 2,
-                manifest_sig: [0x51; 64],
-            },
             kernel_parts: vec![
                 KernelPart::Scanner,
                 KernelPart::Prover,
                 KernelPart::Publisher,
             ],
-            bootstrap_pubkey: XOnlyKey([0xB0; 32]),
-        };
+        }
+    }
+
+    fn test_bootstrap() -> BootstrapManifest {
+        BootstrapManifest {
+            network: KernelNetwork::Regtest,
+            protocol_version: "v1".into(),
+            seed_relays: vec!["wss://seed.example".into()],
+            blob_stores: vec!["https://blob.example".into()],
+            operator_ids: vec![XOnlyKey([0x0B; 32])],
+            issued_at: 1,
+            expires_at: 2,
+            manifest_sig: [0x51; 64],
+        }
+    }
+
+    #[test]
+    fn get_info_binds_nav_root_from_view() {
+        let view = fold_view(&[(pos(5, 0, 0, 0), pk(1), r(1))], 12);
+        let identity = assemble_chain_identity(
+            KernelNetwork::Regtest,
+            Digest32([0xC1; 32]),
+            Digest32([0xC2; 32]),
+            0,
+            XOnlyKey([0xB0; 32]),
+            test_ops(),
+            test_bootstrap(),
+        );
         let info = get_info(&identity, &view, Readiness::Ready, 0);
         assert_eq!(info.network.as_str(), "regtest");
         assert_eq!(info.accumulator_root.0, view.nav_root_bytes());
         assert_eq!(info.bitcoin_tip_height, 12);
         assert!(info.readiness.is_ready());
         assert_eq!(info.finality_confirmations, 6);
+    }
+
+    /// Complete identity → GetInfo digests are exactly the node-supplied pair.
+    #[test]
+    fn get_info_reports_node_circuit_digests_not_env_overrides() {
+        let view = fold_view(&[(pos(1, 0, 0, 0), pk(1), r(1))], 5);
+        let digest_c = Digest32([0xAA; 32]);
+        let digest_b = Digest32([0xBB; 32]);
+        let identity = assemble_chain_identity(
+            KernelNetwork::Testnet,
+            digest_c,
+            digest_b,
+            100,
+            XOnlyKey([0xCC; 32]),
+            test_ops(),
+            test_bootstrap(),
+        );
+        let info = get_info(&identity, &view, Readiness::Ready, 0);
+        assert_eq!(
+            info.circuit_digest_c, digest_c,
+            "GetInfo C digest must equal the node-known digest passed into identity"
+        );
+        assert_eq!(
+            info.circuit_digest_c_balance, digest_b,
+            "GetInfo C_balance digest must equal the node-known digest"
+        );
+        assert_eq!(info.relay_url, "wss://relay.example");
+        assert_eq!(info.blossom_url, "https://blossom.example");
+        assert_eq!(info.max_blob_bytes, 1_048_576);
+        assert_eq!(info.activation_height, 100);
+        assert_eq!(info.bootstrap_pubkey.0, [0xCC; 32]);
+        assert_eq!(
+            info.kernel_parts,
+            vec![
+                KernelPart::Scanner,
+                KernelPart::Prover,
+                KernelPart::Publisher
+            ]
+        );
+    }
+
+    /// Protocol bounds + finality are code constants — not identity fields
+    /// and not overridable via operational env (ops has no slot for them).
+    #[test]
+    fn get_info_protocol_constants_come_from_code_not_ops() {
+        let view = fold_view(&[], 0);
+        let identity = assemble_chain_identity(
+            KernelNetwork::Mainnet,
+            Digest32([1; 32]),
+            Digest32([2; 32]),
+            800_000,
+            XOnlyKey([3; 32]),
+            test_ops(),
+            test_bootstrap(),
+        );
+        let info = get_info(&identity, &view, Readiness::Ready, 0);
+        assert_eq!(info.finality_confirmations, FINALITY_CONFIRMATIONS);
+        assert_eq!(info.finality_confirmations, 6);
+        assert_eq!(info.max_tx_inputs, MAX_TX_INPUTS as u32);
+        assert_eq!(info.max_tx_outputs, MAX_TX_OUTPUTS as u32);
+        assert_eq!(info.max_rx_coins, MAX_RX_COINS as u32);
+        assert_eq!(info.max_account_assets, MAX_ACCOUNT_ASSETS as u32);
+        assert_eq!(info.protocol_version, "v1");
+        // `parse_chain_identity_ops` only accepts relay/blossom/max_blob/parts —
+        // there is no env slot for finality or circuit bounds (type-level).
+    }
+
+    #[test]
+    fn missing_operational_env_names_the_variable() {
+        let err = parse_chain_identity_ops(None, Some("https://b"), Some("1"), Some("scanner"))
+            .expect_err("relay missing");
+        match err {
+            ChainIdentityError::MissingVar { name } => assert_eq!(name, RELAY_URL_ENV),
+            other => panic!("expected MissingVar(RELAY), got {other:?}"),
+        }
+
+        let err = parse_chain_identity_ops(Some("wss://r"), None, Some("1"), Some("scanner"))
+            .expect_err("blossom missing");
+        match err {
+            ChainIdentityError::MissingVar { name } => assert_eq!(name, BLOSSOM_URL_ENV),
+            other => panic!("expected MissingVar(BLOSSOM), got {other:?}"),
+        }
+
+        let err =
+            parse_chain_identity_ops(Some("wss://r"), Some("https://b"), None, Some("scanner"))
+                .expect_err("max_blob missing");
+        match err {
+            ChainIdentityError::MissingVar { name } => assert_eq!(name, MAX_BLOB_BYTES_ENV),
+            other => panic!("expected MissingVar(MAX_BLOB), got {other:?}"),
+        }
+
+        let err = parse_chain_identity_ops(Some("wss://r"), Some("https://b"), Some("1"), None)
+            .expect_err("parts missing");
+        match err {
+            ChainIdentityError::MissingVar { name } => assert_eq!(name, KERNEL_PARTS_ENV),
+            other => panic!("expected MissingVar(PARTS), got {other:?}"),
+        }
+
+        // Empty string is the same class as missing (no silent default).
+        let err =
+            parse_chain_identity_ops(Some("  "), Some("https://b"), Some("1"), Some("scanner"))
+                .expect_err("blank relay");
+        match err {
+            ChainIdentityError::MissingVar { name } => assert_eq!(name, RELAY_URL_ENV),
+            other => panic!("expected MissingVar on blank, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_max_blob_and_parts_name_the_cause() {
+        let err = parse_max_blob_bytes(Some("0")).expect_err("zero");
+        match err {
+            ChainIdentityError::InvalidVar { name, detail } => {
+                assert_eq!(name, MAX_BLOB_BYTES_ENV);
+                assert!(
+                    detail.contains("> 0"),
+                    "detail must name zero cause: {detail}"
+                );
+            }
+            other => panic!("expected InvalidVar, got {other:?}"),
+        }
+
+        let err = parse_max_blob_bytes(Some("nope")).expect_err("garbage");
+        match err {
+            ChainIdentityError::InvalidVar { name, .. } => assert_eq!(name, MAX_BLOB_BYTES_ENV),
+            other => panic!("expected InvalidVar, got {other:?}"),
+        }
+
+        let err = parse_kernel_parts(Some("scanner,wallet")).expect_err("unknown part");
+        match err {
+            ChainIdentityError::InvalidVar { name, detail } => {
+                assert_eq!(name, KERNEL_PARTS_ENV);
+                assert!(
+                    detail.contains("wallet") && detail.contains("unknown"),
+                    "detail must name the bad token, got: {detail}"
+                );
+            }
+            other => panic!("expected InvalidVar, got {other:?}"),
+        }
+
+        let err = parse_kernel_parts(Some("scanner,scanner")).expect_err("dup");
+        match err {
+            ChainIdentityError::InvalidVar { name, detail } => {
+                assert_eq!(name, KERNEL_PARTS_ENV);
+                assert!(detail.contains("duplicate"), "got: {detail}");
+            }
+            other => panic!("expected InvalidVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_without_bootstrap_is_unavailable_not_invented() {
+        let err = resolve_chain_identity(
+            KernelNetwork::Regtest,
+            Digest32([0xC1; 32]),
+            Digest32([0xC2; 32]),
+            0,
+            XOnlyKey([0xB0; 32]),
+            test_ops(),
+            None,
+        )
+        .expect_err("no bootstrap → unavailable");
+        match err {
+            ChainIdentityError::BootstrapUnavailable { reason } => {
+                assert!(
+                    reason.contains("BMF1") || reason.contains("BootstrapManifest"),
+                    "reason must name the missing capability, got: {reason}"
+                );
+            }
+            other => panic!("expected BootstrapUnavailable, got {other:?}"),
+        }
+        // With a real (test) manifest, resolve succeeds and digests stick.
+        let id = resolve_chain_identity(
+            KernelNetwork::Regtest,
+            Digest32([0xC1; 32]),
+            Digest32([0xC2; 32]),
+            0,
+            XOnlyKey([0xB0; 32]),
+            test_ops(),
+            Some(test_bootstrap()),
+        )
+        .expect("bootstrap present");
+        assert_eq!(id.circuit_digest_c.0, [0xC1; 32]);
+        assert_eq!(id.circuit_digest_c_balance.0, [0xC2; 32]);
+    }
+
+    #[test]
+    fn missing_ops_env_from_process_names_variable() {
+        use std::sync::{Mutex, OnceLock};
+        fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+        }
+        let _guard = env_lock();
+        let keys = [
+            RELAY_URL_ENV,
+            BLOSSOM_URL_ENV,
+            MAX_BLOB_BYTES_ENV,
+            KERNEL_PARTS_ENV,
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in &keys {
+            std::env::remove_var(k);
+        }
+        let err = chain_identity_ops_from_env().expect_err("all unset");
+        match err {
+            ChainIdentityError::MissingVar { name } => {
+                assert!(
+                    keys.contains(&name),
+                    "must name one of the required vars, got {name}"
+                );
+            }
+            other => panic!("expected MissingVar, got {other:?}"),
+        }
+        // Restore.
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 }
