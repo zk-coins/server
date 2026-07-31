@@ -2,15 +2,21 @@
 #
 # Services are derived from the node bootstrap code, not from guesswork:
 #   - postgres:17  — state layer (node/src/test_db.rs with_tag("17"), README)
-#   - node         — Dockerfile + 0.0.0.0:4242 (node/src/main.rs ACCOUNT_NODE_ADDR)
+#   - bitcoind     — regtest RPC for Stage-3 NfLog scan + AggregateStateNullifierV3
+#                    publish (node/src/v1/scan.rs, node/src/v1/publish.rs)
+#   - node         — Dockerfile + 0.0.0.0:4242 REST + KERNEL_GRPC_ADDR gRPC
 #
-# Deliberately NOT included (see docs/local-stack.md):
-#   - zk-coins/api (parallel, not runnable yet)
-#   - bitcoind / electrs-Esplora (external; Stage-3 scanner is bitcoind RPC)
+# NOT a compose service (see docs/local-stack.md):
+#   - zk-coins/api — runnable, but that repo has no Dockerfile; start with
+#                    cargo run against the published kernel gRPC port
+#   - electrs / Esplora — still required by residual NETWORK_CONFIG +
+#                    /health/ready (lib.rs build_network_config_from_env,
+#                    router.rs check_esplora); not in this file
 #
 # No restart:always — a boot failure must stay visible.
 # No invented PUBLISHER_KEY / chain pins — compose fails at parse if missing.
 # No IS_MAINNET=true.
+# No latest-tag images.
 
 name: zkcoins-local
 
@@ -37,6 +43,46 @@ services:
       retries: 12
       start_period: 10s
 
+  bitcoind:
+    # Image pin: repo (CI, docs, tests) does not name a bitcoind version.
+    # Chosen: bitcoin/bitcoin:31.1 — multi-platform Debian image from the
+    # willcl-ark/bitcoin-core-docker line on Docker Hub (not `latest`),
+    # carrying Bitcoin Core 31.1 release binaries. Compatible with this
+    # tree's bitcoincore-rpc 0.19 client (node/Cargo.toml, script-plonky2).
+    # Regtest only — never mainnet.
+    image: bitcoin/bitcoin:31.1
+    command:
+      - -printtoconsole
+      - -regtest=1
+      - -server=1
+      - -txindex=1
+      - -rest=1
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -fallbackfee=0.0002
+    ports:
+      # Regtest JSON-RPC/REST (docs for bitcoin/bitcoin image; tests use :18443).
+      - "18443:18443"
+    volumes:
+      # Default datadir of the image: /home/bitcoin/.bitcoin
+      # Cookie (regtest): /home/bitcoin/.bitcoin/regtest/.cookie
+      - bitcoind_data:/home/bitcoin/.bitcoin
+    healthcheck:
+      # Cookie auth + RPC: bitcoin-cli reads the cookie from the datadir.
+      # Fails until bitcoind has written regtest/.cookie and answers RPC.
+      test:
+        [
+          "CMD",
+          "bitcoin-cli",
+          "-regtest",
+          "-datadir=/home/bitcoin/.bitcoin",
+          "getblockchaininfo",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
   node:
     build:
       context: .
@@ -44,17 +90,21 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      bitcoind:
+        condition: service_healthy
     ports:
       # Listener address is hard-coded: node/src/main.rs ACCOUNT_NODE_ADDR
       # "0.0.0.0:4242"; Dockerfile EXPOSE 4242.
       - "4242:4242"
+      # Kernel gRPC (KERNEL_GRPC_ADDR). Host-side zk-coins/api dials this.
+      - "50051:50051"
     volumes:
       - node_data:/data
-      # bitcoind cookie file (Stage-3 scanner + publisher cookie auth).
-      # Host path is mandatory; empty/missing aborts compose parse.
-      - type: bind
-        source: ${BITCOIND_COOKIE_HOST_PATH:?set BITCOIND_COOKIE_HOST_PATH to the host path of bitcoind .cookie}
-        target: /run/bitcoind/cookie
+      # Stage-3 scanner + publisher cookie auth (v1/scan.rs, v1/publish.rs).
+      # Same volume as bitcoind; cookie path matches regtest datadir layout.
+      - type: volume
+        source: bitcoind_data
+        target: /run/bitcoind-data
         read_only: true
     environment:
       # --- Postgres (internal compose network; matches postgres service) ---
@@ -95,17 +145,24 @@ services:
       ZKCOINS_BOOTSTRAP_PUBKEY: ${ZKCOINS_BOOTSTRAP_PUBKEY:?set ZKCOINS_BOOTSTRAP_PUBKEY (64 lowercase hex x-only)}
       ZKCOINS_EXPECTED_PARAMS_IDENTIFIER: ${ZKCOINS_EXPECTED_PARAMS_IDENTIFIER:?set ZKCOINS_EXPECTED_PARAMS_IDENTIFIER (SHA-256 of canonical network-params; see docs/local-stack.md)}
 
-      # Stage-3 scanner: bitcoind RPC only (node/src/v1/scan.rs
-      # v1_bitcoind_rpc_from_env). No fall-back to Esplora commitment scan.
-      ZKCOINS_V1_BITCOIND_RPC_URL: ${ZKCOINS_V1_BITCOIND_RPC_URL:?set ZKCOINS_V1_BITCOIND_RPC_URL e.g. http://host.docker.internal:18443}
-      ZKCOINS_V1_BITCOIND_COOKIE_PATH: /run/bitcoind/cookie
+      # Stage-3 scanner + publisher: bitcoind RPC only
+      # (node/src/v1/scan.rs v1_bitcoind_rpc_from_env;
+      #  node/src/v1/publish.rs v1_publisher_env_from_env).
+      # Production names (not the live-test ZKCOINS_REGTEST_* aliases):
+      #   URL form matches tests: http://host:18443 (no /wallet/… suffix)
+      #   cookie: path to .cookie file
+      #   wallet: loaded bitcoind wallet name
+      # Compose-internal service DNS — not host.docker.internal.
+      ZKCOINS_V1_BITCOIND_RPC_URL: http://bitcoind:18443
+      ZKCOINS_V1_BITCOIND_COOKIE_PATH: /run/bitcoind-data/regtest/.cookie
 
-      # Publisher wallet (required when resumable pending publishes exist or
-      # when exercising publish; incomplete env is logged and boot continues
-      # only if the pending table is empty — main.rs run_v1_scan_loop).
-      ZKCOINS_V1_BITCOIND_WALLET: ${ZKCOINS_V1_BITCOIND_WALLET:-}
-      ZKCOINS_V1_FEE_RATE_SAT_PER_VB: ${ZKCOINS_V1_FEE_RATE_SAT_PER_VB:-}
-      ZKCOINS_V1_REVEAL_OUTPUT_SATS: ${ZKCOINS_V1_REVEAL_OUTPUT_SATS:-}
+      # Publisher wallet + fee + reveal — required for a mint that reaches
+      # completed (finalise handoff runs construct/broadcast; boot also
+      # aborts if pending rows exist without these — main.rs).
+      # Wallet must already exist and be funded before publish (docs).
+      ZKCOINS_V1_BITCOIND_WALLET: ${ZKCOINS_V1_BITCOIND_WALLET:?set ZKCOINS_V1_BITCOIND_WALLET to a loaded bitcoind wallet name}
+      ZKCOINS_V1_FEE_RATE_SAT_PER_VB: ${ZKCOINS_V1_FEE_RATE_SAT_PER_VB:?set ZKCOINS_V1_FEE_RATE_SAT_PER_VB integer > 0}
+      ZKCOINS_V1_REVEAL_OUTPUT_SATS: ${ZKCOINS_V1_REVEAL_OUTPUT_SATS:?set ZKCOINS_V1_REVEAL_OUTPUT_SATS integer > 0}
 
       # Optional: comma-separated hosts for attest channel binding
       # (node/src/v1/attest.rs public_hosts_from_env — empty is OK, fails loud on use).
@@ -113,14 +170,17 @@ services:
 
       # GetInfo / ChainIdentity operational pins (node/src/kernel/chain.rs +
       # runtime::require_chain_identity_ops_from_env). No defaults — missing
-      # aborts at parse or binary edge. Does not invent a BootstrapManifest
-      # (§4.3 still fail-closed for GetInfo until a signed artifact loader exists).
-      ZKCOINS_RELAY_URL: ${ZKCOINS_RELAY_URL:?set ZKCOINS_RELAY_URL e.g. ws://host.docker.internal:7777}
-      ZKCOINS_BLOSSOM_URL: ${ZKCOINS_BLOSSOM_URL:?set ZKCOINS_BLOSSOM_URL e.g. http://host.docker.internal:3000}
-      ZKCOINS_MAX_BLOB_BYTES: ${ZKCOINS_MAX_BLOB_BYTES:?set ZKCOINS_MAX_BLOB_BYTES e.g. 1048576}
+      # aborts at parse or binary edge. Complete ChainIdentity still needs a
+      # signed §4.3 BootstrapManifest (not loadable yet) — GetInfo stays
+      # fail-closed until a signed artifact loader exists; jobs and
+      # GetNullifierPath do not require identity.
+      ZKCOINS_RELAY_URL: ${ZKCOINS_RELAY_URL:?set ZKCOINS_RELAY_URL (operator-chosen Nostr relay URL for this node)}
+      ZKCOINS_BLOSSOM_URL: ${ZKCOINS_BLOSSOM_URL:?set ZKCOINS_BLOSSOM_URL (operator-chosen Blossom base URL for this node)}
+      ZKCOINS_MAX_BLOB_BYTES: ${ZKCOINS_MAX_BLOB_BYTES:?set ZKCOINS_MAX_BLOB_BYTES integer > 0}
       ZKCOINS_KERNEL_PARTS: ${ZKCOINS_KERNEL_PARTS:?set ZKCOINS_KERNEL_PARTS e.g. scanner,prover,publisher}
 
       # Kernel gRPC bind (node/src/kernel_rpc.rs KERNEL_GRPC_ADDR — no default).
+      # Must be 0.0.0.0 so the host-side api can reach it via published 50051.
       KERNEL_GRPC_ADDR: ${KERNEL_GRPC_ADDR:?set KERNEL_GRPC_ADDR e.g. 0.0.0.0:50051}
 
       PROOFS_DIR: /data/proofs
@@ -133,9 +193,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 18
-      # Cold circuit construction + migrations can take tens of seconds.
+      # Cold circuit construction + migrations can take tens of seconds;
+      # first image build + first circuit build is much longer (see docs).
       start_period: 120s
 
 volumes:
   postgres_data:
   node_data:
+  bitcoind_data:
