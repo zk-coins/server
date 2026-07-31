@@ -25,7 +25,7 @@ use crate::kernel::access::{
 use crate::kernel::attestation::{self, AttestBalanceCommand, AttestBalanceDeps};
 use crate::kernel::bootstrap::{
     self as bootstrap, BundleProcedureDeps, BundleStore, ChallengeAction, ChallengeStore,
-    EntrustCommand, EntrustResult, IssuedChallenge, RevokeCommand, RevokeResult,
+    EntrustCommand, EntrustResult, IssuedChallenge, ManifestStore, RevokeCommand, RevokeResult,
 };
 use crate::kernel::chain;
 use crate::kernel::grants::{
@@ -80,6 +80,8 @@ pub(crate) struct KernelServiceConfig {
     pub challenges: Arc<ChallengeStore>,
     /// Process-local operational-bundle store (Block 8; no durable table yet).
     pub bundles: Arc<BundleStore>,
+    /// Optional verified §4.3 bootstrap manifest (BMF1 loader at boot).
+    pub manifests: Arc<ManifestStore>,
     /// Pull sessions (process-local; no durable table yet).
     pub sessions: Arc<SessionStore>,
     /// Private-record + account-state index (empty in-memory until catalog).
@@ -102,6 +104,8 @@ pub(crate) struct KernelService {
     challenges: Arc<ChallengeStore>,
     /// Process-local operational-bundle store (Block 8).
     bundles: Arc<BundleStore>,
+    /// Optional verified §4.3 bootstrap manifest (BMF1).
+    manifests: Arc<ManifestStore>,
     /// Pull sessions (process-local; no durable table yet).
     sessions: Arc<SessionStore>,
     /// Private-record + account-state index (empty in-memory until catalog).
@@ -119,6 +123,7 @@ impl KernelService {
             notify_map,
             challenges,
             bundles,
+            manifests,
             sessions,
             private_index,
             chain,
@@ -131,6 +136,7 @@ impl KernelService {
             notify_map,
             challenges,
             bundles,
+            manifests,
             sessions,
             private_index,
             chain,
@@ -148,6 +154,7 @@ impl KernelService {
             notify_map,
             challenges: ChallengeStore::shared(),
             bundles: BundleStore::shared(),
+            manifests: ManifestStore::shared(),
             sessions: SessionStore::shared(),
             private_index: InMemoryPrivateIndex::shared(),
             chain: ChainHandle::default(),
@@ -190,6 +197,7 @@ impl KernelService {
             notify_map,
             challenges,
             bundles: BundleStore::shared(),
+            manifests: ManifestStore::shared(),
             sessions: SessionStore::shared(),
             private_index: InMemoryPrivateIndex::shared(),
             chain,
@@ -202,11 +210,28 @@ impl KernelService {
         self
     }
 
+    /// Install the boot-time verified bootstrap-manifest store (or empty).
+    ///
+    /// Called from the REST/gRPC boot edge after the optional BMF1 load.
+    /// GetInfo mirroring of the manifest is **not** wired here — callers
+    /// use [`Self::manifest_store`] when they assemble `ChainIdentity`.
+    pub(crate) fn with_manifest_store(mut self, manifests: Arc<ManifestStore>) -> Self {
+        self.manifests = manifests;
+        self
+    }
+
     /// Private-record index handle for the production decrypt-index writer
     /// (when wired). Empty until a catalog exists; still reachable so the
     /// Arc field is not library-dead.
     pub(crate) fn private_record_index(&self) -> &Arc<InMemoryPrivateIndex> {
         &self.private_index
+    }
+
+    /// Verified bootstrap-manifest store for GetInfo / ChainIdentity wiring.
+    ///
+    /// Empty when `ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH` was unset at boot.
+    pub(crate) fn manifest_store(&self) -> &Arc<ManifestStore> {
+        &self.manifests
     }
 
     fn require_chain_view(&self) -> KernelResult<ChainView> {

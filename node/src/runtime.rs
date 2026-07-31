@@ -69,9 +69,10 @@ pub struct RestNodeConfig {
 ///
 /// Requires `ZKCOINS_RELAY_URL`, `ZKCOINS_BLOSSOM_URL`,
 /// `ZKCOINS_MAX_BLOB_BYTES`, `ZKCOINS_KERNEL_PARTS` — each non-empty, no
-/// defaults. A missing or invalid value names the variable. Does **not**
-/// load or invent a §4.3 `BootstrapManifest` (that remains the GetInfo
-/// fail-closed gap until a signed-artifact loader exists).
+/// defaults. A missing or invalid value names the variable. The optional
+/// `ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH` is validated later in
+/// [`start_rest_node`] (before any socket binds): unset is ok; set must
+/// fully verify under the pinned `bootstrap_pubkey`.
 ///
 /// Call before expensive bootstrap so a misconfigured deployment fails
 /// before circuit construction / DB work completes unused.
@@ -118,6 +119,70 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     // Publisher reject-reason vocabulary (§7.6 closed `reason` set).
     if let Err(e) = crate::kernel::publish::validate_closed_sets() {
         anyhow::bail!("kernel publish closed-set contract invalid: {e}");
+    }
+
+    // §4.3 / §7.7 BMF1 bootstrap manifest — optional path, fail-closed when set.
+    // Runs before any listener (gRPC or REST) so a bad/missing configured
+    // artifact never leaves a half-started node accepting traffic.
+    let manifest_store = {
+        use crate::kernel::bootstrap::{
+            bootstrap_manifest_path_from_env, load_manifest_store, LoadBootstrapManifestConfig,
+            ManifestStore, BOOTSTRAP_MANIFEST_PATH_ENV,
+        };
+        use shared::spec_v1::ManifestClock;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let path_env = bootstrap_manifest_path_from_env().map_err(|e| anyhow::anyhow!("{e}"))?;
+        match path_env {
+            None => ManifestStore::shared(),
+            Some(path) => {
+                // Path set ⇒ need the frozen §3.6 pin to verify under.
+                let pins = crate::v1::mode::v1_boot_pins_from_env().map_err(|e| {
+                    anyhow::anyhow!(
+                        "{BOOTSTRAP_MANIFEST_PATH_ENV} is set but network pins are \
+                         unavailable for verification: {e}"
+                    )
+                })?;
+                let pinned = pins.network_params.bootstrap_pubkey();
+                let expected_network = crate::v1::mode::network_label(pins.network);
+                let clock = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                    Ok(d) => ManifestClock::UnixSeconds(d.as_secs()),
+                    // Clock before epoch is unusable for expiry — skip only
+                    // that check (signature + network still enforced).
+                    Err(_) => ManifestClock::Unavailable,
+                };
+                load_manifest_store(LoadBootstrapManifestConfig {
+                    path_env: Some(path.as_str()),
+                    pinned_bootstrap_pubkey: &pinned,
+                    expected_network,
+                    clock,
+                })
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            }
+        }
+    };
+    if let Some(v) = manifest_store.get() {
+        // Field accessors stay library-reachable for later GetInfo wiring.
+        let m = v.manifest();
+        tracing::info!(
+            manifest_id = %hex::encode(v.manifest_id()),
+            network = %v.network(),
+            protocol_version = %v.protocol_version(),
+            issued_at = v.issued_at(),
+            expires_at = v.expires_at(),
+            seed_relays = v.seed_relays().len(),
+            blob_stores = v.blob_stores().len(),
+            operator_ids = v.operator_ids().len(),
+            // seed_relays is non-empty after verify (≥ 1).
+            first_seed_relay = %m.seed_relays[0],
+            manifest_sig_len = v.manifest_sig().len(),
+            "verified BootstrapManifestV1 loaded"
+        );
+    } else {
+        tracing::info!(
+            "no BootstrapManifest configured ({} unset) — store empty",
+            crate::kernel::bootstrap::BOOTSTRAP_MANIFEST_PATH_ENV
+        );
     }
 
     let socket_addr = addr
@@ -333,7 +398,8 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             Arc::clone(&job_notify_map),
             Arc::clone(&state.pending_sign_map),
             Arc::clone(&state.attest_challenges),
-        );
+        )
+        .with_manifest_store(Arc::clone(&manifest_store));
         // Block 7 access surfaces (process-local until a durable
         // decrypt-index exists). Empty in-memory index is an installed
         // surface, not a missing one. Logging the Arc strong-count keeps
@@ -341,6 +407,8 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         // SubscribeReceipts stays Unimplemented (no credit writer yet).
         tracing::info!(
             private_index_refs = Arc::strong_count(domain.private_record_index()),
+            bootstrap_manifest_refs = Arc::strong_count(domain.manifest_store()),
+            bootstrap_manifest_loaded = domain.manifest_store().is_loaded(),
             "kernel access surfaces installed (Pull/Records; in-memory empty)"
         );
         if let Some(engine) = v1_engine.as_ref() {
@@ -383,11 +451,12 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             let digest_b = Digest32(pins.network_params.circuit_digest_c_balance());
             let bootstrap_pubkey = XOnlyKey(pins.network_params.bootstrap_pubkey());
 
-            // BootstrapManifest (§4.3): no BMF1 loader / no signed artifact
-            // source in this tree — do not invent. Operational ops stay
-            // validated; identity stays None so GetInfo remains fail-closed
-            // until a real signed manifest can be loaded into
-            // `resolve_chain_identity(..., Some(manifest))`.
+            // BootstrapManifest (§4.3): BMF1 loader may have installed a
+            // verified copy on `manifest_store`. ChainIdentity / GetInfo
+            // mirroring is intentionally **not** wired here (parallel
+            // work on `chain.rs`). Operational ops stay validated;
+            // identity stays None so GetInfo remains fail-closed until
+            // that wiring uses `domain.manifest_store().get()`.
             let identity = match resolve_chain_identity(
                 network,
                 digest_c,

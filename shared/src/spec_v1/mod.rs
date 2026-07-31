@@ -9,6 +9,7 @@
 //! `zkcoins_program::types`.
 
 pub mod accumulator;
+pub mod bootstrap_manifest;
 pub mod coinhist;
 pub mod datastructures;
 pub mod encoding;
@@ -33,6 +34,12 @@ pub use accumulator::{
     ChainPosition, FoldOutcome, LookupResult, NfLogAccumulator, PublishedNullifier,
     SpendClassification,
 };
+pub use bootstrap_manifest::{
+    bootstrap_message, deserialize as deserialize_bootstrap_manifest, manifest_id,
+    serialize as serialize_bootstrap_manifest, verify_bootstrap_manifest, BootstrapManifestV1,
+    ManifestClock, VerifyBootstrapManifest, BMF1_MAGIC, BMF1_VERSION, BOOTSTRAP_PROTOCOL_VERSION,
+    MAX_BOOTSTRAP_URL_LEN,
+};
 pub use coinhist::{
     coinhist_empty_root, coinhist_empty_subtree_roots, coinhist_leaf_hash, coinhist_node_hash,
     coinhist_root_after_first_insert, CoinHistProof, CoinHistState, CoinHistTree,
@@ -46,6 +53,7 @@ pub use encoding::{
     hc, HcInput, MAX_BYTE_STRING_LEN, MAX_SMALL_NUMERIC,
 };
 pub use error::SpecError;
+pub use error::{BootstrapStringField, BootstrapUrlKind};
 pub use hashes::{
     account_state_hash, address, asset_id_v1, asset_id_v2, coin_identifier, derive_nav_rand,
     detect_tag, hash_proof_data, hkdf_sha256, name_consent_preimage, name_hash, name_message,

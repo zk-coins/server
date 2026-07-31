@@ -95,6 +95,90 @@ pub enum SpecError {
     },
     /// `coinhist_node_hash` level is outside the domain `0..=256`.
     CoinHistLevelOutOfRange { level: u32 },
+
+    // --- BootstrapManifestV1 (BMF1) decode / verify (§4.3 / §7.7) ---
+    /// Wire magic is not ASCII `"BMF1"`.
+    BootstrapMagicInvalid { got: [u8; 4] },
+    /// Wire version byte is not `0x01`.
+    BootstrapVersionInvalid { got: u8 },
+    /// `seed_relay_count == 0` (must be ≥ 1).
+    BootstrapSeedRelayCountZero,
+    /// `blob_store_count == 0` (must be ≥ 1).
+    BootstrapBlobStoreCountZero,
+    /// `operator_id_count == 0` (must be ≥ 1).
+    BootstrapOperatorIdCountZero,
+    /// A URL length prefix is 0.
+    BootstrapUrlEmpty {
+        which: BootstrapUrlKind,
+        index: usize,
+    },
+    /// A URL length exceeds the 2048-byte bound.
+    BootstrapUrlTooLong {
+        which: BootstrapUrlKind,
+        index: usize,
+        len: usize,
+    },
+    /// Input ended before a fixed-width or length-prefixed field could be read.
+    BootstrapTruncated {
+        context: &'static str,
+        needed: usize,
+        remaining: usize,
+    },
+    /// Bytes remain after a complete BMF1 frame.
+    BootstrapTrailingBytes { remaining: usize },
+    /// A length-prefixed string field is not valid UTF-8.
+    BootstrapInvalidUtf8 {
+        field: BootstrapStringField,
+        error: String,
+    },
+    /// `protocol_version` is not exactly `"v1"`.
+    BootstrapProtocolVersionInvalid { got: String },
+    /// BIP-340 verification of `manifest_sig` under the pinned key failed.
+    BootstrapSignatureInvalid,
+    /// Decoded `network` does not match the verifier's network.
+    BootstrapNetworkMismatch { expected: String, actual: String },
+    /// Decoded `protocol_version` does not match the verifier's version.
+    BootstrapProtocolVersionMismatch { expected: String, actual: String },
+    /// `expires_at < now` under a provided wall clock.
+    BootstrapExpired { expires_at: u64, now: u64 },
+    /// `issued_at > expires_at` — degenerate lifetime (rejected structurally).
+    BootstrapIssuedAfterExpiry { issued_at: u64, expires_at: u64 },
+}
+
+/// Which bootstrap URL list a length/UTF-8 error refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapUrlKind {
+    SeedRelay,
+    BlobStore,
+}
+
+impl fmt::Display for BootstrapUrlKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SeedRelay => f.write_str("seed_relay"),
+            Self::BlobStore => f.write_str("blob_store"),
+        }
+    }
+}
+
+/// Which length-prefixed UTF-8 field failed to decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapStringField {
+    Network,
+    ProtocolVersion,
+    SeedRelay { index: usize },
+    BlobStore { index: usize },
+}
+
+impl fmt::Display for BootstrapStringField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Network => f.write_str("network"),
+            Self::ProtocolVersion => f.write_str("protocol_version"),
+            Self::SeedRelay { index } => write!(f, "seed_relays[{index}]"),
+            Self::BlobStore { index } => write!(f, "blob_stores[{index}]"),
+        }
+    }
 }
 
 impl fmt::Display for SpecError {
@@ -257,6 +341,83 @@ impl fmt::Display for SpecError {
             SpecError::CoinHistLevelOutOfRange { level } => write!(
                 f,
                 "coin-history node level out of range: {level} (must be <= 256)"
+            ),
+            SpecError::BootstrapMagicInvalid { got } => write!(
+                f,
+                "bootstrap manifest magic invalid: got {:?} (expected ASCII \"BMF1\")",
+                String::from_utf8_lossy(got)
+            ),
+            SpecError::BootstrapVersionInvalid { got } => write!(
+                f,
+                "bootstrap manifest version invalid: 0x{got:02x} (expected 0x01)"
+            ),
+            SpecError::BootstrapSeedRelayCountZero => {
+                write!(f, "bootstrap manifest seed_relay_count is 0 (must be >= 1)")
+            }
+            SpecError::BootstrapBlobStoreCountZero => {
+                write!(f, "bootstrap manifest blob_store_count is 0 (must be >= 1)")
+            }
+            SpecError::BootstrapOperatorIdCountZero => {
+                write!(
+                    f,
+                    "bootstrap manifest operator_id_count is 0 (must be >= 1)"
+                )
+            }
+            SpecError::BootstrapUrlEmpty { which, index } => {
+                write!(f, "bootstrap manifest {which} URL at index {index} is empty")
+            }
+            SpecError::BootstrapUrlTooLong {
+                which,
+                index,
+                len,
+            } => write!(
+                f,
+                "bootstrap manifest {which} URL at index {index} is {len} bytes (max 2048)"
+            ),
+            SpecError::BootstrapTruncated {
+                context,
+                needed,
+                remaining,
+            } => write!(
+                f,
+                "bootstrap manifest truncated at {context}: needed {needed} bytes, have {remaining}"
+            ),
+            SpecError::BootstrapTrailingBytes { remaining } => write!(
+                f,
+                "bootstrap manifest has {remaining} trailing byte(s) after a complete frame"
+            ),
+            SpecError::BootstrapInvalidUtf8 { field, error } => {
+                write!(f, "bootstrap manifest {field} is not valid UTF-8: {error}")
+            }
+            SpecError::BootstrapProtocolVersionInvalid { got } => write!(
+                f,
+                "bootstrap manifest protocol_version {got:?} is not exactly \"v1\""
+            ),
+            SpecError::BootstrapSignatureInvalid => {
+                write!(
+                    f,
+                    "bootstrap manifest signature does not verify under the pinned bootstrap_pubkey"
+                )
+            }
+            SpecError::BootstrapNetworkMismatch { expected, actual } => write!(
+                f,
+                "bootstrap manifest network {actual:?} does not match verifier network {expected:?}"
+            ),
+            SpecError::BootstrapProtocolVersionMismatch { expected, actual } => write!(
+                f,
+                "bootstrap manifest protocol_version {actual:?} does not match verifier {expected:?}"
+            ),
+            SpecError::BootstrapExpired { expires_at, now } => write!(
+                f,
+                "bootstrap manifest expired: expires_at={expires_at} < now={now}"
+            ),
+            SpecError::BootstrapIssuedAfterExpiry {
+                issued_at,
+                expires_at,
+            } => write!(
+                f,
+                "bootstrap manifest issued_at={issued_at} is after expires_at={expires_at} \
+                 (degenerate lifetime)"
             ),
         }
     }

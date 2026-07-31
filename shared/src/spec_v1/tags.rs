@@ -57,5 +57,9 @@ pub const TAG_NPK_COMMIT: &[u8] = b"zkCoins/v1/NpkCommit";
 /// `name_message = SHA256(TAG_NAME_CONSENT ‖ network ‖ u32-be(name_len) ‖ UTF-8(name) ‖ op_pubkey)`.
 pub const TAG_NAME_CONSENT: &[u8] = b"zkCoins/v1/NameConsent";
 
+/// Raw ASCII domain for §4.3 / §7.7 bootstrap manifest signature preimage:
+/// `bootstrap_message = SHA-256(TAG_BOOTSTRAP_MANIFEST ‖ <framed body network…expires_at>)`.
+pub const TAG_BOOTSTRAP_MANIFEST: &[u8] = b"zkCoins/v1/BootstrapManifest";
+
 /// Bech32m HRP for addresses (§1.7.7).
 pub const ADDRESS_HRP: &str = "zk";

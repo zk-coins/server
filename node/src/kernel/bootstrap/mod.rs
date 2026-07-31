@@ -1,11 +1,13 @@
 //! Bootstrap-family kernel operations.
 //!
 //! Shared action-bound challenge store (Pull / AttestBalance / IssueViewGrant /
-//! Entrust / Revoke) and the process-local operational-bundle store for
-//! `EntrustOperationalBundle` / `RevokeOperationalBundle` (§7.7 / §7.8).
+//! Entrust / Revoke), the process-local operational-bundle store for
+//! `EntrustOperationalBundle` / `RevokeOperationalBundle` (§7.7 / §7.8), and
+//! the verifying BMF1 bootstrap-manifest loader (§4.3 / §7.7).
 
 pub(crate) mod bundle;
 pub(crate) mod challenges;
+pub(crate) mod manifest;
 
 /// Crate-private bootstrap façade re-exports.
 ///
@@ -22,4 +24,8 @@ pub(crate) use bundle::{
 };
 pub(crate) use challenges::{
     ChallengeAction, ChallengeConsumeError, ChallengeStore, IssuedChallenge, RedeemedPullChallenge,
+};
+pub(crate) use manifest::{
+    bootstrap_manifest_path_from_env, load_manifest_store, LoadBootstrapManifestConfig,
+    ManifestStore, BOOTSTRAP_MANIFEST_PATH_ENV,
 };
