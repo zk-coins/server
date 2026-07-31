@@ -3105,6 +3105,7 @@ mod tests {
             fold_seq: 0,
             nflog: Vec::new(),
             accounts: Vec::new(),
+            inscriptions: Vec::new(),
         };
         let proved = TransitionSignature {
             pk_i: [1u8; 32],
@@ -3152,6 +3153,7 @@ mod tests {
             fold_seq: 0,
             nflog: Vec::new(),
             accounts: Vec::new(),
+            inscriptions: Vec::new(),
         };
         let sig = TransitionSignature {
             pk_i: [1u8; 32],

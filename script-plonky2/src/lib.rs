@@ -32,7 +32,16 @@
 //!   `pub(crate)`.
 //! - [`scanner`] — production `Scanner` / config / report types used by
 //!   the node binary. Free helpers and test/fault-injection hooks are
-//!   `pub(crate)`.
+//!   `pub(crate)`. Catalog edge required by the node crate (cross-crate;
+//!   `pub(crate)` cannot span the boundary):
+//!   - [`scanner::ScannedInscription`] (+ its fields) — accepted
+//!     inscription after §3.6 steps 1–3; node maps it into the durable
+//!     catalog (`CatalogInscription::from_scanned`) and ListInscriptions.
+//!     Fields are the minimal set the node reads (height/tx/vin,
+//!     reveal_txid, format, members, block_anchor); no extra accessors.
+//!   - [`scanner::Scanner::accepted_inscriptions`] — read the post-scan
+//!     accepted stream (including first-occurrence losers the NfLog
+//!     ignores) so the node can fold catalog + NfLog in one apply.
 //! - [`half_agg`] — production half-aggregation edge (untouched this round).
 //! - [`circuit_identity`] — `require_live_digests_match_pins` (node boot
 //!   canary). `require_one_live_digest_matches_pin` is `pub(crate)`.

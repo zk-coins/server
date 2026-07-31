@@ -290,6 +290,38 @@ pub struct DuplicateNullifier {
     pub winner_position: ChainPosition,
 }
 
+/// One accepted inscription after §3.6 steps 1–3 (envelope, parse, anchor,
+/// signatures). Catalog material — distinct from NfLog fold winners.
+///
+/// Members include **every** verified `(Pkⱼ, Rⱼ)` of the payload, including
+/// later first-occurrence losers. The catalog describes what was inscribed;
+/// the NfLog describes what won. Rejected inputs stay in
+/// [`RejectedInscription`] and never become a [`ScannedInscription`].
+///
+/// # Reveal txid byte order
+///
+/// `reveal_txid` is **internal / consensus byte order** — the 32 bytes of
+/// [`bitcoin::Txid::to_byte_array`], identical to the on-wire internal order
+/// required by §7.8 `Inscription.txid`. This is **not** the reversed
+/// display / RPC / explorer order produced by `Txid`'s `Display` impl.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannedInscription {
+    /// Inclusion block height.
+    pub height: u64,
+    /// Transaction index within the block.
+    pub tx_index: u32,
+    /// Reveal-input index within the transaction.
+    pub vin_index: u32,
+    /// Reveal transaction id, internal byte order (see type docs).
+    pub reveal_txid: [u8; 32],
+    /// §3.5 `format` byte from the payload (`0x00` raw / `0x01` half-agg).
+    pub format: u8,
+    /// Verified `(Pkⱼ, Rⱼ)` pairs in payload member order.
+    pub members: Vec<([u8; 32], [u8; 32])>,
+    /// Freshness anchor from the payload (§3.5 / §3.9).
+    pub block_anchor: BlockAnchor,
+}
+
 /// Result of scanning a single confirmed block.
 #[derive(Clone, Debug)]
 pub struct BlockScanResult {
@@ -352,6 +384,9 @@ pub struct Scanner {
     /// All signature-verified, bound-checked nullifiers in canonical order
     /// (including first-occurrence losers). Input for [`NfLogAccumulator::reorg_replay`].
     survivors: Vec<PublishedNullifier>,
+    /// Accepted inscriptions (steps 1–3) in scan order — including members
+    /// that later lose first-occurrence fold. Truncated with survivors on reorg.
+    accepted_inscriptions: Vec<ScannedInscription>,
     /// First-occurrence winner position per `Pk` among `survivors`.
     ///
     /// Maintained alongside `survivors` so duplicate handling is **O(1)** per
@@ -516,6 +551,7 @@ impl Scanner {
             config,
             accumulator,
             survivors: Vec::new(),
+            accepted_inscriptions: Vec::new(),
             winner_by_pk: HashMap::new(),
             scanned_through: None,
             scanned_blocks: BTreeMap::new(),
@@ -814,6 +850,14 @@ impl Scanner {
     /// (including first-occurrence losers). Suitable as the reorg-replay stream.
     pub fn survivors(&self) -> &[PublishedNullifier] {
         &self.survivors
+    }
+
+    /// Accepted inscriptions (steps 1–3), including first-occurrence losers.
+    ///
+    /// Ordered by `(height, tx_index, vin_index)`. Truncated on reorg to the
+    /// common ancestor together with [`Self::survivors`].
+    pub fn accepted_inscriptions(&self) -> &[ScannedInscription] {
+        &self.accepted_inscriptions
     }
 
     /// Scanner configuration (network, activation height, …).
@@ -1218,11 +1262,27 @@ enum LinkedFetchOutcome {
     ChainBroken,
 }
 
+/// Pre-fold result of §3.6 steps 1–3 on one already-loaded block.
+///
+/// Named fields (not a 4-tuple) so call sites read without position
+/// memory and a later fifth value does not break every destructure.
+struct CollectedBlockContents {
+    /// Signature-verified members in canonical order (including later fold losers).
+    verified: Vec<PublishedNullifier>,
+    /// Inscriptions that passed steps 1–3 — catalog material, losers included.
+    accepted: Vec<ScannedInscription>,
+    /// Rejections with reasons — never silently dropped.
+    rejected: Vec<RejectedInscription>,
+    /// Envelopes seen before validation (successful extract + marker-looking errors).
+    inscriptions_seen: usize,
+}
+
 /// Collected replacement-block data before the reorg path mutates scanner state.
 struct CollectedBlock {
     height: u64,
     block_hash: BlockHash,
     verified: Vec<PublishedNullifier>,
+    accepted: Vec<ScannedInscription>,
     rejected: Vec<RejectedInscription>,
     inscriptions_seen: usize,
 }
@@ -1327,6 +1387,15 @@ impl Scanner {
                     .collect(),
                 None => Vec::new(),
             };
+            let retained_inscriptions: Vec<ScannedInscription> = match fork_height {
+                Some(fork) => self
+                    .accepted_inscriptions
+                    .iter()
+                    .filter(|ins| ins.height <= fork)
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            };
 
             let rescan_from = match fork_height {
                 Some(fork) => fork.checked_add(1).context("fork height + 1 overflowed")?,
@@ -1359,15 +1428,16 @@ impl Scanner {
                             break;
                         }
                         LinkedFetchOutcome::Linked(fetch) => {
-                            let (verified, rejected, inscriptions_seen) =
+                            let contents =
                                 self.collect_block_nullifiers_from(height, &fetch.block)?;
                             expected_prev = Some(fetch.block_hash);
                             collected.push(CollectedBlock {
                                 height: fetch.height,
                                 block_hash: fetch.block_hash,
-                                verified,
-                                rejected,
-                                inscriptions_seen,
+                                verified: contents.verified,
+                                accepted: contents.accepted,
+                                rejected: contents.rejected,
+                                inscriptions_seen: contents.inscriptions_seen,
                             });
                         }
                     }
@@ -1392,12 +1462,16 @@ impl Scanner {
             // ── APPLY (single atomic step after full collection succeeded) ─
             // Ancestor-walk cache already cleared at reorg detection (Finding 1).
 
-            // 1–3: retain survivors, replay retained stream, rebuild winner index.
+            // 1–3: retain survivors + accepted inscriptions, replay retained
+            // stream, rebuild winner index. Catalog and NfLog survivors share
+            // the same ancestor cut — an inscription above the fork would
+            // describe a chain that no longer exists.
             let outcome = self
                 .accumulator
                 .reorg_replay(old_tip_height, retained.clone())
                 .map_err(|e| anyhow!("accumulator reorg_replay failed: {e}"))?;
             self.survivors = retained;
+            self.accepted_inscriptions = retained_inscriptions;
             self.rebuild_winner_index();
 
             // 4: truncate checkpoints and verified-chain history to fork.
@@ -1416,11 +1490,13 @@ impl Scanner {
                 None => None,
             };
 
-            // 5: fold each collected block (real admissions / duplicates).
+            // 5: fold each collected block (real admissions / duplicates) and
+            // append its accepted inscriptions to the catalog stream.
             let mut block_reports = Vec::new();
             for block in collected {
                 let (admitted, duplicates, duplicate_details) =
                     self.fold_verified_nullifiers(&block.verified)?;
+                self.accepted_inscriptions.extend(block.accepted);
                 self.scanned_blocks.insert(block.height, block.block_hash);
                 self.scanned_through = Some((block.height, block.block_hash));
                 self.record_verified_block(block.height, block.block_hash);
@@ -1618,10 +1694,11 @@ impl Scanner {
         block_hash: BlockHash,
         block: &Block,
     ) -> Result<BlockScanResult> {
-        let (verified, rejected, inscriptions_seen) =
-            self.collect_block_nullifiers_from(height, block)?;
+        let contents = self.collect_block_nullifiers_from(height, block)?;
 
-        let (admitted, duplicates, duplicate_details) = self.fold_verified_nullifiers(&verified)?;
+        let (admitted, duplicates, duplicate_details) =
+            self.fold_verified_nullifiers(&contents.verified)?;
+        self.accepted_inscriptions.extend(contents.accepted);
 
         self.scanned_blocks.insert(height, block_hash);
         self.scanned_through = Some((height, block_hash));
@@ -1645,8 +1722,8 @@ impl Scanner {
         Ok(BlockScanResult {
             height,
             block_hash,
-            inscriptions_seen,
-            rejected,
+            inscriptions_seen: contents.inscriptions_seen,
+            rejected: contents.rejected,
             admitted,
             duplicates,
             duplicate_details,
@@ -1679,11 +1756,14 @@ impl Scanner {
     }
 
     /// Discover → parse/bound-check → verify against an already-loaded block.
+    ///
+    /// Accepted inscriptions are those that passed steps 1–3; their members
+    /// are exactly the rows pushed into [`CollectedBlockContents::verified`].
     fn collect_block_nullifiers_from(
         &mut self,
         height: u64,
         block: &Block,
-    ) -> Result<(Vec<PublishedNullifier>, Vec<RejectedInscription>, usize)> {
+    ) -> Result<CollectedBlockContents> {
         ensure!(
             height >= self.config.activation_height,
             "collect_block_nullifiers_from called below activation_height \
@@ -1696,12 +1776,16 @@ impl Scanner {
         let inclusion_hash = block.block_hash();
 
         let mut verified = Vec::new();
+        let mut accepted = Vec::new();
         let mut rejected = Vec::new();
         let mut inscriptions_seen = 0usize;
 
         for (tx_index_usize, tx) in block.txdata.iter().enumerate() {
             let tx_index = u32::try_from(tx_index_usize)
                 .with_context(|| format!("tx_index {tx_index_usize} does not fit in u32"))?;
+            // Internal / consensus byte order (§7.8 Inscription.txid).
+            // Display of Txid is the reversed explorer order — never store that.
+            let reveal_txid = tx.compute_txid().to_byte_array();
 
             for (vin_index_usize, input) in tx.input.iter().enumerate() {
                 let vin_index = u32::try_from(vin_index_usize)
@@ -1790,6 +1874,18 @@ impl Scanner {
                     continue;
                 }
 
+                // Accepted inscription: steps 1–3 passed. Emit catalog row
+                // before expanding members so losers stay on the catalog.
+                accepted.push(ScannedInscription {
+                    height,
+                    tx_index,
+                    vin_index,
+                    reveal_txid,
+                    format: agg.format,
+                    members: agg.members.clone(),
+                    block_anchor: agg.block_anchor,
+                });
+
                 // §3.6 step 4 — Order: build ChainPosition per member.
                 for (member_index_usize, (pk, r)) in agg.members.iter().enumerate() {
                     let member_index = u32::try_from(member_index_usize).with_context(|| {
@@ -1812,7 +1908,12 @@ impl Scanner {
         // Canonical order within the block is already (tx_index, vin_index,
         // member_index) from the nested loops. Do not re-sort defensively —
         // an ordering bug must surface as OutOfOrderFold, not be hidden.
-        Ok((verified, rejected, inscriptions_seen))
+        Ok(CollectedBlockContents {
+            verified,
+            accepted,
+            rejected,
+            inscriptions_seen,
+        })
     }
 
     /// §3.5 `block_anchor` bound against the **inclusion block's own ancestry**.
@@ -2644,6 +2745,7 @@ mod tests {
             },
             accumulator: NfLogAccumulator::new(0),
             survivors: Vec::new(),
+            accepted_inscriptions: Vec::new(),
             winner_by_pk: HashMap::new(),
             scanned_through: None,
             scanned_blocks: BTreeMap::new(),
@@ -2722,6 +2824,89 @@ mod tests {
         }
     }
 
+    /// §7.8 / catalog: reveal txid is internal byte order, not Display order.
+    ///
+    /// A non-palindromic 32-byte sequence makes internal and reversed forms
+    /// differ — storing Display would silently pass every test that only
+    /// checks "looks like a 32-byte txid".
+    #[test]
+    fn reveal_txid_internal_order_differs_from_display_order() {
+        let mut internal = [0u8; 32];
+        for (i, b) in internal.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let txid = Txid::from_byte_array(internal);
+        let stored = txid.to_byte_array();
+        assert_eq!(
+            stored, internal,
+            "Txid::to_byte_array must be the internal/consensus order we persist"
+        );
+        let mut reversed = internal;
+        reversed.reverse();
+        assert_ne!(
+            stored, reversed,
+            "fixture must distinguish internal from reversed Display order"
+        );
+        // Display hex is the reversed bytes (RPC/explorer convention).
+        let display = txid.to_string();
+        let mut display_bytes = [0u8; 32];
+        assert_eq!(display.len(), 64, "txid Display is 64 lower-hex chars");
+        for (i, slot) in display_bytes.iter_mut().enumerate() {
+            let hex_byte = &display[i * 2..i * 2 + 2];
+            *slot = u8::from_str_radix(hex_byte, 16).expect("hex");
+        }
+        assert_eq!(
+            display_bytes, reversed,
+            "Display must be the reversed explorer order"
+        );
+        // Catalog stores `to_byte_array`, never the Display-decoded form.
+        let catalog_field = ScannedInscription {
+            height: 1,
+            tx_index: 0,
+            vin_index: 0,
+            reveal_txid: stored,
+            format: FORMAT_RAW,
+            members: vec![([1u8; 32], [2u8; 32])],
+            block_anchor: BlockAnchor {
+                block_hash: [0u8; 32],
+                height: 0,
+            },
+        };
+        assert_eq!(catalog_field.reveal_txid, internal);
+        assert_ne!(catalog_field.reveal_txid, reversed);
+    }
+
+    /// format is the payload byte, not a function of member count.
+    #[test]
+    fn scanned_inscription_format_is_payload_byte_not_member_count() {
+        // Half-agg with one member is still 0x01; raw is always 0x00 with one.
+        let half_one = ScannedInscription {
+            height: 10,
+            tx_index: 1,
+            vin_index: 2,
+            reveal_txid: [0x11; 32],
+            format: FORMAT_HALF_AGG,
+            members: vec![([0xAAu8; 32], [0xBBu8; 32])],
+            block_anchor: BlockAnchor::default(),
+        };
+        let raw_one = ScannedInscription {
+            height: 10,
+            tx_index: 1,
+            vin_index: 3,
+            reveal_txid: [0x22; 32],
+            format: FORMAT_RAW,
+            members: vec![([0xCCu8; 32], [0xDDu8; 32])],
+            block_anchor: BlockAnchor::default(),
+        };
+        assert_eq!(half_one.format, 0x01);
+        assert_eq!(raw_one.format, 0x00);
+        assert_eq!(half_one.members.len(), raw_one.members.len());
+        assert_ne!(
+            half_one.format, raw_one.format,
+            "same member count must not collapse format"
+        );
+    }
+
     /// F2: walk cache retains at most `ANCESTOR_WALK_CACHE_CAPACITY` maps.
     #[test]
     fn ancestor_walk_cache_honours_capacity_bound() {
@@ -2744,6 +2929,7 @@ mod tests {
             },
             accumulator: NfLogAccumulator::new(0),
             survivors: Vec::new(),
+            accepted_inscriptions: Vec::new(),
             winner_by_pk: HashMap::new(),
             scanned_through: None,
             scanned_blocks: BTreeMap::new(),
@@ -2811,6 +2997,7 @@ mod tests {
             },
             accumulator: NfLogAccumulator::new(0),
             survivors: Vec::new(),
+            accepted_inscriptions: Vec::new(),
             winner_by_pk: HashMap::new(),
             scanned_through: None,
             scanned_blocks: BTreeMap::new(),

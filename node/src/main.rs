@@ -617,6 +617,11 @@ async fn run_v1_scan_loop(
             .ok_or("v1.1 scanner has no scanned_through tip after successful scan_to_tip")?;
         let tip_height = tip.0;
         let tip_hash = tip.1.to_byte_array();
+        // Scanner streams only: accepted inscriptions + survivors. Expansion
+        // and coupling live inside apply_canonical_survivors /
+        // apply_forward_scan (immediately before mutate) so a second caller
+        // cannot skip them. The binary does not re-derive the fold source.
+        let accepted_inscriptions = scanner.accepted_inscriptions().to_vec();
         let survivors = scanner.survivors().to_vec();
 
         // —— Boot observation unit: bind recon to THIS scan's tip ——
@@ -814,10 +819,18 @@ async fn run_v1_scan_loop(
 
         let do_full_replace = force_full_replace;
         if do_full_replace {
-            // Full replace: scanner survivors are the canonical stream.
-            let stats = v1::apply_canonical_survivors(&adapter, tip_height, tip_hash, &survivors)
-                .await
-                .map_err(|e| format!("v1.1 reorg/full-replace NfLog apply failed: {e:#}"))?;
+            // Full replace: scanner survivors + accepted inscriptions are the
+            // canonical streams (catalog carries losers NfLog ignores).
+            // Expansion + coupling run inside apply (sole fold source).
+            let stats = v1::apply_canonical_survivors(
+                &adapter,
+                tip_height,
+                tip_hash,
+                &survivors,
+                &accepted_inscriptions,
+            )
+            .await
+            .map_err(|e| format!("v1.1 reorg/full-replace NfLog apply failed: {e:#}"))?;
             folded_keys.clear();
             for nf in &survivors {
                 folded_keys.insert((
@@ -833,24 +846,29 @@ async fn run_v1_scan_loop(
                 tip_height, tip.1, stats.appended, stats.duplicate_ignored
             );
         } else {
-            let new: Vec<_> = survivors
-                .iter()
-                .copied()
-                .filter(|nf| {
-                    !folded_keys.contains(&(
-                        nf.chain_pos.height,
-                        nf.chain_pos.tx_index,
-                        nf.chain_pos.vin_index,
-                        nf.chain_pos.member_index,
-                        nf.pk,
-                    ))
-                })
-                .collect();
-            if !new.is_empty() || tip_height > adapter.with_engine(|e| e.tip_height()) {
-                let stats = v1::apply_forward_scan(&adapter, tip_height, tip_hash, &new)
-                    .await
-                    .map_err(|e| format!("v1.1 forward NfLog apply failed: {e:#}"))?;
-                for nf in &new {
+            // Gate only: apply_forward_scan owns expansion, coupling, and the
+            // fold delta against `folded_keys`. Catalog delta is crate-private.
+            let has_new = survivors.iter().any(|nf| {
+                !folded_keys.contains(&(
+                    nf.chain_pos.height,
+                    nf.chain_pos.tx_index,
+                    nf.chain_pos.vin_index,
+                    nf.chain_pos.member_index,
+                    nf.pk,
+                ))
+            });
+            if has_new || tip_height > adapter.with_engine(|e| e.tip_height()) {
+                let stats = v1::apply_forward_scan(
+                    &adapter,
+                    tip_height,
+                    tip_hash,
+                    &survivors,
+                    &accepted_inscriptions,
+                    &folded_keys,
+                )
+                .await
+                .map_err(|e| format!("v1.1 forward NfLog apply failed: {e:#}"))?;
+                for nf in &survivors {
                     folded_keys.insert((
                         nf.chain_pos.height,
                         nf.chain_pos.tx_index,

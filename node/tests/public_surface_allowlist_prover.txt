@@ -243,8 +243,22 @@ zkcoins_prover_plonky2::scanner::Scanner::accumulator
 zkcoins_prover_plonky2::scanner::Scanner::config
 zkcoins_prover_plonky2::scanner::Scanner::connect
 zkcoins_prover_plonky2::scanner::Scanner::scan_to_tip
+# Cross-crate catalog edge (node reads accepted stream; pub(crate) cannot span crates).
+# Reason on script-plonky2 crate-root positive list (lib.rs scanner bullet).
+zkcoins_prover_plonky2::scanner::Scanner::accepted_inscriptions
 zkcoins_prover_plonky2::scanner::Scanner::scanned_through
 zkcoins_prover_plonky2::scanner::Scanner::survivors
+# Accepted inscription after §3.6 steps 1–3; node durable catalog + ListInscriptions.
+# Fields = exactly what CatalogInscription::from_scanned / apply path reads.
+# Reason on script-plonky2 crate-root positive list (lib.rs scanner bullet).
+zkcoins_prover_plonky2::scanner::ScannedInscription
+zkcoins_prover_plonky2::scanner::ScannedInscription::block_anchor
+zkcoins_prover_plonky2::scanner::ScannedInscription::format
+zkcoins_prover_plonky2::scanner::ScannedInscription::height
+zkcoins_prover_plonky2::scanner::ScannedInscription::members
+zkcoins_prover_plonky2::scanner::ScannedInscription::reveal_txid
+zkcoins_prover_plonky2::scanner::ScannedInscription::tx_index
+zkcoins_prover_plonky2::scanner::ScannedInscription::vin_index
 zkcoins_prover_plonky2::scanner::ScannerConfig
 zkcoins_prover_plonky2::scanner::ScannerConfig::activation_height
 zkcoins_prover_plonky2::scanner::ScannerConfig::cookie_path

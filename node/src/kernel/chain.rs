@@ -6,9 +6,9 @@
 //! derivation of the NAV root, no silent `present: false` on load
 //! errors, no partial triple-cursor.
 //!
-//! # Inscription catalog prerequisite (§3.5 / §7.8)
+//! # Inscription catalog (§3.5 / §7.8)
 //!
-//! A complete `ListInscriptions` answer must carry, for each inscription,
+//! A complete `ListInscriptions` answer carries, for each inscription,
 //! the fields §3.5 and §7.8 require on the wire: the reveal transaction
 //! `txid` (internal byte order), the §3.5 `format` byte (`0x00` raw or
 //! `0x01` half-aggregated), the member list `(Pkⱼ, Rⱼ)` with per-member
@@ -17,30 +17,20 @@
 //!
 //! The live NfLog (and its first-occurrence mirror on [`ChainView`])
 //! stores only winning `(pk, r)` entries together with the
-//! [`ChainPosition`] used at fold time (height / tx_index / vin_index /
-//! member_index). It does **not** store the reveal transaction id and
-//! does **not** store the §3.5 format byte. Those two fields cannot be
-//! recovered from the NfLog alone without inventing values.
+//! [`ChainPosition`] used at fold time. The **inscription catalog**
+//! written at fold time (same DB transaction as the NfLog) supplies
+//! reveal txid, format, and every accepted member — including
+//! first-occurrence losers the NfLog ignored. Member `state` is the
+//! join of catalog membership with NfLog first-occurrence at the tip.
 //!
-//! Until the scanner writes a dedicated inscription catalog at fold
-//! time (reveal txid, §3.5 format, members, triple), `ListInscriptions`
-//! is not a faithful procedure: the gRPC surface stays
-//! `Unimplemented`, and no NfLog projection synthesises a placeholder
-//! txid or a guessed format. Nullifier membership on the committed log
-//! remains answerable via `GetNullifierPath` (path verified against
-//! size + mth). Catalog-dependent list projection is **not** built here
-//! ahead of that store — production logic reachable only from tests
-//! would not speak for the running service.
-//!
-//! When that catalog is wired, listing **MUST** satisfy these three
-//! contracts (so they are not re-invented at rebuild time):
+//! Listing **MUST** satisfy these three contracts:
 //!
 //! 1. **Total, stable order** over `(height, tx_index, vin_index)` —
 //!    ordinary integer lexicographic order on the triple; equal keys
 //!    never leave list order ambiguous.
 //! 2. **Cursor all-or-nothing** — an inclusive `from` triple and an
 //!    exclusive `next` triple are each fully present or fully absent;
-//!    a half-filled cursor is not representable.
+//!    a half-filled cursor is not representable ([`InscriptionCursor`]).
 //! 3. **Gapless page continuation** — the exclusive `next` of page *n*
 //!    is the inclusive `from` of page *n+1*, so consecutive pages
 //!    neither overlap nor skip a triple.
@@ -203,6 +193,11 @@ impl InscriptionLimit {
         }
         Ok(Self(limit))
     }
+
+    /// Validated page size (construction is the only gate).
+    pub(crate) fn get(self) -> u32 {
+        self.0
+    }
 }
 
 /// `ListInscriptions` request after transport normalisation.
@@ -210,6 +205,91 @@ impl InscriptionLimit {
 pub(crate) struct ListInscriptions {
     pub from: InscriptionCursor,
     pub limit: InscriptionLimit,
+}
+
+/// One catalog member projected for `ListInscriptions`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ListedNullifier {
+    pub pubkey: [u8; 32],
+    pub r: [u8; 32],
+    pub state: NullifierMemberState,
+}
+
+/// Reveal-tx confirmation only (`pending` | `completed`) — never `failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RevealConfirmationState {
+    Pending,
+    Completed,
+}
+
+impl RevealConfirmationState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+/// One inscription on the list stream (§7.8 `Inscription`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ListedInscription {
+    /// Reveal txid, internal byte order.
+    pub txid: [u8; 32],
+    pub height: u64,
+    pub tx_index: u64,
+    pub vin_index: u64,
+    /// §3.5 format byte as u32 on the wire (`0` or `1`).
+    pub format: u32,
+    /// Member count (= `nullifiers.len()`).
+    pub count: u32,
+    pub nullifiers: Vec<ListedNullifier>,
+    pub confirmation_state: RevealConfirmationState,
+}
+
+/// Page of inscriptions plus exclusive next cursor (all-or-nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ListInscriptionsPage {
+    pub inscriptions: Vec<ListedInscription>,
+    /// Exclusive lower bound for the next page, or `None` when exhausted.
+    pub next: Option<InscriptionCursor>,
+}
+
+/// Durable catalog row as held on [`ChainView`] (no member state yet).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogEntry {
+    pub height: u64,
+    pub tx_index: u32,
+    pub vin_index: u32,
+    pub reveal_txid: [u8; 32],
+    pub format: u8,
+    /// Payload order: `(member_index, pk, r)`.
+    pub members: Vec<(u32, [u8; 32], [u8; 32])>,
+    pub block_anchor_hash: [u8; 32],
+    pub block_anchor_height: u32,
+}
+
+impl CatalogEntry {
+    fn from_stored(row: &crate::v1::db_v1::CatalogInscription) -> Self {
+        Self {
+            height: row.height,
+            tx_index: row.tx_index,
+            vin_index: row.vin_index,
+            reveal_txid: row.reveal_txid,
+            format: row.format,
+            members: row.members.clone(),
+            block_anchor_hash: row.block_anchor_hash,
+            block_anchor_height: row.block_anchor_height,
+        }
+    }
+
+    fn cursor(&self) -> InscriptionCursor {
+        InscriptionCursor {
+            height: self.height,
+            tx_index: u64::from(self.tx_index),
+            vin_index: u64::from(self.vin_index),
+        }
+    }
 }
 
 /// §3.10 per-member nullifier state on an inscription.
@@ -799,12 +879,13 @@ impl ChainReadinessFlags {
     }
 }
 
-/// Immutable chain tip + NfLog view used by the four read procedures.
+/// Immutable chain tip + NfLog + inscription catalog for read procedures.
 ///
 /// Built by reading the live engine once under its mutex — never by
 /// recomputing MTH from a second log copy after the fact for the tip
 /// root (the engine's `nav()` is the source of truth; `nflog_root` is
-/// applied only to that pair).
+/// applied only to that pair). Catalog rows come from the same adapter
+/// snapshot path (no second port).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChainView {
     pub tip_height: u64,
@@ -815,14 +896,24 @@ pub(crate) struct ChainView {
     pub mirror: Vec<(ChainPosition, NfLogEntry)>,
     /// Parallel first-occurrence index: `pk → (position, r)`.
     pub index: std::collections::HashMap<[u8; 32], (u64, [u8; 32])>,
+    /// Accepted inscriptions in total order `(height, tx_index, vin_index)`.
+    pub catalog: Vec<CatalogEntry>,
+    /// Chain positions present in the NfLog (winners only) — used for
+    /// per-member state projection without inventing presence from pk alone.
+    pub winning_positions: std::collections::HashSet<(u64, u32, u32, u32)>,
 }
 
 impl ChainView {
-    /// Snapshot the live engine. A poisoned mutex is an internal error —
-    /// never reinterpreted as an empty chain.
+    /// Snapshot the live engine + catalog. A poisoned mutex is an internal
+    /// error — never reinterpreted as an empty chain.
     pub(crate) fn from_engine(adapter: &EngineAdapter) -> KernelResult<Self> {
-        // Capture tip hash outside the engine borrow (adapter fields).
+        // Capture tip hash and catalog outside the engine borrow.
         let tip_block_hash = adapter.tip_hash();
+        let catalog: Vec<CatalogEntry> = adapter
+            .catalog_snapshot()
+            .iter()
+            .map(CatalogEntry::from_stored)
+            .collect();
         adapter.with_engine(|engine| {
             let tip_height = engine.tip_height();
             let nav = engine.nflog().nav();
@@ -831,7 +922,8 @@ impl ChainView {
             // function of the same first-occurrence sequence the tip
             // commits to — not a second store.
             let mut index = std::collections::HashMap::with_capacity(mirror.len());
-            for (pos, (_chain, entry)) in mirror.iter().enumerate() {
+            let mut winning_positions = std::collections::HashSet::with_capacity(mirror.len());
+            for (pos, (chain, entry)) in mirror.iter().enumerate() {
                 let position = pos as u64;
                 if index.insert(entry.pk, (position, entry.r)).is_some() {
                     return Err(KernelError::with_internal(
@@ -842,6 +934,12 @@ impl ChainView {
                         ),
                     ));
                 }
+                winning_positions.insert((
+                    chain.height,
+                    chain.tx_index,
+                    chain.vin_index,
+                    chain.member_index,
+                ));
             }
             if index.len() != mirror.len() {
                 return Err(KernelError::with_internal(
@@ -870,6 +968,8 @@ impl ChainView {
                 nav,
                 mirror,
                 index,
+                catalog,
+                winning_positions,
             })
         })
     }
@@ -978,6 +1078,103 @@ pub(crate) fn get_nullifier_path(
     }
 }
 
+/// `ListInscriptions` — catalog page in total `(height, tx_index, vin_index)` order.
+///
+/// Member state is the join of catalog membership with NfLog winners at the
+/// tip (present at the same chain position ⇒ completed/pending by depth;
+/// otherwise failed). No field is invented: format and txid come only from
+/// the catalog rows written at fold time.
+pub(crate) fn list_inscriptions(
+    view: &ChainView,
+    request: ListInscriptions,
+) -> ListInscriptionsPage {
+    let from = request.from;
+    let limit = request.limit.get() as usize;
+
+    // Inclusive lower bound: first entry with cursor >= from.
+    let start = view.catalog.partition_point(|e| {
+        let c = e.cursor();
+        c < from
+    });
+    let end = (start + limit).min(view.catalog.len());
+    let page_slice = &view.catalog[start..end];
+
+    let inscriptions: Vec<ListedInscription> = page_slice
+        .iter()
+        .map(|entry| project_listed_inscription(view, entry))
+        .collect();
+
+    // Exclusive next: cursor of the first entry after this page, if any.
+    // Structural Option — never a half-filled triple.
+    let next = if end < view.catalog.len() {
+        Some(view.catalog[end].cursor())
+    } else {
+        None
+    };
+
+    ListInscriptionsPage { inscriptions, next }
+}
+
+fn project_listed_inscription(view: &ChainView, entry: &CatalogEntry) -> ListedInscription {
+    let nullifiers: Vec<ListedNullifier> = entry
+        .members
+        .iter()
+        .map(|(member_index, pk, r)| {
+            let won = view.winning_positions.contains(&(
+                entry.height,
+                entry.tx_index,
+                entry.vin_index,
+                *member_index,
+            ));
+            let state = if won {
+                member_confirmation_state(view.tip_height, entry.height)
+            } else {
+                NullifierMemberState::Failed
+            };
+            ListedNullifier {
+                pubkey: *pk,
+                r: *r,
+                state,
+            }
+        })
+        .collect();
+    let count = u32::try_from(nullifiers.len()).expect("member_count validated at persist");
+    ListedInscription {
+        txid: entry.reveal_txid,
+        height: entry.height,
+        tx_index: u64::from(entry.tx_index),
+        vin_index: u64::from(entry.vin_index),
+        format: u32::from(entry.format),
+        count,
+        nullifiers,
+        confirmation_state: reveal_confirmation_state(view.tip_height, entry.height),
+    }
+}
+
+/// Per-member completed/pending from inclusion depth (§3.9 / §3.10).
+fn member_confirmation_state(tip_height: u64, inclusion_height: u64) -> NullifierMemberState {
+    let confirmations = tip_height
+        .saturating_sub(inclusion_height)
+        .saturating_add(1);
+    if confirmations >= u64::from(FINALITY_CONFIRMATIONS) {
+        NullifierMemberState::Completed
+    } else {
+        NullifierMemberState::Pending
+    }
+}
+
+/// Reveal-tx confirmation only (never `failed`).
+fn reveal_confirmation_state(tip_height: u64, inclusion_height: u64) -> RevealConfirmationState {
+    let confirmations = tip_height
+        .saturating_sub(inclusion_height)
+        .saturating_add(1);
+    if confirmations >= u64::from(FINALITY_CONFIRMATIONS) {
+        RevealConfirmationState::Completed
+    } else {
+        RevealConfirmationState::Pending
+    }
+}
+
 /// `GetInfo` — static identity + live tip / readiness / NAV root.
 pub(crate) fn get_info(
     identity: &ChainIdentity,
@@ -1020,6 +1217,18 @@ pub(crate) fn chain_view_from_accumulator(
     tip_block_hash: [u8; 32],
     mirror: Vec<(ChainPosition, NfLogEntry)>,
 ) -> KernelResult<ChainView> {
+    chain_view_from_accumulator_with_catalog(acc, tip_height, tip_block_hash, mirror, Vec::new())
+}
+
+/// Test helper: chain view with an explicit catalog.
+#[cfg(test)]
+pub(crate) fn chain_view_from_accumulator_with_catalog(
+    acc: &shared::spec_v1::NfLogAccumulator,
+    tip_height: u64,
+    tip_block_hash: [u8; 32],
+    mirror: Vec<(ChainPosition, NfLogEntry)>,
+    catalog: Vec<CatalogEntry>,
+) -> KernelResult<ChainView> {
     let nav = acc.nav();
     if nav.size != mirror.len() as u64 {
         return Err(KernelError::with_internal(
@@ -1033,8 +1242,10 @@ pub(crate) fn chain_view_from_accumulator(
         ));
     }
     let mut index = std::collections::HashMap::with_capacity(mirror.len());
-    for (pos, (_c, e)) in mirror.iter().enumerate() {
+    let mut winning_positions = std::collections::HashSet::with_capacity(mirror.len());
+    for (pos, (c, e)) in mirror.iter().enumerate() {
         index.insert(e.pk, (pos as u64, e.r));
+        winning_positions.insert((c.height, c.tx_index, c.vin_index, c.member_index));
     }
     Ok(ChainView {
         tip_height,
@@ -1042,6 +1253,8 @@ pub(crate) fn chain_view_from_accumulator(
         nav,
         mirror,
         index,
+        catalog,
+        winning_positions,
     })
 }
 
@@ -1579,5 +1792,241 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    fn catalog_entry(
+        height: u64,
+        tx_index: u32,
+        vin_index: u32,
+        format: u8,
+        members: Vec<(u32, [u8; 32], [u8; 32])>,
+        txid_byte: u8,
+    ) -> CatalogEntry {
+        CatalogEntry {
+            height,
+            tx_index,
+            vin_index,
+            reveal_txid: [txid_byte; 32],
+            format,
+            members,
+            block_anchor_hash: [0xAA; 32],
+            block_anchor_height: height.saturating_sub(1) as u32,
+        }
+    }
+
+    fn view_with_catalog(
+        nflog: &[(ChainPosition, [u8; 32], [u8; 32])],
+        catalog: Vec<CatalogEntry>,
+        tip: u64,
+    ) -> ChainView {
+        let mut acc = NfLogAccumulator::new(0);
+        let mut mirror = Vec::new();
+        for &(chain_pos, p, rr) in nflog {
+            acc.fold(chain_pos, p, rr).expect("fold");
+            mirror.push((chain_pos, NfLogEntry { pk: p, r: rr }));
+        }
+        chain_view_from_accumulator_with_catalog(&acc, tip, [0xAB; 32], mirror, catalog)
+            .expect("view")
+    }
+
+    /// Contract 1: total stable order over the triple.
+    #[test]
+    fn list_inscriptions_total_order_by_height_tx_vin() {
+        let mut catalog = vec![
+            catalog_entry(2, 0, 0, 0x00, vec![(0, pk(1), r(1))], 0x01),
+            catalog_entry(1, 1, 0, 0x00, vec![(0, pk(2), r(2))], 0x02),
+            catalog_entry(1, 0, 1, 0x01, vec![(0, pk(3), r(3))], 0x03),
+            catalog_entry(1, 0, 0, 0x00, vec![(0, pk(4), r(4))], 0x04),
+        ];
+        catalog.sort_by_key(|e| (e.height, e.tx_index, e.vin_index));
+        let view = view_with_catalog(&[], catalog, 10);
+        let page = list_inscriptions(
+            &view,
+            ListInscriptions {
+                from: InscriptionCursor::origin(),
+                limit: InscriptionLimit::new(10).expect("limit"),
+            },
+        );
+        let keys: Vec<(u64, u64, u64)> = page
+            .inscriptions
+            .iter()
+            .map(|i| (i.height, i.tx_index, i.vin_index))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![(1, 0, 0), (1, 0, 1), (1, 1, 0), (2, 0, 0)],
+            "stream order must be lexicographic on the triple"
+        );
+    }
+
+    /// Contract 2: cursor is structurally complete (`InscriptionCursor`).
+    #[test]
+    fn list_inscriptions_cursor_is_structurally_complete() {
+        let c = InscriptionCursor {
+            height: 7,
+            tx_index: 3,
+            vin_index: 9,
+        };
+        assert_eq!((c.height, c.tx_index, c.vin_index), (7, 3, 9));
+        let catalog = vec![catalog_entry(5, 0, 0, 0x00, vec![(0, pk(1), r(1))], 0x11)];
+        let view = view_with_catalog(&[], catalog, 5);
+        let page = list_inscriptions(
+            &view,
+            ListInscriptions {
+                from: InscriptionCursor::origin(),
+                limit: InscriptionLimit::new(1).expect("limit"),
+            },
+        );
+        assert!(page.next.is_none(), "single-page stream has no next");
+    }
+
+    /// Contract 3: exclusive next of page n is inclusive from of page n+1.
+    #[test]
+    fn list_inscriptions_gapless_pages_over_three_pages() {
+        let mut catalog = Vec::new();
+        for i in 0u32..7 {
+            catalog.push(catalog_entry(
+                10,
+                i,
+                0,
+                0x00,
+                vec![(0, pk(i as u8 + 1), r(i as u8 + 1))],
+                i as u8,
+            ));
+        }
+        let view = view_with_catalog(&[], catalog, 20);
+        let limit = InscriptionLimit::new(2).expect("limit");
+        let mut from = InscriptionCursor::origin();
+        let mut seen = Vec::new();
+        for page_i in 0..3 {
+            let page = list_inscriptions(&view, ListInscriptions { from, limit });
+            assert_eq!(
+                page.inscriptions.len(),
+                2,
+                "page {page_i} must be full (2 of 7)"
+            );
+            for ins in &page.inscriptions {
+                seen.push((ins.height, ins.tx_index, ins.vin_index));
+            }
+            from = page.next.expect("pages 0..2 must have next");
+        }
+        let last = list_inscriptions(&view, ListInscriptions { from, limit });
+        assert_eq!(last.inscriptions.len(), 1);
+        assert!(last.next.is_none());
+        seen.push((
+            last.inscriptions[0].height,
+            last.inscriptions[0].tx_index,
+            last.inscriptions[0].vin_index,
+        ));
+        assert_eq!(seen.len(), 7);
+        for (i, entry) in seen.iter().enumerate() {
+            assert_eq!(entry, &(10, i as u64, 0));
+        }
+    }
+
+    /// Double-spend loser: in catalog, not in NfLog at its position → failed.
+    #[test]
+    fn list_inscriptions_double_spend_loser_is_failed() {
+        let winner_pos = pos(10, 0, 0, 0);
+        let winner_entry = catalog_entry(10, 0, 0, 0x00, vec![(0, pk(1), r(1))], 0xA1);
+        let loser_entry = catalog_entry(11, 0, 0, 0x00, vec![(0, pk(1), r(9))], 0xB1);
+        let view = view_with_catalog(
+            &[(winner_pos, pk(1), r(1))],
+            vec![winner_entry, loser_entry],
+            20,
+        );
+        let page = list_inscriptions(
+            &view,
+            ListInscriptions {
+                from: InscriptionCursor::origin(),
+                limit: InscriptionLimit::new(10).expect("limit"),
+            },
+        );
+        assert_eq!(page.inscriptions.len(), 2);
+        assert_eq!(
+            page.inscriptions[0].nullifiers[0].state,
+            NullifierMemberState::Completed
+        );
+        assert_eq!(
+            page.inscriptions[1].nullifiers[0].state,
+            NullifierMemberState::Failed,
+            "loser must be failed — catalog member whose chain position is not in NfLog"
+        );
+    }
+
+    /// format 0x00 and 0x01 come from the catalog payload field, not member count.
+    #[test]
+    fn list_inscriptions_format_is_catalog_byte_not_member_count() {
+        let half_one = catalog_entry(1, 0, 0, 0x01, vec![(0, pk(1), r(1))], 0x01);
+        let raw_one = catalog_entry(1, 0, 1, 0x00, vec![(0, pk(2), r(2))], 0x02);
+        let view = view_with_catalog(&[], vec![half_one, raw_one], 1);
+        let page = list_inscriptions(
+            &view,
+            ListInscriptions {
+                from: InscriptionCursor::origin(),
+                limit: InscriptionLimit::new(10).expect("limit"),
+            },
+        );
+        assert_eq!(page.inscriptions[0].format, 1);
+        assert_eq!(page.inscriptions[0].count, 1);
+        assert_eq!(page.inscriptions[1].format, 0);
+        assert_eq!(page.inscriptions[1].count, 1);
+        assert_ne!(page.inscriptions[0].format, page.inscriptions[1].format);
+    }
+
+    /// Multi-member inscription preserves member_index order.
+    #[test]
+    fn list_inscriptions_multi_member_preserves_order() {
+        let entry = catalog_entry(
+            3,
+            1,
+            2,
+            0x01,
+            vec![(0, pk(10), r(10)), (1, pk(11), r(11)), (2, pk(12), r(12))],
+            0x33,
+        );
+        let view = view_with_catalog(
+            &[
+                (pos(3, 1, 2, 0), pk(10), r(10)),
+                (pos(3, 1, 2, 1), pk(11), r(11)),
+                (pos(3, 1, 2, 2), pk(12), r(12)),
+            ],
+            vec![entry],
+            3,
+        );
+        let page = list_inscriptions(
+            &view,
+            ListInscriptions {
+                from: InscriptionCursor::origin(),
+                limit: InscriptionLimit::new(1).expect("limit"),
+            },
+        );
+        assert_eq!(page.inscriptions[0].count, 3);
+        assert_eq!(page.inscriptions[0].nullifiers[0].pubkey, pk(10));
+        assert_eq!(page.inscriptions[0].nullifiers[1].pubkey, pk(11));
+        assert_eq!(page.inscriptions[0].nullifiers[2].pubkey, pk(12));
+    }
+
+    /// Txid on the list is the internal-order bytes from the catalog.
+    #[test]
+    fn list_inscriptions_txid_is_internal_order_from_catalog() {
+        let mut internal = [0u8; 32];
+        for (i, b) in internal.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mut entry = catalog_entry(1, 0, 0, 0x00, vec![(0, pk(1), r(1))], 0);
+        entry.reveal_txid = internal;
+        let view = view_with_catalog(&[], vec![entry], 1);
+        let page = list_inscriptions(
+            &view,
+            ListInscriptions {
+                from: InscriptionCursor::origin(),
+                limit: InscriptionLimit::new(1).expect("limit"),
+            },
+        );
+        assert_eq!(page.inscriptions[0].txid, internal);
+        let mut reversed = internal;
+        reversed.reverse();
+        assert_ne!(page.inscriptions[0].txid, reversed);
     }
 }

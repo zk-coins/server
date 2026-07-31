@@ -837,6 +837,12 @@ pub(crate) async fn reset_v1_proof_dependent_state_tx(
     sqlx::query("DELETE FROM v1_pending_publishes")
         .execute(&mut *tx)
         .await?;
+    sqlx::query("DELETE FROM v1_inscription_members")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM v1_inscriptions")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM v1_spendable_coins")
         .execute(&mut *tx)
         .await?;

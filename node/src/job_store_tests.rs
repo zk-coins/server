@@ -1808,6 +1808,7 @@ async fn stale_fence_cannot_commit_engine_snapshot_or_members_ready() {
         fold_seq: 0,
         nflog: vec![],
         accounts: vec![],
+        inscriptions: vec![],
     };
     let account_owner = Address(account_addr(0xE8));
     let pk = [0xAAu8; 32];

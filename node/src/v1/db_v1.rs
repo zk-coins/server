@@ -35,6 +35,51 @@ type AccountRow = (
 /// sqlx row shape for `v1_spendable_coins` (coin_id, coin, ash, index).
 type SpendableRow = (Vec<u8>, Vec<u8>, Vec<u8>, i32);
 
+/// sqlx row for `v1_inscriptions` — catalog head (one accepted inscription).
+///
+/// Mirrors the head table: stream key, reveal identity, format, declared
+/// member_count, and block anchor. Members live in
+/// [`CatalogMemberRow`] / `v1_inscription_members`.
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct CatalogHeadRow {
+    height: i64,
+    tx_index: i64,
+    vin_index: i64,
+    reveal_txid: Vec<u8>,
+    format: i16,
+    member_count: i32,
+    block_anchor_hash: Vec<u8>,
+    block_anchor_height: i64,
+}
+
+/// sqlx row for `v1_inscription_members` — one verified (Pk, R) under a head.
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct CatalogMemberRow {
+    height: i64,
+    tx_index: i64,
+    vin_index: i64,
+    member_index: i64,
+    pk: Vec<u8>,
+    r: Vec<u8>,
+}
+
+/// Decoded catalog head key `(height, tx_index, vin_index)` after integer checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CatalogHeadKey {
+    height: u64,
+    tx_index: u32,
+    vin_index: u32,
+}
+
+/// One member slot under a head, after length-checked decode from
+/// [`CatalogMemberRow`]. Field names match the schema / payload order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogMemberSlot {
+    member_index: u32,
+    pk: [u8; 32],
+    r: [u8; 32],
+}
+
 /// Serializable snapshot of one account for the DB layer.
 ///
 /// `op_secret` is redacted in Debug (via [`OpSecret`]); it must never appear
@@ -55,6 +100,63 @@ pub(crate) struct AccountSnapshot {
     pub last_nullifier_pos: Option<u64>,
 }
 
+/// One accepted inscription in the durable catalog (§3.5 / §7.8).
+///
+/// Written in the same transaction as the NfLog fold it describes. Carries
+/// every verified member (including first-occurrence losers) so the list
+/// surface can report what was inscribed independently of who won.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogInscription {
+    pub height: u64,
+    pub tx_index: u32,
+    pub vin_index: u32,
+    /// Reveal txid, internal/consensus byte order (not Display/RPC order).
+    pub reveal_txid: [u8; 32],
+    /// §3.5 format byte (`0x00` raw / `0x01` half-aggregated).
+    pub format: u8,
+    /// Members in payload order: `(member_index, pk, r)`.
+    pub members: Vec<(u32, [u8; 32], [u8; 32])>,
+    pub block_anchor_hash: [u8; 32],
+    pub block_anchor_height: u32,
+}
+
+impl CatalogInscription {
+    /// Build from a scanner-accepted inscription (steps 1–3).
+    pub(crate) fn from_scanned(ins: &zkcoins_prover::scanner::ScannedInscription) -> Self {
+        let members = ins
+            .members
+            .iter()
+            .enumerate()
+            .map(|(i, (pk, r))| {
+                (
+                    u32::try_from(i).expect("member_index fits u32 after scan acceptance"),
+                    *pk,
+                    *r,
+                )
+            })
+            .collect();
+        Self {
+            height: ins.height,
+            tx_index: ins.tx_index,
+            vin_index: ins.vin_index,
+            reveal_txid: ins.reveal_txid,
+            format: ins.format,
+            members,
+            block_anchor_hash: ins.block_anchor.block_hash,
+            block_anchor_height: ins.block_anchor.height,
+        }
+    }
+
+    /// Inclusive stream key `(height, tx_index, vin_index)`.
+    pub(crate) fn cursor_key(&self) -> (u64, u64, u64) {
+        (
+            self.height,
+            u64::from(self.tx_index),
+            u64::from(self.vin_index),
+        )
+    }
+}
+
 /// Full engine snapshot as read from / written to Postgres.
 #[derive(Clone, Debug)]
 pub(crate) struct EngineSnapshot {
@@ -68,14 +170,22 @@ pub(crate) struct EngineSnapshot {
     pub fold_seq: u32,
     pub nflog: Vec<(ChainPosition, NfLogEntry)>,
     pub accounts: Vec<AccountSnapshot>,
+    /// Accepted inscriptions in stream order (same TX as NfLog).
+    pub inscriptions: Vec<CatalogInscription>,
 }
 
 impl EngineSnapshot {
-    /// Snapshot an engine together with its tip block hash.
+    /// Snapshot an engine together with its tip block hash and catalog.
     ///
     /// Stage 1: the hash is not yet on [`StateEngine`]; callers that persist
-    /// after a load must pass the reloaded hash so it is not zeroed.
-    pub(crate) fn from_engine_with_tip_hash(engine: &StateEngine, tip_hash: [u8; 32]) -> Self {
+    /// after a load must pass the reloaded hash so it is not zeroed. The
+    /// inscription catalog lives on the adapter (not StateEngine) and is
+    /// threaded in by the caller.
+    pub(crate) fn from_engine_with_tip_hash(
+        engine: &StateEngine,
+        tip_hash: [u8; 32],
+        inscriptions: Vec<CatalogInscription>,
+    ) -> Self {
         let accounts = engine
             .accounts()
             .map(|(owner, record)| AccountSnapshot {
@@ -104,6 +214,7 @@ impl EngineSnapshot {
             fold_seq: engine.fold_seq(),
             nflog: engine.nflog_mirror(),
             accounts,
+            inscriptions,
         }
     }
 
@@ -247,7 +358,9 @@ async fn count_any_v1_rows(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
           + (SELECT COUNT(*) FROM v1_accounts) \
           + (SELECT COUNT(*) FROM v1_spendable_coins) \
           + (SELECT COUNT(*) FROM v1_spent_coins) \
-          + (SELECT COUNT(*) FROM v1_pending_publishes)",
+          + (SELECT COUNT(*) FROM v1_pending_publishes) \
+          + (SELECT COUNT(*) FROM v1_inscriptions) \
+          + (SELECT COUNT(*) FROM v1_inscription_members)",
     )
     .fetch_one(&mut **tx)
     .await
@@ -528,6 +641,8 @@ pub(crate) async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineS
         });
     }
 
+    let inscriptions = load_catalog(&mut tx).await?;
+
     tx.commit().await.context("commit v1 load tx")?;
 
     Ok(Some(EngineSnapshot {
@@ -538,7 +653,110 @@ pub(crate) async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineS
         fold_seq,
         nflog,
         accounts,
+        inscriptions,
     }))
+}
+
+/// Load the inscription catalog in stream order; validate member_count.
+async fn load_catalog(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<CatalogInscription>> {
+    let heads: Vec<CatalogHeadRow> = sqlx::query_as(
+        "SELECT height, tx_index, vin_index, reveal_txid, format, member_count, \
+                block_anchor_hash, block_anchor_height \
+         FROM v1_inscriptions \
+         ORDER BY height ASC, tx_index ASC, vin_index ASC",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .context("load v1_inscriptions")?;
+
+    let member_rows: Vec<CatalogMemberRow> = sqlx::query_as(
+        "SELECT height, tx_index, vin_index, member_index, pk, r \
+         FROM v1_inscription_members \
+         ORDER BY height ASC, tx_index ASC, vin_index ASC, member_index ASC",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .context("load v1_inscription_members")?;
+
+    let mut members_by_head: std::collections::BTreeMap<CatalogHeadKey, Vec<CatalogMemberSlot>> =
+        std::collections::BTreeMap::new();
+    for row in member_rows {
+        let key = CatalogHeadKey {
+            height: u64_from_i64(row.height, "inscription_member.height")?,
+            tx_index: u32_from_i64(row.tx_index, "inscription_member.tx_index")?,
+            vin_index: u32_from_i64(row.vin_index, "inscription_member.vin_index")?,
+        };
+        let slot = CatalogMemberSlot {
+            member_index: u32_from_i64(row.member_index, "inscription_member.member_index")?,
+            pk: fixed_32(&row.pk, "inscription_member.pk")?,
+            r: fixed_32(&row.r, "inscription_member.r")?,
+        };
+        members_by_head.entry(key).or_default().push(slot);
+    }
+
+    let mut out = Vec::with_capacity(heads.len());
+    for head in heads {
+        let height = u64_from_i64(head.height, "inscription.height")?;
+        let tx_index = u32_from_i64(head.tx_index, "inscription.tx_index")?;
+        let vin_index = u32_from_i64(head.vin_index, "inscription.vin_index")?;
+        let format = u8::try_from(head.format)
+            .with_context(|| format!("inscription.format={} does not fit in u8", head.format))?;
+        if format != 0 && format != 1 {
+            bail!("inscription.format={format:#04x} is not a closed §3.5 value");
+        }
+        let member_count = u32::try_from(head.member_count).with_context(|| {
+            format!(
+                "inscription.member_count={} does not fit in u32",
+                head.member_count
+            )
+        })?;
+        let key = CatalogHeadKey {
+            height,
+            tx_index,
+            vin_index,
+        };
+        let slots = members_by_head.remove(&key).unwrap_or_default();
+        if slots.len() as u32 != member_count {
+            bail!(
+                "inscription at ({height},{tx_index},{vin_index}): member_count={member_count} \
+                 but {} member row(s)",
+                slots.len()
+            );
+        }
+        for (i, slot) in slots.iter().enumerate() {
+            if slot.member_index != i as u32 {
+                bail!(
+                    "inscription at ({height},{tx_index},{vin_index}): member_index gap \
+                     at slot {i} (got {})",
+                    slot.member_index
+                );
+            }
+        }
+        let members = slots
+            .into_iter()
+            .map(|s| (s.member_index, s.pk, s.r))
+            .collect();
+        out.push(CatalogInscription {
+            height,
+            tx_index,
+            vin_index,
+            reveal_txid: fixed_32(&head.reveal_txid, "inscription.reveal_txid")?,
+            format,
+            members,
+            block_anchor_hash: fixed_32(&head.block_anchor_hash, "inscription.block_anchor_hash")?,
+            block_anchor_height: u32_from_i64(
+                head.block_anchor_height,
+                "inscription.block_anchor_height",
+            )?,
+        });
+    }
+    if !members_by_head.is_empty() {
+        bail!(
+            "v1_inscription_members has {} orphan head key(s) without a parent row",
+            members_by_head.len()
+        );
+    }
+    Ok(out)
 }
 
 /// Atomically replace the entire v1.1 engine snapshot with `snap`.
@@ -745,6 +963,14 @@ async fn insert_members_ready_row(
 
 async fn clear_all(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     // Children first (FK), then parents, then meta.
+    // Catalog members CASCADE from heads; delete heads explicitly so a
+    // reorg/full rewrite never leaves half inscriptions.
+    sqlx::query("DELETE FROM v1_inscription_members")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM v1_inscriptions")
+        .execute(&mut **tx)
+        .await?;
     sqlx::query("DELETE FROM v1_spendable_coins")
         .execute(&mut **tx)
         .await?;
@@ -894,6 +1120,85 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
         }
     }
 
+    write_catalog(tx, &snap.inscriptions).await?;
+
+    Ok(())
+}
+
+/// Persist catalog heads + members. Caller must have cleared both tables.
+async fn write_catalog(
+    tx: &mut Transaction<'_, Postgres>,
+    inscriptions: &[CatalogInscription],
+) -> Result<()> {
+    for ins in inscriptions {
+        let member_count = i32::try_from(ins.members.len()).with_context(|| {
+            format!(
+                "inscription member_count {} does not fit in i32",
+                ins.members.len()
+            )
+        })?;
+        if member_count == 0 {
+            bail!(
+                "refusing to persist inscription at ({},{},{}) with zero members",
+                ins.height,
+                ins.tx_index,
+                ins.vin_index
+            );
+        }
+        if ins.format != 0 && ins.format != 1 {
+            bail!(
+                "refusing to persist inscription format {:#04x} (not §3.5 closed set)",
+                ins.format
+            );
+        }
+        sqlx::query(
+            "INSERT INTO v1_inscriptions \
+             (height, tx_index, vin_index, reveal_txid, format, member_count, \
+              block_anchor_hash, block_anchor_height) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(as_i64_u64(ins.height, "inscription.height")?)
+        .bind(as_i64_u32(ins.tx_index, "inscription.tx_index")?)
+        .bind(as_i64_u32(ins.vin_index, "inscription.vin_index")?)
+        .bind(ins.reveal_txid.as_slice())
+        .bind(i16::from(ins.format))
+        .bind(member_count)
+        .bind(ins.block_anchor_hash.as_slice())
+        .bind(as_i64_u32(
+            ins.block_anchor_height,
+            "inscription.block_anchor_height",
+        )?)
+        .execute(&mut **tx)
+        .await
+        .with_context(|| {
+            format!(
+                "insert v1_inscriptions ({},{},{})",
+                ins.height, ins.tx_index, ins.vin_index
+            )
+        })?;
+
+        for (member_index, pk, r) in &ins.members {
+            sqlx::query(
+                "INSERT INTO v1_inscription_members \
+                 (height, tx_index, vin_index, member_index, pk, r) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(as_i64_u64(ins.height, "member.height")?)
+            .bind(as_i64_u32(ins.tx_index, "member.tx_index")?)
+            .bind(as_i64_u32(ins.vin_index, "member.vin_index")?)
+            .bind(as_i64_u32(*member_index, "member.member_index")?)
+            .bind(pk.as_slice())
+            .bind(r.as_slice())
+            .execute(&mut **tx)
+            .await
+            .with_context(|| {
+                format!(
+                    "insert v1_inscription_members ({},{},{},{})",
+                    ins.height, ins.tx_index, ins.vin_index, member_index
+                )
+            })?;
+        }
+    }
     Ok(())
 }
 

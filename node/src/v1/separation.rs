@@ -62,14 +62,16 @@ const LEGACY_SCAN_STATE_COUNT_SQL: &str = "SELECT \
   + (SELECT COUNT(*) FROM mmr_state) \
   + (SELECT COUNT(*) FROM latest_block)";
 
-/// SQL: any durable v1.1 scan-stack row across the six engine tables.
+/// SQL: any durable v1.1 scan-stack row across the engine + catalog tables.
 const V1_SCAN_STATE_COUNT_SQL: &str = "SELECT \
     (SELECT COUNT(*) FROM v1_engine_meta) \
   + (SELECT COUNT(*) FROM v1_nflog_entries) \
   + (SELECT COUNT(*) FROM v1_nullifier_index) \
   + (SELECT COUNT(*) FROM v1_accounts) \
   + (SELECT COUNT(*) FROM v1_spendable_coins) \
-  + (SELECT COUNT(*) FROM v1_spent_coins)";
+  + (SELECT COUNT(*) FROM v1_spent_coins) \
+  + (SELECT COUNT(*) FROM v1_inscriptions) \
+  + (SELECT COUNT(*) FROM v1_inscription_members)";
 
 /// Load the claimed mode, if any.
 #[cfg(test)]

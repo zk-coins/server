@@ -27,7 +27,8 @@ use crate::kernel::types::{
 };
 use crate::kernel::{
     AccumulatorTip as DomainAccumulatorTip, KernelInfo, ListInscriptions as DomainListInscriptions,
-    NullifierPath as DomainNullifierPath, NullifierPathRequest as DomainNullifierPathRequest,
+    ListedInscription, NullifierPath as DomainNullifierPath,
+    NullifierPathRequest as DomainNullifierPathRequest,
 };
 use crate::kernel::{
     Job, JobEvent, JobId, JobState, KernelError, KernelErrorCode, KernelResult, SignTransition,
@@ -377,6 +378,28 @@ pub(crate) fn accumulator_tip_to_proto(tip: &DomainAccumulatorTip) -> ProtoAccum
         tip_block_hash: tip.tip_block_hash.0.to_vec(),
         tip_height: tip.tip_height,
         size: tip.size,
+    }
+}
+
+/// Domain listed inscription → proto `Inscription`.
+pub(crate) fn inscription_to_proto(ins: &ListedInscription) -> kernel_proto::Inscription {
+    kernel_proto::Inscription {
+        txid: ins.txid.to_vec(),
+        height: ins.height,
+        count: ins.count,
+        format: ins.format,
+        nullifiers: ins
+            .nullifiers
+            .iter()
+            .map(|n| kernel_proto::Nullifier {
+                pubkey: n.pubkey.to_vec(),
+                r: n.r.to_vec(),
+                state: n.state.as_str().to_string(),
+            })
+            .collect(),
+        confirmation_state: ins.confirmation_state.as_str().to_string(),
+        tx_index: ins.tx_index,
+        vin_index: ins.vin_index,
     }
 }
 

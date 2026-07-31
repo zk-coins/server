@@ -5170,6 +5170,7 @@ mod jobs_endpoint_tests {
                             fold_seq: 0,
                             nflog: vec![],
                             accounts: vec![],
+                            inscriptions: vec![],
                         },
                         pending.owner,
                         signature.pk_i,

@@ -240,7 +240,7 @@ pub(crate) fn replace_engine_nflog_from_survivors(
     let (nflog_pairs, stats) = first_occurrence_nflog_pairs(activation_height, survivors)?;
 
     // Snapshot accounts (and current meta) without needing AccountRecord: Clone.
-    let mut snap = EngineSnapshot::from_engine_with_tip_hash(engine, tip_hash);
+    let mut snap = EngineSnapshot::from_engine_with_tip_hash(engine, tip_hash, Vec::new());
     snap.tip_height = tip_height;
     snap.tip_hash = tip_hash;
     snap.nflog = nflog_pairs;
@@ -261,14 +261,68 @@ pub(crate) fn replace_engine_nflog_from_survivors(
 /// Holds [`EngineAdapter::lock_writes`] for the full snapshot→mutate→persist
 /// →restore window so a concurrent receive cannot have its committed work
 /// rolled back by this path's restore (and vice versa).
+///
+/// `survivors` is the scanner's full survivor stream (for coupling check);
+/// `accepted_inscriptions` is the scanner's full accepted stream. Expansion
+/// from inscriptions is the **sole** fold source; `already_folded` filters
+/// the forward delta. Catalog append is the subset not already durable.
+/// New catalog heads must have every member present in that delta — see
+/// [`ensure_new_catalog_delta_coupled`].
+///
+/// Full-stream coupling ([`ensure_accepted_survivor_coupling`]) runs here,
+/// immediately before mutate, so a forward-only caller cannot skip it.
 pub async fn apply_forward_scan(
     adapter: &EngineAdapter,
     tip_height: u64,
     tip_hash: [u8; 32],
-    new_survivors: &[PublishedNullifier],
+    survivors: &[PublishedNullifier],
+    accepted_inscriptions: &[zkcoins_prover::scanner::ScannedInscription],
+    already_folded: &std::collections::HashSet<(u64, u32, u32, u32, [u8; 32])>,
 ) -> Result<FoldStats> {
     require_v1_process_for_nflog_write()?;
+    ensure_accepted_survivor_coupling(survivors, accepted_inscriptions).with_context(|| {
+        format!(
+            "apply_forward_scan: stream coupling refused \
+             (survivor_count={} inscription_count={})",
+            survivors.len(),
+            accepted_inscriptions.len()
+        )
+    })?;
+    // Expansion is the sole fold source; filter against already-folded keys
+    // for the forward delta (first-occurrence losers stay out of NfLog but
+    // must not re-enter the fold after a still-canonical restart).
+    let expanded = survivors_from_accepted_inscriptions(accepted_inscriptions)?;
+    let new_survivors: Vec<PublishedNullifier> = expanded
+        .iter()
+        .copied()
+        .filter(|nf| {
+            !already_folded.contains(&(
+                nf.chain_pos.height,
+                nf.chain_pos.tx_index,
+                nf.chain_pos.vin_index,
+                nf.chain_pos.member_index,
+                nf.pk,
+            ))
+        })
+        .collect();
+
     let _write_gate = adapter.lock_writes().await;
+    // Catalog delta under the write gate (heads not yet durable). Refuse new
+    // catalog rows whose members are missing from `new_survivors` before any
+    // mutate so a decoupled feed cannot fold NfLog then leave catalog orphaned
+    // (or the reverse).
+    let existing_keys: std::collections::HashSet<(u64, u32, u32)> = adapter
+        .catalog_snapshot()
+        .iter()
+        .map(|i| (i.height, i.tx_index, i.vin_index))
+        .collect();
+    let catalog_rows: Vec<crate::v1::db_v1::CatalogInscription> = accepted_inscriptions
+        .iter()
+        .filter(|ins| !existing_keys.contains(&(ins.height, ins.tx_index, ins.vin_index)))
+        .map(crate::v1::db_v1::CatalogInscription::from_scanned)
+        .collect();
+    ensure_new_catalog_delta_coupled(&catalog_rows, &new_survivors)?;
+
     let backup = adapter.snapshot_live();
 
     let stats = match adapter.with_engine_mut(|engine| -> Result<FoldStats> {
@@ -283,7 +337,7 @@ pub async fn apply_forward_scan(
         if tip_height > engine.tip_height() {
             engine.set_tip_height(tip_height);
         }
-        fold_survivors_into_engine(engine, new_survivors)
+        fold_survivors_into_engine(engine, &new_survivors)
     }) {
         Ok(Ok(s)) => s,
         Ok(Err(e)) | Err(e) => {
@@ -293,6 +347,17 @@ pub async fn apply_forward_scan(
             return Err(e);
         }
     };
+    // Catalog append in the same mutate window as the fold; persist writes
+    // both in one transaction (see EngineAdapter::persist / db_v1::clear_all).
+    //
+    // Delta was computed above (crate-private `catalog_snapshot`) so the
+    // binary does not re-derive catalog keys.
+    if let Err(e) = adapter.append_catalog(&catalog_rows) {
+        adapter
+            .restore_live(backup)
+            .context("apply_forward_scan: restore after catalog append error")?;
+        return Err(e);
+    }
     adapter
         .set_tip_hash(tip_hash)
         .context("apply_forward_scan: set_tip_hash")?;
@@ -315,18 +380,38 @@ pub async fn apply_forward_scan(
 /// Same memory-before-persist safety as [`apply_forward_scan`]: restore
 /// the pre-mutation snapshot if durable write fails. Same write-gate
 /// serialisation against receive.
+///
+/// `survivors` is the scanner's full survivor stream (for coupling check);
+/// `inscriptions` is the scanner's full accepted stream. Expansion from
+/// inscriptions is the **sole** fold/replace source. Full streams must
+/// couple: every accepted inscription expands to the survivors that share
+/// its head key, and every survivor belongs to an accepted inscription
+/// ([`ensure_accepted_survivor_coupling`]) — checked immediately before
+/// mutate so a second caller cannot skip it.
 pub async fn apply_canonical_survivors(
     adapter: &EngineAdapter,
     tip_height: u64,
     tip_hash: [u8; 32],
     survivors: &[PublishedNullifier],
+    inscriptions: &[zkcoins_prover::scanner::ScannedInscription],
 ) -> Result<FoldStats> {
     require_v1_process_for_nflog_write()?;
+    ensure_accepted_survivor_coupling(survivors, inscriptions).with_context(|| {
+        format!(
+            "apply_canonical_survivors: stream coupling refused \
+             (survivor_count={} inscription_count={})",
+            survivors.len(),
+            inscriptions.len()
+        )
+    })?;
+    // Expansion is the sole NfLog replace source (equals `survivors` after
+    // the coupling check above).
+    let expanded = survivors_from_accepted_inscriptions(inscriptions)?;
     let _write_gate = adapter.lock_writes().await;
     let backup = adapter.snapshot_live();
 
     let stats = match adapter.with_engine_mut(|engine| {
-        replace_engine_nflog_from_survivors(engine, tip_height, tip_hash, survivors)
+        replace_engine_nflog_from_survivors(engine, tip_height, tip_hash, &expanded)
     }) {
         Ok(Ok(s)) => s,
         Ok(Err(e)) | Err(e) => {
@@ -336,6 +421,18 @@ pub async fn apply_canonical_survivors(
             return Err(e);
         }
     };
+    // Full-replace the catalog from the post-reorg accepted stream in the
+    // same window as NfLog replace; durable write is one TX.
+    let catalog_rows: Vec<crate::v1::db_v1::CatalogInscription> = inscriptions
+        .iter()
+        .map(crate::v1::db_v1::CatalogInscription::from_scanned)
+        .collect();
+    if let Err(e) = adapter.replace_catalog(catalog_rows) {
+        adapter
+            .restore_live(backup)
+            .context("apply_canonical_survivors: restore after catalog replace error")?;
+        return Err(e);
+    }
     adapter
         .set_tip_hash(tip_hash)
         .context("apply_canonical_survivors: set_tip_hash")?;
@@ -810,6 +907,162 @@ pub fn folded_keys_from_nflog_mirror(
             )
         })
         .collect()
+}
+
+/// Expand accepted inscriptions to the survivor stream they imply.
+///
+/// Same construction the script-plonky2 scanner uses after steps 1–3: one
+/// [`PublishedNullifier`] per member, in inscription then member order.
+/// Production apply paths treat this expansion as the **sole** survivor
+/// source so catalog and NfLog cannot be fed independent streams.
+///
+/// Crate-private: called from [`apply_forward_scan`] /
+/// [`apply_canonical_survivors`] (and unit tests). Not part of the public
+/// surface — the binary passes scanner streams only.
+pub(crate) fn survivors_from_accepted_inscriptions(
+    inscriptions: &[zkcoins_prover::scanner::ScannedInscription],
+) -> Result<Vec<PublishedNullifier>> {
+    let mut out = Vec::new();
+    for ins in inscriptions {
+        if ins.members.is_empty() {
+            bail!(
+                "accepted inscription at ({},{},{}) has zero members",
+                ins.height,
+                ins.tx_index,
+                ins.vin_index
+            );
+        }
+        for (i, (pk, r)) in ins.members.iter().enumerate() {
+            let member_index = u32::try_from(i).with_context(|| {
+                format!(
+                    "member_index {i} at ({},{},{}) does not fit in u32",
+                    ins.height, ins.tx_index, ins.vin_index
+                )
+            })?;
+            out.push(PublishedNullifier {
+                chain_pos: ChainPosition {
+                    height: ins.height,
+                    tx_index: ins.tx_index,
+                    vin_index: ins.vin_index,
+                    member_index,
+                },
+                pk: *pk,
+                r: *r,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Fail loud when the survivor list is not exactly the member expansion of
+/// `inscriptions` (order and content).
+///
+/// Counts in the error message: `survivor_count` vs `inscription_member_count`
+/// (and `inscription_count` for context). Either direction of drift refuses.
+///
+/// Crate-private: invoked by the apply paths immediately before mutate (and
+/// by unit tests). Not part of the public surface.
+pub(crate) fn ensure_accepted_survivor_coupling(
+    survivors: &[PublishedNullifier],
+    inscriptions: &[zkcoins_prover::scanner::ScannedInscription],
+) -> Result<()> {
+    let expected = survivors_from_accepted_inscriptions(inscriptions)?;
+    if survivors.len() != expected.len() {
+        bail!(
+            "accepted-inscription / survivor stream coupling broken: \
+             survivor_count={} inscription_member_count={} inscription_count={}",
+            survivors.len(),
+            expected.len(),
+            inscriptions.len()
+        );
+    }
+    for (i, (got, want)) in survivors.iter().zip(expected.iter()).enumerate() {
+        if got != want {
+            bail!(
+                "accepted-inscription / survivor stream coupling broken at index {i}: \
+                 survivor_count={} inscription_member_count={} inscription_count={}; \
+                 got chain_pos=({},{},{},{}) pk={} want chain_pos=({},{},{},{}) pk={}",
+                survivors.len(),
+                expected.len(),
+                inscriptions.len(),
+                got.chain_pos.height,
+                got.chain_pos.tx_index,
+                got.chain_pos.vin_index,
+                got.chain_pos.member_index,
+                hex::encode(got.pk),
+                want.chain_pos.height,
+                want.chain_pos.tx_index,
+                want.chain_pos.vin_index,
+                want.chain_pos.member_index,
+                hex::encode(want.pk),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Forward-path delta check: every newly appended catalog head must have all
+/// of its members present in `new_survivors`.
+///
+/// The reverse (new survivors without new catalog heads) is allowed — after a
+/// still-canonical restart, first-occurrence losers reappear as fold delta
+/// while their catalog head is already durable.
+fn ensure_new_catalog_delta_coupled(
+    catalog_rows: &[crate::v1::db_v1::CatalogInscription],
+    new_survivors: &[PublishedNullifier],
+) -> Result<()> {
+    if catalog_rows.is_empty() {
+        return Ok(());
+    }
+    let mut expected: Vec<PublishedNullifier> = Vec::new();
+    for ins in catalog_rows {
+        for (member_index, pk, r) in &ins.members {
+            expected.push(PublishedNullifier {
+                chain_pos: ChainPosition {
+                    height: ins.height,
+                    tx_index: ins.tx_index,
+                    vin_index: ins.vin_index,
+                    member_index: *member_index,
+                },
+                pk: *pk,
+                r: *r,
+            });
+        }
+    }
+    let head_keys: std::collections::HashSet<(u64, u32, u32)> = catalog_rows
+        .iter()
+        .map(|i| (i.height, i.tx_index, i.vin_index))
+        .collect();
+    let relevant: Vec<&PublishedNullifier> = new_survivors
+        .iter()
+        .filter(|s| {
+            head_keys.contains(&(
+                s.chain_pos.height,
+                s.chain_pos.tx_index,
+                s.chain_pos.vin_index,
+            ))
+        })
+        .collect();
+    let mut missing = 0u64;
+    for e in &expected {
+        if !new_survivors.iter().any(|s| s == e) {
+            missing += 1;
+        }
+    }
+    if missing > 0 || relevant.len() != expected.len() {
+        bail!(
+            "forward catalog/survivor delta coupling broken: \
+             new_catalog_inscriptions={} new_catalog_members={} \
+             new_survivors_total={} new_survivors_for_new_catalog_heads={} \
+             missing_member_rows={}",
+            catalog_rows.len(),
+            expected.len(),
+            new_survivors.len(),
+            relevant.len(),
+            missing
+        );
+    }
+    Ok(())
 }
 
 /// Build [`PublishedNullifier`] rows for one multi-member inscription at a

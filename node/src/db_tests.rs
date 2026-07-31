@@ -104,6 +104,9 @@ async fn connect_and_migrate_creates_all_tables() {
     //     (no new table names; prover_mode / shape columns on runs).
     //   * After 0027 (rename v11_* → v1_*): same count; renames stack
     //     tables/indexes + stack_scan_mode / prover_mode labels.
+    //   * After 0029 (jobs kind receive): ALTER-only.
+    //   * After 0030 (v1 inscriptions catalog): +2 tables
+    //     (`v1_inscriptions`, `v1_inscription_members`).
     assert_eq!(
         names,
         vec![
@@ -137,6 +140,8 @@ async fn connect_and_migrate_creates_all_tables() {
             "usernames".to_string(),
             "v1_accounts".to_string(),
             "v1_engine_meta".to_string(),
+            "v1_inscription_members".to_string(),
+            "v1_inscriptions".to_string(),
             "v1_nflog_entries".to_string(),
             "v1_nullifier_index".to_string(),
             "v1_pending_publishes".to_string(),

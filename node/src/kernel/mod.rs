@@ -26,7 +26,7 @@ pub(crate) mod types;
 /// import it from the defining module when needed.
 pub(crate) use chain::{
     AccumulatorTip, ChainIdentity, ChainReadinessFlags, ChainView, KernelInfo, KernelNetwork,
-    ListInscriptions, NullifierPath, NullifierPathRequest,
+    ListInscriptions, ListInscriptionsPage, ListedInscription, NullifierPath, NullifierPathRequest,
 };
 pub(crate) use error::{KernelError, KernelErrorCode, KernelResult};
 pub(crate) use job_events::JobEventHub;

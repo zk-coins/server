@@ -27,16 +27,18 @@ use zkcoins_program::circuit::compliance::Network;
 use zkcoins_prover::prover_bridge::ProverBridge;
 use zkcoins_prover::state_engine::StateEngine;
 
-use super::db_v1::{self, EngineSnapshot};
+use super::db_v1::{self, CatalogInscription, EngineSnapshot};
 use super::mode::{network_label, v1_boot_pins_from_env, V1_BOOT_CONFIG_ERROR};
 use super::separation::require_v1_process_for_nflog_write;
 
 /// In-memory engine plus the tip block hash the StateEngine does not yet
 /// carry (Stage 1: hash lives on the adapter / snapshot so equal-height
-/// forks stay distinguishable across persist/reload).
+/// forks stay distinguishable across persist/reload), and the inscription
+/// catalog written at fold time (same durable transaction as NfLog).
 struct LiveEngine {
     engine: StateEngine,
     tip_hash: [u8; 32],
+    catalog: Vec<CatalogInscription>,
 }
 
 /// Identity fingerprints for restart tests:
@@ -74,6 +76,7 @@ impl EngineAdapter {
                     live: Mutex::new(LiveEngine {
                         engine,
                         tip_hash: [0u8; 32],
+                        catalog: Vec::new(),
                     }),
                     write_gate: AsyncMutex::new(()),
                     pool,
@@ -103,11 +106,16 @@ impl EngineAdapter {
                     );
                 }
                 let tip_hash = snap.tip_hash;
+                let catalog = snap.inscriptions.clone();
                 let engine = snap
                     .into_engine()
                     .context("EngineAdapter: reconstruct StateEngine from snapshot")?;
                 Ok(Self {
-                    live: Mutex::new(LiveEngine { engine, tip_hash }),
+                    live: Mutex::new(LiveEngine {
+                        engine,
+                        tip_hash,
+                        catalog,
+                    }),
                     write_gate: AsyncMutex::new(()),
                     pool,
                     network,
@@ -216,7 +224,55 @@ impl EngineAdapter {
     /// downstream cannot roll its own mutate window.
     pub(crate) fn snapshot_live(&self) -> EngineSnapshot {
         let guard = self.live.lock().expect("EngineAdapter mutex poisoned");
-        EngineSnapshot::from_engine_with_tip_hash(&guard.engine, guard.tip_hash)
+        EngineSnapshot::from_engine_with_tip_hash(
+            &guard.engine,
+            guard.tip_hash,
+            guard.catalog.clone(),
+        )
+    }
+
+    /// Read-only clone of the in-memory inscription catalog.
+    pub(crate) fn catalog_snapshot(&self) -> Vec<CatalogInscription> {
+        self.live
+            .lock()
+            .expect("EngineAdapter mutex poisoned")
+            .catalog
+            .clone()
+    }
+
+    /// Replace the full catalog (reorg / full-replace apply).
+    pub(crate) fn replace_catalog(&self, catalog: Vec<CatalogInscription>) -> Result<()> {
+        require_v1_process_for_nflog_write()
+            .context("EngineAdapter::replace_catalog: stack claim required")?;
+        let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");
+        guard.catalog = catalog;
+        Ok(())
+    }
+
+    /// Append newly accepted inscriptions (forward scan). Refuses duplicate
+    /// triple keys so a re-scan cannot double-insert.
+    pub(crate) fn append_catalog(&self, new: &[CatalogInscription]) -> Result<()> {
+        require_v1_process_for_nflog_write()
+            .context("EngineAdapter::append_catalog: stack claim required")?;
+        let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");
+        for ins in new {
+            let key = ins.cursor_key();
+            if guard.catalog.iter().any(|e| e.cursor_key() == key) {
+                bail!(
+                    "EngineAdapter::append_catalog: inscription at \
+                     ({},{},{}) already present — refusing silent overwrite",
+                    ins.height,
+                    ins.tx_index,
+                    ins.vin_index
+                );
+            }
+            guard.catalog.push(ins.clone());
+        }
+        // Keep stream order: (height, tx_index, vin_index).
+        guard
+            .catalog
+            .sort_by_key(|e| (e.height, e.tx_index, e.vin_index));
+        Ok(())
     }
 
     /// Replace the live engine from a previously taken [`Self::snapshot_live`].
@@ -244,23 +300,33 @@ impl EngineAdapter {
             );
         }
         let tip_hash = snap.tip_hash;
+        let catalog = snap.inscriptions.clone();
         let engine = snap
             .into_engine()
             .context("EngineAdapter::restore_live reconstruct")?;
         let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");
         guard.engine = engine;
         guard.tip_hash = tip_hash;
+        guard.catalog = catalog;
         Ok(())
     }
 
     /// Snapshot the live engine and write it atomically to Postgres.
+    ///
+    /// NfLog, accounts, and the inscription catalog share one transaction
+    /// (`clear_all` + `write_all`) so a failed fold cannot leave catalog
+    /// rows without a matching NfLog tip (or the reverse).
     ///
     /// **Crate-private durable-write sink.** Downstream durable writes go
     /// through receive / scan orchestration only.
     pub(crate) async fn persist(&self) -> Result<()> {
         let snap = {
             let guard = self.live.lock().expect("EngineAdapter mutex poisoned");
-            EngineSnapshot::from_engine_with_tip_hash(&guard.engine, guard.tip_hash)
+            EngineSnapshot::from_engine_with_tip_hash(
+                &guard.engine,
+                guard.tip_hash,
+                guard.catalog.clone(),
+            )
         };
         db_v1::persist_engine_snapshot(&self.pool, &snap)
             .await
@@ -303,12 +369,14 @@ impl EngineAdapter {
             );
         }
         let tip_hash = snap.tip_hash;
+        let catalog = snap.inscriptions.clone();
         let engine = snap
             .into_engine()
             .context("EngineAdapter::reload_from_db reconstruct")?;
         let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");
         guard.engine = engine;
         guard.tip_hash = tip_hash;
+        guard.catalog = catalog;
         Ok(())
     }
 
@@ -347,6 +415,7 @@ impl EngineAdapter {
             let mut guard = self.live.lock().expect("EngineAdapter mutex poisoned");
             guard.engine = StateEngine::new(self.network, self.activation_height);
             guard.tip_hash = [0u8; 32];
+            guard.catalog.clear();
         }
         self.persist()
             .await

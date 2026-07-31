@@ -290,7 +290,7 @@ async fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
     )
     .expect("insert account with operational bundle");
 
-    let snap = EngineSnapshot::from_engine_with_tip_hash(&live, [0x10; 32]);
+    let snap = EngineSnapshot::from_engine_with_tip_hash(&live, [0x10; 32], Vec::new());
     db_v1::persist_engine_snapshot(&pool, &snap)
         .await
         .expect("persist engine snapshot with op_secret");
@@ -395,7 +395,7 @@ async fn restart_identity_nflog_and_coinhist_roots() {
     let before_mirror = engine.nflog_mirror();
     let tip_hash = [0xAB; 32];
 
-    let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, tip_hash);
+    let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, tip_hash, Vec::new());
     assert_eq!(snap.tip_hash, tip_hash);
     db_v1::persist_engine_snapshot(&pool, &snap)
         .await
@@ -521,7 +521,7 @@ async fn missing_meta_with_data_rows_fails_loud() {
 
     // Seed a complete snapshot so child tables have rows.
     let engine = seeded_engine();
-    let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, [0x11; 32]);
+    let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, [0x11; 32], Vec::new());
     db_v1::persist_engine_snapshot(&pool, &snap)
         .await
         .expect("persist");
@@ -615,8 +615,9 @@ async fn tip_hash_survives_persist_reload() {
 // ---------------------------------------------------------------------------
 
 use super::scan::{
-    apply_canonical_survivors, first_boot_requires_full_replace, fold_survivors_into_engine,
-    members_to_published, observation_tip_still_live, reconcile_persisted_tip, sort_canonical,
+    apply_canonical_survivors, ensure_accepted_survivor_coupling, first_boot_requires_full_replace,
+    fold_survivors_into_engine, members_to_published, observation_tip_still_live,
+    reconcile_persisted_tip, sort_canonical, survivors_from_accepted_inscriptions,
     PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome, MAX_RECOVERABLE_REORG_DEPTH,
 };
 use super::separation::{
@@ -632,6 +633,31 @@ fn expect_ready(outcome: TipReconcileOutcome) -> PersistedTipReconciliation {
         TipReconcileOutcome::RetryableIncompleteView { detail, .. } => {
             panic!("expected Ready recon, got RetryableIncompleteView: {detail}")
         }
+    }
+}
+
+/// Synthetic accepted inscription matching `members_to_published` for coupling tests.
+fn scanned_inscription(
+    height: u64,
+    tx_index: u32,
+    vin_index: u32,
+    members: Vec<([u8; 32], [u8; 32])>,
+) -> zkcoins_prover::scanner::ScannedInscription {
+    use zkcoins_prover::half_agg::BlockAnchor;
+    zkcoins_prover::scanner::ScannedInscription {
+        height,
+        tx_index,
+        vin_index,
+        reveal_txid: {
+            let mut t = [0u8; 32];
+            t[0] = height as u8;
+            t[1] = tx_index as u8;
+            t[2] = vin_index as u8;
+            t
+        },
+        format: 0x00,
+        members,
+        block_anchor: BlockAnchor::default(),
     }
 }
 
@@ -848,7 +874,7 @@ async fn hard_separation_v1_claim_accepts_own_refuses_legacy() {
             .expect("fresh DB claims v1");
         // Persist a real snapshot under the claim (transactional writer).
         let engine = StateEngine::new(Network::Regtest, 0);
-        let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, [0u8; 32]);
+        let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, [0u8; 32], Vec::new());
         db_v1::persist_engine_snapshot(&pool, &snap)
             .await
             .expect("persist under v1 claim");
@@ -893,7 +919,7 @@ async fn v1_persist_refuses_under_mismatching_marker_in_transaction() {
         .expect("claim legacy");
 
     let engine = StateEngine::new(Network::Regtest, 0);
-    let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, [0x42; 32]);
+    let snap = EngineSnapshot::from_engine_with_tip_hash(&engine, [0x42; 32], Vec::new());
     let err = db_v1::persist_engine_snapshot(&pool, &snap)
         .await
         .expect_err("v1 persist under legacy marker must fail");
@@ -991,23 +1017,33 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
         .await
         .expect("adapter");
-    let fork_survivors = members_to_published(10, 0, 0, &[(pk(1), r_val(1)), (pk(2), r_val(2))])
-        .expect("old fork members");
-    let mut orphaned = members_to_published(11, 0, 0, &[(pk(3), r_val(3))]).expect("orphan");
+    let fork_members = vec![(pk(1), r_val(1)), (pk(2), r_val(2))];
+    let orphan_members = vec![(pk(3), r_val(3))];
+    let fork_survivors = members_to_published(10, 0, 0, &fork_members).expect("old fork members");
+    let mut orphaned = members_to_published(11, 0, 0, &orphan_members).expect("orphan");
     let mut old_stream = fork_survivors.clone();
     old_stream.append(&mut orphaned);
+    let old_inscriptions = vec![
+        scanned_inscription(10, 0, 0, fork_members.clone()),
+        scanned_inscription(11, 0, 0, orphan_members),
+    ];
 
-    apply_canonical_survivors(&adapter, 11, old_tip_hash, &old_stream)
+    apply_canonical_survivors(&adapter, 11, old_tip_hash, &old_stream, &old_inscriptions)
         .await
         .expect("persist old fork");
     let (old_root, _) = adapter.identity_roots();
     assert_eq!(adapter.with_engine(|e| e.nflog().nav().size), 3);
 
     // --- New canonical stream after reorg (pk3 orphaned, pk4 wins at 11) ---
+    let replacement_members = vec![(pk(4), r_val(4))];
     let mut new_stream = fork_survivors;
     let mut replacement =
-        members_to_published(11, 0, 0, &[(pk(4), r_val(4))]).expect("replacement");
+        members_to_published(11, 0, 0, &replacement_members).expect("replacement");
     new_stream.append(&mut replacement);
+    let new_inscriptions = vec![
+        scanned_inscription(10, 0, 0, fork_members),
+        scanned_inscription(11, 0, 0, replacement_members),
+    ];
 
     // Independent continuous-node oracle: sequential first-occurrence fold
     // the way a node that never restarted would accumulate — never calls
@@ -1060,7 +1096,7 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     assert_eq!(restarted.identity_roots().0, old_root);
 
     // Shallow apply — must match the independent sequential oracle.
-    apply_canonical_survivors(&restarted, 11, new_tip_hash, &new_stream)
+    apply_canonical_survivors(&restarted, 11, new_tip_hash, &new_stream, &new_inscriptions)
         .await
         .expect("restart full replace");
 
@@ -1095,6 +1131,216 @@ async fn restart_across_reorg_rebuilds_nflog_to_continuous_node() {
     let err = reconcile_persisted_tip(5, [0u8; 32], 0, 5, [1u8; 32], 5, |_| Ok(None))
         .expect_err("zero hash with height must refuse");
     assert!(format!("{err:#}").contains("all-zero"), "got: {err:#}");
+}
+
+/// Catalog reorg cut: entries above the ancestor are dropped with the NfLog
+/// full-replace; entries at/below the ancestor remain.
+#[tokio::test]
+async fn catalog_reorg_truncates_above_ancestor_with_nflog() {
+    use zkcoins_prover::half_agg::BlockAnchor;
+    use zkcoins_prover::scanner::ScannedInscription;
+
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    enforce_stack_scan_mode(&pool, ScanStackMode::V1)
+        .await
+        .expect("claim v1");
+
+    let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Regtest, 0)
+        .await
+        .expect("adapter");
+
+    let below = ScannedInscription {
+        height: 10,
+        tx_index: 0,
+        vin_index: 0,
+        reveal_txid: [0x10; 32],
+        format: 0x00,
+        members: vec![([0x01; 32], [0x11; 32])],
+        block_anchor: BlockAnchor {
+            block_hash: [0xAA; 32],
+            height: 9,
+        },
+    };
+    let above = ScannedInscription {
+        height: 11,
+        tx_index: 0,
+        vin_index: 0,
+        reveal_txid: [0x11; 32],
+        format: 0x00,
+        members: vec![([0x02; 32], [0x22; 32])],
+        block_anchor: BlockAnchor {
+            block_hash: [0xBB; 32],
+            height: 10,
+        },
+    };
+    let mut survivors_old =
+        members_to_published(10, 0, 0, &[([0x01; 32], [0x11; 32])]).expect("below");
+    survivors_old
+        .extend(members_to_published(11, 0, 0, &[([0x02; 32], [0x22; 32])]).expect("above"));
+
+    apply_canonical_survivors(
+        &adapter,
+        11,
+        [0x0D; 32],
+        &survivors_old,
+        &[below.clone(), above],
+    )
+    .await
+    .expect("seed catalog");
+    assert_eq!(adapter.catalog_snapshot().len(), 2);
+
+    // Reorg: keep only height ≤ 10, replace tip.
+    let survivors_new =
+        members_to_published(10, 0, 0, &[([0x01; 32], [0x11; 32])]).expect("retained");
+    apply_canonical_survivors(&adapter, 10, [0x0C; 32], &survivors_new, &[below])
+        .await
+        .expect("reorg catalog");
+
+    let cat = adapter.catalog_snapshot();
+    assert_eq!(cat.len(), 1, "entry above ancestor must be gone");
+    assert_eq!(cat[0].height, 10);
+    assert_eq!(cat[0].reveal_txid, [0x10; 32]);
+    // Durable: reload must match.
+    let reloaded = EngineAdapter::load_or_create(pool, Network::Regtest, 0)
+        .await
+        .expect("reload");
+    assert_eq!(reloaded.catalog_snapshot().len(), 1);
+    assert_eq!(reloaded.catalog_snapshot()[0].height, 10);
+}
+
+/// Atomizität: failed durable write restores pre-mutation catalog (and NfLog).
+#[tokio::test]
+async fn catalog_restore_after_failed_mutate_keeps_prior_rows() {
+    use zkcoins_prover::half_agg::BlockAnchor;
+    use zkcoins_prover::scanner::ScannedInscription;
+
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    enforce_stack_scan_mode(&pool, ScanStackMode::V1)
+        .await
+        .expect("claim v1");
+
+    let adapter = EngineAdapter::load_or_create(pool, Network::Regtest, 0)
+        .await
+        .expect("adapter");
+    let seed = ScannedInscription {
+        height: 5,
+        tx_index: 0,
+        vin_index: 0,
+        reveal_txid: [0x55; 32],
+        format: 0x01,
+        members: vec![([0x0A; 32], [0x0B; 32])],
+        block_anchor: BlockAnchor::default(),
+    };
+    let survivors =
+        members_to_published(5, 0, 0, &[([0x0A; 32], [0x0B; 32])]).expect("seed survivors");
+    apply_canonical_survivors(&adapter, 5, [0x05; 32], &survivors, &[seed])
+        .await
+        .expect("seed");
+    assert_eq!(adapter.catalog_snapshot().len(), 1);
+
+    // Snapshot → mutate catalog → restore without persist (simulates failed write).
+    let backup = adapter.snapshot_live();
+    let ghost = crate::v1::db_v1::CatalogInscription {
+        height: 99,
+        tx_index: 0,
+        vin_index: 0,
+        reveal_txid: [0x99; 32],
+        format: 0x00,
+        members: vec![(0, [0x99; 32], [0x98; 32])],
+        block_anchor_hash: [0; 32],
+        block_anchor_height: 0,
+    };
+    adapter.append_catalog(&[ghost]).expect("in-memory append");
+    assert_eq!(adapter.catalog_snapshot().len(), 2);
+    adapter.restore_live(backup).expect("restore");
+    let cat = adapter.catalog_snapshot();
+    assert_eq!(
+        cat.len(),
+        1,
+        "restore after failed fold must drop uncommitted catalog rows"
+    );
+    assert_eq!(cat[0].height, 5);
+    assert_eq!(cat[0].reveal_txid, [0x55; 32]);
+}
+
+/// Path-2 construction: survivors are exactly the member expansion of
+/// accepted inscriptions (order and content).
+#[test]
+fn survivors_from_accepted_match_member_expansion() {
+    let inscriptions = vec![
+        scanned_inscription(10, 0, 0, vec![(pk(1), r_val(1)), (pk(2), r_val(2))]),
+        scanned_inscription(11, 1, 0, vec![(pk(3), r_val(3))]),
+    ];
+    let derived = survivors_from_accepted_inscriptions(&inscriptions).expect("expand");
+    let expected = {
+        let mut v =
+            members_to_published(10, 0, 0, &[(pk(1), r_val(1)), (pk(2), r_val(2))]).expect("a");
+        v.extend(members_to_published(11, 1, 0, &[(pk(3), r_val(3))]).expect("b"));
+        v
+    };
+    assert_eq!(derived, expected);
+    ensure_accepted_survivor_coupling(&derived, &inscriptions).expect("coupled");
+}
+
+/// Decoupled streams refuse with both counts in the message.
+///
+/// Against a build that only *assumed* scanner coupling, this would pass
+/// apply with a silent catalog/NfLog skew — today it must fail loud.
+#[test]
+fn decoupled_survivor_without_inscription_refuses() {
+    let survivors = members_to_published(10, 0, 0, &[(pk(1), r_val(1))]).expect("s");
+    let err = ensure_accepted_survivor_coupling(&survivors, &[])
+        .expect_err("survivors without inscriptions must refuse");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("survivor_count=1") && msg.contains("inscription_member_count=0"),
+        "must report both counts; got: {msg}"
+    );
+}
+
+/// Inscription members with no survivor rows refuse (other drift direction).
+#[test]
+fn decoupled_inscription_without_survivor_refuses() {
+    let inscriptions = vec![scanned_inscription(10, 0, 0, vec![(pk(1), r_val(1))])];
+    let err = ensure_accepted_survivor_coupling(&[], &inscriptions)
+        .expect_err("inscriptions without survivors must refuse");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("survivor_count=0") && msg.contains("inscription_member_count=1"),
+        "must report both counts; got: {msg}"
+    );
+}
+
+/// Full-replace apply refuses decoupled streams (not only the pure helper).
+#[tokio::test]
+async fn apply_canonical_refuses_decoupled_streams() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    enforce_stack_scan_mode(&pool, ScanStackMode::V1)
+        .await
+        .expect("claim v1");
+    let adapter = EngineAdapter::load_or_create(pool, Network::Regtest, 0)
+        .await
+        .expect("adapter");
+    let survivors = members_to_published(5, 0, 0, &[(pk(1), r_val(1))]).expect("s");
+    // Empty inscriptions while survivors non-empty — pre-coupling this would
+    // fold NfLog and replace catalog with [] (silent catalog wipe relative to
+    // the survivor feed).
+    let err = apply_canonical_survivors(&adapter, 5, [0x05; 32], &survivors, &[])
+        .await
+        .expect_err("decoupled apply must refuse");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("coupling") || msg.contains("survivor_count"),
+        "must name coupling failure; got: {msg}"
+    );
+    assert_eq!(
+        adapter.with_engine(|e| e.nflog().nav().size),
+        0,
+        "refused apply must not fold"
+    );
 }
 
 /// Defect 1: offline reorg deeper than the recoverable limit (§3.9 ≥6)

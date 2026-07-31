@@ -6,21 +6,18 @@
 //! `Status::unimplemented("<Name>: not yet implemented")` — never an
 //! invented `Ok(...)` payload.
 //!
-//! Wired today (Block 4–8): `GetJob`, `StreamJob`, `CancelJob`,
+//! Wired today (Block 4–8 + catalog): `GetJob`, `StreamJob`, `CancelJob`,
 //! `SignTransition`, `SubmitTransition`, `AttestBalance`, `IssueViewGrant`,
-//! `GetInfo`, `GetAccumulator`, `GetNullifierPath`, `OpenPullChallenge`,
-//! `Pull`, `GetRecord`, `GetCoinProof`, `GetAccountState`, `Publish`,
-//! `EntrustOperationalBundle`, `RevokeOperationalBundle`.
-//! `ListInscriptions` stays `Unimplemented` until a scanner-written
-//! inscription catalog supplies reveal txid and §3.5 format (NfLog has
-//! neither — see `kernel::chain` module docs). `SubscribeReceipts` stays
-//! `Unimplemented` until a receive/decrypt-index writer exists that emits
-//! verified credits **after** durable persist (§4.8 / §4.9) — accepting a
-//! subscription with no producer is a silent empty stream (worse than
-//! naming the missing prerequisite; full writer contract in
-//! `kernel::access::receipts`). Wired procedures call the transport-neutral
-//! domain façade and map through `transport/grpc/` converters + the shared
-//! error contract.
+//! `GetInfo`, `GetAccumulator`, `GetNullifierPath`, `ListInscriptions`,
+//! `OpenPullChallenge`, `Pull`, `GetRecord`, `GetCoinProof`, `GetAccountState`,
+//! `Publish`, `EntrustOperationalBundle`, `RevokeOperationalBundle`.
+//! `SubscribeReceipts` stays `Unimplemented` until a receive/decrypt-index
+//! writer exists that emits verified credits **after** durable persist
+//! (§4.8 / §4.9) — accepting a subscription with no producer is a silent
+//! empty stream (worse than naming the missing prerequisite; full writer
+//! contract in `kernel::access::receipts`). Wired procedures call the
+//! transport-neutral domain façade and map through `transport/grpc/`
+//! converters + the shared error contract.
 //!
 //! The existing HTTP router is untouched; this is an additive internal
 //! surface only (Kernel/API split is a later step).
@@ -55,13 +52,13 @@ use crate::kernel::{
 };
 use crate::transport::grpc::{
     account_state_to_proto, accumulator_tip_to_proto, coin_proof_blob_to_proto,
-    entrust_result_to_proto, job_event_to_proto, job_to_proto, kernel_error_to_status,
-    kernel_info_to_proto, nullifier_path_to_proto, parse_attest_request, parse_coin_proof_request,
-    parse_entrust_request, parse_grant_request, parse_list_inscriptions_request,
-    parse_nullifier_path_request, parse_publish_request, parse_pull_request, parse_record_request,
-    parse_revoke_request, parse_session_authority, parse_session_bound, parse_sign_request,
-    parse_transition_request, publish_outcome_to_proto, pull_result_to_proto, record_blob_to_proto,
-    revoke_result_to_proto,
+    entrust_result_to_proto, inscription_to_proto, job_event_to_proto, job_to_proto,
+    kernel_error_to_status, kernel_info_to_proto, nullifier_path_to_proto, parse_attest_request,
+    parse_coin_proof_request, parse_entrust_request, parse_grant_request,
+    parse_list_inscriptions_request, parse_nullifier_path_request, parse_publish_request,
+    parse_pull_request, parse_record_request, parse_revoke_request, parse_session_authority,
+    parse_session_bound, parse_sign_request, parse_transition_request, publish_outcome_to_proto,
+    pull_result_to_proto, record_blob_to_proto, revoke_result_to_proto,
 };
 use crate::v1::PendingSignMap;
 use shared::spec_v1::Address;
@@ -328,19 +325,15 @@ impl Kernel for GrpcKernelService {
         &self,
         request: Request<ListInscriptionsRequest>,
     ) -> Result<Response<Self::ListInscriptionsStream>, Status> {
-        // Bounds/cursor normalisation still runs so an explicit limit=0
-        // is InvalidArgument, not a silent Unimplemented. After a
-        // well-formed request the answer is honest Unimplemented: proto
-        // `Inscription.txid` / `format` are non-optional scalars (absence
-        // is not representable), and the NfLog carries neither reveal
-        // txid nor §3.5 format. Inventing those fields is worse than no
-        // answer on a proof surface.
-        let _req = parse_list_inscriptions_request(request.into_inner()).map_err(map_domain_err)?;
-        Err(Status::unimplemented(
-            "ListInscriptions: not yet implemented — requires a scanner-written \
-             inscription catalog with reveal txid and §3.5 format (NfLog stores \
-             neither; nullifier membership remains available via GetNullifierPath)",
-        ))
+        let req = parse_list_inscriptions_request(request.into_inner()).map_err(map_domain_err)?;
+        let page = self.domain.list_inscriptions(req).map_err(map_domain_err)?;
+        // Transport edge only: domain page is already resolved. Map to proto
+        // without an intermediate `Result<_, Status>` (Status is large —
+        // `result_large_err`). The stream Item type still needs `Result` for
+        // tonic; wrap with `Result::Ok` (never constructs Err here).
+        let items: Vec<Inscription> = page.inscriptions.iter().map(inscription_to_proto).collect();
+        let stream = futures_util::stream::iter(items.into_iter().map(Result::<_, Status>::Ok));
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn get_nullifier_path(
@@ -898,15 +891,22 @@ mod tests {
                 .await,
             )
             .await;
-        }
-        // ListInscriptions is not wired: NfLog has no reveal txid / §3.5
-        // format; answers wait on a scanner-written inscription catalog.
-        expect_unimplemented(
-            "ListInscriptions",
-            svc.list_inscriptions(Request::new(ListInscriptionsRequest::default()))
+            // Well-formed ListInscriptions: without engine → Internal, never
+            // Unimplemented and never invented Ok. Defaults alone are enough
+            // to pass cursor/limit validation so this path reaches the engine
+            // gate (limit=0 would stop at bounds_exceeded first).
+            expect_chain_unavailable(
+                "ListInscriptions",
+                svc.list_inscriptions(Request::new(ListInscriptionsRequest {
+                    from_height: Some(0),
+                    from_tx_index: Some(0),
+                    from_vin_index: Some(0),
+                    limit: Some(100),
+                }))
                 .await,
-        )
-        .await;
+            )
+            .await;
+        }
         // SubmitTransition is wired: empty body fails closed as
         // malformed_request (InvalidArgument), not unimplemented.
         {

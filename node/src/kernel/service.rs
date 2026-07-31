@@ -3,15 +3,14 @@
 //! Block 1–4: `get_job`, `stream_job`, `cancel_job`, `sign_transition`,
 //! `submit_transition`. Block 5: `attest_balance`, `issue_view_grant`,
 //! and the shared challenge-store issue helpers. Block 6: read-only chain
-//! (`get_info`, `get_accumulator`, `get_nullifier_path`).
+//! (`get_info`, `get_accumulator`, `get_nullifier_path`, `list_inscriptions`).
 //! Block 7: `open_pull_challenge`, `pull`, `get_record`, `get_coin_proof`,
 //! `get_account_state`. Block 8: `publish`, `entrust_operational_bundle`,
 //! `revoke_operational_bundle`. `SubscribeReceipts` is not a façade method:
 //! there is no production credit writer after durable persist (§4.8 / §4.9),
 //! so gRPC answers `Unimplemented` (see `access::receipts` writer contract)
-//! rather than accepting a silent empty stream. `ListInscriptions` waits
-//! on a scanner-written inscription catalog (reveal txid + §3.5 format are
-//! not on the NfLog).
+//! rather than accepting a silent empty stream. `ListInscriptions` reads the
+//! scanner-written inscription catalog via [`ChainView`].
 
 use std::sync::Arc;
 
@@ -40,7 +39,8 @@ use crate::kernel::types::SubjectAddress;
 use crate::kernel::{
     AccumulatorTip, CancelPolicy, ChainIdentity, ChainReadinessFlags, ChainView, Job, JobEvent,
     JobEventHub, JobRequest, KernelError, KernelErrorCode, KernelInfo, KernelNetwork, KernelResult,
-    KernelStream, NullifierPath, NullifierPathRequest, SignTransition, TransitionCommand,
+    KernelStream, ListInscriptions, ListInscriptionsPage, NullifierPath, NullifierPathRequest,
+    SignTransition, TransitionCommand,
 };
 use crate::v1::{EngineAdapter, PendingSignMap};
 
@@ -271,6 +271,15 @@ impl KernelService {
     ) -> KernelResult<NullifierPath> {
         let view = self.require_chain_view()?;
         chain::get_nullifier_path(&view, request)
+    }
+
+    /// `ListInscriptions` — catalog page; requires engine (catalog lives there).
+    pub(crate) fn list_inscriptions(
+        &self,
+        request: ListInscriptions,
+    ) -> KernelResult<ListInscriptionsPage> {
+        let view = self.require_chain_view()?;
+        Ok(chain::list_inscriptions(&view, request))
     }
 
     /// `GetJob` — load and strictly project one job.

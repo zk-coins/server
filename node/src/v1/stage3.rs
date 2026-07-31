@@ -147,6 +147,7 @@ async fn load_engine_snapshot_refuses_foreign_last_proof_in_db() {
             last_nullifier: None,
             last_nullifier_pos: None,
         }],
+        inscriptions: vec![],
     };
     // persist serializes last_proof as raw bincode (no bind on write).
     db_v1::persist_engine_snapshot(&pool, &snap)
