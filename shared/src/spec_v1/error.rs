@@ -203,6 +203,60 @@ pub enum SpecError {
     ZbeAuthFailed { chunk_index: u32 },
     /// Plaintext would require more than `u32::MAX` chunks (`N` unencodable).
     ZbeTooManyChunks { n: usize },
+
+    // --- Bundle codecs: CoinProof / SelfDeliveryRecordV1 / BlobLocatorSet (§7.1) ---
+    /// Input ended before a fixed-width or length-prefixed field could be read.
+    BundleTruncated {
+        context: &'static str,
+        needed: usize,
+        remaining: usize,
+    },
+    /// A `u32-be` / `u16-be` length prefix exceeds the remaining bytes.
+    BundleLengthOverrun {
+        context: &'static str,
+        declared: u32,
+        remaining: usize,
+    },
+    /// Bytes remain after a complete top-level frame.
+    BundleTrailingBytes {
+        context: &'static str,
+        remaining: usize,
+    },
+    /// `asset_terms?` presence byte is neither `0x00` nor `0x01`.
+    CoinProofPresenceInvalid { got: u8 },
+    /// `asset_terms.issuance_version` is outside `{0x01, 0x02}`.
+    CoinProofIssuanceVersionInvalid { got: u8 },
+    /// Trailing `cap_total`/`terms_salt` presence disagrees with `issuance_version`.
+    ///
+    /// `cap_fields_present` is what the encoder/struct claimed (or what the
+    /// wire still had room for): `true` with version 1, or `false` with
+    /// version 2, both malformed per §7.1.
+    CoinProofAssetTermsVersionFieldsMismatch {
+        issuance_version: u8,
+        cap_fields_present: bool,
+    },
+    /// Self-delivery magic is not ASCII `"SDR1"`.
+    SdrMagicInvalid { got: [u8; 4] },
+    /// Self-delivery version byte is not `0x01`.
+    SdrVersionInvalid { got: u8 },
+    /// Self-delivery `record_kind` is outside `{0x01, 0x02, 0x03}`.
+    SdrRecordKindInvalid { got: u8 },
+    /// `BlobLocatorSet.holder_count == 0` (must be ≥ 1).
+    BlobLocatorCountZero,
+    /// `holder_count` exceeds the protocol upper bound ([`super::bundle::MAX_BLOB_HOLDERS`]).
+    ///
+    /// `count` is the **actual** number of holders presented — never clamped to
+    /// a wire width. `max` is the normative upper bound so the error names both
+    /// the observed size and the limit it violated.
+    BlobLocatorCountTooHigh { count: usize, max: usize },
+    /// A holder URL length prefix is 0.
+    BlobLocatorUrlEmpty { index: usize },
+    /// A holder URL length exceeds `MAX_HOLDER_URL_LEN` (2048).
+    BlobLocatorUrlTooLong { index: usize, len: usize },
+    /// A holder URL is not valid UTF-8.
+    BlobLocatorInvalidUtf8 { index: usize },
+    /// A holder URL contains a NUL byte (§7.1).
+    BlobLocatorUrlContainsNul { index: usize },
 }
 
 /// Which bootstrap URL list a length/UTF-8 error refers to.
@@ -576,6 +630,78 @@ impl fmt::Display for SpecError {
             }
             SpecError::ZbeTooManyChunks { n } => {
                 write!(f, "ZBE plaintext requires {n} chunks (exceeds u32::MAX)")
+            }
+            SpecError::BundleTruncated {
+                context,
+                needed,
+                remaining,
+            } => write!(
+                f,
+                "bundle truncated at {context}: needed {needed} bytes, have {remaining}"
+            ),
+            SpecError::BundleLengthOverrun {
+                context,
+                declared,
+                remaining,
+            } => write!(
+                f,
+                "bundle length prefix at {context}: declared {declared} exceeds remaining {remaining}"
+            ),
+            SpecError::BundleTrailingBytes {
+                context,
+                remaining,
+            } => write!(
+                f,
+                "bundle {context} has {remaining} trailing byte(s) after a complete frame"
+            ),
+            SpecError::CoinProofPresenceInvalid { got } => write!(
+                f,
+                "CoinProof asset_terms presence byte 0x{got:02x} is not 0x00/0x01"
+            ),
+            SpecError::CoinProofIssuanceVersionInvalid { got } => write!(
+                f,
+                "CoinProof asset_terms.issuance_version 0x{got:02x} is not 0x01/0x02"
+            ),
+            SpecError::CoinProofAssetTermsVersionFieldsMismatch {
+                issuance_version,
+                cap_fields_present,
+            } => write!(
+                f,
+                "CoinProof asset_terms version/trailing-field mismatch: \
+                 issuance_version={issuance_version}, cap_fields_present={cap_fields_present}"
+            ),
+            SpecError::SdrMagicInvalid { got } => write!(
+                f,
+                "SelfDeliveryRecordV1 magic invalid: got {:?} (expected ASCII \"SDR1\")",
+                String::from_utf8_lossy(got)
+            ),
+            SpecError::SdrVersionInvalid { got } => write!(
+                f,
+                "SelfDeliveryRecordV1 version invalid: 0x{got:02x} (expected 0x01)"
+            ),
+            SpecError::SdrRecordKindInvalid { got } => write!(
+                f,
+                "SelfDeliveryRecordV1 record_kind invalid: 0x{got:02x} (expected 0x01/0x02/0x03)"
+            ),
+            SpecError::BlobLocatorCountZero => {
+                write!(f, "BlobLocatorSet holder_count is 0 (must be >= 1)")
+            }
+            SpecError::BlobLocatorCountTooHigh { count, max } => write!(
+                f,
+                "BlobLocatorSet holder_count {count} exceeds MAX_BLOB_HOLDERS ({max})"
+            ),
+            SpecError::BlobLocatorUrlEmpty { index } => {
+                write!(f, "BlobLocatorSet holder URL at index {index} is empty")
+            }
+            SpecError::BlobLocatorUrlTooLong { index, len } => write!(
+                f,
+                "BlobLocatorSet holder URL at index {index} is {len} bytes (max 2048)"
+            ),
+            SpecError::BlobLocatorInvalidUtf8 { index } => {
+                write!(f, "BlobLocatorSet holder URL at index {index} is not valid UTF-8")
+            }
+            SpecError::BlobLocatorUrlContainsNul { index } => {
+                write!(f, "BlobLocatorSet holder URL at index {index} contains a NUL byte")
             }
         }
     }

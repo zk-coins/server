@@ -84,7 +84,8 @@ pub(crate) struct KernelServiceConfig {
     pub manifests: Arc<ManifestStore>,
     /// Pull sessions (process-local; no durable table yet).
     pub sessions: Arc<SessionStore>,
-    /// Private-record + account-state index (empty in-memory until catalog).
+    /// Private-record + account-state index (process mirror of
+    /// `v1_decrypt_index`; filled by the §4.4 receive path after durable write).
     pub private_index: Arc<InMemoryPrivateIndex>,
     /// Live NfLog / tip / identity for read-only chain procedures.
     pub chain: ChainHandle,
@@ -108,7 +109,7 @@ pub(crate) struct KernelService {
     manifests: Arc<ManifestStore>,
     /// Pull sessions (process-local; no durable table yet).
     sessions: Arc<SessionStore>,
-    /// Private-record + account-state index (empty in-memory until catalog).
+    /// Private-record + account-state index (process mirror of durable decrypt index).
     private_index: Arc<InMemoryPrivateIndex>,
     /// Live NfLog / tip / identity for read-only chain procedures.
     chain: ChainHandle,
@@ -210,6 +211,13 @@ impl KernelService {
         self
     }
 
+    /// Install the process-local operational-bundle store shared with the
+    /// post-persist delivery path (same entrust/revoke map the mesh uses).
+    pub(crate) fn with_bundle_store(mut self, bundles: Arc<BundleStore>) -> Self {
+        self.bundles = bundles;
+        self
+    }
+
     /// Install the boot-time verified bootstrap-manifest store (or empty).
     ///
     /// Called from the REST/gRPC boot edge after the optional BMF1 load.
@@ -221,10 +229,15 @@ impl KernelService {
     }
 
     /// Private-record index handle for the production decrypt-index writer
-    /// (when wired). Empty until a catalog exists; still reachable so the
-    /// Arc field is not library-dead.
+    /// (§4.4 scanner → durable `v1_decrypt_index` → this process mirror).
     pub(crate) fn private_record_index(&self) -> &Arc<InMemoryPrivateIndex> {
         &self.private_index
+    }
+
+    /// Install a shared private-record index (same Arc the receive scanner writes).
+    pub(crate) fn with_private_index(mut self, index: Arc<InMemoryPrivateIndex>) -> Self {
+        self.private_index = index;
+        self
     }
 
     /// Verified bootstrap-manifest store for GetInfo / ChainIdentity wiring.

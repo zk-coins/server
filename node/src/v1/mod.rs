@@ -80,9 +80,29 @@ mod adapter;
 // name sealed sinks via `node::v1::{mint,provenance}::…` still fail
 // (module is private).
 pub(crate) mod attest;
+/// Blossom blob-store client (§7.4): content-addressed fetch/upload against
+/// an untrusted peer. Crate-private; DELETE returns with §4.6 retention.
+pub(crate) mod blossom;
+/// Durable `v1_decrypt_index` (migration 0031) — SQL half of the private-record catalog.
+pub(crate) mod db_decrypt_index;
 pub mod db_v1;
+/// §4.2 send-path delivery: finished transition → gift-wrapped kind-1059.
+/// Port pattern matches the nullifier publisher; kernel stays transport-free.
+pub(crate) mod delivery;
+/// §4.4 note discovery → §2.3.3 verify → durable index → §4.2 ACK.
+pub(crate) mod incoming;
 pub(crate) mod mint;
 pub mod mode;
+/// Nostr transport primitives (NIP-01, NIP-44 v2, NIP-59, kinds 1420/1421,
+/// relay client, kind-0 profile resolution + `Invoice`). Crate-private:
+/// public-surface allowlists stay still; kernel stays transport-free.
+/// Delivery path: [`delivery`] (post-persist mesh send).
+/// Receive path: [`incoming`] (scan → verify → durable index → ACK).
+/// Kind 30423 bootstrap mirror is unit-tested only until a production
+/// Nostr discovery caller exists.
+pub(crate) mod nostr;
+/// Production CSPRNG for mesh delivery / NIP-59 (runtime boot).
+pub(crate) use nostr::nip59::OsSecureRandom;
 pub(crate) mod provenance;
 pub mod publish;
 pub mod receive;
@@ -116,9 +136,23 @@ pub(crate) use attest::{
     v1_attest_route_active, AttestBalanceRequest, AttestChallengeMap, AttestChallengeRequest,
     AttestError, AttestJobBody, U64Decimal, ATTEST_BALANCE_CHALLENGE_DOMAIN,
 };
+// Delivery port + process-local stores used from `runtime` as `crate::v1::…`.
+// Request/report types and `DeliveryTarget` stay on the defining module path
+// (`crate::v1::delivery::…` / signature).
+//
+// `DeliveryTargetStore` + `PaymentInvoice` are **public**: the API/SDK layer
+// (other repo) must insert a verified §4.3 Invoice before mesh send — see
+// `insert_verified_invoice` doc. No in-crate production caller is the
+// documented gap, not a reason to hide the façade.
+pub use delivery::DeliveryTargetStore;
+pub(crate) use delivery::{MeshDeliveryPort, OutgoingDeliveryPort, PendingDeliveryStore};
+/// §4.4 receive poll used from `runtime`.
+pub(crate) use incoming::poll_incoming_deliveries;
 /// Kernel-API (§7.5): gRPC mint begin — process-claim-gated orchestration.
 pub use mint::begin_v1_mint;
 pub use mode::{v1_boot_pins_from_env, v1_shadow_mode_from_env, V1BootPins, V1ShadowMode};
+/// §4.3 amount-specific Invoice for [`DeliveryTargetStore::insert_verified_invoice`].
+pub use nostr::profile::PaymentInvoice;
 /// Kernel-API (§7.5): gRPC send begin — CoinHist provenance orchestration.
 pub use provenance::begin_v1_send;
 pub(crate) use provenance::{refuse_legacy_send_under_v1, LEGACY_SEND_REFUSED_UNDER_V1};
@@ -144,6 +178,8 @@ pub use separation::{
 pub(crate) use separation::{
     ensure_legacy_publisher_allowed, process_stack_mode, require_stack_mode_for_update,
 };
+// `FinaliseDeliveryDeps` is constructed in `runtime` via
+// `crate::v1::signature::FinaliseDeliveryDeps` (not the v1 facade).
 pub(crate) use signature::{
     accept_wallet_transition_signature, decode_job_error, encode_job_error,
     ensure_completion_ready, ensure_finalise_ready, finalise_accepted_prove_persist_and_stage,

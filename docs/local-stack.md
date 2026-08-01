@@ -1,6 +1,7 @@
 # Local stack (`compose.yaml`) — full unmocked pass
 
-Bring up **PostgreSQL 17**, **bitcoind regtest**, and the **node** process with the
+Bring up **PostgreSQL 17**, **bitcoind regtest**, a **Nostr relay**
+(`scsibug/nostr-rs-relay:0.8.13`), and the **node** process with the
 environment the Stage-3 binary actually demands. Run the **api** beside Compose
 (no Dockerfile in `zk-coins/api`). Goal of this document: a **complete** path
 
@@ -16,6 +17,7 @@ wallet key material.
 | --- | --- | --- |
 | `postgres` | State layer | `db::connect_and_migrate` on every boot (`node/src/main.rs`, `node/src/db.rs`). Schema: `node/migrations/`. Image tag **17** matches testcontainers (`node/src/test_db.rs` `.with_tag("17")`). |
 | `bitcoind` | Regtest L1 | Stage-3 NfLog scan + AggregateStateNullifierV3 publish are **bitcoind RPC + cookie** (`node/src/v1/scan.rs` `v1_bitcoind_rpc_from_env`, `node/src/v1/publish.rs` `v1_publisher_env_from_env`). Image **`bitcoin/bitcoin:31.1`** (pinned; repo has no bitcoind version — see below). |
+| `nostr-relay` | NIP-01 WebSocket relay | Local §4.2 / §4.3 delivery peer. Image **`scsibug/nostr-rs-relay:0.8.13`** (pinned; same tag as testcontainers in `node/src/v1/nostr/relay.rs`). Listens on **8080**. The node process does **not** yet wire the relay client into send/receive (later block); the service is here for local stack + client integration tests. |
 | `node` | Kernel binary | Built from repo `Dockerfile`. REST **`0.0.0.0:4242`** (`ACCOUNT_NODE_ADDR`). Kernel gRPC on `KERNEL_GRPC_ADDR` (published as host **50051**). |
 
 ## What this stack is not (compose services)
@@ -57,6 +59,18 @@ Cookie volume: named volume `bitcoind_data` → bitcoind datadir `/home/bitcoin/
 ### bitcoind image version
 
 No version is named in this repo’s CI, docs, or tests. Compose pins **`bitcoin/bitcoin:31.1`** (Bitcoin Core 31.1, multi-platform Debian image on Docker Hub; **not** `latest`). Client library in-tree is `bitcoincore-rpc = "0.19.0"`. Flags match README/CONTRIBUTING: `txindex=1`, `rest=1`, `server=1`, plus `rpcallowip` / `rpcbind` so other containers can use cookie HTTP Basic over the compose network.
+
+### nostr-relay image version
+
+Compose and the relay integration tests pin **`scsibug/nostr-rs-relay:0.8.13`** (not `latest`). Default image config listens on `0.0.0.0:8080` with on-disk SQLite under the `nostr_relay_data` volume. Readiness: TCP accept on port 8080 (`compose.yaml` healthcheck). From the host: `ws://127.0.0.1:8080/`. From another compose service: `ws://nostr-relay:8080/`.
+
+For `ZKCOINS_RELAY_URL` (GetInfo / identity ops pin — still required at boot even though the NIP-01 client is not yet wired into send/receive) a local-stack choice is:
+
+```bash
+export ZKCOINS_RELAY_URL=ws://nostr-relay:8080/
+```
+
+(host-side clients that are not in the compose network use `ws://127.0.0.1:8080/` instead).
 
 ## api (sibling process)
 
@@ -211,7 +225,8 @@ export ZKCOINS_BOOTSTRAP_PUBKEY=…   # 64 lowercase hex x-only — your materia
 export ZKCOINS_EXPECTED_PARAMS_IDENTIFIER=…  # compute as above
 
 # Operational pins (operator-chosen URLs for *this* local node — not invented)
-export ZKCOINS_RELAY_URL=…
+# Compose service `nostr-relay` → ws://nostr-relay:8080/ (host tools: ws://127.0.0.1:8080/)
+export ZKCOINS_RELAY_URL=ws://nostr-relay:8080/
 export ZKCOINS_BLOSSOM_URL=…
 export ZKCOINS_MAX_BLOB_BYTES=1048576
 export ZKCOINS_KERNEL_PARTS=scanner,prover,publisher
@@ -278,6 +293,7 @@ Do not “wait a bit”. Use these checks:
 | Postgres | `docker compose exec postgres pg_isready -U zkcoins -d zkcoins` | exit 0 / “accepting connections” |
 | bitcoind | `docker compose exec bitcoind bitcoin-cli -regtest -datadir=/home/bitcoin/.bitcoin getblockchaininfo` | JSON with `"chain": "regtest"` |
 | bitcoind cookie | `docker compose exec bitcoind test -f /home/bitcoin/.bitcoin/regtest/.cookie` | exit 0 |
+| nostr-relay | `docker compose exec nostr-relay bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'` | exit 0 (TCP accept on 8080) |
 | node liveness | `curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:4242/health` | `200`, body `ok` (`router.rs` `health_handler`) |
 | node gRPC port | TCP connect to `127.0.0.1:50051` (e.g. `nc -z 127.0.0.1 50051`) | open once REST/gRPC task bound |
 | node readiness | `curl -sS http://127.0.0.1:4242/health/ready` | `200` only when Postgres, **Esplora tip**, prover warm, v1 scan caught up, no deep reorg — else `503`. Liveness can be green while ready is red. |

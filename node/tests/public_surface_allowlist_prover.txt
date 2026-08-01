@@ -109,6 +109,11 @@ zkcoins_prover_plonky2::prover_bridge::ProverBridge::prove_transition
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::require_live_identity
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::verify_attestation
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::verify_transition
+# §2.3.3 receive: CoinProof.proof is native Plonky2 wire (§1.7.9), not bincode.
+# Node holds the bytes after bundle decode; only the bridge can from_bytes +
+# bind cyclic-tail to C. Reason on script-plonky2 crate-root positive list
+# (lib.rs prover_bridge bullet).
+zkcoins_prover_plonky2::prover_bridge::ProverBridge::load_transition_proof_bytes
 zkcoins_prover_plonky2::prover_bridge::ReceivedAuthorization
 zkcoins_prover_plonky2::prover_bridge::ReceivedAuthorization::creating_nav_consistency
 zkcoins_prover_plonky2::prover_bridge::ReceivedAuthorization::creating_nav_inclusion

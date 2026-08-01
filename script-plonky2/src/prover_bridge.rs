@@ -791,6 +791,22 @@ impl ProverBridge {
         Ok(proof)
     }
 
+    /// Load a §1.7.9 native wire proof (`ProofWithPublicInputs::to_bytes`)
+    /// and bind it to circuit `C` identity.
+    ///
+    /// This is the receive-path port for `CoinProof.proof` bytes: the
+    /// sender places Plonky2 native encoding in the bundle (§1.7.9), not
+    /// bincode. Full Plonky2 `verify` is a separate call
+    /// ([`Self::verify_transition`]) — identity bind alone is not credit.
+    pub fn load_transition_proof_bytes(&self, bytes: &[u8]) -> Result<ComplianceProof> {
+        self.ensure_proving_identity()?;
+        let circuit = compliance_circuit(self.network)?;
+        let proof = ComplianceProof::from_bytes(bytes.to_vec(), &circuit.data.common)
+            .context("native Plonky2 proof bytes rejected by from_bytes (CoinProof.proof)")?;
+        self.bind_prev_proof_identity(&proof)?;
+        Ok(proof)
+    }
+
     /// Bind an already-deserialized proof to circuit `C` identity (same
     /// gate as [`Self::bind_loaded_prev_proof`]).
     pub fn bind_prev_proof_identity(&self, proof: &ComplianceProof) -> Result<()> {

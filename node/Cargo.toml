@@ -33,6 +33,20 @@ sha2 = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 hex = "0.4.3"
+# NIP-44 v2 (node/src/v1/nostr/nip44.rs): pure ChaCha20 stream cipher. The
+# workspace already pins `chacha20poly1305` for ZBE AEAD, which pulls
+# `chacha20` transitively; NIP-44 authenticates with HMAC-SHA-256 rather
+# than Poly1305, so the naked stream crate is declared direct. Version
+# aligned with the `chacha20poly1305 0.10` → `chacha20 0.9` edge already
+# in the lockfile.
+chacha20 = "0.9"
+# HKDF-Extract/Expand for conversation + message keys (same line as `shared`).
+hkdf = "0.12"
+# HMAC-SHA-256 MAC over `nonce ‖ ciphertext` (NIP-44 authenticator).
+hmac = "0.12"
+# Standard Base64 (with padding) for the v2 payload string. Already locked
+# at 0.22 via other crates; declared direct for the Nostr payload codec.
+base64 = "0.22"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "time", "sync"] }
 # Event-driven chain ingestion (issue #84): WebSocket subscription to
 # the Esplora-compatible block-event stream replaces the previous
@@ -227,6 +241,15 @@ tonic = { version = "0.13.1", default-features = false, features = [
 # Not transitive today — declared direct because the transport error
 # contract depends on it explicitly.
 tonic-types = "0.13.1"
+# HTTP client for the Blossom blob-store (§7.4). Promoted from
+# `[dev-dependencies]`: Blossom *is* an HTTP surface; without a
+# production transport the client cannot exist. Same minimal feature
+# line as the former dev-dep, minus `json` — Blossom parses upload
+# JSON with workspace `serde_json` from raw body bytes, not
+# `reqwest::Response::json` / `RequestBuilder::json`. rustls (not
+# native-tls) matches `tokio-tungstenite` and keeps the binary free
+# of system openssl.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -234,7 +257,8 @@ http-body-util = "0.1"
 # Used by `publisher_tests` for Esplora mocking and by `router_tests`
 # to mock the Esplora HTTP endpoint behind the `/health/ready`
 # readiness probe so the tests never hit the real
-# `https://mutinynet.com/api` from CI.
+# `https://mutinynet.com/api` from CI. Also the Blossom unit-test
+# counterparty in `v1/blossom.rs`.
 wiremock = "0.6"
 # Shared Postgres 17 container for the test suite. The
 # `reusable-containers` feature is load-bearing: it enables
@@ -247,10 +271,11 @@ wiremock = "0.6"
 # `node/src/test_db.rs` for the call-site.
 testcontainers = { version = "0.27", features = ["reusable-containers"] }
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
-# HTTP client for the `api_remote` integration test, which exercises
-# the deployed DEV node end-to-end. rustls (not native-tls) to keep
-# the test runner self-contained on CI hosts without openssl headers.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Feature add-on only: production `reqwest` lives in `[dependencies]`
+# with `rustls-tls`. The `api_remote` integration suite needs
+# `Response::json` / `RequestBuilder::json`; Cargo unions features
+# across dependency kinds, so this does not pull a second copy.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # Random key + suffix generation for the `api_remote` suite so each
 # run picks a fresh wallet and avoids collisions with concurrent
 # DEV-node consumers.

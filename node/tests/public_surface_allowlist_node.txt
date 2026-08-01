@@ -135,6 +135,13 @@ node::username::LoadUsernameStoreError
 node::username::UsernameStore
 node::username::UsernameStore::load_from_pg
 node::v1
+# Mesh-delivery target façade for API/SDK (other repo). §7.5 carries only a
+# bare address; API must insert a verified §4.3 Invoice before mesh send.
+# Reason on node crate-root positive list (lib.rs v1 bullet).
+node::v1::DeliveryTargetStore
+node::v1::DeliveryTargetStore::insert_verified_invoice
+node::v1::DeliveryTargetStore::new
+node::v1::DeliveryTargetStore::shared
 node::v1::EngineAdapter
 node::v1::EngineAdapter::activation_height
 node::v1::EngineAdapter::bridge
@@ -159,6 +166,19 @@ node::v1::FoldStats
 node::v1::FoldStats::appended
 node::v1::FoldStats::below_activation
 node::v1::FoldStats::duplicate_ignored
+# §4.3 Invoice type for DeliveryTargetStore::insert_verified_invoice (API/SDK).
+node::v1::PaymentInvoice
+node::v1::PaymentInvoice::addr_sig
+node::v1::PaymentInvoice::amount
+node::v1::PaymentInvoice::asset_id
+node::v1::PaymentInvoice::ivpk
+node::v1::PaymentInvoice::memo
+node::v1::PaymentInvoice::nk_commit
+node::v1::PaymentInvoice::op_pubkey
+node::v1::PaymentInvoice::pk0
+node::v1::PaymentInvoice::recipient
+node::v1::PaymentInvoice::relays
+node::v1::PaymentInvoice::sig
 node::v1::PendingSignEntry
 node::v1::PendingSignEntry::completion_result
 node::v1::PendingSignEntry::completion_status

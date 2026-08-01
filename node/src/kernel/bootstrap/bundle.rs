@@ -168,12 +168,36 @@ impl BundleStore {
         }
     }
 
+    /// Full active operational bundle (`ivk`/`ovk`/`op`/`nk`/`op_secret`).
+    ///
+    /// `None` when the subject has never been entrusted in this process or has
+    /// been revoked. Callers **must** treat absence as a named error — there
+    /// is no default key material (BundleStore is process-local only).
+    pub(crate) fn get_active(&self, subject: &SubjectAddress) -> Option<OperationalBundle> {
+        match self.by_subject.get(&subject.0)?.value() {
+            BundleSlot::Active(b) => Some(*b),
+            BundleSlot::Revoked => None,
+        }
+    }
+
     /// Whether the subject currently has an active (non-revoked) bundle.
     pub(crate) fn is_active(&self, subject: &SubjectAddress) -> bool {
         matches!(
             self.by_subject.get(&subject.0).as_deref(),
             Some(BundleSlot::Active(_))
         )
+    }
+
+    /// Snapshot every active (subject, bundle) pair — for ACK inbox polling
+    /// and other process-local sweeps. Order is unspecified.
+    pub(crate) fn list_active(&self) -> Vec<(SubjectAddress, OperationalBundle)> {
+        self.by_subject
+            .iter()
+            .filter_map(|entry| match entry.value() {
+                BundleSlot::Active(b) => Some((SubjectAddress(*entry.key()), *b)),
+                BundleSlot::Revoked => None,
+            })
+            .collect()
     }
 
     /// Whether the subject is under a revoke tombstone.

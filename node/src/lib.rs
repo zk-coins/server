@@ -69,6 +69,12 @@
 //!   engine sinks and process-control helpers stay non-public.
 //!   `downstream-boundary` compile-fail matrix names sealed sinks on this
 //!   module tree.
+//!   **Mesh-delivery target façade (API/SDK, other repo):**
+//!   [`v1::DeliveryTargetStore`] + [`v1::PaymentInvoice`] +
+//!   [`v1::DeliveryTargetStore::insert_verified_invoice`]. §7.5 carries only
+//!   a bare zk-address; the API must insert a verified §4.3 Invoice before
+//!   prove/finalise so the send path has an IVPK + relays. No in-crate
+//!   production caller — that is the documented cross-repo gap.
 //! - [`self_heal`] — binary `heal_circuit_digest` / `ResetDecision`.
 //! - [`openapi`] — integration `openapi_smoke` reads `openapi_json` /
 //!   `DOCS_HTML` only; route handlers stay `pub(crate)`.

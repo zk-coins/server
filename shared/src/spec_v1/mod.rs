@@ -10,6 +10,7 @@
 
 pub mod accumulator;
 pub mod bootstrap_manifest;
+pub mod bundle;
 pub mod coinhist;
 pub mod datastructures;
 pub mod encoding;
@@ -40,6 +41,13 @@ pub use bootstrap_manifest::{
     serialize as serialize_bootstrap_manifest, verify_bootstrap_manifest, BootstrapManifestV1,
     ManifestClock, VerifyBootstrapManifest, BMF1_MAGIC, BMF1_VERSION, BOOTSTRAP_PROTOCOL_VERSION,
     MAX_BOOTSTRAP_URL_LEN,
+};
+pub use bundle::{
+    deserialize_blob_locator_set, deserialize_coin_proof, deserialize_self_delivery_record,
+    serialize_blob_locator_set, serialize_coin_proof, serialize_self_delivery_record,
+    BlobLocatorSet, BlockAnchor, CoinProof, CreatingNullifier, IssuanceTerms, NavOpening,
+    OutputRef, RecordKind, SelfDeliveryRecordV1, COIN_WIRE_LEN, MAX_ASSET_NAME_LEN,
+    MAX_BLOB_HOLDERS, MAX_HOLDER_URL_LEN, PROOF_DATA_WIRE_LEN, SDR1_MAGIC, SDR1_VERSION,
 };
 pub use coinhist::{
     coinhist_empty_root, coinhist_empty_subtree_roots, coinhist_leaf_hash, coinhist_node_hash,

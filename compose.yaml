@@ -4,6 +4,8 @@
 #   - postgres:17  — state layer (node/src/test_db.rs with_tag("17"), README)
 #   - bitcoind     — regtest RPC for Stage-3 NfLog scan + AggregateStateNullifierV3
 #                    publish (node/src/v1/scan.rs, node/src/v1/publish.rs)
+#   - nostr-relay  — NIP-01 WebSocket relay (node/src/v1/nostr/relay.rs;
+#                    testcontainers pin scsibug/nostr-rs-relay:0.8.13)
 #   - node         — Dockerfile + 0.0.0.0:4242 REST + KERNEL_GRPC_ADDR gRPC
 #
 # NOT a compose service (see docs/local-stack.md):
@@ -77,6 +79,31 @@ services:
           "-regtest",
           "-datadir=/home/bitcoin/.bitcoin",
           "getblockchaininfo",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  nostr-relay:
+    # Image pin: scsibug/nostr-rs-relay:0.8.13 — same tag as the
+    # testcontainers integration tests in node/src/v1/nostr/relay.rs
+    # (RELAY_IMAGE / RELAY_TAG). Starts with the image default config
+    # (listen 0.0.0.0:8080, on-disk SQLite). Not `latest`.
+    # WebSocket NIP-01 endpoint: ws://nostr-relay:8080/ (compose DNS)
+    # or ws://127.0.0.1:8080/ from the host.
+    image: scsibug/nostr-rs-relay:0.8.13
+    ports:
+      - "8080:8080"
+    volumes:
+      - nostr_relay_data:/usr/src/app/db
+    healthcheck:
+      # TCP readiness on the relay listen port — the image has bash;
+      # fails until the process accepts connections on 8080.
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'",
         ]
       interval: 5s
       timeout: 5s
@@ -201,3 +228,4 @@ volumes:
   postgres_data:
   node_data:
   bitcoind_data:
+  nostr_relay_data:

@@ -17,7 +17,14 @@
 //! - [`prover_bridge`] — `ProverBridge`, `TransitionWitness` (byte load only
 //!   via [`prover_bridge::TransitionWitness::decode_bound`]; no public
 //!   `Deserialize`; private wire type; no public `From`/`TryFrom`), prove/
-//!   verify/bind APIs.
+//!   verify/bind APIs. Cross-crate receive edge:
+//!   - [`prover_bridge::ProverBridge::load_transition_proof_bytes`] — node
+//!     §2.3.3 step 2 loads `CoinProof.proof` as **native** Plonky2 wire
+//!     (`ProofWithPublicInputs::from_bytes`), not bincode. The node already
+//!     holds the raw bytes after bundle decode, but only the bridge owns
+//!     circuit `C` common data + cyclic-tail bind; `bind_loaded_prev_proof`
+//!     is the durable-account bincode path and cannot accept §1.7.9 wire.
+//!     Full `verify_transition` remains a separate call.
 //! - [`prover_bridge::test_signing`] — `TestSignature`, `deterministic_secret`,
 //!   `normalized_key`, `sign_transition`: **required by `probe_r2`** for
 //!   host-valid clause-10 fixtures (not a production wallet API).

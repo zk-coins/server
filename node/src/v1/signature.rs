@@ -942,18 +942,40 @@ pub fn finalise_accepted_prove_outside_lock(
     })
 }
 
+/// Runtime-supplied deps for §4.2 mesh delivery after durable persist.
+///
+/// Absent means "no delivery port installed" (legacy stack / tests). When
+/// present, finalise runs delivery **after** engine+members_ready persist
+/// and **after** the nullifier publish hand-off — never before durable
+/// write. Missing operational bundle or recipient IVPK is a named error.
+pub(crate) struct FinaliseDeliveryDeps<'a> {
+    pub port: &'a dyn crate::v1::delivery::OutgoingDeliveryPort,
+    pub bundles: &'a crate::kernel::bootstrap::BundleStore,
+    pub targets: &'a crate::v1::delivery::DeliveryTargetStore,
+    /// Ordered Blossom base URLs (holders only; no default).
+    pub blob_holders: Vec<String>,
+    pub max_blob_bytes: u64,
+    pub now: u64,
+    /// Kind-24242 auth expiration (absolute unix seconds).
+    pub auth_expiration: u64,
+    /// Closed network label for post-send profile refresh (`mainnet`/…).
+    pub expected_network: &'a str,
+}
+
 /// Production job-path finalise: prove outside the lock, apply under the
 /// write gate, then **atomically** persist the engine snapshot and stage
 /// `v1_pending_publishes` (`members_ready`) **under the claim fence**, then
 /// hand the staged intent to the durable nullifier publisher
-/// ([`crate::v1::resume_pending_publish`] / `durable_publish_nullifier`).
+/// ([`crate::v1::resume_pending_publish`] / `durable_publish_nullifier`),
+/// then run §4.2 mesh delivery when [`FinaliseDeliveryDeps`] is provided.
 ///
-/// Order is safety-relevant and fixed: **persist → publish → return Ok**
+/// Order is safety-relevant and fixed:
+/// **persist → publish (nullifier) → deliver (mesh) → return Ok**
 /// (caller may then mark the job `completed`). A crash after this function
 /// returns leaves the account advanced, a progressive publish status, and
 /// (once the host edge finishes) a completed job. Publish failure returns
 /// `Err` **without** deleting or completing the `members_ready` row so a
-/// later resume can still pick it up.
+/// later resume can still pick it up. Delivery never runs before persist.
 ///
 /// ## Fence
 ///
@@ -984,6 +1006,7 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     publisher_pubkey: Option<[u8; 32]>,
     fence: crate::job_store::FinaliseFence,
     publisher: &impl crate::v1::receive::NullifierBatchPublisher,
+    delivery: Option<FinaliseDeliveryDeps<'_>>,
 ) -> Result<FinaliseOutcome, anyhow::Error> {
     use crate::job_store::FINALISE_FENCE_LOST;
     use crate::v1::db_v1;
@@ -991,6 +1014,10 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     // Already durable from a prior attempt that crashed after stage.
     // Still require a live fence: a stale epoch must not re-enter host-edge
     // completion after another claim reclaimed the job.
+    //
+    // Mesh delivery is **not** re-driven here: process-local retention and
+    // the prove-time materials are gone after crash. Durable pending-delivery
+    // storage would need a migration (GAP — see delivery module docs).
     if let Some(row) = db_v1::load_pending_publish(adapter.pool(), signature.pk_i)
         .await
         .map_err(|e| anyhow::anyhow!("load_pending_publish before finalise: {e:#}"))?
@@ -1022,6 +1049,24 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
             &pending,
             publisher_pubkey,
         ));
+    }
+
+    // Capture delivery materials before prove moves `pending`.
+    let delivery_snapshot = DeliverySnapshot::from_pending(&pending, &signature)?;
+
+    // §4.2 targets must be resolved **before** durable finalise. A missing
+    // IVPK discovered only at mesh-build would leave the transition already
+    // persisted and the nullifier published. Fail closed here, named.
+    if let Some(deps) = delivery.as_ref() {
+        crate::v1::delivery::ensure_delivery_targets_before_finalise(
+            &delivery_snapshot.owner,
+            &delivery_snapshot.output_coins,
+            deps.targets,
+            deps.now,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("v1.1 finalise: delivery targets incomplete before prove/persist: {e}")
+        })?;
     }
 
     let output_coin_ids = FinaliseOutcome::output_coin_ids_from_pending(&pending);
@@ -1127,7 +1172,18 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
 
     // Hand off this staged row to the durable publisher. Failure keeps the
     // members_ready (or progressive) row for later resume — never mark done.
+    // Order: **persist → publish (nullifier) → deliver (mesh)** — delivery
+    // never runs before the durable write above.
     publish_staged_nullifier_after_members_ready(adapter, publisher, pk).await?;
+
+    // §4.2 mesh delivery for external-recipient coins (after durable persist).
+    if let Some(deps) = delivery {
+        // Plonky2 native encoding (§1.7.9) — `to_bytes()` is infallible.
+        let proof_bytes = applied.proved().proof.to_bytes();
+        deliver_outgoing_after_persist(&delivery_snapshot, &proof_bytes, deps)
+            .await
+            .map_err(|e| anyhow::anyhow!("v1.1 finalise mesh delivery after persist: {e}"))?;
+    }
 
     let pd = &applied.proved().proof_data;
     Ok(FinaliseOutcome {
@@ -1137,6 +1193,153 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
         output_coin_ids,
         publisher_pubkey,
     })
+}
+
+/// Snapshot of delivery-relevant fields taken before prove moves `pending`.
+struct DeliverySnapshot {
+    owner: [u8; 32],
+    output_coins: Vec<shared::spec_v1::Coin>,
+    creating_prev_ash: shared::spec_v1::HashDigest,
+    nav_size: u64,
+    nav_mth: shared::spec_v1::HashDigest,
+    nav_rand: [u8; 32],
+    pk_create: [u8; 32],
+    r_create: [u8; 32],
+    r_prime_create: [u8; 32],
+}
+
+impl DeliverySnapshot {
+    fn from_pending(
+        pending: &PendingTransition,
+        signature: &TransitionSignature,
+    ) -> Result<Self, anyhow::Error> {
+        use shared::spec_v1 as host;
+        let w = &pending.witness_wip;
+        let creating_prev_ash = host::account_state_hash(&w.prev_account_state)
+            .map_err(|e| anyhow::anyhow!("v1.1 finalise: creating_prev_ash: {e}"))?;
+        Ok(Self {
+            owner: pending.owner.0,
+            output_coins: w.output_coins.clone(),
+            creating_prev_ash,
+            nav_size: pending.nav_opening.nav.size,
+            nav_mth: pending.nav_opening.nav.mth,
+            nav_rand: pending.nav_opening.nav_rand,
+            pk_create: signature.pk_i,
+            r_create: signature.signature_r(),
+            r_prime_create: signature.r_prime,
+        })
+    }
+}
+
+/// Build per-coin materials and invoke the delivery port (§4.2 after persist).
+async fn deliver_outgoing_after_persist(
+    snap: &DeliverySnapshot,
+    proof_bytes: &[u8],
+    deps: FinaliseDeliveryDeps<'_>,
+) -> Result<(), crate::v1::delivery::DeliveryError> {
+    use crate::kernel::types::SubjectAddress;
+    use crate::v1::delivery::{
+        bundle_nav_opening, creating_nullifier_from_parts, external_delivery_coins,
+        DeliveryOperatorContext, OutgoingCoinMaterial, TransitionDeliveryRequest,
+    };
+
+    let external = external_delivery_coins(&snap.owner, &snap.output_coins);
+    if external.is_empty() {
+        // Pure receive / mint-to-self / change-only: no mesh delivery.
+        return Ok(());
+    }
+
+    let subject = SubjectAddress(snap.owner);
+    let bundle = deps.bundles.get_active(&subject).ok_or(
+        crate::v1::delivery::DeliveryError::OperationalBundleMissing {
+            subject: snap.owner,
+        },
+    )?;
+
+    let all_output_ids: Vec<_> = snap.output_coins.iter().map(|c| c.identifier).collect();
+    let creating_nullifier =
+        creating_nullifier_from_parts(snap.pk_create, snap.r_create, snap.r_prime_create);
+    let nav_opening = bundle_nav_opening(snap.nav_size, snap.nav_mth, snap.nav_rand);
+
+    let mut coins = Vec::with_capacity(external.len());
+    for (leaf_index, coin) in external {
+        // Re-check expiry at delivery time (target was already required
+        // before prove; a long prove must not use a mid-flight-expired entry).
+        let target = deps.targets.require(&coin.recipient.0, deps.now)?;
+        if target.relays.is_empty() {
+            return Err(crate::v1::delivery::DeliveryError::RecipientRelaysEmpty {
+                recipient: coin.recipient.0,
+            });
+        }
+        if proof_bytes.is_empty() {
+            return Err(crate::v1::delivery::DeliveryError::ProofBytes(
+                "creating transition proof_bytes empty — refuse mesh delivery without a proof"
+                    .into(),
+            ));
+        }
+        coins.push(OutgoingCoinMaterial {
+            coin: coin.clone(),
+            leaf_index: leaf_index as u32,
+            all_output_ids: all_output_ids.clone(),
+            proof_bytes: proof_bytes.to_vec(),
+            creating_prev_ash: snap.creating_prev_ash,
+            creating_nullifier,
+            nav_opening,
+            asset_terms: None,
+            recipient_ivpk: target.ivpk,
+            recipient_op_pk: target.op_pk,
+            recipient_relays: target.relays,
+        });
+    }
+
+    // Snapshot targets for post-send profile refresh (replaceable kind-0).
+    let refresh: Vec<([u8; 32], Vec<String>)> = coins
+        .iter()
+        .map(|c| (c.recipient_op_pk, c.recipient_relays.clone()))
+        .collect();
+
+    let request = TransitionDeliveryRequest {
+        subject: snap.owner,
+        coins,
+        operator: DeliveryOperatorContext {
+            op_sk: bundle.op,
+            ovk: bundle.ovk,
+            blob_holders: deps.blob_holders,
+            max_blob_bytes: deps.max_blob_bytes,
+            now: deps.now,
+            auth_expiration: deps.auth_expiration,
+        },
+    };
+
+    let report = deps.port.deliver_outgoing(request).await?;
+    tracing::info!(
+        subject = %hex::encode(snap.owner),
+        delivered = report.delivered,
+        "mesh delivery finished after durable persist"
+    );
+
+    // Refresh delivery targets from the recipient's published profile so the
+    // next payment does not keep a stale relay set for the full TTL.
+    // Delivery already succeeded; a refresh failure is named in logs only —
+    // it must not reverse the mesh send or drop retention.
+    for (op_pk, relays) in refresh {
+        if let Err(e) = crate::v1::delivery::refresh_target_from_recipient_profile(
+            deps.targets,
+            &op_pk,
+            &relays,
+            deps.expected_network,
+            deps.now,
+        )
+        .await
+        {
+            tracing::warn!(
+                op_pk = %hex::encode(op_pk),
+                error = %e,
+                "post-delivery profile refresh failed (target TTL still applies)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Typed cause for §7.5 `publish_rejected` (durable nullifier broadcast

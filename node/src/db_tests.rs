@@ -107,6 +107,7 @@ async fn connect_and_migrate_creates_all_tables() {
     //   * After 0029 (jobs kind receive): ALTER-only.
     //   * After 0030 (v1 inscriptions catalog): +2 tables
     //     (`v1_inscriptions`, `v1_inscription_members`).
+    //   * After 0031 (v1 decrypt index): +1 table (`v1_decrypt_index`).
     assert_eq!(
         names,
         vec![
@@ -139,6 +140,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "username_claim_log".to_string(),
             "usernames".to_string(),
             "v1_accounts".to_string(),
+            "v1_decrypt_index".to_string(),
             "v1_engine_meta".to_string(),
             "v1_inscription_members".to_string(),
             "v1_inscriptions".to_string(),

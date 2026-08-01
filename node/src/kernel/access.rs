@@ -176,12 +176,27 @@ pub(crate) struct IndexedRecord {
     pub coin_id: Option<Digest32>,
 }
 
+/// Outcome of inserting a verified private record into the decrypt index.
+///
+/// Replay of the same bundle / coin is a **named** outcome, never a silent
+/// second credit. The scan path re-ACKs on [`Self::AlreadyPresent`] but
+/// does not re-credit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InsertRecordOutcome {
+    /// Row was not present; now durable in this index.
+    Inserted,
+    /// Same `(subject, coin_id)` or same `record_id` already held — replay.
+    AlreadyPresent,
+}
+
 /// Transport-free private-record + account-state index.
 ///
-/// Production has no durable decrypt-index table for pull (GAP 8 of the
-/// Entwurf). The in-memory implementation is the test/production stand-in
-/// until a catalog is wired — empty by default (opaque replica behaviour:
-/// empty record lists, not invented ownership maps).
+/// Production writer is the §4.4 / §2.3.3 receive path
+/// ([`InMemoryPrivateIndex::insert_record`] plus the durable
+/// `v1_decrypt_index` table, migration 0031). The scanner fills the index
+/// **after** verification and **before** ACK — never the reverse. Kernel
+/// procedures only **read**; transport (relay / Blossom) never appears
+/// here. Empty by default = opaque replica (no invented ownership map).
 pub(crate) trait PrivateIndex: Send + Sync {
     /// List record refs for `subject` that fall inside `scope`.
     ///
@@ -237,26 +252,95 @@ impl InMemoryPrivateIndex {
         Arc::new(Self::new())
     }
 
-    /// Test plant: insert a record into the in-memory index.
+    /// Production write path for a **already verified** private record.
     ///
-    /// Production write path (decrypt-index at fold time) is not this
-    /// method — it will land with a durable catalog. Marked `cfg(test)`
-    /// so the library target stays free of plant-only surface.
-    #[cfg(test)]
-    pub(crate) fn insert_record(&self, record: IndexedRecord) {
-        self.records
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(record);
+    /// Call only after §2.3.3 steps 2–6 pass and the durable SQL insert
+    /// (`v1_decrypt_index`, migration 0031) has succeeded. The §4.4 scanner
+    /// is the production caller; kernel procedures never invent rows.
+    ///
+    /// Replay: same `record_id` or same `(subject, coin_id)` for a
+    /// `CoinProof` returns [`InsertRecordOutcome::AlreadyPresent`] without
+    /// mutating the store — the caller may re-ACK but must not re-credit.
+    pub(crate) fn insert_record(&self, record: IndexedRecord) -> KernelResult<InsertRecordOutcome> {
+        record.validate_for_insert()?;
+        let mut guard = self.records.lock().map_err(|e| {
+            KernelError::with_internal(
+                KernelErrorCode::InternalError,
+                "Failed to insert private record",
+                format!("private-index mutex poisoned: {e}"),
+            )
+        })?;
+        for existing in guard.iter() {
+            if existing.record_id == record.record_id {
+                return Ok(InsertRecordOutcome::AlreadyPresent);
+            }
+            if existing.record_type == RecordType::CoinProof
+                && record.record_type == RecordType::CoinProof
+                && existing.subject == record.subject
+                && existing.coin_id.is_some()
+                && existing.coin_id == record.coin_id
+            {
+                return Ok(InsertRecordOutcome::AlreadyPresent);
+            }
+        }
+        guard.push(record);
+        Ok(InsertRecordOutcome::Inserted)
     }
 
-    /// Test plant: insert account state.
+    /// Insert or replace authoritative account state for `subject`.
+    ///
+    /// Test plant only today — production account state lands via the
+    /// receive/finalise engine path, not this process-local index. Kept
+    /// under `cfg(test)` so the lib target does not carry a dead writer.
     #[cfg(test)]
     pub(crate) fn insert_account(&self, subject: SubjectAddress, view: AccountStateView) {
-        self.accounts
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push((subject, view));
+        let mut guard = self.accounts.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, slot)) = guard.iter_mut().find(|(s, _)| *s == subject) {
+            *slot = view;
+        } else {
+            guard.push((subject, view));
+        }
+    }
+}
+
+impl IndexedRecord {
+    /// Structural checks before insert — body required for CoinProof credit.
+    fn validate_for_insert(&self) -> KernelResult<()> {
+        match self.record_type {
+            RecordType::CoinProof => {
+                if self.coin_id.is_none() {
+                    return Err(KernelError::with_internal(
+                        KernelErrorCode::InternalError,
+                        "Corrupt private-record index",
+                        "CoinProof insert missing coin_id",
+                    ));
+                }
+                if self.canonical.is_none() {
+                    return Err(KernelError::with_internal(
+                        KernelErrorCode::InternalError,
+                        "Corrupt private-record index",
+                        "CoinProof insert missing canonical body — refuse empty credit",
+                    ));
+                }
+            }
+            RecordType::SelfDelivery => {
+                if self.transition_kind.is_none() {
+                    return Err(KernelError::with_internal(
+                        KernelErrorCode::InternalError,
+                        "Corrupt private-record index",
+                        "self_delivery insert missing transition_kind",
+                    ));
+                }
+                if self.canonical.is_none() {
+                    return Err(KernelError::with_internal(
+                        KernelErrorCode::InternalError,
+                        "Corrupt private-record index",
+                        "self_delivery insert missing canonical body",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -805,17 +889,19 @@ mod tests {
     ) -> (Digest32, Digest32) {
         let record_id = digest(asset.wrapping_add(0x40));
         let coin_id = digest(asset.wrapping_add(0x80));
-        index.insert_record(IndexedRecord {
-            subject: subj,
-            record_id,
-            asset_id: digest(asset),
-            occurred_at: at,
-            record_type: RecordType::CoinProof,
-            transition_kind: None,
-            blob_id: digest(asset.wrapping_add(0xC0)),
-            canonical: Some(body.to_vec()),
-            coin_id: Some(coin_id),
-        });
+        index
+            .insert_record(IndexedRecord {
+                subject: subj,
+                record_id,
+                asset_id: digest(asset),
+                occurred_at: at,
+                record_type: RecordType::CoinProof,
+                transition_kind: None,
+                blob_id: digest(asset.wrapping_add(0xC0)),
+                canonical: Some(body.to_vec()),
+                coin_id: Some(coin_id),
+            })
+            .expect("plant coin record");
         (record_id, coin_id)
     }
 

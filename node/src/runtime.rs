@@ -193,6 +193,198 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
 
     let proof_store = Arc::new(ProofStore::new(&proofs_dir));
 
+    // Process-local delivery stores (same durability class as BundleStore).
+    // Shared with the kernel Entrust surface and the post-persist mesh port.
+    let shared_bundle_store = crate::kernel::bootstrap::BundleStore::shared();
+    let shared_delivery_targets = crate::v1::DeliveryTargetStore::shared();
+    let shared_delivery_retention = crate::v1::PendingDeliveryStore::shared();
+    // Process mirror of durable `v1_decrypt_index` — filled by the §4.4
+    // receive scanner after SQL insert; shared with kernel Pull surfaces.
+    let shared_private_index = crate::kernel::access::InMemoryPrivateIndex::shared();
+    let shared_delivery_port: Arc<dyn crate::v1::OutgoingDeliveryPort> =
+        Arc::new(crate::v1::MeshDeliveryPort::new(
+            Arc::clone(&shared_delivery_retention),
+            Box::new(crate::v1::OsSecureRandom),
+        ));
+
+    // §4.2 ACK return path: poll own incoming gift-wraps on the node's
+    // advertised relay, unwrap under each entrusteed `ivk`, free retention
+    // on a valid kind-1421. Exponential-backoff *republish* is not here
+    // (GAP — next block / explicit retry campaign).
+    {
+        let retention = Arc::clone(&shared_delivery_retention);
+        let bundles = Arc::clone(&shared_bundle_store);
+        let relay_url = crate::kernel::chain::chain_identity_ops_from_env()
+            .ok()
+            .map(|ops| ops.relay_url);
+        tokio::spawn(async move {
+            let Some(relay_url) = relay_url else {
+                tracing::warn!(
+                    "ACK inbox not started: chain identity ops (relay URL) unavailable at boot"
+                );
+                return;
+            };
+            // Interval is a soft poll — not the §4.2 republish schedule.
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                if retention.len() == 0 {
+                    continue;
+                }
+                let pool = match crate::v1::nostr::relay::RelayPool::new(vec![relay_url.clone()]) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ACK inbox: relay pool construction failed");
+                        continue;
+                    }
+                };
+                for (_subject, bundle) in bundles.list_active() {
+                    match crate::v1::delivery::poll_incoming_acks(
+                        &pool,
+                        &bundle.ivk,
+                        retention.as_ref(),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(results) => {
+                            for r in results {
+                                match r {
+                                    crate::v1::delivery::AckInboxResult::Accepted {
+                                        blob_id,
+                                        ack_nonce,
+                                    } => {
+                                        tracing::info!(
+                                            blob_id = %hex::encode(blob_id),
+                                            ack_nonce = %hex::encode(ack_nonce),
+                                            "ACK accepted; pending delivery released"
+                                        );
+                                    }
+                                    crate::v1::delivery::AckInboxResult::Rejected { error } => {
+                                        tracing::debug!(
+                                            error = %error,
+                                            "ACK candidate rejected"
+                                        );
+                                    }
+                                    crate::v1::delivery::AckInboxResult::Ignored { .. } => {}
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "ACK inbox poll failed");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // §4.4 receive path: poll gift-wraps, match detect_tag under each
+    // entrusteed `ivk`, verify CoinProof, durable decrypt-index insert,
+    // then ACK. Requires the exclusive v1.1 engine (NfLog for step 4) and
+    // operational relay / max_blob. No credit without verify+persist.
+    if let Some(engine) = v1_engine.as_ref() {
+        let engine = Arc::clone(engine);
+        let bundles = Arc::clone(&shared_bundle_store);
+        let private_index = Arc::clone(&shared_private_index);
+        let pool = Arc::clone(&pool);
+        let ops = crate::kernel::chain::chain_identity_ops_from_env().ok();
+        let network_label = crate::v1::mode::network_label(engine.network()).to_string();
+        tokio::spawn(async move {
+            let Some(ops) = ops else {
+                tracing::warn!(
+                    "incoming delivery scanner not started: chain identity ops unavailable at boot"
+                );
+                return;
+            };
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                    Ok(d) => d.as_secs(),
+                    Err(_) => {
+                        tracing::warn!(
+                            "incoming scanner: wall clock before UNIX epoch — skipping tick"
+                        );
+                        continue;
+                    }
+                };
+                // RNG is required for the *outbound* kind-1421 ACK gift-wrap
+                // after durable persist (seal/wrap nonces + ephemeral key) —
+                // not for unwrapping inbound 1420s. Stack-local: no mutex, so
+                // no guard can span the relay/Blossom awaits inside the poll.
+                let mut rng = crate::v1::OsSecureRandom;
+                for (subject, bundle) in bundles.list_active() {
+                    match crate::v1::poll_incoming_deliveries(crate::v1::incoming::IncomingPoll {
+                        relays: std::slice::from_ref(&ops.relay_url),
+                        secrets: crate::v1::incoming::CandidateSecrets {
+                            subject: &subject.0,
+                            ivk: &bundle.ivk,
+                            op: &bundle.op,
+                        },
+                        stores: crate::v1::incoming::CandidateStores {
+                            adapter: engine.as_ref(),
+                            pool: pool.as_ref(),
+                            index: private_index.as_ref(),
+                        },
+                        max_blob_bytes: ops.max_blob_bytes,
+                        expected_network: &network_label,
+                        now,
+                        rng: &mut rng,
+                        since: None,
+                    })
+                    .await
+                    {
+                        Ok(outcomes) => {
+                            for o in outcomes {
+                                match o {
+                                    crate::v1::incoming::CandidateOutcome::Accepted {
+                                        coin_id,
+                                        blob_id,
+                                        record_id,
+                                        replay,
+                                        holder_attempts,
+                                    } => {
+                                        tracing::info!(
+                                            coin_id = %hex::encode(coin_id),
+                                            blob_id = %hex::encode(blob_id),
+                                            record_id = %hex::encode(record_id),
+                                            replay,
+                                            holders = holder_attempts.len(),
+                                            "incoming CoinProof verified, durable, ACK sent"
+                                        );
+                                        for a in holder_attempts {
+                                            if matches!(
+                                                a.outcome,
+                                                crate::v1::incoming::HolderOutcome::ContentAddressLie { .. }
+                                            ) {
+                                                tracing::warn!(
+                                                    holder = %a.holder,
+                                                    outcome = %a.outcome,
+                                                    "Blossom holder lied about content address"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    crate::v1::incoming::CandidateOutcome::Rejected { error } => {
+                                        tracing::debug!(
+                                            error = %error,
+                                            "incoming candidate rejected (no credit, no ACK)"
+                                        );
+                                    }
+                                    crate::v1::incoming::CandidateOutcome::Ignored { .. } => {}
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "incoming delivery poll failed");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Neutral, permissionless model (Milestone 2): there is NO central
     // minting authority. The node holds no minting key and bootstraps
     // no privileged minting account — anyone creates their own asset
@@ -243,6 +435,9 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         // alone. The publisher handle is connected once at boot so the hook
         // can reach durable_publish without breaking the AppState layering
         // (AppState / V1FinaliseHook still carry no publisher type).
+        //
+        // §4.2 mesh delivery hangs **after** durable persist (and after the
+        // nullifier hand-off) via the same port pattern as the publisher.
         v1_finalise: v1_engine.as_ref().map(|adapter| {
             let adapter = Arc::clone(adapter);
             let network = adapter.network();
@@ -277,22 +472,76 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                         },
                     ),
             );
+            // Shared process-local stores: entrust writes BundleStore; delivery
+            // reads it. Target store is filled by profile/Invoice resolution.
+            let bundle_store = Arc::clone(&shared_bundle_store);
+            let delivery_targets = Arc::clone(&shared_delivery_targets);
+            let delivery_port: Arc<dyn crate::v1::OutgoingDeliveryPort> =
+                Arc::clone(&shared_delivery_port);
+            // Blossom holders + max size from the same ops env as GetInfo —
+            // no default URL, no default size.
+            let ops_for_delivery = crate::kernel::chain::chain_identity_ops_from_env().ok();
             let hook: crate::router::V1FinaliseHook = Arc::new(move |pending, signature, fence| {
                 let adapter = Arc::clone(&adapter);
                 let publisher_slot = Arc::clone(&publisher_slot);
+                let bundle_store = Arc::clone(&bundle_store);
+                let delivery_targets = Arc::clone(&delivery_targets);
+                let delivery_port = Arc::clone(&delivery_port);
+                let ops_for_delivery = ops_for_delivery.clone();
                 // publisher_pubkey is filled by the dispatcher from the job
                 // request_body after the hook returns.
                 // Durable + fenced: prove → apply → engine snapshot +
-                // members_ready → durable publish handoff, only while this
-                // claim epoch still holds for the persist step.
+                // members_ready → durable publish handoff → mesh delivery,
+                // only while this claim epoch still holds for the persist step.
                 Box::pin(async move {
                     let publisher = match publisher_slot.as_ref() {
                         Ok(p) => p,
                         // Preserve the typed cause for dispatcher downcast.
                         Err(cause) => return Err(anyhow::Error::new(cause.clone())),
                     };
+                    let now =
+                        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                            Ok(d) => d.as_secs(),
+                            Err(_) => {
+                                return Err(anyhow::anyhow!(
+                                    "v1.1 finalise: wall clock before UNIX epoch — \
+                                 refusing delivery auth timestamps (no silent 0)"
+                                ));
+                            }
+                        };
+                    // Always install the delivery port. Missing ops env yields
+                    // empty holders → external-coin delivery fails with
+                    // `BlobHoldersEmpty` (named), never a silent success.
+                    // Ops is required at boot via
+                    // `require_chain_identity_ops_from_env`; this is belt-and-
+                    // braces for the hook closure.
+                    let (blob_holders, max_blob_bytes) = match ops_for_delivery.as_ref() {
+                        Some(ops) => (vec![ops.blossom_url.clone()], ops.max_blob_bytes),
+                        None => (Vec::new(), 0),
+                    };
+                    // Network label for post-send profile refresh — same pin
+                    // the engine was built with (no silent mainnet default).
+                    let expected_network = crate::v1::mode::network_label(network);
+                    let delivery_deps = Some(crate::v1::signature::FinaliseDeliveryDeps {
+                        port: delivery_port.as_ref(),
+                        bundles: bundle_store.as_ref(),
+                        targets: delivery_targets.as_ref(),
+                        blob_holders,
+                        max_blob_bytes,
+                        now,
+                        // Kind-24242: expiration = now + §7.4 replay window.
+                        auth_expiration: now
+                            .saturating_add(crate::v1::blossom::AUTH_REPLAY_WINDOW_SECS),
+                        expected_network,
+                    });
                     crate::v1::finalise_accepted_prove_persist_and_stage(
-                        &adapter, pending, signature, None, fence, publisher,
+                        &adapter,
+                        pending,
+                        signature,
+                        None,
+                        fence,
+                        publisher,
+                        delivery_deps,
                     )
                     .await
                 })
@@ -399,17 +648,20 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             Arc::clone(&state.pending_sign_map),
             Arc::clone(&state.attest_challenges),
         )
-        .with_manifest_store(Arc::clone(&manifest_store));
-        // Block 7 access surfaces (process-local until a durable
-        // decrypt-index exists). Empty in-memory index is an installed
-        // surface, not a missing one. Logging the Arc strong-count keeps
-        // the getter library-reachable under clippy --all-targets.
-        // SubscribeReceipts stays Unimplemented (no credit writer yet).
+        .with_manifest_store(Arc::clone(&manifest_store))
+        .with_bundle_store(Arc::clone(&shared_bundle_store))
+        .with_private_index(Arc::clone(&shared_private_index));
+        // Pull/Records read the process mirror of `v1_decrypt_index`
+        // (migration 0031). The §4.4 scanner writes SQL first, then this
+        // index, then ACK. SubscribeReceipts stays Unimplemented until a
+        // credit (receive-transition) writer exists after durable persist.
         tracing::info!(
             private_index_refs = Arc::strong_count(domain.private_record_index()),
             bootstrap_manifest_refs = Arc::strong_count(domain.manifest_store()),
             bootstrap_manifest_loaded = domain.manifest_store().is_loaded(),
-            "kernel access surfaces installed (Pull/Records; in-memory empty)"
+            delivery_target_refs = Arc::strong_count(&shared_delivery_targets),
+            delivery_retention_len = shared_delivery_retention.len(),
+            "kernel access surfaces installed (Pull/Records; durable decrypt-index + process mirror)"
         );
         if let Some(engine) = v1_engine.as_ref() {
             use crate::kernel::chain::{

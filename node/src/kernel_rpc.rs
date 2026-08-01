@@ -557,7 +557,9 @@ impl Kernel for GrpcKernelService {
         // the session and yielding silence would repeat the Block-2
         // empty-Notify-Map failure mode.
         Err(Status::unimplemented(
-            "SubscribeReceipts: not yet implemented — requires a receive/decrypt-index \
+            "SubscribeReceipts: not yet implemented — requires a credit writer after \
+             durable decrypt-index (verified CoinProofs are indexed; account credit \
+             + receipt push is a later block) — see node/src/kernel/access/receipts.rs; \
              writer that publishes verified credits after durable persist (§4.8/§4.9); \
              without that writer a subscription must not be accepted",
         ))

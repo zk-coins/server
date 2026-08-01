@@ -14,7 +14,11 @@
 //!
 //! ## Future writer contract (normative for the later block)
 //!
-//! When a receive/decrypt-index writer is introduced, it **must**:
+//! The durable decrypt-index writer (migration 0031 / §4.4 scanner) now
+//! stores verified CoinProofs **before** ACK. Credit (receive transition)
+//! and `SubscribeReceipts` still require a separate writer that emits
+//! **after** account credit. When that credit writer is introduced, it
+//! **must**:
 //!
 //! 1. Emit the event **after** verification and durable persist (§4.8 /
 //!    §4.9), never before — store-everything holds before any push.
