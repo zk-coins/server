@@ -75,6 +75,96 @@ forward-only (no `down` migrations in the MVP).
 cargo test -p node db -- --test-threads=8
 ```
 
+That command is a **subset** — useful and correct for DB work. It is not the
+full `node` + `shared` suite. The line for the full suite is below.
+
+### Running tests
+
+**Full hermetic suite.** CI's authoritative gate
+(`cargo llvm-cov nextest` under the `ci:full` label — see [CI/CD](#cicd))
+drives `node` + `shared` through nextest, not plain `cargo test`. Locally,
+mirror that selection with:
+
+```bash
+cargo nextest run -p node -p shared --all-features --test-threads 8 -E 'not binary(api_remote)'
+```
+
+`-E 'not binary(api_remote)'` drops the `api_remote` integration target
+(`node/tests/api_remote.rs`). That suite talks to the live DEV node and does
+not belong in a hermetic run; the CI workflow excludes it with the same
+expression for the same reason (post-deploy coverage lives in
+`deploy-dev.yaml` / `deploy-prd.yaml`).
+
+`cargo nextest` is not a built-in Cargo subcommand. Install it the way the
+self-hosted CI runners do, or from crates.io:
+
+```bash
+brew install cargo-nextest
+# or:
+cargo install cargo-nextest --locked
+```
+
+**Why nextest is required here — not a preference.**
+`stack-policy` records the stack mode as a **process-wide, monotonic claim**
+(`PROCESS_STACK_MODE` via `set_process_stack_mode`): a process must not
+dual-boot Legacy and V1, and a conflicting re-set **panics on purpose**. The
+test-only reset (`clear_process_stack_mode_for_test`) is gated on
+`#[cfg(test)]` of the **defining** crate, so dependents such as `node` cannot
+clear the claim from their own test binaries.
+
+Under plain `cargo test`, every case shares one process. A Legacy case and a
+V1 case collide; the mutex poisons (`PoisonError`), and every later test in
+that process fails — a cascade from a single intentional panic, not a broken
+tree. `cargo nextest` gives each test its own process, so the collision
+cannot occur. That is why the CI gate uses nextest rather than `cargo test`.
+If you run `cargo test -p node -p shared --all-features` and see a large red
+swath, read it as this process-wide claim issue first.
+
+**When `cargo test` is still the right tool.** Targeted subsets remain valid
+and preferred for day-to-day work, for example the DB filter above or a
+single integration binary:
+
+```bash
+cargo test -p node db -- --test-threads=8
+cargo test -p node --test openapi_smoke
+```
+
+The boundary is stack modes: as soon as a run includes cases that claim
+**both** Legacy and V1, it needs nextest (process-per-test isolation).
+Single-mode or non-claiming subsets can stay on `cargo test`.
+
+**Prove path outside `-p node -p shared`.** The recommended command above
+scopes only to the `node` and `shared` packages. Heavy prove-flow tests live
+in `zkcoins-prover-plonky2` (`script-plonky2/`) and are not selected by that
+run. Include the package explicitly when you need those flows:
+
+```bash
+cargo nextest run -p zkcoins-prover-plonky2
+```
+
+A run without `zkcoins-prover-plonky2` is **not** a complete verification of
+the prove path. The CI gate matches the same package scope
+(`cargo llvm-cov nextest … -p node -p shared`); it does not execute the
+prover package's prove-flow suite.
+
+**`#[ignore]` tests in the `node` + `shared` scope.** Four cases in `node`
+are marked `#[ignore]`. They do not run under the recommended command above
+and do not run in the CI gate today:
+
+- `node v1::receive::tests::concurrent_append_after_broadcast_still_reported_success`
+- `node v1::receive::tests::concurrent_scanner_append_during_prove_still_commits`
+- `node v1::receive::tests::production_path_receive_with_genuine_prove_via_verify_and_begin`
+- `node v1::self_heal::unit_tests::resolve_v1_live_digest_via_real_prover_bridge_refuses_pin_mismatch`
+
+Run them with nextest's ignored-test controls (`--run-ignored all` includes
+them with the rest of the suite; `--run-ignored only` runs just the ignored
+set):
+
+```bash
+cargo nextest run -p node -p shared --all-features --test-threads 8 \
+  -E 'not binary(api_remote)' --run-ignored all
+```
+
 ## Code style
 
 ### Rust
