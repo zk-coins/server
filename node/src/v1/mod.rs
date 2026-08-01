@@ -101,6 +101,11 @@ pub mod mode;
 /// Kind 30423 bootstrap mirror is unit-tested only until a production
 /// Nostr discovery caller exists.
 pub(crate) mod nostr;
+/// §4.5 emergency recovery (node-side steps 3–5 only): gapless kind-1059
+/// scan over seed relays, re-verify via existing §2.3.3 checks, decrypt-index
+/// fill. Dense account enumeration (step 1) is wallet-side — SPEND branch
+/// `A/0'/i'` never leaves the wallet (§1.2 / §7.7); see module docs.
+pub(crate) mod recovery;
 /// Production CSPRNG for mesh delivery / NIP-59 (runtime boot).
 pub(crate) use nostr::nip59::OsSecureRandom;
 pub(crate) mod provenance;

@@ -20,7 +20,7 @@ pub(crate) mod manifest;
 /// from the defining module when needed.
 pub(crate) use bundle::{
     entrust_operational_bundle, revoke_operational_bundle, BundleProcedureDeps, BundleStore,
-    EntrustCommand, EntrustResult, RevokeCommand, RevokeResult,
+    EntrustCommand, EntrustResult, OperationalBundle, RevokeCommand, RevokeResult,
 };
 pub(crate) use challenges::{
     ChallengeAction, ChallengeConsumeError, ChallengeStore, IssuedChallenge, RedeemedPullChallenge,

@@ -282,6 +282,126 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         });
     }
 
+    // §4.5 emergency recovery (operator opt-in only).
+    //
+    // Why a background task *after* the shared stores exist, not a blocking
+    // pre-bind step: a gapless scan over full seed-relay history can take a
+    // long time. Blocking socket bind / readiness on that scan would leave
+    // the node unready for the entire campaign — also wrong. Without
+    // `ZKCOINS_V1_RECOVERY=1` this path is never started (a node that
+    // full-history-scans on every boot would be an operational accident).
+    //
+    // Fail-closed: incomplete config with the flag set aborts boot (named
+    // env errors); missing seed relays aborts boot; missing operational
+    // bundle is waited on (process-local BundleStore is empty until
+    // Entrust) then the campaign refuses `restored=true` on incomplete
+    // scan. No silent default page size / earliest bound.
+    {
+        match crate::v1::recovery::recovery_campaign_config_from_env() {
+            Ok(None) => {
+                tracing::debug!(
+                    "§4.5 recovery not requested ({} unset or not 1)",
+                    crate::v1::recovery::RECOVERY_ENV
+                );
+            }
+            Err(e) => {
+                anyhow::bail!("{e}");
+            }
+            Ok(Some(recovery_config)) => {
+                let Some(engine) = v1_engine.as_ref() else {
+                    anyhow::bail!(
+                        "{}=1 requires the v1.1 engine (ScanStackMode::V1) — \
+                         recovery cannot verify CoinProofs without it",
+                        crate::v1::recovery::RECOVERY_ENV
+                    );
+                };
+                let seed_relays = match manifest_store.get() {
+                    Some(v) if !v.seed_relays().is_empty() => v.seed_relays().to_vec(),
+                    _ => {
+                        anyhow::bail!(
+                            "{}=1 requires a verified BootstrapManifest with \
+                             non-empty seed_relays (set {} to a BMF1 artifact) \
+                             — refusing to invent relay URLs",
+                            crate::v1::recovery::RECOVERY_ENV,
+                            crate::kernel::bootstrap::BOOTSTRAP_MANIFEST_PATH_ENV
+                        );
+                    }
+                };
+                let ops = crate::kernel::chain::chain_identity_ops_from_env().map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}=1 requires chain identity ops (max_blob_bytes / network \
+                         surface): {e}",
+                        crate::v1::recovery::RECOVERY_ENV
+                    )
+                })?;
+                let engine = Arc::clone(engine);
+                let bundles = Arc::clone(&shared_bundle_store);
+                let private_index = Arc::clone(&shared_private_index);
+                let receipt_hub = Arc::clone(&shared_receipt_hub);
+                let pool = Arc::clone(&pool);
+                let network_label = crate::v1::mode::network_label(engine.network()).to_string();
+                tracing::info!(
+                    page_limit = recovery_config.page_limit,
+                    earliest = recovery_config.earliest_account_timestamp,
+                    seed_relays = seed_relays.len(),
+                    "§4.5 recovery campaign scheduled (background; will wait for \
+                     entrusteed operational bundle before scanning)"
+                );
+                tokio::spawn(async move {
+                    match crate::v1::recovery::run_recovery_campaign(
+                        recovery_config,
+                        crate::v1::recovery::RecoveryCampaignDeps {
+                            seed_relays,
+                            bundles,
+                            adapter: engine,
+                            pool,
+                            index: private_index,
+                            receipts: receipt_hub,
+                            max_blob_bytes: ops.max_blob_bytes,
+                            expected_network: network_label,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(report) => {
+                            if report.restored {
+                                tracing::info!(
+                                    accepted = report.coin_proof_accepted,
+                                    sdr_gaps = report.sdr_named_gaps.len(),
+                                    sdr_replay = ?crate::v1::recovery::SDR_REPLAY_STATUS,
+                                    "§4.5 recovery campaign: restored=true"
+                                );
+                            } else {
+                                tracing::error!(
+                                    scan_status = ?report.scan_status,
+                                    accepted = report.coin_proof_accepted,
+                                    sdr_gaps = report.sdr_named_gaps.len(),
+                                    sdr_replay = ?crate::v1::recovery::SDR_REPLAY_STATUS,
+                                    "§4.5 recovery campaign: restored=false — do not \
+                                     treat this node as fully recovered"
+                                );
+                            }
+                            for gap in &report.sdr_named_gaps {
+                                tracing::warn!(
+                                    blob_id = %hex::encode(gap.blob_id),
+                                    record_kind = ?gap.record_kind,
+                                    status = ?gap.status,
+                                    "§4.5 recovery SDR named gap (replay unavailable)"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "§4.5 recovery campaign failed — node is NOT restored"
+                            );
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // §4.4 receive path: poll gift-wraps, match detect_tag under each
     // entrusteed `ivk`, verify CoinProof, durable decrypt-index insert,
     // receipt publish, then ACK. Requires the exclusive v1.1 engine
