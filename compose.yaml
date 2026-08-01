@@ -1,19 +1,19 @@
-# Local developer stack for the zkCoins node (Stage-3 binary).
+# Local developer stack for the zkCoins node (Stage-3 binary) + public API.
 #
-# Services are derived from the node bootstrap code, not from guesswork:
+# Services are derived from the node/api bootstrap code, not from guesswork:
 #   - postgres:17  — state layer (node/src/test_db.rs with_tag("17"), README)
 #   - bitcoind     — regtest RPC for Stage-3 NfLog scan + AggregateStateNullifierV3
 #                    publish (node/src/v1/scan.rs, node/src/v1/publish.rs)
 #   - nostr-relay  — NIP-01 WebSocket relay (node/src/v1/nostr/relay.rs;
 #                    testcontainers pin scsibug/nostr-rs-relay:0.8.13)
 #   - node         — Dockerfile + 0.0.0.0:4242 REST + KERNEL_GRPC_ADDR gRPC
+#   - api          — sibling zk-coins/api Dockerfile; REST §7.5 over kernel gRPC
 #
 # NOT a compose service (see docs/local-stack.md):
-#   - zk-coins/api — runnable, but that repo has no Dockerfile; start with
-#                    cargo run against the published kernel gRPC port
 #   - electrs / Esplora — still required by residual NETWORK_CONFIG +
 #                    /health/ready (lib.rs build_network_config_from_env,
 #                    router.rs check_esplora); not in this file
+#   - wallet / SDK — signing and operational-bundle material stay off-compose
 #
 # No restart:always — a boot failure must stay visible.
 # No invented PUBLISHER_KEY / chain pins — compose fails at parse if missing.
@@ -90,11 +90,13 @@ services:
     # testcontainers integration tests in node/src/v1/nostr/relay.rs
     # (RELAY_IMAGE / RELAY_TAG). Starts with the image default config
     # (listen 0.0.0.0:8080, on-disk SQLite). Not `latest`.
-    # WebSocket NIP-01 endpoint: ws://nostr-relay:8080/ (compose DNS)
-    # or ws://127.0.0.1:8080/ from the host.
+    # WebSocket NIP-01 endpoint: ws://nostr-relay:8080/ (compose DNS).
+    # Host publish is 18080 (not 8080): host 8080 is the api REST surface
+    # below — both containers listen on 8080 internally, but only one
+    # process can bind a given host port.
     image: scsibug/nostr-rs-relay:0.8.13
     ports:
-      - "8080:8080"
+      - "18080:8080"
     volumes:
       - nostr_relay_data:/usr/src/app/db
     healthcheck:
@@ -152,7 +154,10 @@ services:
 
       # --- Publisher key (crypto secret — never invent a default) ---
       # Panic: node/src/lib.rs PUBLISHER_KEY lazy_static.
-      PUBLISHER_KEY: ${PUBLISHER_KEY:?set PUBLISHER_KEY — generate with: openssl rand -hex 32}
+      # Quoted: the `: ` inside the :? message is a YAML mapping separator in an
+      # unquoted scalar — without the quotes `docker compose config` rejects the
+      # whole file, which is why this stack had never been validated.
+      PUBLISHER_KEY: "${PUBLISHER_KEY:?set PUBLISHER_KEY — generate with `openssl rand -hex 32`}"
 
       # --- Username domain returned by /api/info ---
       # Panic: node/src/lib.rs USERNAME_DOMAIN lazy_static.
@@ -224,8 +229,85 @@ services:
       # first image build + first circuit build is much longer (see docs).
       start_period: 120s
 
+  api:
+    # Build context is the sibling checkout of zk-coins/api next to this
+    # node worktree: …/zk-coins/api when this file lives in …/zk-coins/node
+    # (compose path ../api). That layout is an operator assumption, not a
+    # monorepo guarantee. If the api repo is elsewhere, point
+    # build.context at that path (or build/tag an image yourself and
+    # replace this block with `image:`) — there is no fallback context
+    # and no pre-built registry pin in this stack.
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+    # depends_on — only what the api process actually dials:
+    #   node (YES): ZKCOINS_KERNEL_ADDR → kernel gRPC (api/src/config.rs,
+    #     api/src/main.rs connect_lazy, api/src/kernel/client.rs). Every
+    #     non-local REST surface is a kernel RPC pass-through.
+    #   postgres (NO): api holds no value-bearing DB and has no DATABASE_URL
+    #     (api/src/config.rs closed env set). Postgres is node-only.
+    #   bitcoind (NO): api never speaks Bitcoin RPC; scan/publish stay in
+    #     the kernel (node/src/v1/scan.rs, node/src/v1/publish.rs).
+    #   nostr-relay (NO): NIP-01 transport and delivery live in the node
+    #     path, not in the api process (api only proxies kernel RPCs;
+    #     local-stack.md: node client not yet wired into send/receive).
+    depends_on:
+      node:
+        condition: service_healthy
+    ports:
+      # Operator bind: ZKCOINS_BIND_ADDR (api/src/config.rs + main.rs).
+      # Local-stack convention inside the container: 0.0.0.0:8080
+      # (Dockerfile EXPOSE 8080) — not a binary default.
+      - "8080:8080"
+    volumes:
+      # §7.4 content-addressed Blossom store (api/src/config.rs
+      # ZKCOINS_BLOSSOM_STORE; api/src/blossom/store.rs BlobStore::open).
+      - api_blossom_data:/data/blossom
+    environment:
+      # --- Pflicht (api/src/config.rs Config::from_env) — no defaults ---
+      ZKCOINS_BIND_ADDR: "0.0.0.0:8080"
+      # Compose DNS → node KERNEL_GRPC_ADDR (published host 50051).
+      ZKCOINS_KERNEL_ADDR: "http://node:50051"
+      # Variable required; unknown token is a start error. Full pass needs
+      # at least wallet,explorer (docs/local-stack.md). Empty string =
+      # all features off is allowed by the binary but rejected here by
+      # ${…:?} so an operator must name the set explicitly.
+      ZKCOINS_FEATURES: ${ZKCOINS_FEATURES:?set ZKCOINS_FEATURES e.g. wallet,explorer}
+      # Variable required; empty string allowed (OwnershipProof / session
+      # surfaces fail loud — mint/sign/nullifier do not need it).
+      # For host-side wallets dialing http://127.0.0.1:8080 the SDK derives
+      # chan_bind from host "127.0.0.1:8080" (sdk/src/v1/ownership.ts
+      # canonicalHostFromApiUrl) — set that exact string when using
+      # bootstrap/pull/attest/grants from the host.
+      ZKCOINS_PUBLIC_HOST: ${ZKCOINS_PUBLIC_HOST:-}
+
+      # --- Blossom (§7.4) — store set ⇒ companions Pflicht ---
+      # Store path matches the volume mount. Absent store would leave
+      # blossom routes unmounted; this stack mounts the store so delivery
+      # blobs have a local holder.
+      ZKCOINS_BLOSSOM_STORE: /data/blossom
+      ZKCOINS_BLOSSOM_MAX_BLOB_BYTES: ${ZKCOINS_BLOSSOM_MAX_BLOB_BYTES:?set ZKCOINS_BLOSSOM_MAX_BLOB_BYTES integer > 0}
+      # Variable required when store is set; empty string allowed
+      # (surface up, every upload 403 — api/src/config.rs).
+      ZKCOINS_BLOSSOM_ALLOWED_OPS: ${ZKCOINS_BLOSSOM_ALLOWED_OPS:-}
+
+      RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      # Liveness only: GET /health → body "ok" once the TCP listener is
+      # bound (api/src/routes.rs health). Do **not** probe /health/ready
+      # here: that path is a GetInfo projection (api/src/info.rs
+      # health_ready) and stays HTTP 503 while the kernel BootstrapManifest
+      # / ChainIdentity path is fail-closed. A depends_on on ready would
+      # block the stack without saying anything about the REST listener.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
 volumes:
   postgres_data:
   node_data:
   bitcoind_data:
   nostr_relay_data:
+  api_blossom_data:

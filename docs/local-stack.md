@@ -1,12 +1,13 @@
 # Local stack (`compose.yaml`) — full unmocked pass
 
-Bring up **PostgreSQL 17**, **bitcoind regtest**, a **Nostr relay**
-(`scsibug/nostr-rs-relay:0.8.13`), and the **node** process with the
-environment the Stage-3 binary actually demands. Run the **api** beside Compose
-(no Dockerfile in `zk-coins/api`). Goal of this document: a **complete** path
+Bring up **five** Compose services — **PostgreSQL 17**, **bitcoind regtest**, a
+**Nostr relay** (`scsibug/nostr-rs-relay:0.8.13`), the **node** (kernel), and the
+**api** (public REST over kernel gRPC) — with the environment those binaries
+actually demand. Goal of this document: a **complete** path
 
-> mint → signature → job `completed` → nullifier visible on
-> `GET /v1/chain/nullifier/<pubkey>` after chain inclusion and scanner fold.
+> stack up → readiness **prüfbar** je Dienst → operatives Bundle entrusten →
+> mint → signieren (Wallet/SDK) → Blöcke erzeugen → Nullifier-Nachweis →
+> send → receive
 
 Nothing here invents chain endpoints, circuit pins, publisher secrets, or
 wallet key material.
@@ -17,18 +18,32 @@ wallet key material.
 | --- | --- | --- |
 | `postgres` | State layer | `db::connect_and_migrate` on every boot (`node/src/main.rs`, `node/src/db.rs`). Schema: `node/migrations/`. Image tag **17** matches testcontainers (`node/src/test_db.rs` `.with_tag("17")`). |
 | `bitcoind` | Regtest L1 | Stage-3 NfLog scan + AggregateStateNullifierV3 publish are **bitcoind RPC + cookie** (`node/src/v1/scan.rs` `v1_bitcoind_rpc_from_env`, `node/src/v1/publish.rs` `v1_publisher_env_from_env`). Image **`bitcoin/bitcoin:31.1`** (pinned; repo has no bitcoind version — see below). |
-| `nostr-relay` | NIP-01 WebSocket relay | Local §4.2 / §4.3 delivery peer. Image **`scsibug/nostr-rs-relay:0.8.13`** (pinned; same tag as testcontainers in `node/src/v1/nostr/relay.rs`). Listens on **8080**. The node process does **not** yet wire the relay client into send/receive (later block); the service is here for local stack + client integration tests. |
-| `node` | Kernel binary | Built from repo `Dockerfile`. REST **`0.0.0.0:4242`** (`ACCOUNT_NODE_ADDR`). Kernel gRPC on `KERNEL_GRPC_ADDR` (published as host **50051**). |
+| `nostr-relay` | NIP-01 WebSocket relay | Local §4.2 / §4.3 delivery peer. Image **`scsibug/nostr-rs-relay:0.8.13`** (pinned; same tag as testcontainers in `node/src/v1/nostr/relay.rs`). Listens on **8080 inside** the container; **host** publish is **18080** so host port **8080** stays free for the api. The node process does **not** yet wire the relay client into send/receive (later block); the service is here for local stack + client integration tests. |
+| `node` | Kernel binary | Built from this repo `Dockerfile`. REST **`0.0.0.0:4242`** (`ACCOUNT_NODE_ADDR`). Kernel gRPC on `KERNEL_GRPC_ADDR` (published as host **50051**). |
+| `api` | Public REST (§7.5) | Built from sibling **`../api`** (`zk-coins/api` `Dockerfile`). Binds **`0.0.0.0:8080`** in-container (`ZKCOINS_BIND_ADDR`); host **8080**. Dials the kernel at `http://node:50051` (`ZKCOINS_KERNEL_ADDR`). Optional Blossom store volume `api_blossom_data` → `/data/blossom`. |
+
+### api build context layout
+
+`compose.yaml` sets `build.context: ../api`. That assumes a sibling checkout:
+
+```text
+…/zk-coins/api    ← Dockerfile + sources
+…/zk-coins/node   ← this compose.yaml
+```
+
+If the api repo lives elsewhere, point `build.context` at that path (or replace
+the service with a pre-built `image:`). There is **no** fallback context and no
+registry pin in this stack.
 
 ## What this stack is not (compose services)
 
 | Missing as a service | Why | How you get it |
 | --- | --- | --- |
-| **`zk-coins/api`** | That repo has **no Dockerfile** and is a sibling directory, not this compose context. Inventing a build context that points outside this tree is out of scope. | Host `cargo run` against the published kernel port (below). |
-| **Esplora / electrs** | Still **required** by residual `NETWORK_CONFIG` (`lib.rs` `build_network_config_from_env`) and by `/health/ready` (`router.rs` `check_esplora`). Stage-3 **scan does not use Esplora**. No electrs image/config in this repo. | Operator-supplied; set `ESPLORA_URL` / `ESPLORA_WS_URL`. |
+| **Esplora / electrs** | Still **required** by residual `NETWORK_CONFIG` (`lib.rs` `build_network_config_from_env`) and by node `/health/ready` (`router.rs` `check_esplora`). Stage-3 **scan does not use Esplora**. No electrs image/config in this repo. | Operator-supplied; set `ESPLORA_URL` / `ESPLORA_WS_URL`. |
 | **Mainnet** | `IS_MAINNET` is hard-set to `false`. Do not override to `true`. | — |
 | **Funded wallet / mined blocks** | Compose does **not** create wallets or mine blocks at start. Silent funding would hide operator setup. | Operator steps below. |
-| **Signed §4.3 BootstrapManifest** | No BMF1 loader; process must not invent `manifest_sig` (`kernel/chain.rs` `BOOTSTRAP_MANIFEST_UNAVAILABLE_REASON`). Operational env is still required so identity assembly has something real to attach later. | `GetInfo` / complete `ChainIdentity` stay fail-closed; jobs + `GetNullifierPath` do not need identity. |
+| **Signed §4.3 BootstrapManifest** | No BMF1 loader path that invents `manifest_sig` (`kernel/chain.rs` `BOOTSTRAP_MANIFEST_UNAVAILABLE_REASON`). Operational env is still required so identity assembly has something real to attach later. | `GetInfo` / complete `ChainIdentity` stay fail-closed; jobs + `GetNullifierPath` do not need identity. |
+| **Wallet / SDK process** | Signing and key derivation are **not** a compose service. The pass needs a wallet that can produce BIP-340 transition signatures and OwnershipProofs. | **`zk-coins/sdk`** v1 surface (`src/v1/`: `signTransition` / `refuseOrSignTransition`, OwnershipProof helpers). Not the node. |
 
 ## How the node reaches bitcoind (boot path)
 
@@ -62,7 +77,12 @@ No version is named in this repo’s CI, docs, or tests. Compose pins **`bitcoin
 
 ### nostr-relay image version
 
-Compose and the relay integration tests pin **`scsibug/nostr-rs-relay:0.8.13`** (not `latest`). Default image config listens on `0.0.0.0:8080` with on-disk SQLite under the `nostr_relay_data` volume. Readiness: TCP accept on port 8080 (`compose.yaml` healthcheck). From the host: `ws://127.0.0.1:8080/`. From another compose service: `ws://nostr-relay:8080/`.
+Compose and the relay integration tests pin **`scsibug/nostr-rs-relay:0.8.13`** (not `latest`). Default image config listens on `0.0.0.0:8080` with on-disk SQLite under the `nostr_relay_data` volume. Readiness: TCP accept on port 8080 **inside** the container (`compose.yaml` healthcheck).
+
+| Who | Relay URL |
+| --- | --- |
+| Other compose services (node env pin) | `ws://nostr-relay:8080/` |
+| Host-side tools | `ws://127.0.0.1:18080/` (host port map; container still 8080) |
 
 For `ZKCOINS_RELAY_URL` (GetInfo / identity ops pin — still required at boot even though the NIP-01 client is not yet wired into send/receive) a local-stack choice is:
 
@@ -70,44 +90,59 @@ For `ZKCOINS_RELAY_URL` (GetInfo / identity ops pin — still required at boot e
 export ZKCOINS_RELAY_URL=ws://nostr-relay:8080/
 ```
 
-(host-side clients that are not in the compose network use `ws://127.0.0.1:8080/` instead).
+## api (compose service)
 
-## api (sibling process)
-
-### Env (from `api/src/config.rs` — only these four)
+### Env (from `api/src/config.rs`)
 
 | Variable | Rules |
 | --- | --- |
-| `ZKCOINS_BIND_ADDR` | Required, non-empty, parseable `SocketAddr` (e.g. `0.0.0.0:8080`). No default. |
-| `ZKCOINS_KERNEL_ADDR` | Required, non-empty tonic URI. Tests use `http://127.0.0.1:50051`. Point at the published kernel port. |
-| `ZKCOINS_FEATURES` | Required **as a variable** (may be empty string = all off). Closed set: `wallet`, `explorer`, `publisher`, `lightning_bridge`, `mail_bridge`. Full pass needs at least **`wallet,explorer`**. |
+| `ZKCOINS_BIND_ADDR` | Required, non-empty, parseable `SocketAddr`. Compose fixes `0.0.0.0:8080` (Dockerfile `EXPOSE 8080` convention — not a binary default). |
+| `ZKCOINS_KERNEL_ADDR` | Required, non-empty tonic URI. Compose fixes `http://node:50051` (service DNS → kernel gRPC). |
+| `ZKCOINS_FEATURES` | Required **as a variable**. Closed set: `wallet`, `explorer`, `publisher`, `lightning_bridge`, `mail_bridge`. Compose uses `${…:?}` so the operator must set a non-empty value; full pass: **`wallet,explorer`**. |
 | `ZKCOINS_PUBLIC_HOST` | Required **as a variable** (may be empty). Authoritative hosts for §5.1 `chan_bind`; never taken from the HTTP `Host` header. Empty ⇒ ownership-auth surfaces fail loud; mint/sign/nullifier do not need it. |
+| `ZKCOINS_BLOSSOM_STORE` | Optional gate. **Absent** ⇒ Blossom routes unmounted. Compose **sets** `/data/blossom` (volume) so the §7.4 surface is mounted. |
+| `ZKCOINS_BLOSSOM_MAX_BLOB_BYTES` | Pflicht when store is set; integer **> 0**. |
+| `ZKCOINS_BLOSSOM_ALLOWED_OPS` | Pflicht when store is set; may be empty (every upload `403`). |
 
 The api does **not** take node identity vars (`ZKCOINS_RELAY_URL`, …). Those are kernel-side.
 
-### Dockerfile
+### depends_on (what and why)
 
-**None** in `zk-coins/api` (verified: no `Dockerfile` at repo root). Start on the host:
+| Service | In `depends_on`? | Reason (code) |
+| --- | --- | --- |
+| `node` | **yes** (`service_healthy`) | Sole upstream: `ZKCOINS_KERNEL_ADDR` → `connect_lazy` (`api/src/main.rs`, `api/src/kernel/client.rs`). |
+| `postgres` | **no** | Api has no DB env and no SQL client (`api/src/config.rs` closed set). |
+| `bitcoind` | **no** | Api never opens Bitcoin RPC; scan/publish stay in the kernel. |
+| `nostr-relay` | **no** | Api does not dial NIP-01; transport is node-side (and not yet wired into send/receive). |
 
-```bash
-# From the zk-coins/api checkout (sibling of this node worktree).
-export ZKCOINS_BIND_ADDR=0.0.0.0:8080
-export ZKCOINS_KERNEL_ADDR=http://127.0.0.1:50051
-export ZKCOINS_FEATURES=wallet,explorer
-export ZKCOINS_PUBLIC_HOST=
-# Optional: RUST_LOG=info
-cargo run
+Healthcheck is **`GET /health`** (liveness body `ok`), **not** `/health/ready`. Ready is a `GetInfo` projection and stays **503** while BootstrapManifest / `ChainIdentity` is fail-closed — a ready-based `depends_on` would park the stack without proving the REST listener is dead.
+
+### `ZKCOINS_PUBLIC_HOST` and wallet `chan_bind`
+
+The wallet computes `chan_bind = H("zkCoins/v1/PullHost" ‖ host)` from the URL it dials (`sdk/src/v1/ownership.ts` `canonicalHostFromApiUrl` / `chanBindForHost`; verified by `api/src/ownership.rs` `chan_bind_for_host` against `ZKCOINS_PUBLIC_HOST`).
+
+For host-side clients:
+
+```text
+api URL:  http://127.0.0.1:8080
+host:     127.0.0.1:8080   ← non-default port is kept
 ```
 
-Kernel must already be listening on host port **50051** (`KERNEL_GRPC_ADDR=0.0.0.0:50051` in compose + published port).
+So for bootstrap / pull / attest / grants from the host:
+
+```bash
+export ZKCOINS_PUBLIC_HOST=127.0.0.1:8080
+```
+
+Empty `ZKCOINS_PUBLIC_HOST` is valid for mint → sign → nullifier alone; OwnershipProof surfaces then fail loud with no silent localhost.
 
 ## Prerequisites
 
 1. Docker with Compose v2.
 2. Disk and RAM for a **first** node image build (multi-stage Rust + Plonky2 circuits). Expect **many minutes to hours** on a cold machine; subsequent boots reuse the image and `/data/proofs` volume but still pay migration + scanner connect. Be honest: the first circuit construction is the long pole (see also `docs/build-report.md` for historical full-build wall times).
-3. An Esplora-compatible HTTP + WebSocket endpoint the node container can reach (residual config + readiness only).
-4. A sibling checkout of `zk-coins/api` with a working Rust toolchain (`rust-toolchain` in that repo).
-5. Ability to produce a BIP-340 creator signature for the mint (wallet / SDK / tooling you control). This document describes the **HTTP wire**, not a full wallet implementation.
+3. A first **api** image build from `../api` (multi-stage Rust + pinned `protoc`; shorter than the node, still cold-cache heavy).
+4. An Esplora-compatible HTTP + WebSocket endpoint the node container can reach (residual config + node readiness only).
+5. Ability to produce BIP-340 creator signatures and (for entrust / pull) OwnershipProofs — **`zk-coins/sdk`** v1 signer + wallet flow, not the node.
 
 ## Required environment (host → compose)
 
@@ -120,14 +155,14 @@ Compose uses `${VAR:?…}` so a missing variable **fails at parse time**.
 | `PUBLISHER_KEY` | `node/src/lib.rs` `PUBLISHER_KEY` | `export PUBLISHER_KEY="$(openssl rand -hex 32)"` — real secp256k1 secret; no compose default |
 | `USERNAME_DOMAIN` | `node/src/lib.rs` `USERNAME_DOMAIN` | e.g. `export USERNAME_DOMAIN=local.zkcoins.test` |
 
-### Residual Esplora (still mandatory at boot)
+### Residual Esplora (still mandatory at node boot)
 
 | Variable | Fail site | Notes |
 | --- | --- | --- |
-| `ESPLORA_URL` | `build_network_config_from_env` | HTTP base; `/health/ready` pings tip height |
+| `ESPLORA_URL` | `build_network_config_from_env` | HTTP base; node `/health/ready` pings tip height |
 | `ESPLORA_WS_URL` | same | Still required even though Stage-3 scan does not use the legacy WS scanner |
 
-No invented third-party URLs in this document. Point at an Esplora **you** run for the same regtest chain if you have one; if you only care about the mint/nullifier path, expect `/health/ready` to stay non-ready while jobs still run against bitcoind.
+No invented third-party URLs in this document. Point at an Esplora **you** run for the same regtest chain if you have one; if you only care about the mint/nullifier path, expect node `/health/ready` to stay non-ready while jobs still run against bitcoind.
 
 ### §3.6 boot pins
 
@@ -194,6 +229,15 @@ export ZKCOINS_EXPECTED_PARAMS_IDENTIFIER="$(…output…)"
 | `ZKCOINS_V1_FEE_RATE_SAT_PER_VB` | sat/vB, integer > 0 |
 | `ZKCOINS_V1_REVEAL_OUTPUT_SATS` | reveal output sats, integer > 0 |
 
+### api (compose service)
+
+| Variable | Meaning |
+| --- | --- |
+| `ZKCOINS_FEATURES` | e.g. `wallet,explorer` |
+| `ZKCOINS_PUBLIC_HOST` | may be empty; for host wallets use `127.0.0.1:8080` |
+| `ZKCOINS_BLOSSOM_MAX_BLOB_BYTES` | integer > 0 (store is always set in compose) |
+| `ZKCOINS_BLOSSOM_ALLOWED_OPS` | may be empty (uploads all 403) |
+
 ### Fixed inside compose
 
 | Variable | Value | Why |
@@ -205,6 +249,9 @@ export ZKCOINS_EXPECTED_PARAMS_IDENTIFIER="$(…output…)"
 | `DATABASE_URL` | internal to `postgres` | User `zkcoins` / password `localdev` / db `zkcoins` — local-only |
 | `ZKCOINS_V1_BITCOIND_RPC_URL` | `http://bitcoind:18443` | Compose DNS |
 | `ZKCOINS_V1_BITCOIND_COOKIE_PATH` | `/run/bitcoind-data/regtest/.cookie` | Shared volume |
+| api `ZKCOINS_BIND_ADDR` | `0.0.0.0:8080` | Local-stack bind convention |
+| api `ZKCOINS_KERNEL_ADDR` | `http://node:50051` | Compose DNS → kernel |
+| api `ZKCOINS_BLOSSOM_STORE` | `/data/blossom` | Volume mount |
 
 ## Start
 
@@ -225,9 +272,10 @@ export ZKCOINS_BOOTSTRAP_PUBKEY=…   # 64 lowercase hex x-only — your materia
 export ZKCOINS_EXPECTED_PARAMS_IDENTIFIER=…  # compute as above
 
 # Operational pins (operator-chosen URLs for *this* local node — not invented)
-# Compose service `nostr-relay` → ws://nostr-relay:8080/ (host tools: ws://127.0.0.1:8080/)
+# Compose service `nostr-relay` → ws://nostr-relay:8080/ (host tools: ws://127.0.0.1:18080/)
 export ZKCOINS_RELAY_URL=ws://nostr-relay:8080/
-export ZKCOINS_BLOSSOM_URL=…
+# Advertised Blossom base for GetInfo ops — host-facing api Blossom surface is :8080
+export ZKCOINS_BLOSSOM_URL=http://127.0.0.1:8080/
 export ZKCOINS_MAX_BLOB_BYTES=1048576
 export ZKCOINS_KERNEL_PARTS=scanner,prover,publisher
 export KERNEL_GRPC_ADDR=0.0.0.0:50051
@@ -236,6 +284,12 @@ export KERNEL_GRPC_ADDR=0.0.0.0:50051
 export ZKCOINS_V1_BITCOIND_WALLET=zkcoins
 export ZKCOINS_V1_FEE_RATE_SAT_PER_VB=2
 export ZKCOINS_V1_REVEAL_OUTPUT_SATS=1000
+
+# api
+export ZKCOINS_FEATURES=wallet,explorer
+export ZKCOINS_PUBLIC_HOST=127.0.0.1:8080
+export ZKCOINS_BLOSSOM_MAX_BLOB_BYTES=1048576
+export ZKCOINS_BLOSSOM_ALLOWED_OPS=   # empty = surface up, uploads 403 until you list op pubkeys
 ```
 
 ### 2. Bring Compose up
@@ -244,7 +298,8 @@ export ZKCOINS_V1_REVEAL_OUTPUT_SATS=1000
 docker compose up --build
 ```
 
-First build builds the node image (Rust + circuits). Leave it running.
+First build builds the **node** image (Rust + circuits) and the **api** image
+(from `../api`). Leave the stack running.
 
 ### 3. Operator bitcoind steps (no silent funding in compose)
 
@@ -274,15 +329,7 @@ If the node was already running before the wallet existed, restart the **node** 
 docker compose restart node
 ```
 
-### 4. Start the api (host)
-
-```bash
-export ZKCOINS_BIND_ADDR=0.0.0.0:8080
-export ZKCOINS_KERNEL_ADDR=http://127.0.0.1:50051
-export ZKCOINS_FEATURES=wallet,explorer
-export ZKCOINS_PUBLIC_HOST=
-cargo run   # in zk-coins/api
-```
+(`api` depends on node healthy — it will restart/wait with the dependency chain when you recreate, not on a bare `restart node` of an already-running api.)
 
 ## Probes — when is each piece actually up?
 
@@ -293,17 +340,56 @@ Do not “wait a bit”. Use these checks:
 | Postgres | `docker compose exec postgres pg_isready -U zkcoins -d zkcoins` | exit 0 / “accepting connections” |
 | bitcoind | `docker compose exec bitcoind bitcoin-cli -regtest -datadir=/home/bitcoin/.bitcoin getblockchaininfo` | JSON with `"chain": "regtest"` |
 | bitcoind cookie | `docker compose exec bitcoind test -f /home/bitcoin/.bitcoin/regtest/.cookie` | exit 0 |
-| nostr-relay | `docker compose exec nostr-relay bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'` | exit 0 (TCP accept on 8080) |
+| nostr-relay (in-container) | `docker compose exec nostr-relay bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'` | exit 0 (TCP accept on 8080) |
+| nostr-relay (host) | TCP connect to `127.0.0.1:18080` (e.g. `nc -z 127.0.0.1 18080`) | open once relay accepts |
 | node liveness | `curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:4242/health` | `200`, body `ok` (`router.rs` `health_handler`) |
 | node gRPC port | TCP connect to `127.0.0.1:50051` (e.g. `nc -z 127.0.0.1 50051`) | open once REST/gRPC task bound |
 | node readiness | `curl -sS http://127.0.0.1:4242/health/ready` | `200` only when Postgres, **Esplora tip**, prover warm, v1 scan caught up, no deep reorg — else `503`. Liveness can be green while ready is red. |
 | api liveness | `curl -sS http://127.0.0.1:8080/health` | body `ok` (`api` `GET /health`) |
 | api readiness | `curl -sS http://127.0.0.1:8080/health/ready` | Kernel `GetInfo`. While BootstrapManifest is missing, kernel `GetInfo` stays fail-closed → expect **503** `{ ready: false, … }` (api `docs/rest-surface.md`). That does **not** mean jobs are dead. |
-| api discovery | `curl -sS http://127.0.0.1:8080/` | JSON with `endpoints` for registered surfaces only |
+| api discovery | `curl -sS http://127.0.0.1:8080/` | JSON with `endpoints` for registered surfaces only (includes `blossom_*` while the store is configured) |
 
-## Full pass (mint → sign → completed → nullifier)
+## Full pass (entrust → mint → sign → completed → nullifier → send → receive)
 
 All api calls below assume `http://127.0.0.1:8080` and features `wallet,explorer`.
+
+### 0. Entrust the operational bundle — `POST /v1/bootstrap/*`
+
+Who: the **account holder’s wallet** (holds the seed / operational secrets). How: §7.7 via the api edge (`api/src/bootstrap.rs`) → kernel `EntrustOperationalBundle` (`node/node/src/kernel/bootstrap/bundle.rs`).
+
+Wire:
+
+1. `POST /v1/bootstrap/challenge` with `{ "subject": "<zk1…>", "action": "entrust" }` → `{ nonce, expiry, domain }` (`domain` = `zkCoins/v1/EntrustChallenge`).
+2. Wallet builds an OwnershipProof under that domain with `chan_bind` for the host in `ZKCOINS_PUBLIC_HOST` (SDK: `buildOwnershipProof` / pull-challenge helpers in `sdk/src/v1/ownership.ts` — same composition as the api edge).
+3. `POST /v1/bootstrap/entrust` with `{ challenge: { nonce, expiry }, ownership_proof, bundle }` where `bundle` is **322 lowercase hex characters** = 161 bytes `serialize(OperationalBundle)` = `version(0x01) ‖ ivk ‖ ovk ‖ op ‖ nk ‖ op_secret` (each 32 B). **Never log the hex.**
+
+```bash
+# Challenge
+curl -sS -X POST http://127.0.0.1:8080/v1/bootstrap/challenge \
+  -H 'content-type: application/json' \
+  -d '{"subject":"<zk1…>","action":"entrust"}'
+
+# Entrust (bundle hex is wallet material — not invented here)
+curl -sS -X POST http://127.0.0.1:8080/v1/bootstrap/entrust \
+  -H 'content-type: application/json' \
+  -d '{
+    "challenge": {"nonce":"<64-hex>","expiry":"<decimal-u64>"},
+    "ownership_proof": {
+      "type": "ownership",
+      "subject": "<zk1…>",
+      "public_key": "<64-hex Pk0>",
+      "nk_commit": "<64-hex>",
+      "signature": "<128-hex>"
+    },
+    "bundle": "<322-hex>"
+  }'
+```
+
+**Expected:** HTTP **200** `{ "accepted": true }`.
+
+> The SDK v1 client (`ZkCoinsV1Client`) exposes transition/pull helpers; it does **not** currently ship a dedicated `entrust` method — challenge + OwnershipProof + bundle assembly is wallet work over the same wire. Bundle store is process-local in the kernel today (lost on node restart — see gaps).
+
+Without an active bundle, receive/scan-side decryption and recovery paths that need `ivk` / operational keys fail closed. Mint admit can still be attempted; full hosted receive needs entrust.
 
 ### A. Mint — `POST /v1/tx`
 
@@ -338,7 +424,7 @@ curl -sS -X POST http://127.0.0.1:8080/v1/tx \
 
 **Expected:** HTTP **202** body `{ "job_id": "…", "status": "accepted" }`.
 
-> Placeholders only — no example keys that look like live secrets. Field widths are from the api validator (`decode_hex_exact` 32 bytes for pubkey digests). How you derive `subject` / keys is wallet/SDK work (**open** if you do not have that tooling).
+> Placeholders only — no example keys that look like live secrets. Field widths are from the api validator (`decode_hex_exact` 32 bytes for pubkey digests). How you derive `subject` / keys is wallet/SDK work.
 
 ### B. Wait for signature challenge — `GET /v1/jobs/<job_id>`
 
@@ -355,7 +441,14 @@ Poll until `status` is `awaiting_signature`. The object then includes `awaiting_
 
 Alternatively: `GET /v1/jobs/<job_id>/stream` (SSE: `phase` / `complete` / `error`).
 
-### C. Sign — `POST /v1/jobs/<job_id>/sign`
+### C. Sign — Wallet / SDK, then `POST /v1/jobs/<job_id>/sign`
+
+The **node does not sign**. The signature is produced by the wallet using the
+**v1 signer** in **`zk-coins/sdk`**:
+
+- `refuseOrSignTransition` / `signTransition` / `signTransitionOverProofData`
+  (`sdk/src/v1/signGate.ts`, `sdk/src/v1/transitionSignature.ts`)
+- Wire body via `signBodyFromSignature` → `{ signature, s2c_nonce }`
 
 Body (`SignBodyJson`): `{ "signature": "<128-hex = 64 bytes>", "s2c_nonce": "<64-hex = 32 bytes>" }` — BIP-340 creator signature + x-only even-y `R'` (`node/src/v1/signature.rs` wire rules: lowercase hex, no `0x`).
 
@@ -366,8 +459,6 @@ curl -sS -X POST http://127.0.0.1:8080/v1/jobs/<job_id>/sign \
 ```
 
 **Expected:** HTTP **200** with updated job JSON. Production path then finalises (prove/apply, durable `members_ready`, construct/broadcast handoff).
-
-> How to compute the signature from `awaiting_signature` fields is protocol/wallet logic (domain-separated BIP-340 over proof-data). Exact local signing command **open** without a wallet binary in this stack — use your SDK or the signing code paths under `script-plonky2` / `node/src/v1/signature.rs` as the source of truth.
 
 ### D. Job reaches `completed`
 
@@ -407,7 +498,7 @@ curl -sS "http://127.0.0.1:8080/v1/chain/nullifier/<pubkey-hex>"
 ```
 
 - Path segment: **32-byte hex** account pubkey for the nullifier index (`api/src/chain.rs` `get_nullifier` → kernel `GetNullifierPath`).
-- Which pubkey? The NfLog first-occurrence key for the transition (account state nullifier `pk`). For a mint this is the account public key whose state was nullified — typically the signing account’s x-only pubkey for that transition, **not** the bech32 `subject` string as-is. Mapping from wallet material → this 32-byte key is wallet/SDK territory (**open** if your tooling does not already expose it).
+- Which pubkey? The NfLog first-occurrence key for the transition (account state nullifier `pk`). For a mint this is the account public key whose state was nullified — typically the signing account’s x-only pubkey for that transition, **not** the bech32 `subject` string as-is. Mapping from wallet material → this 32-byte key is wallet/SDK territory.
 
 **Expected after scanner fold of an included nullifier:**
 
@@ -420,19 +511,34 @@ Kernel `internal_error` is **not** rewritten as absent.
 
 Optional cross-check: `GET /v1/chain/accumulator` → `{ size, root, tip_block_hash, tip_height }` (pass-through of kernel `nav_root`).
 
+### G. Send — `POST /v1/tx` kind `send`
+
+Same job lifecycle as mint (`api/src/jobs.rs`: send requires non-empty `input_coins` + `output_templates`, forbids `fold_coin_ids` / `issuance`). Sign with the SDK v1 gate again.
+
+**Recipient addressing:** a real send needs the recipient’s **`IVPK`** (and relays) so the delivery event can be encrypted (§4.2 / §4.3). That material is **not** on the §7.5 REST inventory — there is **no** `Invoice` path key in `CLOSED_ENDPOINT_KEYS` (`api/src/routes.rs`). Spec addressing is off-chain `Invoice` / kind-30420 profile / handle resolution (`docs` specification §4.3). For a local two-wallet pass you must obtain `IVPK` from the recipient wallet out-of-band (or construct a verified Invoice outside this stack). Without it, on-chain nullifier publish may still complete while **private delivery cannot**.
+
+### H. Receive — `POST /v1/tx` kind `receive`
+
+Receive requires non-empty `fold_coin_ids` and forbids `input_coins` / `output_templates` / `issuance` (`api/src/jobs.rs`). Folding needs coins the node can already see as incoming (delivery + decrypt under entrusteed `ivk`). That path depends on Nostr delivery wiring and an active operational bundle — both called out under gaps when incomplete.
+
 ## What the pass proves — and what it does not
 
 | Claim | Proved by this pass? |
 | --- | --- |
+| Five compose services start; each readiness probe above is checkable | Yes when probes match the Expected column |
 | api accepts mint, returns a job, and projects kernel status | Yes, if steps A–D succeed |
-| Wallet signature verified; host applied state; broadcast handoff recorded | Yes when status is `completed` (`JOB_FINALISE_HOST_EDGE`) |
+| Wallet signature verified; host applied state; broadcast handoff recorded | Yes when status is `completed` (`JOB_FINALISE_HOST_EDGE`) — signature from **SDK/wallet**, not the node |
+| Operational bundle accepted by the kernel for a subject | Yes when step 0 returns `accepted: true` |
 | Commit/reveal in a mined block on **this** regtest bitcoind | Yes only after step E and mempool/chain checks you perform |
 | Nullifier folded into the node’s NfLog and served with inclusion path | Yes when step F returns `present: true` |
 | Six-confirmation finality | Only if you mined depth ≥ 6 under tip; one block is not finality |
 | `completed` alone = chain inclusion | **No** — that is why step F exists |
 | Full `GetInfo` / signed network bootstrap | **No** — BootstrapManifest still missing |
-| Production readiness (`/health/ready` green without Esplora) | **No** — Esplora still on the residual path |
+| Production readiness (node `/health/ready` green without Esplora) | **No** — Esplora still on the residual path |
+| api `/health/ready` green | **No** while kernel `GetInfo` is fail-closed (expected 503) |
 | Mainnet safety | **No** — regtest only; never set `IS_MAINNET=true` |
+| End-to-end private **send delivery** (Nostr gift-wrap → recipient decrypt) | **No** until recipient `IVPK` is available out-of-band **and** node delivery/relay wiring is live |
+| That the **Wallet** is replaceable by curl alone for signatures | **No** — BIP-340 transition signatures and OwnershipProofs are wallet/SDK work (`zk-coins/sdk` v1) |
 
 ## Cleanup
 
@@ -440,11 +546,15 @@ Optional cross-check: `GET /v1/chain/accumulator` → `{ size, root, tip_block_h
 # Stop containers; keep volumes
 docker compose down
 
-# Stop and remove volumes (Postgres state, node /data/proofs, bitcoind regtest)
+# Stop and remove volumes (Postgres state, node /data/proofs, bitcoind regtest,
+# nostr relay db, api Blossom store)
 docker compose down -v
 ```
 
-Re-creating volumes wipes the regtest chain, cookie, wallet, and node state. After `-v`, re-run wallet create, funding, and pin exports from scratch.
+Re-creating volumes wipes the regtest chain, cookie, wallet, node state, and
+Blossom blobs. After `-v`, re-run wallet create, funding, and pin exports from
+scratch. Kernel process-local bundle store is always empty after a node restart
+(even without `-v`).
 
 ## Fail-loud behaviour (by design)
 
@@ -452,22 +562,28 @@ Re-creating volumes wipes the regtest chain, cookie, wallet, and node state. Aft
 - Missing `PUBLISHER_KEY` / Esplora / §3.6 pins / identity ops / bitcoind RPC env → process panic or `Err`.
 - Unreachable bitcoind after boot → scanner connect fails → process exits (`run_v1_scan_loop`). No `restart: always`.
 - Wrong circuit digests vs the binary → self-heal / boot refusal.
-- api missing any of its four env vars → exit code 1 with named error (`Config::from_env`).
+- api missing any of its four Pflicht env vars → exit code 1 with named error (`Config::from_env`).
+- api Blossom store set without companions → start error (`parse_blossom_config`).
 
 ## Gaps / open items
 
-1. **No api image** — host `cargo run` only until `zk-coins/api` grows a Dockerfile.
-2. **Esplora not bundled** — residual boot + readiness still need operator Esplora; scan/publish use bitcoind.
-3. **BootstrapManifest** — `GetInfo` / api `/health/ready` stay fail-closed; job + nullifier paths do not.
-4. **Wallet signing CLI** — this stack does not ship a mint signer; signature computation is open without external wallet/SDK.
-5. **Exact pubkey for `/v1/chain/nullifier/<pubkey>`** after a mint depends on wallet key layout; not derivable from compose alone.
-6. **Legacy residual network label** — `IS_MAINNET=false` still maps residual `EsploraConfig::network()` to **Signet** for Taproot address derivation (`publisher.rs`), while v1 pins use `regtest` (existing node behaviour).
-7. **First boot time** — circuit build dominates; not fixed to a single number in compose.
+1. **Esplora not bundled** — residual boot + node readiness still need operator Esplora; scan/publish use bitcoind.
+2. **BootstrapManifest** — `GetInfo` / api `/health/ready` stay fail-closed; job + nullifier paths do not.
+3. **Wallet signing** — compose does not ship a mint/send signer; use **`zk-coins/sdk`** v1 (`refuseOrSignTransition` / `signTransition`).
+4. **Entrust material** — 161-byte operational bundle and OwnershipProof come from the wallet; no compose default. Kernel `BundleStore` is process-local (lost on node restart; durable table is a separate migration — `bundle.rs` comment).
+5. **Recipient `IVPK` / Invoice** — §7.5 REST has **no** `Invoice` carrier (`CLOSED_ENDPOINT_KEYS`). Send delivery needs `IVPK` (+ relays) from Invoice / kind-30420 / handle resolution (§4.3) **outside** this compose REST surface.
+6. **Nostr delivery wiring** — relay service is up; node client into send/receive is not yet the production path (see service table). Receive fold may stall without delivery + decrypt.
+7. **Exact pubkey for `/v1/chain/nullifier/<pubkey>`** after a mint depends on wallet key layout; not derivable from compose alone.
+8. **Blossom upload allow-list** — empty `ZKCOINS_BLOSSOM_ALLOWED_OPS` leaves the surface up but every upload `403` until real `op` pubkeys are listed.
+9. **Blossom volume ownership** — api image runs as uid `10001` (`Dockerfile`); a root-owned named volume can make `BlobStore::open` fail at create — operator must ensure the mount is writable by that user.
+10. **Legacy residual network label** — `IS_MAINNET=false` still maps residual `EsploraConfig::network()` to **Signet** for Taproot address derivation (`publisher.rs`), while v1 pins use `regtest` (existing node behaviour).
+11. **First boot time** — node circuit build dominates; not fixed to a single number in compose.
+12. **Host port split** — api owns host **8080**; nostr-relay host map is **18080** (container still 8080; compose DNS unchanged).
 
 ## Policy reminders
 
 - Never set `IS_MAINNET=true` in this file or a local override for this stack.
-- Never commit a real `PUBLISHER_KEY`.
+- Never commit a real `PUBLISHER_KEY` or operational-bundle hex.
 - Do not add `restart: always` to paper over boot failures.
-- Do not replace `/health` with a `true` healthcheck.
+- Do not replace `/health` with a `true` healthcheck; do not use `/health/ready` as a compose gate.
 - Do not invent URLs, digests, or example keys that look live.
