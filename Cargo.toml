@@ -23,6 +23,9 @@ blake3 = "1.6.1"
 lazy_static = "1.5.0"
 bitcoin = { version = "0.32.5", features = ["rand", "rand-std", "serde"] }
 bech32 = "0.11"
+# ZBE AEAD (§4.2.1). Workspace-pinned so shared (and any future consumer)
+# share one RustCrypto ChaCha20-Poly1305 version; not pinned past the workspace.
+chacha20poly1305 = "0.10.1"
 # Structured logging facade + `fmt` subscriber. Workspace-level so any
 # future crate adopting the partial-migration path (shared,
 # script-plonky2) picks up the same version automatically.

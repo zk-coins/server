@@ -20,6 +20,14 @@ pub const TAG_NAV_COMMIT: &str = "zkCoins/v1/NavCommit";
 /// HKDF info for `nav_rand = HKDF("zkCoins/v1/NavRand", op_secret ‖ u64-be(send_counter))` (§1.4).
 pub const TAG_NAV_RAND: &str = "zkCoins/v1/NavRand";
 pub const TAG_DETECT_TAG: &str = "zkCoins/v1/DetectTag";
+/// HKDF info for `K_tx = HKDF("zkCoins/v1/NoteKey", ss ‖ epk)` (§1.3).
+pub const TAG_NOTE_KEY: &str = "zkCoins/v1/NoteKey";
+/// HKDF info for `K_out = HKDF("zkCoins/v1/OutKey", ovk ‖ epk)` (§1.3).
+pub const TAG_OUT_KEY: &str = "zkCoins/v1/OutKey";
+/// HKDF info for `kb = HKDF("zkCoins/v1/BlobKey", K_tx)` (§4.2.1).
+pub const TAG_BLOB_KEY: &str = "zkCoins/v1/BlobKey";
+/// Per-chunk AEAD AAD prefix: `aad_i = "zkCoins/v1/Blob" ‖ u32_be(N) ‖ u32_be(i)` (§4.2.1).
+pub const TAG_BLOB_AAD: &[u8] = b"zkCoins/v1/Blob";
 
 pub const TAG_COINS_ROOT_LEAF: &str = "zkCoins/v1/CoinsRoot/Leaf";
 pub const TAG_COINS_ROOT_NODE: &str = "zkCoins/v1/CoinsRoot/Node";

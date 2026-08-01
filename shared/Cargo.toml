@@ -22,6 +22,7 @@ bincode = { workspace = true }
 hex = "0.4.3"
 bech32 = { workspace = true }
 plonky2 = "1.1.0"
+chacha20poly1305 = { workspace = true }
 
 [dev-dependencies]
 # Integration tests (`tests/*`) are separate crates and cannot see package

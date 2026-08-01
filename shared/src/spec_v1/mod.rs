@@ -26,6 +26,7 @@ pub mod nflog;
 /// compiles or exports a second (non-normative) RFC-6962 derivation path.
 #[cfg(feature = "test-fixtures")]
 pub mod nflog_boundary;
+pub mod note_encryption;
 pub mod serialize;
 pub mod tags;
 pub mod trees;
@@ -64,6 +65,13 @@ pub use network_params::NetworkParams;
 pub use nflog::{
     consistency_proof, inclusion_path, nflog_empty, nflog_leaf_hash, nflog_mth, nflog_node_hash,
     nflog_root, verify_consistency, verify_inclusion, Nav, NfLogEntry,
+};
+pub use note_encryption::{
+    base64url_decode_no_pad, base64url_encode_no_pad, derive_blob_key, derive_note_key,
+    derive_out_key, ecdh_shared_x, envelope_open, envelope_seal, parse_scalar, parse_xonly,
+    shared_secret_receiver, shared_secret_sender, xonly_pubkey, zbe_open, zbe_seal,
+    COIN_CIPHERTEXT_LEN, ENVELOPE_LABEL_COIN, ENVELOPE_LABEL_K_TX, ENVELOPE_PREFIX,
+    OUT_CIPHERTEXT_LEN, ZBE_CHUNK, ZBE_MAGIC,
 };
 pub use serialize::{
     deserialize_coin, deserialize_proof_data, deserialize_spend_record, parse_account_state,

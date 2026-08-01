@@ -143,6 +143,66 @@ pub enum SpecError {
     BootstrapExpired { expires_at: u64, now: u64 },
     /// `issued_at > expires_at` — degenerate lifetime (rejected structurally).
     BootstrapIssuedAfterExpiry { issued_at: u64, expires_at: u64 },
+    // --- Note encryption / ECDH / NIP44Binary envelope (§1.1 / §1.3) ---
+    /// Scalar byte string is not exactly 32 bytes.
+    ScalarWrongLength { actual: usize },
+    /// Scalar is the zero scalar (not in `[1, n)`).
+    ScalarZero,
+    /// Scalar is ≥ curve order `n` (not in `[1, n)`).
+    ScalarOutOfRange,
+    /// x-only public-key encoding is not exactly 32 bytes.
+    XOnlyWrongLength { actual: usize },
+    /// x-only x-coordinate satisfies `x ≥ p` (secp256k1 field prime).
+    XOnlyXGeP,
+    /// x-only x-coordinate is `< p` but no curve point has that x (off-curve).
+    XOnlyOffCurve,
+
+    /// NIP44Binary plaintext does not start with `zkcoins-bin-v1:`.
+    EnvelopeWrongPrefix,
+    /// NIP44Binary plaintext label does not match the expected call-site label.
+    EnvelopeWrongLabel { expected: String, actual: String },
+    /// NIP44Binary plaintext is missing the `label`/`payload` `:` separator.
+    EnvelopeMissingSeparator,
+    /// Envelope label is empty or contains `:` (not a fixed ASCII token).
+    EnvelopeInvalidLabel,
+    /// base64url_no_pad payload contains `=` padding.
+    Base64UrlPadding,
+    /// base64url_no_pad payload uses the standard Base64 alphabet (`+` / `/`).
+    Base64UrlStandardAlphabet,
+    /// base64url_no_pad payload contains whitespace.
+    Base64UrlWhitespace,
+    /// base64url_no_pad payload contains a character outside `[A-Za-z0-9\-_]`.
+    Base64UrlInvalidChar { ch: char },
+    /// base64url_no_pad payload has an impossible length (`len % 4 == 1`).
+    Base64UrlInvalidLength { len: usize },
+    /// base64url_no_pad payload is non-canonical (re-encode ≠ input).
+    Base64UrlNonCanonical,
+    /// Decoded NIP44Binary binary length ≠ expected call-site `L`.
+    EnvelopeWrongBinaryLength { expected: usize, actual: usize },
+
+    // --- ZBE §4.2.1 (chunked ChaCha20-Poly1305 blob encryption) ---
+    /// Ciphertext does not start with ASCII magic `ZBE1`.
+    ZbeWrongMagic,
+    /// Ciphertext ends before a complete header or chunk frame can be read.
+    ZbeTruncated,
+    /// Declared chunk count is zero (normative `N >= 1`).
+    ZbeInvalidChunkCount { n: u32 },
+    /// Declared `N` does not equal the number of complete length-prefixed chunks.
+    ZbeChunkCountMismatch { declared: u32, parsed: u32 },
+    /// A chunk's `u32_be(len C_i)` exceeds the remaining ciphertext bytes.
+    ZbeChunkLengthOverrun {
+        chunk_index: u32,
+        declared_len: u32,
+        remaining: usize,
+    },
+    /// Bytes remain after the last framed chunk.
+    ZbeTrailingBytes { remaining: usize },
+    /// Framed chunk shorter than the 16-byte Poly1305 tag.
+    ZbeChunkTooShort { chunk_index: u32, len: u32 },
+    /// Poly1305 authentication-tag verification failed for chunk `chunk_index`.
+    ZbeAuthFailed { chunk_index: u32 },
+    /// Plaintext would require more than `u32::MAX` chunks (`N` unencodable).
+    ZbeTooManyChunks { n: usize },
 }
 
 /// Which bootstrap URL list a length/UTF-8 error refers to.
@@ -419,6 +479,104 @@ impl fmt::Display for SpecError {
                 "bootstrap manifest issued_at={issued_at} is after expires_at={expires_at} \
                  (degenerate lifetime)"
             ),
+            SpecError::ScalarWrongLength { actual } => {
+                write!(f, "scalar wrong length: expected 32, got {actual}")
+            }
+            SpecError::ScalarZero => {
+                write!(f, "scalar is zero (must be in [1, n))")
+            }
+            SpecError::ScalarOutOfRange => {
+                write!(f, "scalar ≥ n (must be in [1, n))")
+            }
+            SpecError::XOnlyWrongLength { actual } => {
+                write!(f, "x-only public key wrong length: expected 32, got {actual}")
+            }
+            SpecError::XOnlyXGeP => {
+                write!(f, "x-only x-coordinate ≥ p (secp256k1 field prime)")
+            }
+            SpecError::XOnlyOffCurve => {
+                write!(f, "x-only x-coordinate is not on secp256k1")
+            }
+            SpecError::EnvelopeWrongPrefix => {
+                write!(f, "NIP44Binary plaintext missing prefix \"zkcoins-bin-v1:\"")
+            }
+            SpecError::EnvelopeWrongLabel { expected, actual } => {
+                write!(
+                    f,
+                    "NIP44Binary label mismatch: expected {expected:?}, got {actual:?}"
+                )
+            }
+            SpecError::EnvelopeMissingSeparator => {
+                write!(f, "NIP44Binary plaintext missing label/payload separator ':'")
+            }
+            SpecError::EnvelopeInvalidLabel => {
+                write!(f, "NIP44Binary label is empty or contains ':'")
+            }
+            SpecError::Base64UrlPadding => {
+                write!(f, "base64url_no_pad rejects '=' padding")
+            }
+            SpecError::Base64UrlStandardAlphabet => {
+                write!(f, "base64url_no_pad rejects standard Base64 alphabet '+/'")
+            }
+            SpecError::Base64UrlWhitespace => {
+                write!(f, "base64url_no_pad rejects whitespace")
+            }
+            SpecError::Base64UrlInvalidChar { ch } => {
+                write!(f, "base64url_no_pad invalid character {ch:?}")
+            }
+            SpecError::Base64UrlInvalidLength { len } => {
+                write!(f, "base64url_no_pad invalid length {len} (len % 4 == 1)")
+            }
+            SpecError::Base64UrlNonCanonical => {
+                write!(f, "base64url_no_pad encoding is non-canonical")
+            }
+            SpecError::EnvelopeWrongBinaryLength { expected, actual } => {
+                write!(
+                    f,
+                    "NIP44Binary decoded length mismatch: expected {expected}, got {actual}"
+                )
+            }
+            SpecError::ZbeWrongMagic => {
+                write!(f, "ZBE ciphertext missing magic \"ZBE1\"")
+            }
+            SpecError::ZbeTruncated => {
+                write!(f, "ZBE ciphertext truncated before complete framing")
+            }
+            SpecError::ZbeInvalidChunkCount { n } => {
+                write!(f, "ZBE invalid chunk count N={n} (must be >= 1)")
+            }
+            SpecError::ZbeChunkCountMismatch { declared, parsed } => {
+                write!(
+                    f,
+                    "ZBE chunk count mismatch: declared N={declared}, parsed {parsed}"
+                )
+            }
+            SpecError::ZbeChunkLengthOverrun {
+                chunk_index,
+                declared_len,
+                remaining,
+            } => write!(
+                f,
+                "ZBE chunk {chunk_index} length {declared_len} exceeds remaining {remaining} bytes"
+            ),
+            SpecError::ZbeTrailingBytes { remaining } => {
+                write!(f, "ZBE trailing bytes after last chunk: {remaining}")
+            }
+            SpecError::ZbeChunkTooShort { chunk_index, len } => {
+                write!(
+                    f,
+                    "ZBE chunk {chunk_index} length {len} is shorter than Poly1305 tag (16)"
+                )
+            }
+            SpecError::ZbeAuthFailed { chunk_index } => {
+                write!(
+                    f,
+                    "ZBE Poly1305 authentication failed for chunk {chunk_index}"
+                )
+            }
+            SpecError::ZbeTooManyChunks { n } => {
+                write!(f, "ZBE plaintext requires {n} chunks (exceeds u32::MAX)")
+            }
         }
     }
 }
