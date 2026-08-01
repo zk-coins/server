@@ -14,7 +14,7 @@ pub(crate) use convert::{
     parse_entrust_request, parse_grant_request, parse_list_inscriptions_request,
     parse_nullifier_path_request, parse_publish_request, parse_pull_request, parse_record_request,
     parse_revoke_request, parse_session_authority, parse_session_bound, parse_sign_request,
-    parse_transition_request, publish_outcome_to_proto, pull_result_to_proto, record_blob_to_proto,
-    revoke_result_to_proto,
+    parse_transition_request, publish_outcome_to_proto, pull_result_to_proto, receipt_to_proto,
+    record_blob_to_proto, revoke_result_to_proto,
 };
 pub(crate) use errors::kernel_error_to_status;

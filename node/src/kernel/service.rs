@@ -5,12 +5,12 @@
 //! and the shared challenge-store issue helpers. Block 6: read-only chain
 //! (`get_info`, `get_accumulator`, `get_nullifier_path`, `list_inscriptions`).
 //! Block 7: `open_pull_challenge`, `pull`, `get_record`, `get_coin_proof`,
-//! `get_account_state`. Block 8: `publish`, `entrust_operational_bundle`,
-//! `revoke_operational_bundle`. `SubscribeReceipts` is not a façade method:
-//! there is no production credit writer after durable persist (§4.8 / §4.9),
-//! so gRPC answers `Unimplemented` (see `access::receipts` writer contract)
-//! rather than accepting a silent empty stream. `ListInscriptions` reads the
-//! scanner-written inscription catalog via [`ChainView`].
+//! `get_account_state`, `subscribe_receipts`. Block 8: `publish`,
+//! `entrust_operational_bundle`, `revoke_operational_bundle`.
+//! `SubscribeReceipts` is the filtered push stream over the receipt hub;
+//! the receive path publishes after durable decrypt-index persist (§4.8 /
+//! §4.9). `ListInscriptions` reads the scanner-written inscription catalog
+//! via [`ChainView`].
 
 use std::sync::Arc;
 
@@ -19,8 +19,9 @@ use tokio::sync::mpsc;
 use crate::job_dispatcher::{JobEnvelope, JobNotifyMap};
 use crate::job_store::JobStore;
 use crate::kernel::access::{
-    self, AccountStateView, GetCoinProofCommand, GetRecordCommand, InMemoryPrivateIndex,
-    PrivateIndex, PullCommand, PullResult, RecordBlob, SessionBoundRequest, SessionStore,
+    self, AccountStateView, CreditReceipt, GetCoinProofCommand, GetRecordCommand,
+    InMemoryPrivateIndex, PrivateIndex, PullCommand, PullResult, ReceiptHub, RecordBlob,
+    SessionBoundRequest, SessionStore,
 };
 use crate::kernel::attestation::{self, AttestBalanceCommand, AttestBalanceDeps};
 use crate::kernel::bootstrap::{
@@ -87,6 +88,9 @@ pub(crate) struct KernelServiceConfig {
     /// Private-record + account-state index (process mirror of
     /// `v1_decrypt_index`; filled by the §4.4 receive path after durable write).
     pub private_index: Arc<InMemoryPrivateIndex>,
+    /// Credit-receipt fan-out: receive path publishes after dual persist;
+    /// `SubscribeReceipts` filters by server-side session subject + scope.
+    pub receipt_hub: Arc<ReceiptHub>,
     /// Live NfLog / tip / identity for read-only chain procedures.
     pub chain: ChainHandle,
 }
@@ -111,6 +115,8 @@ pub(crate) struct KernelService {
     sessions: Arc<SessionStore>,
     /// Private-record + account-state index (process mirror of durable decrypt index).
     private_index: Arc<InMemoryPrivateIndex>,
+    /// Credit-receipt fan-out shared with the §4.4 receive scanner.
+    receipt_hub: Arc<ReceiptHub>,
     /// Live NfLog / tip / identity for read-only chain procedures.
     chain: ChainHandle,
 }
@@ -127,6 +133,7 @@ impl KernelService {
             manifests,
             sessions,
             private_index,
+            receipt_hub,
             chain,
         }: KernelServiceConfig,
     ) -> Self {
@@ -140,6 +147,7 @@ impl KernelService {
             manifests,
             sessions,
             private_index,
+            receipt_hub,
             chain,
         }
     }
@@ -158,6 +166,7 @@ impl KernelService {
             manifests: ManifestStore::shared(),
             sessions: SessionStore::shared(),
             private_index: InMemoryPrivateIndex::shared(),
+            receipt_hub: ReceiptHub::shared(),
             chain: ChainHandle::default(),
         })
     }
@@ -201,6 +210,7 @@ impl KernelService {
             manifests: ManifestStore::shared(),
             sessions: SessionStore::shared(),
             private_index: InMemoryPrivateIndex::shared(),
+            receipt_hub: ReceiptHub::shared(),
             chain,
         })
     }
@@ -237,6 +247,17 @@ impl KernelService {
     /// Install a shared private-record index (same Arc the receive scanner writes).
     pub(crate) fn with_private_index(mut self, index: Arc<InMemoryPrivateIndex>) -> Self {
         self.private_index = index;
+        self
+    }
+
+    /// Credit-receipt hub shared with the §4.4 receive path (emit after persist).
+    pub(crate) fn receipt_hub(&self) -> &Arc<ReceiptHub> {
+        &self.receipt_hub
+    }
+
+    /// Install the shared receipt hub (same Arc the receive scanner publishes on).
+    pub(crate) fn with_receipt_hub(mut self, hub: Arc<ReceiptHub>) -> Self {
+        self.receipt_hub = hub;
         self
     }
 
@@ -498,6 +519,25 @@ impl KernelService {
         request: SessionBoundRequest,
     ) -> KernelResult<AccountStateView> {
         access::get_account_state(self.access_deps(&[], now), request)
+    }
+
+    /// `SubscribeReceipts` — server-stream of verified credits for the
+    /// pull session's stored subject + resolved scope (ownership **or** grant).
+    ///
+    /// Subject/scope come only from the server-side session. Emission is the
+    /// receive path after durable dual-persist via
+    /// [`access::publish_credit_if_inserted`].
+    pub(crate) fn subscribe_receipts(
+        &self,
+        now: u64,
+        request: SessionBoundRequest,
+    ) -> KernelResult<KernelStream<CreditReceipt>> {
+        access::subscribe_receipts(
+            self.sessions.as_ref(),
+            self.receipt_hub.as_ref(),
+            request,
+            now,
+        )
     }
 
     /// `Publish` — fee-less publisher hand-off (§7.6 / §7.8).

@@ -8,8 +8,7 @@
 //! ## What a grant unlocks
 //!
 //! Reading procedures that honour a grant (`Pull`, `GetRecord`,
-//! `GetCoinProof`) live in [`crate::kernel::access`]. (`SubscribeReceipts`
-//! will join them once a credit writer exists — see `access::receipts`.)
+//! `GetCoinProof`, `SubscribeReceipts`) live in [`crate::kernel::access`].
 //! A grant session is issued at `Pull` with
 //! [`SessionAuthority::Grant`](crate::kernel::access::SessionAuthority::Grant);
 //! scope is enforced there. This module only **issues** the Bech32m grant.

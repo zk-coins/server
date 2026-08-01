@@ -8,8 +8,8 @@
 use uuid::Uuid;
 
 use crate::kernel::access::{
-    AccountStateView, GetCoinProofCommand, GetRecordCommand, PullCommand, PullResult,
-    RecordBlob as DomainRecordBlob, RecordRef, SessionAuthority, SessionBoundRequest,
+    AccountStateView, CreditReceipt, GetCoinProofCommand, GetRecordCommand, PullCommand,
+    PullResult, RecordBlob as DomainRecordBlob, RecordRef, SessionAuthority, SessionBoundRequest,
 };
 use crate::kernel::attestation::{AttestBalanceCommand, AttestCeiling};
 use crate::kernel::bootstrap::{EntrustCommand, RevokeCommand};
@@ -46,10 +46,11 @@ use kernel_proto::{
     ListInscriptionsRequest as ProtoListInscriptionsRequest, NullifierPath as ProtoNullifierPath,
     NullifierPathRequest as ProtoNullifierPathRequest, OutputTemplate as ProtoOutputTemplate,
     PublishRequest as ProtoPublishRequest, PublishResult as ProtoPublishResult,
-    PullRequest as ProtoPullRequest, PullResult as ProtoPullResult, RecordBlob as ProtoRecordBlob,
-    RecordRef as ProtoRecordRef, RecordRequest as ProtoRecordRequest,
-    RevokeRequest as ProtoRevokeRequest, RevokeResult as ProtoRevokeResult, Scope as ProtoScope,
-    SignRequest as ProtoSignRequest, TransitionRequest as ProtoTransitionRequest,
+    PullRequest as ProtoPullRequest, PullResult as ProtoPullResult, Receipt as ProtoReceipt,
+    RecordBlob as ProtoRecordBlob, RecordRef as ProtoRecordRef,
+    RecordRequest as ProtoRecordRequest, RevokeRequest as ProtoRevokeRequest,
+    RevokeResult as ProtoRevokeResult, Scope as ProtoScope, SignRequest as ProtoSignRequest,
+    TransitionRequest as ProtoTransitionRequest,
 };
 use shared::spec_v1::Address;
 
@@ -257,9 +258,8 @@ pub(crate) fn coin_proof_blob_to_proto(canonical: Vec<u8>) -> ProtoCoinProofBlob
 
 /// Parse proto `AccountStateRequest` / `SubscribeReceiptsRequest` shape.
 ///
-/// `SubscribeReceipts` itself is `Unimplemented` until a credit writer
-/// exists; this parser remains for the shared session-bound request shape
-/// used by `GetAccountState` (and later by a real subscribe path).
+/// Shared by `GetAccountState` and `SubscribeReceipts`. Both requests carry
+/// **only** `session` + `chan_bind` — no client subject field.
 pub(crate) fn parse_session_bound(
     session: String,
     chan_bind: Vec<u8>,
@@ -268,6 +268,20 @@ pub(crate) fn parse_session_bound(
         session,
         chan_bind: ChanBind(parse_exact_32(&chan_bind, "chan_bind")?),
     })
+}
+
+/// Domain credit receipt → proto `Receipt`.
+///
+/// Server-side `subject` is admission-only and is **not** on the wire
+/// message (proto has no subject field). Amount is a decimal `u128` string.
+pub(crate) fn receipt_to_proto(receipt: &CreditReceipt) -> ProtoReceipt {
+    ProtoReceipt {
+        coin_id: receipt.coin_id.0.to_vec(),
+        asset_id: receipt.asset_id.0.to_vec(),
+        amount: receipt.amount.to_string(),
+        state: receipt.state.as_str().to_string(),
+        credited_at: receipt.credited_at,
+    }
 }
 
 /// Domain account-state view → proto.

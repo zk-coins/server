@@ -38,11 +38,10 @@
 //!   `StreamJob` / `CancelJob` / `SignTransition` / `SubmitTransition` /
 //!   `AttestBalance` / `IssueViewGrant` / `GetInfo` / `GetAccumulator` /
 //!   `GetNullifierPath` / `OpenPullChallenge` / `Pull` / `GetRecord` /
-//!   `GetCoinProof` / `GetAccountState` are wired; `SubscribeReceipts`
-//!   stays `Unimplemented` until a credit writer exists after durable
-//!   persist; `ListInscriptions` waits on a scanner-written inscription
-//!   catalog (reveal txid + §3.5 format are not on the NfLog). Remaining
-//!   procedures stay unimplemented until a faithful §7.8 mapping exists.
+//!   `GetCoinProof` / `GetAccountState` / `SubscribeReceipts` /
+//!   `ListInscriptions` / `Publish` / `EntrustOperationalBundle` /
+//!   `RevokeOperationalBundle` are wired (**20 of 20**). Receipts stream
+//!   from the shared hub after the receive path's durable dual persist.
 //! - [`state`] — binary `State::load_from_pg` (+ `LoadStateError`). The
 //!   type is public so the binary can hold `Arc<Mutex<State>>`. **Not**
 //!   public: `new`, `update`, `serialize_for_persist`,

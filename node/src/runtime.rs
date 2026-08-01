@@ -112,7 +112,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         anyhow::bail!("kernel closed-set contract invalid: {e}");
     }
     // Access-layer closed sets (RecordType / TransitionKind / SessionAuthority /
-    // ChallengeAction including Pull). ReceiptState returns with a credit writer.
+    // ReceiptState / ChallengeAction including Pull).
     if let Err(e) = crate::kernel::access::validate_closed_sets() {
         anyhow::bail!("kernel access closed-set contract invalid: {e}");
     }
@@ -201,6 +201,9 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     // Process mirror of durable `v1_decrypt_index` — filled by the §4.4
     // receive scanner after SQL insert; shared with kernel Pull surfaces.
     let shared_private_index = crate::kernel::access::InMemoryPrivateIndex::shared();
+    // Credit-receipt fan-out: scanner publishes after dual persist; kernel
+    // SubscribeReceipts filters by server-side session subject + scope.
+    let shared_receipt_hub = crate::kernel::access::ReceiptHub::shared();
     let shared_delivery_port: Arc<dyn crate::v1::OutgoingDeliveryPort> =
         Arc::new(crate::v1::MeshDeliveryPort::new(
             Arc::clone(&shared_delivery_retention),
@@ -281,12 +284,14 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
 
     // §4.4 receive path: poll gift-wraps, match detect_tag under each
     // entrusteed `ivk`, verify CoinProof, durable decrypt-index insert,
-    // then ACK. Requires the exclusive v1.1 engine (NfLog for step 4) and
-    // operational relay / max_blob. No credit without verify+persist.
+    // receipt publish, then ACK. Requires the exclusive v1.1 engine
+    // (NfLog for step 4) and operational relay / max_blob. No credit /
+    // receipt without verify+persist.
     if let Some(engine) = v1_engine.as_ref() {
         let engine = Arc::clone(engine);
         let bundles = Arc::clone(&shared_bundle_store);
         let private_index = Arc::clone(&shared_private_index);
+        let receipt_hub = Arc::clone(&shared_receipt_hub);
         let pool = Arc::clone(&pool);
         let ops = crate::kernel::chain::chain_identity_ops_from_env().ok();
         let network_label = crate::v1::mode::network_label(engine.network()).to_string();
@@ -326,6 +331,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                             adapter: engine.as_ref(),
                             pool: pool.as_ref(),
                             index: private_index.as_ref(),
+                            receipts: receipt_hub.as_ref(),
                         },
                         max_blob_bytes: ops.max_blob_bytes,
                         expected_network: &network_label,
@@ -650,18 +656,21 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         )
         .with_manifest_store(Arc::clone(&manifest_store))
         .with_bundle_store(Arc::clone(&shared_bundle_store))
-        .with_private_index(Arc::clone(&shared_private_index));
-        // Pull/Records read the process mirror of `v1_decrypt_index`
-        // (migration 0031). The §4.4 scanner writes SQL first, then this
-        // index, then ACK. SubscribeReceipts stays Unimplemented until a
-        // credit (receive-transition) writer exists after durable persist.
+        .with_private_index(Arc::clone(&shared_private_index))
+        .with_receipt_hub(Arc::clone(&shared_receipt_hub));
+        // Pull/Records/SubscribeReceipts share the process mirror of
+        // `v1_decrypt_index` (migration 0031) and the receipt hub. The
+        // §4.4 scanner writes SQL first, then the process index, then
+        // publishes a credit receipt, then ACK.
         tracing::info!(
             private_index_refs = Arc::strong_count(domain.private_record_index()),
+            receipt_hub_refs = Arc::strong_count(domain.receipt_hub()),
             bootstrap_manifest_refs = Arc::strong_count(domain.manifest_store()),
             bootstrap_manifest_loaded = domain.manifest_store().is_loaded(),
             delivery_target_refs = Arc::strong_count(&shared_delivery_targets),
             delivery_retention_len = shared_delivery_retention.len(),
-            "kernel access surfaces installed (Pull/Records; durable decrypt-index + process mirror)"
+            "kernel access surfaces installed (Pull/Records/SubscribeReceipts; \
+             durable decrypt-index + process mirror + receipt hub)"
         );
         if let Some(engine) = v1_engine.as_ref() {
             use crate::kernel::chain::{

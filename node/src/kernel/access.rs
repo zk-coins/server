@@ -1,4 +1,5 @@
-//! Pull, Records, AccountState — transport-free domain (§5.1 / §7.5 / §7.8).
+//! Pull, Records, AccountState, Receipts — transport-free domain
+//! (§5.1 / §4.9 / §7.5 / §7.8).
 //!
 //! ## Procedures
 //!
@@ -7,12 +8,9 @@
 //! - [`get_record`] — one Private record within a still-valid session
 //! - [`get_coin_proof`] — one CoinProof within a still-valid session
 //! - [`get_account_state`] — ownership sessions **only**
-//!
-//! `SubscribeReceipts` is **not** a domain procedure here. There is no
-//! production credit writer after durable persist (§4.8 / §4.9); the gRPC
-//! edge answers `Unimplemented` and names that prerequisite. The future
-//! writer contract lives in [`receipts`] module docs — do not re-introduce
-//! a test-only hub.
+//! - [`subscribe_receipts`] — filtered push stream (ownership **or** grant);
+//!   emission is the receive path after durable persist via
+//!   [`publish_credit_if_inserted`]
 //!
 //! ## No second truth
 //!
@@ -45,13 +43,21 @@ pub(crate) mod session;
 use std::sync::Arc;
 
 // Non-façade helpers (not re-exported): import from the defining submodule.
+// `scope_admits_asset_and_time`, `should_emit_credit`, and
+// `RECEIPT_SUBSCRIBER_BUFFER` stay in `receipts` — only the defining module
+// (and its tests) call them; re-exporting would invent unused façade surface.
 use crate::kernel::access::receipts::scope_admits_asset_and_time;
+
+// Receipt writer surface — re-exported so callers use `access::…` only.
 use crate::kernel::bootstrap::{
     ChallengeAction, ChallengeStore, IssuedChallenge, RedeemedPullChallenge,
 };
 use crate::kernel::grants::{GrantAssetScope, GrantScope};
 use crate::kernel::types::{ChanBind, Digest32, SubjectAddress};
 use crate::kernel::{KernelError, KernelErrorCode, KernelResult};
+pub(crate) use receipts::{
+    publish_credit_if_inserted, subscribe_receipts, CreditReceipt, ReceiptHub, ReceiptState,
+};
 
 // Access-façade re-exports: also the sole local binding for these names.
 // Callers outside `access` must use `crate::kernel::access::…` only.
@@ -800,9 +806,15 @@ pub(crate) fn validate_closed_sets() -> Result<(), String> {
     });
     validate_wire_vocabulary("SessionAuthority", &authorities)?;
 
-    // ReceiptState is intentionally absent: no domain receipt type is
-    // emitted until a credit writer exists (see `receipts` module docs).
-    // Re-introduce the closed-set check with the SubscribeReceipts writer.
+    let receipt_states: [WireEntry; 3] = receipts::ReceiptState::ALL.map(|s| WireEntry {
+        label: match s {
+            receipts::ReceiptState::Completed => "Completed",
+            receipts::ReceiptState::Pending => "Pending",
+            receipts::ReceiptState::Failed => "Failed",
+        },
+        wire: s.as_str(),
+    });
+    validate_wire_vocabulary("ReceiptState", &receipt_states)?;
 
     let actions: [WireEntry; 5] = ChallengeAction::ALL.map(|a| WireEntry {
         label: match a {
@@ -1213,8 +1225,11 @@ mod tests {
     #[test]
     fn subject_not_on_follow_up_request_types() {
         // Structural: GetRecordCommand / GetCoinProofCommand /
-        // SessionBoundRequest have no subject field. Subject is only on
-        // PullCommand (API-authenticated) and SessionCommon (server-side).
+        // SessionBoundRequest (SubscribeReceipts / GetAccountState) have no
+        // subject field. Subject is only on PullCommand (API-authenticated)
+        // and SessionCommon (server-side). Proto SubscribeReceiptsRequest
+        // is likewise { session, chan_bind } only — never read a client
+        // subject even if a future field were added without a domain map.
         let rec = GetRecordCommand {
             record_id: digest(1),
             session: "tok".into(),
@@ -1237,6 +1252,8 @@ mod tests {
             chan_bind: bind(1),
         };
         let _ = bound.session;
+        let _ = bound.chan_bind;
+        // compile-time: no bound.subject — SubscribeReceipts uses this shape
     }
 
     #[test]

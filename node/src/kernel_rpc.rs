@@ -6,18 +6,17 @@
 //! `Status::unimplemented("<Name>: not yet implemented")` — never an
 //! invented `Ok(...)` payload.
 //!
-//! Wired today (Block 4–8 + catalog): `GetJob`, `StreamJob`, `CancelJob`,
-//! `SignTransition`, `SubmitTransition`, `AttestBalance`, `IssueViewGrant`,
-//! `GetInfo`, `GetAccumulator`, `GetNullifierPath`, `ListInscriptions`,
-//! `OpenPullChallenge`, `Pull`, `GetRecord`, `GetCoinProof`, `GetAccountState`,
-//! `Publish`, `EntrustOperationalBundle`, `RevokeOperationalBundle`.
-//! `SubscribeReceipts` stays `Unimplemented` until a receive/decrypt-index
-//! writer exists that emits verified credits **after** durable persist
-//! (§4.8 / §4.9) — accepting a subscription with no producer is a silent
-//! empty stream (worse than naming the missing prerequisite; full writer
-//! contract in `kernel::access::receipts`). Wired procedures call the
-//! transport-neutral domain façade and map through `transport/grpc/`
-//! converters + the shared error contract.
+//! Wired today (Block 4–8 + catalog + receipts): `GetJob`, `StreamJob`,
+//! `CancelJob`, `SignTransition`, `SubmitTransition`, `AttestBalance`,
+//! `IssueViewGrant`, `GetInfo`, `GetAccumulator`, `GetNullifierPath`,
+//! `ListInscriptions`, `OpenPullChallenge`, `Pull`, `GetRecord`,
+//! `GetCoinProof`, `GetAccountState`, `SubscribeReceipts`, `Publish`,
+//! `EntrustOperationalBundle`, `RevokeOperationalBundle`.
+//! **20 of 20** kernel procedures. `SubscribeReceipts` streams verified
+//! credits from the receipt hub after the receive path's durable dual
+//! persist (§4.8 / §4.9); subject + scope come only from the server-side
+//! pull session. Wired procedures call the transport-neutral domain façade
+//! and map through `transport/grpc/` converters + the shared error contract.
 //!
 //! The existing HTTP router is untouched; this is an additive internal
 //! surface only (Kernel/API split is a later step).
@@ -58,7 +57,7 @@ use crate::transport::grpc::{
     parse_list_inscriptions_request, parse_nullifier_path_request, parse_publish_request,
     parse_pull_request, parse_record_request, parse_revoke_request, parse_session_authority,
     parse_session_bound, parse_sign_request, parse_transition_request, publish_outcome_to_proto,
-    pull_result_to_proto, record_blob_to_proto, revoke_result_to_proto,
+    pull_result_to_proto, receipt_to_proto, record_blob_to_proto, revoke_result_to_proto,
 };
 use crate::v1::PendingSignMap;
 use shared::spec_v1::Address;
@@ -547,22 +546,33 @@ impl Kernel for GrpcKernelService {
 
     async fn subscribe_receipts(
         &self,
-        _request: Request<SubscribeReceiptsRequest>,
+        request: Request<SubscribeReceiptsRequest>,
     ) -> Result<Response<Self::SubscribeReceiptsStream>, Status> {
-        // Honest Unimplemented: a subscription that can never deliver is
-        // worse than naming the missing producer. Spec §4.9 / §7.8 requires
-        // a push on verified credit after durable persist (§4.8). No
-        // production writer exists; domain fan-out is not built until one
-        // does (see `kernel::access::receipts` writer contract). Accepting
-        // the session and yielding silence would repeat the Block-2
-        // empty-Notify-Map failure mode.
-        Err(Status::unimplemented(
-            "SubscribeReceipts: not yet implemented — requires a credit writer after \
-             durable decrypt-index (verified CoinProofs are indexed; account credit \
-             + receipt push is a later block) — see node/src/kernel/access/receipts.rs; \
-             writer that publishes verified credits after durable persist (§4.8/§4.9); \
-             without that writer a subscription must not be accepted",
-        ))
+        // Session + chan_bind only — subject/scope from server-side session
+        // (proto has no subject field; never invent one from the client).
+        let inner = request.into_inner();
+        let req = parse_session_bound(inner.session, inner.chan_bind).map_err(map_domain_err)?;
+        let now = crate::v1::unix_now();
+        // Without the domain façade (writer hub) this is Internal — never
+        // Unimplemented and never an invented Ok empty stream.
+        let domain_stream = self
+            .domain
+            .subscribe_receipts(now, req)
+            .map_err(map_domain_err)?;
+
+        let stream = async_stream::stream! {
+            let mut domain_stream = domain_stream;
+            while let Some(item) = domain_stream.next().await {
+                match item {
+                    Ok(receipt) => yield Ok(receipt_to_proto(&receipt)),
+                    Err(e) => {
+                        yield Err(map_domain_err(e));
+                        return;
+                    }
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn publish(
@@ -819,34 +829,13 @@ mod tests {
         panic!("kernel gRPC did not accept TCP on {addr} within timeout; last_err={last_err:?}");
     }
 
-    /// Procedures that are not yet faithfully mapped must name themselves
-    /// in an `Unimplemented` status. No invented `Ok` payloads.
+    /// All 20 kernel procedures are wired: each fails closed on a
+    /// well-formed request without its dependency (engine / session / …)
+    /// — never `Unimplemented` and never an invented `Ok` payload.
     #[tokio::test]
     async fn unmapped_procedures_are_unimplemented_with_their_name() {
         let (domain, _scope) = test_domain().await;
         let svc = grpc_svc(domain);
-
-        async fn expect_unimplemented<T>(name: &'static str, result: Result<T, Status>) {
-            let status = match result {
-                Ok(_) => panic!("{name} must not return Ok"),
-                Err(status) => status,
-            };
-            assert_eq!(
-                status.code(),
-                Code::Unimplemented,
-                "{name}: expected Code::Unimplemented, got {:?}",
-                status.code()
-            );
-            let msg = status.message();
-            assert!(
-                msg.contains(name),
-                "{name}: status message must name the procedure, got {msg:?}"
-            );
-            assert!(
-                msg.contains("not yet implemented"),
-                "{name}: status message must say not yet implemented, got {msg:?}"
-            );
-        }
 
         // Block 6 chain procedures that are wired: without an EngineAdapter
         // (or ChainIdentity for GetInfo) they fail closed as Internal,
@@ -1002,15 +991,36 @@ mod tests {
                 err.code()
             );
         }
-        // SubscribeReceipts is not wired: no production credit writer after
-        // durable persist (§4.8/§4.9). Silent empty streams are forbidden —
-        // same posture as ListInscriptions.
-        expect_unimplemented(
-            "SubscribeReceipts",
-            svc.subscribe_receipts(Request::new(SubscribeReceiptsRequest::default()))
-                .await,
-        )
-        .await;
+        // SubscribeReceipts is wired: well-formed session+chan_bind reaches
+        // the domain. Without a live pull session the result is
+        // session_expired / unauthorized — never Unimplemented and never
+        // an invented Ok stream. Empty defaults fail width validation first
+        // (chan_bind must be 32 bytes), so supply a well-formed request.
+        // Match (not `expect_err`): Ok is `Response<BoxStream<Receipt>>` and
+        // the stream trait object has no Debug — do not invent one that
+        // could format private receipt fields into a panic/log.
+        {
+            let err = match svc
+                .subscribe_receipts(Request::new(SubscribeReceiptsRequest {
+                    session: "not-a-live-session".into(),
+                    chan_bind: vec![0u8; 32],
+                }))
+                .await
+            {
+                Err(e) => e,
+                Ok(_) => panic!("SubscribeReceipts without session must fail closed"),
+            };
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "SubscribeReceipts is wired; missing session is not unimplemented"
+            );
+            assert!(
+                matches!(err.code(), Code::Unauthenticated | Code::Internal),
+                "SubscribeReceipts well-formed but no session: got {:?}",
+                err.code()
+            );
+        }
         {
             let err = svc
                 .publish(Request::new(PublishRequest::default()))

@@ -16,14 +16,19 @@
 //!    [`ProverBridge`] port (recursive verify, output inclusion, S2C open of
 //!    `H(ProofData)`, first-occurrence, `asset_terms` self-auth).
 //! 6. **Durable persist** — `v1_decrypt_index` then process-local index.
-//! 7. **ACK** — kind-1421 gift-wrap back to the sender's IVPK, echoing
+//! 7. **Receipt push** — after a fresh dual insert only, publish a
+//!    [`CreditReceipt`] on the shared [`ReceiptHub`] (§4.9 / §7.8
+//!    `SubscribeReceipts`). Never before persist; never on replay.
+//! 8. **ACK** — kind-1421 gift-wrap back to the sender's IVPK, echoing
 //!    `ack_nonce` **unchanged**.
 //!
-//! No credit and no ACK on any failure. ACK is the promise "verified and
-//! durable" — never "I saw something".
+//! No credit, no receipt, and no ACK on any failure. ACK is the promise
+//! "verified and durable" — never "I saw something". Order is always
+//! persist → publish → ACK.
 //!
 //! Kernel stays transport-free: this module is the port that fills
-//! [`crate::kernel::access::InMemoryPrivateIndex`].
+//! [`crate::kernel::access::InMemoryPrivateIndex`] and emits on
+//! [`crate::kernel::access::ReceiptHub`].
 
 use std::fmt;
 
@@ -58,7 +63,11 @@ use super::nostr::nip59::{seal_and_wrap, unwrap_gift, SecureRandom, KIND_GIFT_WR
 use super::nostr::profile::resolve_profile_by_op_pubkey;
 use super::nostr::relay::{Filter, RelayPool};
 use super::receive::{extract_compliance_public_inputs, verify_output_inclusion};
-use crate::kernel::access::{InMemoryPrivateIndex, InsertRecordOutcome};
+use crate::kernel::access::{
+    publish_credit_if_inserted, CreditReceipt, InMemoryPrivateIndex, InsertRecordOutcome,
+    ReceiptHub, ReceiptState,
+};
+use crate::kernel::types::{Digest32, SubjectAddress};
 
 // ---------------------------------------------------------------------------
 // Errors — named causes, never a bare is_err contract
@@ -611,7 +620,7 @@ pub(crate) struct CandidateSecrets<'a> {
     pub op: &'a [u8; 32],
 }
 
-/// Durable SQL + process-local index + engine port.
+/// Durable SQL + process-local index + receipt hub + engine port.
 ///
 /// Argument group (clippy `too_many_arguments`), not pure config: `adapter`
 /// is a live engine dependency. No [`Debug`] — nothing formats this bag, and
@@ -621,6 +630,8 @@ pub(crate) struct CandidateStores<'a> {
     pub adapter: &'a EngineAdapter,
     pub pool: &'a PgPool,
     pub index: &'a InMemoryPrivateIndex,
+    /// Shared with kernel `SubscribeReceipts`; publish only after dual persist.
+    pub receipts: &'a ReceiptHub,
 }
 
 /// Blob size bound, discovery relays (sender profile), closed network label.
@@ -747,6 +758,7 @@ async fn process_delivery_candidate_inner(
         adapter,
         pool,
         index,
+        receipts,
     }: CandidateStores<'_>,
     CandidateNetwork {
         max_blob_bytes,
@@ -933,7 +945,26 @@ async fn process_delivery_candidate_inner(
         (InsertRecordOutcome::AlreadyPresent, _) | (_, InsertRecordOutcome::AlreadyPresent)
     );
 
-    // 7. ACK after durable persist.
+    // 7. Receipt push — only after durable dual insert, never on replay,
+    // never before persist. Does not sit between persist and this point
+    // as a blocking gate: publish is non-blocking (bounded fan-out).
+    // Creating nullifier is ValidFirstSpend at this point; wire state is
+    // §3.10 `completed` (first-occurrence verified before credit).
+    publish_credit_if_inserted(
+        sql_outcome,
+        mem_outcome,
+        receipts,
+        CreditReceipt {
+            subject: SubjectAddress(*subject),
+            coin_id: Digest32(coin_id),
+            asset_id: Digest32(asset_id),
+            amount: cp.coin.amount,
+            state: ReceiptState::Completed,
+            credited_at: now,
+        },
+    );
+
+    // 8. ACK after durable persist (+ receipt publish).
     send_ack_to_seal_author(
         AckIdentity {
             op_sk: op,
