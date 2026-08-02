@@ -25,9 +25,20 @@ When in doubt about whether a feature belongs in the wallet, SDK, or node: if it
 A bare `cargo run -p node` is **not** startable: the binary fails closed without
 Postgres migrations, kernel gRPC bind, chain-identity ops, Stage-3 v1 pins,
 bitcoind RPC, a verified **BMF1** bootstrap manifest
-(`ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH`), and related env. Use the local stack:
+(`ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH`), and related env. Use the local stack.
+
+**Layout prerequisite:** `deploy/local-e2e/up.sh` and `compose.yaml` build the
+public REST edge from the **sibling** checkout `../api` (`build.context: ../api`;
+preflight dies if `../api/Dockerfile` is missing). A node-only clone is not
+enough — clone `api` next to `node` under the same parent directory:
 
 ```bash
+# Required sibling layout (compose build.context: ../api):
+#   <parent>/
+#     api/   ← https://github.com/zk-coins/api
+#     node/  ← this repo
+mkdir -p zk-coins && cd zk-coins
+git clone https://github.com/zk-coins/api.git
 git clone https://github.com/zk-coins/node.git
 cd node
 # Full unmocked stack (postgres, bitcoind regtest, nostr-relay, node, api):

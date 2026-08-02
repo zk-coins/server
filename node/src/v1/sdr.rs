@@ -947,25 +947,20 @@ mod tests {
             "open Phase-A list must still contain the mainnet-withheld row"
         );
 
-        let due = db_outbox::list_due(&pool).await.expect("list_due");
-        let sdr_due: Vec<_> = due
-            .iter()
-            .filter(|r| r.kind == OutboxKind::SelfDelivery)
-            .collect();
-        assert!(
-            sdr_due.is_empty(),
-            "no self_delivery outbox after mainnet provisional refusal; got {}",
-            sdr_due.len()
-        );
-
-        // Broader check: no outbox row at all for this transition (pending
-        // would appear in list_due; completed/failed would be a bug too).
-        let open_for_pk = db_outbox::list_open_for_transition(&pool, &pk)
-            .await
-            .expect("list_open_for_transition");
-        assert!(
-            open_for_pk.is_empty(),
-            "no outbox for withheld mainnet Phase A"
+        // list_due only sees pending/awaiting_ack; list_open_for_transition
+        // excludes completed/failed. A terminal self_delivery row would be
+        // invisible to both — count every status for this transition.
+        let self_delivery_n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM v1_delivery_outbox \
+             WHERE transition_pk = $1 AND kind = 'self_delivery'",
+        )
+        .bind(pk.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("count self_delivery over all statuses");
+        assert_eq!(
+            self_delivery_n, 0,
+            "no self_delivery outbox row (any status) after mainnet provisional refusal"
         );
     }
 

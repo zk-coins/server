@@ -1257,6 +1257,134 @@ mod tests {
         );
     }
 
+    /// Concurrent k-th receipt insert and timeout sweep must serialise on the
+    /// parent row (`FOR UPDATE`). Deterministic orchestration: hold the k-th
+    /// receipt path mid-flight (receipt durable, status still open), prove the
+    /// sweep blocks, then finish the receipt path — durable outcome is only
+    /// `completed`, never `failed`.
+    #[tokio::test]
+    async fn kth_receipt_and_timeout_sweep_race_completes_not_failed() {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        let k = 2;
+        let entry = sample_insert(0x94, k);
+        let id = outbox_id(
+            entry.kind,
+            &entry.subject,
+            &entry.coin_id,
+            &entry.transition_pk,
+        );
+        insert_pending(&pool, &[entry]).await.expect("insert");
+        mark_published(&pool, &id, &sample_artefacts(0x94))
+            .await
+            .expect("publish");
+        mark_ack_received(&pool, &id).await.expect("ack");
+
+        // k-1 durable — short of k, so a naive timeout would terminal-fail.
+        store_receipt(
+            &pool,
+            &id,
+            &StoredReceipt {
+                holder_op_pubkey: [0x01; 32],
+                receipt_json: br#"{"holder":1}"#.to_vec(),
+                retention_class: "indefinite".into(),
+                stored_at: 1,
+            },
+        )
+        .await
+        .expect("receipt k-1");
+        let row = get_by_id(&pool, &id).await.expect("get").expect("row");
+        assert_eq!(row.status, OutboxStatus::AwaitingReceipts);
+
+        sqlx::query(
+            "UPDATE v1_delivery_outbox SET \
+                 ack_received_at = NOW() - make_interval(secs => $2::double precision) \
+             WHERE outbox_id = $1",
+        )
+        .bind(id.as_slice())
+        .bind((AWAITING_RECEIPTS_TIMEOUT_SECS + 60) as f64)
+        .execute(&pool)
+        .await
+        .expect("backdate past timeout");
+
+        // Connection A: mirror store_receipt — lock parent, insert k-th, hold.
+        let mut receipt_tx = pool.begin().await.expect("begin k-th receipt tx");
+        let locked = sqlx::query_as::<_, OutboxSqlRow>(&format!("{OUTBOX_SELECT} FOR UPDATE"))
+            .bind(id.as_slice())
+            .fetch_optional(&mut *receipt_tx)
+            .await
+            .expect("lock outbox for k-th receipt");
+        assert!(
+            locked.is_some(),
+            "k-th receipt path must lock the parent outbox row"
+        );
+        sqlx::query(
+            "INSERT INTO v1_delivery_receipts \
+                 (outbox_id, holder_op_pubkey, receipt_json, retention_class, stored_at) \
+             VALUES ($1,$2,$3,$4,$5) \
+             ON CONFLICT (outbox_id, holder_op_pubkey) DO NOTHING",
+        )
+        .bind(id.as_slice())
+        .bind([0x02u8; 32].as_slice())
+        .bind(br#"{"holder":2}"#.as_slice())
+        .bind("indefinite")
+        .bind(2i64)
+        .execute(&mut *receipt_tx)
+        .await
+        .expect("insert k-th receipt under lock");
+        let n_under_lock: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM v1_delivery_receipts WHERE outbox_id = $1",
+        )
+        .bind(id.as_slice())
+        .fetch_one(&mut *receipt_tx)
+        .await
+        .expect("count under lock");
+        assert_eq!(
+            n_under_lock,
+            i64::from(k),
+            "k receipts must be durable under the open receipt transaction"
+        );
+
+        // Connection B: timeout sweep must block on the same parent lock.
+        let pool_sweep = pool.clone();
+        let mut sweep_fut = Box::pin(fail_stale_awaiting_receipts(&pool_sweep));
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut sweep_fut).await;
+        assert!(
+            blocked.is_err(),
+            "timeout sweep must block on FOR UPDATE while k-th receipt holds the parent row"
+        );
+
+        // Finish the receipt path (same complete+commit as store_receipt).
+        try_complete_if_ready_in_tx(&mut receipt_tx, &id)
+            .await
+            .expect("complete under k-th receipt lock");
+        receipt_tx.commit().await.expect("commit k-th receipt path");
+
+        let failed_n = sweep_fut.await.expect("sweep after receipt commit");
+        assert_eq!(
+            failed_n, 0,
+            "sweep must not terminal-fail after k-th receipt completed the row"
+        );
+
+        let row = get_by_id(&pool, &id).await.expect("get").expect("row");
+        assert_eq!(
+            row.status,
+            OutboxStatus::Completed,
+            "k-th receipt vs timeout race must end completed, never failed"
+        );
+        assert!(
+            row.fail_reason.is_none(),
+            "completed row must not carry fail_reason: {:?}",
+            row.fail_reason
+        );
+        assert_eq!(
+            receipt_count(&pool, &id).await.expect("count"),
+            i64::from(k),
+            "k receipts remain durable after the race"
+        );
+    }
+
     /// Crash after ACK before complete: a repeated ACK must re-check k and
     /// complete (idempotent path must not return early without reconcile).
     #[tokio::test]
