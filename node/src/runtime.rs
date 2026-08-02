@@ -69,10 +69,13 @@ pub struct RestNodeConfig {
 ///
 /// Requires `ZKCOINS_RELAY_URL`, `ZKCOINS_BLOSSOM_URL`,
 /// `ZKCOINS_MAX_BLOB_BYTES`, `ZKCOINS_KERNEL_PARTS` — each non-empty, no
-/// defaults. A missing or invalid value names the variable. The optional
-/// `ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH` is validated later in
-/// [`start_rest_node`] (before any socket binds): unset is ok; set must
-/// fully verify under the pinned `bootstrap_pubkey`.
+/// defaults. A missing or invalid value names the variable.
+///
+/// A complete [`crate::kernel::ChainIdentity`] also needs a verified
+/// §4.3 BootstrapManifest (`ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH`). That
+/// load + identity install runs later in [`start_rest_node`] before any
+/// socket binds: unset path, or a path that does not verify, aborts boot
+/// when the exclusive v1 engine is present (no GetInfo without identity).
 ///
 /// Call before expensive bootstrap so a misconfigured deployment fails
 /// before circuit construction / DB work completes unused.
@@ -793,9 +796,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
              durable decrypt-index + process mirror + receipt hub)"
         );
         if let Some(engine) = v1_engine.as_ref() {
-            use crate::kernel::chain::{
-                chain_identity_ops_from_env, resolve_chain_identity, ChainIdentityError,
-            };
+            use crate::kernel::chain::{chain_identity_ops_from_env, resolve_chain_identity};
             use crate::kernel::types::{Digest32, XOnlyKey};
             use crate::kernel::{ChainHandle, ChainReadinessFlags, KernelNetwork};
 
@@ -832,48 +833,62 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             let digest_b = Digest32(pins.network_params.circuit_digest_c_balance());
             let bootstrap_pubkey = XOnlyKey(pins.network_params.bootstrap_pubkey());
 
-            // BootstrapManifest (§4.3): BMF1 loader may have installed a
-            // verified copy on `manifest_store`. ChainIdentity / GetInfo
-            // mirroring is intentionally **not** wired here (parallel
-            // work on `chain.rs`). Operational ops stay validated;
-            // identity stays None so GetInfo remains fail-closed until
-            // that wiring uses `domain.manifest_store().get()`.
-            let identity = match resolve_chain_identity(
+            // BootstrapManifest (§4.3): the BMF1 loader may have installed a
+            // verified copy on `manifest_store` at the start of this function.
+            // Project it into the domain echo type and require a complete
+            // ChainIdentity — a node without identity must not serve (GetInfo
+            // / readiness would otherwise stay permanently unanswerable).
+            let bootstrap = match manifest_store.get() {
+                Some(verified) => {
+                    use crate::kernel::chain::{
+                        bootstrap_manifest_from_verified, VerifiedManifestFields,
+                    };
+                    bootstrap_manifest_from_verified(VerifiedManifestFields {
+                        network_label: verified.network(),
+                        protocol_version: verified.protocol_version(),
+                        seed_relays: verified.seed_relays(),
+                        blob_stores: verified.blob_stores(),
+                        operator_ids: verified.operator_ids(),
+                        issued_at: verified.issued_at(),
+                        expires_at: verified.expires_at(),
+                        manifest_sig: verified.manifest_sig(),
+                    })
+                    .map_err(|e| anyhow::anyhow!("verified BootstrapManifest projection: {e}"))?
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "ChainIdentity requires a verified §4.3 BootstrapManifest — set \
+                         {} to a BMF1 artifact that verifies under the pinned \
+                         bootstrap_pubkey (no silent empty identity)",
+                        crate::kernel::bootstrap::BOOTSTRAP_MANIFEST_PATH_ENV
+                    ));
+                }
+            };
+            let identity = resolve_chain_identity(
                 network,
                 digest_c,
                 digest_b,
                 pins.activation_height,
                 bootstrap_pubkey,
-                ops.clone(),
-                None,
-            ) {
-                Ok(id) => Some(id),
-                Err(ChainIdentityError::BootstrapUnavailable { reason }) => {
-                    tracing::warn!(
-                        %reason,
-                        relay = %ops.relay_url,
-                        blossom = %ops.blossom_url,
-                        max_blob_bytes = ops.max_blob_bytes,
-                        kernel_parts = ?ops
-                            .kernel_parts
-                            .iter()
-                            .map(|p| p.as_str())
-                            .collect::<Vec<_>>(),
-                        digest_c = %hex::encode(digest_c.0),
-                        digest_c_balance = %hex::encode(digest_b.0),
-                        "ChainIdentity: operational config + circuit digests ready; \
-                         signed BootstrapManifest missing — GetInfo stays fail-closed"
-                    );
-                    None
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("{e}"));
-                }
-            };
+                ops,
+                Some(bootstrap),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            tracing::info!(
+                network = %identity.network.as_str(),
+                relay = %identity.relay_url,
+                blossom = %identity.blossom_url,
+                max_blob_bytes = identity.max_blob_bytes,
+                activation_height = identity.activation_height,
+                seed_relays = identity.bootstrap.seed_relays.len(),
+                digest_c = %hex::encode(identity.circuit_digest_c.0),
+                digest_c_balance = %hex::encode(identity.circuit_digest_c_balance.0),
+                "ChainIdentity installed for GetInfo"
+            );
 
             domain = domain.with_chain(ChainHandle {
                 engine: Some(Arc::clone(engine)),
-                identity,
+                identity: Some(identity),
                 readiness: ChainReadinessFlags {
                     scan_caught_up: state.v1_scan_caught_up.clone(),
                     finality_ok: state.v1_finality_ok.clone(),

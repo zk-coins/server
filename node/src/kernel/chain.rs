@@ -78,6 +78,24 @@ impl KernelNetwork {
             zkcoins_program::circuit::compliance::Network::Regtest => Self::Regtest,
         }
     }
+
+    /// Parse a closed wire label (`mainnet` | `testnet` | `regtest`).
+    ///
+    /// Unknown or empty labels fail loud — never invent a network tag for
+    /// a bootstrap or GetInfo answer.
+    pub(crate) fn from_wire(label: &str) -> Result<Self, ChainIdentityError> {
+        match label {
+            "mainnet" => Ok(Self::Mainnet),
+            "testnet" => Ok(Self::Testnet),
+            "regtest" => Ok(Self::Regtest),
+            other => Err(ChainIdentityError::InvalidVar {
+                name: "bootstrap.network",
+                detail: format!(
+                    "unknown network {other:?}; must be exactly one of mainnet, testnet, regtest"
+                ),
+            }),
+        }
+    }
 }
 
 /// Closed readiness reason when `ready == false`.
@@ -612,10 +630,12 @@ pub(crate) enum ChainIdentityError {
     MissingVar { name: &'static str },
     /// Present but unparseable / out of bounds / closed-set violation.
     InvalidVar { name: &'static str, detail: String },
-    /// Signed §4.3 `BootstrapManifest` cannot be supplied by this binary yet.
+    /// Signed §4.3 `BootstrapManifest` was not provided to
+    /// [`resolve_chain_identity`].
     ///
-    /// Operational env may already be complete; GetInfo stays fail-closed
-    /// until a loader for a real signed manifest exists. Never invent one.
+    /// Operational env may already be complete; production boot refuses to
+    /// install `ChainIdentity` (and therefore to answer GetInfo) until a
+    /// verified BMF1 artifact is loaded. Never invent one.
     BootstrapUnavailable { reason: &'static str },
 }
 
@@ -641,15 +661,16 @@ impl std::fmt::Display for ChainIdentityError {
 
 impl std::error::Error for ChainIdentityError {}
 
-/// Why production cannot yet install a complete [`ChainIdentity`].
+/// Why production cannot install a complete [`ChainIdentity`] when no
+/// verified §4.3 manifest was supplied to [`resolve_chain_identity`].
 ///
-/// The tree has the domain type and the wire echo path, but no BMF1
-/// decoder, no path/env load of a signed artifact, and no bootstrap
-/// signing key material (correct: the node must not invent signatures).
+/// The BMF1 loader exists (`ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH`); this
+/// reason names the **missing verified artifact**, not a missing codec.
+/// The process must not invent `manifest_sig` or bootstrap key material.
 pub(crate) const BOOTSTRAP_MANIFEST_UNAVAILABLE_REASON: &str = "\
-no BootstrapManifestV1 (BMF1) loader and no source of a network-signed \
-manifest artifact — shared has no serialize/deserialize for §4.3, the \
-node does not fetch kind-30423, and the process must not invent \
+no verified BootstrapManifestV1 (BMF1) installed — set \
+ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH to a network-signed artifact that \
+verifies under the pinned bootstrap_pubkey; the process must not invent \
 manifest_sig or bootstrap key material";
 
 /// Parse one non-empty URL (trim; length 1..=2048). No scheme allow-list
@@ -826,7 +847,7 @@ pub(crate) fn assemble_chain_identity(
 
 /// Production resolve: require operational env; complete identity only when a
 /// real signed bootstrap is provided. `bootstrap == None` →
-/// [`ChainIdentityError::BootstrapUnavailable`] (GetInfo stays fail-closed).
+/// [`ChainIdentityError::BootstrapUnavailable`] (boot / GetInfo fail-closed).
 pub(crate) fn resolve_chain_identity(
     network: KernelNetwork,
     circuit_digest_c: Digest32,
@@ -841,6 +862,17 @@ pub(crate) fn resolve_chain_identity(
             reason: BOOTSTRAP_MANIFEST_UNAVAILABLE_REASON,
         });
     };
+    if bootstrap.network != network {
+        return Err(ChainIdentityError::InvalidVar {
+            name: "bootstrap.network",
+            detail: format!(
+                "manifest network {} disagrees with engine/pin network {} — \
+                 refusing to install identity",
+                bootstrap.network.as_str(),
+                network.as_str()
+            ),
+        });
+    }
     Ok(assemble_chain_identity(
         network,
         circuit_digest_c,
@@ -850,6 +882,81 @@ pub(crate) fn resolve_chain_identity(
         ops,
         bootstrap,
     ))
+}
+
+/// Borrowed fields from a post-verify BMF1 artifact, ready to project
+/// into the domain [`BootstrapManifest`].
+///
+/// Flat field bag (not a method on the verification/loader type) so the
+/// projection stays decoupled from that type's layout — callers assemble
+/// this from whatever verified source they hold (store entry, fixture).
+pub(crate) struct VerifiedManifestFields<'a> {
+    pub network_label: &'a str,
+    pub protocol_version: &'a str,
+    pub seed_relays: &'a [String],
+    pub blob_stores: &'a [String],
+    pub operator_ids: &'a [[u8; 32]],
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub manifest_sig: &'a [u8; 64],
+}
+
+/// Project a verified BMF1 store entry into the domain GetInfo echo type.
+///
+/// Trust: the caller must pass a post-verify artifact (loader or test
+/// fixture). This function only maps fields — it does not re-check the
+/// BIP-340 signature.
+pub(crate) fn bootstrap_manifest_from_verified(
+    fields: VerifiedManifestFields<'_>,
+) -> Result<BootstrapManifest, ChainIdentityError> {
+    let VerifiedManifestFields {
+        network_label,
+        protocol_version,
+        seed_relays,
+        blob_stores,
+        operator_ids,
+        issued_at,
+        expires_at,
+        manifest_sig,
+    } = fields;
+    let network = KernelNetwork::from_wire(network_label)?;
+    if protocol_version != "v1" {
+        return Err(ChainIdentityError::InvalidVar {
+            name: "bootstrap.protocol_version",
+            detail: format!(
+                "expected protocol_version \"v1\", got {protocol_version:?} — \
+                 refusing to echo a foreign bootstrap into GetInfo"
+            ),
+        });
+    }
+    if seed_relays.is_empty() {
+        return Err(ChainIdentityError::InvalidVar {
+            name: "bootstrap.seed_relays",
+            detail: "verified manifest must retain at least one seed relay".into(),
+        });
+    }
+    if blob_stores.is_empty() {
+        return Err(ChainIdentityError::InvalidVar {
+            name: "bootstrap.blob_stores",
+            detail: "verified manifest must retain at least one blob store".into(),
+        });
+    }
+    if operator_ids.is_empty() {
+        return Err(ChainIdentityError::InvalidVar {
+            name: "bootstrap.operator_ids",
+            detail: "verified manifest must retain at least one operator id".into(),
+        });
+    }
+    Ok(BootstrapManifest {
+        network,
+        protocol_version: protocol_version.to_string(),
+        seed_relays: seed_relays.to_vec(),
+        blob_stores: blob_stores.to_vec(),
+        operator_ids: operator_ids.iter().copied().map(XOnlyKey).collect(),
+        issued_at,
+        expires_at,
+        manifest_sig: *manifest_sig,
+    })
 }
 
 /// Live readiness flags shared with `/health/ready` under the v1.1 claim.
@@ -1734,8 +1841,10 @@ mod tests {
         match err {
             ChainIdentityError::BootstrapUnavailable { reason } => {
                 assert!(
-                    reason.contains("BMF1") || reason.contains("BootstrapManifest"),
-                    "reason must name the missing capability, got: {reason}"
+                    reason.contains("BMF1")
+                        || reason.contains("BootstrapManifest")
+                        || reason.contains("ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH"),
+                    "reason must name the missing artifact / env path, got: {reason}"
                 );
             }
             other => panic!("expected BootstrapUnavailable, got {other:?}"),
@@ -1753,6 +1862,143 @@ mod tests {
         .expect("bootstrap present");
         assert_eq!(id.circuit_digest_c.0, [0xC1; 32]);
         assert_eq!(id.circuit_digest_c_balance.0, [0xC2; 32]);
+    }
+
+    /// Production boot must not install identity when the verified
+    /// BootstrapManifest is absent — silent `None` would leave GetInfo
+    /// unanswerable while the node still serves other RPCs.
+    #[test]
+    fn boot_identity_without_verified_manifest_fails_closed() {
+        let err = resolve_chain_identity(
+            KernelNetwork::Regtest,
+            Digest32([0xAA; 32]),
+            Digest32([0xBB; 32]),
+            42,
+            XOnlyKey([0xCC; 32]),
+            test_ops(),
+            None,
+        )
+        .expect_err("missing bootstrap must abort identity install");
+        assert!(
+            matches!(err, ChainIdentityError::BootstrapUnavailable { .. }),
+            "must be BootstrapUnavailable, got {err:?}"
+        );
+        // Display names the operational path so ops can fix the deploy.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("BootstrapManifest") || msg.contains("BMF1"),
+            "error must name the missing §4.3 artifact: {msg}"
+        );
+    }
+
+    /// Verified BMF1 fields → domain bootstrap → GetInfo echoes them
+    /// (plus digests/ops from the node pins), matching §7.8 `Info`.
+    #[test]
+    fn get_info_with_wired_identity_reports_section_7_8_fields() {
+        let view = fold_view(&[(pos(3, 0, 0, 0), pk(9), r(9))], 100);
+        let digest_c = Digest32([0x11; 32]);
+        let digest_b = Digest32([0x22; 32]);
+        let bootstrap_pubkey = XOnlyKey([0x33; 32]);
+        let seed = "wss://seed-from-manifest.example".to_string();
+        let blob = "https://blob-from-manifest.example".to_string();
+        let operator = [0x44u8; 32];
+        let sig = [0x55u8; 64];
+        let bootstrap = bootstrap_manifest_from_verified(VerifiedManifestFields {
+            network_label: "regtest",
+            protocol_version: "v1",
+            seed_relays: std::slice::from_ref(&seed),
+            blob_stores: std::slice::from_ref(&blob),
+            operator_ids: std::slice::from_ref(&operator),
+            issued_at: 1_700_000_000,
+            expires_at: 1_800_000_000,
+            manifest_sig: &sig,
+        })
+        .expect("verified fields project to domain bootstrap");
+        let identity = resolve_chain_identity(
+            KernelNetwork::Regtest,
+            digest_c,
+            digest_b,
+            7,
+            bootstrap_pubkey,
+            test_ops(),
+            Some(bootstrap),
+        )
+        .expect("complete sources → identity");
+        let info = get_info(&identity, &view, Readiness::Ready, 0);
+
+        // §7.8 static pins from the node / ops — not invented defaults.
+        assert_eq!(info.network, KernelNetwork::Regtest);
+        assert_eq!(info.protocol_version, "v1");
+        assert_eq!(info.circuit_digest_c, digest_c);
+        assert_eq!(info.circuit_digest_c_balance, digest_b);
+        assert_eq!(info.bootstrap_pubkey, bootstrap_pubkey);
+        assert_eq!(info.relay_url, "wss://relay.example");
+        assert_eq!(info.blossom_url, "https://blossom.example");
+        assert_eq!(info.max_blob_bytes, 1_048_576);
+        assert_eq!(info.activation_height, 7);
+        assert_eq!(info.finality_confirmations, FINALITY_CONFIRMATIONS);
+        assert_eq!(info.max_tx_inputs, MAX_TX_INPUTS as u32);
+        assert_eq!(info.max_tx_outputs, MAX_TX_OUTPUTS as u32);
+        assert_eq!(info.max_rx_coins, MAX_RX_COINS as u32);
+        assert_eq!(info.max_account_assets, MAX_ACCOUNT_ASSETS as u32);
+        assert!(info.readiness.is_ready());
+        assert_eq!(info.bitcoin_tip_height, 100);
+        assert_eq!(info.accumulator_root.0, view.nav_root_bytes());
+
+        // §4.3 bootstrap echo — exactly the verified artifact fields.
+        assert_eq!(info.bootstrap.network, KernelNetwork::Regtest);
+        assert_eq!(info.bootstrap.protocol_version, "v1");
+        assert_eq!(info.bootstrap.seed_relays, vec![seed]);
+        assert_eq!(info.bootstrap.blob_stores, vec![blob]);
+        assert_eq!(info.bootstrap.operator_ids, vec![XOnlyKey(operator)]);
+        assert_eq!(info.bootstrap.issued_at, 1_700_000_000);
+        assert_eq!(info.bootstrap.expires_at, 1_800_000_000);
+        assert_eq!(info.bootstrap.manifest_sig, sig);
+    }
+
+    #[test]
+    fn resolve_rejects_bootstrap_network_disagreeing_with_pin() {
+        let mut bootstrap = test_bootstrap();
+        bootstrap.network = KernelNetwork::Mainnet;
+        let err = resolve_chain_identity(
+            KernelNetwork::Regtest,
+            Digest32([1; 32]),
+            Digest32([2; 32]),
+            0,
+            XOnlyKey([3; 32]),
+            test_ops(),
+            Some(bootstrap),
+        )
+        .expect_err("network mismatch must refuse identity");
+        match err {
+            ChainIdentityError::InvalidVar { name, detail } => {
+                assert_eq!(name, "bootstrap.network");
+                assert!(
+                    detail.contains("mainnet") && detail.contains("regtest"),
+                    "detail must name both sides: {detail}"
+                );
+            }
+            other => panic!("expected InvalidVar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_manifest_from_verified_refuses_unknown_network() {
+        let err = bootstrap_manifest_from_verified(VerifiedManifestFields {
+            network_label: "mutinynet",
+            protocol_version: "v1",
+            seed_relays: &["wss://r".into()],
+            blob_stores: &["https://b".into()],
+            operator_ids: &[[0u8; 32]],
+            issued_at: 1,
+            expires_at: 2,
+            manifest_sig: &[0u8; 64],
+        })
+        .expect_err("unknown network");
+        match err {
+            ChainIdentityError::InvalidVar { name, .. } => assert_eq!(name, "bootstrap.network"),
+            other => panic!("expected InvalidVar, got {other:?}"),
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //!
 //! | Variable | Start |
 //! |---|---|
-//! | fehlt | ok, kein Manifest (GetInfo sagt das später ehrlich) |
+//! | fehlt | Store leer; exclusive v1-Boot bricht später bei `ChainIdentity`-Install ab |
 //! | gesetzt, Datei fehlt / unlesbar / ungültig | **Startabbruch** mit Variable + Grund |
 //! | gesetzt, gültig unter gepinntem `bootstrap_pubkey` | verifiziertes Manifest im Store |
 //!

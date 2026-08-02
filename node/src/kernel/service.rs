@@ -261,9 +261,11 @@ impl KernelService {
         self
     }
 
-    /// Verified bootstrap-manifest store for GetInfo / ChainIdentity wiring.
+    /// Verified bootstrap-manifest store used at boot to assemble
+    /// `ChainIdentity` for GetInfo.
     ///
-    /// Empty when `ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH` was unset at boot.
+    /// Production with the exclusive v1 engine refuses to start when this
+    /// store is empty (`ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH` unset / unloadable).
     pub(crate) fn manifest_store(&self) -> &Arc<ManifestStore> {
         &self.manifests
     }

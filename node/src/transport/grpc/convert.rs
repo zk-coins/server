@@ -1456,4 +1456,87 @@ mod tests {
         let err = parse_sign_request(req).expect_err("blank id");
         assert_eq!(err.code, KernelErrorCode::MalformedRequest);
     }
+
+    // ---- TransitionRequest presence matrix (receive, §7.5) ----
+
+    fn receive_subject_bech32() -> String {
+        shared::spec_v1::Address([0xA1u8; 32]).to_bech32m()
+    }
+
+    fn base_receive_request() -> ProtoTransitionRequest {
+        ProtoTransitionRequest {
+            kind: "receive".into(),
+            subject: receive_subject_bech32(),
+            next_pubkey: vec![0xB2u8; 32],
+            npk_rand: vec![0xC3u8; 32],
+            input_coins: vec![],
+            output_templates: vec![],
+            publisher_pubkey: vec![],
+            fee_address: String::new(),
+            fold_coin_ids: vec![vec![0x22u8; 32]],
+            issuance: None,
+            idempotency_key: "k-rx".into(),
+        }
+    }
+
+    #[test]
+    fn parse_receive_valid_maps_to_command() {
+        let cmd = parse_transition_request(base_receive_request()).expect("valid receive");
+        match cmd {
+            TransitionCommand::Receive { fold_coin_ids, .. } => {
+                assert_eq!(fold_coin_ids.len(), 1);
+                assert_eq!(fold_coin_ids[0].0, [0x22u8; 32]);
+            }
+            other => panic!("expected Receive, got {other:?}"),
+        }
+    }
+
+    /// Empty `fold_coin_ids` is a shape error at admit time
+    /// (`malformed_request`); parse still yields a Receive command with
+    /// an empty list so [`validate_transition_command`] is the single
+    /// source of the §7.5 empty-list rule.
+    #[test]
+    fn parse_receive_empty_fold_is_malformed_at_validate() {
+        let mut req = base_receive_request();
+        req.fold_coin_ids.clear();
+        let cmd = parse_transition_request(req).expect("parse allows empty list through");
+        let err = crate::kernel::jobs::submit::validate_transition_command(&cmd)
+            .expect_err("empty fold_coin_ids is malformed");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(
+            err.public_message.contains("fold_coin_ids"),
+            "must name the missing field: {}",
+            err.public_message
+        );
+    }
+
+    #[test]
+    fn parse_receive_with_input_coins_is_malformed() {
+        let mut req = base_receive_request();
+        req.input_coins = vec![vec![0x11u8; 32]];
+        let err = parse_transition_request(req).expect_err("input_coins forbidden on receive");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(
+            err.public_message.contains("input_coins"),
+            "must name the forbidden field: {}",
+            err.public_message
+        );
+    }
+
+    #[test]
+    fn parse_receive_with_output_templates_is_malformed() {
+        let mut req = base_receive_request();
+        req.output_templates = vec![ProtoOutputTemplate {
+            recipient: receive_subject_bech32(),
+            asset_id: vec![0xE5u8; 32],
+            amount: "1".into(),
+        }];
+        let err = parse_transition_request(req).expect_err("output_templates forbidden on receive");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(
+            err.public_message.contains("output_templates"),
+            "must name the forbidden field: {}",
+            err.public_message
+        );
+    }
 }

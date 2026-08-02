@@ -182,10 +182,10 @@ pub(crate) enum TransitionCommand {
     /// `kind == "receive"`: `fold_coin_ids` required;
     /// `input_coins` / `output_templates` / `issuance` absent by construction.
     ///
-    /// Shape validation runs; **job admission is refused** until the
-    /// dispatcher can drive §2.3.3 from the command payload alone (it
-    /// cannot: clause-10 slots, operational bundle, and wallet signature
-    /// are absent — see `submit_transition` / `ReceiveJobPathNotWired`).
+    /// Shape validation and job admission share the mint/send path.
+    /// Clause-10 slots, the operational bundle, and the wallet signature
+    /// are assembled later (dispatcher / `v1::receive`) — they are not
+    /// carried on this command.
     Receive {
         common: TransitionCommon,
         fold_coin_ids: Vec<Digest32>,

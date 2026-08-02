@@ -98,9 +98,10 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     // GetInfo operational pins (relay / blossom / max_blob_bytes /
     // kernel_parts): required, no defaults — same posture as the gRPC
-    // addr. Missing variable names itself. A complete ChainIdentity still
-    // needs a signed §4.3 BootstrapManifest (not loadable yet); that one
-    // field keeps GetInfo fail-closed after boot, without inventing URLs.
+    // addr. Missing variable names itself. A complete ChainIdentity also
+    // needs a verified §4.3 BootstrapManifest (`ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH`);
+    // that load + identity install fails closed in `start_rest_node` before
+    // any listener binds when the exclusive v1 engine is present.
     require_chain_identity_ops_from_env().unwrap_or_else(|e| {
         panic!("{e}");
     });

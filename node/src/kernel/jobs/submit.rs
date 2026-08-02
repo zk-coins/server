@@ -302,40 +302,19 @@ pub(crate) async fn admit_job(
     }
 }
 
-/// Public message when `kind=receive` is refused at admission.
-///
-/// The job path cannot execute §2.3.3: a
-/// [`crate::v1::receive::V1ReceiveRequest`] needs clause-10 slots, the
-/// operational bundle, and a wallet transition signature —
-/// [`TransitionCommand::Receive`] carries only `fold_coin_ids`. Accepting
-/// a row that the dispatcher must then terminal-fail is the worse of two
-/// honesties; refuse before `JobStore::create`.
-pub(crate) const RECEIVE_SUBMIT_NOT_ADMITTED_MSG: &str =
-    "kind=receive is not admitted: the job path cannot execute §2.3.3 receive \
-     (clause-10 slots, operational bundle, and wallet TransitionSignature are \
-     not carried by SubmitTransition; use the direct v1 receive surface)";
-
 /// `SubmitTransition` (§7.8): validate the closed command, admit, notify.
 ///
-/// Mint and send share the admit path. Receive is **shape-validated** then
-/// **refused at admission** until the dispatcher can drive §2.3.3 from the
-/// command payload (it cannot — see [`RECEIVE_SUBMIT_NOT_ADMITTED_MSG`]).
-/// Persistence of `jobs.kind = 'receive'` remains available to store/tests;
-/// `SubmitTransition` does not create those rows.
+/// Mint, send, and receive share the admit path. Presence/bounds checks
+/// run first ([`validate_transition_command`]); a well-formed
+/// `kind=receive` creates a `jobs.kind = 'receive'` row and enqueues the
+/// dispatcher. Clause-10 slot reconstitution and §2.3.3 prove/finalise
+/// remain on the dispatcher / `v1::receive` surface (the command body
+/// carries only `fold_coin_ids` plus common fields — see §7.5).
 pub(crate) async fn submit_transition(
     deps: SubmitTransitionDeps<'_>,
     command: TransitionCommand,
 ) -> KernelResult<Job> {
     validate_transition_command(&command)?;
-
-    // Refuse before create: never leave a permanent queued receive that the
-    // dispatcher cannot execute. Validation above still enforces fold bounds.
-    if matches!(&command, TransitionCommand::Receive { .. }) {
-        return Err(KernelError::new(
-            KernelErrorCode::InternalError,
-            RECEIVE_SUBMIT_NOT_ADMITTED_MSG,
-        ));
-    }
 
     let common = command.common().clone();
     let account = common.subject.0;
@@ -344,8 +323,6 @@ pub(crate) async fn submit_transition(
     let store_kind = match &command {
         TransitionCommand::Mint { .. } => job_store::JobKind::Mint,
         TransitionCommand::Send { .. } => job_store::JobKind::Send,
-        // Unreachable: Receive returns above. Kept exhaustive so a future
-        // re-enable of admission cannot silently map to the wrong kind.
         TransitionCommand::Receive { .. } => job_store::JobKind::Receive,
     };
     let request_body = encode_normative_request_body(&command)?;
@@ -848,42 +825,76 @@ mod tests {
         }
     }
 
-    /// Receive is shape-valid but not executable on the job path
-    /// (`V1ReceiveRequest` needs clause-10 slots + op bundle + wallet
-    /// signature; the command only has `fold_coin_ids`). Admission must
-    /// refuse **before** `JobStore::create` so no permanent queued row.
+    /// A well-formed `kind=receive` must admit a job row (Accepted) and
+    /// persist `jobs.kind = receive` — the property that was blocked when
+    /// admission refused the kind outright.
     #[tokio::test]
-    async fn submit_receive_refused_at_admission_creates_no_row() {
+    async fn submit_receive_admits_job_with_receive_kind() {
+        let (store, _db) = fresh_store().await;
+        let (tx, mut rx) = mpsc::channel::<JobEnvelope>(8);
+        // Drain enqueue so the channel never fills; this test is admit-only.
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let job = submit_transition(deps(store.as_ref(), &tx), receive_cmd("k-rx"))
+            .await
+            .expect("valid receive must admit");
+        assert!(
+            matches!(job.state, JobState::Accepted),
+            "fresh receive is accepted, got {:?}",
+            job.state
+        );
+        assert_eq!(
+            job.kind.as_str(),
+            "receive",
+            "projected kind must be the wire string receive"
+        );
+
+        let row = store
+            .load(job.id.as_uuid())
+            .await
+            .expect("load")
+            .expect("row after admit");
+        assert_eq!(
+            row.kind,
+            job_store::JobKind::Receive,
+            "store kind must be receive"
+        );
+        assert_eq!(
+            row.request_body.get("kind").and_then(|v| v.as_str()),
+            Some("receive"),
+            "persisted body must echo kind=receive"
+        );
+        let folds = row
+            .request_body
+            .get("fold_coin_ids")
+            .and_then(|v| v.as_array())
+            .expect("fold_coin_ids array");
+        assert_eq!(
+            folds.len(),
+            1,
+            "fold_coin_ids from the command must survive encode"
+        );
+        assert_eq!(
+            folds[0].as_str().expect("hex"),
+            hex::encode(digest(0x22).0),
+            "fold id must be the submitted coin identifier"
+        );
+    }
+
+    /// Same-key / same-body receive replay returns the original job id.
+    #[tokio::test]
+    async fn submit_receive_same_body_replays() {
         let (store, _db) = fresh_store().await;
         let (tx, mut rx) = mpsc::channel::<JobEnvelope>(8);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-        let err = submit_transition(deps(store.as_ref(), &tx), receive_cmd("k-rx"))
+        let first = submit_transition(deps(store.as_ref(), &tx), receive_cmd("idem-rx"))
             .await
-            .expect_err("receive must be refused at admission (job path not wired)");
-        assert_eq!(
-            err.code,
-            KernelErrorCode::InternalError,
-            "admission refuse uses internal_error; got {}",
-            err.code.reason()
-        );
-        assert_eq!(
-            err.public_message, RECEIVE_SUBMIT_NOT_ADMITTED_MSG,
-            "public message must be the typed admission constant"
-        );
-
-        // No non-terminal row may exist — create never ran.
-        let pending = store
-            .list_non_terminal_for_resume()
+            .expect("first");
+        let second = submit_transition(deps(store.as_ref(), &tx), receive_cmd("idem-rx"))
             .await
-            .expect("list non-terminal");
-        assert!(
-            pending.is_empty(),
-            "admission refuse must create no job row; found {}",
-            pending.len()
-        );
-        // Shape validation still accepts a well-formed receive command.
-        validate_transition_command(&receive_cmd("k-rx")).expect("shape still valid");
+            .expect("replay");
+        assert_eq!(second.id, first.id, "same key + same body → same job");
     }
 
     #[test]

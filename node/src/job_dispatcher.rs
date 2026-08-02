@@ -320,24 +320,27 @@ pub(crate) async fn process_envelope_for_test(
 }
 
 /// Typed cause: a `receive` job reached the dispatcher, but the job path
-/// cannot drive §2.3.3.
+/// cannot yet drive §2.3.3 prove/finalise.
 ///
-/// [`crate::v1::receive::V1ReceiveRequest`] needs full clause-10
-/// [`crate::v1::receive::ReceivedCoinSlot`] bindings, the operational
-/// bundle, and a wallet [`zkcoins_prover::prover_bridge::TransitionSignature`].
-/// `SubmitTransition` only carries `fold_coin_ids` digests plus common
-/// fields — reconstituting slots from digests alone is not possible.
-/// Outward machine code is `internal_error` (closed set); classification
-/// is by downcast of this type, never by parsing the Display text.
+/// Admission of `kind=receive` is open ([`crate::kernel::jobs::submit`]).
+/// Execution still needs clause-10 [`crate::v1::receive::ReceivedCoinSlot`]
+/// bindings reconstituted from the private index + live NfLog, the
+/// operational bundle, and a wallet
+/// [`zkcoins_prover::prover_bridge::TransitionSignature`]. Until that
+/// reconstitution is wired, a receive envelope is terminal-failed rather
+/// than inventing a half-proved state. Outward machine code is
+/// `internal_error` (closed set); classification is by downcast of this
+/// type, never by parsing the Display text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReceiveJobPathNotWired;
 
 impl std::fmt::Display for ReceiveJobPathNotWired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
-            "receive job path not wired: SubmitTransition carries fold_coin_ids only; \
-             §2.3.3 needs clause-10 ReceivedCoinSlot bindings, operational bundle, and \
-             a wallet TransitionSignature (direct path: v1::receive::execute_v1_receive)",
+            "receive job path not wired: fold_coin_ids admitted, but clause-10 \
+             ReceivedCoinSlot reconstitution + operational bundle + wallet \
+             TransitionSignature are not yet driven by the dispatcher \
+             (direct path: v1::receive::execute_v1_receive)",
         )
     }
 }
@@ -2025,13 +2028,13 @@ async fn wait_for_commit(
                 "Job dispatcher: attest_balance has no commit/broadcast leg"
             ));
         }
-        // Receive never enters wait_for_commit: admission refuses the kind,
-        // and any queued receive is terminal-failed as path-not-wired.
-        // This arm is structural exhaustiveness — reaching it is a bug.
+        // Receive never enters wait_for_commit: non-terminal receive
+        // envelopes are terminal-failed as path-not-wired before this arm.
+        // Reaching it is a bug (exhaustiveness only).
         JobKind::Receive => {
             return Err(anyhow::anyhow!(
                 "Job dispatcher: receive has no commit/broadcast leg \
-                 (job path not wired; refuse rather than invent a commit outcome)"
+                 (path-not-wired terminal-fail owns receive envelopes)"
             ));
         }
     };
