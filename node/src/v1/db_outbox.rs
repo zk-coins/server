@@ -416,42 +416,71 @@ pub(crate) async fn mark_published(
 
 /// Record a valid recipient ACK. Does **not** complete the row — advances to
 /// `awaiting_receipts` only. Completion needs k receipts separately.
+///
+/// Serialised under `SELECT … FOR UPDATE` on the outbox row so completion
+/// and the timeout sweep cannot race this transition. Repeated ACKs while
+/// already `awaiting_receipts` re-run completion (crash after ACK before
+/// complete must not leave a k-ready row stuck).
 pub(crate) async fn mark_ack_received(pool: &PgPool, outbox_id: &[u8; 32]) -> Result<()> {
-    let result = sqlx::query(
-        "UPDATE v1_delivery_outbox SET \
-             status = 'awaiting_receipts', \
-             ack_received_at = NOW(), \
-             updated_at = NOW() \
-         WHERE outbox_id = $1 \
-           AND status = 'awaiting_ack'",
-    )
-    .bind(outbox_id.as_slice())
-    .execute(pool)
-    .await
-    .context("v1_delivery_outbox mark_ack_received")?;
-    if result.rows_affected() == 0 {
-        // Idempotent: already awaiting_receipts / completed is fine for the
-        // ACK path, but pending without publish is a named error.
-        let row = get_by_id(pool, outbox_id).await?;
-        match row.map(|r| r.status) {
-            Some(OutboxStatus::AwaitingReceipts) | Some(OutboxStatus::Completed) => Ok(()),
-            Some(status) => bail!(
-                "mark_ack_received: refuse ACK in status {}",
-                status.as_str()
-            ),
-            None => bail!("mark_ack_received: outbox row missing"),
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin v1_delivery_outbox mark_ack_received")?;
+    let locked = sqlx::query_as::<_, OutboxSqlRow>(&format!("{OUTBOX_SELECT} FOR UPDATE"))
+        .bind(outbox_id.as_slice())
+        .fetch_optional(&mut *tx)
+        .await
+        .context("v1_delivery_outbox mark_ack_received lock")?;
+    let Some(locked) = locked else {
+        bail!("mark_ack_received: outbox row missing");
+    };
+    let status = OutboxStatus::parse(&locked.status)?;
+    match status {
+        OutboxStatus::AwaitingAck => {
+            let result = sqlx::query(
+                "UPDATE v1_delivery_outbox SET \
+                     status = 'awaiting_receipts', \
+                     ack_received_at = NOW(), \
+                     updated_at = NOW() \
+                 WHERE outbox_id = $1 \
+                   AND status = 'awaiting_ack'",
+            )
+            .bind(outbox_id.as_slice())
+            .execute(&mut *tx)
+            .await
+            .context("v1_delivery_outbox mark_ack_received")?;
+            if result.rows_affected() == 0 {
+                bail!("mark_ack_received: status race under row lock");
+            }
+            // Maybe enough receipts already exist (ACK after receipts).
+            try_complete_if_ready_in_tx(&mut tx, outbox_id).await?;
         }
-    } else {
-        // Maybe enough receipts already exist (ACK after receipts).
-        try_complete_if_ready(pool, outbox_id).await?;
-        Ok(())
+        OutboxStatus::AwaitingReceipts => {
+            // Idempotent re-ACK: always re-check completion (k may already
+            // be present after a crash between ACK and complete).
+            try_complete_if_ready_in_tx(&mut tx, outbox_id).await?;
+        }
+        OutboxStatus::Completed => {
+            // Already terminal-success — pure no-op.
+        }
+        status => bail!(
+            "mark_ack_received: refuse ACK in status {}",
+            status.as_str()
+        ),
     }
+    tx.commit()
+        .await
+        .context("commit v1_delivery_outbox mark_ack_received")?;
+    Ok(())
 }
 
 /// Store one ReplicaReceiptV1 under a distinct holder operator id.
 ///
 /// Duplicate `(outbox_id, holder_op_pubkey)` is a no-op (idempotent re-upload).
 /// After insert, completes the row when ACK is present and receipt count ≥ k.
+///
+/// Locks the parent outbox row for the insert+complete path so the k-th
+/// receipt and [`fail_stale_awaiting_receipts`] cannot race each other.
 pub(crate) async fn store_receipt(
     pool: &PgPool,
     outbox_id: &[u8; 32],
@@ -466,6 +495,19 @@ pub(crate) async fn store_receipt(
             receipt.retention_class
         );
     }
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin v1_delivery_receipts store_receipt")?;
+    // Serialise against timeout sweep / concurrent complete on this outbox.
+    let parent = sqlx::query_as::<_, OutboxSqlRow>(&format!("{OUTBOX_SELECT} FOR UPDATE"))
+        .bind(outbox_id.as_slice())
+        .fetch_optional(&mut *tx)
+        .await
+        .context("v1_delivery_outbox store_receipt lock")?;
+    if parent.is_none() {
+        bail!("store_receipt: outbox row missing");
+    }
     sqlx::query(
         "INSERT INTO v1_delivery_receipts \
              (outbox_id, holder_op_pubkey, receipt_json, retention_class, stored_at) \
@@ -477,15 +519,25 @@ pub(crate) async fn store_receipt(
     .bind(&receipt.receipt_json)
     .bind(&receipt.retention_class)
     .bind(i64::try_from(receipt.stored_at).context("stored_at fits i64")?)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("v1_delivery_receipts insert")?;
 
-    try_complete_if_ready(pool, outbox_id).await?;
+    try_complete_if_ready_in_tx(&mut tx, outbox_id).await?;
+    tx.commit()
+        .await
+        .context("commit v1_delivery_receipts store_receipt")?;
     Ok(())
 }
 
-/// Count distinct operator receipts for one outbox entry.
+/// Count distinct operator receipts for one outbox entry (test-only helper).
+///
+/// Production completion never uses this: it counts receipts **inline within
+/// the same `FOR UPDATE` transaction** (see [`try_complete_if_ready_in_tx`]
+/// and [`fail_stale_awaiting_receipts`]) so the count and the terminal-state
+/// write are atomic against a concurrent receipt. A separate pool connection
+/// here would race that lock. Kept for unit tests that assert the stored count.
+#[cfg(test)]
 pub(crate) async fn receipt_count(pool: &PgPool, outbox_id: &[u8; 32]) -> Result<i64> {
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM v1_delivery_receipts WHERE outbox_id = $1",
@@ -499,7 +551,8 @@ pub(crate) async fn receipt_count(pool: &PgPool, outbox_id: &[u8; 32]) -> Result
 
 /// List stored `ReplicaReceiptV1` rows for one outbox entry.
 ///
-/// Production completion uses [`receipt_count`] only. This list is the
+/// Production completion counts receipts inline under the `FOR UPDATE`
+/// transaction (not via a pool helper). This list is the
 /// durable read path for the **trust-list / `receipt_sig` verification
 /// follow-up** (§4.6: distinct trust-list operator IDs, BIP-340 verify on
 /// stored bodies) — not wired yet. Kept as the named façade so that block
@@ -553,46 +606,118 @@ pub(crate) async fn mark_failed(pool: &PgPool, outbox_id: &[u8; 32], reason: &st
 /// Terminal progress path for stuck `awaiting_receipts` rows.
 ///
 /// After a valid ACK the row leaves [`list_due`] and must not be republished.
-/// If ≥ `replication_k` receipts never arrive within
-/// [`AWAITING_RECEIPTS_TIMEOUT_SECS`] of `ack_received_at`, mark the row
-/// `failed` with a named reason (no silent eternal wait). Rows with a NULL
+/// Past [`AWAITING_RECEIPTS_TIMEOUT_SECS`] after `ack_received_at`:
+/// - if receipt count ≥ `replication_k` → **complete** (reconcile a crash
+///   window where k was already durable but status stayed open);
+/// - if receipt count < `replication_k` → **failed** with a named reason
+///   (no silent eternal wait).
+///
+/// Receipt count is evaluated under the same transaction and row lock as the
+/// status write, so the k-th receipt insert cannot lose a race that would
+/// terminal-fail an already-replicated delivery. Rows with a NULL
 /// `ack_received_at` are skipped (corrupt/impossible under the state machine;
 /// not silently repaired).
 ///
-/// Returns the number of rows transitioned to `failed`.
+/// Returns the number of rows transitioned to `failed` (completed reconciles
+/// are not counted).
 pub(crate) async fn fail_stale_awaiting_receipts(pool: &PgPool) -> Result<usize> {
     let reason = format!(
         "{AWAITING_RECEIPTS_TIMEOUT_REASON}: k receipts not collected within \
          {AWAITING_RECEIPTS_TIMEOUT_SECS}s after ACK"
     );
-    let result = sqlx::query(
-        "UPDATE v1_delivery_outbox SET \
-             status = 'failed', \
-             fail_reason = $1, \
-             updated_at = NOW() \
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin v1_delivery_outbox fail_stale_awaiting_receipts")?;
+    // Lock every past-deadline open row; serialises against store_receipt /
+    // mark_ack_received which also take FOR UPDATE on the same outbox_id.
+    let candidates: Vec<(Vec<u8>, i32)> = sqlx::query_as(
+        "SELECT outbox_id, replication_k \
+         FROM v1_delivery_outbox \
          WHERE status = 'awaiting_receipts' \
            AND ack_received_at IS NOT NULL \
            AND ack_received_at \
-               + make_interval(secs => $2::double precision) < NOW()",
+               + make_interval(secs => $1::double precision) < NOW() \
+         FOR UPDATE",
     )
-    .bind(&reason)
     .bind(AWAITING_RECEIPTS_TIMEOUT_SECS as f64)
-    .execute(pool)
+    .fetch_all(&mut *tx)
     .await
-    .context("v1_delivery_outbox fail_stale_awaiting_receipts")?;
-    usize::try_from(result.rows_affected()).context("rows_affected fits usize")
+    .context("v1_delivery_outbox fail_stale_awaiting_receipts lock")?;
+
+    let mut failed = 0usize;
+    for (oid, replication_k) in candidates {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM v1_delivery_receipts WHERE outbox_id = $1",
+        )
+        .bind(&oid)
+        .fetch_one(&mut *tx)
+        .await
+        .context("v1_delivery_receipts count under fail_stale lock")?;
+        if n >= i64::from(replication_k) {
+            // k already durable — successful terminal path, never failed.
+            sqlx::query(
+                "UPDATE v1_delivery_outbox SET \
+                     status = 'completed', updated_at = NOW() \
+                 WHERE outbox_id = $1 AND status = 'awaiting_receipts'",
+            )
+            .bind(&oid)
+            .execute(&mut *tx)
+            .await
+            .context("v1_delivery_outbox complete under fail_stale")?;
+        } else {
+            sqlx::query(
+                "UPDATE v1_delivery_outbox SET \
+                     status = 'failed', \
+                     fail_reason = $2, \
+                     updated_at = NOW() \
+                 WHERE outbox_id = $1 AND status = 'awaiting_receipts'",
+            )
+            .bind(&oid)
+            .bind(&reason)
+            .execute(&mut *tx)
+            .await
+            .context("v1_delivery_outbox fail under fail_stale")?;
+            failed = failed
+                .checked_add(1)
+                .context("fail_stale_awaiting_receipts failed count overflow")?;
+        }
+    }
+    tx.commit()
+        .await
+        .context("commit v1_delivery_outbox fail_stale_awaiting_receipts")?;
+    Ok(failed)
 }
 
 /// Complete when status is `awaiting_receipts` and receipt count ≥ k.
-async fn try_complete_if_ready(pool: &PgPool, outbox_id: &[u8; 32]) -> Result<()> {
-    let Some(row) = get_by_id(pool, outbox_id).await? else {
+///
+/// Caller must hold a transaction that already locked the outbox row
+/// (`SELECT … FOR UPDATE`) so concurrent timeout cannot fail a k-ready row.
+async fn try_complete_if_ready_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    outbox_id: &[u8; 32],
+) -> Result<()> {
+    let row: Option<(String, i32)> = sqlx::query_as(
+        "SELECT status, replication_k FROM v1_delivery_outbox WHERE outbox_id = $1",
+    )
+    .bind(outbox_id.as_slice())
+    .fetch_optional(&mut **tx)
+    .await
+    .context("v1_delivery_outbox try_complete status")?;
+    let Some((status, replication_k)) = row else {
         return Ok(());
     };
-    if row.status != OutboxStatus::AwaitingReceipts {
+    if status != OutboxStatus::AwaitingReceipts.as_str() {
         return Ok(());
     }
-    let n = receipt_count(pool, outbox_id).await?;
-    if n < i64::from(row.replication_k) {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM v1_delivery_receipts WHERE outbox_id = $1",
+    )
+    .bind(outbox_id.as_slice())
+    .fetch_one(&mut **tx)
+    .await
+    .context("v1_delivery_receipts count under complete")?;
+    if n < i64::from(replication_k) {
         return Ok(());
     }
     sqlx::query(
@@ -601,7 +726,7 @@ async fn try_complete_if_ready(pool: &PgPool, outbox_id: &[u8; 32]) -> Result<()
          WHERE outbox_id = $1 AND status = 'awaiting_receipts'",
     )
     .bind(outbox_id.as_slice())
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("v1_delivery_outbox complete")?;
     Ok(())
@@ -1049,6 +1174,153 @@ mod tests {
             .await
             .expect("fail_stale again");
         assert_eq!(n2, 0);
+    }
+
+    /// k receipts already durable before the timeout fires → successful
+    /// terminal path (`completed`), never `failed`. Covers the crash window
+    /// where ACK advanced the row but complete did not land.
+    #[tokio::test]
+    async fn awaiting_receipts_with_k_met_is_completed_not_failed_on_timeout() {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        let k = 3;
+        let entry = sample_insert(0x92, k);
+        let id = outbox_id(
+            entry.kind,
+            &entry.subject,
+            &entry.coin_id,
+            &entry.transition_pk,
+        );
+        insert_pending(&pool, &[entry]).await.expect("insert");
+        mark_published(&pool, &id, &sample_artefacts(0x92))
+            .await
+            .expect("publish");
+        mark_ack_received(&pool, &id).await.expect("ack");
+
+        for holder in [0x01u8, 0x02, 0x03] {
+            store_receipt(
+                &pool,
+                &id,
+                &StoredReceipt {
+                    holder_op_pubkey: [holder; 32],
+                    receipt_json: format!(r#"{{"holder":{holder}}}"#).into_bytes(),
+                    retention_class: "indefinite".into(),
+                    stored_at: u64::from(holder),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("receipt {holder}: {e:#}"));
+        }
+        // store_receipt should already have completed when k was reached.
+        let row = get_by_id(&pool, &id).await.expect("get").expect("row");
+        assert_eq!(
+            row.status,
+            OutboxStatus::Completed,
+            "k receipts after ACK must complete immediately"
+        );
+
+        // Simulate the crash window: force status back to awaiting_receipts
+        // with k still durable, backdate ACK past the deadline, then sweep.
+        sqlx::query(
+            "UPDATE v1_delivery_outbox SET \
+                 status = 'awaiting_receipts', \
+                 fail_reason = NULL, \
+                 ack_received_at = NOW() - make_interval(secs => $2::double precision), \
+                 updated_at = NOW() \
+             WHERE outbox_id = $1",
+        )
+        .bind(id.as_slice())
+        .bind((AWAITING_RECEIPTS_TIMEOUT_SECS + 60) as f64)
+        .execute(&pool)
+        .await
+        .expect("force stale open with k receipts");
+        assert_eq!(
+            receipt_count(&pool, &id).await.expect("count"),
+            i64::from(k),
+            "k receipts remain durable under forced open status"
+        );
+
+        let n = fail_stale_awaiting_receipts(&pool)
+            .await
+            .expect("fail_stale with k met");
+        assert_eq!(n, 0, "must not terminal-fail a fully replicated row");
+
+        let row = get_by_id(&pool, &id).await.expect("get").expect("row");
+        assert_eq!(
+            row.status,
+            OutboxStatus::Completed,
+            "timeout with k receipts must reconcile to completed, not failed"
+        );
+        assert!(
+            row.fail_reason.is_none(),
+            "completed row must not carry fail_reason: {:?}",
+            row.fail_reason
+        );
+    }
+
+    /// Crash after ACK before complete: a repeated ACK must re-check k and
+    /// complete (idempotent path must not return early without reconcile).
+    #[tokio::test]
+    async fn repeated_ack_reconciles_completion_when_k_already_met() {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        let k = 2;
+        let entry = sample_insert(0x93, k);
+        let id = outbox_id(
+            entry.kind,
+            &entry.subject,
+            &entry.coin_id,
+            &entry.transition_pk,
+        );
+        insert_pending(&pool, &[entry]).await.expect("insert");
+        mark_published(&pool, &id, &sample_artefacts(0x93))
+            .await
+            .expect("publish");
+
+        // Receipts before ACK (store while awaiting_ack does not complete).
+        for holder in [0x11u8, 0x22] {
+            store_receipt(
+                &pool,
+                &id,
+                &StoredReceipt {
+                    holder_op_pubkey: [holder; 32],
+                    receipt_json: format!(r#"{{"h":{holder}}}"#).into_bytes(),
+                    retention_class: "indefinite".into(),
+                    stored_at: u64::from(holder),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("receipt {holder}: {e:#}"));
+        }
+        let row = get_by_id(&pool, &id).await.expect("get").expect("row");
+        assert_eq!(row.status, OutboxStatus::AwaitingAck);
+
+        mark_ack_received(&pool, &id).await.expect("first ack completes");
+        let row = get_by_id(&pool, &id).await.expect("get").expect("row");
+        assert_eq!(row.status, OutboxStatus::Completed);
+
+        // Force the crash window again: open + k durable, re-ACK must complete.
+        sqlx::query(
+            "UPDATE v1_delivery_outbox SET \
+                 status = 'awaiting_receipts', \
+                 ack_received_at = NOW(), \
+                 updated_at = NOW() \
+             WHERE outbox_id = $1",
+        )
+        .bind(id.as_slice())
+        .execute(&pool)
+        .await
+        .expect("force open with k");
+
+        mark_ack_received(&pool, &id)
+            .await
+            .expect("repeated ack must reconcile");
+        let row = get_by_id(&pool, &id).await.expect("get").expect("row");
+        assert_eq!(
+            row.status,
+            OutboxStatus::Completed,
+            "idempotent ACK must complete when k is already durable"
+        );
     }
 
     /// Terminal failure: row is `failed` with a named reason and leaves

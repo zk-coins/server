@@ -846,7 +846,8 @@ mod tests {
     }
 
     /// Transport mapping smoke: every kernel procedure has a gRPC handler
-    /// that is **not** a bare `Unimplemented` stub.
+    /// that is **not** a bare `Unimplemented` stub (domain / validation
+    /// reached). Matches `docs/kernel-rpc-mapping.md` "transport-mapped".
     ///
     /// This is **not** a production-completeness proof. Two classes:
     /// - **Well-formed body, missing dependency** (engine / session): reaches
@@ -855,8 +856,12 @@ mod tests {
     /// - **Empty / malformed body**: pure boundary test for fail-closed
     ///   `InvalidArgument` / auth errors — does **not** claim the happy path
     ///   works. Named as malformed-boundary checks below.
+    ///
+    /// `SignTransition` feature-gate `Unimplemented` (V1 claim inactive) is
+    /// covered separately — that is an intentional edge gate, not an unmapped
+    /// procedure.
     #[tokio::test]
-    async fn unmapped_procedures_are_unimplemented_with_their_name() {
+    async fn all_kernel_procedures_are_transport_mapped_not_bare_unimplemented() {
         let (domain, _scope) = test_domain().await;
         let svc = grpc_svc(domain);
 

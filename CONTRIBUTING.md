@@ -93,10 +93,11 @@ full `node` + `shared` suite. The line for the full suite is below.
 
 ### Running tests
 
-**Full hermetic suite.** CI's authoritative gate
-(`cargo llvm-cov nextest` under the `ci:full` label — see [CI/CD](#cicd))
-drives `node` + `shared` through nextest, not plain `cargo test`. Locally,
-mirror that selection with:
+**Full hermetic suite.** CI's authoritative heavy gate (`test-and-coverage` in
+`ci.yaml`) runs on **every non-draft PR** (no `ci:full` label required — see
+[CI/CD](#cicd)). It drives `node` + `shared` under `cargo llvm-cov nextest`,
+then the release-mode prover package and ignored prove flows. Locally, mirror
+the hermetic `node` + `shared` selection with:
 
 ```bash
 cargo nextest run -p node -p shared --all-features --test-threads 8 -E 'not binary(api_remote)'
@@ -146,36 +147,27 @@ The boundary is stack modes: as soon as a run includes cases that claim
 **both** Legacy and V1, it needs nextest (process-per-test isolation).
 Single-mode or non-claiming subsets can stay on `cargo test`.
 
-**Prove path outside `-p node -p shared`.** The recommended command above
+**Prove path outside `-p node -p shared`.** The recommended local command above
 scopes only to the `node` and `shared` packages. Heavy prove-flow tests live
 in `zkcoins-prover-plonky2` (`script-plonky2/`) and are not selected by that
 run. Include the package explicitly when you need those flows:
 
 ```bash
-cargo nextest run -p zkcoins-prover-plonky2
+cargo nextest run -p zkcoins-prover-plonky2 --release
 ```
 
-A run without `zkcoins-prover-plonky2` is **not** a complete verification of
-the prove path. The CI gate matches the same package scope
-(`cargo llvm-cov nextest … -p node -p shared`); it does not execute the
-prover package's prove-flow suite.
+A local run without `zkcoins-prover-plonky2` is **not** a complete verification
+of the prove path. The CI heavy gate **does** run that package in release mode
+after the llvm-cov nextest step (see `.github/workflows/ci.yaml`).
 
-**`#[ignore]` tests in the `node` + `shared` scope.** Four cases in `node`
-are marked `#[ignore]`. They do not run under the recommended command above
-and do not run in the CI gate today:
-
-- `node v1::receive::tests::concurrent_append_after_broadcast_still_reported_success`
-- `node v1::receive::tests::concurrent_scanner_append_during_prove_still_commits`
-- `node v1::receive::tests::production_path_receive_with_genuine_prove_via_verify_and_begin`
-- `node v1::self_heal::unit_tests::resolve_v1_live_digest_via_real_prover_bridge_refuses_pin_mismatch`
-
-Run them with nextest's ignored-test controls (`--run-ignored all` includes
-them with the rest of the suite; `--run-ignored only` runs just the ignored
-set):
+**`#[ignore]` prove flows.** Several multi-minute prove paths are marked
+`#[ignore]` so the default hermetic nextest stays fast. The CI heavy gate
+runs them explicitly with `--run-ignored ignored-only` (node + shared) and
+also verifies live circuit digests against the committed file. Locally:
 
 ```bash
-cargo nextest run -p node -p shared --all-features --test-threads 8 \
-  -E 'not binary(api_remote)' --run-ignored all
+cargo nextest run -p node -p shared --all-features --release \
+  --run-ignored ignored-only
 ```
 
 ## Code style
@@ -318,20 +310,46 @@ Do **not** use a minimal `export … && cargo run -p node` snippet as the
 supported operator path — it will panic on missing pins/manifest. Use
 `deploy/local-e2e/` (or an equivalent full env from `docs/local-stack.md`).
 
+### Mainnet function restriction (SDR Phase B)
+
+Stage-3 SDR Phase B seals `SelfDeliveryRecordV1` only when first-occurrence
+inclusion + BIP-113 MTP are available. Until bitcoind supplies that path, the
+node uses a **named provisional** stand-in (`tip_hash` + wall-clock) that is
+**fail-closed on mainnet**:
+
+- **Regtest / testnet:** provisional Inclusion/MTP may finalise Phase A → seal
+  → `self_delivery` outbox.
+- **Mainnet:** `finalize_due_phase_b_adapter` refuses provisional seal
+  (`PROVISIONAL_MTP_MAINNET_REFUSED`), returns `Ok(0)`, leaves Phase-A rows in
+  `awaiting_first_occurrence` (does **not** `mark_failed`). Operators will see
+  open Phase-A rows and error logs until real MTP is wired — this is intentional,
+  not a silent success.
+
+See `node/src/v1/sdr.rs` (`provisional_inclusion_mtp_for_network`,
+`finalize_due_phase_b_adapter`).
+
 ## Docker
 
+A single-container `docker run` with only `ESPLORA_URL` / `USERNAME_DOMAIN` is
+**not startable**: the binary fails closed without `DATABASE_URL`,
+`PUBLISHER_KEY`, `KERNEL_GRPC_ADDR`, Stage-3 pins, bitcoind RPC, and a verified
+BMF1 bootstrap manifest. Do not treat a minimal `docker run` as an operator path.
+
+**Supported local stack** (postgres, bitcoind regtest, nostr-relay, node, api):
+
 ```bash
-docker build -t zkcoins/node .
-docker run -p 4242:4242 --network bitcoin \
-  -e ESPLORA_URL=http://electrs-mainnet:3000 \
-  -e USERNAME_DOMAIN=zkcoins.app \
-  zkcoins/node
+# Full env + compose — see deploy/local-e2e/README.md and docs/local-stack.md
+cp deploy/local-e2e/env.example.sh deploy/local-e2e/env.local.sh
+# Edit env.local.sh (required secrets/pins), then:
+bash -c 'set -a && source deploy/local-e2e/env.local.sh && set +a && ./deploy/local-e2e/up.sh'
 ```
 
-Docker builds use nightly Rust auto-installed via the workspace `rust-toolchain`
-— no Succinct toolchain, no zkVM target. The node connects to Bitcoin Core with
-an Esplora-compatible indexer (electrs) over the shared Docker network `bitcoin`;
-the underlying bitcoind needs `txindex=1`, `rest=1`, `server=1`.
+Or the workspace Compose path documented in `docs/local-stack.md`
+(`docker compose up --build` after generating/signing BMF1 and filling env).
+
+Image builds use nightly Rust via the workspace `rust-toolchain` — no Succinct
+toolchain, no zkVM target. Stage-3 scan + publish use **bitcoind RPC** (not
+Esplora WS); residual `ESPLORA_URL` is a boot pin only.
 
 ## Git workflow
 
@@ -344,7 +362,7 @@ the underlying bitcoind needs `txindex=1`, `rest=1`, `server=1`.
 | `main` | Production releases, promoted from `develop` | PRD node |
 
 - **Open feature PRs against `staging`** by default — it is the integration buffer where feature branches accumulate before being batched into a single `develop` promotion. (Repo-hygiene/cleanup PRs that target develop-only files may go directly to `develop`; note the reason in the PR body.)
-- **`develop` and `main` are protected** — no direct pushes, no force-pushes, no deletions. `develop` is auto-PR'd from `staging` (`auto-release-pr-staging.yaml`, `ci:full` applied); `main` is auto-PR'd from `develop` (`auto-release-pr.yaml`).
+- **`develop` and `main` are protected** — no direct pushes, no force-pushes, no deletions. `develop` is auto-PR'd from `staging` (`auto-release-pr-staging.yaml`); `main` is auto-PR'd from `develop` (`auto-release-pr.yaml`). Non-draft PRs always get the heavy CI gate (no label).
 - **Maintainers merge PRs; agents open them as drafts.** Never force-push, never amend, never `--no-verify` on a real change.
 
 ### Commit messages
@@ -365,16 +383,28 @@ wip
 
 | Workflow | Trigger | Action |
 |---|---|---|
-| `ci.yaml` — **Lint & Build** | Any ready PR, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program), build, the no-polling grep. Fast GitHub-hosted tier, no label needed. |
-| `ci.yaml` — **Tests + Coverage Gate** | Ready PR with `ci:full` label, push to develop | Full `node` + `shared` nextest suite under `llvm-cov` on the self-hosted M3 Ultra pool, measured coverage floor (see `.github/coverage-baseline.md`). |
+| `ci.yaml` — **Lint & Build** | Every non-draft PR (`pull_request` opened/synchronize/reopened/ready_for_review/…) | `cargo fmt --check`, clippy (MVP + all-features + program/prover), build, the no-polling grep over `node/src/main.rs` + `node/src/publisher.rs` (same-line `scanner-polling-ok:` opt-out). Fast GitHub-hosted tier. |
+| `ci.yaml` — **Tests + Coverage Gate** | Every non-draft PR (same draft guard; **no** `ci:full` label) | Full `node` + `shared` nextest under `llvm-cov` on the self-hosted M3 Ultra pool, measured coverage floor (see `.github/coverage-baseline.md`), then release-mode `zkcoins-prover-plonky2`, ignored prove flows (`--run-ignored ignored-only`), and circuit-digest verify. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → `zkcoins/node:beta` → DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → `zkcoins/node:latest` → PRD |
-| `auto-release-pr-staging.yaml` | Push to staging | Promote PR (staging → develop), `ci:full` |
-| `auto-release-pr.yaml` | Push to develop | Release PR (develop → main), `ci:full` |
+| `auto-release-pr-staging.yaml` | Push to staging | Promote PR (staging → develop) |
+| `auto-release-pr.yaml` | Push to develop | Release PR (develop → main) |
 
 **Draft PRs skip every `ci.yaml` job** — CI fires once the PR is marked
-ready-for-review. Apply the `ci:full` label when the PR is ready to run against
-the authoritative gate. After push, watch CI until green; never abandon a red run.
+ready-for-review (or on synchronize of a ready PR). The heavy gate is the
+default for non-draft PRs; there is no label opt-in. After push, watch CI until
+green; never abandon a red run.
+
+**No-polling gate (Lint & Build).** Matches the workflow step exactly:
+
+```bash
+grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' \
+  node/src/main.rs node/src/publisher.rs \
+  | grep -v 'scanner-polling-ok:'
+```
+
+Any hit without a same-line `scanner-polling-ok:` comment fails the build
+(see [No polling — events only](#no-polling--events-only)).
 
 ## Related Repos
 

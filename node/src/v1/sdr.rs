@@ -887,6 +887,87 @@ mod tests {
         }
     }
 
+    /// Production adapter path on mainnet: provisional Inclusion/MTP is
+    /// refused, Phase-A stays open (not `mark_failed`), no SDR seal, no
+    /// `self_delivery` outbox. Exercises `finalize_due_phase_b_adapter`, not
+    /// only the helper.
+    #[tokio::test]
+    async fn mainnet_finalize_due_phase_b_adapter_leaves_phase_a_open() {
+        use super::super::adapter::EngineAdapter;
+        use super::super::separation::{
+            claim_stack_scan_mode, set_process_stack_mode, ScanStackMode,
+        };
+
+        // Process claim is monotonic; nextest isolates per test.
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim v1 stack mode");
+
+        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Mainnet, 0)
+            .await
+            .expect("mainnet adapter");
+        assert_eq!(adapter.network(), Network::Mainnet);
+
+        let pk = [0xDDu8; 32];
+        let mat = sample_phase_a(pk);
+        db_sdr::insert_phase_a(&pool, &pk, &[0x11u8; 32], &mat)
+            .await
+            .expect("insert phase a");
+
+        let n = finalize_due_phase_b_adapter(&adapter, [0xAAu8; 32], 1_700_000_000)
+            .await
+            .expect("mainnet adapter path returns Ok(0), not Err");
+        assert_eq!(n, 0, "mainnet must finalise zero Phase-B rows under provisional MTP");
+
+        let row = db_sdr::get_phase_a(&pool, &pk)
+            .await
+            .expect("get")
+            .expect("phase-a row must remain");
+        assert_eq!(
+            row.status,
+            db_sdr::SdrPhaseAStatus::AwaitingFirstOccurrence,
+            "Phase A must stay open — not finalised and not mark_failed"
+        );
+        assert!(
+            row.fail_reason.is_none(),
+            "mainnet refusal must not mark_failed: {:?}",
+            row.fail_reason
+        );
+
+        let open = db_sdr::list_awaiting_first_occurrence(&pool)
+            .await
+            .expect("list open");
+        assert!(
+            open.iter().any(|r| r.transition_pk == pk),
+            "open Phase-A list must still contain the mainnet-withheld row"
+        );
+
+        let due = db_outbox::list_due(&pool).await.expect("list_due");
+        let sdr_due: Vec<_> = due
+            .iter()
+            .filter(|r| r.kind == OutboxKind::SelfDelivery)
+            .collect();
+        assert!(
+            sdr_due.is_empty(),
+            "no self_delivery outbox after mainnet provisional refusal; got {}",
+            sdr_due.len()
+        );
+
+        // Broader check: no outbox row at all for this transition (pending
+        // would appear in list_due; completed/failed would be a bug too).
+        let open_for_pk = db_outbox::list_open_for_transition(&pool, &pk)
+            .await
+            .expect("list_open_for_transition");
+        assert!(
+            open_for_pk.is_empty(),
+            "no outbox for withheld mainnet Phase A"
+        );
+    }
+
     #[tokio::test]
     async fn incomplete_phase_a_is_named_failure_not_silent_skip() {
         let scope = setup_pool().await;

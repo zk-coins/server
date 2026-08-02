@@ -27,11 +27,13 @@
 //!    failures (`DeliveryError::is_terminal_outbox_failure`) call
 //!    `db_outbox::mark_failed` so the row leaves the drive loop with a
 //!    named `fail_reason` (never silent eternal republish);
-//! 10. `awaiting_receipts` rows that never reach k within
-//!     [`db_outbox::AWAITING_RECEIPTS_TIMEOUT_SECS`] are marked `failed`
-//!     with a named reason via [`db_outbox::fail_stale_awaiting_receipts`]
-//!     (driven each tick from [`drive_due_outbox_entries`]) — no silent
-//!     eternal wait after ACK.
+//! 10. `awaiting_receipts` rows past
+//!     [`db_outbox::AWAITING_RECEIPTS_TIMEOUT_SECS`] are swept each tick by
+//!     [`db_outbox::fail_stale_awaiting_receipts`] (from
+//!     [`drive_due_outbox_entries`]): fewer than k receipts → named `failed`;
+//!     k or more → reconcile to `completed` (never fail a fully replicated
+//!     row). Sweep SQL/driver errors propagate as [`DeliveryError`] — not a
+//!     best-effort side step.
 //!
 //! # Port boundary
 //!
@@ -1238,6 +1240,8 @@ pub(crate) async fn drive_due_outbox_entries(
 ) -> Result<usize, DeliveryError> {
     // Progress path for ACK-held rows that never reach k receipts: named
     // terminal failure after AWAITING_RECEIPTS_TIMEOUT_SECS (not eternal wait).
+    // Failures here are not best-effort: a broken sweep leaves rows open past
+    // the deadline, so propagate as DeliveryError (named, not silent).
     match db_outbox::fail_stale_awaiting_receipts(pool).await {
         Ok(n) if n > 0 => {
             tracing::warn!(
@@ -1247,7 +1251,13 @@ pub(crate) async fn drive_due_outbox_entries(
         }
         Ok(_) => {}
         Err(e) => {
-            tracing::warn!(error = %e, "outbox: fail_stale_awaiting_receipts failed");
+            tracing::error!(
+                error = %e,
+                "outbox: fail_stale_awaiting_receipts failed — refusing drive tick"
+            );
+            return Err(DeliveryError::Relay(format!(
+                "fail_stale_awaiting_receipts: {e:#}"
+            )));
         }
     }
 

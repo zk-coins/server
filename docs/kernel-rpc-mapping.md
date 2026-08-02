@@ -8,9 +8,23 @@ Normative Quellen:
 
 Spalte **gRPC verdrahtet?** meint die `tonic`-Implementierung in
 `node/src/kernel_rpc.rs` über die transportneutrale Domain-Fassade
-(`node/src/kernel/`). „Ja“ = Domain-Aufruf + Proto-Mapping, kein
-`Status::unimplemented`. „Nein“ nennt die **konkret fehlende**
-Voraussetzung für eine ehrliche Verdrahtung.
+(`node/src/kernel/`). **„Ja“ / transport-mapped** = Domain-Aufruf +
+Proto-Mapping ist verdrahtet; leere/malformed Bodies und fehlende Chain-
+Abhängigkeiten sind **nicht** `Status::unimplemented` (typisch
+`InvalidArgument` / `Internal`). Das ist **nicht** dasselbe wie
+„production happy-path complete“.
+
+**Feature-Gate (Ausnahme, kein Platzhalter):** `SignTransition` liefert bei
+**inaktivem** V1-Claim (`!v1_sign_route_active()`) absichtlich
+`Status::unimplemented` am gRPC-Rand **vor** dem Domain-Aufruf — mit
+Meldung zu `ZKCOINS_V1_SHADOW` / `ScanStackMode::V1`, **nicht** dem Text
+`not yet implemented` unverdrahteter Prozeduren. Bei aktivem V1-Claim ist
+der Pfad domain-mapped. Dieses Gate zählt als transport-mapped, nicht als
+unverdrahteter Stub.
+
+„Nein“ / unmapped würde die **konkret fehlende** Voraussetzung für eine
+ehrliche Verdrahtung nennen (aktuell: kein Kernel-RPC nur als bare
+`Unimplemented`-Stub).
 
 Boot: gRPC startet **nur** aus `start_rest_node` via
 `serve_kernel_grpc_with_domain` mit **geteiltem** Job-Store + Notify-Map
@@ -57,11 +71,11 @@ Die REST-Keys `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delet
 
 | Kriterium | Prozeduren | Zahl |
 |---|---|---|
-| **gRPC transport-mapped** (Domain + Proto handler present; empty/malformed body is not `Unimplemented`) | all 20 in `service Kernel` | **20** |
-| **Production happy-path complete** (persist + rehydrate + restart-tested content) | subset — see per-row notes (`GetAccountState` index, process-local private records, …) | **not 20** |
-| gRPC `Unimplemented` as the only surface (no domain call) | — | **0** |
+| **gRPC transport-mapped** (Domain + Proto-Handler vorhanden; empty/malformed ≠ bare-`Unimplemented`-Stub; `SignTransition`-Feature-Gate bei inaktivem V1-Claim ist absichtlich und zählt hier mit) | alle 20 in `service Kernel` | **20** |
+| **Production happy-path complete** (persist + rehydrate + restart-tested content) | Teilmenge — siehe Zeilennotizen (`GetAccountState`-Index, process-local private records, …) | **nicht 20** |
+| gRPC bare-`Unimplemented` als einzige Fläche (kein Domain-Aufruf, Platzhalter) | — | **0** |
 
-**Kurzfassung:** Alle **20** Kernel-Prozeduren haben einen gRPC-Handler und Domain-Aufruf (kein stummes `Unimplemented` als Platzhalter). Das ist **nicht** dasselbe wie „production-complete“: z. B. `GetAccountState` bleibt ohne rehydrierten Account-Index praktisch fail-closed, private records sind process-local bis SQL-Rehydrate, und einige Surfaces brauchen live Session/Engine. `ListInscriptions` liest den beim Falten geschriebenen Inschriften-Katalog. `SubscribeReceipts` streamt Credits vom `ReceiptHub` nach dual-Persist (`v1::incoming`). `OpenPullChallenge` deckt auch `entrust`/`revoke` ab. `SignTransition` hat ein **API-Rand-Feature-Gate** bei inaktivem V1-Claim. Server-Boot nur über `start_rest_node` + shared Hub + pending-sign-Map + shared Receipt-Hub — kein stummer pool-only-Stream-Pfad.
+**Kurzfassung:** Alle **20** Kernel-Prozeduren haben einen gRPC-Handler und Domain-Pfad (kein stummes Platzhalter-`Unimplemented`). Das ist **nicht** dasselbe wie „production-complete“: z. B. `GetAccountState` bleibt ohne rehydrierten Account-Index praktisch fail-closed, private records sind process-local bis SQL-Rehydrate, und einige Surfaces brauchen live Session/Engine. `ListInscriptions` liest den beim Falten geschriebenen Inschriften-Katalog. `SubscribeReceipts` streamt Credits vom `ReceiptHub` nach dual-Persist (`v1::incoming`). `OpenPullChallenge` deckt auch `entrust`/`revoke` ab. `SignTransition` hat ein **API-Rand-Feature-Gate** (`Unimplemented` nur bei inaktivem V1-Claim; mit aktivem Claim domain-mapped). Server-Boot nur über `start_rest_node` + shared Hub + pending-sign-Map + shared Receipt-Hub — kein stummer pool-only-Stream-Pfad.
 
 ## API-lokale Endpunkte (explizit ohne Kernel)
 
