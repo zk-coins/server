@@ -38,19 +38,26 @@ require_env() {
 }
 
 # Wait until the compose service reports Health=healthy. Named timeout —
-# never silent continue.
+# never silent continue. Optional third arg: progress note re-logged every 60s
+# (used for node cold-start circuit construction so the wait is not mistaken
+# for a hang).
 wait_healthy() {
   local service="$1"
   local timeout_s="$2"
-  local start now elapsed cid health
+  local progress_note="${3:-}"
+  local start now elapsed cid health last_progress=0
   start="$(date +%s)"
   log "waiting for service '${service}' healthy (timeout ${timeout_s}s)…"
+  if [[ -n "${progress_note}" ]]; then
+    log "${progress_note}"
+  fi
   while true; do
     now="$(date +%s)"
     elapsed=$((now - start))
     if (( elapsed > timeout_s )); then
       die "timeout after ${timeout_s}s waiting for service '${service}' healthy — inspect: docker compose -f ${COMPOSE_FILE} logs ${service}"
     fi
+    health="unknown"
     cid="$(docker compose -f "${COMPOSE_FILE}" ps -q "${service}" 2>/dev/null | head -n 1 || true)"
     if [[ -n "${cid}" ]]; then
       health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${cid}" 2>/dev/null || echo missing)"
@@ -61,6 +68,14 @@ wait_healthy() {
       if [[ "${health}" == "unhealthy" ]]; then
         die "service '${service}' is unhealthy — inspect: docker compose -f ${COMPOSE_FILE} logs ${service}"
       fi
+    fi
+    # Periodic progress — multi-minute cold starts must not look hung.
+    if (( elapsed - last_progress >= 60 )); then
+      log "still waiting for '${service}' (${elapsed}s / ${timeout_s}s, health=${health})…"
+      if [[ -n "${progress_note}" ]]; then
+        log "  note: ${progress_note}"
+      fi
+      last_progress=$elapsed
     fi
     sleep 2
   done
@@ -112,6 +127,26 @@ docker compose version >/dev/null 2>&1 \
 export COMPOSE_FILE="${COMPOSE_FILE:-${REPO_ROOT}/compose.yaml}"
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-zkcoins-local}"
 [[ -f "${COMPOSE_FILE}" ]] || die "compose file not found: ${COMPOSE_FILE}"
+
+# Non-fatal: cold §1.7.9 circuit construction (C + C_balance) OOMs under a
+# lean Docker VM. Observed exit 137 / OOMKilled=true at ~15.6 GiB. Exact
+# threshold is build-dependent — warn, do not hard-abort.
+warn_docker_memory_if_low() {
+  local total_bytes total_gib
+  total_bytes="$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)"
+  if [[ -z "${total_bytes}" || "${total_bytes}" == "0" ]]; then
+    log "WARNING: could not read Docker Total Memory — ensure the Docker VM has ≥ 24 GiB (see deploy/local-e2e/README.md Prerequisites → Memory)"
+    return 0
+  fi
+  total_gib=$((total_bytes / 1024 / 1024 / 1024))
+  if (( total_gib < 20 )); then
+    log "WARNING: Docker VM reports ~${total_gib} GiB Total Memory."
+    log "WARNING: cold-start circuit construction needs well more than 16 GiB (OOM observed at 15.6 GiB)."
+    log "WARNING: assign ≥ 24 GiB to the Docker VM (OrbStack: VM memory; Docker Desktop: Resources → Memory), then restart the VM."
+    log "WARNING: details: deploy/local-e2e/README.md Prerequisites → Memory"
+  fi
+}
+warn_docker_memory_if_low
 
 # Every ${VAR:?} pin from compose.yaml (host-supplied).
 require_env PUBLISHER_KEY
@@ -203,8 +238,13 @@ wait_healthy "postgres" 120
 wait_healthy "bitcoind" 120
 wait_healthy "nostr-relay" 120
 
-# Node cold start: migrations + circuit warm can exceed 2 minutes on first boot.
-wait_healthy "node" 900
+# Node cold start: §1.7.9 circuit construction (C + C_balance, full Plonky2
+# recursion) runs before /health is served — often many minutes on a cold
+# machine. 20 min deadline; still fail-closed with compose-logs hint after.
+# Progress is re-logged every 60s so a waiting operator does not assume a hang.
+NODE_HEALTH_TIMEOUT_S=1200
+NODE_COLD_START_NOTE="cold-start circuit construction (C / C_balance) may take many minutes; /health is served only after circuits stand — not a hang"
+wait_healthy "node" "${NODE_HEALTH_TIMEOUT_S}" "${NODE_COLD_START_NOTE}"
 wait_http_ok "node /health" "http://127.0.0.1:4242/health" 120 "ok"
 
 wait_healthy "api" 300
@@ -249,7 +289,9 @@ fi
 log "restarting node so publisher binds the funded wallet…"
 docker compose -f "${COMPOSE_FILE}" restart node \
   || die "docker compose restart node failed"
-wait_healthy "node" 900
+# Same generous deadline: process-local circuit state is lost on restart.
+wait_healthy "node" "${NODE_HEALTH_TIMEOUT_S}" \
+  "post-restart circuit rebuild may take many minutes; /health waits until circuits stand"
 wait_http_ok "node /health (post-restart)" "http://127.0.0.1:4242/health" 120 "ok"
 wait_healthy "api" 300
 wait_http_ok "api /health (post-restart)" "http://127.0.0.1:8080/health" 120 "ok"

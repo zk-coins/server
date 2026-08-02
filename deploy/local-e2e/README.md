@@ -11,6 +11,16 @@ not hold.
 Operator background: [`docs/local-stack.md`](../../docs/local-stack.md).  
 Pass predicate: `docs-vectors/docs/implementation-mandate.md` §3.
 
+## Prerequisites
+
+| Need | Detail |
+| --- | --- |
+| Docker Compose v2 | Required by `up.sh` / `down.sh`. |
+| Host tools | `curl`, `cargo` (only if `gen_bootstrap_manifest` is not already built). Journey needs Node.js ≥ 22. |
+| Sibling `api` checkout | Compose builds `../api` next to this `node` worktree. |
+| **Memory** | The Docker VM (OrbStack / Docker Desktop) needs **well more than 16 GiB** for the node's cold-start circuit construction (C + C_balance, full Plonky2 recursion). **Observed: OOMKilled (exit 137) at ~15.6 GiB.** Assign **≥ 24 GiB** to the Docker VM. The exact peak is build-dependent; 15.6 GiB is proven insufficient. Settings: **OrbStack** → VM memory; **Docker Desktop** → Settings → Resources → Memory. Changing the limit requires a **VM restart**. `up.sh` warns (non-fatal) when Docker reports under ~20 GiB. |
+| **bash for env** | `env.local.sh` derives paths via `${BASH_SOURCE[0]}` and aborts if sourced under zsh/sh. Source under bash (see Environment below). Scripts (`up.sh`, …) already use `#!/usr/bin/env bash`. |
+
 ## Layout
 
 | Path | Role |
@@ -40,7 +50,12 @@ mkdir -p deploy/local-e2e/data
 # Write bootstrap.priv (64 lowercase hex), chmod 0600
 # Point ZKCOINS_BOOTSTRAP_PRIVKEY_FILE at it (default path in env.example.sh)
 
-set -a && source deploy/local-e2e/env.local.sh && set +a
+# Source under bash — not zsh. From a zsh login shell, either:
+bash -c 'set -a && source deploy/local-e2e/env.local.sh && set +a && ./deploy/local-e2e/up.sh'
+# or enter bash first, then:
+#   bash
+#   set -a && source deploy/local-e2e/env.local.sh && set +a
+#   ./deploy/local-e2e/up.sh
 ```
 
 Regtest circuit digests are **tree-pinned** in `env.example.sh` from
@@ -50,17 +65,20 @@ is **not** pinned in-tree: it includes *your* `ZKCOINS_BOOTSTRAP_PUBKEY`.
 ### 2. Start the stack
 
 ```bash
+# If env was already sourced in this bash shell:
 ./deploy/local-e2e/up.sh
 ```
 
 What `up.sh` does, fail-closed:
 
 1. Checks docker compose + every required env (refuses `REPLACE_ME_*`).
+   Non-fatal warn if Docker VM memory is under ~20 GiB (OOM risk; see Prerequisites).
 2. Builds/signs BMF1 with `gen_bootstrap_manifest` if the host path is empty
    (secret only via `ZKCOINS_BOOTSTRAP_PRIVKEY_FILE` — never argv).
 3. `docker compose up -d --build`.
 4. Waits for health: postgres → bitcoind → nostr-relay → node `/health` →
-   api `/health` (named timeouts; no silent continue).
+   api `/health` (named timeouts; no silent continue). Node cold start allows
+   **20 minutes** for §1.7.9 circuit construction, with progress every 60s.
 5. Creates/loads `ZKCOINS_V1_BITCOIND_WALLET`, mines ~110 blocks for mature
    coinbase, restarts `node` so the publisher sees the funded wallet.
 
@@ -88,12 +106,14 @@ Signing and key derivation use **`@zkcoins/sdk`** against the live api
 | Step | Expectation |
 | --- | --- |
 | First **node** image build | Multi-stage Rust + Plonky2 circuits — **many minutes to hours** on a cold machine. Dominant cost. |
+| First **node** process boot | Builds §1.7.9 circuits (C + C_balance) **before** `/health` is served — often many minutes; needs **≥ 24 GiB** Docker-VM RAM (see Prerequisites). `up.sh` waits up to 20 minutes with progress logs. |
 | First **api** image build | Multi-stage Rust + protoc — shorter than node, still cold-cache heavy. |
 | Subsequent `up.sh` | Reuses images and volumes; still pays migrations + scanner connect + optional circuit warm. |
 | `gen_bootstrap_manifest` | Fast if `target/release/…` already built; otherwise one release crate build. |
 | Journey stage 2 (mint prove) | Real Plonky2 proof — can take minutes per transition on modest hardware. |
 
-Do not treat a multi-hour first boot as a script bug.
+Do not treat a multi-hour first boot as a script bug. Under ~16 GiB Docker-VM RAM,
+expect OOM (exit 137) during circuit construction rather than a logic failure.
 
 ## What each journey stage asserts
 

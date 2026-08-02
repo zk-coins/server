@@ -239,13 +239,16 @@ services:
       # Liveness only: GET /health returns "ok" once the TCP listener is bound
       # (node/src/router.rs health_handler). Does not mask dependency failure —
       # /health/ready is the readiness probe (db + esplora + prover + v1_scan).
+      # /health is served only after §1.7.9 circuits (C + C_balance) stand —
+      # cold construction is multi-minute, not a hung process. start_period must
+      # cover that window so failed probes do not burn retries into unhealthy.
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4242/health"]
       interval: 10s
       timeout: 5s
-      retries: 18
-      # Cold circuit construction + migrations can take tens of seconds;
-      # first image build + first circuit build is much longer (see docs).
-      start_period: 120s
+      retries: 30
+      # 20 min: cold Plonky2 circuit construction before /health is bound.
+      # Aligns with deploy/local-e2e/up.sh node wait (1200s). Not a hang budget.
+      start_period: 1200s
 
   api:
     # Build context is the sibling checkout of zk-coins/api next to this

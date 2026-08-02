@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # env.example.sh — template for every compose `${VAR:?…}` pin.
 #
-# Copy, fill, then source before up.sh:
+# Copy, fill, then source under **bash** before up.sh (not zsh — see guard):
 #
 #   cp deploy/local-e2e/env.example.sh deploy/local-e2e/env.local.sh
 #   # edit env.local.sh — never commit secrets
+#   bash -c 'set -a && source deploy/local-e2e/env.local.sh && set +a && ./deploy/local-e2e/up.sh'
+#
+# Or stay inside a bash shell:
+#
+#   bash
 #   set -a && source deploy/local-e2e/env.local.sh && set +a
 #   ./deploy/local-e2e/up.sh
 #
@@ -12,6 +17,17 @@
 # Never put real secrets in this file or any committed path.
 #
 # Full operator context: docs/local-stack.md
+
+# Bash-only: path derivation uses ${BASH_SOURCE[0]}. Sourcing under zsh leaves
+# that unset, yields an empty _SCRIPT_DIR, and points COMPOSE_FILE at the wrong
+# tree. Refuse loudly — never silent wrong paths.
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "env.example.sh / env.local.sh: ERROR: must be sourced or run under bash (not zsh/sh)." >&2
+  echo "  source under bash:" >&2
+  echo "    bash -c 'set -a && source deploy/local-e2e/env.local.sh && set +a && ./deploy/local-e2e/up.sh'" >&2
+  echo "  or run the scripts directly (they have #!/usr/bin/env bash)." >&2
+  return 1 2>/dev/null || exit 1
+fi
 
 set -euo pipefail
 
