@@ -111,6 +111,8 @@ pub(crate) use nostr::nip59::OsSecureRandom;
 pub(crate) mod provenance;
 pub mod publish;
 pub mod receive;
+/// Clause-10 slot reconstitution from `fold_coin_ids` + private index + live NfLog.
+pub(crate) mod reconstitute;
 pub mod scan;
 pub mod self_heal;
 // Crate-private: external edge names only the curated re-exports below
@@ -171,6 +173,10 @@ pub use receive::{
     verify_and_begin_receive, PublishedBatchSummary, ReceivedCoinSlot, V1ReceiveOutcome,
     V1ReceiveRequest,
 };
+// Production receive path calls `crate::v1::reconstitute::…` directly
+// (`reconstitute_receive_slots_locked` in the job dispatcher). Only the
+// error type is re-exported on the facade for `crate::v1::ReconstituteError`.
+pub(crate) use reconstitute::ReconstituteError;
 pub use scan::{
     apply_canonical_survivors, apply_forward_scan, first_boot_requires_full_replace,
     folded_keys_from_nflog_mirror, observation_tip_still_live, reconcile_persisted_tip, FoldStats,

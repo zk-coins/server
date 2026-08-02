@@ -319,37 +319,6 @@ pub(crate) async fn process_envelope_for_test(
     .await
 }
 
-/// Typed cause: a `receive` job reached the dispatcher, but the job path
-/// cannot yet drive §2.3.3 prove/finalise.
-///
-/// Admission of `kind=receive` is open ([`crate::kernel::jobs::submit`]).
-/// Execution still needs clause-10 [`crate::v1::receive::ReceivedCoinSlot`]
-/// bindings reconstituted from the private index + live NfLog, the
-/// operational bundle, and a wallet
-/// [`zkcoins_prover::prover_bridge::TransitionSignature`]. Until that
-/// reconstitution is wired, a receive envelope is terminal-failed rather
-/// than inventing a half-proved state. Outward machine code is
-/// `internal_error` (closed set); classification is by downcast of this
-/// type, never by parsing the Display text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReceiveJobPathNotWired;
-
-impl std::fmt::Display for ReceiveJobPathNotWired {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(
-            "receive job path not wired: fold_coin_ids admitted, but clause-10 \
-             ReceivedCoinSlot reconstitution + operational bundle + wallet \
-             TransitionSignature are not yet driven by the dispatcher \
-             (direct path: v1::receive::execute_v1_receive)",
-        )
-    }
-}
-
-impl std::error::Error for ReceiveJobPathNotWired {}
-
-/// Machine code stored when a receive job is terminal-failed as not wired.
-pub(crate) const RECEIVE_JOB_PATH_NOT_WIRED_CODE: &str = "internal_error";
-
 /// Pure decision for one non-terminal dispatcher envelope.
 ///
 /// Terminal statuses are filtered before this is consulted. The table is
@@ -361,10 +330,10 @@ pub(crate) enum DispatcherEnvelopeAction {
     ProcessMintAwaitingSignature,
     ProcessSendQueued,
     ProcessSendAwaitingSignature,
+    ProcessReceiveQueued,
+    ProcessReceiveAwaitingSignature,
     ProcessAttest,
     DriveV1Finalise,
-    /// Receive cannot be executed on the job path — terminal fail.
-    RejectReceiveNotWired,
     /// Prove already in flight (re-delivered envelope / concurrent owner).
     SkipConcurrentProving,
     /// Broadcast/finalise already in flight without v1 re-entry.
@@ -375,8 +344,8 @@ pub(crate) enum DispatcherEnvelopeAction {
 
 /// Decision table for [`process_envelope`]. Pure; no I/O.
 ///
-/// `v1_sign_route_active` gates the mint/send broadcasting re-entry that
-/// drives durable finalise without re-parking on `/sign`.
+/// `v1_sign_route_active` gates the mint/send/receive broadcasting re-entry
+/// that drives durable finalise without re-parking on `/sign`.
 pub(crate) fn dispatcher_envelope_action(
     kind: JobKind,
     status: JobStatus,
@@ -388,22 +357,25 @@ pub(crate) fn dispatcher_envelope_action(
         (JobKind::Mint, JobStatus::AwaitingSignature) => ProcessMintAwaitingSignature,
         (JobKind::Send, JobStatus::Queued) => ProcessSendQueued,
         (JobKind::Send, JobStatus::AwaitingSignature) => ProcessSendAwaitingSignature,
+        (JobKind::Receive, JobStatus::Queued) => ProcessReceiveQueued,
+        (JobKind::Receive, JobStatus::AwaitingSignature) => ProcessReceiveAwaitingSignature,
         // Gap G6: attest_balance has no awaiting_signature phase (§7.5).
         (JobKind::AttestBalance, JobStatus::Queued | JobStatus::Proving) => ProcessAttest,
         // Mid-finalise crash: durable signed capability + broadcasting.
-        (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting) if v1_sign_route_active => {
+        (JobKind::Mint | JobKind::Send | JobKind::Receive, JobStatus::Broadcasting)
+            if v1_sign_route_active =>
+        {
             DriveV1Finalise
         }
-        // Job path cannot drive §2.3.3 from fold_coin_ids alone.
-        (JobKind::Receive, JobStatus::Queued)
-        | (JobKind::Receive, JobStatus::Proving)
-        | (JobKind::Receive, JobStatus::AwaitingSignature)
-        | (JobKind::Receive, JobStatus::Broadcasting) => RejectReceiveNotWired,
         // Re-delivered envelope while prove owns the row — do not re-start.
-        (JobKind::Mint | JobKind::Send, JobStatus::Proving) => SkipConcurrentProving,
+        (JobKind::Mint | JobKind::Send | JobKind::Receive, JobStatus::Proving) => {
+            SkipConcurrentProving
+        }
         // Legacy in-process commit continues from AwaitingSignature; an
         // orphaned broadcasting envelope is concurrent mid-commit.
-        (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting) => SkipConcurrentBroadcasting,
+        (JobKind::Mint | JobKind::Send | JobKind::Receive, JobStatus::Broadcasting) => {
+            SkipConcurrentBroadcasting
+        }
         // Terminal statuses are filtered before this function; named so a
         // caller that forgets the filter still does not invent work.
         (
@@ -487,14 +459,31 @@ async fn process_envelope(
             )
             .await
         }
+        DispatcherEnvelopeAction::ProcessReceiveQueued => {
+            process_receive_initial(
+                job_store,
+                app_state,
+                notify_map,
+                awaiting_signature_timeout,
+                job,
+            )
+            .await
+        }
+        DispatcherEnvelopeAction::ProcessReceiveAwaitingSignature => {
+            process_receive_resume(
+                job_store,
+                app_state,
+                notify_map,
+                awaiting_signature_timeout,
+                job,
+            )
+            .await
+        }
         DispatcherEnvelopeAction::ProcessAttest => {
             process_attest_balance(job_store, app_state, notify_map, job).await
         }
         DispatcherEnvelopeAction::DriveV1Finalise => {
             drive_v1_finalise(job_store, app_state, notify_map, env.public_id, &job).await
-        }
-        DispatcherEnvelopeAction::RejectReceiveNotWired => {
-            reject_receive_job_path_not_wired(job_store, notify_map, job).await
         }
         DispatcherEnvelopeAction::SkipConcurrentProving => {
             // Named intentional skip: prove CAS already advanced the row.
@@ -522,50 +511,6 @@ async fn process_envelope(
             fail_unexpected_non_terminal_envelope(job_store, notify_map, job).await
         }
     }
-}
-
-/// Terminal-fail a receive job that the job path cannot execute.
-///
-/// `from` is the observed non-terminal status; a CAS miss means another
-/// actor already advanced the row — no failed event, no invented success.
-async fn reject_receive_job_path_not_wired(
-    job_store: &JobStore,
-    notify_map: &JobNotifyMap,
-    job: Job,
-) -> anyhow::Result<()> {
-    let public_id = job.public_id;
-    let from = job.status;
-    let cause = ReceiveJobPathNotWired;
-    let msg = crate::v1::encode_job_error(RECEIVE_JOB_PATH_NOT_WIRED_CODE, cause.to_string());
-    tracing::error!(
-        "Job dispatcher: receive job {} status={:?} refused — {}",
-        public_id,
-        from,
-        cause
-    );
-    if !job_store.fail(public_id, from, &msg).await? {
-        tracing::warn!(
-            "Job dispatcher: receive job {} fail({:?}→failed) matched 0 rows; \
-             not publishing failed event",
-            public_id,
-            from
-        );
-        notify_map.remove(&public_id);
-        return Ok(());
-    }
-    publish_phase(
-        notify_map,
-        public_id,
-        JobPhaseEvent {
-            status: JobStatus::Failed,
-            phase: "failed".to_string(),
-            proof_id: None,
-            result: None,
-            error: Some(msg),
-        },
-    );
-    notify_map.remove(&public_id);
-    Ok(())
 }
 
 /// Terminal-fail a non-terminal `(kind, status)` that has no named skip.
@@ -1735,6 +1680,535 @@ async fn process_send_resume(
     .await
 }
 
+// ---------------------------------------------------------------------------
+// Receive (§2.3.3 / D11) — reconstitute slots → begin → awaiting_signature
+// ---------------------------------------------------------------------------
+
+/// Parsed receive job body: subject, next_pubkey, npk_rand, fold_coin_ids.
+type ParsedReceiveJobBody = (
+    crate::kernel::types::SubjectAddress,
+    [u8; 32],
+    [u8; 32],
+    Vec<[u8; 32]>,
+);
+
+/// Auth material for receive begin: nk, op_secret, current_pubkey.
+type ReceiveAuthKeys = ([u8; 32], zkcoins_prover::state_engine::OpSecret, [u8; 32]);
+
+/// Parse the normative receive job body (`subject`, `next_pubkey`,
+/// `npk_rand`, `fold_coin_ids`) that [`crate::kernel::jobs::submit`] encodes.
+fn parse_receive_job_body(body: &serde_json::Value) -> Result<ParsedReceiveJobBody, String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "receive job body is not a JSON object".to_string())?;
+    let subject_hex = obj
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "receive job body missing subject".to_string())?;
+    let next_hex = obj
+        .get("next_pubkey")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "receive job body missing next_pubkey".to_string())?;
+    let npk_hex = obj
+        .get("npk_rand")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "receive job body missing npk_rand".to_string())?;
+    let fold_arr = obj
+        .get("fold_coin_ids")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "receive job body missing fold_coin_ids".to_string())?;
+
+    let subject = parse_hex32_field(subject_hex, "subject")?;
+    let next_pubkey = parse_hex32_field(next_hex, "next_pubkey")?;
+    let npk_rand = parse_hex32_field(npk_hex, "npk_rand")?;
+    let mut fold_coin_ids = Vec::with_capacity(fold_arr.len());
+    for (i, v) in fold_arr.iter().enumerate() {
+        let h = v
+            .as_str()
+            .ok_or_else(|| format!("fold_coin_ids[{i}] is not a hex string"))?;
+        fold_coin_ids.push(parse_hex32_field(h, &format!("fold_coin_ids[{i}]"))?);
+    }
+    Ok((
+        crate::kernel::types::SubjectAddress(subject),
+        next_pubkey,
+        npk_rand,
+        fold_coin_ids,
+    ))
+}
+
+fn parse_hex32_field(hex_str: &str, field: &str) -> Result<[u8; 32], String> {
+    if hex_str.len() != 64 {
+        return Err(format!(
+            "{field} must be 64 hex chars, got {}",
+            hex_str.len()
+        ));
+    }
+    let bytes = hex::decode(hex_str).map_err(|e| format!("{field} hex decode: {e}"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| format!("{field} must decode to 32 bytes"))?;
+    Ok(arr)
+}
+
+/// Resolve `nk` / `op_secret` / `current_pubkey` for a receive begin.
+///
+/// - Registered engine account → live account fields (bundle must match).
+/// - Fresh account (InitialProof) → operational bundle + address-bound
+///   genesis key from the private-index account view when present.
+fn resolve_receive_auth_keys(
+    app_state: &AppState,
+    subject: &crate::kernel::types::SubjectAddress,
+) -> Result<ReceiveAuthKeys, String> {
+    let bundle = app_state.bundles.get_active(subject).ok_or_else(|| {
+        format!(
+            "receive: no active operational bundle for subject {} (§7.7)",
+            hex::encode(subject.0)
+        )
+    })?;
+    let op_secret = zkcoins_prover::state_engine::OpSecret::new(bundle.op_secret);
+    let owner = shared::spec_v1::Address(subject.0);
+
+    let adapter = app_state
+        .v1_engine
+        .as_ref()
+        .ok_or_else(|| "receive: v1 EngineAdapter missing".to_string())?;
+
+    adapter.with_engine(|engine| {
+        if let Some(rec) = engine.account(&owner) {
+            if rec.nk != bundle.nk {
+                return Err(
+                    "receive: operational-bundle nk does not match registered account nk".into(),
+                );
+            }
+            if let Some(stored) = rec.op_secret {
+                if stored != op_secret {
+                    return Err(
+                        "receive: operational-bundle op_secret does not match registered account"
+                            .into(),
+                    );
+                }
+            }
+            return Ok((rec.nk, op_secret, rec.state.current_pubkey));
+        }
+        // InitialProof: need Pk₀ such that owner = H(Pk₀ ‖ nk_commit).
+        use crate::kernel::access::PrivateIndex;
+        let view = app_state
+            .private_index
+            .get_account_state(subject)
+            .map_err(|e| {
+                format!(
+                    "receive: InitialProof requires indexed AccountState.current_pubkey \
+                     (genesis Pk₀); private-index load failed: {e}"
+                )
+            })?;
+        let expected = shared::spec_v1::Address(shared::spec_v1::address(
+            &view.current_pubkey,
+            shared::spec_v1::nk_commit(&bundle.nk),
+        ));
+        if expected != owner {
+            return Err("receive: indexed current_pubkey does not open subject as \
+                 H(Pk₀ ‖ nk_commit); refusing InitialProof"
+                .to_string());
+        }
+        Ok((bundle.nk, op_secret, view.current_pubkey))
+    })
+}
+
+/// Host begin of a receive job: reconstitute clause-10 slots →
+/// [`crate::v1::verify_and_begin_receive`] → stage live pending for
+/// `awaiting_signature`. Same handshake as mint/send (§7.5).
+async fn process_receive_initial(
+    job_store: &JobStore,
+    app_state: &AppState,
+    notify_map: &JobNotifyMap,
+    awaiting_signature_timeout: Duration,
+    job: Job,
+) -> anyhow::Result<()> {
+    let public_id = job.public_id;
+    if !job_store
+        .set_status(public_id, JobStatus::Queued, JobStatus::Proving, "proving")
+        .await?
+    {
+        tracing::warn!(
+            "Job dispatcher: receive job {} set_status(queued→proving) matched 0 rows; aborting",
+            public_id
+        );
+        notify_map.remove(&public_id);
+        return Ok(());
+    }
+    publish_phase(
+        notify_map,
+        public_id,
+        JobPhaseEvent {
+            status: JobStatus::Proving,
+            phase: "proving".to_string(),
+            proof_id: None,
+            result: None,
+            error: None,
+        },
+    );
+
+    // Fail helper: proving → failed with §7.5 machine code.
+    async fn fail_receive(
+        job_store: &JobStore,
+        app_state: &AppState,
+        notify_map: &JobNotifyMap,
+        public_id: Uuid,
+        code: &str,
+        message: String,
+    ) -> anyhow::Result<()> {
+        let msg = crate::v1::encode_job_error(code, message);
+        if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
+            tracing::warn!(
+                "Job dispatcher: receive job {} fail(proving) matched 0 rows",
+                public_id
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+        publish_phase(
+            notify_map,
+            public_id,
+            JobPhaseEvent {
+                status: JobStatus::Failed,
+                phase: "failed".to_string(),
+                proof_id: None,
+                result: None,
+                error: Some(msg),
+            },
+        );
+        cleanup_pending_sign(job_store, app_state, public_id).await;
+        notify_map.remove(&public_id);
+        Ok(())
+    }
+
+    let (subject, next_pubkey, npk_rand, fold_coin_ids) =
+        match parse_receive_job_body(&job.request_body) {
+            Ok(v) => v,
+            Err(e) => {
+                return fail_receive(
+                    job_store,
+                    app_state,
+                    notify_map,
+                    public_id,
+                    "malformed_request",
+                    format!("invalid receive request body: {e}"),
+                )
+                .await;
+            }
+        };
+
+    let adapter = match &app_state.v1_engine {
+        Some(a) => a,
+        None => {
+            return fail_receive(
+                job_store,
+                app_state,
+                notify_map,
+                public_id,
+                "internal_error",
+                "v1 EngineAdapter missing for receive job".into(),
+            )
+            .await;
+        }
+    };
+
+    let (nk, op_secret, current_pubkey) = match resolve_receive_auth_keys(app_state, &subject) {
+        Ok(v) => v,
+        Err(e) => {
+            return fail_receive(
+                job_store,
+                app_state,
+                notify_map,
+                public_id,
+                "internal_error",
+                e,
+            )
+            .await;
+        }
+    };
+
+    // Reconstitute clause-10 slots (private index + live NfLog). MAX_RX_COINS
+    // is enforced inside validate_fold_coin_ids_shape / reconstitute.
+    let slots = match reconstitute_receive_slots_locked(
+        app_state,
+        adapter.as_ref(),
+        &subject,
+        &fold_coin_ids,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return fail_receive(
+                job_store,
+                app_state,
+                notify_map,
+                public_id,
+                e.code(),
+                e.to_string(),
+            )
+            .await;
+        }
+    };
+
+    let begin_result = adapter.with_engine(|engine| {
+        crate::v1::verify_and_begin_receive(
+            engine,
+            crate::v1::V1ReceiveRequest {
+                owner: shared::spec_v1::Address(subject.0),
+                nk,
+                op_secret,
+                current_pubkey,
+                slots,
+                next_pubkey,
+                npk_rand,
+            },
+        )
+    });
+
+    let pending = match begin_result {
+        Ok(p) => {
+            note_prove_outcome(app_state, Ok(())).await;
+            p
+        }
+        Err(e) => {
+            note_prove_outcome(app_state, Err("prove failed")).await;
+            return fail_receive(
+                job_store,
+                app_state,
+                notify_map,
+                public_id,
+                "proving_failed",
+                format!("verify_and_begin_receive: {e:#}"),
+            )
+            .await;
+        }
+    };
+
+    if let Ok(Some(j)) = job_store.load(public_id).await {
+        if j.status == JobStatus::Cancelled {
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
+
+    // Register live pending for stage_and_select_awaiting_signature (same
+    // mint/send handshake). Network from the exclusive engine.
+    let network = adapter.network();
+    let entry = crate::v1::PendingSignEntry::new(pending, network);
+    crate::v1::register_live_pending_after_begin(
+        &app_state.v1_live_pending_after_begin,
+        public_id,
+        entry,
+    );
+
+    let notifier = notify_map
+        .entry(public_id)
+        .or_insert_with(|| Arc::new(JobNotifier::new()))
+        .clone();
+
+    let live_pending = resolve_live_pending_after_prove(app_state, public_id);
+    // Receive has no legacy ash/ocr surface — empty placeholders; under v1
+    // the staged PendingSignEntry supplies the §7.5 ProofData advertisement.
+    let result = match stage_and_select_awaiting_signature(
+        job_store,
+        app_state,
+        public_id,
+        "",
+        "",
+        live_pending,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(msg) => {
+            return fail_receive(
+                job_store,
+                app_state,
+                notify_map,
+                public_id,
+                "internal_error",
+                msg,
+            )
+            .await;
+        }
+    };
+
+    // proof_id: receive has no file ProofStore id — use 0 as the sentinel
+    // already used for staged-only transitions (attest uses none).
+    let proof_id: i64 = 0;
+    match job_store
+        .set_awaiting_signature(public_id, proof_id, result.clone())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                "Job dispatcher: receive job {} set_awaiting_signature matched 0 rows; cleaning up",
+                public_id
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+        Err(e) => {
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Err(e.into());
+        }
+    }
+    match job_store.load(public_id).await? {
+        Some(j) if j.status == JobStatus::AwaitingSignature => {}
+        Some(j) if j.status == JobStatus::Cancelled => {
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+        other => {
+            tracing::warn!(
+                "Job dispatcher: receive job {} not in awaiting_signature after set ({:?})",
+                public_id,
+                other.map(|j| j.status)
+            );
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+    }
+    publish_phase(
+        notify_map,
+        public_id,
+        JobPhaseEvent {
+            status: JobStatus::AwaitingSignature,
+            phase: "awaiting_signature".to_string(),
+            proof_id: Some(proof_id),
+            result: Some(result),
+            error: None,
+        },
+    );
+    tracing::info!(
+        "Job dispatcher: receive job {} reached awaiting_signature",
+        public_id
+    );
+
+    wait_for_commit(
+        job_store,
+        app_state,
+        notify_map,
+        awaiting_signature_timeout,
+        public_id,
+        JobKind::Receive,
+        notifier,
+    )
+    .await
+}
+
+/// Async reconstitution under a short engine read lock for NfLog paths.
+async fn reconstitute_receive_slots_locked(
+    app_state: &AppState,
+    adapter: &crate::v1::EngineAdapter,
+    subject: &crate::kernel::types::SubjectAddress,
+    fold_coin_ids: &[[u8; 32]],
+) -> Result<Vec<crate::v1::ReceivedCoinSlot>, crate::v1::ReconstituteError> {
+    use crate::v1::reconstitute::{
+        load_coin_proof_canonical, reconstitute_received_slots_with_loader,
+        validate_fold_coin_ids_shape,
+    };
+    validate_fold_coin_ids_shape(fold_coin_ids)?;
+
+    let mut canonicals: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(fold_coin_ids.len());
+    for coin_id in fold_coin_ids {
+        let bytes = load_coin_proof_canonical(
+            app_state.private_index.as_ref(),
+            app_state.pool.as_ref(),
+            subject,
+            coin_id,
+        )
+        .await?;
+        canonicals.push((*coin_id, bytes));
+    }
+
+    let bridge = adapter.bridge();
+    #[cfg(test)]
+    let test_loader = app_state.receive_creating_proof_loader.clone();
+
+    adapter.with_engine(|engine| {
+        reconstitute_received_slots_with_loader(
+            engine,
+            &subject.0,
+            fold_coin_ids,
+            |id| {
+                canonicals
+                    .iter()
+                    .find(|(cid, _)| cid == id)
+                    .map(|(_, b)| b.clone())
+                    .ok_or(crate::v1::ReconstituteError::UnknownCoinId { coin_id: *id })
+            },
+            |proof_bytes| {
+                #[cfg(test)]
+                if let Some(loader) = test_loader.as_ref() {
+                    return loader(proof_bytes).map_err(|detail| {
+                        crate::v1::ReconstituteError::CreatingProofLoad {
+                            coin_id: [0u8; 32],
+                            detail,
+                        }
+                    });
+                }
+                bridge
+                    .load_transition_proof_bytes(proof_bytes)
+                    .map_err(|e| crate::v1::ReconstituteError::CreatingProofLoad {
+                        coin_id: [0u8; 32],
+                        detail: format!("{e:#}"),
+                    })
+            },
+        )
+    })
+}
+
+/// Resume a receive job already at `awaiting_signature` (boot / re-enqueue).
+async fn process_receive_resume(
+    job_store: &JobStore,
+    app_state: &AppState,
+    notify_map: &JobNotifyMap,
+    awaiting_signature_timeout: Duration,
+    job: Job,
+) -> anyhow::Result<()> {
+    let public_id = job.public_id;
+    rehydrate_pending_sign_into_map(app_state, public_id, &job);
+    let notifier = notify_map
+        .entry(public_id)
+        .or_insert_with(|| Arc::new(JobNotifier::new()))
+        .clone();
+    tracing::info!(
+        "Job dispatcher: resuming receive job {} in awaiting_signature",
+        public_id
+    );
+    publish_phase(
+        notify_map,
+        public_id,
+        JobPhaseEvent {
+            status: JobStatus::AwaitingSignature,
+            phase: "awaiting_signature".to_string(),
+            proof_id: job.proof_id,
+            result: job.response_body.clone(),
+            error: None,
+        },
+    );
+    wait_for_commit(
+        job_store,
+        app_state,
+        notify_map,
+        awaiting_signature_timeout,
+        public_id,
+        JobKind::Receive,
+        notifier,
+    )
+    .await
+}
+
 /// Park on the `notify` channel for the given `public_id`. On wake,
 /// load the (now-updated) job, parse the `CommitRequest` the
 /// commit-route persisted into the job's `request_body`, and drive
@@ -2028,13 +2502,13 @@ async fn wait_for_commit(
                 "Job dispatcher: attest_balance has no commit/broadcast leg"
             ));
         }
-        // Receive never enters wait_for_commit: non-terminal receive
-        // envelopes are terminal-failed as path-not-wired before this arm.
-        // Reaching it is a bug (exhaustiveness only).
+        // Receive is v1-only: `/sign` + drive_v1_finalise (above). Legacy
+        // CommitRequest ash‖ocr is not a receive surface.
         JobKind::Receive => {
             return Err(anyhow::anyhow!(
-                "Job dispatcher: receive has no commit/broadcast leg \
-                 (path-not-wired terminal-fail owns receive envelopes)"
+                "Job dispatcher: receive has no legacy commit/broadcast leg — \
+                 finalise must run via drive_v1_finalise after /sign \
+                 (v1_sign_route_active); refused silent fall-through"
             ));
         }
     };
@@ -3173,7 +3647,10 @@ mod finalise_publish_handoff_tests {
             v1_finalise: None,
             v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
             v1_pending_after_prove: None,
+            receive_creating_proof_loader: None,
             v1_engine: None,
+            private_index: crate::kernel::access::InMemoryPrivateIndex::shared(),
+            bundles: crate::kernel::bootstrap::BundleStore::shared(),
             attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
             public_hosts: Arc::new(vec!["node.test".to_string()]),
         }
@@ -3640,7 +4117,10 @@ mod wait_for_commit_fail_closed_tests {
             v1_finalise: None,
             v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
             v1_pending_after_prove: None,
+            receive_creating_proof_loader: None,
             v1_engine: None,
+            private_index: crate::kernel::access::InMemoryPrivateIndex::shared(),
+            bundles: crate::kernel::bootstrap::BundleStore::shared(),
             attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
             public_hosts: Arc::new(vec!["node.test".to_string()]),
         }
@@ -3888,19 +4368,28 @@ mod receive_job_path_and_decision_table_tests {
                         (JobKind::Send, JobStatus::AwaitingSignature, _) => {
                             ProcessSendAwaitingSignature
                         }
+                        (JobKind::Receive, JobStatus::Queued, _) => ProcessReceiveQueued,
+                        (JobKind::Receive, JobStatus::AwaitingSignature, _) => {
+                            ProcessReceiveAwaitingSignature
+                        }
                         (JobKind::AttestBalance, JobStatus::Queued | JobStatus::Proving, _) => {
                             ProcessAttest
                         }
-                        (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting, true) => {
-                            DriveV1Finalise
-                        }
-                        (JobKind::Receive, s, _) if !s.is_terminal() => RejectReceiveNotWired,
-                        (JobKind::Mint | JobKind::Send, JobStatus::Proving, _) => {
-                            SkipConcurrentProving
-                        }
-                        (JobKind::Mint | JobKind::Send, JobStatus::Broadcasting, false) => {
-                            SkipConcurrentBroadcasting
-                        }
+                        (
+                            JobKind::Mint | JobKind::Send | JobKind::Receive,
+                            JobStatus::Broadcasting,
+                            true,
+                        ) => DriveV1Finalise,
+                        (
+                            JobKind::Mint | JobKind::Send | JobKind::Receive,
+                            JobStatus::Proving,
+                            _,
+                        ) => SkipConcurrentProving,
+                        (
+                            JobKind::Mint | JobKind::Send | JobKind::Receive,
+                            JobStatus::Broadcasting,
+                            false,
+                        ) => SkipConcurrentBroadcasting,
                         (_, s, _) if s.is_terminal() => FailUnexpectedNonTerminal,
                         (JobKind::AttestBalance, _, _) => FailUnexpectedNonTerminal,
                         // Exhaustive over the closed product above.
@@ -3923,61 +4412,97 @@ mod receive_job_path_and_decision_table_tests {
             dispatcher_envelope_action(JobKind::Send, JobStatus::Broadcasting, false),
             SkipConcurrentBroadcasting
         );
-        // Receive never silently skips while non-terminal.
+        // Receive is a real path — queued begins, proving is concurrent skip.
         assert_eq!(
             dispatcher_envelope_action(JobKind::Receive, JobStatus::Queued, false),
-            RejectReceiveNotWired
+            ProcessReceiveQueued
         );
         assert_eq!(
             dispatcher_envelope_action(JobKind::Receive, JobStatus::Proving, true),
-            RejectReceiveNotWired
+            SkipConcurrentProving
+        );
+        assert_eq!(
+            dispatcher_envelope_action(JobKind::Receive, JobStatus::AwaitingSignature, true),
+            ProcessReceiveAwaitingSignature
         );
     }
 
-    /// Typed cause identity (downcast), not message parsing.
-    #[test]
-    fn receive_job_path_not_wired_is_downcastable() {
-        let err = anyhow::Error::new(ReceiveJobPathNotWired);
-        assert!(
-            err.downcast_ref::<ReceiveJobPathNotWired>().is_some(),
-            "ReceiveJobPathNotWired must be recoverable via downcast"
-        );
-        let display = ReceiveJobPathNotWired.to_string();
-        assert!(
-            display.contains("receive job path not wired"),
-            "Display must name the cause; got {display}"
-        );
-    }
-
-    /// An admitted (store-created) receive job is terminal-failed with the
-    /// typed path-not-wired cause — never left `queued`.
+    /// Receive with unknown fold coin fails terminal (named), never hangs
+    /// in `queued` and never invents success.
     #[tokio::test]
-    async fn admitted_receive_job_is_terminal_failed_not_silently_skipped() {
+    async fn receive_unknown_coin_terminal_fails_with_named_error() {
+        use crate::kernel::access::{AccountStateView, InMemoryPrivateIndex};
+        use crate::kernel::bootstrap::{BundleStore, OperationalBundle};
+        use crate::kernel::types::{Digest32, SubjectAddress};
+        use crate::v1::separation::{claim_stack_scan_mode, set_process_stack_mode, ScanStackMode};
+        use zkcoins_program::circuit::compliance::Network;
+        use zkcoins_prover::prover_bridge::test_signing::{deterministic_secret, normalized_key};
+
+        set_process_stack_mode(ScanStackMode::V1);
         let scope = crate::test_db::setup_pool().await;
+        // Exclusive DB marker before any v1 write — load_or_create persists
+        // an empty genesis snapshot and refuses without this claim.
+        claim_stack_scan_mode(&scope.pool, ScanStackMode::V1)
+            .await
+            .expect("claim stack_scan_mode v1");
         let store = JobStore::new(scope.pool.clone());
+
+        let nk = [4u8; 32];
+        let (_sk0, _pt, pk0) = normalized_key(deterministic_secret(b"rx-unk-pk0"));
+        let subject = shared::spec_v1::address(&pk0, shared::spec_v1::nk_commit(&nk));
         let fold_hex = "22".repeat(32);
         let CreateResult::Fresh(job) = store
             .create(
                 JobKind::Receive,
-                &[0xCEu8; 32],
-                Some("k-rx-dispatch"),
+                &subject,
+                Some("k-rx-unknown"),
                 serde_json::json!({
                     "kind": "receive",
+                    "subject": hex::encode(subject),
+                    "next_pubkey": hex::encode([0x11u8; 32]),
+                    "npk_rand": hex::encode([0x22u8; 32]),
                     "fold_coin_ids": [fold_hex],
                 }),
             )
             .await
-            .expect("create receive row (store path; admission refuses)")
+            .expect("create")
         else {
             panic!("expected Fresh");
         };
         let job_id = job.public_id;
-        assert_eq!(job.status, JobStatus::Queued);
 
-        // Minimal AppState is not required: reject path only needs store + notify.
-        // process_envelope_for_test still takes AppState — build a cheap one.
         let pool = std::sync::Arc::new(scope.pool.clone());
         let job_store = std::sync::Arc::new(store);
+        let adapter =
+            crate::v1::EngineAdapter::load_or_create((*pool).clone(), Network::Regtest, 0)
+                .await
+                .expect("adapter");
+
+        let bundles = BundleStore::shared();
+        bundles.install_for_test(
+            &SubjectAddress(subject),
+            OperationalBundle {
+                ivk: [1; 32],
+                ovk: [2; 32],
+                op: [3; 32],
+                nk,
+                op_secret: [5; 32],
+            },
+        );
+        let private_index = InMemoryPrivateIndex::shared();
+        private_index.insert_account(
+            SubjectAddress(subject),
+            AccountStateView {
+                account_state: vec![0u8; 140],
+                state_head: Digest32([0; 32]),
+                head_record_id: None,
+                send_counter: 0,
+                current_pubkey: pk0,
+                last_nullifier_pk: None,
+                last_nullifier_r: None,
+            },
+        );
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let proof_dir = tmp.path().to_str().expect("utf8").to_string();
         std::mem::forget(tmp);
@@ -4009,7 +4534,10 @@ mod receive_job_path_and_decision_table_tests {
             v1_finalise: None,
             v1_live_pending_after_begin: std::sync::Arc::new(dashmap::DashMap::new()),
             v1_pending_after_prove: None,
-            v1_engine: None,
+            receive_creating_proof_loader: None,
+            v1_engine: Some(std::sync::Arc::new(adapter)),
+            private_index,
+            bundles,
             attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
             public_hosts: std::sync::Arc::new(vec!["node.test".to_string()]),
         };
@@ -4022,34 +4550,375 @@ mod receive_job_path_and_decision_table_tests {
             JobEnvelope { public_id: job_id },
         )
         .await
-        .expect("reject path returns Ok after terminal fail");
+        .expect("dispatcher returns Ok after terminal fail");
 
         let after = job_store.load(job_id).await.expect("load").expect("row");
         assert_eq!(
             after.status,
             JobStatus::Failed,
-            "receive must be terminal-failed, not left queued; got {:?}",
+            "unknown coin must terminal-fail; got {:?}",
             after.status
         );
-        let err = after.error.as_deref().expect("failed row must store error");
-        let outward = crate::v1::decode_job_error(Some(err), JobStatus::Failed);
-        assert_eq!(
-            outward["error"], RECEIVE_JOB_PATH_NOT_WIRED_CODE,
-            "stored machine code must be the typed path-not-wired code; got {err}"
-        );
-        let message = outward["message"].as_str().expect("message field present");
-        // Cause identity: Display of the typed error is what we stored.
-        assert_eq!(
-            message,
-            ReceiveJobPathNotWired.to_string(),
-            "stored message must be the typed ReceiveJobPathNotWired Display"
-        );
-        // Downcast path: chain carrying the same typed cause.
-        let chained = anyhow::Error::new(ReceiveJobPathNotWired);
+        let err = after.error.as_deref().expect("error");
         assert!(
-            chained.downcast_ref::<ReceiveJobPathNotWired>().is_some(),
-            "tests recover the cause via downcast, not substring on is_err()"
+            err.contains("unknown coin") || err.contains("unknown_coin"),
+            "must name unknown-coin cause; got {err}"
         );
+        drop(scope);
+    }
+
+    /// End-to-end: `submit_transition` → dispatcher tick → `awaiting_signature`.
+    ///
+    /// Hits the **same** production path as the live receive job:
+    /// `process_receive_initial` → `reconstitute_receive_slots_locked` →
+    /// `validate_fold_coin_ids_shape` + `reconstitute_received_slots_with_loader`
+    /// → `verify_and_begin_receive` → stage pending → `set_awaiting_signature`.
+    ///
+    /// Creating-proof load uses the test hollow loader; the wall time is the
+    /// genuine `verify_and_begin_receive` circuit build (~6 min measured), not
+    /// a prove — which still puts this run in the heavy class. The fast
+    /// negative/presence tests above cover the wiring in the default suite.
+    #[tokio::test]
+    #[ignore = "heavy: real receive circuit build in verify_and_begin (minutes); run with --ignored --release"]
+    async fn receive_submit_transition_reaches_awaiting_signature() {
+        use crate::kernel::access::{
+            AccountStateView, InMemoryPrivateIndex, IndexedRecord, RecordType,
+        };
+        use crate::kernel::bootstrap::{BundleStore, OperationalBundle};
+        use crate::kernel::jobs::submit::{submit_transition, SubmitTransitionDeps};
+        use crate::kernel::jobs::ProfileHighWaterStore;
+        use crate::kernel::types::{
+            Digest32, IdempotencyKey, PublisherChoice, SubjectAddress, TransitionCommand,
+            TransitionCommon, XOnlyKey,
+        };
+        use crate::v1::separation::{claim_stack_scan_mode, set_process_stack_mode, ScanStackMode};
+        use crate::v1::DeliveryTargetStore;
+        use shared::spec_v1::bundle::serialize_coin_proof;
+        use shared::spec_v1::encoding::digest_to_bytes;
+        use shared::spec_v1::ManifestClock;
+        use zkcoins_program::circuit::compliance::Network;
+        use zkcoins_prover::prover_bridge::test_signing::{deterministic_secret, normalized_key};
+        use zkcoins_prover::state_engine::{ScannedNullifier, StateEngine};
+
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = crate::test_db::setup_pool().await;
+        // Exclusive DB marker before any v1 write — load_or_create persists
+        // an empty genesis snapshot and refuses without this claim.
+        claim_stack_scan_mode(&scope.pool, ScanStackMode::V1)
+            .await
+            .expect("claim stack_scan_mode v1");
+        let store = std::sync::Arc::new(JobStore::new(scope.pool.clone()));
+
+        let nk = [0x41u8; 32];
+        let op_secret_bytes = [0x42u8; 32];
+        let (_sk0, _pt, pk0) = normalized_key(deterministic_secret(b"rx-await-pk0"));
+        let subject = shared::spec_v1::address(&pk0, shared::spec_v1::nk_commit(&nk));
+        let owner = shared::spec_v1::Address(subject);
+
+        // Plant folded coin + hollow CoinProof (same fixture as reconstitute tests).
+        let mut eng = StateEngine::new(Network::Regtest, 0);
+        let (cp, hollow_proof, coin_id) = {
+            // Inline minimal plant (mirrors reconstitute::tests::plant_folded_coin).
+            use plonky2::field::polynomial::PolynomialCoeffs;
+            use plonky2::field::types::Field;
+            use plonky2::fri::proof::FriProof;
+            use plonky2::hash::merkle_tree::MerkleCap;
+            use plonky2::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
+            use shared::spec_v1::bundle::{CreatingNullifier, NavOpening as BundleNav};
+            use shared::spec_v1::{self as host, Coin, ProofData, TreeKind};
+            use zkcoins_program::F;
+            use zkcoins_prover::prover_bridge::test_signing::sign_transition;
+            use zkcoins_prover::prover_bridge::ComplianceProof;
+
+            let tag = 7u8;
+            let (sk, pk_pt, create_pk) =
+                normalized_key(deterministic_secret(&[b'K', tag, b's', b'k']));
+            let creating_prev_ash = host::digest_from_bytes(&[
+                b'p', tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0,
+            ])
+            .unwrap();
+            let asset_id = host::asset_id_v1(host::GENESIS_TAG, &create_pk, &[tag; 32], 2, 1);
+            let amount = 17u128;
+            let coin_identifier =
+                host::coin_identifier(creating_prev_ash, &owner.0, asset_id, amount, 0);
+            let coin = Coin {
+                identifier: coin_identifier,
+                recipient: owner,
+                amount,
+                asset_id,
+            };
+            let ocr = host::merkle_root(TreeKind::CoinsRoot, &[coin_identifier]);
+            let empty_nav = host::Nav {
+                size: 0,
+                mth: host::nflog_empty(),
+            };
+            let nav_rand = [tag; 32];
+            let pd = ProofData {
+                new_account_state_hash: host::digest_from_bytes(&[b'a'; 32]).unwrap(),
+                output_coins_root: ocr,
+                input_nullifiers_root: host::merkle_root(TreeKind::NullifiersRoot, &[]),
+                coin_history_root: host::coinhist_empty_root(),
+                nav_commitment: host::nav_commitment(empty_nav.root(), &nav_rand),
+                npk_commit: [tag; 32],
+            };
+            let sig = sign_transition(sk, pk_pt, &pd, Network::Regtest);
+            let r = sig.transition.signature_r();
+            let r_prime = sig.transition.r_prime;
+            eng.append_nullifier(ScannedNullifier::from_survivor(
+                &shared::spec_v1::PublishedNullifier {
+                    chain_pos: host::ChainPosition {
+                        height: 30,
+                        tx_index: 0,
+                        vin_index: 0,
+                        member_index: 0,
+                    },
+                    pk: create_pk,
+                    r,
+                },
+            ))
+            .expect("fold");
+            eng.set_tip_height(40);
+
+            let mut public_inputs = vec![F::ZERO; 108];
+            let write_digest = |pis: &mut [F], offset: usize, d: host::HashDigest| {
+                for (i, el) in d.elements.iter().enumerate() {
+                    pis[offset + i] = *el;
+                }
+            };
+            write_digest(&mut public_inputs, 0, pd.new_account_state_hash);
+            write_digest(&mut public_inputs, 4, pd.output_coins_root);
+            write_digest(&mut public_inputs, 8, pd.input_nullifiers_root);
+            write_digest(&mut public_inputs, 12, pd.coin_history_root);
+            write_digest(&mut public_inputs, 16, pd.nav_commitment);
+            for i in 0..8 {
+                let start = 28 - 4 * i;
+                let limb = u32::from_be_bytes(pd.npk_commit[start..start + 4].try_into().unwrap());
+                public_inputs[20 + i] = F::from_canonical_u32(limb);
+            }
+            for i in 0..8 {
+                let start = 28 - 4 * i;
+                let limb = u32::from_be_bytes(create_pk[start..start + 4].try_into().unwrap());
+                public_inputs[28 + i] = F::from_canonical_u32(limb);
+            }
+            let hollow: ComplianceProof = ProofWithPublicInputs {
+                proof: Proof {
+                    wires_cap: MerkleCap(vec![]),
+                    plonk_zs_partial_products_cap: MerkleCap(vec![]),
+                    quotient_polys_cap: MerkleCap(vec![]),
+                    openings: OpeningSet {
+                        constants: vec![],
+                        plonk_sigmas: vec![],
+                        wires: vec![],
+                        plonk_zs: vec![],
+                        plonk_zs_next: vec![],
+                        partial_products: vec![],
+                        quotient_polys: vec![],
+                        lookup_zs: vec![],
+                        lookup_zs_next: vec![],
+                    },
+                    opening_proof: FriProof {
+                        commit_phase_merkle_caps: vec![],
+                        query_round_proofs: vec![],
+                        final_poly: PolynomialCoeffs::new(vec![]),
+                        pow_witness: F::ZERO,
+                    },
+                },
+                public_inputs,
+            };
+            let mut incl_wire = Vec::new();
+            incl_wire.extend_from_slice(&0u32.to_be_bytes());
+            incl_wire.push(0);
+            let cp = shared::spec_v1::bundle::CoinProof {
+                coin,
+                proof: vec![tag],
+                inclusion_proof: incl_wire,
+                creating_prev_ash,
+                creating_nullifier: CreatingNullifier {
+                    pk_create: create_pk,
+                    r_create: r,
+                    r_prime_create: r_prime,
+                },
+                nav_opening: BundleNav {
+                    size: empty_nav.size,
+                    mth: empty_nav.mth,
+                    nav_rand,
+                },
+                asset_terms: None,
+                epk: [tag | 0x80; 32],
+                ciphertext: vec![1, 2],
+                detect_tag: host::digest_from_bytes(&[b'd'; 32]).unwrap(),
+            };
+            (cp, hollow, digest_to_bytes(&coin_identifier))
+        };
+
+        let canonical = serialize_coin_proof(&cp).expect("ser");
+
+        // Install the folded engine into the adapter before admit/tick.
+        let adapter =
+            crate::v1::EngineAdapter::load_or_create(scope.pool.clone(), Network::Regtest, 0)
+                .await
+                .expect("adapter");
+        adapter
+            .with_engine_mut(|engine| {
+                *engine = eng;
+            })
+            .expect("install engine");
+
+        let private_index = InMemoryPrivateIndex::shared();
+        private_index
+            .insert_record(IndexedRecord {
+                subject: SubjectAddress(subject),
+                record_id: Digest32([0x01; 32]),
+                asset_id: Digest32(digest_to_bytes(&cp.coin.asset_id)),
+                occurred_at: 1,
+                record_type: RecordType::CoinProof,
+                transition_kind: None,
+                blob_id: Digest32([0x02; 32]),
+                canonical: Some(canonical),
+                coin_id: Some(Digest32(coin_id)),
+            })
+            .expect("insert coin");
+        private_index.insert_account(
+            SubjectAddress(subject),
+            AccountStateView {
+                account_state: vec![0u8; 140],
+                state_head: Digest32([0; 32]),
+                head_record_id: None,
+                send_counter: 0,
+                current_pubkey: pk0,
+                last_nullifier_pk: None,
+                last_nullifier_r: None,
+            },
+        );
+        let bundles = BundleStore::shared();
+        bundles.install_for_test(
+            &SubjectAddress(subject),
+            OperationalBundle {
+                ivk: [1; 32],
+                ovk: [2; 32],
+                op: [3; 32],
+                nk,
+                op_secret: op_secret_bytes,
+            },
+        );
+
+        // Normative admit: same body shape the production gRPC/HTTP edge
+        // encodes, then dispatcher enqueue via job_tx.
+        let (job_tx, mut job_rx) = tokio::sync::mpsc::channel::<JobEnvelope>(8);
+        let targets = DeliveryTargetStore::new();
+        let hw = ProfileHighWaterStore::new();
+        let projected = submit_transition(
+            SubmitTransitionDeps {
+                store: store.as_ref(),
+                job_tx: &job_tx,
+                bundles: &bundles,
+                delivery_targets: &targets,
+                profile_high_water: &hw,
+                subject_owner: Some(subject),
+                network: crate::kernel::chain::KernelNetwork::Regtest,
+                clock: ManifestClock::UnixSeconds(1_700_000_000),
+            },
+            TransitionCommand::Receive {
+                common: TransitionCommon {
+                    subject: SubjectAddress(subject),
+                    next_pubkey: XOnlyKey([0x55; 32]),
+                    npk_rand: Digest32([0x66; 32]),
+                    publisher: PublisherChoice::SelfPublish,
+                    idempotency_key: IdempotencyKey::from_validated("k-rx-await".to_string()),
+                },
+                fold_coin_ids: vec![Digest32(coin_id)],
+            },
+        )
+        .await
+        .expect("submit_transition must admit receive");
+        let job_id = projected.id.as_uuid();
+
+        // Drain the admit enqueue so the channel stays live; we drive the
+        // envelope ourselves so the witness is one explicit dispatcher tick.
+        let enqueued = job_rx.recv().await.expect("admit must enqueue envelope");
+        assert_eq!(enqueued.public_id, job_id);
+
+        let hollow_for_loader = hollow_proof.clone();
+        let pool = std::sync::Arc::new(scope.pool.clone());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let proof_dir = tmp.path().to_str().expect("utf8").to_string();
+        std::mem::forget(tmp);
+        let state_arc = std::sync::Arc::new(std::sync::Mutex::new(crate::state::State::new()));
+        let app_state = crate::router::AppState {
+            account_node: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::account_node::AccountNode::new(state_arc),
+            )),
+            proof_store: std::sync::Arc::new(crate::router::ProofStore::new(&proof_dir)),
+            mint_store: std::sync::Arc::new(crate::router::MintStore::new()),
+            username_store: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::username::UsernameStore::new(),
+            )),
+            pool: std::sync::Arc::clone(&pool),
+            esplora_config: std::sync::Arc::new(crate::publisher::EsploraConfig {
+                url: "http://127.0.0.1:1".to_string(),
+                is_mainnet: false,
+                network_name: "Regtest".to_string(),
+                ws_url: None,
+            }),
+            prover_warm: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            prover_health: std::sync::Arc::new(crate::prover_health::ProverHealth::new()),
+            job_store: std::sync::Arc::clone(&store),
+            job_tx,
+            job_notify_map: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_scan_caught_up: None,
+            v1_finality_ok: None,
+            pending_sign_map: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_finalise: None,
+            v1_live_pending_after_begin: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_pending_after_prove: None,
+            receive_creating_proof_loader: Some(std::sync::Arc::new(move |_| {
+                Ok(hollow_for_loader.clone())
+            })),
+            v1_engine: Some(std::sync::Arc::new(adapter)),
+            private_index,
+            bundles,
+            attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
+            public_hosts: std::sync::Arc::new(vec!["node.test".to_string()]),
+        };
+
+        // Dispatcher tick parks on awaiting_signature; poll until that status
+        // then abort the park. Short park bound: this is not a multi-minute
+        // prove (hollow creating-proof loader); a long timeout only masks hangs.
+        let js = std::sync::Arc::clone(&store);
+        let as_state = app_state.clone();
+        let tick = tokio::spawn(async move {
+            process_envelope_for_test(
+                js.as_ref(),
+                &as_state,
+                &as_state.job_notify_map,
+                Duration::from_secs(2),
+                JobEnvelope { public_id: job_id },
+            )
+            .await
+        });
+
+        let mut saw_awaiting = false;
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let row = store.load(job_id).await.expect("load").expect("row");
+            if row.status == JobStatus::AwaitingSignature {
+                saw_awaiting = true;
+                break;
+            }
+            if row.status.is_terminal() {
+                panic!(
+                    "receive went terminal before awaiting_signature: {:?} err={:?}",
+                    row.status, row.error
+                );
+            }
+        }
+        assert!(
+            saw_awaiting,
+            "submit_transition + dispatcher tick must reach awaiting_signature"
+        );
+        // Unblock the parked dispatcher (timeout path is fine).
+        tick.abort();
         drop(scope);
     }
 }

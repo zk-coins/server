@@ -307,6 +307,51 @@ impl InMemoryPrivateIndex {
             guard.push((subject, view));
         }
     }
+
+    /// Own-node load of a verified CoinProof body by `(subject, coin_id)`.
+    ///
+    /// Unscoped (no view-grant): the §2.3.3 fold path is the account's own
+    /// node reconstituting receipts it already verified under entrusteed
+    /// `ivk`. Grant-scoped [`PrivateIndex::get_coin_proof`] stays the
+    /// pull/API surface.
+    ///
+    /// - `Ok(Some(bytes))` — canonical §7.1 body present
+    /// - `Ok(None)` — no row for this pair (caller may fall through to SQL)
+    /// - `Err` — mutex / corrupt body (locator without canonical)
+    pub(crate) fn load_coin_proof_canonical(
+        &self,
+        subject: &SubjectAddress,
+        coin_id: &[u8; 32],
+    ) -> KernelResult<Option<Vec<u8>>> {
+        let guard = self.records.lock().map_err(|e| {
+            KernelError::with_internal(
+                KernelErrorCode::InternalError,
+                "Failed to load coin proof for receive fold",
+                format!("private-index mutex poisoned: {e}"),
+            )
+        })?;
+        let want = Digest32(*coin_id);
+        for r in guard.iter() {
+            if r.record_type != RecordType::CoinProof {
+                continue;
+            }
+            if &r.subject != subject {
+                continue;
+            }
+            if r.coin_id.as_ref() != Some(&want) {
+                continue;
+            }
+            return match &r.canonical {
+                Some(bytes) if !bytes.is_empty() => Ok(Some(bytes.clone())),
+                Some(_) | None => Err(KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Corrupt private-record index",
+                    "CoinProof row present but canonical body missing/empty — refuse fold",
+                )),
+            };
+        }
+        Ok(None)
+    }
 }
 
 impl IndexedRecord {

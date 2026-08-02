@@ -101,7 +101,10 @@ fn test_state() -> AppState {
         v1_finalise: None,
         v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
         v1_pending_after_prove: None,
+        receive_creating_proof_loader: None,
         v1_engine: None,
+        private_index: crate::kernel::access::InMemoryPrivateIndex::shared(),
+        bundles: crate::kernel::bootstrap::BundleStore::shared(),
         attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
         public_hosts: Arc::new(vec!["node.test".to_string()]),
     }
@@ -2392,7 +2395,10 @@ fn mint_test_state() -> AppState {
         v1_finalise: None,
         v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
         v1_pending_after_prove: None,
+        receive_creating_proof_loader: None,
         v1_engine: None,
+        private_index: crate::kernel::access::InMemoryPrivateIndex::shared(),
+        bundles: crate::kernel::bootstrap::BundleStore::shared(),
         attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
         public_hosts: Arc::new(vec!["node.test".to_string()]),
     }
@@ -4571,7 +4577,10 @@ mod jobs_endpoint_tests {
             v1_finalise: None,
             v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
             v1_pending_after_prove: None,
+            receive_creating_proof_loader: None,
             v1_engine: None,
+            private_index: crate::kernel::access::InMemoryPrivateIndex::shared(),
+            bundles: crate::kernel::bootstrap::BundleStore::shared(),
             attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
             public_hosts: Arc::new(vec!["node.test".to_string()]),
         }

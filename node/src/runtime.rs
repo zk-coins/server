@@ -685,7 +685,11 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         // Test-only injection point (Defect 4): never installed in production.
         #[cfg(test)]
         v1_pending_after_prove: None,
+        #[cfg(test)]
+        receive_creating_proof_loader: None,
         v1_engine: v1_engine.clone(),
+        private_index: Arc::clone(&shared_private_index),
+        bundles: Arc::clone(&shared_bundle_store),
         attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
         public_hosts: Arc::new(crate::v1::public_hosts_from_env()),
     };

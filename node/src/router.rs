@@ -268,9 +268,19 @@ pub(crate) struct AppState {
     /// input (Defect 4).
     #[cfg(test)]
     pub(crate) v1_pending_after_prove: Option<V1PendingAfterProveHook>,
+    /// Test-only creating-proof loader for receive reconstitution (host
+    /// hollow fixtures). Production always uses
+    /// [`zkcoins_prover::prover_bridge::ProverBridge::load_transition_proof_bytes`].
+    #[cfg(test)]
+    pub(crate) receive_creating_proof_loader: Option<ReceiveCreatingProofLoader>,
     /// Shared v1.1 engine for Gap-G6 balance attestation (and later
     /// Stage-3 prove paths). `None` under the legacy stack.
     pub(crate) v1_engine: Option<Arc<crate::v1::EngineAdapter>>,
+    /// Process mirror of durable `v1_decrypt_index` — receive fold loads
+    /// CoinProofs from here (SQL fall-through in the reconstitutor).
+    pub(crate) private_index: Arc<crate::kernel::access::InMemoryPrivateIndex>,
+    /// Process-local operational-bundle store (`nk` / `op_secret` for begin).
+    pub(crate) bundles: Arc<crate::kernel::bootstrap::BundleStore>,
     /// Single-use `AttestBalanceChallenge` store (§7.5 / §5.1).
     pub(crate) attest_challenges: crate::v1::AttestChallengeMap,
     /// Authoritative hostnames for `chan_bind` (§5.1). From
@@ -313,6 +323,14 @@ pub(crate) type V1FinaliseHook = Arc<
 #[cfg(test)]
 pub(crate) type V1PendingAfterProveHook =
     Arc<dyn Fn(uuid::Uuid) -> Option<crate::v1::PendingSignEntry> + Send + Sync>;
+
+/// Test-only creating-proof loader for receive reconstitution — see the
+/// field doc on [`AppState::receive_creating_proof_loader`]. Same
+/// `#[cfg(test)]` discipline as the hooks above (Defect 4).
+#[cfg(test)]
+pub(crate) type ReceiveCreatingProofLoader = Arc<
+    dyn Fn(&[u8]) -> Result<zkcoins_prover::prover_bridge::ComplianceProof, String> + Send + Sync,
+>;
 
 // Response types for our API
 #[derive(Serialize, Deserialize, ToSchema)]
