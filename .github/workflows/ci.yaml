@@ -1,46 +1,30 @@
 name: CI
 
 on:
-  # ---------------------------------------------------------------------
-  # PAUSED — manual dispatch only, on purpose.
-  #
-  # The v1 rebuild is being developed and verified locally; hosted CI is
-  # deliberately out of the loop until the rebuild is finished, and is then
-  # switched back on as the last step before the branch is offered for
-  # review. Running it in between spends self-hosted M3 Ultra slots on a
-  # tree that is known to be mid-flight, and its red/green says nothing
-  # anyone acts on.
-  #
-  # To bring it back: delete this block down to the marker below and
-  # restore the `pull_request:` trigger that follows it, which is left
-  # commented out verbatim so re-enabling is a deletion, not a rewrite.
-  # Nothing else in this file was changed for the pause — every job, guard
-  # and gate is untouched, so the first run after re-enabling exercises
-  # exactly what it did before.
-  #
   # `workflow_dispatch` stays available: a run can still be started by
   # hand from the Actions tab when a specific answer is wanted.
   workflow_dispatch:
 
-  # --- restore from here ------------------------------------------------
   # CI runs on every pull request regardless of target branch. This
   # makes the default safe for stacked PRs (PR-A → PR-B → PR-C where
   # each PR's base is the previous PR's branch) and any other workflow
   # that opens a PR against a non-`develop` branch — previously such
   # PRs were silently skipped because `branches: [develop]` filtered
   # them out, and the only fix was to hand-edit ci.yaml on each new
-  # feature stack. Letting every PR trigger CI is cheap (the heavy
-  # M3 Ultra jobs are still gated behind the `ci:full` label below)
-  # and matches what most repos default to.
+  # feature stack. Letting every PR trigger CI matches what most
+  # repos default to. The heavy M3 Ultra gate (`test-and-coverage`)
+  # now runs on every non-draft PR (CI endgame / G16 — see
+  # `.github/coverage-baseline.md`); drafts still skip via each
+  # job's `if:` guard.
   #
   # `push: develop` is intentionally absent. Every commit reaching
   # `develop` is already covered by the open Release PR (`Release:
   # develop -> main`, created by auto-release-pr.yaml) — that PR's
-  # `synchronize` event runs CI on the new HEAD, and because the
-  # Release PR carries the `ci:full` label the heavy gate runs too.
-  # Adding `on: push: branches: [develop]` would queue a second
-  # workflow instance on the same SHA, doubling self-hosted-runner
-  # load on a check the Release PR's `synchronize` already provides.
+  # `synchronize` event runs CI on the new HEAD, and the heavy gate
+  # runs because the Release PR is non-draft. Adding
+  # `on: push: branches: [develop]` would queue a second workflow
+  # instance on the same SHA, doubling self-hosted-runner load on a
+  # check the Release PR's `synchronize` already provides.
   # (Under the PR-number grouping in the concurrency block below the
   # two runs would land in DIFFERENT groups — push keyed by
   # `refs/heads/develop`, PR keyed by the Release PR's number — so
@@ -51,12 +35,11 @@ on:
   # `if:` guard on each job (saves self-hosted-runner time while
   # work is still in progress).
   #
-  # `labeled` / `unlabeled` are added so toggling the `ci:full` label
-  # triggers (or removes) the heavy self-hosted-runner gate on demand
-  # — see the `test-and-coverage` job below.
-  # pull_request:
-  #   types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
-  # --- restore to here --------------------------------------------------
+  # `labeled` / `unlabeled` remain so label toggles re-fire the
+  # workflow (e.g. operational re-runs). The heavy gate no longer
+  # keys off `ci:full` (see `test-and-coverage` job `if:`).
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 concurrency:
   # Group by PR number so a new push to the same PR cancels the
@@ -72,10 +55,10 @@ concurrency:
   #
   # Label events (`labeled` / `unlabeled`) get their own isolated
   # group keyed by `run_id`, so toggling a label on a PR does NOT
-  # cancel an in-flight 60-90-min Heavy run on the same PR — most
-  # label toggles are unrelated (`bug`, `priority/*`, …) and killing
-  # the Heavy run for them would be a footgun. Trade-off: removing
-  # `ci:full` mid-run does NOT auto-stop a Heavy run that is already
+  # cancel an in-flight Heavy run on the same PR — most label
+  # toggles are unrelated (`bug`, `priority/*`, …) and killing the
+  # Heavy run for them would be a footgun. Trade-off: a label toggle
+  # mid-run does NOT auto-stop a Heavy run that is already
   # executing; cancel it manually with `gh run cancel` if you really
   # need to free an agent.
   group: >-
@@ -95,34 +78,32 @@ env:
 # Job topology — a two-tier test-gating model:
 #
 # * Tier 1 — `lint-and-build` — GitHub-hosted Linux, the DEFAULT.
-#   Runs on every non-draft PR and every push with no label required.
-#   Catches cross-platform compile bitrot and lint regressions
-#   cheaply. Runs in PARALLEL with the heavy gate below — it does not
-#   gate it via `needs:`. Each job carries its own draft/label `if:`
-#   guard, so a lint failure does not block the heavy gate from
-#   starting (deliberate: parallel feedback. Trade-off: on a lint
-#   failure the m3-ultra runner time is spent regardless).
+#   Runs on every non-draft PR and every push. Catches cross-platform
+#   compile bitrot and lint regressions cheaply. Runs in PARALLEL with
+#   the heavy gate below — it does not gate it via `needs:`. Each job
+#   carries its own draft `if:` guard, so a lint failure does not
+#   block the heavy gate from starting (deliberate: parallel
+#   feedback. Trade-off: on a lint failure the m3-ultra runner time
+#   is spent regardless).
 #
 # * Tier 2 — `test-and-coverage` — the authoritative test + coverage
-#   gate, opt-in via the `ci:full` label. Single heavy job (~60-90 min
-#   on the shared self-hosted M3 Ultra runner pool). It runs the FULL
-#   node + shared nextest suite under llvm-cov instrumentation: the Postgres
-#   `db_tests`, the Plonky2-heavy mint/send/receive prover flows, and
-#   the measured coverage floor (see `.github/coverage-baseline.md`),
-#   all in one binary run. Gated behind `ci:full` so we don't burn
-#   runner time on every speculative PR — apply the label when the PR
-#   is ready for the authoritative gate. Both auto-promote PRs
-#   (staging -> develop and develop -> main) get the label applied
-#   automatically by auto-release-pr-staging.yaml /
-#   auto-release-pr.yaml. (Per-non-draft-PR expansion of this job is
-#   deferred to the CI endgame — see coverage-baseline.md.)
+#   gate. Runs on every non-draft PR (CI endgame / G16 expansion —
+#   previously label-gated behind `ci:full`; see
+#   `.github/coverage-baseline.md`). Single heavy job on the shared
+#   self-hosted M3 Ultra runner pool. It runs the FULL node + shared
+#   nextest suite under llvm-cov instrumentation: the Postgres
+#   `db_tests`, the Plonky2-heavy mint/send/receive prover flows, the
+#   measured coverage floor, plus the release-mode prover package and
+#   the four `#[ignore]` prove flows (Task #9), all in one job.
+#   Drafts still skip via the job `if:` (saves runner time while work
+#   is in progress).
 #
 # There is no third "subset" tier: a test either runs in the default
-# Lint & Build (compile/lint) or comes in with `ci:full` (the full
-# suite). The previous narrow per-area subset jobs (and their
-# per-area opt-in labels) were removed — the heavy gate is a strict
-# superset of everything they selected, so they added a maintenance
-# burden (filter drift) without extending coverage.
+# Lint & Build (compile/lint) or in the heavy gate (the full suite).
+# The previous narrow per-area subset jobs (and their per-area opt-in
+# labels) were removed — the heavy gate is a strict superset of
+# everything they selected, so they added a maintenance burden
+# (filter drift) without extending coverage.
 #
 #   Why test + coverage are merged into one job: the previous topology
 #   had a `node-tests` job and a separate `coverage` job, both
@@ -146,9 +127,8 @@ jobs:
   lint-and-build:
     name: Lint & Build
     # Skip on draft PRs. The heavy `test-and-coverage` gate carries
-    # the same draft/push guard plus the `ci:full` label check on its
-    # own `if:`, so it runs in parallel with this job rather than
-    # gating behind it via `needs:`.
+    # the same draft/push guard on its own `if:`, so it runs in
+    # parallel with this job rather than gating behind it via `needs:`.
     if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -241,16 +221,17 @@ jobs:
     # nextest suite — see the file header for the merge rationale).
     # Floor values and ignore rules: `.github/coverage-baseline.md`.
     #
-    # Gated behind the `ci:full` label so we don't burn runner time
-    # on every speculative PR. Both auto-promote PRs get the label
-    # applied automatically: staging -> develop by
-    # auto-release-pr-staging.yaml and develop -> main by
-    # auto-release-pr.yaml.
-    if: >-
-      (github.event_name == 'push' || github.event.pull_request.draft == false)
-      && contains(github.event.pull_request.labels.*.name, 'ci:full')
+    # CI endgame / G16: runs on every non-draft PR (same draft/push
+    # guard as `lint-and-build`). Previously opt-in via the `ci:full`
+    # label; the baseline recorded that expansion for the un-pause
+    # step — the label is no longer required for this gate.
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: [self-hosted, zkcoins-node]
-    timeout-minutes: 120
+    # 180 min: llvm-cov nextest (~60-90 min) + release prover package
+    # + four `#[ignore]` prove flows (a representative multi-input
+    # send prove alone is ~290 s locally) + circuit-digest verify.
+    # Was 120 min when the job stopped at coverage + digests only.
+    timeout-minutes: 180
     env:
       # All three chain-shaping env vars are required by the node
       # bootstrap (see `lib::build_network_config_from_env`). CI uses
@@ -402,12 +383,33 @@ jobs:
             --test-threads 8 \
             -E 'not binary(api_remote)'
 
+      # Task #9: release-mode prover package suite. These prove tests
+      # are multi-minute and never ran in any gate before; the M3 Ultra
+      # job is the right home (GitHub-hosted `lint-and-build` would
+      # time out). Local verification of a representative multi-input
+      # send prove in this package: ~290 s, green.
+      - name: Run zkcoins-prover-plonky2 release tests
+        run: cargo nextest run -p zkcoins-prover-plonky2 --release
+
+      # Task #9: four `#[ignore]` prove flows in node+shared that the
+      # default nextest (and the llvm-cov step above) never select.
+      # They exercise real sequential-history prove paths and a forged
+      # wrapper rejection — minutenlang, self-hosted only:
+      #   - begin_receive_initial_proof_uses_sequential_history_roots
+      #   - begin_send_multi_input_uses_sequential_history_roots
+      #   - verify_incoming_rejects_forged_wrapper_proof_data_before_verify
+      #   - prover_bridge_real_end_to_end
+      - name: Run ignored prove flows (node + shared)
+        run: >
+          cargo nextest run -p node -p shared --all-features --release
+          --run-ignored ignored-only
+
       # §1.7.9 circuit-digest generator: builds real C / C_balance for every
       # network and verifies the committed generated_circuit_digests.txt
       # matches. Multi-minute; kept out of default cargo test via #[ignore],
-      # but a test that cannot run cannot fail — this job (test-and-coverage
-      # under the ci:full label / Release PRs) is the one that actually runs
-      # it. Does NOT set REGEN_CIRCUIT_DIGESTS (verify-only; no file rewrite).
+      # but a test that cannot run cannot fail — this heavy job is the one
+      # that actually runs it. Does NOT set REGEN_CIRCUIT_DIGESTS
+      # (verify-only; no file rewrite).
       - name: Verify live circuit digests vs committed generated_circuit_digests.txt
         run: |
           cargo test -p zkcoins-prover-plonky2 --release --test generated_circuit_digests_test \
@@ -493,8 +495,7 @@ jobs:
   # timeout, OOM, runner crash — still fire the alert. `if: failure()`
   # evaluates against the whole `needs:` group: any listed job
   # transitioning to `failure` triggers it, while skipped jobs
-  # (`test-and-coverage` on a non-ci:full PR, or all jobs on a draft
-  # PR) and manual cancellation stay silent.
+  # (all jobs on a draft PR) and manual cancellation stay silent.
   notify-failure:
     name: Telegram alert on failure
     needs: [lint-and-build, test-and-coverage]
