@@ -22,20 +22,33 @@ When in doubt about whether a feature belongs in the wallet, SDK, or node: if it
 
 ## Quick Start
 
+A bare `cargo run -p node` is **not** startable: the binary fails closed without
+Postgres migrations, kernel gRPC bind, chain-identity ops, Stage-3 v1 pins,
+bitcoind RPC, a verified **BMF1** bootstrap manifest
+(`ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH`), and related env. Use the local stack:
+
 ```bash
 git clone https://github.com/zk-coins/node.git
 cd node
-USERNAME_DOMAIN=test.zkcoins.local cargo run -p node
-# Node starts on http://0.0.0.0:4242
+# Full unmocked stack (postgres, bitcoind regtest, nostr-relay, node, api):
+# see deploy/local-e2e/README.md and docs/local-stack.md
+cp deploy/local-e2e/env.example.sh deploy/local-e2e/env.local.sh
+# Edit env.local.sh (PUBLISHER_KEY, bootstrap pubkey/priv, params id, …)
+# Generate/sign BMF1 via up.sh / gen_bootstrap_manifest (required at boot)
+bash -c 'set -a && source deploy/local-e2e/env.local.sh && set +a && ./deploy/local-e2e/up.sh'
 ```
+
+Kernel gRPC listens on `KERNEL_GRPC_ADDR` (compose publishes **50051**). Residual
+HTTP on `0.0.0.0:4242` is legacy and not the §7.8 surface — public REST is the
+sibling **api** service.
 
 ## Prerequisites
 
 | Tool | Version | Purpose |
 |---|---|---|
 | Rust | nightly (pinned via `rust-toolchain`) | Required for Plonky2 (`feature(specialization)`) |
-| Docker | any recent | `db_tests` spin up a `postgres:17` testcontainer |
-| Bitcoin node | — | Blockchain scanning (or use an Esplora-compatible API) |
+| Docker | any recent | `db_tests` spin up a `postgres:17` testcontainer; `deploy/local-e2e` full stack |
+| Bitcoin node | bitcoind (regtest via compose) | Stage-3 NfLog scan + AggregateStateNullifierV3 publish (RPC + cookie) |
 
 ## Setup
 
@@ -203,28 +216,30 @@ let block = fetch_block(hash).unwrap();
 
 ### No polling — events only
 
-Bitcoin / Esplora signals on the node's hot path are **subscribed to, never
-polled**. The scanner consumes block events from the Esplora-compatible
-WebSocket stream (`scanner_ws.rs`, `ESPLORA_WS_URL`); the publisher broadcasts
-commit and reveal transactions back-to-back and never sleeps or polls between
-them. (History: a 30-s tip-poll once gated `/api/mint` and `/api/send`
-visibility by up to a full block-time — issue [#84](https://github.com/zk-coins/node/issues/84).)
+Bitcoin tip advance on the node's hot path should be **event-driven** (bitcoind
+block signals / ZMQ), not a silent sleep-loop. The legacy Esplora WebSocket
+scanner modules are gone; Stage-3 scan is bitcoind RPC via `main.rs`
+(`scan_to_tip`). The publisher still broadcasts commit and reveal back-to-back
+without sleeping between them. (History: a 30-s tip-poll once gated mint/send
+visibility by up to a full block-time — issue
+[#84](https://github.com/zk-coins/node/issues/84).)
 
 CI enforces this with a `grep` step in the `Lint & Build` job
-(`.github/workflows/ci.yaml`):
+(`.github/workflows/ci.yaml`) over the **active** hotpaths:
 
 ```bash
 grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' \
-  node/src/scanner.rs node/src/scanner_runtime.rs node/src/scanner_ws.rs \
-  node/src/scanner_ws_parse.rs node/src/publisher.rs \
+  node/src/main.rs node/src/publisher.rs \
   | grep -v 'scanner-polling-ok:'
 ```
 
-Any match without a `scanner-polling-ok:` comment marker on the same line fails
-the build. The marker is the documented per-line opt-out for genuinely justified
-exceptions (today: the WS-reconnect backoff in `scanner_ws` and the bounded
-HTTP-retry sleep in `scanner_runtime`); the same line must carry a comment
-explaining why this particular sleep is not a chain-tip poll.
+Any match without a `scanner-polling-ok:` comment marker **on the same line**
+fails the build. The marker is the documented per-line opt-out for genuinely
+justified exceptions. Today the grandfathered case is the v1 `scan_to_tip` idle
+backoff in `main.rs` (and related resume/retry backoffs): bitcoind block-signal
+subscription is **follow-up work**; until then the sleep is an explicit,
+named poll — never a silent one. The same line must explain why the sleep is
+not an unacknowledged tip poll.
 
 ### Hardware target
 
@@ -279,30 +294,29 @@ Adding an endpoint:
 
 The node reads configuration **exclusively from environment variables** (no
 `.env` is loaded). Required variables panic the bootstrap on startup if unset —
-there is no silent fallback.
+there is no silent fallback. The authoritative full set for a running stack is
+`deploy/local-e2e/env.example.sh` and [`docs/local-stack.md`](./docs/local-stack.md).
+A non-exhaustive subset:
 
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | _(required)_ | Postgres connection string for the state layer. |
+| `KERNEL_GRPC_ADDR` | _(required)_ | Kernel gRPC bind address (no default host/port). |
 | `PUBLISHER_KEY` | _(required)_ | 32-byte hex private key for Taproot inscription publishing. Required on every network. **Never commit a real key**; generate via `openssl rand -hex 32`, source deployed values from a secret manager. |
-| `USERNAME_DOMAIN` | _(required)_ | External hostname returned by `/api/info`. |
+| `USERNAME_DOMAIN` | _(required)_ | External hostname returned by residual `/api/info`. |
 | `IS_MAINNET` | _(required)_ | Exact string `true` or `false`; any other value panics. |
-| `ESPLORA_URL` | _(required)_ | HTTP Esplora endpoint (electrs or compatible). |
-| `ESPLORA_WS_URL` | _(required)_ | Esplora-compatible WebSocket endpoint consumed by `scanner_ws` (issue #84). |
-| `NETWORK_NAME` | derived | Human-readable name returned by `/api/info`. Cosmetic. |
+| `ZKCOINS_V1_SHADOW` | _(required for Stage 3)_ | Must be `1` / on; Stage-3 binary refuses the legacy dual stack. |
+| `ZKCOINS_NETWORK` / activation / circuit digests | _(required)_ | §3.6 pins — see `docs/local-stack.md`. |
+| `ZKCOINS_V1_BITCOIND_RPC_URL` / cookie / wallet | _(required)_ | bitcoind RPC for scan + publish (not Esplora WS). |
+| `ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH` | _(required when engine present)_ | Path to a verified **BMF1** artifact; `ChainIdentity` install fails closed without it. |
+| `ESPLORA_URL` | residual boot pin | HTTP Esplora endpoint (legacy residual; Stage-3 scan is bitcoind). |
 | `PROOFS_DIR` | `./proofs` | Directory for per-proof bincode files. |
 | `ZKCOINS_SKIP_BOOTSTRAP_WARMUP` | `false` | When `1`/`true`, skip the Plonky2 prover warmup so `/health/ready` returns 200 immediately. Used by smoke tests; leave unset in production. |
 | `RUST_LOG` | `info` | Log level. |
 
-```bash
-export DATABASE_URL="postgresql://postgres:dev@localhost:5432/postgres"
-export PUBLISHER_KEY="$(openssl rand -hex 32)"
-export USERNAME_DOMAIN="test.zkcoins.local"
-export IS_MAINNET="false"
-export ESPLORA_URL="http://localhost:3000"
-export ESPLORA_WS_URL="ws://localhost:8999/api/v1/ws"
-cargo run -p node
-```
+Do **not** use a minimal `export … && cargo run -p node` snippet as the
+supported operator path — it will panic on missing pins/manifest. Use
+`deploy/local-e2e/` (or an equivalent full env from `docs/local-stack.md`).
 
 ## Docker
 

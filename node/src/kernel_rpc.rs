@@ -845,20 +845,23 @@ mod tests {
         panic!("kernel gRPC did not accept TCP on {addr} within timeout; last_err={last_err:?}");
     }
 
-    /// All 20 kernel procedures are wired: each fails closed on a
-    /// well-formed request without its dependency (engine / session / …)
-    /// — never `Unimplemented` and never an invented `Ok` payload.
+    /// Transport mapping smoke: every kernel procedure has a gRPC handler
+    /// that is **not** a bare `Unimplemented` stub.
+    ///
+    /// This is **not** a production-completeness proof. Two classes:
+    /// - **Well-formed body, missing dependency** (engine / session): reaches
+    ///   the domain gate and fails closed (typically `Internal` /
+    ///   `Unauthenticated`) — proves the handler is mapped past validation.
+    /// - **Empty / malformed body**: pure boundary test for fail-closed
+    ///   `InvalidArgument` / auth errors — does **not** claim the happy path
+    ///   works. Named as malformed-boundary checks below.
     #[tokio::test]
     async fn unmapped_procedures_are_unimplemented_with_their_name() {
         let (domain, _scope) = test_domain().await;
         let svc = grpc_svc(domain);
 
-        // Block 6 chain procedures that are wired: without an EngineAdapter
-        // (or ChainIdentity for GetInfo) they fail closed as Internal,
-        // never as Unimplemented and never as invented Ok payloads.
-        // Request bodies must be well-formed so validation does not fire
-        // before the chain/engine check — otherwise the test measures
-        // InvalidArgument and not the missing-engine path it claims.
+        // Chain procedures: well-formed bodies without EngineAdapter /
+        // ChainIdentity → Internal (mapped), never Unimplemented / invented Ok.
         {
             async fn expect_chain_unavailable<T>(name: &'static str, result: Result<T, Status>) {
                 let status = match result {
@@ -868,7 +871,7 @@ mod tests {
                 assert_ne!(
                     status.code(),
                     Code::Unimplemented,
-                    "{name} is wired; missing engine is internal, not unimplemented"
+                    "{name} transport-mapped; missing engine is internal, not unimplemented"
                 );
                 assert_eq!(
                     status.code(),
@@ -898,10 +901,9 @@ mod tests {
                 .await,
             )
             .await;
-            // Well-formed ListInscriptions: without engine → Internal, never
-            // Unimplemented and never invented Ok. Defaults alone are enough
-            // to pass cursor/limit validation so this path reaches the engine
-            // gate (limit=0 would stop at bounds_exceeded first).
+            // Well-formed ListInscriptions: without engine → Internal.
+            // Defaults pass cursor/limit validation so the path reaches the
+            // engine gate (limit=0 would stop at bounds_exceeded first).
             expect_chain_unavailable(
                 "ListInscriptions",
                 svc.list_inscriptions(Request::new(ListInscriptionsRequest {
@@ -914,8 +916,8 @@ mod tests {
             )
             .await;
         }
-        // SubmitTransition is wired: empty body fails closed as
-        // malformed_request (InvalidArgument), not unimplemented.
+        // Malformed-boundary only: empty body → InvalidArgument, not Unimplemented.
+        // Does not exercise admit / prove / persist.
         {
             let err = svc
                 .submit_transition(Request::new(TransitionRequest::default()))
@@ -924,13 +926,12 @@ mod tests {
             assert_ne!(
                 err.code(),
                 Code::Unimplemented,
-                "SubmitTransition is wired; empty body is malformed, not unimplemented"
+                "SubmitTransition mapped; empty body is malformed, not unimplemented"
             );
             assert_eq!(err.code(), Code::InvalidArgument);
         }
-        // SignTransition is wired **and active** under V1: empty request
-        // fails at the width/UUID boundary as malformed_request, not as
-        // the feature gate (Unimplemented) and not as "not yet implemented".
+        // Malformed-boundary under V1 claim: empty SignRequest → InvalidArgument
+        // (width/UUID), not the feature-gate Unimplemented path.
         // Process claim is monotonic; nextest isolates per test.
         {
             crate::v1::set_process_stack_mode(crate::v1::ScanStackMode::V1);
@@ -941,12 +942,11 @@ mod tests {
             assert_ne!(
                 err.code(),
                 Code::Unimplemented,
-                "SignTransition is wired and active; empty body is malformed, not unimplemented"
+                "SignTransition mapped under V1; empty body is malformed, not unimplemented"
             );
             assert_eq!(err.code(), Code::InvalidArgument);
         }
-        // OpenPullChallenge is wired: empty body fails closed as
-        // malformed_request (subject required), not Unimplemented.
+        // Malformed-boundary: empty OpenPullChallenge → InvalidArgument.
         {
             let err = svc
                 .open_pull_challenge(Request::new(PullChallengeRequest::default()))
@@ -955,18 +955,21 @@ mod tests {
             assert_ne!(
                 err.code(),
                 Code::Unimplemented,
-                "OpenPullChallenge is wired; empty body is malformed, not unimplemented"
+                "OpenPullChallenge mapped; empty body is malformed, not unimplemented"
             );
             assert_eq!(err.code(), Code::InvalidArgument);
         }
-        // Block 7 procedures are wired: empty / missing-authority bodies
-        // fail closed (not Unimplemented).
+        // Malformed / missing-authority boundary (not happy-path).
         {
             let err = svc
                 .pull(Request::new(PullRequest::default()))
                 .await
                 .expect_err("Pull without authority metadata must fail closed");
-            assert_ne!(err.code(), Code::Unimplemented, "Pull is wired");
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "Pull transport-mapped; empty/missing authority is fail-closed"
+            );
             assert_eq!(err.code(), Code::InvalidArgument);
         }
         {
@@ -974,7 +977,11 @@ mod tests {
                 .get_record(Request::new(RecordRequest::default()))
                 .await
                 .expect_err("empty RecordRequest must fail closed");
-            assert_ne!(err.code(), Code::Unimplemented, "GetRecord is wired");
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "GetRecord transport-mapped; empty body is fail-closed (malformed-boundary)"
+            );
             // empty session → unauthorized (Unauthenticated); empty
             // chan_bind width → InvalidArgument. Either is fail-closed.
             assert!(
@@ -988,7 +995,11 @@ mod tests {
                 .get_coin_proof(Request::new(CoinProofRequest::default()))
                 .await
                 .expect_err("empty CoinProofRequest must fail closed");
-            assert_ne!(err.code(), Code::Unimplemented, "GetCoinProof is wired");
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "GetCoinProof transport-mapped; empty body is fail-closed (malformed-boundary)"
+            );
             assert!(
                 matches!(err.code(), Code::InvalidArgument | Code::Unauthenticated),
                 "GetCoinProof empty body: {:?}",
@@ -1000,18 +1011,21 @@ mod tests {
                 .get_account_state(Request::new(AccountStateRequest::default()))
                 .await
                 .expect_err("empty AccountStateRequest must fail closed");
-            assert_ne!(err.code(), Code::Unimplemented, "GetAccountState is wired");
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "GetAccountState transport-mapped; empty body is fail-closed (malformed-boundary; not a production happy-path)"
+            );
             assert!(
                 matches!(err.code(), Code::InvalidArgument | Code::Unauthenticated),
                 "GetAccountState empty body: {:?}",
                 err.code()
             );
         }
-        // SubscribeReceipts is wired: well-formed session+chan_bind reaches
-        // the domain. Without a live pull session the result is
-        // session_expired / unauthorized — never Unimplemented and never
-        // an invented Ok stream. Empty defaults fail width validation first
-        // (chan_bind must be 32 bytes), so supply a well-formed request.
+        // Well-formed session+chan_bind shape reaches the domain. Without a
+        // live pull session → session_expired / unauthorized — never
+        // Unimplemented and never an invented Ok stream. Empty defaults fail
+        // width validation first (chan_bind must be 32 bytes).
         // Match (not `expect_err`): Ok is `Response<BoxStream<Receipt>>` and
         // the stream trait object has no Debug — do not invent one that
         // could format private receipt fields into a panic/log.
@@ -1029,7 +1043,7 @@ mod tests {
             assert_ne!(
                 err.code(),
                 Code::Unimplemented,
-                "SubscribeReceipts is wired; missing session is not unimplemented"
+                "SubscribeReceipts transport-mapped; missing session is not unimplemented"
             );
             assert!(
                 matches!(err.code(), Code::Unauthenticated | Code::Internal),
@@ -1042,7 +1056,11 @@ mod tests {
                 .publish(Request::new(PublishRequest::default()))
                 .await
                 .expect_err("empty PublishRequest must fail closed");
-            assert_ne!(err.code(), Code::Unimplemented, "Publish is wired");
+            assert_ne!(
+                err.code(),
+                Code::Unimplemented,
+                "Publish transport-mapped; empty body is fail-closed (malformed-boundary)"
+            );
             assert_eq!(err.code(), Code::InvalidArgument);
         }
         {
@@ -1053,7 +1071,7 @@ mod tests {
             assert_ne!(
                 err.code(),
                 Code::Unimplemented,
-                "EntrustOperationalBundle is wired"
+                "EntrustOperationalBundle transport-mapped; empty body is fail-closed (malformed-boundary)"
             );
             assert_eq!(err.code(), Code::InvalidArgument);
         }
@@ -1065,13 +1083,12 @@ mod tests {
             assert_ne!(
                 err.code(),
                 Code::Unimplemented,
-                "RevokeOperationalBundle is wired"
+                "RevokeOperationalBundle transport-mapped; empty body is fail-closed (malformed-boundary)"
             );
             assert_eq!(err.code(), Code::InvalidArgument);
         }
-        // AttestBalance / IssueViewGrant are wired (Block 5): empty body
-        // fails closed as malformed_request (InvalidArgument), not
-        // unimplemented. OwnershipProof fields are absent from the proto.
+        // Malformed-boundary (Block 5): empty body → InvalidArgument, not
+        // Unimplemented. OwnershipProof fields are absent from the proto.
         {
             let err = svc
                 .attest_balance(Request::new(AttestRequest::default()))
@@ -1080,7 +1097,7 @@ mod tests {
             assert_ne!(
                 err.code(),
                 Code::Unimplemented,
-                "AttestBalance is wired; empty body is malformed, not unimplemented"
+                "AttestBalance transport-mapped; empty body is fail-closed (malformed-boundary)"
             );
             assert_eq!(err.code(), Code::InvalidArgument);
         }
@@ -1092,7 +1109,7 @@ mod tests {
             assert_ne!(
                 err.code(),
                 Code::Unimplemented,
-                "IssueViewGrant is wired; empty body is malformed, not unimplemented"
+                "IssueViewGrant transport-mapped; empty body is fail-closed (malformed-boundary)"
             );
             assert_eq!(err.code(), Code::InvalidArgument);
         }

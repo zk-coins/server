@@ -93,6 +93,20 @@ pub(crate) const REPUBLISH_CAP_SECS: u64 = 3_600;
 /// Default replication factor **k = 3** (§4.6; MUST NOT be less than 2).
 pub(crate) const DEFAULT_REPLICATION_K: i32 = 3;
 
+/// Max time after a valid ACK to collect ≥ `replication_k` distinct operator
+/// receipts before the row is marked **failed** with a named reason.
+///
+/// `awaiting_receipts` is excluded from [`list_due`] (ACK already held; mesh
+/// republish must not re-fire). Without this deadline a row that never reaches
+/// k receipts would wait forever. Frozen at **24 h** (well above the 1 h
+/// republish cap so holders can still finish after the last publish attempt).
+/// Receipt re-collection without re-ACK remains a follow-up; this path is the
+/// fail-closed progress exit, consistent with [`mark_failed`].
+pub(crate) const AWAITING_RECEIPTS_TIMEOUT_SECS: u64 = 86_400;
+
+/// Token embedded in the stale-receipts fail reason (tests + operator logs).
+pub(crate) const AWAITING_RECEIPTS_TIMEOUT_REASON: &str = "AWAITING_RECEIPTS_TIMEOUT";
+
 /// Exponential backoff delay after a successful publish attempt `attempt_n`
 /// (1-based: first publish → next retry after 30 s).
 ///
@@ -536,6 +550,39 @@ pub(crate) async fn mark_failed(pool: &PgPool, outbox_id: &[u8; 32], reason: &st
     Ok(())
 }
 
+/// Terminal progress path for stuck `awaiting_receipts` rows.
+///
+/// After a valid ACK the row leaves [`list_due`] and must not be republished.
+/// If ≥ `replication_k` receipts never arrive within
+/// [`AWAITING_RECEIPTS_TIMEOUT_SECS`] of `ack_received_at`, mark the row
+/// `failed` with a named reason (no silent eternal wait). Rows with a NULL
+/// `ack_received_at` are skipped (corrupt/impossible under the state machine;
+/// not silently repaired).
+///
+/// Returns the number of rows transitioned to `failed`.
+pub(crate) async fn fail_stale_awaiting_receipts(pool: &PgPool) -> Result<usize> {
+    let reason = format!(
+        "{AWAITING_RECEIPTS_TIMEOUT_REASON}: k receipts not collected within \
+         {AWAITING_RECEIPTS_TIMEOUT_SECS}s after ACK"
+    );
+    let result = sqlx::query(
+        "UPDATE v1_delivery_outbox SET \
+             status = 'failed', \
+             fail_reason = $1, \
+             updated_at = NOW() \
+         WHERE status = 'awaiting_receipts' \
+           AND ack_received_at IS NOT NULL \
+           AND ack_received_at \
+               + make_interval(secs => $2::double precision) < NOW()",
+    )
+    .bind(&reason)
+    .bind(AWAITING_RECEIPTS_TIMEOUT_SECS as f64)
+    .execute(pool)
+    .await
+    .context("v1_delivery_outbox fail_stale_awaiting_receipts")?;
+    usize::try_from(result.rows_affected()).context("rows_affected fits usize")
+}
+
 /// Complete when status is `awaiting_receipts` and receipt count ≥ k.
 async fn try_complete_if_ready(pool: &PgPool, outbox_id: &[u8; 32]) -> Result<()> {
     let Some(row) = get_by_id(pool, outbox_id).await? else {
@@ -919,6 +966,89 @@ mod tests {
         let ids: Vec<_> = due.iter().map(|r| r.outbox_id).collect();
         assert!(ids.contains(&id1), "pending must be due");
         assert!(!ids.contains(&id2), "completed must never be due");
+    }
+
+    /// After ACK without k receipts the row sits in `awaiting_receipts` and
+    /// is invisible to `list_due`. Past the configured deadline it must leave
+    /// via named `failed` — never a silent eternal wait.
+    #[tokio::test]
+    async fn awaiting_receipts_past_timeout_is_named_failed() {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        let k = 3;
+        let entry = sample_insert(0x91, k);
+        let id = outbox_id(
+            entry.kind,
+            &entry.subject,
+            &entry.coin_id,
+            &entry.transition_pk,
+        );
+        insert_pending(&pool, &[entry]).await.expect("insert");
+        mark_published(&pool, &id, &sample_artefacts(0x91))
+            .await
+            .expect("publish");
+        mark_ack_received(&pool, &id).await.expect("ack");
+
+        // Only one receipt — short of k=3. Row must still be awaiting_receipts.
+        store_receipt(
+            &pool,
+            &id,
+            &StoredReceipt {
+                holder_op_pubkey: [0x01; 32],
+                receipt_json: br#"{"one":1}"#.to_vec(),
+                retention_class: "indefinite".into(),
+                stored_at: 1,
+            },
+        )
+        .await
+        .expect("one receipt");
+        let row = get_by_id(&pool, &id).await.expect("get").expect("row");
+        assert_eq!(row.status, OutboxStatus::AwaitingReceipts);
+
+        // Fresh ACK is inside the window — timeout path must not touch it.
+        let n0 = fail_stale_awaiting_receipts(&pool)
+            .await
+            .expect("fail_stale fresh");
+        assert_eq!(n0, 0, "fresh ACK must not be timed out");
+        let row = get_by_id(&pool, &id).await.expect("get").expect("row");
+        assert_eq!(row.status, OutboxStatus::AwaitingReceipts);
+
+        // Backdate ack_received_at past the deadline.
+        let backdate_secs = i64::try_from(AWAITING_RECEIPTS_TIMEOUT_SECS + 60)
+            .expect("timeout+margin fits i64");
+        sqlx::query(
+            "UPDATE v1_delivery_outbox SET \
+                 ack_received_at = NOW() - make_interval(secs => $2::double precision) \
+             WHERE outbox_id = $1",
+        )
+        .bind(id.as_slice())
+        .bind(backdate_secs as f64)
+        .execute(&pool)
+        .await
+        .expect("backdate ack_received_at");
+
+        let n = fail_stale_awaiting_receipts(&pool)
+            .await
+            .expect("fail_stale expired");
+        assert_eq!(n, 1, "one stale awaiting_receipts row must terminal-fail");
+
+        let row = get_by_id(&pool, &id).await.expect("get").expect("row");
+        assert_eq!(row.status, OutboxStatus::Failed);
+        let reason = row.fail_reason.expect("named fail_reason");
+        assert!(
+            reason.contains(AWAITING_RECEIPTS_TIMEOUT_REASON),
+            "timeout token in reason: {reason}"
+        );
+        assert!(
+            reason.contains(&AWAITING_RECEIPTS_TIMEOUT_SECS.to_string()),
+            "deadline secs in reason: {reason}"
+        );
+
+        // Idempotent: second sweep finds nothing.
+        let n2 = fail_stale_awaiting_receipts(&pool)
+            .await
+            .expect("fail_stale again");
+        assert_eq!(n2, 0);
     }
 
     /// Terminal failure: row is `failed` with a named reason and leaves

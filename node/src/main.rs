@@ -428,9 +428,8 @@ async fn run_pending_publish_resumer(
     use v1::{connect_v1_publisher, resume_all_pending_publishes, v1_publisher_env_from_env};
 
     loop {
-        // scanner-polling-ok: pending-publish resume idle backoff (same form
-        // as v1 scan_to_tip idle sleep — named const, not a magic body literal)
-        tokio::time::sleep(PENDING_PUBLISH_RESUME_INTERVAL).await;
+        // Pending-publish resume idle backoff (named const; not tip poll).
+        tokio::time::sleep(PENDING_PUBLISH_RESUME_INTERVAL).await; // scanner-polling-ok: pending-publish resume idle backoff (event-driven bitcoind resume is follow-up)
 
         // Fail-closed list: undeterminable is an error, not "nothing pending".
         let open = match node::v1::db_v1::list_resumable_pending_publishes(adapter.pool()).await {
@@ -745,8 +744,7 @@ async fn run_v1_scan_loop(
                     tip_height,
                     hex::encode(tip_hash)
                 );
-                // scanner-polling-ok: v1 bound-observation tip-stability retry
-                tokio::time::sleep(RECON_RETRY_BACKOFF).await;
+                tokio::time::sleep(RECON_RETRY_BACKOFF).await; // scanner-polling-ok: bound-observation tip-stability retry (not tip-advance poll; re-observe after discarded window)
                 continue;
             }
 
@@ -761,8 +759,7 @@ async fn run_v1_scan_loop(
                         "v1.1 boot tip: incomplete live view at height \
                          {queried_height} — {detail}; staying unready and retrying"
                     );
-                    // scanner-polling-ok: v1 incomplete-view RPC-behind backoff
-                    tokio::time::sleep(RECON_RETRY_BACKOFF).await;
+                    tokio::time::sleep(RECON_RETRY_BACKOFF).await; // scanner-polling-ok: incomplete-view RPC-behind backoff (transient; not tip-advance poll)
                     continue;
                 }
                 TipReconcileOutcome::Ready(PersistedTipReconciliation::Fresh) => {
@@ -899,18 +896,14 @@ async fn run_v1_scan_loop(
                             "v1.1 scanner: wall clock before UNIX epoch — \
                              skipping SDR Phase B this tick (no silent 0 MTP)"
                         );
-                        // scanner-polling-ok: v1 bitcoind scan_to_tip idle backoff
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        tokio::time::sleep(Duration::from_secs(5)).await; // scanner-polling-ok: scan_to_tip idle backoff (bitcoind block-signal subscription is follow-up; no Esplora WS on this path)
                         continue;
                     }
                 };
-            // Inclusion block hash: resolve via bitcoind when the inclusion
-            // height is known per row (adapter helper). Fixed tip hash is only
-            // a stand-in for the MTP source's block_hash field when the row's
-            // inclusion height equals the tip; BitcoindInclusionMtp is the
-            // production path once wired. For now the public adapter carries
-            // tip_hash + wall-clock seconds as a **named provisional** for
-            // regtest/dev — BIP-113 MTP must replace this before mainnet.
+            // Inclusion / MTP: the adapter builds a **named provisional**
+            // (tip_hash + wall-clock) only on regtest/testnet. Mainnet is
+            // fail-closed until first-occurrence inclusion + BIP-113 MTP via
+            // bitcoind is wired (`provisional_inclusion_mtp_for_network`).
             let n = v1::finalize_due_phase_b_adapter(&adapter, tip_hash, occurred_at)
                 .await
                 .map_err(|e| format!("v1.1 SDR Phase B finalise failed: {e:#}"))?;
@@ -930,11 +923,9 @@ async fn run_v1_scan_loop(
             }
         }
 
-        // Event-driven tip advance is owned by bitcoind; poll interval is a
-        // last-resort backoff between successful scan_to_tip calls (no
-        // Esplora WS on this path). Marked so CI lint grandfathering matches
-        // scanner_runtime's HTTP backoff token style.
-        // scanner-polling-ok: v1 bitcoind scan_to_tip idle backoff
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Tip-advance poll: bitcoind block-signal subscription is follow-up
+        // work; until then this idle sleep is the only wake between
+        // successful scan_to_tip calls (no Esplora WS on the v1 path).
+        tokio::time::sleep(Duration::from_secs(5)).await; // scanner-polling-ok: scan_to_tip idle backoff until bitcoind block-signal subscription (event-driven tip advance is follow-up)
     }
 }

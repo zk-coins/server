@@ -25,6 +25,7 @@ use shared::spec_v1::serialize::{
     deserialize_proof_data, parse_account_state, serialize_proof_data,
 };
 use sqlx::PgPool;
+use zkcoins_program::circuit::compliance::Network;
 
 use super::adapter::EngineAdapter;
 use super::db_outbox::OutboxKind;
@@ -33,6 +34,37 @@ use super::delivery::{fresh_esk, insert_sdr_outbox_pending, DeliveryError};
 use super::nostr::nip59::SecureRandom;
 use super::outbox_material::{SdrOutboxMaterial, SdrPhaseAMaterial, SdrPhaseAOutputRef};
 use super::OsSecureRandom;
+
+/// Stable token in the mainnet provisional-MTP refusal message (tests + logs).
+pub(crate) const PROVISIONAL_MTP_MAINNET_REFUSED: &str = "PROVISIONAL_MTP_MAINNET_REFUSED";
+
+/// Build the **named provisional** Inclusion/MTP stand-in used until
+/// bitcoind first-occurrence inclusion + BIP-113 MTP is wired.
+///
+/// **Fail-closed on mainnet:** provisional tip-hash + wall-clock must never
+/// seal a SelfDeliveryRecord on mainnet. Regtest and testnet may use the
+/// stand-in (still named provisional in logs / docs).
+pub(crate) fn provisional_inclusion_mtp_for_network(
+    network: Network,
+    tip_hash: [u8; 32],
+    occurred_at: u64,
+) -> Result<FixedInclusionMtp> {
+    match network {
+        Network::Mainnet => bail!(
+            "SDR Phase B refused: {PROVISIONAL_MTP_MAINNET_REFUSED}: provisional \
+             Inclusion/MTP (tip_hash + wall-clock) is forbidden on mainnet; \
+             first-occurrence inclusion block and BIP-113 MTP via bitcoind are \
+             required before sealing SelfDeliveryRecordV1"
+        ),
+        Network::Regtest | Network::Testnet => {
+            // Named provisional — allowed only off mainnet until BitcoindInclusionMtp ships.
+            Ok(FixedInclusionMtp {
+                block_hash: tip_hash,
+                occurred_at,
+            })
+        }
+    }
+}
 
 /// Boxed future returned by [`InclusionMtpSource::inclusion_and_mtp`]: the
 /// resolved inclusion [`BlockAnchor`] and its BIP-113 median-time-past.
@@ -127,9 +159,14 @@ pub(crate) async fn stage_phase_a(
 /// Production scanner hook after each NfLog fold (binary `run_v1_scan_loop`).
 ///
 /// Public so the binary crate can call it; the trait-based core stays
-/// crate-private. Builds a provisional inclusion/MTP source from
-/// `tip_hash` + wall-clock `occurred_at` (regtest/dev stand-in until
-/// BIP-113 MTP is wired).
+/// crate-private.
+///
+/// **Inclusion / MTP source.** Until bitcoind first-occurrence inclusion +
+/// BIP-113 MTP is wired, this path uses a **named provisional** stand-in
+/// (`tip_hash` + wall-clock `occurred_at`) via
+/// [`provisional_inclusion_mtp_for_network`]. That stand-in is **fail-closed
+/// on mainnet** (no provisional seal; Phase-A rows left open). Regtest and
+/// testnet may still use it.
 ///
 /// Incomplete material → named [`db_sdr::mark_failed`] (no silent skip).
 /// Success → `insert_sdr_outbox_pending` + [`db_sdr::mark_finalised`] so
@@ -139,9 +176,31 @@ pub async fn finalize_due_phase_b_adapter(
     tip_hash: [u8; 32],
     occurred_at: u64,
 ) -> Result<usize> {
-    let mtp = FixedInclusionMtp {
-        block_hash: tip_hash,
+    let mtp = match provisional_inclusion_mtp_for_network(
+        adapter.network(),
+        tip_hash,
         occurred_at,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            // Mainnet (or any network that refuses provisional): do not write
+            // non-normative SDRs. Leave Phase-A open for a future real MTP path
+            // — do not mark_failed (that would destroy recoverable material).
+            let open = db_sdr::list_awaiting_first_occurrence(adapter.pool())
+                .await
+                .context(
+                    "SDR Phase B: list open Phase A under provisional Inclusion/MTP refusal",
+                )?;
+            if !open.is_empty() {
+                tracing::error!(
+                    open_phase_a = open.len(),
+                    network = ?adapter.network(),
+                    error = %e,
+                    "SDR Phase B withheld: provisional Inclusion/MTP refused; Phase-A left open"
+                );
+            }
+            return Ok(0);
+        }
     };
     let mut rng = OsSecureRandom;
     finalize_due_phase_b_with_mtp(adapter, &mtp, &mut rng).await
@@ -801,6 +860,31 @@ mod tests {
         assert!(!material.blob_id_hex.is_empty());
         assert!(!material.epk_hex.is_empty());
         assert_eq!(material.record_kind, 0x02);
+    }
+
+    #[test]
+    fn mainnet_refuses_provisional_inclusion_mtp() {
+        let err = provisional_inclusion_mtp_for_network(Network::Mainnet, [0xAA; 32], 1_700_000_000)
+            .expect_err("mainnet must refuse provisional MTP");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(PROVISIONAL_MTP_MAINNET_REFUSED),
+            "named token: {msg}"
+        );
+        assert!(
+            msg.contains("mainnet") && msg.contains("BIP-113"),
+            "operator-readable refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn regtest_and_testnet_allow_named_provisional_inclusion_mtp() {
+        for network in [Network::Regtest, Network::Testnet] {
+            let mtp = provisional_inclusion_mtp_for_network(network, [0xBB; 32], 42)
+                .unwrap_or_else(|e| panic!("{network:?} must allow provisional: {e:#}"));
+            assert_eq!(mtp.block_hash, [0xBB; 32]);
+            assert_eq!(mtp.occurred_at, 42);
+        }
     }
 
     #[tokio::test]

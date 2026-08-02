@@ -26,7 +26,12 @@
 //!    §4.2 exponential backoff (30 s → double → cap 1 h); terminal publish
 //!    failures (`DeliveryError::is_terminal_outbox_failure`) call
 //!    `db_outbox::mark_failed` so the row leaves the drive loop with a
-//!    named `fail_reason` (never silent eternal republish).
+//!    named `fail_reason` (never silent eternal republish);
+//! 10. `awaiting_receipts` rows that never reach k within
+//!     [`db_outbox::AWAITING_RECEIPTS_TIMEOUT_SECS`] are marked `failed`
+//!     with a named reason via [`db_outbox::fail_stale_awaiting_receipts`]
+//!     (driven each tick from [`drive_due_outbox_entries`]) — no silent
+//!     eternal wait after ACK.
 //!
 //! # Port boundary
 //!
@@ -1231,6 +1236,21 @@ pub(crate) async fn drive_due_outbox_entries(
     now: u64,
     auth_expiration: u64,
 ) -> Result<usize, DeliveryError> {
+    // Progress path for ACK-held rows that never reach k receipts: named
+    // terminal failure after AWAITING_RECEIPTS_TIMEOUT_SECS (not eternal wait).
+    match db_outbox::fail_stale_awaiting_receipts(pool).await {
+        Ok(n) if n > 0 => {
+            tracing::warn!(
+                timed_out = n,
+                "outbox: awaiting_receipts past deadline → named failed"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "outbox: fail_stale_awaiting_receipts failed");
+        }
+    }
+
     let due = db_outbox::list_due(pool)
         .await
         .map_err(|e| DeliveryError::Relay(format!("list_due: {e:#}")))?;

@@ -183,22 +183,23 @@ jobs:
       - name: Run clippy (program + prover)
         run: cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --all-targets -- -D warnings
 
-      # Issue #84: the chain-tip wait path and the publisher's
-      # commit→reveal propagation wait must be event-driven (WS /
-      # ZMQ), not polled. The grep below fails the build if a
-      # `tokio::time::{sleep,sleep_until,interval}` or
-      # `std::thread::sleep` call sneaks back into the scanner /
-      # publisher modules without the documented opt-out marker. See
-      # CONTRIBUTING.md § "No polling — events only" for the per-line
-      # `scanner-polling-ok:` escape hatch and the rationale for each
-      # currently-grandfathered occurrence. The marker is a plain
-      # comment token (not an `#[allow(...)]` attribute) so future
-      # contributors cannot mistake it for a real lint suppression
-      # (issue #84 round-4 MINOR 4).
+      # Issue #84: chain-tip advance and publisher commit→reveal waits must
+      # be event-driven (bitcoind ZMQ / block signals), not silent polls.
+      # The deleted Esplora WS scanner modules are gone; the live hotpaths
+      # are the v1 bitcoind scan loop in `main.rs` and `publisher.rs`.
+      # The grep fails the build if a `tokio::time::{sleep,sleep_until,
+      # interval}` or `std::thread::sleep` call appears there without the
+      # same-line opt-out marker. See CONTRIBUTING.md § "No polling —
+      # events only" for `scanner-polling-ok:` and the rationale for each
+      # grandfathered occurrence. The marker is a plain comment token
+      # (not an `#[allow(...)]` attribute) so contributors cannot mistake
+      # it for a real lint suppression (issue #84 round-4 MINOR 4).
+      # Follow-up: replace main.rs scan_to_tip idle sleep with bitcoind
+      # block-signal subscription (event-driven tip advance).
       - name: Forbid polling patterns in scanner/publisher
         run: |
           set -e
-          FOUND=$(grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' node/src/scanner.rs node/src/scanner_runtime.rs node/src/scanner_ws.rs node/src/scanner_ws_parse.rs node/src/publisher.rs 2>/dev/null | grep -v 'scanner-polling-ok:' || true)
+          FOUND=$(grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' node/src/main.rs node/src/publisher.rs 2>/dev/null | grep -v 'scanner-polling-ok:' || true)
           if [ -n "$FOUND" ]; then
             echo "::error::Polling pattern (tokio::time::sleep|sleep_until|interval or std::thread::sleep) detected in event-driven hot paths. See issue #84."
             echo "$FOUND"
