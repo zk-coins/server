@@ -1410,15 +1410,59 @@ async fn admit_and_enqueue(
             // cached body + status verbatim. Otherwise return the
             // current snapshot so the wallet sees the same job_id.
             if job.status == JobStatus::Completed {
-                let status_code = StatusCode::from_u16(job.response_status.unwrap_or(200) as u16)
-                    .unwrap_or(StatusCode::OK);
-                // `JobStore::complete` always sets `response_body` on the row before
-                // flipping the status to `Completed`; the matching INSERT in
-                // `complete()` is non-nullable on the value side. A `None` here
-                // would mean the row was hand-edited or the schema invariant
-                // broke — the `.expect()` surfaces that immediately instead of
-                // hiding behind a defensive empty-object fallback (which would
-                // also cost the 100% line-coverage gate a never-reached closure).
+                // `JobStore::complete` always writes both `response_status` and
+                // `response_body` before flipping the row to `Completed`. A
+                // missing or non-HTTP status is corruption / hand-edit — never
+                // invent 200 OK (absence must not mean success).
+                let Some(raw_status) = job.response_status else {
+                    tracing::error!(
+                        job_id = %job.public_id,
+                        "completed job missing response_status on idempotent replay"
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(JobErrorResponse {
+                            error: "internal_error".to_string(),
+                        }),
+                    )
+                        .into_response();
+                };
+                let status_u16 = match u16::try_from(raw_status) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::error!(
+                            job_id = %job.public_id,
+                            response_status = raw_status,
+                            "completed job has non-u16 response_status on idempotent replay"
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(JobErrorResponse {
+                                error: "internal_error".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                };
+                let status_code = match StatusCode::from_u16(status_u16) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        tracing::error!(
+                            job_id = %job.public_id,
+                            response_status = status_u16,
+                            "completed job has invalid HTTP response_status on idempotent replay"
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(JobErrorResponse {
+                                error: "internal_error".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                };
+                // Same invariant as response_status: `complete()` always sets
+                // the body. A `None` here is corruption — surface immediately.
                 let body = job
                     .response_body
                     .clone()
@@ -1885,11 +1929,13 @@ pub(crate) async fn attest_balance_challenge_handler(
     _active: RequireAttestRoute,
     V1Json(body): V1Json<crate::v1::AttestChallengeRequest>,
 ) -> axum::response::Response {
-    match crate::v1::issue_attest_challenge(
-        &state.attest_challenges,
-        &body.subject,
-        crate::v1::unix_now(),
-    ) {
+    let now = match crate::v1::unix_now() {
+        Ok(n) => n,
+        Err(e) => {
+            return attest_error_response(crate::v1::AttestError::Internal(e.to_string()));
+        }
+    };
+    match crate::v1::issue_attest_challenge(&state.attest_challenges, &body.subject, now) {
         Ok((nonce, expiry)) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1915,11 +1961,17 @@ pub(crate) async fn attest_balance_handler(
     _active: RequireAttestRoute,
     V1Json(body): V1Json<crate::v1::AttestBalanceRequest>,
 ) -> axum::response::Response {
+    let now = match crate::v1::unix_now() {
+        Ok(n) => n,
+        Err(e) => {
+            return attest_error_response(crate::v1::AttestError::Internal(e.to_string()));
+        }
+    };
     let authorised = match crate::v1::authorise_attest_balance(
         &state.attest_challenges,
         state.public_hosts.as_slice(),
         &body,
-        crate::v1::unix_now(),
+        now,
     ) {
         Ok(b) => b,
         Err(e) => return attest_error_response(e),

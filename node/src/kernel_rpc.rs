@@ -301,6 +301,24 @@ fn map_domain_err(err: KernelError) -> Status {
     kernel_error_to_status(&err)
 }
 
+/// Fail-closed wall clock for session/challenge-bound procedures.
+///
+/// A host clock before the UNIX epoch must not become a synthetic `0`
+/// timestamp (that would corrupt challenge expiry and grant windows).
+// Returns the domain error (small) rather than `Result<u64, Status>`: a
+// tiny Ok beside a large `tonic::Status` trips `result_large_err`, and the
+// file deliberately keeps `Status` off small-Ok results (see the
+// ListInscriptions note). Call sites map with `map_domain_err`.
+fn require_unix_now() -> Result<u64, KernelError> {
+    crate::v1::unix_now().map_err(|e| {
+        KernelError::with_internal(
+            KernelErrorCode::InternalError,
+            "Kernel clock unavailable",
+            e.to_string(),
+        )
+    })
+}
+
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 #[tonic::async_trait]
@@ -454,7 +472,7 @@ impl Kernel for GrpcKernelService {
             OpenPullChallengeParse::Ready(p) => p,
             OpenPullChallengeParse::Err(e) => return Err(map_domain_err(e)),
         };
-        let now = crate::v1::unix_now();
+        let now = require_unix_now().map_err(map_domain_err)?;
         let issued = self.domain.open_pull_challenge(
             now,
             parsed.action,
@@ -493,7 +511,7 @@ impl Kernel for GrpcKernelService {
             .iter()
             .map(|h| crate::v1::attest::chan_bind_for_host(h))
             .collect();
-        let now = crate::v1::unix_now();
+        let now = require_unix_now().map_err(map_domain_err)?;
         let result = self
             .domain
             .pull(&allowed, now, command)
@@ -506,7 +524,7 @@ impl Kernel for GrpcKernelService {
         request: Request<RecordRequest>,
     ) -> Result<Response<RecordBlob>, Status> {
         let command = parse_record_request(request.into_inner()).map_err(map_domain_err)?;
-        let now = crate::v1::unix_now();
+        let now = require_unix_now().map_err(map_domain_err)?;
         let blob = self
             .domain
             .get_record(now, command)
@@ -519,7 +537,7 @@ impl Kernel for GrpcKernelService {
         request: Request<CoinProofRequest>,
     ) -> Result<Response<CoinProofBlob>, Status> {
         let command = parse_coin_proof_request(request.into_inner()).map_err(map_domain_err)?;
-        let now = crate::v1::unix_now();
+        let now = require_unix_now().map_err(map_domain_err)?;
         let canonical = self
             .domain
             .get_coin_proof(now, command)
@@ -533,7 +551,7 @@ impl Kernel for GrpcKernelService {
     ) -> Result<Response<AccountStateResult>, Status> {
         let inner = request.into_inner();
         let req = parse_session_bound(inner.session, inner.chan_bind).map_err(map_domain_err)?;
-        let now = crate::v1::unix_now();
+        let now = require_unix_now().map_err(map_domain_err)?;
         let view = self
             .domain
             .get_account_state(now, req)
@@ -552,7 +570,7 @@ impl Kernel for GrpcKernelService {
         // (proto has no subject field; never invent one from the client).
         let inner = request.into_inner();
         let req = parse_session_bound(inner.session, inner.chan_bind).map_err(map_domain_err)?;
-        let now = crate::v1::unix_now();
+        let now = require_unix_now().map_err(map_domain_err)?;
         // Without the domain façade (writer hub) this is Internal — never
         // Unimplemented and never an invented Ok empty stream.
         let domain_stream = self
@@ -596,7 +614,7 @@ impl Kernel for GrpcKernelService {
             .iter()
             .map(|h| crate::v1::attest::chan_bind_for_host(h))
             .collect();
-        let now = crate::v1::unix_now();
+        let now = require_unix_now().map_err(map_domain_err)?;
         let result = self
             .domain
             .entrust_operational_bundle(&allowed, now, command)
@@ -614,7 +632,7 @@ impl Kernel for GrpcKernelService {
             .iter()
             .map(|h| crate::v1::attest::chan_bind_for_host(h))
             .collect();
-        let now = crate::v1::unix_now();
+        let now = require_unix_now().map_err(map_domain_err)?;
         let result = self
             .domain
             .revoke_operational_bundle(&allowed, now, command)
@@ -633,7 +651,7 @@ impl Kernel for GrpcKernelService {
             .iter()
             .map(|h| crate::v1::attest::chan_bind_for_host(h))
             .collect();
-        let now = crate::v1::unix_now();
+        let now = require_unix_now().map_err(map_domain_err)?;
         let job = self
             .domain
             .attest_balance(&self.job_tx, &allowed, now, command)
@@ -658,7 +676,7 @@ impl Kernel for GrpcKernelService {
             .iter()
             .map(|h| crate::v1::attest::chan_bind_for_host(h))
             .collect();
-        let now = crate::v1::unix_now();
+        let now = require_unix_now().map_err(map_domain_err)?;
         let issued = self
             .domain
             .issue_view_grant(&allowed, now, command)

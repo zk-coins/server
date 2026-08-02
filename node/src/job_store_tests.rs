@@ -2548,6 +2548,51 @@ async fn from_row_returns_decode_error_for_unknown_status() {
     );
 }
 
+/// Unknown `jobs.status` on the finalise-claim loss path must be a named
+/// load error — never silently rewritten to `JobStatus::Failed`.
+///
+/// Pre-fix behaviour: `from_db_str(...).unwrap_or(Failed)` made schema
+/// drift look like a normal terminal loss. Without this gate the claim
+/// would return `Ok(Lost { observed: Failed })`.
+#[tokio::test]
+async fn claim_finalise_unknown_status_is_decode_error_not_failed() {
+    let (store, _c) = setup_store().await;
+    let result = store
+        .create(
+            JobKind::Send,
+            &account_addr(0xA5),
+            Some("k-unknown-status-claim"),
+            sample_mint_body(),
+        )
+        .await
+        .expect("create");
+    let job_id = match result {
+        CreateResult::Fresh(j) => j.public_id,
+        _ => panic!("expected Fresh"),
+    };
+    // CHECK rejects unknown labels at write time; drop it so we can plant
+    // the defence-in-depth path the claim decoder must refuse loudly.
+    sqlx::query("ALTER TABLE jobs DROP CONSTRAINT jobs_status_check")
+        .execute(store.pool())
+        .await
+        .expect("drop jobs_status_check");
+    sqlx::query("UPDATE jobs SET status = 'archived' WHERE public_id = $1")
+        .bind(job_id)
+        .execute(store.pool())
+        .await
+        .expect("plant unknown status");
+
+    let err = store
+        .claim_finalise_exclusive(job_id)
+        .await
+        .expect_err("unknown status must not become FinaliseClaim::Lost(Failed)");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown jobs.status: archived"),
+        "expected named decode error, got {msg}"
+    );
+}
+
 #[tokio::test]
 async fn is_terminal_matches_terminal_states_only() {
     assert!(!JobStatus::Queued.is_terminal());

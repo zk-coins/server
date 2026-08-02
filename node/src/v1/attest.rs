@@ -1171,12 +1171,41 @@ pub(crate) async fn prove_attestation_for_job(
     Ok(proved)
 }
 
-/// Unix seconds for challenge expiry.
-pub(crate) fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+/// Wall clock unusable for challenge expiry / session checks.
+///
+/// Raised when the host clock is before the UNIX epoch. Callers must refuse
+/// the operation — never invent a synthetic timestamp such as `0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WallClockUnavailable;
+
+impl std::fmt::Display for WallClockUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "wall clock is before UNIX epoch — refusing synthetic timestamp"
+        )
+    }
+}
+
+impl std::error::Error for WallClockUnavailable {}
+
+/// Convert a [`SystemTime`] to Unix seconds, fail-closed before the epoch.
+///
+/// Pure helper so tests can plant a pre-epoch clock without mutating the
+/// host wall clock. Production uses [`unix_now`].
+pub(crate) fn unix_secs(now: SystemTime) -> Result<u64, WallClockUnavailable> {
+    now.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_err(|_| WallClockUnavailable)
+}
+
+/// Unix seconds for challenge expiry and session-bound checks.
+///
+/// A host clock before the UNIX epoch is a fail-closed condition: returns
+/// [`WallClockUnavailable`] instead of inventing `0` (which would make every
+/// challenge appear expired or every TTL window nonsense).
+pub(crate) fn unix_now() -> Result<u64, WallClockUnavailable> {
+    unix_secs(SystemTime::now())
 }
 
 /// Read authoritative hosts from `ZKCOINS_PUBLIC_HOST` (comma-separated).
@@ -1240,6 +1269,25 @@ mod tests {
             ceiling_encoding(None, Some(1)),
             Err(AttestError::Malformed(_))
         ));
+    }
+
+    /// Pre-epoch wall clock must not yield a synthetic `0` timestamp.
+    ///
+    /// Without the fail-closed gate, `duration_since(UNIX_EPOCH).unwrap_or(0)`
+    /// would turn a broken clock into Unix second 0 and silently corrupt
+    /// challenge expiry / session TTL checks.
+    #[test]
+    fn unix_secs_refuses_pre_epoch_clock() {
+        let pre_epoch = UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("epoch - 1s is representable on this platform");
+        assert_eq!(unix_secs(pre_epoch), Err(WallClockUnavailable));
+        // Epoch itself is a real instant (Unix 0), not "unavailable".
+        assert_eq!(unix_secs(UNIX_EPOCH), Ok(0));
+        assert_eq!(
+            unix_secs(UNIX_EPOCH + std::time::Duration::from_secs(42)),
+            Ok(42)
+        );
     }
 
     #[test]

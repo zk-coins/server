@@ -2809,6 +2809,113 @@ mod jobs_endpoint_tests {
         assert_eq!(v2["proof_id"], 99u64);
     }
 
+    /// Completed idempotent replay with `response_status = NULL` must be
+    /// `500 internal_error`, never invent HTTP 200.
+    ///
+    /// Pre-fix: `response_status.unwrap_or(200)` treated absence as success.
+    #[tokio::test]
+    async fn jobs_mint_idempotent_replay_missing_response_status_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let body = signed_mint_body(1);
+        let first = run(
+            state.clone(),
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k-missing-status")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        let v1: serde_json::Value = serde_json::from_str(&first.2).unwrap();
+        let job_id = uuid::Uuid::parse_str(v1["job_id"].as_str().unwrap()).unwrap();
+
+        // Body present, status NULL — the silent-200 path this gate removes.
+        sqlx::query(
+            "UPDATE jobs SET status = 'completed', phase = 'completed', progress = 100, \
+             response_body = $1::jsonb, response_status = NULL, completed_at = NOW() \
+             WHERE public_id = $2",
+        )
+        .bind(serde_json::json!({"success": true, "proof_id": 77u64}))
+        .bind(job_id)
+        .execute(pool.as_ref())
+        .await
+        .expect("plant completed without response_status");
+
+        let second = run(
+            state,
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k-missing-status")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            second.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "missing response_status must not 200; body={}",
+            second.2
+        );
+        let v2: serde_json::Value = serde_json::from_str(&second.2).unwrap();
+        assert_eq!(v2["error"], "internal_error");
+        assert!(
+            v2.get("proof_id").is_none(),
+            "must not surface cached body on corrupt status: {}",
+            second.2
+        );
+    }
+
+    /// Completed idempotent replay with a non-HTTP `response_status` must be
+    /// `500 internal_error`, never invent HTTP 200 via `from_u16` fallback.
+    ///
+    /// Pre-fix: `StatusCode::from_u16(...).unwrap_or(StatusCode::OK)`.
+    #[tokio::test]
+    async fn jobs_mint_idempotent_replay_invalid_response_status_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let body = signed_mint_body(1);
+        let first = run(
+            state.clone(),
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k-bad-status")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        let v1: serde_json::Value = serde_json::from_str(&first.2).unwrap();
+        let job_id = uuid::Uuid::parse_str(v1["job_id"].as_str().unwrap()).unwrap();
+
+        // 7000 is a valid i16 but not a valid HTTP status code.
+        sqlx::query(
+            "UPDATE jobs SET status = 'completed', phase = 'completed', progress = 100, \
+             response_body = $1::jsonb, response_status = 7000, completed_at = NOW() \
+             WHERE public_id = $2",
+        )
+        .bind(serde_json::json!({"success": true, "proof_id": 88u64}))
+        .bind(job_id)
+        .execute(pool.as_ref())
+        .await
+        .expect("plant completed with invalid response_status");
+
+        let second = run(
+            state,
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k-bad-status")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            second.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid response_status must not 200; body={}",
+            second.2
+        );
+        let v2: serde_json::Value = serde_json::from_str(&second.2).unwrap();
+        assert_eq!(v2["error"], "internal_error");
+    }
+
     // ---- POST /api/jobs/send ----
 
     #[tokio::test]

@@ -1128,7 +1128,11 @@ impl JobStore {
         {
             Some(r) => {
                 let s: String = r.try_get("status")?;
-                JobStatus::from_db_str(&s).unwrap_or(JobStatus::Failed)
+                // Same decode rule as [`Job::from_row`]: an unknown status is
+                // schema drift / corruption, never a silent `Failed`.
+                JobStatus::from_db_str(&s).ok_or_else(|| {
+                    sqlx::Error::Decode(format!("unknown jobs.status: {s}").into())
+                })?
             }
             None => JobStatus::Failed,
         };
