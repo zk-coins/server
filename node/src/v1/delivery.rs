@@ -1148,17 +1148,15 @@ impl DeliveryTargetStore {
 
     /// Insert from a fully verified §4.3 `Invoice` (checks i–iii already run).
     ///
-    /// # Production caller (missing in this repo)
+    /// # Production caller
     ///
-    /// §7.5 `TransitionRequest.output_templates[].recipient` is a **zk-address
-    /// only** — no `ivpk`, no name. §4.3 forbids resolution from a bare
-    /// address. The **API / SDK layer** (other repo) must accept a verified
-    /// `Invoice` or kind-0 profile from the wallet and call this method
-    /// **before** prove/finalise so the mesh send path has a
-    /// [`DeliveryTarget`]. The node never sees names (NIP-05 lives in that
-    /// same API layer). Until that caller exists, send to a foreign recipient
-    /// fails closed with [`DeliveryError::RecipientIvpkUnavailable`].
-    /// Insert a fully verified §4.3 `Invoice` into the target store.
+    /// Kernel `SubmitTransition` verifies `OutputTemplate.delivery` (invoice
+    /// or profile) and calls this path (or [`Self::insert_verified_profile`])
+    /// **before** admit/prove so the mesh send path has a [`DeliveryTarget`].
+    /// The API/SDK layer may also call this façade after its own checks; the
+    /// node never sees names (NIP-05 lives in that layer). Only
+    /// `{ivpk, op_pubkey, relays}` (+ TTL) are retained — `pk0`, `nk_commit`,
+    /// `memo`, and signatures are discarded (§7.5 retention).
     ///
     /// Public error type is a display string so the API layer does not depend
     /// on crate-private [`DeliveryError`] variants. Checklist failures and

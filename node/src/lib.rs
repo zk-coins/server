@@ -69,12 +69,12 @@
 //!   engine sinks and process-control helpers stay non-public.
 //!   `downstream-boundary` compile-fail matrix names sealed sinks on this
 //!   module tree.
-//!   **Mesh-delivery target façade (API/SDK, other repo):**
+//!   **Mesh-delivery target façade:**
 //!   [`v1::DeliveryTargetStore`] + [`v1::PaymentInvoice`] +
-//!   [`v1::DeliveryTargetStore::insert_verified_invoice`]. §7.5 carries only
-//!   a bare zk-address; the API must insert a verified §4.3 Invoice before
-//!   prove/finalise so the send path has an IVPK + relays. No in-crate
-//!   production caller — that is the documented cross-repo gap.
+//!   [`v1::DeliveryTargetStore::insert_verified_invoice`]. Kernel
+//!   `SubmitTransition` verifies `OutputTemplate.delivery` (§7.5) and fills
+//!   the store before prove; the API/SDK may still insert a verified Invoice
+//!   directly. Only `{ivpk, op_pubkey, relays}` are retained after a check.
 //! - [`self_heal`] — binary `heal_circuit_digest` / `ResetDecision`.
 //! - [`openapi`] — integration `openapi_smoke` reads `openapi_json` /
 //!   `DOCS_HTML` only; route handlers stay `pub(crate)`.

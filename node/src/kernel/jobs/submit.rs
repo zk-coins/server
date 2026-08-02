@@ -10,11 +10,20 @@
 
 use tokio::sync::mpsc;
 
+// §7.5 delivery surface via the `jobs` re-export so the production call path
+// keeps those symbols live (clippy unused_imports is the witness when this
+// path is unwired — same class of gap as the publisher).
+use super::{
+    check_and_store_delivery_credentials, is_self_output, DeliveryCheckDeps, ProfileHighWaterStore,
+};
 use crate::job_dispatcher::JobEnvelope;
 use crate::job_store::{self, CreateResult, JobStore};
+use crate::kernel::bootstrap::BundleStore;
 use crate::kernel::job_projection::project_job_row;
 use crate::kernel::types::{Digest32, IdempotencyKey, Issuance, OutputTemplate, PublisherChoice};
 use crate::kernel::{Job, KernelError, KernelErrorCode, KernelResult, TransitionCommand};
+use crate::v1::DeliveryTargetStore;
+use shared::spec_v1::ManifestClock;
 
 /// §2.5 / §7.5 circuit bounds used at admit time (must match the sealed
 /// circuit shape: `MAX_TX_INPUTS=8`, `MAX_TX_OUTPUTS=8`, `MAX_RX_COINS=4`).
@@ -28,10 +37,31 @@ pub(crate) const MAX_IDEMPOTENCY_KEY_BYTES: usize = 64;
 /// §7.5 / §1.5: asset `name` MUST NOT exceed 255 bytes.
 pub(crate) const MAX_ISSUANCE_NAME_BYTES: usize = 255;
 
-/// Dependencies for [`submit_transition`] / [`admit_job`].
+/// Dependencies for [`admit_job`] (store + dispatcher only).
+pub(crate) struct AdmitJobDeps<'a> {
+    pub store: &'a JobStore,
+    pub job_tx: &'a mpsc::Sender<JobEnvelope>,
+}
+
+/// Dependencies for [`submit_transition`] (admit + §7.5 delivery checks).
 pub(crate) struct SubmitTransitionDeps<'a> {
     pub store: &'a JobStore,
     pub job_tx: &'a mpsc::Sender<JobEnvelope>,
+    /// Active operational bundles (self-output leg of the §7.5 presence rule).
+    pub bundles: &'a BundleStore,
+    /// Verified delivery targets filled after credential checklists pass.
+    pub delivery_targets: &'a DeliveryTargetStore,
+    /// Relay-relative kind-0 high-water for profile freshness.
+    pub profile_high_water: &'a ProfileHighWaterStore,
+    /// Persisted `AccountState.owner` for the command subject, when known.
+    pub subject_owner: Option<[u8; 32]>,
+    /// Network pin for profile `zkcoins.network` checks.
+    pub network: crate::kernel::chain::KernelNetwork,
+    /// Injected wall clock for profile freshness windows and delivery TTL.
+    ///
+    /// [`ManifestClock::Unavailable`] is fail-closed at the credential check
+    /// (profile age / store insert), not silently skipped.
+    pub clock: ManifestClock,
 }
 
 /// Outcome of a successful admit (fresh row or same-key same-body replay).
@@ -235,13 +265,13 @@ fn validate_fold_coin_ids(ids: &[Digest32]) -> KernelResult<()> {
 ///
 /// Replay never re-enqueues.
 pub(crate) async fn admit_job(
-    deps: SubmitTransitionDeps<'_>,
+    deps: AdmitJobDeps<'_>,
     kind: job_store::JobKind,
     account: &[u8; 32],
     idempotency_key: &str,
     request_body: serde_json::Value,
 ) -> Result<AdmitOutcome, AdmitError> {
-    let SubmitTransitionDeps { store, job_tx } = deps;
+    let AdmitJobDeps { store, job_tx } = deps;
 
     let create_result = match store
         .create(kind, account, Some(idempotency_key), request_body)
@@ -302,19 +332,87 @@ pub(crate) async fn admit_job(
     }
 }
 
+/// Wire-edge §7.5 presence rule: every non-self mint/send output must carry
+/// `delivery`. Runs **before** a job row exists; failure is
+/// `malformed_request`. Self-output uses [`is_self_output`] (narrow: recipient
+/// == subject == known owner **and** active operational bundle).
+fn require_delivery_presence(
+    command: &TransitionCommand,
+    bundles: &BundleStore,
+    subject_owner: Option<[u8; 32]>,
+) -> KernelResult<()> {
+    let (subject, templates) = match command {
+        TransitionCommand::Mint {
+            common,
+            output_templates,
+            ..
+        }
+        | TransitionCommand::Send {
+            common,
+            output_templates,
+            ..
+        } => (common.subject, output_templates.as_slice()),
+        TransitionCommand::Receive { .. } => return Ok(()),
+    };
+
+    for (i, template) in templates.iter().enumerate() {
+        if template.delivery.is_some() {
+            continue;
+        }
+        if is_self_output(&template.recipient, &subject, subject_owner, bundles) {
+            continue;
+        }
+        return Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!(
+                "output_templates[{i}].delivery is required for non-self outputs \
+                 (kind ∈ {{send,mint}})"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// `SubmitTransition` (§7.8): validate the closed command, admit, notify.
 ///
-/// Mint, send, and receive share the admit path. Presence/bounds checks
-/// run first ([`validate_transition_command`]); a well-formed
-/// `kind=receive` creates a `jobs.kind = 'receive'` row and enqueues the
-/// dispatcher. Clause-10 slot reconstitution and §2.3.3 prove/finalise
-/// remain on the dispatcher / `v1::receive` surface (the command body
-/// carries only `fold_coin_ids` plus common fields — see §7.5).
+/// Mint, send, and receive share the admit path. Ordering:
+/// 1. Shape / bounds ([`validate_transition_command`])
+/// 2. §7.5 `delivery` presence ([`require_delivery_presence`] / [`is_self_output`])
+///    — **before** a job row exists
+/// 3. Both credential checklists + store fill
+///    ([`check_and_store_delivery_credentials`]) — still before admit so
+///    secrets never hit the job body; failures stay `malformed_request`
+///    (no deferred delivery-time discovery). The filled
+///    [`DeliveryTargetStore`] is what the prove/finalise mesh path reads.
+/// 4. Admit + dispatcher handoff
+///
+/// A well-formed `kind=receive` creates a `jobs.kind = 'receive'` row and
+/// enqueues the dispatcher. Clause-10 slot reconstitution and §2.3.3
+/// prove/finalise remain on the dispatcher / `v1::receive` surface.
 pub(crate) async fn submit_transition(
     deps: SubmitTransitionDeps<'_>,
     command: TransitionCommand,
 ) -> KernelResult<Job> {
     validate_transition_command(&command)?;
+
+    // Wire-edge presence (kernel-only): missing delivery on a foreign output
+    // never creates a job.
+    require_delivery_presence(&command, deps.bundles, deps.subject_owner)?;
+
+    // Credential checklists + verified store fill (kernel-only). Secrets are
+    // discarded after a full pass; only {ivpk, op_pubkey, relays} (+ TTL)
+    // remain for the prove/finalise delivery path.
+    check_and_store_delivery_credentials(
+        &command,
+        &DeliveryCheckDeps {
+            bundles: deps.bundles,
+            delivery_targets: deps.delivery_targets,
+            profile_high_water: deps.profile_high_water,
+            subject_owner: deps.subject_owner,
+            network: deps.network,
+            clock: deps.clock,
+        },
+    )?;
 
     let common = command.common().clone();
     let account = common.subject.0;
@@ -327,7 +425,18 @@ pub(crate) async fn submit_transition(
     };
     let request_body = encode_normative_request_body(&command)?;
 
-    let row = match admit_job(deps, store_kind, &account, idem_key, request_body).await {
+    let row = match admit_job(
+        AdmitJobDeps {
+            store: deps.store,
+            job_tx: deps.job_tx,
+        },
+        store_kind,
+        &account,
+        idem_key,
+        request_body,
+    )
+    .await
+    {
         Ok(AdmitOutcome::Fresh(row) | AdmitOutcome::Replay(row)) => row,
         Err(e) => return Err(e.into_kernel_error()),
     };
@@ -432,6 +541,10 @@ fn encode_issuance(issuance: &Issuance) -> serde_json::Value {
 }
 
 fn encode_output_templates(templates: &[OutputTemplate]) -> serde_json::Value {
+    // Idempotency body: structural fields only. Delivery credentials are
+    // **not** persisted here — after a successful checklist the store holds
+    // only `{ivpk, op_pubkey, relays}` (+ TTL); `pk0` / `nk_commit` / `memo`
+    // / signatures are discarded (§7.5 retention mandate).
     let items: Vec<serde_json::Value> = templates
         .iter()
         .map(|t| {
@@ -439,6 +552,7 @@ fn encode_output_templates(templates: &[OutputTemplate]) -> serde_json::Value {
                 "recipient": hex::encode(t.recipient.0),
                 "asset_id": hex::encode(t.asset_id.0),
                 "amount": t.amount.to_string(),
+                "has_delivery": t.delivery.is_some(),
             })
         })
         .collect();
@@ -493,11 +607,24 @@ pub(crate) mod fixtures {
         }
     }
 
+    /// Self-output template: recipient equals `common_self` subject `0xA1`.
+    /// Delivery may be omitted when the test plants owner + active bundle.
     pub(crate) fn one_output() -> OutputTemplate {
+        OutputTemplate {
+            recipient: subject(0xA1),
+            asset_id: digest(0xE5),
+            amount: 1,
+            delivery: None,
+        }
+    }
+
+    /// Foreign (non-self) output without delivery — fails the presence rule.
+    pub(crate) fn foreign_output() -> OutputTemplate {
         OutputTemplate {
             recipient: subject(0xD4),
             asset_id: digest(0xE5),
             amount: 1,
+            delivery: None,
         }
     }
 
@@ -533,8 +660,12 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+    use crate::kernel::bootstrap::BundleStore;
+    use crate::kernel::jobs::ProfileHighWaterStore;
     use crate::kernel::JobState;
     use crate::test_db::{setup_pool, SchemaScope};
+    use crate::v1::DeliveryTargetStore;
+    use shared::spec_v1::ManifestClock;
     use std::sync::Arc;
 
     async fn fresh_store() -> (Arc<JobStore>, SchemaScope) {
@@ -542,11 +673,38 @@ mod tests {
         (Arc::new(JobStore::new(scope.pool.clone())), scope)
     }
 
+    fn plant_self_subject(bundles: &BundleStore) {
+        use crate::kernel::bootstrap::OperationalBundle;
+        let subj = subject(0xA1);
+        let _ = bundles.install_for_test(
+            &subj,
+            OperationalBundle {
+                ivk: [1; 32],
+                ovk: [2; 32],
+                op: [3; 32],
+                nk: [4; 32],
+                op_secret: [5; 32],
+            },
+        );
+    }
+
     fn deps<'a>(
         store: &'a JobStore,
         job_tx: &'a mpsc::Sender<JobEnvelope>,
+        bundles: &'a BundleStore,
+        targets: &'a DeliveryTargetStore,
+        hw: &'a ProfileHighWaterStore,
     ) -> SubmitTransitionDeps<'a> {
-        SubmitTransitionDeps { store, job_tx }
+        SubmitTransitionDeps {
+            store,
+            job_tx,
+            bundles,
+            delivery_targets: targets,
+            profile_high_water: hw,
+            subject_owner: Some(subject(0xA1).0),
+            network: crate::kernel::chain::KernelNetwork::Regtest,
+            clock: ManifestClock::UnixSeconds(1_700_000_000),
+        }
     }
 
     // ---- Presence / bounds matrix (unit; no store) ----
@@ -713,18 +871,28 @@ mod tests {
         // Drain enqueue so the channel never fills.
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-        let first = submit_transition(deps(store.as_ref(), &tx), mint_cmd("idem-same"))
-            .await
-            .expect("first");
+        let bundles = BundleStore::new();
+        plant_self_subject(&bundles);
+        let targets = DeliveryTargetStore::new();
+        let hw = ProfileHighWaterStore::new();
+        let first = submit_transition(
+            deps(store.as_ref(), &tx, &bundles, &targets, &hw),
+            mint_cmd("idem-same"),
+        )
+        .await
+        .expect("first");
         assert!(
             matches!(first.state, JobState::Accepted),
             "fresh mint is accepted, got {:?}",
             first.state
         );
 
-        let second = submit_transition(deps(store.as_ref(), &tx), mint_cmd("idem-same"))
-            .await
-            .expect("replay");
+        let second = submit_transition(
+            deps(store.as_ref(), &tx, &bundles, &targets, &hw),
+            mint_cmd("idem-same"),
+        )
+        .await
+        .expect("replay");
         assert_eq!(second.id, first.id, "same key + same body → same job");
     }
 
@@ -734,9 +902,16 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<JobEnvelope>(8);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-        submit_transition(deps(store.as_ref(), &tx), mint_cmd("idem-diff"))
-            .await
-            .expect("first");
+        let bundles = BundleStore::new();
+        plant_self_subject(&bundles);
+        let targets = DeliveryTargetStore::new();
+        let hw = ProfileHighWaterStore::new();
+        submit_transition(
+            deps(store.as_ref(), &tx, &bundles, &targets, &hw),
+            mint_cmd("idem-diff"),
+        )
+        .await
+        .expect("first");
 
         let mut other = mint_cmd("idem-diff");
         if let TransitionCommand::Mint { issuance, .. } = &mut other {
@@ -746,7 +921,7 @@ mod tests {
                 amount: 999,
             };
         }
-        let err = submit_transition(deps(store.as_ref(), &tx), other)
+        let err = submit_transition(deps(store.as_ref(), &tx, &bundles, &targets, &hw), other)
             .await
             .expect_err("conflict");
         assert_eq!(
@@ -774,7 +949,10 @@ mod tests {
         let key = "k-strip";
 
         let first = admit_job(
-            deps(store.as_ref(), &tx),
+            AdmitJobDeps {
+                store: store.as_ref(),
+                job_tx: &tx,
+            },
             job_store::JobKind::Mint,
             &account,
             key,
@@ -811,7 +989,10 @@ mod tests {
         );
 
         let second = admit_job(
-            deps(store.as_ref(), &tx),
+            AdmitJobDeps {
+                store: store.as_ref(),
+                job_tx: &tx,
+            },
             job_store::JobKind::Mint,
             &account,
             key,
@@ -835,9 +1016,15 @@ mod tests {
         // Drain enqueue so the channel never fills; this test is admit-only.
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-        let job = submit_transition(deps(store.as_ref(), &tx), receive_cmd("k-rx"))
-            .await
-            .expect("valid receive must admit");
+        let bundles = BundleStore::new();
+        let targets = DeliveryTargetStore::new();
+        let hw = ProfileHighWaterStore::new();
+        let job = submit_transition(
+            deps(store.as_ref(), &tx, &bundles, &targets, &hw),
+            receive_cmd("k-rx"),
+        )
+        .await
+        .expect("valid receive must admit");
         assert!(
             matches!(job.state, JobState::Accepted),
             "fresh receive is accepted, got {:?}",
@@ -888,13 +1075,69 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<JobEnvelope>(8);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-        let first = submit_transition(deps(store.as_ref(), &tx), receive_cmd("idem-rx"))
-            .await
-            .expect("first");
-        let second = submit_transition(deps(store.as_ref(), &tx), receive_cmd("idem-rx"))
-            .await
-            .expect("replay");
+        let bundles = BundleStore::new();
+        let targets = DeliveryTargetStore::new();
+        let hw = ProfileHighWaterStore::new();
+        let first = submit_transition(
+            deps(store.as_ref(), &tx, &bundles, &targets, &hw),
+            receive_cmd("idem-rx"),
+        )
+        .await
+        .expect("first");
+        let second = submit_transition(
+            deps(store.as_ref(), &tx, &bundles, &targets, &hw),
+            receive_cmd("idem-rx"),
+        )
+        .await
+        .expect("replay");
         assert_eq!(second.id, first.id, "same key + same body → same job");
+    }
+
+    /// Full `submit_transition` path (not a direct unit call of the check
+    /// helpers): missing `delivery` on a foreign output is rejected at the
+    /// wire edge with `malformed_request` and **no** job row is created.
+    ///
+    /// This is the wiring witness — if presence is only unit-tested on the
+    /// helper, a Submit in production could still skip the chain.
+    #[tokio::test]
+    async fn missing_delivery_on_foreign_output_no_job() {
+        let (store, _db) = fresh_store().await;
+        let (tx, mut rx) = mpsc::channel::<JobEnvelope>(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let bundles = BundleStore::new();
+        plant_self_subject(&bundles);
+        let targets = DeliveryTargetStore::new();
+        let hw = ProfileHighWaterStore::new();
+        let mut cmd = send_cmd("no-del");
+        if let TransitionCommand::Send {
+            output_templates, ..
+        } = &mut cmd
+        {
+            *output_templates = vec![foreign_output()];
+        }
+        let err = submit_transition(deps(store.as_ref(), &tx, &bundles, &targets, &hw), cmd)
+            .await
+            .expect_err("foreign without delivery");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(
+            err.public_message.contains("delivery is required"),
+            "{}",
+            err.public_message
+        );
+        // Presence fails before admit: store must be empty for this subject.
+        let account = subject(0xA1).0;
+        let rows: (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::bigint FROM jobs WHERE account_address = $1")
+                .bind(&account[..])
+                .fetch_one(store.pool())
+                .await
+                .expect("count jobs");
+        assert_eq!(rows.0, 0, "presence failure must not create a job row");
+        assert!(
+            targets.get(&subject(0xD4).0).is_none(),
+            "target store stays empty when presence fails before checklist"
+        );
     }
 
     #[test]

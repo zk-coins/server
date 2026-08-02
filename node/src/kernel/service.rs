@@ -108,6 +108,10 @@ pub(crate) struct KernelServiceConfig {
     /// domain tests; production additionally mirrors accepted members into
     /// `v1_pending_publishes` when the exclusive V1 engine is installed.
     pub handoff_queue: Arc<InMemoryHandOffQueue>,
+    /// Verified delivery targets filled by `SubmitTransition` credential checks.
+    pub delivery_targets: Arc<crate::v1::DeliveryTargetStore>,
+    /// Relay-relative kind-0 high-water for profile delivery freshness.
+    pub profile_high_water: Arc<crate::kernel::jobs::ProfileHighWaterStore>,
 }
 
 /// Crate-private kernel façade.
@@ -138,6 +142,10 @@ pub(crate) struct KernelService {
     publish_batch_eta_secs: Option<u64>,
     /// Durable §7.6 hand-off queue (see [`KernelServiceConfig::handoff_queue`]).
     handoff_queue: Arc<InMemoryHandOffQueue>,
+    /// Verified delivery targets (see [`KernelServiceConfig::delivery_targets`]).
+    delivery_targets: Arc<crate::v1::DeliveryTargetStore>,
+    /// Profile high-water (see [`KernelServiceConfig::profile_high_water`]).
+    profile_high_water: Arc<crate::kernel::jobs::ProfileHighWaterStore>,
 }
 
 impl KernelService {
@@ -156,6 +164,8 @@ impl KernelService {
             chain,
             publish_batch_eta_secs,
             handoff_queue,
+            delivery_targets,
+            profile_high_water,
         }: KernelServiceConfig,
     ) -> Self {
         Self {
@@ -172,6 +182,8 @@ impl KernelService {
             chain,
             publish_batch_eta_secs,
             handoff_queue,
+            delivery_targets,
+            profile_high_water,
         }
     }
 
@@ -193,6 +205,8 @@ impl KernelService {
             chain: ChainHandle::default(),
             publish_batch_eta_secs: None,
             handoff_queue: Arc::new(InMemoryHandOffQueue::new()),
+            delivery_targets: crate::v1::DeliveryTargetStore::shared(),
+            profile_high_water: crate::kernel::jobs::ProfileHighWaterStore::shared(),
         })
     }
 
@@ -239,6 +253,8 @@ impl KernelService {
             chain,
             publish_batch_eta_secs: None,
             handoff_queue: Arc::new(InMemoryHandOffQueue::new()),
+            delivery_targets: crate::v1::DeliveryTargetStore::shared(),
+            profile_high_water: crate::kernel::jobs::ProfileHighWaterStore::shared(),
         })
     }
 
@@ -281,6 +297,21 @@ impl KernelService {
     pub(crate) fn with_bundle_store(mut self, bundles: Arc<BundleStore>) -> Self {
         self.bundles = bundles;
         self
+    }
+
+    /// Install the shared delivery-target store used by mesh send and by
+    /// `SubmitTransition` credential verification.
+    pub(crate) fn with_delivery_targets(
+        mut self,
+        targets: Arc<crate::v1::DeliveryTargetStore>,
+    ) -> Self {
+        self.delivery_targets = targets;
+        self
+    }
+
+    /// Shared delivery-target store handle (tests / mesh wiring).
+    pub(crate) fn delivery_targets(&self) -> &Arc<crate::v1::DeliveryTargetStore> {
+        &self.delivery_targets
     }
 
     /// Install the boot-time verified bootstrap-manifest store (or empty).
@@ -433,7 +464,8 @@ impl KernelService {
         .await
     }
 
-    /// `SubmitTransition` — presence/bounds validate, admit, dispatcher handoff.
+    /// `SubmitTransition` — presence/bounds validate, delivery credential
+    /// checklists + store fill, admit, dispatcher handoff.
     ///
     /// `job_tx` is the same admit queue the legacy mint/send routes use.
     /// Kept as a method argument (not stored on the service) so read-only
@@ -443,14 +475,81 @@ impl KernelService {
         job_tx: &mpsc::Sender<JobEnvelope>,
         request: TransitionCommand,
     ) -> KernelResult<Job> {
+        let subject = request.common().subject;
+        let subject_owner = self.lookup_account_owner(&subject);
+        // Network pin is required for any profile credential (zkcoins.network
+        // check). Invoice-only paths still need a closed label for the deps
+        // struct — fail loud when a profile is present and no pin exists.
+        let needs_network = match &request {
+            TransitionCommand::Mint {
+                output_templates, ..
+            }
+            | TransitionCommand::Send {
+                output_templates, ..
+            } => output_templates.iter().any(|t| {
+                matches!(
+                    t.delivery,
+                    Some(crate::kernel::types::DeliveryCredential::Profile(_))
+                )
+            }),
+            TransitionCommand::Receive { .. } => false,
+        };
+        let network = match self.publish_network() {
+            Some(n) => n,
+            None if needs_network => {
+                return Err(KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Network pin required for profile delivery credentials",
+                    "KernelService has no chain.network / identity.network for \
+                     profile zkcoins.network check",
+                ));
+            }
+            // Invoice-only / receive / self-output: network is unused by the
+            // checklist. Regtest is a closed label placeholder only — never
+            // a silent default for a profile path (guarded above).
+            None => crate::kernel::chain::KernelNetwork::Regtest,
+        };
+        // Wall clock → ManifestClock at the service edge (same pattern as
+        // bootstrap-manifest load). The credential check is fail-closed on
+        // Unavailable; we do not skip the profile age window.
+        let clock = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => shared::spec_v1::ManifestClock::UnixSeconds(d.as_secs()),
+            Err(_) => shared::spec_v1::ManifestClock::Unavailable,
+        };
         jobs::submit_transition(
             SubmitTransitionDeps {
                 store: self.job_store.as_ref(),
                 job_tx,
+                bundles: self.bundles.as_ref(),
+                // Same process-local store the finalise/mesh path reads via
+                // [`Self::delivery_targets`] (runtime installs one Arc on both).
+                delivery_targets: self.delivery_targets().as_ref(),
+                profile_high_water: self.profile_high_water.as_ref(),
+                subject_owner,
+                network,
+                clock,
             },
             request,
         )
         .await
+    }
+
+    /// Persisted `AccountState.owner` for `subject`, when the private index
+    /// holds a canonical serialisation. Absence means the self-output owner
+    /// leg cannot hold (fail-closed: not self without a known owner).
+    fn lookup_account_owner(
+        &self,
+        subject: &crate::kernel::types::SubjectAddress,
+    ) -> Option<[u8; 32]> {
+        use crate::kernel::access::PrivateIndex;
+        let view = self.private_index.get_account_state(subject).ok()?;
+        // Canonical §1.7.4 layout: owner is the first 32 bytes; min length 140.
+        if view.account_state.len() < 140 {
+            return None;
+        }
+        let mut owner = [0u8; 32];
+        owner.copy_from_slice(&view.account_state[0..32]);
+        Some(owner)
     }
 
     /// `AttestBalance` — consume challenge, admit `attest_balance` job.

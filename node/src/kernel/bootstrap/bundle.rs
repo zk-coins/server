@@ -188,6 +188,21 @@ impl BundleStore {
         )
     }
 
+    /// Test-only install that bypasses the challenge gate.
+    ///
+    /// Production entrust always goes through
+    /// [`entrust_operational_bundle`]. This exists so unit tests for the
+    /// §7.5 self-output rule can plant an active bundle without minting a
+    /// full OwnershipProof challenge.
+    #[cfg(test)]
+    pub(crate) fn install_for_test(
+        &self,
+        subject: &SubjectAddress,
+        bundle: OperationalBundle,
+    ) -> bool {
+        matches!(self.try_install(subject, bundle), InstallOutcome::Installed)
+    }
+
     /// Snapshot every active (subject, bundle) pair — for ACK inbox polling
     /// and other process-local sweeps. Order is unspecified.
     pub(crate) fn list_active(&self) -> Vec<(SubjectAddress, OperationalBundle)> {

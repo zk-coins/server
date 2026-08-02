@@ -1340,10 +1340,10 @@ async fn admit_and_enqueue(
     idem_key: &str,
     request_body: serde_json::Value,
 ) -> axum::response::Response {
-    use crate::kernel::jobs::submit::{admit_job, AdmitError, AdmitOutcome, SubmitTransitionDeps};
+    use crate::kernel::jobs::submit::{admit_job, AdmitError, AdmitJobDeps, AdmitOutcome};
 
     let outcome = match admit_job(
-        SubmitTransitionDeps {
+        AdmitJobDeps {
             store: state.job_store.as_ref(),
             job_tx: &state.job_tx,
         },

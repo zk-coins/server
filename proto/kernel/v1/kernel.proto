@@ -131,7 +131,51 @@ message NullifierPath {
   //   non-inclusion proof; MUST NOT back a credit (§3.7 Path B).
 }
 
-message OutputTemplate { string recipient = 1; bytes asset_id = 2; string amount = 3; }
+message OutputTemplate {
+  string recipient = 1;
+  bytes asset_id = 2;
+  string amount = 3;
+  DeliveryCredential delivery = 4;         // required for every non-self output; absent on
+                                           //   self-outputs (§7.5 presence rule). Verification
+                                           //   is kernel-only (§6.1, §7.5); the API forwards
+                                           //   the field unchanged and MUST NOT mark it verified.
+}
+// Closed tagged union matching §7.5 DeliveryCredential. Exactly one arm is set;
+// any other shape is malformed_request. The two variants have separate, complete
+// check-lists (§7.5): invoice runs the three §4.3 Invoice checks plus byte-exact
+// equality of recipient/asset_id/amount with this OutputTemplate; profile runs the
+// §4.3 profile chain plus zkcoins.address == output.recipient (amount and asset
+// are not compared — a profile is an addressing credential, not a payment
+// authorisation). This field is a §1.7.8 between-step-3-and-step-7 wire addition
+// (neither circuit nor pinned vector nor digest).
+message DeliveryCredential {
+  oneof body {
+    Invoice invoice = 1;                   // type "invoice" — full §1.5 / §4.3 Invoice
+    Kind0Event profile_event = 2;          // type "profile" — full canonical kind-0 event
+  }
+}
+message Invoice {
+  string amount = 1;
+  string recipient = 2;                    // zk-address (Bech32m string)
+  bytes asset_id = 3;
+  string memo = 4;                         // empty when absent
+  bytes pk0 = 5;                           // 32B x-only
+  bytes nk_commit = 6;                     // 32B
+  bytes ivpk = 7;                          // 32B
+  bytes op_pubkey = 8;                     // 32B x-only
+  repeated string relays = 9;
+  bytes addr_sig = 10;                     // 64B BIP-340 under pk0
+  bytes sig = 11;                          // 64B BIP-340 under op_pubkey
+}
+message Kind0Event {
+  bytes id = 1;                            // 32B event id
+  bytes pubkey = 2;                        // 32B author (op_pubkey)
+  uint64 created_at = 3;
+  uint32 kind = 4;                         // MUST be 0
+  string tags_json = 5;                    // canonical JSON array of tags (NIP-01; typically [])
+  string content = 6;                      // JSON content carrying the zkcoins object
+  bytes sig = 7;                           // 64B Nostr event signature under author
+}
 message Issuance {
   string name = 1; uint32 decimals = 2; uint32 issuance_version = 3;
   string amount = 4;

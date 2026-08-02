@@ -10,9 +10,13 @@ use crate::kernel::{
     CancelPolicy, Job, JobEvent, JobEventHub, JobRequest, KernelError, KernelResult, KernelStream,
 };
 
+pub(crate) mod delivery_credential;
 pub(crate) mod sign;
 pub(crate) mod submit;
 
+pub(crate) use delivery_credential::{
+    check_and_store_delivery_credentials, is_self_output, DeliveryCheckDeps, ProfileHighWaterStore,
+};
 pub(crate) use sign::sign_transition;
 // `admit_job` / `validate_transition_command` stay in `submit` and are
 // imported via `jobs::submit::…` where needed (router, tests). Re-exporting

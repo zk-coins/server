@@ -807,6 +807,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         .with_bundle_store(Arc::clone(&shared_bundle_store))
         .with_private_index(Arc::clone(&shared_private_index))
         .with_receipt_hub(Arc::clone(&shared_receipt_hub))
+        .with_delivery_targets(Arc::clone(&shared_delivery_targets))
         .with_publish_batch_eta_secs(publish_batch_eta_secs);
         // Pull/Records/SubscribeReceipts share the process mirror of
         // `v1_decrypt_index` (migration 0031) and the receipt hub. The
@@ -817,7 +818,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             receipt_hub_refs = Arc::strong_count(domain.receipt_hub()),
             bootstrap_manifest_refs = Arc::strong_count(domain.manifest_store()),
             bootstrap_manifest_loaded = domain.manifest_store().is_loaded(),
-            delivery_target_refs = Arc::strong_count(&shared_delivery_targets),
+            delivery_target_refs = Arc::strong_count(domain.delivery_targets()),
             delivery_retention_len = shared_delivery_retention.len(),
             "kernel access surfaces installed (Pull/Records/SubscribeReceipts; \
              durable decrypt-index + process mirror + receipt hub)"

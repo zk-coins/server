@@ -116,12 +116,30 @@ pub(crate) enum PublisherChoice {
     FeeLessHandOff { publisher_pubkey: XOnlyKey },
 }
 
+/// Closed §7.5 `DeliveryCredential` carried on a non-self
+/// [`OutputTemplate`] (and optionally on a self-output).
+///
+/// Wire `oneof` is closed: invoice | profile. Verification is kernel-only
+/// and reuses the §4.3 checklists in `v1::nostr::profile`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeliveryCredential {
+    /// Full §1.5 / §4.3 amount-specific Invoice.
+    Invoice(crate::v1::PaymentInvoice),
+    /// Full canonical kind-0 event (author, created_at, Nostr signature).
+    Profile(crate::v1::nostr::event::Event),
+}
+
 /// One output template (§7.5 `OutputTemplate`); amount is a decoded `u128`.
+///
+/// `delivery` is required for every non-self output (§7.5 presence rule).
+/// A self-output **MAY** omit it; when present it must still satisfy the
+/// matching checklist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutputTemplate {
     pub recipient: SubjectAddress,
     pub asset_id: Digest32,
     pub amount: u128,
+    pub delivery: Option<DeliveryCredential>,
 }
 
 /// Issuance block for `kind == mint` (§7.5 / §6.5).

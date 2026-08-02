@@ -22,8 +22,8 @@ use crate::kernel::publish::{
     refuse_v1_fee_fields, PublishBlockAnchor, PublishCommand, PublishOutcome,
 };
 use crate::kernel::types::{
-    ChanBind, Digest32, Issuance, JobKind, JobPayload, OutputTemplate, PublisherChoice,
-    SubjectAddress, TransitionCommon, XOnlyKey,
+    ChanBind, DeliveryCredential, Digest32, Issuance, JobKind, JobPayload, OutputTemplate,
+    PublisherChoice, SubjectAddress, TransitionCommon, XOnlyKey,
 };
 use crate::kernel::{
     AccumulatorTip as DomainAccumulatorTip, KernelInfo, ListInscriptions as DomainListInscriptions,
@@ -39,10 +39,11 @@ use kernel_proto::{
     AccountStateResult as ProtoAccountStateResult, AccumulatorTip as ProtoAccumulatorTip,
     AttestRequest as ProtoAttestRequest, AwaitingSignature as ProtoAwaitingSignature,
     BootstrapManifest as ProtoBootstrapManifest, CoinProofBlob as ProtoCoinProofBlob,
-    CoinProofRequest as ProtoCoinProofRequest, EntrustRequest as ProtoEntrustRequest,
-    EntrustResult as ProtoEntrustResult, GrantRequest as ProtoGrantRequest, Info as ProtoInfo,
+    CoinProofRequest as ProtoCoinProofRequest, DeliveryCredential as ProtoDeliveryCredential,
+    EntrustRequest as ProtoEntrustRequest, EntrustResult as ProtoEntrustResult,
+    GrantRequest as ProtoGrantRequest, Info as ProtoInfo, Invoice as ProtoInvoice,
     Issuance as ProtoIssuance, Job as ProtoJob, JobError as ProtoJobError,
-    JobEvent as ProtoJobEvent, JobResult as ProtoJobResult,
+    JobEvent as ProtoJobEvent, JobResult as ProtoJobResult, Kind0Event as ProtoKind0Event,
     ListInscriptionsRequest as ProtoListInscriptionsRequest, NullifierPath as ProtoNullifierPath,
     NullifierPathRequest as ProtoNullifierPathRequest, OutputTemplate as ProtoOutputTemplate,
     PublishRequest as ProtoPublishRequest, PublishResult as ProtoPublishResult,
@@ -749,13 +750,146 @@ fn parse_output_templates(list: &[ProtoOutputTemplate]) -> KernelResult<Vec<Outp
         })?;
         let asset_id = parse_digest32(&t.asset_id, &format!("output_templates[{i}].asset_id"))?;
         let amount = parse_u128_decimal(&t.amount, &format!("output_templates[{i}].amount"))?;
+        // Proto3 sub-message: absence is `None`; a present empty oneof body
+        // is malformed (same present-but-empty discipline as publisher_pubkey
+        // width — never silently treat an empty credential as "absent").
+        let delivery = match t.delivery.as_ref() {
+            None => None,
+            Some(cred) => Some(parse_delivery_credential(cred, i)?),
+        };
         out.push(OutputTemplate {
             recipient,
             asset_id,
             amount,
+            delivery,
         });
     }
     Ok(out)
+}
+
+/// Parse the closed §7.5 `DeliveryCredential` oneof.
+///
+/// Exactly one arm must be set. A present message with neither arm set is
+/// `malformed_request` — not "absent delivery".
+fn parse_delivery_credential(
+    cred: &ProtoDeliveryCredential,
+    output_index: usize,
+) -> KernelResult<DeliveryCredential> {
+    let prefix = format!("output_templates[{output_index}].delivery");
+    match cred.body.as_ref() {
+        None => Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("{prefix}: DeliveryCredential oneof body is required (invoice|profile_event)"),
+        )),
+        Some(kernel_proto::delivery_credential::Body::Invoice(inv)) => Ok(
+            DeliveryCredential::Invoice(parse_wire_invoice(inv, &prefix)?),
+        ),
+        Some(kernel_proto::delivery_credential::Body::ProfileEvent(ev)) => Ok(
+            DeliveryCredential::Profile(parse_wire_kind0_event(ev, &prefix)?),
+        ),
+    }
+}
+
+fn parse_wire_invoice(inv: &ProtoInvoice, prefix: &str) -> KernelResult<crate::v1::PaymentInvoice> {
+    let amount = parse_u128_decimal(&inv.amount, &format!("{prefix}.invoice.amount"))?;
+    let recipient = parse_subject_address(&inv.recipient).map_err(|e| {
+        KernelError::new(
+            e.code,
+            format!("{prefix}.invoice.recipient: {}", e.public_message),
+        )
+    })?;
+    let asset_id = parse_digest32(&inv.asset_id, &format!("{prefix}.invoice.asset_id"))?;
+    let pk0 = parse_exact_32(&inv.pk0, &format!("{prefix}.invoice.pk0"))?;
+    let nk_commit = parse_exact_32(&inv.nk_commit, &format!("{prefix}.invoice.nk_commit"))?;
+    let ivpk = parse_exact_32(&inv.ivpk, &format!("{prefix}.invoice.ivpk"))?;
+    let op_pubkey = parse_exact_32(&inv.op_pubkey, &format!("{prefix}.invoice.op_pubkey"))?;
+    let addr_sig = parse_exact_64(&inv.addr_sig, &format!("{prefix}.invoice.addr_sig"))?;
+    let sig = parse_exact_64(&inv.sig, &format!("{prefix}.invoice.sig"))?;
+    // Empty string is the wire encoding of "memo absent" (§7.8 Invoice.memo).
+    let memo = {
+        let t = inv.memo.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+    if inv.relays.is_empty() {
+        return Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("{prefix}.invoice.relays must contain at least one relay URL"),
+        ));
+    }
+    Ok(crate::v1::PaymentInvoice {
+        amount,
+        recipient: recipient.0,
+        asset_id: asset_id.0,
+        memo,
+        pk0,
+        nk_commit,
+        ivpk,
+        op_pubkey,
+        relays: inv.relays.clone(),
+        addr_sig,
+        sig,
+    })
+}
+
+fn parse_wire_kind0_event(
+    ev: &ProtoKind0Event,
+    prefix: &str,
+) -> KernelResult<crate::v1::nostr::event::Event> {
+    use crate::v1::nostr::event::{Event, EventParts};
+
+    let id = parse_exact_32(&ev.id, &format!("{prefix}.profile_event.id"))?;
+    let pubkey = parse_exact_32(&ev.pubkey, &format!("{prefix}.profile_event.pubkey"))?;
+    let sig = parse_exact_64(&ev.sig, &format!("{prefix}.profile_event.sig"))?;
+    if ev.kind != 0 {
+        return Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!(
+                "{prefix}.profile_event.kind must be 0 (kind-0 metadata); got {}",
+                ev.kind
+            ),
+        ));
+    }
+    let tags: Vec<Vec<String>> = if ev.tags_json.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(ev.tags_json.trim()).map_err(|_| {
+            KernelError::new(
+                KernelErrorCode::MalformedRequest,
+                format!("{prefix}.profile_event.tags_json must be a JSON array of tag arrays"),
+            )
+        })?
+    };
+    // verify_parts recomputes id and checks BIP-340 — claimed id/sig are never trusted raw.
+    Event::verify_parts(EventParts {
+        id,
+        pubkey,
+        created_at: ev.created_at,
+        kind: ev.kind,
+        tags,
+        content: ev.content.clone(),
+        sig,
+    })
+    .map_err(|e| {
+        // Named failure class only — never quote event content / signatures.
+        KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("{prefix}.profile_event: kind-0 event failed NIP-01 verification ({e})"),
+        )
+    })
+}
+
+fn parse_exact_64(bytes: &[u8], field: &str) -> KernelResult<[u8; 64]> {
+    match <[u8; 64]>::try_from(bytes) {
+        Ok(a) => Ok(a),
+        Err(_) => Err(KernelError::new(
+            KernelErrorCode::MalformedRequest,
+            format!("{field} must be exactly 64 bytes; got {}", bytes.len()),
+        )),
+    }
 }
 
 fn parse_issuance(i: ProtoIssuance) -> KernelResult<Issuance> {
@@ -1530,6 +1664,7 @@ mod tests {
             recipient: receive_subject_bech32(),
             asset_id: vec![0xE5u8; 32],
             amount: "1".into(),
+            delivery: None,
         }];
         let err = parse_transition_request(req).expect_err("output_templates forbidden on receive");
         assert_eq!(err.code, KernelErrorCode::MalformedRequest);
@@ -1538,5 +1673,28 @@ mod tests {
             "must name the forbidden field: {}",
             err.public_message
         );
+    }
+
+    #[test]
+    fn present_delivery_with_empty_oneof_is_malformed_not_absent() {
+        // Present-but-empty discipline: a DeliveryCredential message with
+        // neither arm set is not "delivery absent" — it is malformed.
+        let mut t = ProtoOutputTemplate {
+            recipient: receive_subject_bech32(),
+            asset_id: vec![0xE5u8; 32],
+            amount: "1".into(),
+            delivery: Some(kernel_proto::DeliveryCredential { body: None }),
+        };
+        let err = parse_output_templates(std::slice::from_ref(&t)).expect_err("empty oneof");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(
+            err.public_message.contains("oneof") || err.public_message.contains("body"),
+            "{}",
+            err.public_message
+        );
+        // Absent delivery remains Ok at parse (presence rule is admit-time).
+        t.delivery = None;
+        let ok = parse_output_templates(&[t]).expect("absent delivery parses");
+        assert!(ok[0].delivery.is_none());
     }
 }

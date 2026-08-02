@@ -146,9 +146,9 @@ pub(crate) use attest::{
 // (`crate::v1::delivery::…` / signature).
 //
 // `DeliveryTargetStore` + `PaymentInvoice` are **public**: the API/SDK layer
-// (other repo) must insert a verified §4.3 Invoice before mesh send — see
-// `insert_verified_invoice` doc. No in-crate production caller is the
-// documented gap, not a reason to hide the façade.
+// (other repo) may still insert a verified §4.3 Invoice directly. The
+// in-crate production caller is now `SubmitTransition` (§7.5
+// `OutputTemplate.delivery` → verified insert after the kernel checklist).
 pub use delivery::DeliveryTargetStore;
 pub(crate) use delivery::{MeshDeliveryPort, OutgoingDeliveryPort, PendingDeliveryStore};
 /// §4.4 receive poll used from `runtime`.
