@@ -176,11 +176,8 @@ pub async fn finalize_due_phase_b_adapter(
     tip_hash: [u8; 32],
     occurred_at: u64,
 ) -> Result<usize> {
-    let mtp = match provisional_inclusion_mtp_for_network(
-        adapter.network(),
-        tip_hash,
-        occurred_at,
-    ) {
+    let mtp = match provisional_inclusion_mtp_for_network(adapter.network(), tip_hash, occurred_at)
+    {
         Ok(m) => m,
         Err(e) => {
             // Mainnet (or any network that refuses provisional): do not write
@@ -864,8 +861,9 @@ mod tests {
 
     #[test]
     fn mainnet_refuses_provisional_inclusion_mtp() {
-        let err = provisional_inclusion_mtp_for_network(Network::Mainnet, [0xAA; 32], 1_700_000_000)
-            .expect_err("mainnet must refuse provisional MTP");
+        let err =
+            provisional_inclusion_mtp_for_network(Network::Mainnet, [0xAA; 32], 1_700_000_000)
+                .expect_err("mainnet must refuse provisional MTP");
         let msg = err.to_string();
         assert!(
             msg.contains(PROVISIONAL_MTP_MAINNET_REFUSED),
@@ -921,7 +919,10 @@ mod tests {
         let n = finalize_due_phase_b_adapter(&adapter, [0xAAu8; 32], 1_700_000_000)
             .await
             .expect("mainnet adapter path returns Ok(0), not Err");
-        assert_eq!(n, 0, "mainnet must finalise zero Phase-B rows under provisional MTP");
+        assert_eq!(
+            n, 0,
+            "mainnet must finalise zero Phase-B rows under provisional MTP"
+        );
 
         let row = db_sdr::get_phase_a(&pool, &pk)
             .await

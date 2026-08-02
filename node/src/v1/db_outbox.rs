@@ -697,13 +697,12 @@ async fn try_complete_if_ready_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     outbox_id: &[u8; 32],
 ) -> Result<()> {
-    let row: Option<(String, i32)> = sqlx::query_as(
-        "SELECT status, replication_k FROM v1_delivery_outbox WHERE outbox_id = $1",
-    )
-    .bind(outbox_id.as_slice())
-    .fetch_optional(&mut **tx)
-    .await
-    .context("v1_delivery_outbox try_complete status")?;
+    let row: Option<(String, i32)> =
+        sqlx::query_as("SELECT status, replication_k FROM v1_delivery_outbox WHERE outbox_id = $1")
+            .bind(outbox_id.as_slice())
+            .fetch_optional(&mut **tx)
+            .await
+            .context("v1_delivery_outbox try_complete status")?;
     let Some((status, replication_k)) = row else {
         return Ok(());
     };
@@ -1139,8 +1138,8 @@ mod tests {
         assert_eq!(row.status, OutboxStatus::AwaitingReceipts);
 
         // Backdate ack_received_at past the deadline.
-        let backdate_secs = i64::try_from(AWAITING_RECEIPTS_TIMEOUT_SECS + 60)
-            .expect("timeout+margin fits i64");
+        let backdate_secs =
+            i64::try_from(AWAITING_RECEIPTS_TIMEOUT_SECS + 60).expect("timeout+margin fits i64");
         sqlx::query(
             "UPDATE v1_delivery_outbox SET \
                  ack_received_at = NOW() - make_interval(secs => $2::double precision) \
@@ -1295,7 +1294,9 @@ mod tests {
         let row = get_by_id(&pool, &id).await.expect("get").expect("row");
         assert_eq!(row.status, OutboxStatus::AwaitingAck);
 
-        mark_ack_received(&pool, &id).await.expect("first ack completes");
+        mark_ack_received(&pool, &id)
+            .await
+            .expect("first ack completes");
         let row = get_by_id(&pool, &id).await.expect("get").expect("row");
         assert_eq!(row.status, OutboxStatus::Completed);
 
