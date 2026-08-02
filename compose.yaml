@@ -218,6 +218,12 @@ services:
       ZKCOINS_MAX_BLOB_BYTES: ${ZKCOINS_MAX_BLOB_BYTES:?set ZKCOINS_MAX_BLOB_BYTES integer > 0}
       ZKCOINS_KERNEL_PARTS: ${ZKCOINS_KERNEL_PARTS:?set ZKCOINS_KERNEL_PARTS e.g. scanner,prover,publisher}
 
+      # §7.6 AcceptFeeLess batch interval (seconds). Required when
+      # kernel_parts includes publisher — no invented default
+      # (runtime.rs ZKCOINS_PUBLISH_BATCH_ETA_SECS; missing eta with
+      # publisher role → internal_error on Publish).
+      ZKCOINS_PUBLISH_BATCH_ETA_SECS: ${ZKCOINS_PUBLISH_BATCH_ETA_SECS:?set ZKCOINS_PUBLISH_BATCH_ETA_SECS to a non-negative integer batch interval in seconds}
+
       # §4.3 / §7.7 BMF1 path inside the container (bind-mounted above).
       # Fixed path — host location is ZKCOINS_V1_BOOTSTRAP_MANIFEST_HOST_PATH.
       # Artifact must verify under ZKCOINS_BOOTSTRAP_PUBKEY or boot aborts.

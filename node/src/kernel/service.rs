@@ -29,13 +29,18 @@ use crate::kernel::bootstrap::{
     EntrustCommand, EntrustResult, IssuedChallenge, ManifestStore, RevokeCommand, RevokeResult,
 };
 use crate::kernel::chain;
+use crate::kernel::chain::KernelPart;
 use crate::kernel::grants::{
     self, GrantScope, IssueViewGrantCommand, IssueViewGrantDeps, ViewGrantIssued,
 };
 use crate::kernel::jobs;
 use crate::kernel::jobs::sign::SignTransitionDeps;
 use crate::kernel::jobs::submit::SubmitTransitionDeps;
-use crate::kernel::publish::{self, PublishCommand, PublishConfig, PublishOutcome, PublishPolicy};
+use crate::kernel::publish::{
+    accept_hand_off, drain_and_inscribe, policy_from_kernel_parts, seed_queue_from_pending_status,
+    HandOffMember, HandOffQueue, InMemoryHandOffQueue, PublishBlockAnchor, PublishCommand,
+    PublishConfig, PublishOutcome, PublishPolicy,
+};
 use crate::kernel::types::SubjectAddress;
 use crate::kernel::{
     AccumulatorTip, CancelPolicy, ChainIdentity, ChainReadinessFlags, ChainView, Job, JobEvent,
@@ -44,6 +49,7 @@ use crate::kernel::{
     SignTransition, TransitionCommand,
 };
 use crate::v1::{EngineAdapter, PendingSignMap};
+use shared::spec_v1::Address;
 
 /// Optional live chain handle for the four Block-6 read procedures.
 ///
@@ -93,6 +99,15 @@ pub(crate) struct KernelServiceConfig {
     pub receipt_hub: Arc<ReceiptHub>,
     /// Live NfLog / tip / identity for read-only chain procedures.
     pub chain: ChainHandle,
+    /// Operator-configured seconds until the next expected inscription batch.
+    ///
+    /// Required when `kernel_parts` includes `publisher`. Never invent a
+    /// default (the former hard-coded 60 s at the gRPC edge is gone).
+    pub publish_batch_eta_secs: Option<u64>,
+    /// Durable §7.6 hand-off queue. Defaults to an in-memory store for pure
+    /// domain tests; production additionally mirrors accepted members into
+    /// `v1_pending_publishes` when the exclusive V1 engine is installed.
+    pub handoff_queue: Arc<InMemoryHandOffQueue>,
 }
 
 /// Crate-private kernel façade.
@@ -119,6 +134,10 @@ pub(crate) struct KernelService {
     receipt_hub: Arc<ReceiptHub>,
     /// Live NfLog / tip / identity for read-only chain procedures.
     chain: ChainHandle,
+    /// Operator-configured batch interval for fee-less AcceptFeeLess.
+    publish_batch_eta_secs: Option<u64>,
+    /// Durable §7.6 hand-off queue (see [`KernelServiceConfig::handoff_queue`]).
+    handoff_queue: Arc<InMemoryHandOffQueue>,
 }
 
 impl KernelService {
@@ -135,6 +154,8 @@ impl KernelService {
             private_index,
             receipt_hub,
             chain,
+            publish_batch_eta_secs,
+            handoff_queue,
         }: KernelServiceConfig,
     ) -> Self {
         Self {
@@ -149,6 +170,8 @@ impl KernelService {
             private_index,
             receipt_hub,
             chain,
+            publish_batch_eta_secs,
+            handoff_queue,
         }
     }
 
@@ -168,6 +191,8 @@ impl KernelService {
             private_index: InMemoryPrivateIndex::shared(),
             receipt_hub: ReceiptHub::shared(),
             chain: ChainHandle::default(),
+            publish_batch_eta_secs: None,
+            handoff_queue: Arc::new(InMemoryHandOffQueue::new()),
         })
     }
 
@@ -212,7 +237,37 @@ impl KernelService {
             private_index: InMemoryPrivateIndex::shared(),
             receipt_hub: ReceiptHub::shared(),
             chain,
+            publish_batch_eta_secs: None,
+            handoff_queue: Arc::new(InMemoryHandOffQueue::new()),
         })
+    }
+
+    /// Install the operator-configured publish batch interval (seconds).
+    ///
+    /// Required for `AcceptFeeLess` when the process advertises the
+    /// `publisher` kernel part. Missing eta with publisher enabled fails
+    /// closed at publish time (no invented default).
+    pub(crate) fn with_publish_batch_eta_secs(mut self, secs: Option<u64>) -> Self {
+        self.publish_batch_eta_secs = secs;
+        self
+    }
+
+    /// Shared hand-off queue handle (drain / resume / tests).
+    pub(crate) fn handoff_queue(&self) -> &Arc<InMemoryHandOffQueue> {
+        &self.handoff_queue
+    }
+
+    /// Network pin used by the publish drain loop (`None` until chain identity
+    /// / engine is installed).
+    pub(crate) fn publish_network(&self) -> Option<KernelNetwork> {
+        self.chain
+            .network
+            .or_else(|| self.chain.identity.as_ref().map(|id| id.network))
+    }
+
+    /// Optional exclusive V1 engine (PG dual-write / boot hydrate).
+    pub(crate) fn chain_engine(&self) -> Option<&Arc<EngineAdapter>> {
+        self.chain.engine.as_ref()
     }
 
     /// Attach / replace the chain handle (tests and late wiring).
@@ -542,19 +597,32 @@ impl KernelService {
         )
     }
 
+    /// Resolve the fee-less publish policy from this process's kernel parts
+    /// and the operator-configured batch interval — never a hard-coded
+    /// `AcceptFeeLess { 60 }` at the transport edge.
+    pub(crate) fn resolve_publish_policy(&self) -> KernelResult<PublishPolicy> {
+        let parts: &[KernelPart] = match self.chain.identity.as_ref() {
+            Some(id) => id.kernel_parts.as_slice(),
+            // No identity yet: not a publisher surface — decline rather than
+            // invent AcceptFeeLess. Callers that need accept in unit tests
+            // install an identity with the publisher part + batch eta.
+            None => &[],
+        };
+        policy_from_kernel_parts(parts, self.publish_batch_eta_secs)
+    }
+
     /// `Publish` — fee-less publisher hand-off (§7.6 / §7.8).
     ///
-    /// Policy/crypto rejections are [`PublishOutcome::Rejected`] (successful
-    /// domain result). Fee fields must already have been refused at the
-    /// transport edge via [`publish::refuse_v1_fee_fields`].
+    /// Policy is derived from kernel_parts + configured batch eta (see
+    /// [`Self::resolve_publish_policy`]). Crypto / policy rejections are
+    /// [`PublishOutcome::Rejected`] (successful domain result). Acceptance
+    /// is returned **only** after durable enqueue via [`accept_hand_off`]
+    /// (and, when the V1 engine is installed, a mirror into
+    /// `v1_pending_publishes`). Never a free `accepted` without a queue write.
     ///
-    /// `policy` is supplied by the caller (gRPC edge / tests) so a node that
-    /// is not acting as a publisher can decline without inventing acceptance.
-    pub(crate) fn publish(
-        &self,
-        policy: PublishPolicy,
-        command: PublishCommand,
-    ) -> KernelResult<PublishOutcome> {
+    /// Fee fields must already have been refused at the transport edge via
+    /// [`crate::kernel::publish::refuse_v1_fee_fields`].
+    pub(crate) async fn publish(&self, command: PublishCommand) -> KernelResult<PublishOutcome> {
         let network = match self.chain.network {
             Some(n) => n,
             None => match self.chain.identity.as_ref() {
@@ -572,14 +640,112 @@ impl KernelService {
             Ok(view) => Some(view.tip_height),
             Err(_) => None,
         };
-        publish::publish(
-            PublishConfig {
-                network,
-                tip_height,
-                policy,
-            },
-            command,
+        let policy = self.resolve_publish_policy()?;
+        let config = PublishConfig {
+            network,
+            tip_height,
+            policy,
+        };
+
+        // Domain accept: evaluate + durable process-queue enqueue. Rejections
+        // never touch the queue; enqueue failure is internal_error (never a
+        // free accepted claim).
+        let outcome = accept_hand_off(self.handoff_queue.as_ref(), config, command)?;
+        let PublishOutcome::Accepted { batch_eta } = outcome else {
+            return Ok(outcome);
+        };
+
+        // Mirror into v1_pending_publishes when the exclusive V1 engine is
+        // installed so a real process restart can re-seed the drain queue
+        // (and the existing resume path can finish mid-flight rows).
+        if let Some(engine) = self.chain.engine.as_ref() {
+            let member = HandOffMember::from_command(command);
+            // External §7.6 hand-offs do not know the account owner; the
+            // recovery table requires a 32-byte owner column — store the
+            // nullifier pk as a non-account sentinel so the row stays
+            // addressable by pk alone.
+            let owner = Address(member.public_key.0);
+            if let Err(e) = crate::v1::db_v1::insert_pending_publish_members_ready(
+                engine.pool(),
+                owner,
+                member.public_key.0,
+                member.r.0,
+                member.s.0,
+                member.r_prime.0,
+                member.block_anchor.height,
+                member.block_anchor.block_hash.0,
+            )
+            .await
+            {
+                // Process queue already holds the accept — mark it failed so
+                // the drain cannot inscribe a member PG never recorded, and
+                // never project Accepted to the caller.
+                let reason = format!("pg durable mirror failed: {e:#}");
+                self.handoff_queue
+                    .mark_failed(&member.public_key, &reason)
+                    .map_err(|detail| {
+                        KernelError::with_internal(
+                            KernelErrorCode::InternalError,
+                            "Failed to mark hand-off failed after PG mirror error",
+                            detail,
+                        )
+                    })?;
+                return Err(KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Failed to durable-queue publish hand-off into v1_pending_publishes",
+                    format!("{e:#}"),
+                ));
+            }
+        }
+
+        Ok(PublishOutcome::Accepted { batch_eta })
+    }
+
+    /// One drain cycle for the process hand-off queue: half-aggregate +
+    /// inscribe via the installed batch publisher.
+    ///
+    /// `publisher == None` is a **named terminal** failure for every
+    /// resumable member (`InscriptionTerminal::PublisherUnavailable`) —
+    /// never a silent skip and never re-projected as `accepted`. Callers
+    /// that only have a transient bitcoind outage must **not** pass `None`;
+    /// they should skip the cycle and retry (see the runtime drain loop).
+    pub(crate) fn drain_handoff_queue<P>(
+        &self,
+        publisher: Option<&P>,
+        batch_anchor: Option<PublishBlockAnchor>,
+    ) -> Result<
+        Option<zkcoins_prover::publisher::PublishedBatch>,
+        crate::kernel::publish::InscriptionTerminal,
+    >
+    where
+        P: crate::v1::receive::NullifierBatchPublisher + ?Sized,
+    {
+        let network = self.publish_network().ok_or_else(|| {
+            crate::kernel::publish::InscriptionTerminal::PublisherUnavailable {
+                detail: "drain_handoff_queue: no network pin on KernelService — \
+                         cannot half-aggregate under an unknown m_state"
+                    .into(),
+            }
+        })?;
+        drain_and_inscribe(
+            self.handoff_queue.as_ref(),
+            publisher,
+            network,
+            batch_anchor,
         )
+    }
+
+    /// Hydrate the process hand-off queue from durable pending rows
+    /// (`list_resumable` / `v1_pending_publishes`) after restart.
+    ///
+    /// Uses [`seed_queue_from_pending_status`] so status labels
+    /// (`members_ready`, `constructed`, …) are preserved via
+    /// [`crate::kernel::publish::HandOffQueueStatus::from_pending_status`].
+    pub(crate) fn seed_handoff_queue_from_pending_rows(
+        &self,
+        rows: &[(HandOffMember, &str)],
+    ) -> Result<usize, String> {
+        seed_queue_from_pending_status(self.handoff_queue.as_ref(), rows)
     }
 
     /// `EntrustOperationalBundle` — store the §7.7 bundle after challenge consume.

@@ -279,6 +279,7 @@ Compose bind-mounts that file read-only to `/run/bootstrap/manifest.bmf1` and se
 | `ZKCOINS_V1_BITCOIND_WALLET` | bitcoind wallet name funding AggregateStateNullifierV3 commits |
 | `ZKCOINS_V1_FEE_RATE_SAT_PER_VB` | sat/vB, integer > 0 |
 | `ZKCOINS_V1_REVEAL_OUTPUT_SATS` | reveal output sats, integer > 0 |
+| `ZKCOINS_PUBLISH_BATCH_ETA_SECS` | seconds until the next expected §7.6 batch (`AcceptFeeLess`); **required** when `ZKCOINS_KERNEL_PARTS` includes `publisher` — no invented default (`runtime.rs`; missing → `internal_error` on Publish) |
 
 ### api (compose service)
 
@@ -335,6 +336,8 @@ export ZKCOINS_RELAY_URL=ws://nostr-relay:8080/
 export ZKCOINS_BLOSSOM_URL=http://127.0.0.1:8080/
 export ZKCOINS_MAX_BLOB_BYTES=1048576
 export ZKCOINS_KERNEL_PARTS=scanner,prover,publisher
+# Required when KERNEL_PARTS includes publisher — no invented default
+export ZKCOINS_PUBLISH_BATCH_ETA_SECS=60
 export KERNEL_GRPC_ADDR=0.0.0.0:50051
 
 # Publish path — wallet name must match the wallet you create in step 3

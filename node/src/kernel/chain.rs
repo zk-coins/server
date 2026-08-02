@@ -322,10 +322,10 @@ impl CatalogEntry {
 /// inscription catalog can represent double-spend losers without
 /// inventing a fourth wire token.
 ///
-/// This is a **closed normative set**: every variant stays in the
-/// inventory even while no production procedure constructs a member
-/// value yet. [`Self::ALL`] plus [`validate_closed_sets`] (start edge)
-/// keep the wire tokens non-empty and pairwise distinct.
+/// This is a **closed normative set**. [`Self::ALL`] plus
+/// [`validate_closed_sets`] (start edge) keep the wire tokens non-empty
+/// and pairwise distinct. Production constructs values via
+/// [`classify_member_state`] (`ListInscriptions` and hand-off finish).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum NullifierMemberState {
     Completed,
@@ -346,6 +346,49 @@ impl NullifierMemberState {
             Self::Failed => "failed",
         }
     }
+}
+
+/// Inputs required to decide a member's §3.10 state.
+///
+/// Used by `ListInscriptions` (catalog + NfLog join) and by the publisher
+/// hand-off path (queue status + optional chain observation). Finished ⇔
+/// [`NullifierMemberState::Completed`] (first-occurrence winner + ≥6
+/// confirmations). Queue status alone is never enough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemberChainObservation {
+    /// Durable hand-off queue marked this member terminal-failed.
+    /// Catalog projections always pass `false` — losers fail via
+    /// [`Self::first_occurrence`].
+    pub queue_failed: bool,
+    /// Whether the node's own scan folded this `Pk` as first-occurrence.
+    pub first_occurrence: bool,
+    /// Inclusion height of the reveal that carried this nullifier, when known.
+    pub inclusion_height: Option<u64>,
+    /// Verifier's Bitcoin tip height.
+    pub tip_height: u64,
+}
+
+/// Classify a member against §3.10. Intermediate queue states and
+/// on-chain `pending` are **not** finished.
+pub(crate) fn classify_member_state(obs: MemberChainObservation) -> NullifierMemberState {
+    if obs.queue_failed {
+        return NullifierMemberState::Failed;
+    }
+    // Not yet on a scanned reveal → not completed, not failed by scan rules.
+    // Spec: pending covers "inscribed but <6 confs"; pre-inscription is also
+    // not completed. We project pre-inscription as Pending (not finished).
+    let Some(inclusion_height) = obs.inclusion_height else {
+        return NullifierMemberState::Pending;
+    };
+    if !obs.first_occurrence {
+        return NullifierMemberState::Failed;
+    }
+    member_confirmation_state(obs.tip_height, inclusion_height)
+}
+
+/// A member is finished **only** at §3.10 `completed`.
+pub(crate) fn member_is_finished(obs: MemberChainObservation) -> bool {
+    classify_member_state(obs) == NullifierMemberState::Completed
 }
 
 /// Current accumulator tip (§7.8 `AccumulatorTip`).
@@ -1227,16 +1270,25 @@ fn project_listed_inscription(view: &ChainView, entry: &CatalogEntry) -> ListedI
         .members
         .iter()
         .map(|(member_index, pk, r)| {
-            let won = view.winning_positions.contains(&(
+            let first_occurrence = view.winning_positions.contains(&(
                 entry.height,
                 entry.tx_index,
                 entry.vin_index,
                 *member_index,
             ));
-            let state = if won {
-                member_confirmation_state(view.tip_height, entry.height)
+            // Catalog rows are on-chain; queue_failed is a hand-off concern only.
+            // §3.10 state goes through the single classifier (same path the
+            // hand-off finish predicate uses) — never a parallel local if/else.
+            let obs = MemberChainObservation {
+                queue_failed: false,
+                first_occurrence,
+                inclusion_height: Some(entry.height),
+                tip_height: view.tip_height,
+            };
+            let state = if member_is_finished(obs) {
+                NullifierMemberState::Completed
             } else {
-                NullifierMemberState::Failed
+                classify_member_state(obs)
             };
             ListedNullifier {
                 pubkey: *pk,

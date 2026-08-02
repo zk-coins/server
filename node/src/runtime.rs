@@ -771,6 +771,32 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     // Unimplemented until a scanner-written catalog exists (NfLog has no
     // reveal txid / §3.5 format).
     {
+        // Batch interval for §7.6 AcceptFeeLess — required when kernel_parts
+        // includes publisher. No silent default (the former hard-coded 60 s
+        // at the gRPC edge is gone).
+        let publish_batch_eta_secs = match std::env::var("ZKCOINS_PUBLISH_BATCH_ETA_SECS") {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "ZKCOINS_PUBLISH_BATCH_ETA_SECS is set but empty — \
+                         refuse to invent a batch interval"
+                    ));
+                }
+                let secs: u64 = trimmed.parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "ZKCOINS_PUBLISH_BATCH_ETA_SECS={raw:?} is not a non-negative integer"
+                    )
+                })?;
+                Some(secs)
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "ZKCOINS_PUBLISH_BATCH_ETA_SECS env read failed: {e}"
+                ));
+            }
+        };
         let mut domain = crate::kernel_rpc::domain_from_parts(
             Arc::clone(&job_store),
             Arc::clone(&job_notify_map),
@@ -780,7 +806,8 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         .with_manifest_store(Arc::clone(&manifest_store))
         .with_bundle_store(Arc::clone(&shared_bundle_store))
         .with_private_index(Arc::clone(&shared_private_index))
-        .with_receipt_hub(Arc::clone(&shared_receipt_hub));
+        .with_receipt_hub(Arc::clone(&shared_receipt_hub))
+        .with_publish_batch_eta_secs(publish_batch_eta_secs);
         // Pull/Records/SubscribeReceipts share the process mirror of
         // `v1_decrypt_index` (migration 0031) and the receipt hub. The
         // §4.4 scanner writes SQL first, then the process index, then
@@ -896,6 +923,77 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                 network: Some(network),
             });
         }
+
+        // Boot-hydrate the process §7.6 hand-off queue from durable
+        // `v1_pending_publishes` so a restart re-enters the multi-member
+        // drain (same recovery table the self-publish resume path walks).
+        // Fail-closed list: undeterminable is logged loud and leaves the
+        // process queue empty (boot resume in main still owns mid-flight
+        // constructed/commit_broadcast rows with prepared txs).
+        if let Some(engine) = domain.chain_engine() {
+            match crate::v1::db_v1::list_resumable_pending_publishes(engine.pool()).await {
+                Ok(rows) => {
+                    let seed: Vec<(crate::kernel::publish::HandOffMember, String)> = rows
+                        .into_iter()
+                        .map(|r| {
+                            (
+                                crate::kernel::publish::HandOffMember {
+                                    public_key: crate::kernel::types::XOnlyKey(r.pk),
+                                    r: crate::kernel::types::XOnlyKey(r.r),
+                                    s: crate::kernel::types::Digest32(r.s),
+                                    r_prime: crate::kernel::types::XOnlyKey(r.r_prime),
+                                    block_anchor: crate::kernel::publish::PublishBlockAnchor {
+                                        block_hash: crate::kernel::types::Digest32(
+                                            r.build_tip_hash,
+                                        ),
+                                        height: r.build_tip_height,
+                                    },
+                                },
+                                r.status,
+                            )
+                        })
+                        .collect();
+                    let refs: Vec<(crate::kernel::publish::HandOffMember, &str)> =
+                        seed.iter().map(|(m, s)| (*m, s.as_str())).collect();
+                    match domain.seed_handoff_queue_from_pending_rows(&refs) {
+                        Ok(0) => tracing::info!(
+                            "§7.6 hand-off queue: no resumable pending publishes to seed"
+                        ),
+                        Ok(n) => tracing::info!(
+                            seeded = n,
+                            "§7.6 hand-off queue seeded from v1_pending_publishes \
+                             (list_resumable → from_pending_status)"
+                        ),
+                        Err(e) => {
+                            // Loud but non-fatal: main's boot_resume still
+                            // walks PG; the process queue can re-fill on
+                            // new accepts. Never invent an empty success.
+                            eprintln!(
+                                "§7.6 hand-off queue seed from pending publishes failed: {e} \
+                                 — continuing; drain will only see new accepts until re-seed"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "§7.6 hand-off queue: list_resumable_pending_publishes failed \
+                         ({e:#}) — not treating as empty; drain starts without hydrate"
+                    );
+                }
+            }
+        }
+
+        // Multi-member half-agg drain loop (same process as gRPC accept).
+        // Transient bitcoind/publisher outages skip the cycle and retry —
+        // never pass publisher=None into drain (that would terminal-fail
+        // every open member). Inscription errors that occur *with* a
+        // connected publisher mark members Failed with a named reason.
+        let domain_for_drain = domain.clone();
+        tokio::spawn(async move {
+            run_handoff_drain_loop(domain_for_drain).await;
+        });
+
         let job_tx_grpc = job_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::kernel_rpc::serve_kernel_grpc_with_domain(
@@ -1044,6 +1142,161 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Idle backoff between §7.6 multi-member drain sweeps.
+///
+/// Same order of magnitude as the pending-publish resumer in `main` so a
+/// stranded `members_ready` row is retried without a tight spin that would
+/// flood logs on a permanent publisher / bitcoind outage.
+const HANDOFF_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Periodic multi-member half-agg drain for accepted §7.6 hand-offs.
+///
+/// ## bitcoind / publisher boundary
+///
+/// - **Env incomplete or connect failure** with open queue rows: log a named
+///   reason and retry next interval. Do **not** call drain with
+///   `publisher=None` — that would mark every open member terminal-failed
+///   for a transient outage.
+/// - **Connected publisher, inscription fails**: `drain_and_inscribe` marks
+///   each attempted member `Failed` with the terminal reason (never left as
+///   an implicit success / never re-projected as `accepted`).
+/// - **Empty queue**: no-op sleep cycle.
+async fn run_handoff_drain_loop(domain: crate::kernel::KernelService) {
+    use crate::kernel::publish::HandOffQueue;
+    use crate::v1::{connect_v1_publisher, v1_publisher_env_from_env};
+
+    loop {
+        // scanner-polling-ok: hand-off drain idle backoff (named const)
+        tokio::time::sleep(HANDOFF_DRAIN_INTERVAL).await;
+
+        let open = match domain.handoff_queue().list_resumable() {
+            Ok(rows) => rows.len(),
+            Err(e) => {
+                eprintln!(
+                    "§7.6 hand-off drain: list_resumable failed ({e}) — \
+                     not treating as empty; will retry next interval"
+                );
+                continue;
+            }
+        };
+        if open == 0 {
+            continue;
+        }
+
+        let Some(network) = domain.publish_network() else {
+            eprintln!(
+                "§7.6 hand-off drain: {open} open row(s) but no network pin on \
+                 KernelService — cannot half-aggregate; will retry next interval"
+            );
+            continue;
+        };
+        let v1_network = match network {
+            crate::kernel::KernelNetwork::Mainnet => {
+                zkcoins_program::circuit::compliance::Network::Mainnet
+            }
+            crate::kernel::KernelNetwork::Testnet => {
+                zkcoins_program::circuit::compliance::Network::Testnet
+            }
+            crate::kernel::KernelNetwork::Regtest => {
+                zkcoins_program::circuit::compliance::Network::Regtest
+            }
+        };
+
+        let env = match v1_publisher_env_from_env(v1_network) {
+            Ok(env) => env,
+            Err(e) => {
+                // Named boundary: publisher env incomplete. Retry — do not
+                // terminal-fail members for a config blip during boot race.
+                eprintln!(
+                    "§7.6 hand-off drain: {open} open row(s); publisher env \
+                     incomplete ({e:#}) — bitcoind inscription path not ready; \
+                     will retry next interval (members left at members_ready)"
+                );
+                continue;
+            }
+        };
+        let publisher = match connect_v1_publisher(env) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "§7.6 hand-off drain: {open} open row(s); publisher connect \
+                     failed ({e:#}) — bitcoind inscription path unavailable; \
+                     will retry next interval (members left at members_ready)"
+                );
+                continue;
+            }
+        };
+
+        // Blocking inscription work off the async runtime (RPC + sign).
+        let domain_sync = domain.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            domain_sync.drain_handoff_queue(Some(&publisher), None)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(None)) => {
+                // Listed open rows, then none drained: statuses may have
+                // moved to CommitBroadcast (owned by per-row PG resume) or
+                // another writer advanced them.
+                tracing::debug!(
+                    open,
+                    "§7.6 hand-off drain: saw open rows; drain produced no batch"
+                );
+            }
+            Ok(Ok(Some(published))) => {
+                tracing::info!(
+                    open,
+                    members = published.aggregate.members.len(),
+                    commit = %published.commit_txid,
+                    reveal = %published.reveal_txid,
+                    "§7.6 hand-off drain: inscribed multi-member batch"
+                );
+                // Mirror successful drain into PG so boot resume does not
+                // re-publish members already at reveal_broadcast on-chain.
+                if let Some(engine) = domain.chain_engine() {
+                    for (pk, _) in &published.aggregate.members {
+                        if let Err(e) = crate::v1::db_v1::mark_pending_publish_status(
+                            engine.pool(),
+                            *pk,
+                            crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY,
+                            crate::v1::db_v1::PENDING_PUBLISH_REVEAL_BROADCAST,
+                        )
+                        .await
+                        {
+                            // Loud: process queue is already RevealBroadcast;
+                            // PG lag means resume might try again (idempotent
+                            // rebroadcast on the self-publish path).
+                            eprintln!(
+                                "§7.6 hand-off drain: PG mirror to reveal_broadcast \
+                                 failed for pk={}: {e:#}",
+                                hex::encode(pk)
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(Err(term)) => {
+                // Members already marked Failed inside drain_and_inscribe.
+                // Named terminal — never re-projected as accepted. PG rows
+                // that remain `members_ready` are retried by the pending-
+                // publish resumer or re-seeded on restart (process Failed
+                // is not silently cleared).
+                eprintln!(
+                    "§7.6 hand-off drain: inscription terminal with {open} open \
+                     row(s) attempted — {term}"
+                );
+            }
+            Err(join_err) => {
+                eprintln!(
+                    "§7.6 hand-off drain: spawn_blocking join failed ({join_err}) \
+                     — will retry next interval"
+                );
+            }
+        }
+    }
 }
 
 async fn rearm_and_enqueue_v1_finalise(

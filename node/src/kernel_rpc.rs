@@ -580,11 +580,9 @@ impl Kernel for GrpcKernelService {
         request: Request<PublishRequest>,
     ) -> Result<Response<PublishResult>, Status> {
         let command = parse_publish_request(request.into_inner()).map_err(map_domain_err)?;
-        let policy = crate::kernel::publish::PublishPolicy::AcceptFeeLess { batch_eta_secs: 60 };
-        let outcome = self
-            .domain
-            .publish(policy, command)
-            .map_err(map_domain_err)?;
+        // Policy is derived from kernel_parts + configured batch eta inside
+        // the domain — never a hard-coded AcceptFeeLess { 60 } here.
+        let outcome = self.domain.publish(command).await.map_err(map_domain_err)?;
         Ok(Response::new(publish_outcome_to_proto(outcome)))
     }
 

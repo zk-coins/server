@@ -1239,7 +1239,7 @@ pub struct PendingPublishRow {
 /// crash-window fixtures that stage a row without rewriting the engine.
 // Clippy too_many_arguments: durable members_ready staging sink; keep the
 // flat Schnorr/tip args aligned with the SQL row and sibling insert path.
-#[allow(dead_code)] // crate-test staging path
+// Production: KernelService::publish dual-writes external §7.6 accepts here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_pending_publish_members_ready(
     pool: &PgPool,
