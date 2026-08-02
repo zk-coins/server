@@ -108,12 +108,14 @@ env:
 #   on the shared self-hosted M3 Ultra runner pool). It runs the FULL
 #   node + shared nextest suite under llvm-cov instrumentation: the Postgres
 #   `db_tests`, the Plonky2-heavy mint/send/receive prover flows, and
-#   the 100% line + function coverage gate, all in one binary run.
-#   Gated behind `ci:full` so we don't burn runner time on every
-#   speculative PR — apply the label when the PR is ready for the
-#   authoritative gate. Both auto-promote PRs (staging -> develop and
-#   develop -> main) get the label applied automatically by
-#   auto-release-pr-staging.yaml / auto-release-pr.yaml.
+#   the measured coverage floor (see `.github/coverage-baseline.md`),
+#   all in one binary run. Gated behind `ci:full` so we don't burn
+#   runner time on every speculative PR — apply the label when the PR
+#   is ready for the authoritative gate. Both auto-promote PRs
+#   (staging -> develop and develop -> main) get the label applied
+#   automatically by auto-release-pr-staging.yaml /
+#   auto-release-pr.yaml. (Per-non-draft-PR expansion of this job is
+#   deferred to the CI endgame — see coverage-baseline.md.)
 #
 # There is no third "subset" tier: a test either runs in the default
 # Lint & Build (compile/lint) or comes in with `ci:full` (the full
@@ -128,8 +130,8 @@ env:
 #   in `cargo llvm-cov nextest`). That doubled wall-clock and m3-ultra
 #   agent usage on every Release PR for no signal benefit — llvm-cov
 #   under nextest produces both test execution AND coverage data in a
-#   single binary run. Merging them keeps the 100% lines + functions
-#   gate intact (same ignore regex, same `not binary(api_remote)`
+#   single binary run. Merging them keeps the measured coverage floor
+#   intact (same ignore regex as baseline, same `not binary(api_remote)`
 #   exclusion) while running the heavy suite once per PR.
 #
 #   The documented hardware target is the M3 Ultra (CONTRIBUTING.md
@@ -231,12 +233,13 @@ jobs:
         run: cargo build -p node --all-features
 
   test-and-coverage:
-    name: Tests + Coverage Gate (M3 Ultra, 100% lines + functions)
+    name: Tests + Coverage Gate (M3 Ultra, measured coverage floor)
     # Authoritative heavy gate: runs the full nextest suite under
     # llvm-cov instrumentation, producing both test execution AND
     # coverage data in a single binary run. Replaces the previous
     # `node-tests` + `coverage` pair (the two jobs ran the same
     # nextest suite — see the file header for the merge rationale).
+    # Floor values and ignore rules: `.github/coverage-baseline.md`.
     #
     # Gated behind the `ci:full` label so we don't burn runner time
     # on every speculative PR. Both auto-promote PRs get the label
@@ -302,7 +305,7 @@ jobs:
       # `cargo llvm-cov`. cargo-llvm-cov does NOT auto-set this cfg —
       # without it every `coverage(off)` in the workspace is inert
       # and llvm-cov counts the excluded fns / lines as uncovered,
-      # which silently broke the 100%-line + 100%-function gate the
+      # which would drag the measured floor below its true value the
       # moment the first annotation landed in the `node` crate. Set
       # only on this job: the `lint-and-build` job runs stable
       # 1.81.0 and would reject `feature(coverage_attribute)`, so the
@@ -361,34 +364,25 @@ jobs:
 
       # `cargo llvm-cov nextest` is the nextest-aware coverage
       # subcommand: collects llvm-cov data while driving the suite
-      # through nextest, so the 100% line/function gate and the test
+      # through nextest, so the measured coverage floor and the test
       # execution share a single binary run. This is the merge of
       # the previous `node-tests` + `coverage` pair — the previous
       # `node-tests` job ran the same nextest invocation without the
       # `cargo llvm-cov` wrapper, which produced no extra signal.
       #
-      # `-p node -p shared --all-features` matches the previous
-      # `node-tests` test set exactly (the previous `coverage` job
-      # was scoped to `-p node` because the coverage GATE is only
-      # measured against the `node` crate; the merge keeps that gate
-      # scope while widening the EXECUTED set to `-p node -p shared`
-      # so the shared crate's `commitment::tests::*` keep running in
-      # the heavy gate — they were part of `node-tests` before).
-      # The `shared/src/commitment.rs` entry in --ignore-filename-regex
-      # keeps the coverage gate strictness identical to the previous
-      # `-p node`-scoped gate: the shared crate's source files are
-      # excluded from the 100% measurement, only the `node` crate is
-      # gated. `--all-features` likewise mirrors the previous
-      # `node-tests` invocation so opt-in feature-gated code paths
-      # still execute.
+      # Scope: `-p node -p shared --all-features`. Production modules
+      # (publisher, runtime, flow, job_dispatcher, scanners, shared)
+      # are measured. Legitimate ignores only: test infra + crate
+      # entrypoints + Plonky2 circuit packages. Floor integers and
+      # full justification: `.github/coverage-baseline.md`.
       #
       # The `api_remote` integration test (node/tests/api_remote.rs)
       # is excluded: it targets the live DEV node and belongs in
       # the post-deploy `api-e2e` job in deploy-dev.yaml, not the
-      # hermetic gate. The MVP coverage scope is measured by the
-      # rest of the suite, which covers the in-process axum handlers
-      # via oneshot().
-      - name: Run llvm-cov nextest (MVP scope, 100% line + function gate)
+      # hermetic gate. The coverage scope is measured by the rest of
+      # the suite, which covers the in-process axum handlers via
+      # oneshot().
+      - name: Run llvm-cov nextest (measured coverage floor)
         # `--test-threads=8` (issue #181 Opt A): the heavy gate is
         # the largest wall consumer on M3 Ultra (~60-90 min at
         # --test-threads=1). 8 outer threads × Rayon-pinned cores
@@ -397,11 +391,14 @@ jobs:
         # Per-test schema isolation (#182) + cross-process file lock
         # around the shared container (`test_db::init_shared_pg`)
         # make the suite parallel-safe under llvm-cov.
+        #
+        # Floor: integer under measured totals (77.28% lines /
+        # 77.82% functions). See `.github/coverage-baseline.md`.
         run: |
           cargo llvm-cov nextest --release -p node -p shared --all-features --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
-            --fail-under-lines 100 \
-            --fail-under-functions 100 \
+            --ignore-filename-regex '_tests\.rs$|test_db\.rs$|bin/.*\.rs$|main\.rs$|lib\.rs$|program-plonky2/|script-plonky2/' \
+            --fail-under-lines 77 \
+            --fail-under-functions 77 \
             --test-threads 8 \
             -E 'not binary(api_remote)'
 
@@ -420,17 +417,17 @@ jobs:
       # re-run, no new test execution — `report` reads the on-disk
       # profraw / profdata produced by the previous step) and emit
       # the per-file "Uncovered Lines" block plus a json digest of
-      # files below 100% line / function. `--show-missing-lines` on
-      # the gate step sometimes elides this section depending on the
-      # llvm-cov build (observed empirically across this repo's
-      # llvm-cov upgrades), so this step makes the detail
-      # deterministic: whenever the gate fails, the operator sees
-      # which file/line/function is below 100% without having to
-      # reproduce locally.
+      # files still below 100% line / function (gap list; the gate
+      # itself fails under the measured floor — see baseline).
+      # `--show-missing-lines` on the gate step sometimes elides this
+      # section depending on the llvm-cov build, so this step makes
+      # the detail deterministic: whenever the gate fails, the
+      # operator sees which file/line/function is uncovered without
+      # having to reproduce locally.
       - name: Show missing coverage on gate failure
         if: failure()
         run: |
-          IGNORE='main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$'
+          IGNORE='_tests\.rs$|test_db\.rs$|bin/.*\.rs$|main\.rs$|lib\.rs$|program-plonky2/|script-plonky2/'
 
           echo "--- llvm-cov report: --show-missing-lines (text) ---"
           cargo llvm-cov report --release --show-missing-lines \

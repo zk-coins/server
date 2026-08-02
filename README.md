@@ -113,10 +113,10 @@ Key configuration variables (full table in [`CONTRIBUTING.md` § Environment var
 ```bash
 cargo test -p node                 # MVP code paths — what the DEV + PRD binary contains
 cargo test -p node --all-features  # including the gated address-list and lnurl routes
-cargo llvm-cov -p node             # coverage gate: 100% lines + functions on the activated MVP surface
+cargo llvm-cov -p node             # coverage: measured floor on node + shared (see .github/coverage-baseline.md)
 ```
 
-The `db_tests` spin up their own `postgres:17` container via `testcontainers-modules`. CI enforces a 100% line + function coverage gate on the activated MVP surface; `publisher.rs`, `main.rs`, the `*_runtime.rs` wrappers, and `scanner_ws.rs` are excluded by design because they require a live Bitcoin node, a funded key, or an upstream socket. Enable the pre-push hook (`git config core.hooksPath .githooks`) to run `cargo fmt --check`, clippy, and `cargo check` before push. CI also enforces a **no-polling** rule: scanner/publisher hot paths subscribe to events, they never poll the chain tip (issue [#84](https://github.com/zk-coins/node/issues/84)).
+The `db_tests` spin up their own `postgres:17` container via `testcontainers-modules`. CI enforces a **measured coverage floor** (currently 77 % lines + functions; full record in [`.github/coverage-baseline.md`](.github/coverage-baseline.md)) over `-p node -p shared --all-features`. Legitimate exclusions are test infrastructure (`*_tests.rs`, `test_db.rs`, `bin/`), crate entrypoints (`main.rs`, `lib.rs`), and the Plonky2 circuit packages (`program-plonky2/`, `script-plonky2/`) — those circuits are secured by the §1.7.9 digest generator, prove tests, and the D-05 differential test, not by line coverage. Production modules such as `publisher.rs`, `runtime.rs`, `flow.rs`, `job_dispatcher.rs`, and the scanners are **included** in the measurement. Enable the pre-push hook (`git config core.hooksPath .githooks`) to run `cargo fmt --check`, clippy, and `cargo check` before push. CI also enforces a **no-polling** rule: scanner/publisher hot paths subscribe to events, they never poll the chain tip (issue [#84](https://github.com/zk-coins/node/issues/84)).
 
 ### HTTP surface
 

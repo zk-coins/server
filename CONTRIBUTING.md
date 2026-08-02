@@ -352,7 +352,7 @@ wip
 | Workflow | Trigger | Action |
 |---|---|---|
 | `ci.yaml` — **Lint & Build** | Any ready PR, push to develop | `cargo fmt --check`, clippy (MVP + all-features + program), build, the no-polling grep. Fast GitHub-hosted tier, no label needed. |
-| `ci.yaml` — **Tests + Coverage Gate** | Ready PR with `ci:full` label, push to develop | Full `node` + `shared` nextest suite under `llvm-cov` on the self-hosted M3 Ultra pool, 100% line + function gate. |
+| `ci.yaml` — **Tests + Coverage Gate** | Ready PR with `ci:full` label, push to develop | Full `node` + `shared` nextest suite under `llvm-cov` on the self-hosted M3 Ultra pool, measured coverage floor (see `.github/coverage-baseline.md`). |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → `zkcoins/node:beta` → DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → `zkcoins/node:latest` → PRD |
 | `auto-release-pr-staging.yaml` | Push to staging | Promote PR (staging → develop), `ci:full` |
