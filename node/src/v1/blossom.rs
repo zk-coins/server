@@ -16,10 +16,16 @@
 //!
 //! - **`DELETE`** — returns with §4.6 retention management (AuthVerb::Delete
 //!   removed until that block; a premature delete path has no production caller).
-//! - **`ReplicaReceiptV1`** — §4.6 dual-commit is not built; an upload
-//!   response may carry a `receipt` field and this client **does not**
-//!   read or validate it.
 //! - Server-side Blossom routes (API plane).
+//!
+//! # ReplicaReceiptV1
+//!
+//! A successful upload **MAY** carry a `receipt` object under the dual-commit
+//! rule (§4.6 / §7.4). This client **parses and returns** it when present
+//! (closed schema, canonical hex / u64 strings). It does **not** invent a
+//! receipt when the key is absent. Trust-list membership and BIP-340
+//! `receipt_sig` verification are the outbox / sender's job (they hold the
+//! operator trust list).
 //!
 //! # HTTP transport
 //!
@@ -122,6 +128,8 @@ pub(crate) enum BlossomError {
         expected: [u8; 32],
         returned: [u8; 32],
     },
+    /// `receipt` key present but fails the closed ReplicaReceiptV1Json schema.
+    MalformedReplicaReceipt { reason: &'static str },
 }
 
 impl fmt::Display for BlossomError {
@@ -186,6 +194,9 @@ impl fmt::Display for BlossomError {
                 hex::encode(expected),
                 hex::encode(returned)
             ),
+            BlossomError::MalformedReplicaReceipt { reason } => {
+                write!(f, "malformed ReplicaReceiptV1 in upload response: {reason}")
+            }
         }
     }
 }
@@ -195,6 +206,46 @@ impl std::error::Error for BlossomError {
         match self {
             BlossomError::AuthEvent(e) => Some(e),
             _ => None,
+        }
+    }
+}
+
+impl BlossomError {
+    /// Whether retrying the same upload cannot recover.
+    ///
+    /// Transient (network, timeout, 5xx / rate-limit, rare 404): stay in the
+    /// outbox drive loop with §4.2 backoff. Permanent (auth/policy, size,
+    /// content-address, schema, bad base URL): outbox must
+    /// [`crate::v1::db_outbox::mark_failed`] so the row leaves the drive loop
+    /// with a named reason — never silent eternal republish of a maligned
+    /// target or broken payload.
+    pub(crate) fn is_terminal(&self) -> bool {
+        match self {
+            // Network / peer blips — backoff and retry.
+            BlossomError::Transport { .. } | BlossomError::Timeout => false,
+            // Upload path rarely sees 404; treat as transient (holder lag).
+            BlossomError::NotFound => false,
+            // DELETE-only; not an upload permanent reject.
+            BlossomError::RetentionHold => false,
+            BlossomError::UnexpectedStatus { status } => {
+                // 408/425/429 and 5xx: retry. Other unexpected codes fail closed.
+                !matches!(*status, 408 | 425 | 429) && !(500..600).contains(status)
+            }
+            // Config, auth, size, content-address, closed-schema: permanent
+            // for this material / operator key / base URL.
+            BlossomError::InvalidBaseUrl { .. }
+            | BlossomError::AuthEvent(_)
+            | BlossomError::ContentAddressMismatch { .. }
+            | BlossomError::BlobTooLarge { .. }
+            | BlossomError::UploadTooLarge { .. }
+            | BlossomError::Unauthorized
+            | BlossomError::Forbidden
+            | BlossomError::PayloadTooLarge
+            | BlossomError::BadRequest
+            | BlossomError::UnsupportedMediaType
+            | BlossomError::MalformedUploadResponse { .. }
+            | BlossomError::UploadBlobIdMismatch { .. }
+            | BlossomError::MalformedReplicaReceipt { .. } => true,
         }
     }
 }
@@ -236,6 +287,33 @@ pub(crate) struct UploadBinding {
     pub attempt_nonce: [u8; 32],
     /// `X-ZkCoins-Retention` — closed enum.
     pub retention: RetentionClass,
+}
+
+/// Parsed `ReplicaReceiptV1` from a Blossom upload response (§4.6 / §7.4).
+///
+/// Fields match the closed JSON schema. `receipt_json` is the exact object
+/// bytes as received (for durable outbox storage). Signature / trust-list
+/// checks are performed by the sender outbox layer, not here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReplicaReceiptV1 {
+    pub blob_id: [u8; 32],
+    pub event_id: [u8; 32],
+    pub holder_op_pubkey: [u8; 32],
+    pub canonical_base_url: String,
+    pub stored_at: u64,
+    pub retention_class: String,
+    pub retention_until: u64,
+    pub attempt_nonce: [u8; 32],
+    pub receipt_sig: [u8; 64],
+    /// Canonical JSON object bytes (no surrounding whitespace normalised).
+    pub receipt_json: Vec<u8>,
+}
+
+/// Successful upload: content-address plus optional dual-commit receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UploadResult {
+    pub blob_id: [u8; 32],
+    pub receipt: Option<ReplicaReceiptV1>,
 }
 
 // ---------------------------------------------------------------------------
@@ -476,8 +554,9 @@ impl BlossomClient {
     /// caller cannot supply a divergent hash. `created_at` / `expiration`
     /// are passed in (no clock). `binding`: all three headers or none.
     ///
-    /// On success returns the content-address `blob_id`. A `receipt` field
-    /// in the JSON body is **ignored** (§4.6 not built).
+    /// On success returns [`UploadResult`]. When the JSON carries `receipt`,
+    /// it is parsed under the closed §7.4 schema (malformed → error). Absent
+    /// `receipt` is valid (holder has not dual-committed).
     pub(crate) async fn upload(
         &self,
         base_url: &str,
@@ -486,7 +565,7 @@ impl BlossomClient {
         op_key: &[u8; 32],
         created_at: u64,
         expiration: u64,
-    ) -> Result<[u8; 32], BlossomError> {
+    ) -> Result<UploadResult, BlossomError> {
         let body_len = bytes.len() as u64;
         if body_len > self.max_blob_bytes {
             return Err(BlossomError::UploadTooLarge {
@@ -519,17 +598,38 @@ impl BlossomClient {
             return Err(map_error_status(status));
         }
 
-        // Upload JSON is small (blob_id hex + optional ignored receipt).
-        // Still stream-cap so a malicious peer cannot fill memory here either.
+        // Upload JSON is small (blob_id hex + optional receipt). Stream-cap
+        // so a malicious peer cannot fill memory here either.
         let body = self.read_body(response).await?;
-        let returned = parse_upload_blob_id(&body)?;
+        let (returned, receipt) = parse_upload_response(&body)?;
         if returned != blob_id {
             return Err(BlossomError::UploadBlobIdMismatch {
                 expected: blob_id,
                 returned,
             });
         }
-        Ok(blob_id)
+        // When a receipt is present, its blob_id / binding fields must match
+        // what we sent (fail closed — never store a cross-blob receipt).
+        if let Some(ref r) = receipt {
+            if r.blob_id != blob_id {
+                return Err(BlossomError::MalformedReplicaReceipt {
+                    reason: "receipt.blob_id != H(body)",
+                });
+            }
+            if let Some(b) = binding {
+                if r.event_id != b.event_id {
+                    return Err(BlossomError::MalformedReplicaReceipt {
+                        reason: "receipt.event_id != X-ZkCoins-Event-Id",
+                    });
+                }
+                if r.attempt_nonce != b.attempt_nonce {
+                    return Err(BlossomError::MalformedReplicaReceipt {
+                        reason: "receipt.attempt_nonce != X-ZkCoins-Attempt-Nonce",
+                    });
+                }
+            }
+        }
+        Ok(UploadResult { blob_id, receipt })
     }
 
     /// Read a response body under `max_blob_bytes`.
@@ -603,11 +703,10 @@ fn content_length_header(response: &reqwest::Response) -> Option<u64> {
         .and_then(|s| s.parse::<u64>().ok())
 }
 
-/// Parse `blob_id` from a successful upload JSON body.
-///
-/// Only `blob_id` is read. A sibling `receipt` key — if present — is
-/// deliberately ignored (§4.6 / `ReplicaReceiptV1` not built).
-fn parse_upload_blob_id(body: &[u8]) -> Result<[u8; 32], BlossomError> {
+/// Parse upload JSON: required `blob_id`, optional closed-schema `receipt`.
+fn parse_upload_response(
+    body: &[u8],
+) -> Result<([u8; 32], Option<ReplicaReceiptV1>), BlossomError> {
     let value: Value =
         serde_json::from_slice(body).map_err(|_| BlossomError::MalformedUploadResponse {
             reason: "body is not JSON",
@@ -622,9 +721,182 @@ fn parse_upload_blob_id(body: &[u8]) -> Result<[u8; 32], BlossomError> {
             reason: "missing string field blob_id",
         },
     )?;
-    parse_hex32_lower(hex_str).ok_or(BlossomError::MalformedUploadResponse {
+    let blob_id = parse_hex32_lower(hex_str).ok_or(BlossomError::MalformedUploadResponse {
         reason: "blob_id is not 32-byte lowercase hex",
+    })?;
+    let receipt = match obj.get("receipt") {
+        None => None,
+        Some(v) if v.is_null() => None,
+        Some(v) => Some(parse_replica_receipt_value(v)?),
+    };
+    Ok((blob_id, receipt))
+}
+
+/// Closed-schema decoder for `ReplicaReceiptV1Json` (§7.4).
+///
+/// Exactly nine keys; all binary fields lowercase hex of the stated width;
+/// times as canonical decimal strings; `retention_class` ∈ {indefinite, policy}.
+pub(crate) fn parse_replica_receipt_value(v: &Value) -> Result<ReplicaReceiptV1, BlossomError> {
+    let obj = v.as_object().ok_or(BlossomError::MalformedReplicaReceipt {
+        reason: "receipt is not a JSON object",
+    })?;
+    const REQUIRED: [&str; 9] = [
+        "blob_id",
+        "event_id",
+        "holder_op_pubkey",
+        "canonical_base_url",
+        "stored_at",
+        "retention_class",
+        "retention_until",
+        "attempt_nonce",
+        "receipt_sig",
+    ];
+    for k in REQUIRED {
+        if !obj.contains_key(k) {
+            return Err(BlossomError::MalformedReplicaReceipt {
+                reason: "receipt missing required key",
+            });
+        }
+    }
+    for k in obj.keys() {
+        if !REQUIRED.contains(&k.as_str()) {
+            return Err(BlossomError::MalformedReplicaReceipt {
+                reason: "receipt has unknown extra key",
+            });
+        }
+    }
+    let blob_id = req_hex32(obj, "blob_id")?;
+    let event_id = req_hex32(obj, "event_id")?;
+    let holder_op_pubkey = req_hex32(obj, "holder_op_pubkey")?;
+    let attempt_nonce = req_hex32(obj, "attempt_nonce")?;
+    let receipt_sig = req_hex64(obj, "receipt_sig")?;
+    let canonical_base_url = obj
+        .get("canonical_base_url")
+        .and_then(|x| x.as_str())
+        .ok_or(BlossomError::MalformedReplicaReceipt {
+            reason: "canonical_base_url not a string",
+        })?
+        .to_string();
+    if canonical_base_url.is_empty() {
+        return Err(BlossomError::MalformedReplicaReceipt {
+            reason: "canonical_base_url empty",
+        });
+    }
+    let retention_class = obj
+        .get("retention_class")
+        .and_then(|x| x.as_str())
+        .ok_or(BlossomError::MalformedReplicaReceipt {
+            reason: "retention_class not a string",
+        })?
+        .to_string();
+    if retention_class != "indefinite" && retention_class != "policy" {
+        return Err(BlossomError::MalformedReplicaReceipt {
+            reason: "retention_class not in closed enum",
+        });
+    }
+    let stored_at = req_u64_string(obj, "stored_at")?;
+    let retention_until = req_u64_string(obj, "retention_until")?;
+    if retention_class == "indefinite" && retention_until != 0 {
+        return Err(BlossomError::MalformedReplicaReceipt {
+            reason: "retention_until must be 0 when retention_class is indefinite",
+        });
+    }
+    // Persist the exact object encoding as re-serialised compact JSON so the
+    // outbox has a stable byte string without surrounding response noise.
+    let receipt_json =
+        serde_json::to_vec(v).map_err(|_| BlossomError::MalformedReplicaReceipt {
+            reason: "receipt re-serialise failed",
+        })?;
+    Ok(ReplicaReceiptV1 {
+        blob_id,
+        event_id,
+        holder_op_pubkey,
+        canonical_base_url,
+        stored_at,
+        retention_class,
+        retention_until,
+        attempt_nonce,
+        receipt_sig,
+        receipt_json,
     })
+}
+
+fn req_hex32(
+    obj: &serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<[u8; 32], BlossomError> {
+    let s = obj
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or(BlossomError::MalformedReplicaReceipt {
+            reason: "receipt field not a string",
+        })?;
+    parse_hex32_lower(s).ok_or(BlossomError::MalformedReplicaReceipt {
+        reason: "receipt field not 32-byte lowercase hex",
+    })
+}
+
+fn req_hex64(
+    obj: &serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<[u8; 64], BlossomError> {
+    let s = obj
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or(BlossomError::MalformedReplicaReceipt {
+            reason: "receipt_sig not a string",
+        })?;
+    if s.len() != 128 {
+        return Err(BlossomError::MalformedReplicaReceipt {
+            reason: "receipt_sig not 64-byte lowercase hex",
+        });
+    }
+    if !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(BlossomError::MalformedReplicaReceipt {
+            reason: "receipt_sig not 64-byte lowercase hex",
+        });
+    }
+    let bytes = hex::decode(s).map_err(|_| BlossomError::MalformedReplicaReceipt {
+        reason: "receipt_sig hex decode failed",
+    })?;
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Canonical u64 decimal string: `0|[1-9][0-9]*` (§7.4).
+fn req_u64_string(
+    obj: &serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<u64, BlossomError> {
+    let s = obj
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or(BlossomError::MalformedReplicaReceipt {
+            reason: "u64 field not a string",
+        })?;
+    if s.is_empty() {
+        return Err(BlossomError::MalformedReplicaReceipt {
+            reason: "u64 string empty",
+        });
+    }
+    if s == "0" {
+        return Ok(0);
+    }
+    if s.as_bytes()[0] == b'0' {
+        return Err(BlossomError::MalformedReplicaReceipt {
+            reason: "u64 string has leading zero",
+        });
+    }
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(BlossomError::MalformedReplicaReceipt {
+            reason: "u64 string non-decimal",
+        });
+    }
+    s.parse::<u64>()
+        .map_err(|_| BlossomError::MalformedReplicaReceipt {
+            reason: "u64 string out of range",
+        })
 }
 
 fn parse_hex32_lower(s: &str) -> Option<[u8; 32]> {
@@ -797,6 +1069,27 @@ mod tests {
         assert_eq!(v["content"], "");
         assert_eq!(v["tags"][0][1], "upload");
         assert_eq!(v["tags"][1][1], hex::encode(x));
+    }
+
+    #[test]
+    fn blossom_error_terminal_classification() {
+        assert!(!BlossomError::Timeout.is_terminal());
+        assert!(!BlossomError::Transport {
+            message: "reset".into()
+        }
+        .is_terminal());
+        assert!(!BlossomError::NotFound.is_terminal());
+        assert!(!BlossomError::UnexpectedStatus { status: 503 }.is_terminal());
+        assert!(!BlossomError::UnexpectedStatus { status: 429 }.is_terminal());
+        assert!(BlossomError::UnexpectedStatus { status: 418 }.is_terminal());
+        assert!(BlossomError::Forbidden.is_terminal());
+        assert!(BlossomError::Unauthorized.is_terminal());
+        assert!(BlossomError::BadRequest.is_terminal());
+        assert!(BlossomError::PayloadTooLarge.is_terminal());
+        assert!(BlossomError::InvalidBaseUrl {
+            url: "ftp://x".into()
+        }
+        .is_terminal());
     }
 
     // -----------------------------------------------------------------------
@@ -999,10 +1292,10 @@ mod tests {
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
             *self.auth.lock().expect("auth lock") = auth;
+            // No receipt: pure cache upload without dual-commit (§7.4).
+            // A present-but-malformed receipt is rejected by the client.
             ResponseTemplate::new(200).set_body_json(json!({
                 "blob_id": self.blob_id_hex,
-                // Present on purpose — client must ignore it (§4.6 gap).
-                "receipt": { "ignored": true },
             }))
         }
     }
@@ -1055,7 +1348,8 @@ mod tests {
             )
             .await
             .expect("upload");
-        assert_eq!(got, blob_id);
+        assert_eq!(got.blob_id, blob_id);
+        assert!(got.receipt.is_none(), "mock returns no dual-commit receipt");
 
         let sent_body = captured_body.lock().expect("body").clone();
         assert_eq!(
@@ -1179,6 +1473,74 @@ mod tests {
         // created_at ≥ now − AUTH_REPLAY_WINDOW_SECS (recommended). The
         // client does not read a clock; callers pass created_at/expiration.
         assert_eq!(AUTH_REPLAY_WINDOW_SECS, 300);
+    }
+
+    #[test]
+    fn parse_replica_receipt_closed_schema() {
+        let receipt = json!({
+            "blob_id": "aa".repeat(32),
+            "event_id": "bb".repeat(32),
+            "holder_op_pubkey": "cc".repeat(32),
+            "canonical_base_url": "https://holder.example",
+            "stored_at": "1700000000",
+            "retention_class": "indefinite",
+            "retention_until": "0",
+            "attempt_nonce": "dd".repeat(32),
+            "receipt_sig": "ee".repeat(64),
+        });
+        let parsed = parse_replica_receipt_value(&receipt).expect("valid");
+        assert_eq!(parsed.stored_at, 1_700_000_000);
+        assert_eq!(parsed.retention_class, "indefinite");
+        assert_eq!(parsed.canonical_base_url, "https://holder.example");
+        assert!(!parsed.receipt_json.is_empty());
+    }
+
+    #[test]
+    fn parse_replica_receipt_rejects_extra_key() {
+        let receipt = json!({
+            "blob_id": "aa".repeat(32),
+            "event_id": "bb".repeat(32),
+            "holder_op_pubkey": "cc".repeat(32),
+            "canonical_base_url": "https://holder.example",
+            "stored_at": "1",
+            "retention_class": "indefinite",
+            "retention_until": "0",
+            "attempt_nonce": "dd".repeat(32),
+            "receipt_sig": "ee".repeat(64),
+            "extra": true,
+        });
+        let err = parse_replica_receipt_value(&receipt).expect_err("extra");
+        match err {
+            BlossomError::MalformedReplicaReceipt { reason } => {
+                assert!(reason.contains("extra") || reason.contains("unknown"));
+            }
+            other => panic!("expected MalformedReplicaReceipt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_upload_response_stores_receipt_when_present() {
+        let body = json!({
+            "blob_id": "11".repeat(32),
+            "receipt": {
+                "blob_id": "11".repeat(32),
+                "event_id": "22".repeat(32),
+                "holder_op_pubkey": "33".repeat(32),
+                "canonical_base_url": "https://h.example",
+                "stored_at": "9",
+                "retention_class": "policy",
+                "retention_until": "99",
+                "attempt_nonce": "44".repeat(32),
+                "receipt_sig": "55".repeat(64),
+            }
+        });
+        let bytes = serde_json::to_vec(&body).expect("ser");
+        let (blob, receipt) = parse_upload_response(&bytes).expect("parse");
+        assert_eq!(hex::encode(blob), "11".repeat(32));
+        let r = receipt.expect("receipt present");
+        assert_eq!(r.retention_class, "policy");
+        assert_eq!(r.stored_at, 9);
+        assert_eq!(r.retention_until, 99);
     }
 
     #[test]

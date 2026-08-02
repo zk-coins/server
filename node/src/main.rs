@@ -887,6 +887,38 @@ async fn run_v1_scan_loop(
             }
         }
 
+        // §4.2 Phase B: after NfLog fold, finalise any open SDR Phase-A rows
+        // whose own nullifier is now first-occurrence + size_final completed.
+        // Same poll guard as the scan loop — no parallel scheduler.
+        {
+            let occurred_at =
+                match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                    Ok(d) => d.as_secs(),
+                    Err(_) => {
+                        eprintln!(
+                            "v1.1 scanner: wall clock before UNIX epoch — \
+                             skipping SDR Phase B this tick (no silent 0 MTP)"
+                        );
+                        // scanner-polling-ok: v1 bitcoind scan_to_tip idle backoff
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+            // Inclusion block hash: resolve via bitcoind when the inclusion
+            // height is known per row (adapter helper). Fixed tip hash is only
+            // a stand-in for the MTP source's block_hash field when the row's
+            // inclusion height equals the tip; BitcoindInclusionMtp is the
+            // production path once wired. For now the public adapter carries
+            // tip_hash + wall-clock seconds as a **named provisional** for
+            // regtest/dev — BIP-113 MTP must replace this before mainnet.
+            let n = v1::finalize_due_phase_b_adapter(&adapter, tip_hash, occurred_at)
+                .await
+                .map_err(|e| format!("v1.1 SDR Phase B finalise failed: {e:#}"))?;
+            if n > 0 {
+                println!("v1.1 scanner: SDR Phase B finalised {n} SelfDeliveryRecord(s)");
+            }
+        }
+
         // First successful catch-up after a committed boot observation:
         // mark readiness so load balancers can send traffic once the NfLog
         // view reflects the chain tip. Incomplete-view retries never reach

@@ -108,6 +108,9 @@ async fn connect_and_migrate_creates_all_tables() {
     //   * After 0030 (v1 inscriptions catalog): +2 tables
     //     (`v1_inscriptions`, `v1_inscription_members`).
     //   * After 0031 (v1 decrypt index): +1 table (`v1_decrypt_index`).
+    //   * After 0032 (v1 delivery outbox): +2 tables
+    //     (`v1_delivery_outbox`, `v1_delivery_receipts`).
+    //   * After 0033 (v1 SDR Phase A): +1 table (`v1_sdr_phase_a`).
     assert_eq!(
         names,
         vec![
@@ -141,12 +144,15 @@ async fn connect_and_migrate_creates_all_tables() {
             "usernames".to_string(),
             "v1_accounts".to_string(),
             "v1_decrypt_index".to_string(),
+            "v1_delivery_outbox".to_string(),
+            "v1_delivery_receipts".to_string(),
             "v1_engine_meta".to_string(),
             "v1_inscription_members".to_string(),
             "v1_inscriptions".to_string(),
             "v1_nflog_entries".to_string(),
             "v1_nullifier_index".to_string(),
             "v1_pending_publishes".to_string(),
+            "v1_sdr_phase_a".to_string(),
             "v1_spendable_coins".to_string(),
             "v1_spent_coins".to_string(),
         ]

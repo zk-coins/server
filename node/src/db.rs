@@ -809,6 +809,8 @@ this job cannot complete for a transition that no longer exists";
 ///
 /// Tables wiped (derived from migration 0019 / 0021 + legacy leftovers):
 ///
+/// * `v1_delivery_receipts` / `v1_delivery_outbox` — outstanding mesh deliveries
+/// * `v1_sdr_phase_a` — §4.2 SDR Phase-A staging (pre-first-occurrence)
 /// * `v1_pending_publishes` — stale nullifier publish recovery rows
 /// * `v1_spendable_coins` / `v1_spent_coins` — CoinHist leaves
 /// * `v1_accounts` — multi-asset state + last_proof / openings
@@ -834,6 +836,17 @@ pub(crate) async fn reset_v1_proof_dependent_state_tx(
     let mut tx = pool.begin().await?;
     // Order: children / dependents first, then parents, then meta.
     // v1_pending_publishes has no FK to accounts but is proof-dependent.
+    // Delivery outbox holds proof-bound materials (ZBE / K_tx) — wipe with
+    // the rest of the proof-dependent surface on self-heal reset.
+    sqlx::query("DELETE FROM v1_delivery_receipts")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM v1_delivery_outbox")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM v1_sdr_phase_a")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM v1_pending_publishes")
         .execute(&mut *tx)
         .await?;

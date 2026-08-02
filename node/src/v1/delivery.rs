@@ -16,27 +16,37 @@
 //! 5. `DeliveryEvent.payload` → NIP-44 to the recipient's **IVPK** → NIP-59
 //!    gift-wrap with **exactly** the two cleartext outer tags `zkdt` / `zkepk`,
 //! 6. publish to the recipient's relays with **per-relay** outcomes,
-//! 7. retain `(blob, K_tx, ack_nonce, …)` until a valid ACK arrives;
+//! 7. durable outbox row (migration 0032) inserted **atomically with**
+//!    transition persist; first mesh publish marks `awaiting_ack`;
 //! 8. ACK return path: poll gift-wraps, unwrap under sender `ivk`, verify
 //!    kind-1421 (`op_sig` under published recipient `op` **and** nonce
-//!    binding), drop retention on success.
+//!    binding), advance outbox to `awaiting_receipts` (ACK alone never
+//!    completes — need k `ReplicaReceiptV1`);
+//! 9. runtime tick republishes due `pending` / `awaiting_ack` rows with
+//!    §4.2 exponential backoff (30 s → double → cap 1 h); terminal publish
+//!    failures (`DeliveryError::is_terminal_outbox_failure`) call
+//!    `db_outbox::mark_failed` so the row leaves the drive loop with a
+//!    named `fail_reason` (never silent eternal republish).
 //!
 //! # Port boundary
 //!
 //! The kernel never sees axum/tonic/relay/HTTP types. Runtime supplies an
-//! [`OutgoingDeliveryPort`]; finalise calls it **after** durable persistence
-//! (never before). Missing operational bundle or missing recipient IVPK is a
-//! **named error** — never a silent skip that pretends delivery succeeded.
+//! [`OutgoingDeliveryPort`]; finalise inserts outbox rows in the same TX as
+//! engine persist, then the port drives mesh publish. Missing operational
+//! bundle or missing recipient IVPK is a **named error** — never a silent
+//! skip that pretends delivery succeeded.
 //!
 //! Delivery targets are filled from fully verified profiles / Invoices
 //! **before** prove/persist ([`ensure_delivery_targets_before_finalise`]).
 //!
 //! # Self-delivery
 //!
-//! The full `SelfDeliveryRecordV1` two-phase path (§4.2 Phase A/B) is a
-//! separate block (needs first-occurrence MTP). This module exposes
-//! [`out_ciphertext_for_output_ref`] for `K_out` envelopes that an SDR would
-//! carry; the SDR itself is not finalised here.
+//! Outbox `kind = self_delivery` is §4.2 Phase B: after first-occurrence
+//! MTP the scanner hook ([`super::sdr::finalize_due_phase_b_adapter`]) seals
+//! `SelfDeliveryRecordV1` and inserts via [`insert_sdr_outbox_pending`].
+//! Drive/Resume/Backoff is the **same** [`drive_due_outbox_entries`] path
+//! as external coins. Recovery SDR **replay** remains
+//! [`crate::v1::recovery::SdrReplayStatus::Unavailable`].
 //!
 //! Spec: §1.3, §2.3.2, §4.2, §4.2.1, §4.3, §7.1, §7.3.
 
@@ -59,7 +69,12 @@ use shared::spec_v1::serialize::serialize_coin;
 use shared::spec_v1::trees::{empty_leaf_hash, leaf_hash, node_hash, TreeKind};
 use shared::spec_v1::{HashDigest, SpecError};
 
-use super::blossom::{blob_id_of, BlossomClient, BlossomError, RetentionClass, UploadBinding};
+use super::blossom::{
+    blob_id_of, BlossomClient, BlossomError, ReplicaReceiptV1, RetentionClass, UploadBinding,
+};
+use super::db_outbox::{
+    self, OutboxInsert, OutboxKind, OutboxRow, OutboxStatus, PublishArtefacts, StoredReceipt,
+};
 use super::nostr::event::Event;
 use super::nostr::kinds::ack::{
     decode_ack_content, verify_ack_sig, AckContent, AckError, KIND_ACK,
@@ -74,6 +89,8 @@ use super::nostr::profile::{
     VerifiedPaymentProfile,
 };
 use super::nostr::relay::{Filter, RelayPool, RelayPublishResult};
+use super::outbox_material::ExternalOutboxMaterial;
+use sqlx::PgPool;
 
 // ---------------------------------------------------------------------------
 // Errors — named causes, never a bare `is_err()` contract
@@ -115,6 +132,9 @@ pub(crate) enum DeliveryError {
     InclusionProof(String),
     /// Plonky2 proof serialisation failed.
     ProofBytes(String),
+    /// SDR Phase-A `output_ref` could not be built from delivery material
+    /// (empty holders and/or empty `out_ciphertext`).
+    SdrOutputRef(String),
     /// Outer gift-wrap tags are not exactly `zkdt` + `zkepk`.
     OuterTagsInvalid { detail: String },
     /// Profile / Invoice resolution failed for a recipient (named check).
@@ -178,6 +198,7 @@ impl fmt::Display for DeliveryError {
             }
             DeliveryError::InclusionProof(msg) => write!(f, "inclusion_proof: {msg}"),
             DeliveryError::ProofBytes(msg) => write!(f, "proof bytes: {msg}"),
+            DeliveryError::SdrOutputRef(msg) => write!(f, "SDR output_ref: {msg}"),
             DeliveryError::OuterTagsInvalid { detail } => {
                 write!(f, "gift-wrap outer tags invalid: {detail}")
             }
@@ -201,6 +222,50 @@ impl fmt::Display for DeliveryError {
 }
 
 impl std::error::Error for DeliveryError {}
+
+impl DeliveryError {
+    /// Whether an outbox publish failure is **terminal** (row must leave the
+    /// drive loop via [`db_outbox::mark_failed`]) vs **transient** (retain
+    /// and republish under §4.2 backoff).
+    ///
+    /// §4.2 RECOMMENDED freezes delay growth (30 s → double → cap 1 h) but
+    /// does **not** hard-cap attempt count: pure network/relay unavailability
+    /// keeps retrying at the 1 h cap. Terminal means the same durable
+    /// material / config / rejected target cannot recover by waiting —
+    /// crypto/codec on fixed bytes, empty holder/relay sets, permanent
+    /// Blossom policy rejects (403/401/…), profile/IVPK refusal.
+    ///
+    /// `attempt_n` only advances on **successful** mesh publish
+    /// ([`db_outbox::mark_published`]); it is not a failed-attempt counter,
+    /// so classification is by error kind, not attempt threshold.
+    pub(crate) fn is_terminal_outbox_failure(&self) -> bool {
+        match self {
+            // OS entropy can recover; do not bury the row.
+            DeliveryError::RandomSourceFailed => false,
+            // Process-local BundleStore may be refilled after restart/load.
+            DeliveryError::OperationalBundleMissing { .. } => false,
+            // Peer/network: all relays down or rejecting is usually temporary.
+            DeliveryError::NoRelayAccepted { .. } => false,
+            // DB / pool / mark_published wiring after a mesh attempt — retry.
+            DeliveryError::Relay(_) => false,
+            // Fixed material / local construction: waiting never helps.
+            DeliveryError::Spec(_)
+            | DeliveryError::Nip44(_)
+            | DeliveryError::Nip59(_)
+            | DeliveryError::Payload(_)
+            | DeliveryError::InclusionProof(_)
+            | DeliveryError::ProofBytes(_)
+            | DeliveryError::SdrOutputRef(_)
+            | DeliveryError::OuterTagsInvalid { .. }
+            | DeliveryError::RecipientIvpkUnavailable { .. }
+            | DeliveryError::RecipientRelaysEmpty { .. }
+            | DeliveryError::BlobHoldersEmpty
+            | DeliveryError::ProfileResolve { .. }
+            | DeliveryError::RecipientTargetExpired { .. } => true,
+            DeliveryError::Blossom { error, .. } => error.is_terminal(),
+        }
+    }
+}
 
 impl From<SpecError> for DeliveryError {
     fn from(value: SpecError) -> Self {
@@ -679,17 +744,14 @@ fn assert_outer_tags_are_exactly_delivery_scan(
 // ---------------------------------------------------------------------------
 
 /// Per-coin publish report (no aggregated success bool).
+///
+/// Only fields the outbox path actually consumes are retained. Relay/blossom
+/// detail is logged at the call site when needed; a field bag of unread
+/// copies is not kept as a Vorrat.
 #[derive(Clone, Debug)]
 pub(crate) struct CoinDeliveryReport {
-    pub blob_id: [u8; 32],
-    pub detect_tag: [u8; 32],
-    pub epk: [u8; 32],
-    pub ack_nonce: [u8; 32],
-    pub gift_wrap_id: [u8; 32],
-    /// One outcome per holder base URL, in order.
-    pub blossom_ok: Vec<String>,
-    /// One outcome per relay URL, in order — never collapsed.
-    pub relay_results: Vec<RelayPublishResult>,
+    /// ReplicaReceiptV1 values returned by holders that dual-committed (§4.6).
+    pub receipts: Vec<ReplicaReceiptV1>,
 }
 
 /// Upload ZBE blob to every holder, then publish gift-wrap to every relay.
@@ -712,9 +774,9 @@ pub(crate) async fn publish_built_delivery(
         retention: RetentionClass::Indefinite,
     };
 
-    let mut blossom_ok = Vec::with_capacity(built.blob_holders.len());
+    let mut receipts = Vec::new();
     for holder in &built.blob_holders {
-        client
+        let upload = client
             .upload(
                 holder,
                 &built.zbe_ciphertext,
@@ -728,7 +790,9 @@ pub(crate) async fn publish_built_delivery(
                 holder: holder.clone(),
                 error: e,
             })?;
-        blossom_ok.push(holder.clone());
+        if let Some(r) = upload.receipt {
+            receipts.push(r);
+        }
     }
 
     let pool = RelayPool::new(built.recipient_relays.clone())
@@ -762,32 +826,21 @@ pub(crate) async fn publish_built_delivery(
         return Err(DeliveryError::NoRelayAccepted { results });
     }
 
-    Ok(CoinDeliveryReport {
-        blob_id: built.blob_id,
-        detect_tag: built.keys.detect_tag,
-        epk: built.keys.epk,
-        ack_nonce: built.ack_nonce,
-        gift_wrap_id: built.gift_wrap.id,
-        blossom_ok,
-        relay_results,
-    })
+    Ok(CoinDeliveryReport { receipts })
 }
 
 // ---------------------------------------------------------------------------
-// Retention until ACK (§4.2) — process-local; no SQL migration in this block
+// Process-local ACK cache (unit tests + optional mirror of durable outbox)
 // ---------------------------------------------------------------------------
 
-/// One retained delivery attempt awaiting a valid ACK.
+/// One retained delivery attempt for ACK verification (process-local mirror).
 ///
-/// Durable storage would need a migration — **not** created here. Process
-/// memory is the same durability class as `BundleStore`; restart loses the
-/// queue and the operator must re-drive delivery from value-bearing artefacts.
-///
-/// Fields are exactly what ACK verification and post-ACK integrity need:
-/// identity of the attempt, the sealed ZBE body (content-address checked on
-/// accept), `K_tx` + `out_ciphertext` for §4.2 / §1.3 re-open, and the
-/// recipient `op` that must verify `op_sig`. Retransmit to relays/holders is
-/// a separate gap (no caller re-publishes yet).
+/// Production durability is `v1_delivery_outbox` (migration 0032). This store
+/// remains for pure unit tests of ACK crypto without Postgres. A valid ACK
+/// **marks** the attempt accepted but does **not** drop the row — drop is
+/// reserved for the durable outbox once ACK **and** k receipts are present
+/// (§4.2 / §4.6). Process-local rows are not dropped by this store; the
+/// durable outbox owns completion.
 #[derive(Clone, Debug)]
 pub(crate) struct RetainedDeliveryAttempt {
     pub blob_id: [u8; 32],
@@ -797,6 +850,8 @@ pub(crate) struct RetainedDeliveryAttempt {
     pub zbe_ciphertext: Vec<u8>,
     pub out_ciphertext: Vec<u8>,
     pub recipient_op_pk: [u8; 32],
+    /// True after a valid ACK; still retained until k receipts (durable path).
+    pub ack_accepted: bool,
 }
 
 /// Process-local pending-ACK store. Keyed by `(blob_id, ack_nonce)`.
@@ -823,7 +878,8 @@ impl PendingDeliveryStore {
         k
     }
 
-    pub(crate) fn retain(&self, attempt: RetainedDeliveryAttempt) {
+    pub(crate) fn retain(&self, mut attempt: RetainedDeliveryAttempt) {
+        attempt.ack_accepted = false;
         let key = Self::attempt_key(&attempt.blob_id, &attempt.ack_nonce);
         let mut guard = self
             .by_attempt
@@ -845,8 +901,8 @@ impl PendingDeliveryStore {
         guard.get(&key).cloned()
     }
 
-    /// Accept ACK for this attempt and drop the retained copy when both
-    /// signature and nonce checks pass.
+    /// Verify ACK for this attempt and mark `ack_accepted`. Does **not** drop
+    /// the retained copy (§4.2: drop only after ACK + k receipts).
     pub(crate) fn accept_ack_json(
         &self,
         blob_id: &[u8; 32],
@@ -886,7 +942,9 @@ impl PendingDeliveryStore {
             .by_attempt
             .lock()
             .expect("PendingDeliveryStore mutex poisoned");
-        guard.remove(&key);
+        if let Some(entry) = guard.get_mut(&key) {
+            entry.ack_accepted = true;
+        }
         Ok(())
     }
 
@@ -940,22 +998,34 @@ pub(crate) trait OutgoingDeliveryPort: Send + Sync {
     >;
 }
 
-/// Production port: build → upload → publish → retain until ACK.
+/// Production port: build → upload → publish → durable outbox mark_published.
+///
+/// Outbox rows are inserted **atomically with transition persist** (before
+/// this port runs). The port drives pending / due rows and records receipts.
 pub(crate) struct MeshDeliveryPort {
+    pub pool: PgPool,
+    /// Optional process-local mirror for unit tests of ACK unwrap without SQL.
     pub retention: Arc<PendingDeliveryStore>,
     /// Secure random — production uses [`super::nostr::nip59::OsSecureRandom`].
     /// Held behind a mutex so the port is `Sync`.
     pub rng: Arc<Mutex<Box<dyn SecureRandom + Send>>>,
+    /// Replication target k frozen into new inserts when the port creates
+    /// rows itself (legacy path). Prefer finalise-time insert with k.
+    pub replication_k: i32,
 }
 
 impl MeshDeliveryPort {
     pub(crate) fn new(
+        pool: PgPool,
         retention: Arc<PendingDeliveryStore>,
         rng: Box<dyn SecureRandom + Send>,
+        replication_k: i32,
     ) -> Self {
         Self {
+            pool,
             retention,
             rng: Arc::new(Mutex::new(rng)),
+            replication_k,
         }
     }
 }
@@ -979,65 +1049,449 @@ impl OutgoingDeliveryPort for MeshDeliveryPort {
             if request.operator.blob_holders.is_empty() {
                 return Err(DeliveryError::BlobHoldersEmpty);
             }
+            if self.replication_k < 2 {
+                return Err(DeliveryError::Relay(format!(
+                    "replication_k={} < 2 (§4.6 MUST NOT)",
+                    self.replication_k
+                )));
+            }
 
             let mut report = TransitionDeliveryReport { delivered: 0 };
 
             for material in &request.coins {
-                // Draw all CSPRNG material under the mutex, then drop the
-                // guard *before* Blossom upload / relay publish. Holding the
-                // guard across those awaits would serialise every concurrent
-                // delivery on the slowest peer.
-                let built = {
-                    // Mutex: MeshDeliveryPort is Sync and shared across concurrent
-                    // deliveries; SecureRandom::fill_bytes needs exclusive &mut,
-                    // including stateful test RNGs behind the same dyn box.
-                    let mut rng = self.rng.lock().expect("delivery rng mutex poisoned");
-                    build_coin_delivery(
-                        material,
-                        &request.operator.op_sk,
-                        &request.operator.ovk,
-                        &request.operator.blob_holders,
-                        request.operator.now,
-                        rng.as_mut(),
-                    )?
-                }; // MutexGuard dropped here — before any network await.
-
-                let coin_report = publish_built_delivery(
-                    &built,
-                    &request.operator.op_sk,
+                // Ensure a durable pending row exists (idempotent if finalise
+                // already inserted atomically with engine persist).
+                let material_dto = ExternalOutboxMaterial::from_outgoing(
+                    material,
+                    &request.operator.blob_holders,
                     request.operator.max_blob_bytes,
-                    request.operator.now,
-                    request.operator.auth_expiration,
+                );
+                let material_bytes = material_dto
+                    .encode()
+                    .map_err(|e| DeliveryError::Relay(format!("outbox material encode: {e:#}")))?;
+                let coin_id = shared::spec_v1::encoding::digest_to_bytes(&material.coin.identifier);
+                let transition_pk = material.creating_nullifier.pk_create;
+                let insert = OutboxInsert {
+                    kind: OutboxKind::ExternalCoin,
+                    subject: request.subject,
+                    transition_pk,
+                    coin_id,
+                    material: material_bytes,
+                    replication_k: self.replication_k,
+                };
+                db_outbox::insert_pending(&self.pool, &[insert])
+                    .await
+                    .map_err(|e| DeliveryError::Relay(format!("outbox insert: {e:#}")))?;
+
+                let outbox_id = db_outbox::outbox_id(
+                    OutboxKind::ExternalCoin,
+                    &request.subject,
+                    &coin_id,
+                    &transition_pk,
+                );
+                let row = db_outbox::get_by_id(&self.pool, &outbox_id)
+                    .await
+                    .map_err(|e| DeliveryError::Relay(format!("outbox load: {e:#}")))?
+                    .ok_or_else(|| {
+                        DeliveryError::Relay("outbox row missing after insert".into())
+                    })?;
+                if row.status.is_terminal() {
+                    // Completed/failed: never republish.
+                    continue;
+                }
+                if row.status == OutboxStatus::AwaitingReceipts {
+                    // ACK already in hand — only receipts remain.
+                    continue;
+                }
+
+                publish_outbox_row(
+                    &self.pool,
+                    &row,
+                    material,
+                    &request.operator,
+                    self.retention.as_ref(),
+                    self.rng.as_ref(),
                 )
                 .await?;
 
-                // Retain until ACK (§4.2). Process-local only — no migration.
-                self.retention.retain(RetainedDeliveryAttempt {
-                    blob_id: built.blob_id,
-                    detect_tag: built.keys.detect_tag,
-                    k_tx: built.keys.k_tx,
-                    ack_nonce: built.ack_nonce,
-                    zbe_ciphertext: built.zbe_ciphertext.clone(),
-                    out_ciphertext: built.out_ciphertext.clone(),
-                    recipient_op_pk: built.recipient_op_pk,
-                });
-
                 tracing::info!(
                     subject = %hex::encode(request.subject),
-                    blob_id = %hex::encode(coin_report.blob_id),
-                    detect_tag = %hex::encode(coin_report.detect_tag),
-                    epk = %hex::encode(coin_report.epk),
-                    ack_nonce = %hex::encode(coin_report.ack_nonce),
-                    gift_wrap_id = %hex::encode(coin_report.gift_wrap_id),
-                    blossom_holders = coin_report.blossom_ok.len(),
-                    relay_outcomes = coin_report.relay_results.len(),
-                    "mesh delivery published for coin"
+                    outbox_id = %hex::encode(outbox_id),
+                    coin_id = %hex::encode(coin_id),
+                    "mesh delivery published for outbox coin"
                 );
                 report.delivered = report.delivered.saturating_add(1);
             }
             Ok(report)
         })
     }
+}
+
+/// Build + network-publish one outbox row; mark_published + store receipts.
+pub(crate) async fn publish_outbox_row(
+    pool: &PgPool,
+    row: &OutboxRow,
+    material: &OutgoingCoinMaterial,
+    operator: &DeliveryOperatorContext,
+    retention: &PendingDeliveryStore,
+    rng: &Mutex<Box<dyn SecureRandom + Send>>,
+) -> Result<CoinDeliveryReport, DeliveryError> {
+    if row.status.is_terminal() {
+        return Err(DeliveryError::Relay(
+            "refuse publish of terminal outbox row".into(),
+        ));
+    }
+    if row.status == OutboxStatus::AwaitingReceipts {
+        return Err(DeliveryError::Relay(
+            "refuse republish after ACK (awaiting_receipts)".into(),
+        ));
+    }
+
+    let built = {
+        let mut rng = rng.lock().expect("delivery rng mutex poisoned");
+        build_coin_delivery(
+            material,
+            &operator.op_sk,
+            &operator.ovk,
+            &operator.blob_holders,
+            operator.now,
+            rng.as_mut(),
+        )?
+    };
+
+    let coin_report = publish_built_delivery(
+        &built,
+        &operator.op_sk,
+        operator.max_blob_bytes,
+        operator.now,
+        operator.auth_expiration,
+    )
+    .await?;
+
+    let artefacts = PublishArtefacts {
+        blob_id: built.blob_id,
+        detect_tag: built.keys.detect_tag,
+        epk: built.keys.epk,
+        k_tx: built.keys.k_tx,
+        ack_nonce: built.ack_nonce,
+        event_id: built.gift_wrap.id,
+        zbe_ciphertext: built.zbe_ciphertext.clone(),
+        out_ciphertext: built.out_ciphertext.clone(),
+        recipient_op_pk: built.recipient_op_pk,
+    };
+    db_outbox::mark_published(pool, &row.outbox_id, &artefacts)
+        .await
+        .map_err(|e| DeliveryError::Relay(format!("outbox mark_published: {e:#}")))?;
+
+    for r in &coin_report.receipts {
+        db_outbox::store_receipt(
+            pool,
+            &row.outbox_id,
+            &StoredReceipt {
+                holder_op_pubkey: r.holder_op_pubkey,
+                receipt_json: r.receipt_json.clone(),
+                retention_class: r.retention_class.clone(),
+                stored_at: r.stored_at,
+            },
+        )
+        .await
+        .map_err(|e| DeliveryError::Relay(format!("outbox store_receipt: {e:#}")))?;
+    }
+
+    // Process-local mirror for ACK unwrap helpers that still take the store.
+    retention.retain(RetainedDeliveryAttempt {
+        blob_id: built.blob_id,
+        detect_tag: built.keys.detect_tag,
+        k_tx: built.keys.k_tx,
+        ack_nonce: built.ack_nonce,
+        zbe_ciphertext: built.zbe_ciphertext,
+        out_ciphertext: built.out_ciphertext,
+        recipient_op_pk: built.recipient_op_pk,
+        ack_accepted: false,
+    });
+
+    Ok(coin_report)
+}
+
+/// Drive due open outbox rows (runtime republish + resume).
+///
+/// Requires the operational bundle (`op_sk` / `ovk`) for rebuild. Rows whose
+/// subject has no active bundle are skipped with a named log (fail closed on
+/// that subject, not a silent invent of keys).
+///
+/// Publish failures are classified via
+/// [`DeliveryError::is_terminal_outbox_failure`]: terminal →
+/// [`db_outbox::mark_failed`] (status `failed` + named `fail_reason`, leaves
+/// `list_due`); transient → warn and keep for §4.2 backoff republish.
+pub(crate) async fn drive_due_outbox_entries(
+    pool: &PgPool,
+    bundles: &crate::kernel::bootstrap::BundleStore,
+    retention: &PendingDeliveryStore,
+    rng: &Mutex<Box<dyn SecureRandom + Send>>,
+    now: u64,
+    auth_expiration: u64,
+) -> Result<usize, DeliveryError> {
+    let due = db_outbox::list_due(pool)
+        .await
+        .map_err(|e| DeliveryError::Relay(format!("list_due: {e:#}")))?;
+    let mut driven = 0usize;
+    for row in due {
+        let subject = crate::kernel::types::SubjectAddress(row.subject);
+        let Some(bundle) = bundles.get_active(&subject) else {
+            tracing::warn!(
+                subject = %hex::encode(row.subject),
+                outbox_id = %hex::encode(row.outbox_id),
+                "outbox due but operational bundle missing — skip (no invented keys)"
+            );
+            continue;
+        };
+
+        match row.kind {
+            OutboxKind::SelfDelivery => {
+                // Mutex is locked only inside publish_sdr_outbox_row for the
+                // sync seal; never hold a std MutexGuard across this .await.
+                match super::sdr::publish_sdr_outbox_row(
+                    pool,
+                    &row,
+                    &bundle.op,
+                    now,
+                    auth_expiration,
+                    rng,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        driven = driven.saturating_add(1);
+                    }
+                    Err(e) if e.is_terminal_outbox_failure() => {
+                        mark_outbox_failed(pool, &row.outbox_id, &e.to_string()).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            outbox_id = %hex::encode(row.outbox_id),
+                            error = %e,
+                            "SDR outbox publish attempt failed (transient; row retained for retry)"
+                        );
+                    }
+                }
+            }
+            OutboxKind::ExternalCoin => {
+                // Corrupt durable material never heals by waiting — mark failed
+                // per-row so one bad row cannot abort the rest of the due set.
+                let mat = match ExternalOutboxMaterial::decode(&row.material) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        mark_outbox_failed(
+                            pool,
+                            &row.outbox_id,
+                            &format!("outbox material decode: {e:#}"),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let outgoing = match mat.to_outgoing() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        mark_outbox_failed(
+                            pool,
+                            &row.outbox_id,
+                            &format!("outbox material to_outgoing: {e:#}"),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let operator = DeliveryOperatorContext {
+                    op_sk: bundle.op,
+                    ovk: bundle.ovk,
+                    blob_holders: mat.blob_holders.clone(),
+                    max_blob_bytes: mat.max_blob_bytes,
+                    now,
+                    auth_expiration,
+                };
+                match publish_outbox_row(pool, &row, &outgoing, &operator, retention, rng).await {
+                    Ok(_) => {
+                        driven = driven.saturating_add(1);
+                    }
+                    Err(e) if e.is_terminal_outbox_failure() => {
+                        mark_outbox_failed(pool, &row.outbox_id, &e.to_string()).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            outbox_id = %hex::encode(row.outbox_id),
+                            error = %e,
+                            "outbox publish attempt failed (transient; row retained for retry)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(driven)
+}
+
+/// Persist terminal outbox failure (named reason). Logs hard if the write
+/// itself fails — the row may still be due; never invent a soft "not due".
+async fn mark_outbox_failed(pool: &PgPool, outbox_id: &[u8; 32], reason: &str) {
+    match db_outbox::mark_failed(pool, outbox_id, reason).await {
+        Ok(()) => {
+            tracing::error!(
+                outbox_id = %hex::encode(outbox_id),
+                reason,
+                "outbox permanently failed (status=failed; left drive loop)"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                outbox_id = %hex::encode(outbox_id),
+                reason,
+                error = %e,
+                "outbox mark_failed write failed (row may remain due)"
+            );
+        }
+    }
+}
+
+/// Insert a Phase-B `SelfDeliveryRecordV1` outbox row (after first-occurrence MTP).
+///
+/// Call this **only** once the final SDR ciphertext is sealed (§4.2 Phase B).
+/// Phase A must never write a provisional SDR outbox entry. The recovery
+/// path that **replays** recovered SDRs is still
+/// [`crate::v1::recovery::SdrReplayStatus::Unavailable`] — this helper only
+/// queues **outbound** self-delivery.
+pub(crate) async fn insert_sdr_outbox_pending(
+    pool: &PgPool,
+    subject: [u8; 32],
+    transition_pk: [u8; 32],
+    material: &super::outbox_material::SdrOutboxMaterial,
+    replication_k: i32,
+) -> Result<[u8; 32], DeliveryError> {
+    if replication_k < 2 {
+        return Err(DeliveryError::Relay(format!(
+            "replication_k={replication_k} < 2 (§4.6 MUST NOT)"
+        )));
+    }
+    let material_bytes = material
+        .encode()
+        .map_err(|e| DeliveryError::Relay(format!("SDR material encode: {e:#}")))?;
+    // SDR has no coin_id — zero sentinel, one SDR per (subject, transition).
+    let coin_id = [0u8; 32];
+    let id = db_outbox::outbox_id(OutboxKind::SelfDelivery, &subject, &coin_id, &transition_pk);
+    db_outbox::insert_pending(
+        pool,
+        &[OutboxInsert {
+            kind: OutboxKind::SelfDelivery,
+            subject,
+            transition_pk,
+            coin_id,
+            material: material_bytes,
+            replication_k,
+        }],
+    )
+    .await
+    .map_err(|e| DeliveryError::Relay(format!("SDR outbox insert: {e:#}")))?;
+    Ok(id)
+}
+
+/// Build outbox insert payloads for external coins of one transition.
+///
+/// Called from finalise so inserts share the engine+members_ready transaction.
+pub(crate) fn external_outbox_inserts(
+    subject: [u8; 32],
+    transition_pk: [u8; 32],
+    coins: &[OutgoingCoinMaterial],
+    blob_holders: &[String],
+    max_blob_bytes: u64,
+    replication_k: i32,
+) -> Result<Vec<OutboxInsert>, DeliveryError> {
+    if replication_k < 2 {
+        return Err(DeliveryError::Relay(format!(
+            "replication_k={replication_k} < 2 (§4.6 MUST NOT)"
+        )));
+    }
+    let mut out = Vec::with_capacity(coins.len());
+    for material in coins {
+        let dto = ExternalOutboxMaterial::from_outgoing(material, blob_holders, max_blob_bytes);
+        let material_bytes = dto
+            .encode()
+            .map_err(|e| DeliveryError::Relay(format!("outbox material encode: {e:#}")))?;
+        let coin_id = shared::spec_v1::encoding::digest_to_bytes(&material.coin.identifier);
+        out.push(OutboxInsert {
+            kind: OutboxKind::ExternalCoin,
+            subject,
+            transition_pk,
+            coin_id,
+            material: material_bytes,
+            replication_k,
+        });
+    }
+    Ok(out)
+}
+
+/// Durable ACK accept: verify against outbox artefacts, advance to
+/// `awaiting_receipts` (never completes without k receipts).
+pub(crate) async fn accept_outbox_ack_json(
+    pool: &PgPool,
+    blob_id: &[u8; 32],
+    ack_nonce: &[u8; 32],
+    json: &str,
+) -> Result<[u8; 32], AckVerifyError> {
+    let row = db_outbox::get_by_blob_and_ack_nonce(pool, blob_id, ack_nonce)
+        .await
+        .map_err(|_| AckVerifyError::FieldMismatch {
+            field: "blob_id|ack_nonce",
+        })?
+        .ok_or(AckVerifyError::FieldMismatch {
+            field: "blob_id|ack_nonce",
+        })?;
+    let detect_tag = row.detect_tag.ok_or(AckVerifyError::FieldMismatch {
+        field: "detect_tag",
+    })?;
+    let k_tx = row
+        .k_tx
+        .ok_or(AckVerifyError::FieldMismatch { field: "k_tx" })?;
+    let recipient_op_pk = row.recipient_op_pk.ok_or(AckVerifyError::FieldMismatch {
+        field: "recipient_op_pk",
+    })?;
+    let zbe = row
+        .zbe_ciphertext
+        .as_ref()
+        .ok_or(AckVerifyError::FieldMismatch {
+            field: "zbe_ciphertext",
+        })?;
+    let out_ct = row
+        .out_ciphertext
+        .as_ref()
+        .ok_or(AckVerifyError::FieldMismatch {
+            field: "out_ciphertext",
+        })?;
+    let row_blob = row
+        .blob_id
+        .ok_or(AckVerifyError::FieldMismatch { field: "blob_id" })?;
+    if blob_id_of(zbe) != row_blob {
+        return Err(AckVerifyError::FieldMismatch {
+            field: "zbe_ciphertext/blob_id",
+        });
+    }
+    // External coins: out_ciphertext is the ovk recovery envelope (required).
+    // Self-delivery SDR rows seal the whole record under ZBE; no per-coin
+    // out_ciphertext is owed — empty is expected for kind = self_delivery.
+    if out_ct.is_empty() && row.kind != db_outbox::OutboxKind::SelfDelivery {
+        return Err(AckVerifyError::FieldMismatch {
+            field: "out_ciphertext",
+        });
+    }
+    if k_tx == [0u8; 32] {
+        return Err(AckVerifyError::FieldMismatch { field: "k_tx" });
+    }
+    verify_delivery_ack_json(&recipient_op_pk, &detect_tag, blob_id, ack_nonce, json)?;
+    db_outbox::mark_ack_received(pool, &row.outbox_id)
+        .await
+        .map_err(|_| AckVerifyError::FieldMismatch {
+            field: "outbox_status",
+        })?;
+    Ok(row.outbox_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,7 +1741,7 @@ pub(crate) fn ensure_delivery_targets_before_finalise(
 pub(crate) enum AckInboxResult {
     /// Not a gift-wrap we could open, or not kind-1421 — ignored.
     Ignored { reason: &'static str },
-    /// Valid ACK: retention entry dropped.
+    /// Valid ACK: outbox advanced to `awaiting_receipts` (not completed).
     Accepted {
         blob_id: [u8; 32],
         ack_nonce: [u8; 32],
@@ -1305,54 +1759,95 @@ pub(crate) fn process_gift_wrap_for_ack(
     sender_ivk: &[u8; 32],
     store: &PendingDeliveryStore,
 ) -> AckInboxResult {
+    match open_ack_content(wrap, sender_ivk) {
+        OpenAck::Ignored { reason } => AckInboxResult::Ignored { reason },
+        OpenAck::Rejected { error } => AckInboxResult::Rejected { error },
+        OpenAck::Content {
+            blob_id,
+            ack_nonce,
+            json,
+        } => match store.accept_ack_json(&blob_id, &ack_nonce, &json) {
+            Ok(()) => AckInboxResult::Accepted { blob_id, ack_nonce },
+            Err(e) => AckInboxResult::Rejected { error: e },
+        },
+    }
+}
+
+/// Durable variant: ACK advances `v1_delivery_outbox` to `awaiting_receipts`.
+pub(crate) async fn process_gift_wrap_for_ack_durable(
+    wrap: &Event,
+    sender_ivk: &[u8; 32],
+    pg: &PgPool,
+) -> AckInboxResult {
+    match open_ack_content(wrap, sender_ivk) {
+        OpenAck::Ignored { reason } => AckInboxResult::Ignored { reason },
+        OpenAck::Rejected { error } => AckInboxResult::Rejected { error },
+        OpenAck::Content {
+            blob_id,
+            ack_nonce,
+            json,
+        } => match accept_outbox_ack_json(pg, &blob_id, &ack_nonce, &json).await {
+            Ok(_outbox_id) => AckInboxResult::Accepted { blob_id, ack_nonce },
+            Err(e) => AckInboxResult::Rejected { error: e },
+        },
+    }
+}
+
+enum OpenAck {
+    Ignored {
+        reason: &'static str,
+    },
+    Rejected {
+        error: AckVerifyError,
+    },
+    Content {
+        blob_id: [u8; 32],
+        ack_nonce: [u8; 32],
+        json: String,
+    },
+}
+
+fn open_ack_content(wrap: &Event, sender_ivk: &[u8; 32]) -> OpenAck {
     if wrap.kind != KIND_GIFT_WRAP {
-        return AckInboxResult::Ignored {
+        return OpenAck::Ignored {
             reason: "not gift-wrap kind",
         };
     }
     let unwrapped = match unwrap_gift(wrap, sender_ivk) {
         Ok(u) => u,
         Err(_) => {
-            return AckInboxResult::Ignored {
+            return OpenAck::Ignored {
                 reason: "unwrap failed (not for us or corrupt)",
             };
         }
     };
     if unwrapped.rumor.kind != KIND_ACK {
-        return AckInboxResult::Ignored {
+        return OpenAck::Ignored {
             reason: "inner rumor not kind 1421",
         };
     }
-    let content = match decode_ack_content(&unwrapped.rumor.content) {
-        Ok(c) => c,
-        Err(e) => {
-            return AckInboxResult::Rejected {
-                error: AckVerifyError::Decode(e),
-            };
-        }
-    };
-    // Look up by the ACK's own (blob_id, ack_nonce). Attempt-1 nonce against
-    // a store holding only attempt 2 → missing key (FieldMismatch) or, if
-    // caller used attempt-2 key with attempt-1 body, AckNonceMismatch.
-    match store.accept_ack_json(
-        &content.blob_id,
-        &content.ack_nonce,
-        &unwrapped.rumor.content,
-    ) {
-        Ok(()) => AckInboxResult::Accepted {
-            blob_id: content.blob_id,
-            ack_nonce: content.ack_nonce,
+    match decode_ack_content(&unwrapped.rumor.content) {
+        Ok(c) => OpenAck::Content {
+            blob_id: c.blob_id,
+            ack_nonce: c.ack_nonce,
+            json: unwrapped.rumor.content,
         },
-        Err(e) => AckInboxResult::Rejected { error: e },
+        Err(e) => OpenAck::Rejected {
+            error: AckVerifyError::Decode(e),
+        },
     }
 }
 
-/// Query relays for kind-1059 gift-wraps and run [`process_gift_wrap_for_ack`]
-/// on each verified event. No exponential backoff republish here (GAP).
+/// Query relays for kind-1059 gift-wraps and accept ACKs.
+///
+/// When `pg` is `Some`, the durable outbox is the source of truth (ACK →
+/// `awaiting_receipts`). Republish of due rows is a **separate** runtime
+/// tick ([`drive_due_outbox_entries`]) — this function only consumes ACKs.
 pub(crate) async fn poll_incoming_acks(
-    pool: &RelayPool,
+    relay_pool: &RelayPool,
     sender_ivk: &[u8; 32],
     store: &PendingDeliveryStore,
+    pg: Option<&PgPool>,
     since: Option<u64>,
 ) -> Result<Vec<AckInboxResult>, DeliveryError> {
     let filter = Filter {
@@ -1360,10 +1855,14 @@ pub(crate) async fn poll_incoming_acks(
         since,
         ..Filter::default()
     };
-    let aggregate = pool.query_all(&[filter]).await;
+    let aggregate = relay_pool.query_all(&[filter]).await;
     let mut out = Vec::with_capacity(aggregate.events.len());
     for event in &aggregate.events {
-        out.push(process_gift_wrap_for_ack(event, sender_ivk, store));
+        if let Some(pg) = pg {
+            out.push(process_gift_wrap_for_ack_durable(event, sender_ivk, pg).await);
+        } else {
+            out.push(process_gift_wrap_for_ack(event, sender_ivk, store));
+        }
     }
     Ok(out)
 }
@@ -1670,6 +2169,7 @@ mod tests {
             zbe_ciphertext: zbe,
             out_ciphertext: vec![0xAA],
             recipient_op_pk: recip_op_pk,
+            ack_accepted: false,
         });
         let err = store
             .accept_ack_json(&blob, &nonce_attempt_2, &json)
@@ -1682,7 +2182,8 @@ mod tests {
     }
 
     #[test]
-    fn valid_ack_drops_retention() {
+    fn valid_ack_marks_accepted_but_does_not_drop() {
+        // §4.2 / §4.6: ACK alone never discards the retained copy.
         let (recip_op_sk, recip_op_pk) = fixture_sk(b"zkCoins/v1/test/delivery/ack-op2");
         let detect = [0xAAu8; 32];
         let zbe = b"retained-zbe-body".to_vec();
@@ -1700,11 +2201,14 @@ mod tests {
             zbe_ciphertext: zbe,
             out_ciphertext: vec![0xBB],
             recipient_op_pk: recip_op_pk,
+            ack_accepted: false,
         });
         store
             .accept_ack_json(&blob, &nonce, &json)
             .expect("valid ACK");
-        assert_eq!(store.len(), 0);
+        assert_eq!(store.len(), 1, "ACK alone must retain until k receipts");
+        let held = store.get(&blob, &nonce).expect("still held");
+        assert!(held.ack_accepted);
     }
 
     // -----------------------------------------------------------------------
@@ -1885,6 +2389,72 @@ mod tests {
     }
 
     #[test]
+    fn terminal_vs_transient_outbox_publish_classification() {
+        // Transient: network / peer / entropy / missing process-local bundle.
+        assert!(!DeliveryError::RandomSourceFailed.is_terminal_outbox_failure());
+        assert!(
+            !DeliveryError::OperationalBundleMissing { subject: [0; 32] }
+                .is_terminal_outbox_failure()
+        );
+        assert!(!DeliveryError::NoRelayAccepted { results: vec![] }.is_terminal_outbox_failure());
+        assert!(!DeliveryError::Relay("db blip".into()).is_terminal_outbox_failure());
+        assert!(!DeliveryError::Blossom {
+            holder: "https://h.example".into(),
+            error: BlossomError::Timeout,
+        }
+        .is_terminal_outbox_failure());
+        assert!(!DeliveryError::Blossom {
+            holder: "https://h.example".into(),
+            error: BlossomError::Transport {
+                message: "connection reset".into()
+            },
+        }
+        .is_terminal_outbox_failure());
+        assert!(!DeliveryError::Blossom {
+            holder: "https://h.example".into(),
+            error: BlossomError::UnexpectedStatus { status: 503 },
+        }
+        .is_terminal_outbox_failure());
+
+        // Terminal: maligned/rejected target, empty config, fixed-material crypto.
+        assert!(DeliveryError::BlobHoldersEmpty.is_terminal_outbox_failure());
+        assert!(
+            DeliveryError::RecipientRelaysEmpty { recipient: [1; 32] }.is_terminal_outbox_failure()
+        );
+        assert!(
+            DeliveryError::RecipientIvpkUnavailable { recipient: [2; 32] }
+                .is_terminal_outbox_failure()
+        );
+        assert!(DeliveryError::Blossom {
+            holder: "https://h.example".into(),
+            error: BlossomError::Forbidden,
+        }
+        .is_terminal_outbox_failure());
+        assert!(DeliveryError::Blossom {
+            holder: "https://h.example".into(),
+            error: BlossomError::Unauthorized,
+        }
+        .is_terminal_outbox_failure());
+        assert!(DeliveryError::Blossom {
+            holder: "https://h.example".into(),
+            error: BlossomError::InvalidBaseUrl {
+                url: "not-a-url".into()
+            },
+        }
+        .is_terminal_outbox_failure());
+        assert!(DeliveryError::OuterTagsInvalid {
+            detail: "missing zkdt".into()
+        }
+        .is_terminal_outbox_failure());
+        assert!(DeliveryError::InclusionProof("bad length".into()).is_terminal_outbox_failure());
+        assert!(DeliveryError::ProofBytes("empty proof".into()).is_terminal_outbox_failure());
+        assert!(
+            DeliveryError::SdrOutputRef("SDR output_ref: empty holders".into())
+                .is_terminal_outbox_failure()
+        );
+    }
+
+    #[test]
     fn process_gift_wrap_accepts_valid_ack_and_rejects_replay() {
         use crate::v1::nostr::kinds::ack::{ack_rumor, sign_ack};
         use crate::v1::nostr::nip59::seal_and_wrap;
@@ -1907,6 +2477,7 @@ mod tests {
             zbe_ciphertext: zbe,
             out_ciphertext: vec![0xCC],
             recipient_op_pk: recip_op_pk,
+            ack_accepted: false,
         });
 
         // Gift-wrap an ACK for attempt 1 (stale) → must not free attempt 2.
@@ -1927,7 +2498,7 @@ mod tests {
         }
         assert_eq!(store.len(), 1, "attempt 2 must remain after stale ACK");
 
-        // Valid ACK for attempt 2 → free.
+        // Valid ACK for attempt 2 → mark accepted, still retain until k receipts.
         let ack2 = sign_ack(&recip_op_sk, &detect, &blob, &nonce_2).expect("sign2");
         let rumor2 = ack_rumor(recip_op_pk, 101, &ack2);
         let wrap2 = seal_and_wrap(&rumor2, &recip_op_sk, &sender_ivpk, vec![], 101, &mut rng)
@@ -1940,7 +2511,12 @@ mod tests {
             }
             other => panic!("valid ACK must be accepted, got {other:?}"),
         }
-        assert_eq!(store.len(), 0);
+        assert_eq!(
+            store.len(),
+            1,
+            "ACK alone must not drop retention (need k receipts)"
+        );
+        assert!(store.get(&blob, &nonce_2).expect("held").ack_accepted);
     }
 
     #[test]

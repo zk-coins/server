@@ -207,48 +207,91 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     // Credit-receipt fan-out: scanner publishes after dual persist; kernel
     // SubscribeReceipts filters by server-side session subject + scope.
     let shared_receipt_hub = crate::kernel::access::ReceiptHub::shared();
+    // Durable outbox needs the Postgres pool (same durability class as engine).
     let shared_delivery_port: Arc<dyn crate::v1::OutgoingDeliveryPort> =
         Arc::new(crate::v1::MeshDeliveryPort::new(
+            (*pool).clone(),
             Arc::clone(&shared_delivery_retention),
             Box::new(crate::v1::OsSecureRandom),
+            crate::v1::db_outbox::DEFAULT_REPLICATION_K,
         ));
+    // Shared CSPRNG for finalise-time Phase-A change-coin builds and the
+    // outbox drive path (process-local; never invent keys).
+    let shared_delivery_rng: std::sync::Arc<
+        std::sync::Mutex<Box<dyn crate::v1::nostr::nip59::SecureRandom + Send>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(Box::new(crate::v1::OsSecureRandom)));
 
-    // §4.2 ACK return path: poll own incoming gift-wraps on the node's
-    // advertised relay, unwrap under each entrusteed `ivk`, free retention
-    // on a valid kind-1421. Exponential-backoff *republish* is not here
-    // (GAP — next block / explicit retry campaign).
+    // §4.2 ACK return path + §4.2 republish of due outbox rows.
+    //
+    // Same soft 30 s tick as before (event-driven mesh for scanners/publishers
+    // lives elsewhere; this is the ACK/republish guard frame). Due work is
+    // selected by `next_attempt_at` on the durable outbox — the tick only
+    // wakes the driver; backoff itself is §4.2 (30 s, doubling, cap 1 h).
     {
         let retention = Arc::clone(&shared_delivery_retention);
         let bundles = Arc::clone(&shared_bundle_store);
+        let pg: sqlx::PgPool = (*pool).clone();
+        let rng = Arc::clone(&shared_delivery_rng);
         let relay_url = crate::kernel::chain::chain_identity_ops_from_env()
             .ok()
             .map(|ops| ops.relay_url);
         tokio::spawn(async move {
             let Some(relay_url) = relay_url else {
                 tracing::warn!(
-                    "ACK inbox not started: chain identity ops (relay URL) unavailable at boot"
+                    "ACK/outbox driver not started: chain identity ops (relay URL) unavailable at boot"
                 );
                 return;
             };
-            // Interval is a soft poll — not the §4.2 republish schedule.
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 ticker.tick().await;
-                if retention.len() == 0 {
-                    continue;
-                }
-                let pool = match crate::v1::nostr::relay::RelayPool::new(vec![relay_url.clone()]) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "ACK inbox: relay pool construction failed");
+
+                // 1) Republish / first-publish due outbox rows.
+                let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                    Ok(d) => d.as_secs(),
+                    Err(_) => {
+                        tracing::error!(
+                            "outbox driver: wall clock before UNIX epoch — skipping tick"
+                        );
                         continue;
                     }
                 };
+                let auth_expiration =
+                    now.saturating_add(crate::v1::blossom::AUTH_REPLAY_WINDOW_SECS);
+                match crate::v1::delivery::drive_due_outbox_entries(
+                    &pg,
+                    bundles.as_ref(),
+                    retention.as_ref(),
+                    rng.as_ref(),
+                    now,
+                    auth_expiration,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(driven = n, "delivery outbox due rows driven");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "delivery outbox drive failed");
+                    }
+                }
+
+                // 2) ACK inbox → durable outbox awaiting_receipts.
+                let relay_pool =
+                    match crate::v1::nostr::relay::RelayPool::new(vec![relay_url.clone()]) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "ACK inbox: relay pool construction failed");
+                            continue;
+                        }
+                    };
                 for (_subject, bundle) in bundles.list_active() {
                     match crate::v1::delivery::poll_incoming_acks(
-                        &pool,
+                        &relay_pool,
                         &bundle.ivk,
                         retention.as_ref(),
+                        Some(&pg),
                         None,
                     )
                     .await
@@ -263,7 +306,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                                         tracing::info!(
                                             blob_id = %hex::encode(blob_id),
                                             ack_nonce = %hex::encode(ack_nonce),
-                                            "ACK accepted; pending delivery released"
+                                            "ACK accepted; outbox awaiting k receipts"
                                         );
                                     }
                                     crate::v1::delivery::AckInboxResult::Rejected { error } => {
@@ -607,6 +650,13 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             let delivery_targets = Arc::clone(&shared_delivery_targets);
             let delivery_port: Arc<dyn crate::v1::OutgoingDeliveryPort> =
                 Arc::clone(&shared_delivery_port);
+            let delivery_rng = Arc::clone(&shared_delivery_rng);
+            // Self-delivery relays = bootstrap seed relays (non-empty after
+            // verified BMF1). Empty → Phase A refuses (no invent).
+            let self_relays: Vec<String> = manifest_store
+                .get()
+                .map(|v| v.seed_relays().to_vec())
+                .unwrap_or_default();
             // Blossom holders + max size from the same ops env as GetInfo —
             // no default URL, no default size.
             let ops_for_delivery = crate::kernel::chain::chain_identity_ops_from_env().ok();
@@ -616,6 +666,8 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                 let bundle_store = Arc::clone(&bundle_store);
                 let delivery_targets = Arc::clone(&delivery_targets);
                 let delivery_port = Arc::clone(&delivery_port);
+                let delivery_rng = Arc::clone(&delivery_rng);
+                let self_relays = self_relays.clone();
                 let ops_for_delivery = ops_for_delivery.clone();
                 // publisher_pubkey is filled by the dispatcher from the job
                 // request_body after the hook returns.
@@ -662,6 +714,10 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                         auth_expiration: now
                             .saturating_add(crate::v1::blossom::AUTH_REPLAY_WINDOW_SECS),
                         expected_network,
+                        // §4.6 default k=3 (MUST NOT be < 2).
+                        replication_k: crate::v1::db_outbox::DEFAULT_REPLICATION_K,
+                        self_relays,
+                        rng: delivery_rng.as_ref(),
                     });
                     crate::v1::finalise_accepted_prove_persist_and_stage(
                         &adapter,

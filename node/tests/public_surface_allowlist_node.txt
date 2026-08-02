@@ -275,6 +275,7 @@ node::v1::execute_v1_receive
 node::v1::finalise_accepted_prove_outside_lock
 node::v1::finalise_publish_persist
 node::v1::finalise_with_accepted_signature
+node::v1::finalize_due_phase_b_adapter
 node::v1::first_boot_requires_full_replace
 node::v1::folded_keys_from_nflog_mirror
 node::v1::mode

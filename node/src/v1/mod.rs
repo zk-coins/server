@@ -85,6 +85,10 @@ pub(crate) mod attest;
 pub(crate) mod blossom;
 /// Durable `v1_decrypt_index` (migration 0031) — SQL half of the private-record catalog.
 pub(crate) mod db_decrypt_index;
+/// Durable `v1_delivery_outbox` (migration 0032) — mesh delivery state machine.
+pub(crate) mod db_outbox;
+/// Durable `v1_sdr_phase_a` (migration 0033) — §4.2 SDR Phase-A staging.
+pub(crate) mod db_sdr;
 pub mod db_v1;
 /// §4.2 send-path delivery: finished transition → gift-wrapped kind-1059.
 /// Port pattern matches the nullifier publisher; kernel stays transport-free.
@@ -101,11 +105,15 @@ pub mod mode;
 /// Kind 30423 bootstrap mirror is unit-tested only until a production
 /// Nostr discovery caller exists.
 pub(crate) mod nostr;
+/// Versioned rebuild material for durable outbox rows.
+pub(crate) mod outbox_material;
 /// §4.5 emergency recovery (node-side steps 3–5 only): gapless kind-1059
 /// scan over seed relays, re-verify via existing §2.3.3 checks, decrypt-index
 /// fill. Dense account enumeration (step 1) is wallet-side — SPEND branch
 /// `A/0'/i'` never leaves the wallet (§1.2 / §7.7); see module docs.
 pub(crate) mod recovery;
+/// §4.2 SelfDeliveryRecordV1 two-phase finalisation (Phase A stage + Phase B scanner hook).
+pub(crate) mod sdr;
 /// Production CSPRNG for mesh delivery / NIP-59 (runtime boot).
 pub(crate) use nostr::nip59::OsSecureRandom;
 pub(crate) mod provenance;
@@ -182,6 +190,8 @@ pub use scan::{
     folded_keys_from_nflog_mirror, observation_tip_still_live, reconcile_persisted_tip, FoldStats,
     PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome,
 };
+/// §4.2 Phase B: binary scan-loop hook after each NfLog fold.
+pub use sdr::finalize_due_phase_b_adapter;
 pub use self_heal::{resolve_v1_live_digest, v1_canary_for_heal};
 pub use separation::{
     claim_process_stack_from_v1_shadow_env, enforce_stack_scan_mode, ScanStackMode,

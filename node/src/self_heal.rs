@@ -246,6 +246,8 @@ pub async fn heal_circuit_digest(
                 Some(crate::v1::ScanStackMode::V1) => {
                     warn!(
                         "Self-heal reset (v1.1) will DESTROY: \
+                         v1_delivery_outbox / v1_delivery_receipts / v1_sdr_phase_a \
+                         (outstanding mesh deliveries + replica receipts); \
                          v1_pending_publishes (stale nullifier publish recovery); \
                          v1_spendable_coins / v1_spent_coins (CoinHist leaves); \
                          v1_accounts (multi-asset state + last_proof / openings); \

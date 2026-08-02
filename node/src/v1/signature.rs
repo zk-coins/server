@@ -960,6 +960,12 @@ pub(crate) struct FinaliseDeliveryDeps<'a> {
     pub auth_expiration: u64,
     /// Closed network label for post-send profile refresh (`mainnet`/…).
     pub expected_network: &'a str,
+    /// Replication factor k (§4.6; MUST be ≥ 2). Frozen into outbox rows.
+    pub replication_k: i32,
+    /// Self-delivery recipient relays (bootstrap seed relays; non-empty).
+    pub self_relays: Vec<String>,
+    /// Process-local RNG for change-coin / Phase-A builds.
+    pub rng: &'a std::sync::Mutex<Box<dyn crate::v1::nostr::nip59::SecureRandom + Send>>,
 }
 
 /// Production job-path finalise: prove outside the lock, apply under the
@@ -1015,9 +1021,9 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     // Still require a live fence: a stale epoch must not re-enter host-edge
     // completion after another claim reclaimed the job.
     //
-    // Mesh delivery is **not** re-driven here: process-local retention and
-    // the prove-time materials are gone after crash. Durable pending-delivery
-    // storage would need a migration (GAP — see delivery module docs).
+    // Crash-resume after durable stage: re-drive nullifier publish **and**
+    // any open delivery-outbox rows for this transition (mesh was not
+    // completed, or only partially).
     if let Some(row) = db_v1::load_pending_publish(adapter.pool(), signature.pk_i)
         .await
         .map_err(|e| anyhow::anyhow!("load_pending_publish before finalise: {e:#}"))?
@@ -1045,6 +1051,49 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
              skipping re-prove/re-apply (crash-resume after stage)"
         );
         publish_staged_nullifier_after_members_ready(adapter, publisher, signature.pk_i).await?;
+        if let Some(deps) = delivery.as_ref() {
+            // Mesh first (fills external outbox artefacts), then Phase A if
+            // still absent — output_refs require published blob_id/epk.
+            resume_outbox_after_crash(adapter.pool(), signature.pk_i, deps)
+                .await
+                .map_err(|e| anyhow::anyhow!("v1.1 finalise crash-resume mesh outbox: {e}"))?;
+
+            let already = crate::v1::db_sdr::get_phase_a(adapter.pool(), &signature.pk_i)
+                .await
+                .map_err(|e| anyhow::anyhow!("load Phase A on crash-resume: {e:#}"))?;
+            if already.is_none() {
+                let delivery_snapshot = DeliverySnapshot::from_pending(&pending, &signature)?;
+                let tip_hash = adapter.tip_hash();
+                let tip_height = adapter.with_engine(|engine| engine.tip_height());
+                let tip_height_u32 = u32::try_from(tip_height).map_err(|_| {
+                    anyhow::anyhow!("v1.1 finalise crash-resume: tip_height does not fit u32")
+                })?;
+                let proof_bytes = adapter
+                    .with_engine(|engine| {
+                        engine
+                            .accounts()
+                            .find(|(o, _)| o.0 == pending.owner.0)
+                            .and_then(|(_, rec)| rec.last_proof.as_ref().map(|p| p.to_bytes()))
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "v1.1 finalise crash-resume: no last_proof for SDR Phase A re-stage"
+                        )
+                    })?;
+                stage_sdr_phase_a_after_mesh(
+                    adapter,
+                    &delivery_snapshot,
+                    &proof_bytes,
+                    tip_height_u32,
+                    tip_hash,
+                    deps,
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("v1.1 finalise crash-resume SDR Phase A stage: {e}")
+                })?;
+            }
+        }
         return Ok(FinaliseOutcome::from_pending_proof_data_with_publisher(
             &pending,
             publisher_pubkey,
@@ -1126,7 +1175,17 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     })?;
 
     let snap = adapter.snapshot_live();
-    match db_v1::persist_engine_with_pending_members_ready_if_finalise_fence(
+    // Build outbox insert payloads **before** the durable TX so external
+    // deliveries are owed in the same commit as engine + members_ready
+    // (crash between persist and mesh leaves pending rows to resume).
+    let outbox_entries = if let Some(deps) = delivery.as_ref() {
+        let proof_bytes = applied.proved().proof.to_bytes();
+        build_external_outbox_inserts(&delivery_snapshot, &proof_bytes, deps)
+            .map_err(|e| anyhow::anyhow!("v1.1 finalise: outbox insert payload: {e}"))?
+    } else {
+        Vec::new()
+    };
+    match db_v1::persist_engine_with_pending_members_ready_and_outbox_if_finalise_fence(
         adapter.pool(),
         &snap,
         owner,
@@ -1137,6 +1196,7 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
         tip_height_u32,
         tip_hash,
         fence,
+        &outbox_entries,
     )
     .await
     {
@@ -1177,12 +1237,27 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     publish_staged_nullifier_after_members_ready(adapter, publisher, pk).await?;
 
     // §4.2 mesh delivery for external-recipient coins (after durable persist).
-    if let Some(deps) = delivery {
+    // Both mesh delivery and SDR Phase A need the same deps — pass by shared
+    // reference (bundle of refs + Vecs); neither consumer takes ownership.
+    if let Some(deps) = delivery.as_ref() {
         // Plonky2 native encoding (§1.7.9) — `to_bytes()` is infallible.
         let proof_bytes = applied.proved().proof.to_bytes();
         deliver_outgoing_after_persist(&delivery_snapshot, &proof_bytes, deps)
             .await
             .map_err(|e| anyhow::anyhow!("v1.1 finalise mesh delivery after persist: {e}"))?;
+
+        // §4.2 Phase A: stage SDR material keyed by transition nullifier Pk.
+        // Fail-closed — incomplete material is a named error, never a silent skip.
+        stage_sdr_phase_a_after_mesh(
+            adapter,
+            &delivery_snapshot,
+            &proof_bytes,
+            tip_height_u32,
+            tip_hash,
+            deps,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("v1.1 finalise SDR Phase A stage: {e}"))?;
     }
 
     let pd = &applied.proved().proof_data;
@@ -1193,6 +1268,246 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
         output_coin_ids,
         publisher_pubkey,
     })
+}
+
+/// Stage §4.2 Phase-A SDR material after mesh delivery of external coins.
+///
+/// External `output_ref`s come from durable outbox artefacts (same blob_id
+/// the mesh published). Change/self coins are built locally for recovery
+/// envelopes only. Incomplete material → named error (fail-closed).
+async fn stage_sdr_phase_a_after_mesh(
+    adapter: &crate::v1::EngineAdapter,
+    snap: &DeliverySnapshot,
+    proof_bytes: &[u8],
+    tip_height: u32,
+    tip_hash: [u8; 32],
+    deps: &FinaliseDeliveryDeps<'_>,
+) -> Result<(), crate::v1::delivery::DeliveryError> {
+    use crate::kernel::types::SubjectAddress;
+    use crate::v1::delivery::{build_coin_delivery, external_delivery_coins};
+    use crate::v1::outbox_material::{SdrPhaseAMaterial, SdrPhaseAOutputRef};
+    use crate::v1::sdr::{output_ref_from_built, stage_phase_a};
+    use shared::spec_v1::note_encryption::xonly_pubkey;
+    use shared::spec_v1::serialize::serialize_account_state;
+
+    if deps.self_relays.is_empty() {
+        return Err(crate::v1::delivery::DeliveryError::Relay(
+            "SDR Phase A: self_relays empty (bootstrap seed relays required; no invent)".into(),
+        ));
+    }
+    if deps.blob_holders.is_empty() {
+        return Err(crate::v1::delivery::DeliveryError::BlobHoldersEmpty);
+    }
+
+    let subject = SubjectAddress(snap.owner);
+    let bundle = deps.bundles.get_active(&subject).ok_or(
+        crate::v1::delivery::DeliveryError::OperationalBundleMissing {
+            subject: snap.owner,
+        },
+    )?;
+    let self_ivpk = xonly_pubkey(&bundle.ivk).map_err(crate::v1::delivery::DeliveryError::Spec)?;
+    let self_op_pk = xonly_pubkey(&bundle.op).map_err(crate::v1::delivery::DeliveryError::Spec)?;
+
+    // Post-transition account state from the live engine (already applied).
+    let account_state = adapter
+        .with_engine(|engine| {
+            engine
+                .accounts()
+                .find(|(owner, _)| owner.0 == snap.owner)
+                .map(|(_, rec)| rec.state.clone())
+        })
+        .ok_or_else(|| {
+            crate::v1::delivery::DeliveryError::Relay(
+                "SDR Phase A: applied account missing from engine after finalise".into(),
+            )
+        })?;
+    let account_state_bytes = serialize_account_state(&account_state)
+        .map_err(crate::v1::delivery::DeliveryError::Spec)?;
+    let post_send_counter = account_state.send_counter;
+    // Guard: post == entry + 1 (overflow already refused by engine).
+    if post_send_counter
+        != snap.entry_send_counter.checked_add(1).ok_or_else(|| {
+            crate::v1::delivery::DeliveryError::Relay("SDR Phase A: send_counter overflow".into())
+        })?
+    {
+        return Err(crate::v1::delivery::DeliveryError::Relay(format!(
+            "SDR Phase A: post send_counter {post_send_counter} != entry {} + 1",
+            snap.entry_send_counter
+        )));
+    }
+
+    // External output_refs from durable outbox artefacts (shared blob_id).
+    let open = crate::v1::db_outbox::list_open_for_transition(adapter.pool(), &snap.pk_create)
+        .await
+        .map_err(|e| {
+            crate::v1::delivery::DeliveryError::Relay(format!(
+                "SDR Phase A list_open_for_transition: {e:#}"
+            ))
+        })?;
+    // Also include completed external rows for this transition (mesh may have
+    // already finished). Query by loading open first; if artefacts missing,
+    // fail closed — Phase B cannot invent blob_ids.
+    let external_expected: std::collections::HashSet<[u8; 32]> =
+        external_delivery_coins(&snap.owner, &snap.output_coins)
+            .into_iter()
+            .map(|(_, c)| digest_to_bytes(&c.identifier))
+            .collect();
+
+    let mut output_refs: Vec<SdrPhaseAOutputRef> = Vec::new();
+    let mut seen_external: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+
+    for row in &open {
+        if row.kind != crate::v1::db_outbox::OutboxKind::ExternalCoin {
+            continue;
+        }
+        let Some(blob_id) = row.blob_id else {
+            return Err(crate::v1::delivery::DeliveryError::Relay(format!(
+                "SDR Phase A: external outbox {} has no blob_id yet — mesh build incomplete \
+                 (refuse provisional output_ref)",
+                hex::encode(row.outbox_id)
+            )));
+        };
+        let Some(epk) = row.epk else {
+            return Err(crate::v1::delivery::DeliveryError::Relay(format!(
+                "SDR Phase A: external outbox {} missing epk artefact",
+                hex::encode(row.outbox_id)
+            )));
+        };
+        let Some(out_ct) = row.out_ciphertext.as_ref() else {
+            return Err(crate::v1::delivery::DeliveryError::Relay(format!(
+                "SDR Phase A: external outbox {} missing out_ciphertext",
+                hex::encode(row.outbox_id)
+            )));
+        };
+        if out_ct.is_empty() {
+            return Err(crate::v1::delivery::DeliveryError::Relay(format!(
+                "SDR Phase A: external outbox {} empty out_ciphertext",
+                hex::encode(row.outbox_id)
+            )));
+        }
+        let mat = crate::v1::outbox_material::ExternalOutboxMaterial::decode(&row.material)
+            .map_err(|e| {
+                crate::v1::delivery::DeliveryError::Relay(format!(
+                    "SDR Phase A external material: {e:#}"
+                ))
+            })?;
+        if mat.blob_holders.is_empty() {
+            return Err(crate::v1::delivery::DeliveryError::BlobHoldersEmpty);
+        }
+        let coin_id = row.coin_id;
+        seen_external.insert(coin_id);
+        output_refs.push(
+            output_ref_from_built(coin_id, blob_id, epk, out_ct, &mat.blob_holders)
+                .map_err(|e| crate::v1::delivery::DeliveryError::SdrOutputRef(e.to_string()))?,
+        );
+    }
+
+    if seen_external != external_expected {
+        let missing: Vec<_> = external_expected.difference(&seen_external).collect();
+        return Err(crate::v1::delivery::DeliveryError::Relay(format!(
+            "SDR Phase A: missing external outbox artefacts for {} coin(s) \
+             (first missing {}) — refuse incomplete Phase A",
+            missing.len(),
+            missing
+                .first()
+                .map(hex::encode)
+                .unwrap_or_else(|| "none".into())
+        )));
+    }
+
+    // Change / self-output coins: build local CoinProof envelopes for SDR
+    // output_refs (no mesh publish).
+    let change_coins: Vec<_> = snap
+        .output_coins
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.recipient.0 == snap.owner)
+        .collect();
+    if !change_coins.is_empty() {
+        let all_output_ids: Vec<_> = snap.output_coins.iter().map(|c| c.identifier).collect();
+        let creating_nullifier = crate::v1::delivery::creating_nullifier_from_parts(
+            snap.pk_create,
+            snap.r_create,
+            snap.r_prime_create,
+        );
+        let nav_opening =
+            crate::v1::delivery::bundle_nav_opening(snap.nav_size, snap.nav_mth, snap.nav_rand);
+        let mut rng = deps
+            .rng
+            .lock()
+            .expect("finalise delivery rng mutex poisoned");
+        for (leaf_index, coin) in change_coins {
+            let material = crate::v1::delivery::OutgoingCoinMaterial {
+                coin: coin.clone(),
+                leaf_index: leaf_index as u32,
+                all_output_ids: all_output_ids.clone(),
+                proof_bytes: proof_bytes.to_vec(),
+                creating_prev_ash: snap.creating_prev_ash,
+                creating_nullifier,
+                nav_opening,
+                asset_terms: None,
+                recipient_ivpk: self_ivpk,
+                recipient_op_pk: self_op_pk,
+                recipient_relays: deps.self_relays.clone(),
+            };
+            let built = build_coin_delivery(
+                &material,
+                &bundle.op,
+                &bundle.ovk,
+                &deps.blob_holders,
+                deps.now,
+                rng.as_mut(),
+            )?;
+            output_refs.push(
+                output_ref_from_built(
+                    digest_to_bytes(&coin.identifier),
+                    built.blob_id,
+                    built.keys.epk,
+                    &built.out_ciphertext,
+                    &deps.blob_holders,
+                )
+                .map_err(|e| crate::v1::delivery::DeliveryError::SdrOutputRef(e.to_string()))?,
+            );
+        }
+    }
+
+    let material = SdrPhaseAMaterial {
+        v: 1,
+        subject_hex: hex::encode(snap.owner),
+        transition_pk_hex: hex::encode(snap.pk_create),
+        record_kind: snap.record_kind,
+        send_counter: post_send_counter,
+        prev_state_head_hex: hex::encode(digest_to_bytes(&snap.creating_prev_ash)),
+        account_state_hex: hex::encode(account_state_bytes),
+        recursive_proof_hex: hex::encode(proof_bytes),
+        proof_data_hex: hex::encode(snap.proof_data_bytes),
+        own_nullifier_pk_hex: hex::encode(snap.pk_create),
+        own_nullifier_r_hex: hex::encode(snap.r_create),
+        own_nullifier_r_prime_hex: hex::encode(snap.r_prime_create),
+        proof_block_anchor_hash_hex: hex::encode(tip_hash),
+        proof_block_anchor_height: tip_height,
+        spent_or_folded_coin_ids_hex: snap
+            .spent_or_folded_coin_ids
+            .iter()
+            .map(hex::encode)
+            .collect(),
+        output_refs,
+        blob_holders: deps.blob_holders.clone(),
+        max_blob_bytes: deps.max_blob_bytes,
+        recipient_ivpk_hex: hex::encode(self_ivpk),
+        recipient_op_pk_hex: hex::encode(self_op_pk),
+        recipient_relays: deps.self_relays.clone(),
+        replication_k: deps.replication_k,
+    };
+
+    stage_phase_a(adapter.pool(), &material).await?;
+    tracing::info!(
+        transition_pk = %hex::encode(snap.pk_create),
+        subject = %hex::encode(snap.owner),
+        send_counter = post_send_counter,
+        "SDR Phase A staged (awaiting first-occurrence MTP for Phase B)"
+    );
+    Ok(())
 }
 
 /// Snapshot of delivery-relevant fields taken before prove moves `pending`.
@@ -1206,6 +1521,14 @@ struct DeliverySnapshot {
     pk_create: [u8; 32],
     r_create: [u8; 32],
     r_prime_create: [u8; 32],
+    /// SDR `RecordKind` wire byte (mint/send/receive).
+    record_kind: u8,
+    /// Input coin ids (spent / folded into the transition).
+    spent_or_folded_coin_ids: Vec<[u8; 32]>,
+    /// Entry `send_counter` (pre-transition); post-transition is entry+1.
+    entry_send_counter: u64,
+    /// `serialize(ProofData)` — fixed before prove.
+    proof_data_bytes: [u8; 192],
 }
 
 impl DeliverySnapshot {
@@ -1214,9 +1537,24 @@ impl DeliverySnapshot {
         signature: &TransitionSignature,
     ) -> Result<Self, anyhow::Error> {
         use shared::spec_v1 as host;
+        use shared::spec_v1::serialize::serialize_proof_data;
         let w = &pending.witness_wip;
         let creating_prev_ash = host::account_state_hash(&w.prev_account_state)
             .map_err(|e| anyhow::anyhow!("v1.1 finalise: creating_prev_ash: {e}"))?;
+        let record_kind = crate::v1::sdr::record_kind_from_witness(
+            w.asset_issuance.is_some(),
+            !w.received_coins.is_empty(),
+        );
+        let record_kind_byte = match record_kind {
+            shared::spec_v1::bundle::RecordKind::Mint => 0x01,
+            shared::spec_v1::bundle::RecordKind::Send => 0x02,
+            shared::spec_v1::bundle::RecordKind::Receive => 0x03,
+        };
+        let spent_or_folded_coin_ids: Vec<[u8; 32]> = w
+            .input_coins
+            .iter()
+            .map(|c| digest_to_bytes(&c.identifier))
+            .collect();
         Ok(Self {
             owner: pending.owner.0,
             output_coins: w.output_coins.clone(),
@@ -1227,35 +1565,54 @@ impl DeliverySnapshot {
             pk_create: signature.pk_i,
             r_create: signature.signature_r(),
             r_prime_create: signature.r_prime,
+            record_kind: record_kind_byte,
+            spent_or_folded_coin_ids,
+            entry_send_counter: w.prev_account_state.send_counter,
+            proof_data_bytes: serialize_proof_data(&pending.proof_data),
         })
     }
 }
 
-/// Build per-coin materials and invoke the delivery port (§4.2 after persist).
-async fn deliver_outgoing_after_persist(
+/// Build durable outbox insert rows for external coins (atomic with persist).
+fn build_external_outbox_inserts(
     snap: &DeliverySnapshot,
     proof_bytes: &[u8],
-    deps: FinaliseDeliveryDeps<'_>,
-) -> Result<(), crate::v1::delivery::DeliveryError> {
-    use crate::kernel::types::SubjectAddress;
+    deps: &FinaliseDeliveryDeps<'_>,
+) -> Result<Vec<crate::v1::db_outbox::OutboxInsert>, crate::v1::delivery::DeliveryError> {
+    let coins = build_outgoing_coin_materials(snap, proof_bytes, deps)?;
+    if coins.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::v1::delivery::external_outbox_inserts(
+        snap.owner,
+        snap.pk_create,
+        &coins,
+        &deps.blob_holders,
+        deps.max_blob_bytes,
+        deps.replication_k,
+    )
+}
+
+/// Shared material assembly for outbox insert and mesh publish.
+fn build_outgoing_coin_materials(
+    snap: &DeliverySnapshot,
+    proof_bytes: &[u8],
+    deps: &FinaliseDeliveryDeps<'_>,
+) -> Result<Vec<crate::v1::delivery::OutgoingCoinMaterial>, crate::v1::delivery::DeliveryError> {
     use crate::v1::delivery::{
         bundle_nav_opening, creating_nullifier_from_parts, external_delivery_coins,
-        DeliveryOperatorContext, OutgoingCoinMaterial, TransitionDeliveryRequest,
+        OutgoingCoinMaterial,
     };
 
     let external = external_delivery_coins(&snap.owner, &snap.output_coins);
     if external.is_empty() {
-        // Pure receive / mint-to-self / change-only: no mesh delivery.
-        return Ok(());
+        return Ok(Vec::new());
     }
-
-    let subject = SubjectAddress(snap.owner);
-    let bundle = deps.bundles.get_active(&subject).ok_or(
-        crate::v1::delivery::DeliveryError::OperationalBundleMissing {
-            subject: snap.owner,
-        },
-    )?;
-
+    if proof_bytes.is_empty() {
+        return Err(crate::v1::delivery::DeliveryError::ProofBytes(
+            "creating transition proof_bytes empty — refuse mesh delivery without a proof".into(),
+        ));
+    }
     let all_output_ids: Vec<_> = snap.output_coins.iter().map(|c| c.identifier).collect();
     let creating_nullifier =
         creating_nullifier_from_parts(snap.pk_create, snap.r_create, snap.r_prime_create);
@@ -1263,19 +1620,11 @@ async fn deliver_outgoing_after_persist(
 
     let mut coins = Vec::with_capacity(external.len());
     for (leaf_index, coin) in external {
-        // Re-check expiry at delivery time (target was already required
-        // before prove; a long prove must not use a mid-flight-expired entry).
         let target = deps.targets.require(&coin.recipient.0, deps.now)?;
         if target.relays.is_empty() {
             return Err(crate::v1::delivery::DeliveryError::RecipientRelaysEmpty {
                 recipient: coin.recipient.0,
             });
-        }
-        if proof_bytes.is_empty() {
-            return Err(crate::v1::delivery::DeliveryError::ProofBytes(
-                "creating transition proof_bytes empty — refuse mesh delivery without a proof"
-                    .into(),
-            ));
         }
         coins.push(OutgoingCoinMaterial {
             coin: coin.clone(),
@@ -1291,6 +1640,107 @@ async fn deliver_outgoing_after_persist(
             recipient_relays: target.relays,
         });
     }
+    Ok(coins)
+}
+
+/// Crash-resume: re-drive open outbox rows for `transition_pk` via the port.
+async fn resume_outbox_after_crash(
+    pool: &sqlx::PgPool,
+    transition_pk: [u8; 32],
+    deps: &FinaliseDeliveryDeps<'_>,
+) -> Result<(), crate::v1::delivery::DeliveryError> {
+    use crate::kernel::types::SubjectAddress;
+    use crate::v1::delivery::{DeliveryOperatorContext, TransitionDeliveryRequest};
+    use crate::v1::outbox_material::ExternalOutboxMaterial;
+
+    let open = crate::v1::db_outbox::list_open_for_transition(pool, &transition_pk)
+        .await
+        .map_err(|e| {
+            crate::v1::delivery::DeliveryError::Relay(format!("list_open_for_transition: {e:#}"))
+        })?;
+    if open.is_empty() {
+        return Ok(());
+    }
+    // Rebuild OutgoingCoinMaterial from durable material for each open row.
+    let mut coins = Vec::with_capacity(open.len());
+    let mut subject: Option<[u8; 32]> = None;
+    for row in &open {
+        if row.kind != crate::v1::db_outbox::OutboxKind::ExternalCoin {
+            continue;
+        }
+        match subject {
+            None => subject = Some(row.subject),
+            Some(s) if s != row.subject => {
+                return Err(crate::v1::delivery::DeliveryError::Relay(
+                    "open outbox rows for one transition_pk disagree on subject".into(),
+                ));
+            }
+            Some(_) => {}
+        }
+        let mat = ExternalOutboxMaterial::decode(&row.material).map_err(|e| {
+            crate::v1::delivery::DeliveryError::Relay(format!("outbox material decode: {e:#}"))
+        })?;
+        coins.push(mat.to_outgoing().map_err(|e| {
+            crate::v1::delivery::DeliveryError::Relay(format!("outbox material to_outgoing: {e:#}"))
+        })?);
+    }
+    if coins.is_empty() {
+        return Ok(());
+    }
+    let subject = match subject {
+        Some(s) => s,
+        None => {
+            return Err(crate::v1::delivery::DeliveryError::Relay(
+                "open external outbox rows without subject".into(),
+            ));
+        }
+    };
+    let bundle = deps
+        .bundles
+        .get_active(&SubjectAddress(subject))
+        .ok_or(crate::v1::delivery::DeliveryError::OperationalBundleMissing { subject })?;
+    let request = TransitionDeliveryRequest {
+        subject,
+        coins,
+        operator: DeliveryOperatorContext {
+            op_sk: bundle.op,
+            ovk: bundle.ovk,
+            blob_holders: deps.blob_holders.clone(),
+            max_blob_bytes: deps.max_blob_bytes,
+            now: deps.now,
+            auth_expiration: deps.auth_expiration,
+        },
+    };
+    let report = deps.port.deliver_outgoing(request).await?;
+    tracing::info!(
+        transition_pk = %hex::encode(transition_pk),
+        delivered = report.delivered,
+        "mesh outbox re-driven after crash-resume"
+    );
+    Ok(())
+}
+
+/// Build per-coin materials and invoke the delivery port (§4.2 after persist).
+async fn deliver_outgoing_after_persist(
+    snap: &DeliverySnapshot,
+    proof_bytes: &[u8],
+    deps: &FinaliseDeliveryDeps<'_>,
+) -> Result<(), crate::v1::delivery::DeliveryError> {
+    use crate::kernel::types::SubjectAddress;
+    use crate::v1::delivery::{DeliveryOperatorContext, TransitionDeliveryRequest};
+
+    let coins = build_outgoing_coin_materials(snap, proof_bytes, deps)?;
+    if coins.is_empty() {
+        // Pure receive / mint-to-self / change-only: no mesh delivery.
+        return Ok(());
+    }
+
+    let subject = SubjectAddress(snap.owner);
+    let bundle = deps.bundles.get_active(&subject).ok_or(
+        crate::v1::delivery::DeliveryError::OperationalBundleMissing {
+            subject: snap.owner,
+        },
+    )?;
 
     // Snapshot targets for post-send profile refresh (replaceable kind-0).
     let refresh: Vec<([u8; 32], Vec<String>)> = coins
@@ -1304,7 +1754,7 @@ async fn deliver_outgoing_after_persist(
         operator: DeliveryOperatorContext {
             op_sk: bundle.op,
             ovk: bundle.ovk,
-            blob_holders: deps.blob_holders,
+            blob_holders: deps.blob_holders.clone(),
             max_blob_bytes: deps.max_blob_bytes,
             now: deps.now,
             auth_expiration: deps.auth_expiration,

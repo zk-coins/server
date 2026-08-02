@@ -850,6 +850,12 @@ pub(crate) async fn persist_engine_with_pending_members_ready(
 /// between check and commit cannot race the durable stage in.
 // Clippy too_many_arguments: fenced durable engine write; signature stays
 // explicit so fence/lease args cannot be silently regrouped.
+//
+// Test-only: production finalisation goes through the durable outbox path
+// (`persist_engine_and_outbox…`); this bare-fence variant now has only
+// `#[cfg(test)]` callers (the finalise-handoff and job-store fence tests),
+// so it is gated to the test build rather than left dead in the library.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_engine_with_pending_members_ready_if_finalise_fence(
     pool: &PgPool,
@@ -862,6 +868,41 @@ pub(crate) async fn persist_engine_with_pending_members_ready_if_finalise_fence(
     build_tip_height: u32,
     build_tip_hash: [u8; 32],
     fence: crate::job_store::FinaliseFence,
+) -> Result<bool> {
+    persist_engine_with_pending_members_ready_and_outbox_if_finalise_fence(
+        pool,
+        snap,
+        account_owner,
+        pk,
+        r,
+        s,
+        r_prime,
+        build_tip_height,
+        build_tip_hash,
+        fence,
+        &[],
+    )
+    .await
+}
+
+/// Same as [`persist_engine_with_pending_members_ready_if_finalise_fence`]
+/// but also inserts durable delivery-outbox rows in the **same** transaction
+/// (§4.2: outbox entry exists before the first mesh send attempt).
+// Clippy too_many_arguments: fenced durable stage + outbox; kept flat so the
+// outbox slice cannot be silently defaulted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn persist_engine_with_pending_members_ready_and_outbox_if_finalise_fence(
+    pool: &PgPool,
+    snap: &EngineSnapshot,
+    account_owner: Address,
+    pk: [u8; 32],
+    r: [u8; 32],
+    s: [u8; 32],
+    r_prime: [u8; 32],
+    build_tip_height: u32,
+    build_tip_hash: [u8; 32],
+    fence: crate::job_store::FinaliseFence,
+    outbox_entries: &[crate::v1::db_outbox::OutboxInsert],
 ) -> Result<bool> {
     use crate::job_store::FINALISE_CLAIM_PHASE;
 
@@ -917,6 +958,13 @@ pub(crate) async fn persist_engine_with_pending_members_ready_if_finalise_fence(
         build_tip_hash,
     )
     .await?;
+    // Delivery outbox in the same TX: crash after commit still has pending
+    // mesh work to resume (gap 5). Never insert after commit.
+    if !outbox_entries.is_empty() {
+        crate::v1::db_outbox::insert_pending_in_tx(&mut tx, outbox_entries)
+            .await
+            .context("fenced engine+members_ready: delivery outbox insert")?;
+    }
     tx.commit()
         .await
         .context("commit fenced engine+members_ready persist tx")?;
