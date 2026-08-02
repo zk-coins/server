@@ -20,9 +20,17 @@
 //! [`NetworkParams::bootstrap_pubkey`](super::network_params::NetworkParams::bootstrap_pubkey)
 //! (or an explicit x-only key passed in by a caller that already took it
 //! from that pin). A key from the manifest, env, or operator config is
-//! never accepted as the authority. This module does **not** sign.
+//! never accepted as the authority.
+//!
+//! ## Signing
+//!
+//! [`sign_bootstrap_manifest`] is the sole production sign path. It
+//! reuses [`bootstrap_message`] / [`serialize`] (same framing as verify)
+//! and **fail-closes** when the secret key does not derive to the
+//! caller-supplied `expected_bootstrap_pubkey` — so a tool cannot emit
+//! an artifact the node would later reject under the pin.
 
-use bitcoin::secp256k1::{Message, Secp256k1, XOnlyPublicKey};
+use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey, XOnlyPublicKey};
 use sha2::{Digest, Sha256};
 
 use super::error::{BootstrapStringField, BootstrapUrlKind, SpecError};
@@ -92,6 +100,38 @@ pub struct VerifyBootstrapManifest<'a> {
     pub expected_protocol_version: &'a str,
     /// Optional wall clock; see [`ManifestClock`].
     pub clock: ManifestClock,
+}
+
+/// Unsigned body fields for [`sign_bootstrap_manifest`].
+///
+/// `manifest_sig` is produced by the sign path; callers never supply it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootstrapManifestBody {
+    /// Exactly one of `mainnet` | `testnet` | `regtest`.
+    pub network: String,
+    /// Exactly `"v1"`.
+    pub protocol_version: String,
+    /// Seed Nostr relays (≥ 1).
+    pub seed_relays: Vec<String>,
+    /// Blossom base URLs (≥ 1).
+    pub blob_stores: Vec<String>,
+    /// Operator trust-list x-only pubkeys (≥ 1).
+    pub operator_ids: Vec<[u8; 32]>,
+    /// Unix seconds.
+    pub issued_at: u64,
+    /// Unix seconds.
+    pub expires_at: u64,
+}
+
+/// Inputs for [`sign_bootstrap_manifest`] (destructured at the call site).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignBootstrapManifest<'a> {
+    /// 32-byte secp256k1 secret. Never log or display.
+    pub secret_key: &'a [u8; 32],
+    /// Expected network-parameter pin (x-only). Must equal the key
+    /// derived from `secret_key` or signing aborts with
+    /// [`SpecError::BootstrapPubkeyMismatch`].
+    pub expected_bootstrap_pubkey: &'a [u8; 32],
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +472,65 @@ pub fn verify_bootstrap_manifest(
     Ok(())
 }
 
+/// Sign a §4.3 BootstrapManifest under the network bootstrap secret.
+///
+/// Order (fail-closed):
+/// 1. Parse `secret_key` as a secp256k1 scalar.
+/// 2. Derive the BIP-340 x-only public key; require exact equality with
+///    `expected_bootstrap_pubkey` (the network pin the node will use).
+/// 3. Validate body structure (same rules as encode/verify).
+/// 4. BIP-340-sign [`bootstrap_message`] with no aux randomness
+///    (deterministic; matches the in-tree test vectors).
+///
+/// On any error, nothing is returned that could be written as a BMF1
+/// artifact. Key bytes never appear in [`SpecError`] display strings.
+pub fn sign_bootstrap_manifest(
+    body: BootstrapManifestBody,
+    SignBootstrapManifest {
+        secret_key,
+        expected_bootstrap_pubkey,
+    }: SignBootstrapManifest<'_>,
+) -> Result<BootstrapManifestV1, SpecError> {
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(secret_key.as_slice())
+        .map_err(|_| SpecError::BootstrapSecretKeyInvalid)?;
+    let kp = Keypair::from_secret_key(&secp, &sk);
+    let (xonly, _) = kp.x_only_public_key();
+    let derived = xonly.serialize();
+    if derived.as_slice() != expected_bootstrap_pubkey.as_slice() {
+        return Err(SpecError::BootstrapPubkeyMismatch);
+    }
+
+    let mut m = BootstrapManifestV1 {
+        network: body.network,
+        protocol_version: body.protocol_version,
+        seed_relays: body.seed_relays,
+        blob_stores: body.blob_stores,
+        operator_ids: body.operator_ids,
+        issued_at: body.issued_at,
+        expires_at: body.expires_at,
+        manifest_sig: [0u8; 64],
+    };
+    // Structural bounds before hashing/signing (counts, URLs, network, lifetime).
+    validate_structure(&m)?;
+    let msg = bootstrap_message(&m)?;
+    let sig = secp.sign_schnorr_no_aux_rand(&Message::from_digest(msg), &kp);
+    m.manifest_sig = *sig.as_ref();
+    Ok(m)
+}
+
+/// Sign then [`serialize`] — full BMF1 bytes ready to write to disk.
+///
+/// Convenience for operator tools: one call that either yields complete
+/// verified-domain bytes or an error (no partial frame).
+pub fn sign_and_serialize_bootstrap_manifest(
+    body: BootstrapManifestBody,
+    sign: SignBootstrapManifest<'_>,
+) -> Result<Vec<u8>, SpecError> {
+    let m = sign_bootstrap_manifest(body, sign)?;
+    serialize(&m)
+}
+
 // ---------------------------------------------------------------------------
 // Cursor helpers
 // ---------------------------------------------------------------------------
@@ -514,17 +613,8 @@ mod tests {
         }
     }
 
-    fn sign_manifest(m: &mut BootstrapManifestV1, sk_bytes: &[u8; 32]) {
-        let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(sk_bytes).expect("test sk");
-        let kp = Keypair::from_secret_key(&secp, &sk);
-        let msg = bootstrap_message(m).expect("message");
-        let sig = secp.sign_schnorr_no_aux_rand(&Message::from_digest(msg), &kp);
-        m.manifest_sig = *sig.as_ref();
-    }
-
-    fn sample_unsigned() -> BootstrapManifestV1 {
-        BootstrapManifestV1 {
+    fn sample_body() -> BootstrapManifestBody {
+        BootstrapManifestBody {
             network: "regtest".to_string(),
             protocol_version: "v1".to_string(),
             seed_relays: vec!["wss://relay.example.com".to_string()],
@@ -532,38 +622,143 @@ mod tests {
             operator_ids: vec![[0x11; 32]],
             issued_at: 1_700_000_000,
             expires_at: 1_800_000_000,
+        }
+    }
+
+    /// Re-sign an already-built struct in place (field-flip tests).
+    fn sign_manifest(m: &mut BootstrapManifestV1, sk_bytes: &[u8; 32]) {
+        let body = BootstrapManifestBody {
+            network: m.network.clone(),
+            protocol_version: m.protocol_version.clone(),
+            seed_relays: m.seed_relays.clone(),
+            blob_stores: m.blob_stores.clone(),
+            operator_ids: m.operator_ids.clone(),
+            issued_at: m.issued_at,
+            expires_at: m.expires_at,
+        };
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(sk_bytes).expect("test sk");
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        let pk = xonly.serialize();
+        *m = sign_bootstrap_manifest(
+            body,
+            SignBootstrapManifest {
+                secret_key: sk_bytes,
+                expected_bootstrap_pubkey: &pk,
+            },
+        )
+        .expect("re-sign");
+    }
+
+    fn sample_unsigned() -> BootstrapManifestV1 {
+        let b = sample_body();
+        BootstrapManifestV1 {
+            network: b.network,
+            protocol_version: b.protocol_version,
+            seed_relays: b.seed_relays,
+            blob_stores: b.blob_stores,
+            operator_ids: b.operator_ids,
+            issued_at: b.issued_at,
+            expires_at: b.expires_at,
             manifest_sig: [0u8; 64],
         }
     }
 
     fn sample_signed() -> (BootstrapManifestV1, [u8; 32]) {
         let (sk, pk) = fixture_sk(b"zkCoins/v1/test-vector/bootstrap-pubkey");
-        let mut m = sample_unsigned();
-        sign_manifest(&mut m, &sk);
+        let m = sign_bootstrap_manifest(
+            sample_body(),
+            SignBootstrapManifest {
+                secret_key: &sk,
+                expected_bootstrap_pubkey: &pk,
+            },
+        )
+        .expect("sign");
         (m, pk)
     }
 
     fn multi_signed() -> (BootstrapManifestV1, [u8; 32]) {
         let (sk, pk) = fixture_sk(b"zkCoins/v1/test-vector/bootstrap-pubkey");
-        let mut m = BootstrapManifestV1 {
-            network: "testnet".to_string(),
-            protocol_version: "v1".to_string(),
-            seed_relays: vec![
-                "wss://a.example".to_string(),
-                "wss://b.example".to_string(),
-                "wss://c.example".to_string(),
-            ],
-            blob_stores: vec![
-                "https://blob1.example".to_string(),
-                "https://blob2.example".to_string(),
-            ],
-            operator_ids: vec![[0xAAu8; 32], [0xBBu8; 32], [0xCCu8; 32]],
-            issued_at: 10,
-            expires_at: 20,
-            manifest_sig: [0u8; 64],
-        };
-        sign_manifest(&mut m, &sk);
+        let m = sign_bootstrap_manifest(
+            BootstrapManifestBody {
+                network: "testnet".to_string(),
+                protocol_version: "v1".to_string(),
+                seed_relays: vec![
+                    "wss://a.example".to_string(),
+                    "wss://b.example".to_string(),
+                    "wss://c.example".to_string(),
+                ],
+                blob_stores: vec![
+                    "https://blob1.example".to_string(),
+                    "https://blob2.example".to_string(),
+                ],
+                operator_ids: vec![[0xAAu8; 32], [0xBBu8; 32], [0xCCu8; 32]],
+                issued_at: 10,
+                expires_at: 20,
+            },
+            SignBootstrapManifest {
+                secret_key: &sk,
+                expected_bootstrap_pubkey: &pk,
+            },
+        )
+        .expect("sign multi");
         (m, pk)
+    }
+
+    #[test]
+    fn sign_path_verifies_under_derived_pin() {
+        let (sk, pk) = fixture_sk(b"zkCoins/v1/test-vector/bootstrap-pubkey");
+        let bytes = sign_and_serialize_bootstrap_manifest(
+            sample_body(),
+            SignBootstrapManifest {
+                secret_key: &sk,
+                expected_bootstrap_pubkey: &pk,
+            },
+        )
+        .expect("sign+ser");
+        let m = deserialize(&bytes).expect("de");
+        verify_ok(
+            &m,
+            &pk,
+            "regtest",
+            ManifestClock::UnixSeconds(1_750_000_000),
+        );
+        assert_eq!(&bytes[..4], BMF1_MAGIC.as_slice());
+    }
+
+    #[test]
+    fn sign_path_refuses_pubkey_mismatch() {
+        let (sk, _pk) = fixture_sk(b"zkCoins/v1/test-vector/bootstrap-pubkey");
+        let (_sk_o, pk_other) = fixture_sk(b"zkCoins/v1/test-vector/bootstrap-pubkey-OTHER");
+        let err = sign_bootstrap_manifest(
+            sample_body(),
+            SignBootstrapManifest {
+                secret_key: &sk,
+                expected_bootstrap_pubkey: &pk_other,
+            },
+        )
+        .expect_err("mismatch");
+        assert_eq!(err, SpecError::BootstrapPubkeyMismatch);
+        // Display must not leak key material.
+        let msg = err.to_string();
+        assert!(!msg.contains(&hex::encode(sk)));
+        assert!(!msg.contains(&hex::encode(pk_other)));
+    }
+
+    #[test]
+    fn sign_path_refuses_invalid_secret() {
+        let bad = [0u8; 32]; // zero scalar
+        let fake_pk = [0xABu8; 32];
+        let err = sign_bootstrap_manifest(
+            sample_body(),
+            SignBootstrapManifest {
+                secret_key: &bad,
+                expected_bootstrap_pubkey: &fake_pk,
+            },
+        )
+        .expect_err("zero sk");
+        assert_eq!(err, SpecError::BootstrapSecretKeyInvalid);
     }
 
     fn verify_ok(m: &BootstrapManifestV1, pk: &[u8; 32], network: &str, clock: ManifestClock) {

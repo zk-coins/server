@@ -143,6 +143,16 @@ pub enum SpecError {
     BootstrapExpired { expires_at: u64, now: u64 },
     /// `issued_at > expires_at` — degenerate lifetime (rejected structurally).
     BootstrapIssuedAfterExpiry { issued_at: u64, expires_at: u64 },
+    /// Secret key bytes are not a valid secp256k1 scalar (sign path).
+    ///
+    /// Display never includes key material — only that the key was rejected.
+    BootstrapSecretKeyInvalid,
+    /// Derived x-only public key does not match the caller-supplied pin.
+    ///
+    /// Fail-closed for the sign path: refuse to emit an artifact the node
+    /// would later reject under `bootstrap_pubkey`. Display never includes
+    /// key material.
+    BootstrapPubkeyMismatch,
     // --- Note encryption / ECDH / NIP44Binary envelope (§1.1 / §1.3) ---
     /// Scalar byte string is not exactly 32 bytes.
     ScalarWrongLength { actual: usize },
@@ -532,6 +542,15 @@ impl fmt::Display for SpecError {
                 f,
                 "bootstrap manifest issued_at={issued_at} is after expires_at={expires_at} \
                  (degenerate lifetime)"
+            ),
+            SpecError::BootstrapSecretKeyInvalid => write!(
+                f,
+                "bootstrap secret key is not a valid secp256k1 scalar — refusing to sign"
+            ),
+            SpecError::BootstrapPubkeyMismatch => write!(
+                f,
+                "derived bootstrap public key does not match the supplied bootstrap_pubkey — \
+                 refusing to write an artifact the verifier would reject"
             ),
             SpecError::ScalarWrongLength { actual } => {
                 write!(f, "scalar wrong length: expected 32, got {actual}")

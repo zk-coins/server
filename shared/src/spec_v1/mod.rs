@@ -38,9 +38,10 @@ pub use accumulator::{
 };
 pub use bootstrap_manifest::{
     bootstrap_message, deserialize as deserialize_bootstrap_manifest, manifest_id,
-    serialize as serialize_bootstrap_manifest, verify_bootstrap_manifest, BootstrapManifestV1,
-    ManifestClock, VerifyBootstrapManifest, BMF1_MAGIC, BMF1_VERSION, BOOTSTRAP_PROTOCOL_VERSION,
-    MAX_BOOTSTRAP_URL_LEN,
+    serialize as serialize_bootstrap_manifest, sign_and_serialize_bootstrap_manifest,
+    sign_bootstrap_manifest, verify_bootstrap_manifest, BootstrapManifestBody, BootstrapManifestV1,
+    ManifestClock, SignBootstrapManifest, VerifyBootstrapManifest, BMF1_MAGIC, BMF1_VERSION,
+    BOOTSTRAP_PROTOCOL_VERSION, MAX_BOOTSTRAP_URL_LEN,
 };
 pub use bundle::{
     deserialize_blob_locator_set, deserialize_coin_proof, deserialize_self_delivery_record,

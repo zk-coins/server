@@ -12,6 +12,7 @@
 //!
 //! **Runde 8:** documented surface ≡ real surface. External consumers are
 //! exclusively `main.rs`, `probe_r2`, `recover_inscription`,
+//! `gen_bootstrap_manifest` (shared codec only — no `node::` surface),
 //! `downstream-boundary`, and `node/tests/`. Crate-internal unit tests are
 //! **not** a reason to keep `pub`. A rustdoc-JSON coverage test
 //! (`tests/public_surface_coverage.rs`) fails when a public item lacks a

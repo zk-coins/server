@@ -286,9 +286,12 @@ pub(crate) fn load_manifest_store(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+    use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
     use sha2::{Digest, Sha256};
-    use shared::spec_v1::bootstrap_manifest::{bootstrap_message, serialize, BMF1_MAGIC};
+    use shared::spec_v1::bootstrap_manifest::{
+        sign_and_serialize_bootstrap_manifest, BootstrapManifestBody, SignBootstrapManifest,
+        BMF1_MAGIC,
+    };
     use std::io::Write;
 
     fn fixture_sk(label: &[u8]) -> ([u8; 32], [u8; 32]) {
@@ -306,24 +309,29 @@ mod tests {
         }
     }
 
+    /// Same production sign path as `gen_bootstrap_manifest` (shared codec).
     fn signed_bytes(network: &str, sk: &[u8; 32]) -> Vec<u8> {
-        let mut m = BootstrapManifestV1 {
-            network: network.to_string(),
-            protocol_version: "v1".to_string(),
-            seed_relays: vec!["wss://relay.example".to_string()],
-            blob_stores: vec!["https://blob.example".to_string()],
-            operator_ids: vec![[0x42; 32]],
-            issued_at: 1_000,
-            expires_at: 2_000_000_000,
-            manifest_sig: [0u8; 64],
-        };
         let secp = Secp256k1::new();
-        let secret = SecretKey::from_slice(sk).unwrap();
+        let secret = SecretKey::from_slice(sk).expect("test sk");
         let kp = Keypair::from_secret_key(&secp, &secret);
-        let msg = bootstrap_message(&m).unwrap();
-        let sig = secp.sign_schnorr_no_aux_rand(&Message::from_digest(msg), &kp);
-        m.manifest_sig = *sig.as_ref();
-        serialize(&m).unwrap()
+        let (xonly, _) = kp.x_only_public_key();
+        let pk = xonly.serialize();
+        sign_and_serialize_bootstrap_manifest(
+            BootstrapManifestBody {
+                network: network.to_string(),
+                protocol_version: "v1".to_string(),
+                seed_relays: vec!["wss://relay.example".to_string()],
+                blob_stores: vec!["https://blob.example".to_string()],
+                operator_ids: vec![[0x42; 32]],
+                issued_at: 1_000,
+                expires_at: 2_000_000_000,
+            },
+            SignBootstrapManifest {
+                secret_key: sk,
+                expected_bootstrap_pubkey: &pk,
+            },
+        )
+        .expect("sign+ser")
     }
 
     fn write_temp(bytes: &[u8]) -> tempfile::NamedTempFile {
@@ -445,5 +453,98 @@ mod tests {
             }
             other => panic!("expected Invalid/sig, got {other:?}"),
         }
+    }
+
+    /// Generator output (shared `sign_and_serialize_bootstrap_manifest`) must
+    /// pass the real boot loader under the matching pin.
+    #[test]
+    fn generator_artifact_passes_load_manifest_store() {
+        let (sk, pk) = fixture_sk(b"zkCoins/v1/test-vector/bootstrap-pubkey");
+        let bytes = signed_bytes("regtest", &sk);
+        let f = write_temp(&bytes);
+        let store = load_manifest_store(LoadBootstrapManifestConfig {
+            path_env: Some(f.path().to_str().unwrap()),
+            pinned_bootstrap_pubkey: &pk,
+            expected_network: "regtest",
+            clock: ManifestClock::UnixSeconds(1_500),
+        })
+        .expect("generator artifact must load");
+        let v = store.get().expect("loaded");
+        assert_eq!(v.network(), "regtest");
+        assert_eq!(v.seed_relays(), &["wss://relay.example".to_string()]);
+        assert_eq!(v.blob_stores(), &["https://blob.example".to_string()]);
+        assert_eq!(v.operator_ids(), &[[0x42; 32]]);
+    }
+
+    /// One flipped wire byte → loader rejects (signature or codec).
+    #[test]
+    fn tampered_generator_artifact_rejected_at_load() {
+        let (sk, pk) = fixture_sk(b"zkCoins/v1/test-vector/bootstrap-pubkey");
+        let mut bytes = signed_bytes("regtest", &sk);
+        let idx = bytes.len() / 2;
+        bytes[idx] ^= 0x01;
+        let f = write_temp(&bytes);
+        let err = load_bootstrap_manifest(LoadBootstrapManifestConfig {
+            path_env: Some(f.path().to_str().unwrap()),
+            pinned_bootstrap_pubkey: &pk,
+            expected_network: "regtest",
+            clock: ManifestClock::Unavailable,
+        })
+        .expect_err("tamper");
+        match err {
+            ManifestLoadError::Invalid { .. } => {}
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    /// Artifact network label must match the verifier pin.
+    #[test]
+    fn network_mismatch_rejected_at_load() {
+        let (sk, pk) = fixture_sk(b"zkCoins/v1/test-vector/bootstrap-pubkey");
+        let bytes = signed_bytes("regtest", &sk);
+        let f = write_temp(&bytes);
+        let err = load_bootstrap_manifest(LoadBootstrapManifestConfig {
+            path_env: Some(f.path().to_str().unwrap()),
+            pinned_bootstrap_pubkey: &pk,
+            expected_network: "testnet",
+            clock: ManifestClock::Unavailable,
+        })
+        .expect_err("network");
+        match err {
+            ManifestLoadError::Invalid { cause, .. } => {
+                assert_eq!(
+                    cause,
+                    SpecError::BootstrapNetworkMismatch {
+                        expected: "testnet".to_string(),
+                        actual: "regtest".to_string(),
+                    }
+                );
+            }
+            other => panic!("expected Invalid/network, got {other:?}"),
+        }
+    }
+
+    /// Wrong secret vs expected pin must not produce loadable bytes.
+    #[test]
+    fn sign_pubkey_mismatch_never_yields_bytes() {
+        let (sk, _pk) = fixture_sk(b"zkCoins/v1/test-vector/bootstrap-pubkey");
+        let (_sk_o, pk_other) = fixture_sk(b"zkCoins/v1/test-vector/bootstrap-pubkey-OTHER");
+        let err = sign_and_serialize_bootstrap_manifest(
+            BootstrapManifestBody {
+                network: "regtest".to_string(),
+                protocol_version: "v1".to_string(),
+                seed_relays: vec!["wss://relay.example".to_string()],
+                blob_stores: vec!["https://blob.example".to_string()],
+                operator_ids: vec![[0x42; 32]],
+                issued_at: 1_000,
+                expires_at: 2_000_000_000,
+            },
+            SignBootstrapManifest {
+                secret_key: &sk,
+                expected_bootstrap_pubkey: &pk_other,
+            },
+        )
+        .expect_err("mismatch");
+        assert_eq!(err, SpecError::BootstrapPubkeyMismatch);
     }
 }

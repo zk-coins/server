@@ -135,6 +135,14 @@ services:
         source: bitcoind_data
         target: /run/bitcoind-data
         read_only: true
+      # Signed §4.3 BootstrapManifest (BMF1). Host path is operator-supplied
+      # (produce with `gen_bootstrap_manifest` — see docs/local-stack.md).
+      # No silent default artifact; compose fails at parse if the host path
+      # env is unset. Container path is fixed so the node env pin is stable.
+      - type: bind
+        source: ${ZKCOINS_V1_BOOTSTRAP_MANIFEST_HOST_PATH:?set ZKCOINS_V1_BOOTSTRAP_MANIFEST_HOST_PATH to the host path of a signed BMF1 artifact}
+        target: /run/bootstrap/manifest.bmf1
+        read_only: true
     environment:
       # --- Postgres (internal compose network; matches postgres service) ---
       # Panic site if unset outside compose: node/src/lib.rs DATABASE_URL lazy_static.
@@ -202,14 +210,18 @@ services:
 
       # GetInfo / ChainIdentity operational pins (node/src/kernel/chain.rs +
       # runtime::require_chain_identity_ops_from_env). No defaults — missing
-      # aborts at parse or binary edge. Complete ChainIdentity still needs a
-      # signed §4.3 BootstrapManifest (not loadable yet) — GetInfo stays
-      # fail-closed until a signed artifact loader exists; jobs and
-      # GetNullifierPath do not require identity.
+      # aborts at parse or binary edge. Complete ChainIdentity also needs a
+      # verified §4.3 BootstrapManifest (BMF1) under the path below — produce
+      # it with `gen_bootstrap_manifest` (docs/local-stack.md).
       ZKCOINS_RELAY_URL: ${ZKCOINS_RELAY_URL:?set ZKCOINS_RELAY_URL (operator-chosen Nostr relay URL for this node)}
       ZKCOINS_BLOSSOM_URL: ${ZKCOINS_BLOSSOM_URL:?set ZKCOINS_BLOSSOM_URL (operator-chosen Blossom base URL for this node)}
       ZKCOINS_MAX_BLOB_BYTES: ${ZKCOINS_MAX_BLOB_BYTES:?set ZKCOINS_MAX_BLOB_BYTES integer > 0}
       ZKCOINS_KERNEL_PARTS: ${ZKCOINS_KERNEL_PARTS:?set ZKCOINS_KERNEL_PARTS e.g. scanner,prover,publisher}
+
+      # §4.3 / §7.7 BMF1 path inside the container (bind-mounted above).
+      # Fixed path — host location is ZKCOINS_V1_BOOTSTRAP_MANIFEST_HOST_PATH.
+      # Artifact must verify under ZKCOINS_BOOTSTRAP_PUBKEY or boot aborts.
+      ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH: /run/bootstrap/manifest.bmf1
 
       # Kernel gRPC bind (node/src/kernel_rpc.rs KERNEL_GRPC_ADDR — no default).
       # Must be 0.0.0.0 so the host-side api can reach it via published 50051.
@@ -296,9 +308,9 @@ services:
       # Liveness only: GET /health → body "ok" once the TCP listener is
       # bound (api/src/routes.rs health). Do **not** probe /health/ready
       # here: that path is a GetInfo projection (api/src/info.rs
-      # health_ready) and stays HTTP 503 while the kernel BootstrapManifest
-      # / ChainIdentity path is fail-closed. A depends_on on ready would
-      # block the stack without saying anything about the REST listener.
+      # health_ready) and depends on kernel ChainIdentity (verified BMF1 +
+      # ops pins). A depends_on on ready would park the stack on kernel
+      # identity issues without proving the REST listener is up.
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 10s
       timeout: 5s
