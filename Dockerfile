@@ -24,6 +24,16 @@
 FROM rust:bookworm AS builder
 WORKDIR /app
 
+# `kernel-proto/build.rs` compiles the `kernel.v1` gRPC contract with
+# prost, which needs `protoc` on PATH at build time. Pin the Debian
+# bookworm package (same pin as the api image) rather than an
+# unversioned install so the compiler is reproducible across rebuilds.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        protobuf-compiler=3.21.12-3+deb12u1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && protoc --version
+
 # `sqlx::migrate!("./migrations")` is compile-time, so the migrations
 # directory must exist when `cargo build` runs (the COPY below pulls
 # it in). The current `db.rs` uses runtime-checked `sqlx::query` /
