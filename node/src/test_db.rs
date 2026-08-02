@@ -72,13 +72,17 @@
 //! their in-use schemas. Leftovers from killed processes (no backend)
 //! are removed automatically at the next attach.
 //!
-//! ## No polling
+//! ## Readiness (connect loop, not log scrape)
 //!
-//! `OnceCell::get_or_init` is event-driven; the first caller spawns
-//! the container, every subsequent caller awaits the same future.
-//! Per the repo's "No polling — events only" rule (CONTRIBUTING.md)
-//! there is no readiness poll loop. The cross-process file lock uses
-//! `try_lock_exclusive` with a deadline (bounded wait, fail-loud).
+//! `OnceCell::get_or_init` is event-driven for the container handle.
+//! Postgres readiness itself is a **bounded connect loop** under
+//! [`CONTAINER_READY_SECS`]: log-based waits are insufficient under
+//! `ReuseDirective::Always` (attach skips wait conditions; the official
+//! image also emits "ready to accept connections" during temporary
+//! initdb before the real postmaster is up). The cross-process file
+//! lock uses `try_lock_exclusive` with a deadline (bounded wait,
+//! fail-loud). There is no "run without Postgres" path — the loop only
+//! delays the loud failure until the deadline.
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, PgPool};
@@ -104,7 +108,20 @@ const LOCK_WAIT_SECS: u64 = 120;
 
 /// How long `init_shared_pg` may spend on container start/attach +
 /// first admin connect + orphan purge before failing loud.
+///
+/// Single readiness budget for the whole path — no second competing
+/// deadline. Per-attempt connect timeouts are slices of this budget.
 const CONTAINER_READY_SECS: u64 = 90;
+
+/// Cap on a single admin connect attempt inside the readiness loop.
+/// Protocol / refuse errors fail immediately; this only bounds a hung
+/// TCP handshake so one attempt cannot consume the whole deadline.
+const ADMIN_CONNECT_ATTEMPT_SECS: u64 = 2;
+
+/// Initial backoff between transient connect failures; doubles each
+/// retry up to [`ADMIN_CONNECT_BACKOFF_MAX`].
+const ADMIN_CONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
+const ADMIN_CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
 
 /// Cap simultaneous connections per test pool. Under nextest with
 /// `--test-threads=8`, eight processes × this budget must stay under
@@ -341,23 +358,58 @@ async fn init_shared_pg() -> Arc<SharedPg> {
 
     acquire_shared_pg_lock(&lock_file, &lock_path);
 
-    // Bound the whole attach/create + readiness path so a wedged
-    // Docker daemon cannot hang nextest indefinitely.
-    let ready = tokio::time::timeout(Duration::from_secs(CONTAINER_READY_SECS), async {
-        let container = Postgres::default()
-            .with_tag("17")
-            .with_container_name(SHARED_PG_CONTAINER_NAME)
-            .with_reuse(ReuseDirective::Always)
-            .start()
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "start or attach to shared postgres:17 container \
-                     `{SHARED_PG_CONTAINER_NAME}` failed: {e}\n\
-                     Fix: `docker rm -f {SHARED_PG_CONTAINER_NAME}` \
-                     then re-run. Ensure Docker is running."
-                )
-            });
+    // Single readiness budget for attach/create + connect + purge.
+    // Nested timeouts would invent a second deadline; everything below
+    // shares this Instant.
+    let deadline = Instant::now() + Duration::from_secs(CONTAINER_READY_SECS);
+
+    // `Postgres::default()` keeps the module's stock log wait (first
+    // "database system is ready to accept connections"). We deliberately
+    // do **not** sharpen it (e.g. `with_times(2)` for the post-initdb
+    // postmaster):
+    // - On `ReuseDirective::Always` attach, testcontainers skips wait
+    //   conditions entirely — log waits never run.
+    // - On cold create, the first "ready" still races the temporary
+    //   initdb server; waiting for the second line helps only that path
+    //   and still leaves a protocol-flaky window.
+    // Real readiness is the connect loop below, which covers both cold
+    // start and attach.
+    let ready = async {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "shared postgres init exceeded {CONTAINER_READY_SECS}s \
+                 before container start/attach began.\n\
+                 Fix: `docker rm -f {SHARED_PG_CONTAINER_NAME}` and \
+                 `rm -f {}`, ensure Docker is healthy, then re-run.",
+                lock_path.display()
+            );
+        }
+        let container = match tokio::time::timeout(
+            remaining,
+            Postgres::default()
+                .with_tag("17")
+                .with_container_name(SHARED_PG_CONTAINER_NAME)
+                .with_reuse(ReuseDirective::Always)
+                .start(),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => panic!(
+                "start or attach to shared postgres:17 container \
+                 `{SHARED_PG_CONTAINER_NAME}` failed: {e}\n\
+                 Fix: `docker rm -f {SHARED_PG_CONTAINER_NAME}` \
+                 then re-run. Ensure Docker is running."
+            ),
+            Err(_) => panic!(
+                "shared postgres init exceeded {CONTAINER_READY_SECS}s \
+                 waiting for container start/attach.\n\
+                 Fix: `docker rm -f {SHARED_PG_CONTAINER_NAME}` and \
+                 `rm -f {}`, ensure Docker is healthy, then re-run.",
+                lock_path.display()
+            ),
+        };
         let host = container
             .get_host()
             .await
@@ -368,46 +420,162 @@ async fn init_shared_pg() -> Arc<SharedPg> {
             .expect("shared postgres get_host_port_ipv4");
         let base_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
-        // Fail loud if the container is up but Postgres is not
-        // answering protocol-correctly (partial boot / catalog wedge).
-        let admin = PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(Duration::from_secs(30))
-            .connect(&base_url)
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "shared postgres at {base_url} did not accept connections: {e}\n\
-                     Fix: `docker rm -f {SHARED_PG_CONTAINER_NAME}` then re-run."
-                )
-            });
+        // Protocol-correct accept (covers cold initdb race + reuse attach).
+        let admin = connect_shared_admin_until_ready(&base_url, deadline).await;
 
         // Purge leftover `t_*` schemas from previous nextest runs
         // whose process-exit skipped Drop. Only drops schemas with
         // no live backend advertising the test application_name.
-        purge_orphan_test_schemas(&admin).await;
+        let purge_budget = deadline.saturating_duration_since(Instant::now());
+        if purge_budget.is_zero() {
+            admin.close().await;
+            panic!(
+                "shared postgres init exceeded {CONTAINER_READY_SECS}s \
+                 after admin connect, before orphan purge.\n\
+                 Fix: `docker rm -f {SHARED_PG_CONTAINER_NAME}` and \
+                 `rm -f {}`, ensure Docker is healthy, then re-run.",
+                lock_path.display()
+            );
+        }
+        match tokio::time::timeout(purge_budget, purge_orphan_test_schemas(&admin)).await {
+            Ok(()) => {}
+            Err(_) => {
+                admin.close().await;
+                panic!(
+                    "shared postgres init exceeded {CONTAINER_READY_SECS}s \
+                     during orphan purge.\n\
+                     Fix: `docker rm -f {SHARED_PG_CONTAINER_NAME}` and \
+                     `rm -f {}`, ensure Docker is healthy, then re-run.",
+                    lock_path.display()
+                );
+            }
+        }
         admin.close().await;
 
         Arc::new(SharedPg {
             _container: container,
             base_url,
         })
-    })
+    }
     .await;
 
-    // Release the lock before interpreting the timeout result so a
-    // panic/timeout cannot leave the exclusive lock held.
+    // Release the lock after the critical section so a panic cannot
+    // leave the exclusive lock held (Drop of File unlocks on Unix).
     drop(lock_file);
 
-    match ready {
-        Ok(pg) => pg,
-        Err(_) => panic!(
-            "shared postgres init exceeded {CONTAINER_READY_SECS}s \
-             (container start/attach + admin connect + orphan purge).\n\
-             Fix: `docker rm -f {SHARED_PG_CONTAINER_NAME}` and \
-             `rm -f {}`, ensure Docker is healthy, then re-run.",
-            lock_path.display()
+    ready
+}
+
+/// Whether a failed admin connect should be retried until the readiness
+/// deadline, or fail loud immediately.
+///
+/// Transient: half-started Postgres (SSLRequest protocol garbage),
+/// connection refused/reset while the postmaster restarts after initdb,
+/// pool attempt timeout, TLS handshake noise during partial boot, and
+/// Postgres SQLSTATEs that sqlx itself marks as connect-phase transient
+/// (`57P03` cannot_connect_now, `53300` too_many_connections).
+///
+/// Permanent: configuration errors, closed pool, authentication
+/// failures, missing database, and any other database error that is not
+/// connect-phase transient. Those must not be swallowed by the loop.
+pub(crate) fn is_transient_pg_connect_error(err: &sqlx::Error) -> bool {
+    match err {
+        // Cold initdb window: port is open, response to SSLRequest is not
+        // yet `S`/`N` (observed as `unexpected response from SSLRequest: 0x00`).
+        // Hard error for sqlx — not a timeout — so acquire_timeout alone
+        // never covers it.
+        sqlx::Error::Protocol(_) => true,
+        sqlx::Error::Tls(_) => true,
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::WouldBlock
         ),
+        sqlx::Error::Database(db) => db.is_transient_in_connect_phase(),
+        // Auth, missing DB, bad URL/options, worker crash, … — fail loud.
+        sqlx::Error::Configuration(_)
+        | sqlx::Error::InvalidArgument(_)
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed => false,
+        // Column/row/migrate/encode paths do not arise from connect; treat
+        // as permanent so a surprising variant never retries forever.
+        _ => false,
+    }
+}
+
+/// Retry admin connect until `deadline` or a permanent error.
+///
+/// Panics with the same remediation as the previous single-shot path
+/// (`docker rm -f …`), plus attempt count and last transient error when
+/// the deadline expires. Never falls back to "no database".
+async fn connect_shared_admin_until_ready(base_url: &str, deadline: Instant) -> PgPool {
+    let mut attempts: u32 = 0;
+    let mut last_err: Option<sqlx::Error> = None;
+    let mut backoff = ADMIN_CONNECT_BACKOFF_INITIAL;
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            let last = match &last_err {
+                Some(e) => e.to_string(),
+                None => "no connection attempt completed before deadline".to_string(),
+            };
+            panic!(
+                "shared postgres at {base_url} did not accept connections \
+                 within {CONTAINER_READY_SECS}s after {attempts} attempt(s); \
+                 last error: {last}\n\
+                 Fix: `docker rm -f {SHARED_PG_CONTAINER_NAME}` then re-run."
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let attempt_budget = remaining.min(Duration::from_secs(ADMIN_CONNECT_ATTEMPT_SECS));
+        // A zero budget means the deadline check above should have fired;
+        // keep the loop fail-closed rather than spinning.
+        if attempt_budget.is_zero() {
+            let last = match &last_err {
+                Some(e) => e.to_string(),
+                None => "no connection attempt completed before deadline".to_string(),
+            };
+            panic!(
+                "shared postgres at {base_url} did not accept connections \
+                 within {CONTAINER_READY_SECS}s after {attempts} attempt(s); \
+                 last error: {last}\n\
+                 Fix: `docker rm -f {SHARED_PG_CONTAINER_NAME}` then re-run."
+            );
+        }
+
+        attempts = attempts.saturating_add(1);
+        match PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(attempt_budget)
+            .connect(base_url)
+            .await
+        {
+            Ok(pool) => return pool,
+            Err(e) if is_transient_pg_connect_error(&e) => {
+                last_err = Some(e);
+                let sleep_for = backoff.min(deadline.saturating_duration_since(Instant::now()));
+                if !sleep_for.is_zero() {
+                    tokio::time::sleep(sleep_for).await;
+                }
+                backoff = (backoff.saturating_mul(2)).min(ADMIN_CONNECT_BACKOFF_MAX);
+            }
+            Err(e) => {
+                panic!(
+                    "shared postgres at {base_url} did not accept connections: {e}\n\
+                     Fix: `docker rm -f {SHARED_PG_CONTAINER_NAME}` then re-run."
+                );
+            }
+        }
     }
 }
 
@@ -559,4 +727,67 @@ async fn drop_schema_best_effort_on(admin: &PgPool, schema: &str) {
     let _ = admin
         .execute(format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE").as_str())
         .await;
+}
+
+#[cfg(test)]
+mod connect_error_classification_tests {
+    use super::is_transient_pg_connect_error;
+
+    /// Without the classifier treating SSLRequest / refuse / reset as
+    /// transient, the readiness loop would still fail closed on the
+    /// first hard sqlx error (the cold-container flake). Permanent
+    /// errors must stay non-retryable so the loop never masks auth or
+    /// configuration failures.
+    #[test]
+    fn transient_connect_errors_are_retried_permanent_are_not() {
+        // --- transient: loop continues ---
+        assert!(
+            is_transient_pg_connect_error(&sqlx::Error::Protocol(
+                "unexpected response from SSLRequest: 0x00".into()
+            )),
+            "half-started Postgres SSLRequest garbage must be retryable"
+        );
+        assert!(
+            is_transient_pg_connect_error(&sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "connection refused",
+            ))),
+            "connection refused during postmaster restart must be retryable"
+        );
+        assert!(
+            is_transient_pg_connect_error(&sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            ))),
+            "connection reset during postmaster restart must be retryable"
+        );
+        assert!(
+            is_transient_pg_connect_error(&sqlx::Error::PoolTimedOut),
+            "per-attempt pool timeout is a slice of the deadline, not a permanent failure"
+        );
+        assert!(
+            is_transient_pg_connect_error(&sqlx::Error::Tls("server does not support TLS".into())),
+            "TLS handshake noise during partial boot must be retryable"
+        );
+
+        // --- permanent: loop must fail loud immediately ---
+        assert!(
+            !is_transient_pg_connect_error(&sqlx::Error::Configuration(
+                "invalid connect options".into()
+            )),
+            "configuration errors must not be swallowed by the readiness loop"
+        );
+        assert!(
+            !is_transient_pg_connect_error(&sqlx::Error::PoolClosed),
+            "closed pool is a programming error, not a cold-start race"
+        );
+        assert!(
+            !is_transient_pg_connect_error(&sqlx::Error::WorkerCrashed),
+            "worker crash must not be retried as readiness"
+        );
+        assert!(
+            !is_transient_pg_connect_error(&sqlx::Error::RowNotFound),
+            "non-connect error variants must fail loud, not spin"
+        );
+    }
 }
