@@ -1246,11 +1246,175 @@ mod tests {
     // testcontainers' AsyncRunner; no #[ignore], no extra feature flag,
     // no env opt-in. Docker must be available (as for every DB test).
     // Image is pinned by tag like bitcoind in compose.yaml.
+    //
+    // ## Readiness (connect loop, not log scrape alone)
+    //
+    // Log wait (`control message listener started`) is a useful first
+    // filter on cold create but is not protocol-correct accept: under
+    // parallel load the mapped port can accept TCP while the WebSocket
+    // handshake is still unfinished ("Handshake not finished"). Real
+    // readiness is a bounded connect probe in
+    // [`wait_relay_ready`] — same shape as
+    // `test_db::connect_shared_admin_until_ready` (deadline, per-attempt
+    // budget, exponential backoff, transient vs permanent, panic with
+    // attempt count + last error). All integration tests go through
+    // [`start_relay_container`], so the probe covers every consumer.
 
     /// Pinned Nostr relay image (compose + tests). Tag-fixed; no `latest`.
     const RELAY_IMAGE: &str = "scsibug/nostr-rs-relay";
     const RELAY_TAG: &str = "0.8.13";
     const RELAY_PORT: u16 = 8080;
+
+    /// How long [`wait_relay_ready`] may spend probing WebSocket accept
+    /// after the container handle is up before failing loud.
+    ///
+    /// Single readiness budget for the probe — per-attempt connect
+    /// timeouts are slices of this budget (mirrors
+    /// `test_db::CONTAINER_READY_SECS`).
+    const RELAY_READY_SECS: u64 = 90;
+
+    /// Cap on a single readiness connect attempt. Production
+    /// [`CONNECT_TIMEOUT`] is 15 s and would burn the whole deadline on
+    /// one hung peer; this only bounds a hung handshake so retries stay
+    /// live (mirrors `test_db::ADMIN_CONNECT_ATTEMPT_SECS`).
+    const RELAY_CONNECT_ATTEMPT_SECS: u64 = 2;
+
+    /// Initial backoff between transient connect failures; doubles each
+    /// retry up to [`RELAY_CONNECT_BACKOFF_MAX`].
+    const RELAY_CONNECT_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
+    const RELAY_CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(2);
+
+    /// Whether a failed readiness connect should be retried until the
+    /// deadline, or fail loud immediately.
+    ///
+    /// Transient: cold-start window where the port is bound but the
+    /// WebSocket accept path is not ready yet (`Handshake not finished`),
+    /// connection refused/reset/aborted while the process binds, broken
+    /// pipe / unexpected EOF, per-attempt timeout, and OS refuse/reset
+    /// codes that tungstenite stringifies into `ConnectFailed.message`.
+    ///
+    /// Permanent: invalid URL, empty list, and any other `RelayError`
+    /// variant that is not a connect-phase race. Those must not be
+    /// swallowed by the loop (fail-closed, same posture as
+    /// `test_db::is_transient_pg_connect_error`).
+    fn is_transient_relay_connect_error(err: &RelayError) -> bool {
+        match err {
+            // Per-attempt budget exhausted — a slice of the readiness
+            // deadline, not a permanent peer failure.
+            RelayError::ConnectTimeout { .. } => true,
+            RelayError::ConnectFailed { message, .. } => {
+                let m = message.to_ascii_lowercase();
+                // Observed flake under --test-threads=8: mapped port
+                // accepts TCP, handshake returns
+                // "WebSocket protocol error: Handshake not finished".
+                m.contains("handshake")
+                    || m.contains("connection refused")
+                    || m.contains("connection reset")
+                    || m.contains("connection aborted")
+                    || m.contains("broken pipe")
+                    || m.contains("not connected")
+                    || m.contains("unexpected eof")
+                    || m.contains("timed out")
+                    || m.contains("timeout")
+                    || m.contains("would block")
+                    || m.contains("temporarily unavailable")
+                    // Stringified OS codes when ErrorKind is not preserved.
+                    || m.contains("os error 61") // ECONNREFUSED (macOS)
+                    || m.contains("os error 111") // ECONNREFUSED (Linux)
+                    || m.contains("os error 104") // ECONNRESET (Linux)
+                    || m.contains("os error 54") // ECONNRESET (macOS)
+            }
+            // Invalid URL, protocol misuse, verification, send, … — fail loud.
+            _ => false,
+        }
+    }
+
+    /// Retry WebSocket connect until `deadline` or a permanent error.
+    ///
+    /// Panics with attempt count and last transient error when the
+    /// deadline expires (same message shape as
+    /// `test_db::connect_shared_admin_until_ready`). Never falls back to
+    /// "skip the relay" or soft-pass the integration body.
+    async fn wait_relay_ready(url: &str, deadline: std::time::Instant) {
+        let mut attempts: u32 = 0;
+        let mut last_err: Option<RelayError> = None;
+        let mut backoff = RELAY_CONNECT_BACKOFF_INITIAL;
+
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                let last = match &last_err {
+                    Some(e) => e.to_string(),
+                    None => "no connection attempt completed before deadline".to_string(),
+                };
+                panic!(
+                    "nostr relay at {url} did not accept WebSocket connections \
+                     within {RELAY_READY_SECS}s after {attempts} attempt(s); \
+                     last error: {last}\n\
+                     Fix: ensure Docker is running; \
+                     `docker pull {RELAY_IMAGE}:{RELAY_TAG}`; re-run."
+                );
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let attempt_budget = remaining.min(Duration::from_secs(RELAY_CONNECT_ATTEMPT_SECS));
+            // A zero budget means the deadline check above should have fired;
+            // keep the loop fail-closed rather than spinning.
+            if attempt_budget.is_zero() {
+                let last = match &last_err {
+                    Some(e) => e.to_string(),
+                    None => "no connection attempt completed before deadline".to_string(),
+                };
+                panic!(
+                    "nostr relay at {url} did not accept WebSocket connections \
+                     within {RELAY_READY_SECS}s after {attempts} attempt(s); \
+                     last error: {last}\n\
+                     Fix: ensure Docker is running; \
+                     `docker pull {RELAY_IMAGE}:{RELAY_TAG}`; re-run."
+                );
+            }
+
+            attempts = attempts.saturating_add(1);
+            // Outer timeout slices the readiness budget; production
+            // CONNECT_TIMEOUT (15 s) must not monopolise one attempt.
+            match tokio::time::timeout(attempt_budget, RelayClient::connect(url)).await {
+                Ok(Ok(client)) => {
+                    // Probe only — drop so the real test body connects clean.
+                    let _ = client.close().await;
+                    return;
+                }
+                Ok(Err(e)) if is_transient_relay_connect_error(&e) => {
+                    last_err = Some(e);
+                    let sleep_for =
+                        backoff.min(deadline.saturating_duration_since(std::time::Instant::now()));
+                    if !sleep_for.is_zero() {
+                        tokio::time::sleep(sleep_for).await;
+                    }
+                    backoff = (backoff.saturating_mul(2)).min(RELAY_CONNECT_BACKOFF_MAX);
+                }
+                Ok(Err(e)) => {
+                    panic!(
+                        "nostr relay at {url} did not accept WebSocket connections: {e}\n\
+                         Fix: ensure Docker is running; \
+                         `docker pull {RELAY_IMAGE}:{RELAY_TAG}`; re-run."
+                    );
+                }
+                // Attempt budget elapsed without a Result — treat as
+                // transient (hung peer during boot), same as ConnectTimeout.
+                Err(_) => {
+                    last_err = Some(RelayError::ConnectTimeout {
+                        url: url.to_string(),
+                    });
+                    let sleep_for =
+                        backoff.min(deadline.saturating_duration_since(std::time::Instant::now()));
+                    if !sleep_for.is_zero() {
+                        tokio::time::sleep(sleep_for).await;
+                    }
+                    backoff = (backoff.saturating_mul(2)).min(RELAY_CONNECT_BACKOFF_MAX);
+                }
+            }
+        }
+    }
 
     async fn start_relay_container() -> (
         testcontainers::ContainerAsync<testcontainers::GenericImage>,
@@ -1260,26 +1424,47 @@ mod tests {
         use testcontainers::runners::AsyncRunner;
         use testcontainers::GenericImage;
 
-        let container = GenericImage::new(RELAY_IMAGE, RELAY_TAG)
-            .with_exposed_port(RELAY_PORT.tcp())
-            // Readiness line, read off the running image rather than guessed.
-            // `listening on: 0.0.0.0:8080` comes first but is too early: the
-            // socket is bound while the db writer and the control-message
-            // listener are still coming up, and a connect inside that window
-            // dies with "Handshake not finished". The last startup line is the
-            // one that means the relay will actually serve.
-            .with_wait_for(WaitFor::message_on_either_std(
-                "control message listener started",
-            ))
-            .start()
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "start {RELAY_IMAGE}:{RELAY_TAG} failed: {e}\n\
-                     Fix: ensure Docker is running; \
-                     `docker pull {RELAY_IMAGE}:{RELAY_TAG}`."
-                )
-            });
+        // Single readiness budget for log-wait start + connect probe.
+        // Nested timeouts would invent a second deadline; everything
+        // below shares this Instant (mirrors test_db::init_shared_pg).
+        let deadline = std::time::Instant::now() + Duration::from_secs(RELAY_READY_SECS);
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "nostr relay init exceeded {RELAY_READY_SECS}s \
+                 before container start began.\n\
+                 Fix: ensure Docker is running; \
+                 `docker pull {RELAY_IMAGE}:{RELAY_TAG}`."
+            );
+        }
+        let container = match tokio::time::timeout(
+            remaining,
+            GenericImage::new(RELAY_IMAGE, RELAY_TAG)
+                .with_exposed_port(RELAY_PORT.tcp())
+                // First filter only: last startup line of the image. Still
+                // leaves a protocol-flaky window under parallel load; real
+                // readiness is the connect loop after the URL is known.
+                .with_wait_for(WaitFor::message_on_either_std(
+                    "control message listener started",
+                ))
+                .start(),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => panic!(
+                "start {RELAY_IMAGE}:{RELAY_TAG} failed: {e}\n\
+                 Fix: ensure Docker is running; \
+                 `docker pull {RELAY_IMAGE}:{RELAY_TAG}`."
+            ),
+            Err(_) => panic!(
+                "nostr relay init exceeded {RELAY_READY_SECS}s \
+                 waiting for container start/log wait.\n\
+                 Fix: ensure Docker is running; \
+                 `docker pull {RELAY_IMAGE}:{RELAY_TAG}`."
+            ),
+        };
 
         let host = container.get_host().await.expect("relay get_host");
         let port = container
@@ -1287,7 +1472,71 @@ mod tests {
             .await
             .expect("relay mapped port");
         let url = format!("ws://{host}:{port}/");
+
+        // Protocol-correct accept (covers log-wait race under load).
+        wait_relay_ready(&url, deadline).await;
+
         (container, url)
+    }
+
+    /// Without the classifier treating handshake / refuse / reset as
+    /// transient, the readiness loop would still fail closed on the
+    /// first hard connect error (the cold-container flake under
+    /// `--test-threads=8`). Permanent errors must stay non-retryable
+    /// so the loop never masks bad URLs or non-connect failures.
+    #[test]
+    fn transient_relay_connect_errors_are_retried_permanent_are_not() {
+        // --- transient: loop continues ---
+        assert!(
+            is_transient_relay_connect_error(&RelayError::ConnectFailed {
+                url: "ws://127.0.0.1:9/".into(),
+                message: "WebSocket protocol error: Handshake not finished".into(),
+            }),
+            "half-started relay handshake must be retryable"
+        );
+        assert!(
+            is_transient_relay_connect_error(&RelayError::ConnectFailed {
+                url: "ws://127.0.0.1:9/".into(),
+                message: "IO error: Connection refused (os error 61)".into(),
+            }),
+            "connection refused during relay bind must be retryable"
+        );
+        assert!(
+            is_transient_relay_connect_error(&RelayError::ConnectFailed {
+                url: "ws://127.0.0.1:9/".into(),
+                message: "IO error: Connection reset by peer (os error 54)".into(),
+            }),
+            "connection reset during relay bind must be retryable"
+        );
+        assert!(
+            is_transient_relay_connect_error(&RelayError::ConnectTimeout {
+                url: "ws://127.0.0.1:9/".into(),
+            }),
+            "per-attempt connect timeout is a slice of the deadline, not a permanent failure"
+        );
+
+        // --- permanent: loop must fail loud immediately ---
+        assert!(
+            !is_transient_relay_connect_error(&RelayError::InvalidRelayUrl {
+                url: "https://example.com".into(),
+            }),
+            "invalid URL must not be swallowed by the readiness loop"
+        );
+        assert!(
+            !is_transient_relay_connect_error(&RelayError::EmptyRelayList),
+            "empty relay list is a programming error, not a cold-start race"
+        );
+        assert!(
+            !is_transient_relay_connect_error(&RelayError::ConnectionClosed),
+            "non-connect error variants must fail loud, not spin"
+        );
+        assert!(
+            !is_transient_relay_connect_error(&RelayError::ConnectFailed {
+                url: "ws://127.0.0.1:9/".into(),
+                message: "URL error: Invalid URL scheme".into(),
+            }),
+            "non-transient ConnectFailed messages must fail loud, not spin"
+        );
     }
 
     #[tokio::test]
