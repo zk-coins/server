@@ -234,6 +234,10 @@ jobs:
     # label; the baseline recorded that expansion for the un-pause
     # step — the label is no longer required for this gate.
     if: github.event_name == 'push' || github.event.pull_request.draft == false
+    # The registered self-hosted M3 Ultra machines (dfx01, dfx01-2) advertise
+    # the `zkcoins-node` pool label, not `m3-ultra` — the old `m3-ultra`
+    # requirement matched no online runner, so this gate queued forever. Target
+    # the label the runners actually carry.
     runs-on: [self-hosted, zkcoins-node]
     # 180 min: llvm-cov nextest (~60-90 min) + release prover package
     # + four `#[ignore]` prove flows (a representative multi-input
