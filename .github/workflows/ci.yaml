@@ -337,10 +337,15 @@ jobs:
       # already running with a different cap than the requested
       # SCCACHE_CACHE_SIZE, stop it so the next --start-server picks up
       # the new env value; the on-disk cache files survive the restart.
-      - name: Ensure sccache + cargo-nextest are installed
+      - name: Ensure sccache + cargo-nextest + protoc are installed
         run: |
           command -v sccache >/dev/null || brew install sccache
           command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          # kernel-proto/build.rs invokes protoc; the self-hosted runner has
+          # no protobuf-compiler unless we install it (idempotent, like the
+          # tools above). The ubuntu lint job installs it via apt separately.
+          command -v protoc >/dev/null || brew install protobuf
+          protoc --version
           if ! sccache --show-stats 2>/dev/null | grep -qE "Max cache size +50 GiB"; then
             sccache --stop-server >/dev/null 2>&1 || true
           fi
