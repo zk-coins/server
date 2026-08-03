@@ -329,19 +329,70 @@ pub(crate) async fn update_pending_failure_reason(
 
 // ---- State persistence (PR-A2) --------------------------------------------
 
+/// Advance the canonical derived-state epoch inside an open transaction.
+///
+/// The singleton row is the durable head pointer for every epoch-scoped
+/// table. `fetch_one` deliberately fails closed if migration state is corrupt
+/// and the singleton is missing.
+pub(crate) async fn bump_derived_state_epoch_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<i64, sqlx::Error> {
+    let (epoch,): (i64,) = sqlx::query_as(
+        "UPDATE derived_state_epoch_meta \
+         SET epoch = epoch + 1 \
+         WHERE id = 1 \
+         RETURNING epoch",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(epoch)
+}
+
+/// Read the canonical derived-state epoch.
+///
+/// Missing singleton metadata is corruption, not epoch zero; `fetch_one`
+/// therefore propagates `RowNotFound` without a fallback.
+pub(crate) async fn current_derived_state_epoch(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let (epoch,): (i64,) =
+        sqlx::query_as("SELECT epoch FROM derived_state_epoch_meta WHERE id = 1")
+            .fetch_one(pool)
+            .await?;
+    Ok(epoch)
+}
+
+/// Read the canonical derived-state epoch inside an open transaction.
+///
+/// Missing singleton metadata is returned as an error so callers cannot
+/// silently expose epoch zero as canonical state.
+pub(crate) async fn current_derived_state_epoch_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<i64, sqlx::Error> {
+    let (epoch,): (i64,) =
+        sqlx::query_as("SELECT epoch FROM derived_state_epoch_meta WHERE id = 1")
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok(epoch)
+}
+
 /// Load the bincode-serialized Sparse Merkle Tree blob.
 pub(crate) async fn load_smt(pool: &PgPool) -> Result<Option<Vec<u8>>, sqlx::Error> {
-    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT data FROM smt_state WHERE id = 1")
-        .fetch_optional(pool)
-        .await?;
+    let epoch = current_derived_state_epoch(pool).await?;
+    let row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT data FROM smt_state WHERE state_epoch = $1 AND id = 1")
+            .bind(epoch)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(|(data,)| data))
 }
 
 /// Load the bincode-serialized Merkle Mountain Range blob.
 pub(crate) async fn load_mmr(pool: &PgPool) -> Result<Option<Vec<u8>>, sqlx::Error> {
-    let row: Option<(Vec<u8>,)> = sqlx::query_as("SELECT data FROM mmr_state WHERE id = 1")
-        .fetch_optional(pool)
-        .await?;
+    let epoch = current_derived_state_epoch(pool).await?;
+    let row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT data FROM mmr_state WHERE state_epoch = $1 AND id = 1")
+            .bind(epoch)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(|(data,)| data))
 }
 
@@ -449,30 +500,35 @@ pub(crate) async fn persist_state_and_mark_complete_tx(
 
     let mut tx = pool.begin().await?;
     require_legacy_stack_mode_in_tx(&mut tx).await?;
+    let epoch = current_derived_state_epoch_in_tx(&mut tx).await?;
     sqlx::query(
-        "INSERT INTO smt_state (id, data, updated_at) \
-         VALUES (1, $1, NOW()) \
-         ON CONFLICT (id) DO UPDATE \
+        "INSERT INTO smt_state (state_epoch, id, data, updated_at) \
+         VALUES ($1, 1, $2, NOW()) \
+         ON CONFLICT (state_epoch, id) DO UPDATE \
          SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
     )
+    .bind(epoch)
     .bind(smt)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO mmr_state (id, data, updated_at) \
-         VALUES (1, $1, NOW()) \
-         ON CONFLICT (id) DO UPDATE \
+        "INSERT INTO mmr_state (state_epoch, id, data, updated_at) \
+         VALUES ($1, 1, $2, NOW()) \
+         ON CONFLICT (state_epoch, id) DO UPDATE \
          SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
     )
+    .bind(epoch)
     .bind(mmr)
     .execute(&mut *tx)
     .await?;
     if let Some((prev_bytes, smt_bytes, leaf_i64)) = root_index_bytes {
         sqlx::query(
-            "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index, created_at) \
-             VALUES ($1, $2, $3, NOW()) \
-             ON CONFLICT (prev_mmr_root) DO NOTHING",
+            "INSERT INTO mmr_root_index \
+             (state_epoch, prev_mmr_root, smt_root, leaf_index, created_at) \
+             VALUES ($1, $2, $3, $4, NOW()) \
+             ON CONFLICT (state_epoch, prev_mmr_root) DO NOTHING",
         )
+        .bind(epoch)
         .bind(&prev_bytes[..])
         .bind(&smt_bytes[..])
         .bind(leaf_i64)
@@ -500,10 +556,13 @@ pub(crate) async fn persist_state_and_mark_complete_tx(
 pub(crate) async fn load_all_accounts(
     pool: &PgPool,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, sqlx::Error> {
-    let rows: Vec<(Vec<u8>, Vec<u8>)> =
-        sqlx::query_as("SELECT address, data FROM accounts ORDER BY address")
-            .fetch_all(pool)
-            .await?;
+    let epoch = current_derived_state_epoch(pool).await?;
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT address, data FROM accounts WHERE state_epoch = $1 ORDER BY address",
+    )
+    .bind(epoch)
+    .fetch_all(pool)
+    .await?;
     Ok(rows)
 }
 
@@ -531,16 +590,18 @@ pub(crate) async fn upsert_account_with_source(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     require_legacy_stack_mode_in_tx(&mut tx).await?;
+    let epoch = current_derived_state_epoch_in_tx(&mut tx).await?;
     sqlx::query("SELECT set_config('zkcoins.account_source', $1, true)")
         .bind(source)
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "INSERT INTO accounts (address, data, updated_at) \
-         VALUES ($1, $2, NOW()) \
-         ON CONFLICT (address) DO UPDATE \
+        "INSERT INTO accounts (state_epoch, address, data, updated_at) \
+         VALUES ($1, $2, $3, NOW()) \
+         ON CONFLICT (state_epoch, address) DO UPDATE \
          SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
     )
+    .bind(epoch)
     .bind(address)
     .bind(data)
     .execute(&mut *tx)
@@ -572,10 +633,11 @@ pub(crate) async fn upsert_account(
 /// digest to decide whether the persisted proofs are still
 /// circuit-compatible — see `crate::self_heal::reset_decision`.
 pub(crate) async fn load_circuit_digest(pool: &PgPool) -> Result<Option<Vec<u8>>, sqlx::Error> {
-    let row: Option<(Vec<u8>,)> =
-        sqlx::query_as("SELECT digest FROM circuit_digest_meta WHERE id = 1")
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT digest FROM circuit_digest_meta WHERE id = 1 AND digest IS NOT NULL",
+    )
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|(digest,)| digest))
 }
 
@@ -586,8 +648,8 @@ pub(crate) async fn load_circuit_digest(pool: &PgPool) -> Result<Option<Vec<u8>>
 /// DB)" path: there is nothing to heal, we only record / refresh the
 /// digest so the next boot has a baseline to compare against. The
 /// "digest mismatch" path goes through [`reset_proof_dependent_state_tx`]
-/// instead, which wipes the proof-dependent state and stores the new
-/// digest in the same transaction.
+/// instead, which archives the old canonical proof-dependent state and
+/// stores the new digest in the same transaction.
 pub(crate) async fn store_circuit_digest(pool: &PgPool, digest: &[u8]) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO circuit_digest_meta (id, digest, updated_at) \
@@ -601,107 +663,49 @@ pub(crate) async fn store_circuit_digest(pool: &PgPool, digest: &[u8]) -> Result
     Ok(())
 }
 
-/// Delete the singleton circuit-digest row, WITHOUT touching any other
-/// state.
+/// Clear the singleton circuit digest without deleting its durable row.
 ///
 /// Used by the runtime prover-health watchdog: when the job dispatcher
 /// observes [`crate::prover_health::PROVE_FAILURE_THRESHOLD`] consecutive
 /// `prove failed` outcomes it clears the persisted digest to *arm* the
-/// boot self-heal. Removing the row makes the next boot's
+/// boot self-heal. Setting `digest` to NULL makes the next boot's
 /// [`load_circuit_digest`] return `None`, which routes
 /// `heal_circuit_digest` through the canary-recursion branch instead of
 /// the steady-state `Keep` fast path — the restart then authoritatively
 /// re-checks whether the persisted proofs still recurse and resets to
 /// genesis IFF the canary says `Stale` (`Compatible` / `NoSample` just
 /// re-record the baseline: no reset, no data loss). Clearing the digest
-/// never wipes proof state itself; the destructive reset stays gated
-/// behind the canary. Idempotent: deleting an absent row is a no-op.
+/// never changes proof state itself. The singleton row is permanent;
+/// clearing an absent row or an already-NULL digest is idempotent.
 pub(crate) async fn clear_circuit_digest(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM circuit_digest_meta WHERE id = 1")
+    sqlx::query("UPDATE circuit_digest_meta SET digest = NULL, updated_at = NOW() WHERE id = 1")
         .execute(pool)
         .await?;
     Ok(())
 }
 
-/// Reset all proof-dependent state to genesis and store the new circuit
-/// digest, atomically, in a single transaction.
+/// Archive the canonical legacy proof-dependent state and store a new
+/// circuit digest atomically.
 ///
-/// Invoked from the boot path when the live circuit's digest does not
-/// match the persisted one (a breaking circuit change). Because a
-/// circuit change invalidates EVERY proof in the system at once — each
-/// `account.proof`, every queued `CoinProof` source proof, every
-/// recipient-held proof — and the global SMT/MMR are append-only and
-/// shared across all accounts (they cannot be partially unwound per
-/// account without leaving a global-vs-account mismatch), the only
-/// provably-consistent recovery is a full reset to genesis. This is
-/// exactly the documented `reset-zkcoins-node` tabula rasa, permitted
-/// in the closed test env (CONTRIBUTING § "Closed test environment").
+/// The current rows in `accounts`, `smt_state`, `mmr_state`,
+/// `mmr_root_index`, and `latest_block` are retained permanently. Advancing
+/// `derived_state_epoch_meta.epoch` makes them historical and exposes an
+/// empty canonical legacy state for recomputation. New writes are stamped
+/// with that epoch. The same transaction advances the self-heal job
+/// generation, fails non-terminal jobs, and stores `new_digest`.
 ///
-/// Tables wiped (the proof-dependent state-layer set, mirroring the
-/// DEV-recovery `TRUNCATE` in CONTRIBUTING § "DEV state recovery",
-/// minus `minting_meta` which migration 0005 dropped):
-///
-/// * `accounts`      — per-address ledger (carries the stale `proof`).
-/// * `smt_state`     — global commitment Sparse Merkle Tree.
-/// * `mmr_state`     — global Merkle Mountain Range of SMT roots.
-/// * `mmr_root_index`— `prev_mmr_root → (smt_root, leaf_index)` map.
-/// * `latest_block`  — scanner resume cursor (re-derived from the tip).
-///
-/// `_sqlx_migrations` is intentionally left untouched so
-/// `connect_and_migrate` skips re-applying the schema. The append-only
-/// log/audit tables (`account_history`, `state_update_log`, …) are NOT
-/// wiped — they are historical evidence, do not feed proof
-/// construction, and stop being appended to until the next user
-/// round-trip re-populates `accounts`.
-///
-/// `usernames` is deliberately PRESERVED (not in the DELETE set above):
-/// a `name → address` mapping is a human-facing handle, not
-/// proof-dependent state — it does not feed proof construction and
-/// survives a genesis reset so a user keeps their handle even though
-/// their balance/proof are wiped. (The address it points at simply has
-/// no `accounts` row until the next round-trip re-creates one.)
-///
-/// `coin_proof_store` (migration 0008) is deliberately NOT in the DELETE
-/// set either, but for a different reason: it is unused schema
-/// groundwork. Migration 0008 only CREATEs the table as a persisted view
-/// of the in-memory `ProofStore`; the bootstrap that would populate it is
-/// an explicit follow-up (see the migration 0008 comment), so there is no
-/// production INSERT today and nothing to wipe. MIGRATION_RESEARCH: if the
-/// DB-backed `ProofStore` bootstrap later lands and starts persisting
-/// proof bytes here, `coin_proof_store` becomes proof-dependent state and
-/// MUST be added to this DELETE set (its rows reference proof ids that a
-/// genesis reset invalidates).
-///
-/// The on-disk per-proof file store (`PROOFS_DIR`) is dropped by the
-/// caller (see `crate::self_heal::reset_proof_store_dir`) — it lives
-/// outside Postgres so it cannot ride this transaction, but the
-/// proof_id space resets cleanly because the files are content-
-/// addressed by id and no surviving row references them.
+/// `usernames`, audit/history tables, and other non-derived state are not
+/// epoch-scoped and remain untouched. No database row is deleted by this
+/// reset. The legacy stack capability check remains the first operation.
 pub(crate) async fn reset_proof_dependent_state_tx(
     pool: &PgPool,
     new_digest: &[u8],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    // Capability check first: this mutates the four legacy scan tables
-    // (smt_state / mmr_state / mmr_root_index / latest_block) plus accounts.
-    // Under a missing or v1.1 marker the wipe must refuse — same invariant
-    // as every other legacy stack writer (no silent cross-stack mutate).
+    // Capability check first: under a missing or v1 marker the canonical
+    // epoch transition must refuse, matching every legacy stack writer.
     require_legacy_stack_mode_in_tx(&mut tx).await?;
-    sqlx::query("DELETE FROM accounts")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM smt_state")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM mmr_state")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM mmr_root_index")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM latest_block")
-        .execute(&mut *tx)
-        .await?;
+    bump_derived_state_epoch_in_tx(&mut tx).await?;
     // Fence concurrent job writers (same shape as the v1.1 path): bump the
     // self-heal reset generation so every job-advancing write that still
     // carries a pre-reset generation loses, fail non-terminal jobs, and
@@ -785,97 +789,60 @@ async fn fail_non_terminal_jobs_for_self_heal_in_tx(
 }
 
 /// Operator-visible error stamped onto every non-terminal `jobs` row when a
-/// circuit-digest self-heal reset wipes proof-dependent state.
+/// circuit-digest self-heal reset archives proof-dependent state.
 ///
-/// A reset must leave **no** job that can later claim success for wiped work
+/// A reset must leave **no** job that can later claim success for archived work
 /// (durable `finalisation` capability + cached `completion_result` would
 /// otherwise let the dispatcher skip prove/apply and mark `completed`).
 pub(crate) const SELF_HEAL_RESET_JOB_ERROR: &str = "\
-circuit-digest self-heal reset: proof-dependent state was wiped to genesis; \
+circuit-digest self-heal reset: proof-dependent state was archived via state_epoch; \
 this job cannot complete for a transition that no longer exists";
 
-/// v1.1 self-heal reset: wipe **all v1.1 proof-dependent state** plus any
-/// leftover legacy proof-bearing `accounts` rows, **fail every non-terminal
-/// job** (stripping durable finalisation / completion cache), then store
-/// the live digest. Leaves structures the v1.1 stack does not use untouched
-/// (SMT / MMR / root index / latest_block).
+/// Archive the canonical v1 proof-dependent state and reconcile durable work.
 ///
-/// Under exclusive v1.1 the full [`reset_proof_dependent_state_tx`] is a
-/// legacy-stack writer and must not run (it requires the legacy marker and
-/// would wipe scan tables that stack separation already keeps empty). A
-/// circuit-digest change on the v1.1 path invalidates every
-/// `ComplianceProof` / NfLog-bound opening at once — the only consistent
-/// recovery is empty-engine genesis for the v1 tables.
+/// Advancing `derived_state_epoch_meta.epoch` archives, without deleting,
+/// `v1_engine_meta`, NfLog/index rows, v1 accounts and coin sets, the
+/// inscription catalog, and any legacy epoch-scoped rows left from an older
+/// stack. The new epoch is an empty canonical engine until it is rebuilt.
 ///
-/// Tables wiped (derived from migration 0019 / 0021 + legacy leftovers):
-///
-/// * `v1_delivery_outbox` — durable mesh delivery log (proof-bound ZBE / K_tx)
-/// * `v1_sdr_phase_a` — §4.2 SDR Phase-A staging (pre-first-occurrence)
-/// * `v1_pending_publishes` — stale nullifier publish recovery rows
-/// * `v1_spendable_coins` / `v1_spent_coins` — CoinHist leaves
-/// * `v1_accounts` — multi-asset state + last_proof / openings
-/// * `v1_nullifier_index` / `v1_nflog_entries` — NfLog
-/// * `v1_engine_meta` — tip / network pin row
-/// * `accounts` — legacy proof-bearing rows that may still linger
-///
-/// Jobs reconciled (not deleted — operator retains the row):
-///
-/// * every non-terminal `jobs` row (`queued` / `proving` /
-///   `awaiting_signature` / `broadcasting`) → `failed` with
-///   [`SELF_HEAL_RESET_JOB_ERROR`], and `request_body` stripped of
-///   `finalisation` / `pending_sign` / `sign` / `finalise_claim` so a
-///   cached `completion_result` cannot later flip the job to `completed`
-///
-/// Does **not** require a legacy stack marker (v1.1 process owns this path).
-/// Does **not** DELETE from `smt_state` / `mmr_state` / `mmr_root_index` /
-/// `latest_block` (v1.1 does not use them; leave them intact).
+/// Non-epoch delivery state is retained and soft-failed: pending or
+/// awaiting-ack outbox deliveries receive a permanent reason; non-terminal
+/// pending publishes become `failed`; and Phase-A rows awaiting first
+/// occurrence become `failed` with a permanent reason. Completed/terminal
+/// rows remain unchanged. The transaction then advances the self-heal job
+/// generation, fails non-terminal jobs while retaining every job row, and
+/// stores `new_digest`. This function performs no physical deletion.
 pub(crate) async fn reset_v1_proof_dependent_state_tx(
     pool: &PgPool,
     new_digest: &[u8],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    // Order: children / dependents first, then parents, then meta.
-    // v1_pending_publishes has no FK to accounts but is proof-dependent.
-    // Delivery outbox holds proof-bound materials (ZBE / K_tx) — wipe with
-    // the rest of the proof-dependent surface on self-heal reset.
-    // (Self-heal is a full proof-dependent reset, not a delivery drop path.)
-    sqlx::query("DELETE FROM v1_delivery_outbox")
+    sqlx::query(
+        "UPDATE v1_delivery_outbox \
+         SET status = 'failed', \
+             fail_reason = 'circuit-digest self-heal reset: proof-dependent state archived via state_epoch; non-terminal delivery cannot complete', \
+             updated_at = NOW() \
+         WHERE status IN ('pending', 'awaiting_ack')",
+    )
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM v1_sdr_phase_a")
+    sqlx::query(
+        "UPDATE v1_pending_publishes \
+         SET status = 'failed', updated_at = NOW() \
+         WHERE status NOT IN ('complete', 'failed')",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE v1_sdr_phase_a \
+         SET status = 'failed', \
+             fail_reason = 'circuit-digest self-heal reset: proof-dependent state archived via state_epoch', \
+             updated_at = NOW() \
+         WHERE status = 'awaiting_first_occurrence'",
+    )
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM v1_pending_publishes")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_inscription_members")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_inscriptions")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_spendable_coins")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_spent_coins")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_accounts")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_nullifier_index")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_nflog_entries")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_engine_meta")
-        .execute(&mut *tx)
-        .await?;
-    // Leftover legacy proof-bearing rows (Stage 1–2 dual surface).
-    sqlx::query("DELETE FROM accounts")
-        .execute(&mut *tx)
-        .await?;
+    bump_derived_state_epoch_in_tx(&mut tx).await?;
     // Fence concurrent job writers first: bump the self-heal reset
     // generation so every job-advancing write that still carries a
     // pre-reset generation (loaded before this commit) loses the CAS —
@@ -1262,9 +1229,12 @@ pub(crate) struct InscriptionSummary {
 pub(crate) async fn load_root_indices(
     pool: &PgPool,
 ) -> Result<Vec<(HashDigest, HashDigest, u64)>, sqlx::Error> {
+    let epoch = current_derived_state_epoch(pool).await?;
     let rows: Vec<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
-        "SELECT prev_mmr_root, smt_root, leaf_index FROM mmr_root_index ORDER BY leaf_index",
+        "SELECT prev_mmr_root, smt_root, leaf_index FROM mmr_root_index \
+         WHERE state_epoch = $1 ORDER BY leaf_index",
     )
+    .bind(epoch)
     .fetch_all(pool)
     .await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -1335,7 +1305,7 @@ mod tests;
 /// means either both land or neither does; on a crash before COMMIT,
 /// the next start-up re-runs `state.update` against the SAME unchanged
 /// MMR and writes the SAME `(prev_mmr_root, smt_root, leaf_index)` —
-/// `ON CONFLICT (prev_mmr_root) DO NOTHING` makes that a no-op on the
+/// `ON CONFLICT (state_epoch, prev_mmr_root) DO NOTHING` makes that a no-op on the
 /// row that did land, or a fresh insert on the row that did not.
 ///
 /// `root_index_entry` is `Option<…>` because the first call from a
@@ -1367,39 +1337,45 @@ pub(crate) async fn persist_state_tx(
     // concurrent v1.1 claim cannot slip past this write, and a missing /
     // mismatching marker aborts before any SMT/MMR row is touched.
     require_legacy_stack_mode_in_tx(&mut tx).await?;
+    let epoch = current_derived_state_epoch_in_tx(&mut tx).await?;
     sqlx::query(
-        "INSERT INTO smt_state (id, data, updated_at) \
-         VALUES (1, $1, NOW()) \
-         ON CONFLICT (id) DO UPDATE \
+        "INSERT INTO smt_state (state_epoch, id, data, updated_at) \
+         VALUES ($1, 1, $2, NOW()) \
+         ON CONFLICT (state_epoch, id) DO UPDATE \
          SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
     )
+    .bind(epoch)
     .bind(smt)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO mmr_state (id, data, updated_at) \
-         VALUES (1, $1, NOW()) \
-         ON CONFLICT (id) DO UPDATE \
+        "INSERT INTO mmr_state (state_epoch, id, data, updated_at) \
+         VALUES ($1, 1, $2, NOW()) \
+         ON CONFLICT (state_epoch, id) DO UPDATE \
          SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
     )
+    .bind(epoch)
     .bind(mmr)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO latest_block (id, block_hash, updated_at) \
-         VALUES (1, $1, NOW()) \
-         ON CONFLICT (id) DO UPDATE \
+        "INSERT INTO latest_block (state_epoch, id, block_hash, updated_at) \
+         VALUES ($1, 1, $2, NOW()) \
+         ON CONFLICT (state_epoch, id) DO UPDATE \
          SET block_hash = EXCLUDED.block_hash, updated_at = EXCLUDED.updated_at",
     )
+    .bind(epoch)
     .bind(&latest_block[..])
     .execute(&mut *tx)
     .await?;
     if let Some((prev_bytes, smt_bytes, leaf_i64)) = root_index_bytes {
         sqlx::query(
-            "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index, created_at) \
-             VALUES ($1, $2, $3, NOW()) \
-             ON CONFLICT (prev_mmr_root) DO NOTHING",
+            "INSERT INTO mmr_root_index \
+             (state_epoch, prev_mmr_root, smt_root, leaf_index, created_at) \
+             VALUES ($1, $2, $3, $4, NOW()) \
+             ON CONFLICT (state_epoch, prev_mmr_root) DO NOTHING",
         )
+        .bind(epoch)
         .bind(&prev_bytes[..])
         .bind(&smt_bytes[..])
         .bind(leaf_i64)
@@ -1413,8 +1389,10 @@ pub(crate) async fn persist_state_tx(
 #[cfg(test)]
 /// Load the 32-byte block hash of the last fully-processed block.
 pub(crate) async fn load_latest_block(pool: &PgPool) -> Result<Option<[u8; 32]>, sqlx::Error> {
+    let epoch = current_derived_state_epoch(pool).await?;
     let row: Option<(Vec<u8>,)> =
-        sqlx::query_as("SELECT block_hash FROM latest_block WHERE id = 1")
+        sqlx::query_as("SELECT block_hash FROM latest_block WHERE state_epoch = $1 AND id = 1")
+            .bind(epoch)
             .fetch_optional(pool)
             .await?;
     match row {
@@ -1469,11 +1447,14 @@ pub(crate) async fn insert_root_index(
     let leaf_i64 = leaf_index as i64;
     let mut tx = pool.begin().await?;
     require_legacy_stack_mode_in_tx(&mut tx).await?;
+    let epoch = current_derived_state_epoch_in_tx(&mut tx).await?;
     sqlx::query(
-        "INSERT INTO mmr_root_index (prev_mmr_root, smt_root, leaf_index, created_at) \
-         VALUES ($1, $2, $3, NOW()) \
-         ON CONFLICT (prev_mmr_root) DO NOTHING",
+        "INSERT INTO mmr_root_index \
+         (state_epoch, prev_mmr_root, smt_root, leaf_index, created_at) \
+         VALUES ($1, $2, $3, $4, NOW()) \
+         ON CONFLICT (state_epoch, prev_mmr_root) DO NOTHING",
     )
+    .bind(epoch)
     .bind(&prev_bytes[..])
     .bind(&smt_bytes[..])
     .bind(leaf_i64)
@@ -1548,6 +1529,7 @@ pub(crate) async fn commit_mint_tx(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     require_legacy_stack_mode_in_tx(&mut tx).await?;
+    let epoch = current_derived_state_epoch_in_tx(&mut tx).await?;
     // Tag every `account_history` row written by the trigger as
     // `source = 'mint'`. `set_config(..., is_local := true)` only
     // takes effect for the lifetime of THIS transaction, so the
@@ -1557,11 +1539,12 @@ pub(crate) async fn commit_mint_tx(
         .await?;
     for (address, data) in accounts {
         sqlx::query(
-            "INSERT INTO accounts (address, data, updated_at) \
-             VALUES ($1, $2, NOW()) \
-             ON CONFLICT (address) DO UPDATE \
+            "INSERT INTO accounts (state_epoch, address, data, updated_at) \
+             VALUES ($1, $2, $3, NOW()) \
+             ON CONFLICT (state_epoch, address) DO UPDATE \
              SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
         )
+        .bind(epoch)
         .bind(*address)
         .bind(*data)
         .execute(&mut *tx)

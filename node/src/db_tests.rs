@@ -121,6 +121,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "boot_log".to_string(),
             "circuit_digest_meta".to_string(),
             "coin_proof_store".to_string(),
+            "derived_state_epoch_meta".to_string(),
             "error_log".to_string(),
             "esplora_log".to_string(),
             "jobs".to_string(),
@@ -255,7 +256,7 @@ async fn persist_state_tx_root_index_on_conflict_does_nothing() {
     // Re-scanning the same commit tx after a crash MUST be a no-op on
     // the root_index row — `update()` is replayed against the same
     // unchanged MMR and the (prev_mmr_root, smt_root, leaf_index)
-    // tuple is identical, so `ON CONFLICT (prev_mmr_root) DO NOTHING`
+    // tuple is identical, so `ON CONFLICT (state_epoch, prev_mmr_root) DO NOTHING`
     // keeps the original row authoritative. Belt-and-braces: the
     // second call's `smt_root` differs to prove that the conflict
     // branch genuinely takes the DO NOTHING path (otherwise the row
@@ -379,7 +380,7 @@ async fn store_circuit_digest_inserts_then_updates_on_conflict() {
 }
 
 #[tokio::test]
-async fn reset_proof_dependent_state_tx_wipes_state_and_stores_digest() {
+async fn reset_proof_dependent_state_tx_archives_state_and_stores_digest() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     claim_legacy_stack(&pool).await;
@@ -408,7 +409,7 @@ async fn reset_proof_dependent_state_tx_wipes_state_and_stores_digest() {
 
     reset_proof_dependent_state_tx(&pool, b"NEW").await.unwrap();
 
-    // All proof-dependent state gone, new digest stored, atomically.
+    // The new canonical epoch is empty and the new digest is stored atomically.
     assert!(load_all_accounts(&pool).await.unwrap().is_empty());
     assert_eq!(load_smt(&pool).await.unwrap(), None);
     assert_eq!(load_mmr(&pool).await.unwrap(), None);
@@ -417,6 +418,25 @@ async fn reset_proof_dependent_state_tx_wipes_state_and_stores_digest() {
     assert_eq!(
         load_circuit_digest(&pool).await.unwrap(),
         Some(b"NEW".to_vec())
+    );
+
+    // Data permanence: rows from the prior epoch remain physically stored.
+    let (account_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (smt_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM smt_state")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (mmr_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mmr_state")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(account_rows >= 1, "archived accounts must remain stored");
+    assert!(
+        smt_rows >= 1 || mmr_rows >= 1,
+        "at least one archived state snapshot must remain stored"
     );
 }
 
@@ -579,7 +599,7 @@ async fn commit_mint_tx_upserts_every_account_atomically() {
 }
 
 /// Second call with the same address overwrites the prior payload via
-/// the `ON CONFLICT (address) DO UPDATE` branch. Exercises the
+/// the `ON CONFLICT (state_epoch, address) DO UPDATE` branch. Exercises the
 /// idempotent-replay shape the post-Phase-D mint flow relies on (a
 /// concurrent receive between the snapshot and the commit will retry
 /// with the latest serialized Account on the next mint).

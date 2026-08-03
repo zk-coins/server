@@ -527,17 +527,24 @@ async fn missing_meta_with_data_rows_fails_loud() {
         .expect("persist");
 
     // Delete only the singleton meta row — data remains.
-    let deleted = sqlx::query("DELETE FROM v1_engine_meta WHERE id = 1")
-        .execute(&pool)
-        .await
-        .expect("delete meta");
+    let deleted = sqlx::query(
+        "DELETE FROM v1_engine_meta \
+         WHERE id = 1 \
+           AND state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("delete meta");
     assert_eq!(deleted.rows_affected(), 1, "meta row must have existed");
 
     // Sanity: data rows still present.
-    let (nflog_n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_nflog_entries")
-        .fetch_one(&pool)
-        .await
-        .expect("count nflog");
+    let (nflog_n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM v1_nflog_entries \
+         WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count nflog");
     assert!(nflog_n > 0, "test setup requires leftover nflog rows");
 
     let err = db_v1::load_engine_snapshot(&pool)
@@ -608,6 +615,64 @@ async fn tip_hash_survives_persist_reload() {
         42,
         "height alone cannot distinguish the fork"
     );
+}
+
+/// Data permanence: engine full-replace bumps state_epoch; old rows stay;
+/// load returns only the new canonical snapshot.
+#[tokio::test]
+async fn engine_snapshot_replace_archives_prior_epoch() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    claim_v1_marker(&pool).await;
+
+    // Snapshot A: empty/minimal engine, tip_hash H1.
+    let engine_a = StateEngine::new(Network::Regtest, 0);
+    let tip_a = [0xA1u8; 32];
+    let snap_a = EngineSnapshot::from_engine_with_tip_hash(&engine_a, tip_a, Vec::new());
+    db_v1::persist_engine_snapshot(&pool, &snap_a)
+        .await
+        .expect("persist A");
+
+    let loaded_a = db_v1::load_engine_snapshot(&pool)
+        .await
+        .expect("load")
+        .expect("meta A");
+    assert_eq!(loaded_a.tip_hash, tip_a);
+
+    // Snapshot B: different tip_hash (empty nflog ok if tip differs).
+    let engine_b = StateEngine::new(Network::Regtest, 0);
+    let tip_b = [0xB2u8; 32];
+    assert_ne!(tip_a, tip_b);
+    let snap_b = EngineSnapshot::from_engine_with_tip_hash(&engine_b, tip_b, Vec::new());
+    db_v1::persist_engine_snapshot(&pool, &snap_b)
+        .await
+        .expect("persist B");
+
+    let loaded_b = db_v1::load_engine_snapshot(&pool)
+        .await
+        .expect("load")
+        .expect("meta B");
+    assert_eq!(
+        loaded_b.tip_hash, tip_b,
+        "load returns only the new canonical snapshot"
+    );
+
+    // Physical: ≥ 2 meta rows across epochs.
+    let (phys,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_engine_meta")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(phys >= 2, "prior epoch rows must remain physically stored");
+
+    // Canonical: exactly 1 meta row on current epoch.
+    let (canon,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM v1_engine_meta \
+         WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(canon, 1, "exactly one canonical v1_engine_meta row");
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,7 +1504,7 @@ async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v1_claim() {
     // optional root-index argument is None — no mmr_root_index row.
     sqlx::query(
         "INSERT INTO smt_state (id, data, updated_at) VALUES (1, $1, NOW()) \
-         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+         ON CONFLICT (state_epoch, id) DO UPDATE SET data = EXCLUDED.data",
     )
     .bind([0x51u8; 16].as_slice())
     .execute(&pool)
@@ -1447,7 +1512,7 @@ async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v1_claim() {
     .expect("seed smt_state");
     sqlx::query(
         "INSERT INTO mmr_state (id, data, updated_at) VALUES (1, $1, NOW()) \
-         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+         ON CONFLICT (state_epoch, id) DO UPDATE SET data = EXCLUDED.data",
     )
     .bind([0x52u8; 16].as_slice())
     .execute(&pool)
@@ -1455,7 +1520,7 @@ async fn legacy_smt_mmr_latest_block_without_root_index_blocks_v1_claim() {
     .expect("seed mmr_state");
     sqlx::query(
         "INSERT INTO latest_block (id, block_hash, updated_at) VALUES (1, $1, NOW()) \
-         ON CONFLICT (id) DO UPDATE SET block_hash = EXCLUDED.block_hash",
+         ON CONFLICT (state_epoch, id) DO UPDATE SET block_hash = EXCLUDED.block_hash",
     )
     .bind([0x53u8; 32].as_slice())
     .execute(&pool)

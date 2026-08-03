@@ -1,9 +1,10 @@
 //! Postgres load/store for the v1.1 StateEngine tables (migration 0019).
 //!
-//! All writes that replace the engine snapshot run in a single transaction so
-//! a crash cannot leave NfLog entries without a matching nullifier index (or
-//! accounts without their coin sets). Loads use an equivalent transactional
-//! snapshot so a concurrent write cannot produce a mixed old/new state.
+//! `derived_state_epoch_meta.epoch` is the canonical head for every engine and
+//! catalog table. Snapshot replacement advances that head and writes the new
+//! state into the new epoch, permanently retaining prior epochs for audit and
+//! recovery. Writes and loads use one transaction so readers cannot observe a
+//! mixed engine snapshot.
 
 use anyhow::{bail, ensure, Context, Result};
 use shared::spec_v1::{
@@ -347,40 +348,38 @@ fn fixed_32(bytes: &[u8], field: &str) -> Result<[u8; 32]> {
         .with_context(|| format!("{field} has length {}, expected 32", bytes.len()))
 }
 
-/// Count any row across the v1.1 tables (meta + data). Used to distinguish a
-/// genuinely empty database from an inconsistent one that lost its meta row.
-async fn count_any_v1_rows(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
+/// Count canonical engine/catalog rows. Pending publishes are delivery state,
+/// not part of snapshot meta/catalog coherence, and are intentionally omitted.
+async fn count_any_v1_rows(tx: &mut Transaction<'_, Postgres>, epoch: i64) -> Result<i64> {
     let (n,): (i64,) = sqlx::query_as(
         "SELECT \
-            (SELECT COUNT(*) FROM v1_engine_meta) \
-          + (SELECT COUNT(*) FROM v1_nflog_entries) \
-          + (SELECT COUNT(*) FROM v1_nullifier_index) \
-          + (SELECT COUNT(*) FROM v1_accounts) \
-          + (SELECT COUNT(*) FROM v1_spendable_coins) \
-          + (SELECT COUNT(*) FROM v1_spent_coins) \
-          + (SELECT COUNT(*) FROM v1_pending_publishes) \
-          + (SELECT COUNT(*) FROM v1_inscriptions) \
-          + (SELECT COUNT(*) FROM v1_inscription_members)",
+            (SELECT COUNT(*) FROM v1_engine_meta WHERE state_epoch = $1) \
+          + (SELECT COUNT(*) FROM v1_nflog_entries WHERE state_epoch = $1) \
+          + (SELECT COUNT(*) FROM v1_nullifier_index WHERE state_epoch = $1) \
+          + (SELECT COUNT(*) FROM v1_accounts WHERE state_epoch = $1) \
+          + (SELECT COUNT(*) FROM v1_spendable_coins WHERE state_epoch = $1) \
+          + (SELECT COUNT(*) FROM v1_spent_coins WHERE state_epoch = $1) \
+          + (SELECT COUNT(*) FROM v1_inscriptions WHERE state_epoch = $1) \
+          + (SELECT COUNT(*) FROM v1_inscription_members WHERE state_epoch = $1)",
     )
+    .bind(epoch)
     .fetch_one(&mut **tx)
     .await
     .context("count v1 rows for empty/inconsistent check")?;
     Ok(n)
 }
 
-/// Load the full engine snapshot, or `None` if every v1.1 table is empty
-/// (fresh DB — caller must initialise).
+/// Load the engine snapshot at the canonical derived-state epoch, or `None`
+/// when that epoch has no engine/catalog rows (fresh or newly archived head).
 ///
 /// ## Snapshot consistency
 ///
 /// The load runs inside a single Postgres transaction at **REPEATABLE READ**.
 /// Postgres RR is snapshot isolation: all statements see the database as of
 /// the transaction's first query. That is sufficient here because the write
-/// path replaces every v1 table in one committing transaction — a concurrent
-/// reader therefore observes either the complete pre-write state or the
-/// complete post-write state, never a mixture of old meta with new leaves
-/// (or empty tables mid-clear). Read Committed would re-snapshot per
-/// statement and could interleave those commits.
+/// path advances the canonical epoch and writes every v1 table in one
+/// committing transaction. A concurrent reader therefore observes either the
+/// complete prior head or the complete new head, never a mixture of epochs.
 ///
 /// ## Empty vs inconsistent
 ///
@@ -395,17 +394,21 @@ pub(crate) async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineS
         .execute(&mut *tx)
         .await
         .context("set v1 load isolation to REPEATABLE READ")?;
+    let epoch = crate::db::current_derived_state_epoch_in_tx(&mut tx)
+        .await
+        .context("load canonical derived-state epoch")?;
 
     let meta: Option<(String, i64, i64, Vec<u8>, i64)> = sqlx::query_as(
         "SELECT network, activation_height, tip_height, tip_hash, fold_seq \
-         FROM v1_engine_meta WHERE id = 1",
+         FROM v1_engine_meta WHERE state_epoch = $1 AND id = 1",
     )
+    .bind(epoch)
     .fetch_optional(&mut *tx)
     .await
     .context("load v1_engine_meta")?;
 
     let Some((network_s, activation_height, tip_height, tip_hash_b, fold_seq)) = meta else {
-        let n = count_any_v1_rows(&mut tx).await?;
+        let n = count_any_v1_rows(&mut tx, epoch).await?;
         if n != 0 {
             // Roll back before returning; the transaction is not needed further.
             tx.rollback()
@@ -429,8 +432,9 @@ pub(crate) async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineS
 
     let nflog_rows: Vec<NfLogRow> = sqlx::query_as(
         "SELECT position, height, tx_index, vin_index, member_index, pk, r \
-         FROM v1_nflog_entries ORDER BY position ASC",
+         FROM v1_nflog_entries WHERE state_epoch = $1 ORDER BY position ASC",
     )
+    .bind(epoch)
     .fetch_all(&mut *tx)
     .await
     .context("load v1_nflog_entries")?;
@@ -461,7 +465,8 @@ pub(crate) async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineS
 
     // Nullifier index must agree with the first-occurrence fold of the log.
     let index_rows: Vec<(Vec<u8>, i64, Vec<u8>)> =
-        sqlx::query_as("SELECT pk, position, r FROM v1_nullifier_index")
+        sqlx::query_as("SELECT pk, position, r FROM v1_nullifier_index WHERE state_epoch = $1")
+            .bind(epoch)
             .fetch_all(&mut *tx)
             .await
             .context("load v1_nullifier_index")?;
@@ -502,8 +507,9 @@ pub(crate) async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineS
     let account_rows: Vec<AccountRow> = sqlx::query_as(
         "SELECT owner, account_state, nk, op_secret, genesis_pubkey, last_proof, \
                 last_nav_opening, last_nullifier, last_nullifier_pos, coin_history_root \
-         FROM v1_accounts ORDER BY owner",
+         FROM v1_accounts WHERE state_epoch = $1 ORDER BY owner",
     )
+    .bind(epoch)
     .fetch_all(&mut *tx)
     .await
     .context("load v1_accounts")?;
@@ -543,8 +549,10 @@ pub(crate) async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineS
 
         let spendable_rows: Vec<SpendableRow> = sqlx::query_as(
             "SELECT coin_id, coin, creating_prev_ash, coin_index \
-             FROM v1_spendable_coins WHERE owner = $1 ORDER BY coin_id",
+             FROM v1_spendable_coins \
+             WHERE state_epoch = $1 AND owner = $2 ORDER BY coin_id",
         )
+        .bind(epoch)
         .bind(&owner_b)
         .fetch_all(&mut *tx)
         .await
@@ -576,12 +584,15 @@ pub(crate) async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineS
             ));
         }
 
-        let spent_rows: Vec<(Vec<u8>,)> =
-            sqlx::query_as("SELECT coin_id FROM v1_spent_coins WHERE owner = $1 ORDER BY coin_id")
-                .bind(&owner_b)
-                .fetch_all(&mut *tx)
-                .await
-                .with_context(|| format!("load spent for {}", hex::encode(owner_bytes)))?;
+        let spent_rows: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT coin_id FROM v1_spent_coins \
+             WHERE state_epoch = $1 AND owner = $2 ORDER BY coin_id",
+        )
+        .bind(epoch)
+        .bind(&owner_b)
+        .fetch_all(&mut *tx)
+        .await
+        .with_context(|| format!("load spent for {}", hex::encode(owner_bytes)))?;
         let mut spent_ids = Vec::with_capacity(spent_rows.len());
         for (coin_id_b,) in spent_rows {
             spent_ids.push(fixed_32(&coin_id_b, "spent.coin_id")?);
@@ -641,7 +652,7 @@ pub(crate) async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineS
         });
     }
 
-    let inscriptions = load_catalog(&mut tx).await?;
+    let inscriptions = load_catalog(&mut tx, epoch).await?;
 
     tx.commit().await.context("commit v1 load tx")?;
 
@@ -658,22 +669,27 @@ pub(crate) async fn load_engine_snapshot(pool: &PgPool) -> Result<Option<EngineS
 }
 
 /// Load the inscription catalog in stream order; validate member_count.
-async fn load_catalog(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<CatalogInscription>> {
+async fn load_catalog(
+    tx: &mut Transaction<'_, Postgres>,
+    epoch: i64,
+) -> Result<Vec<CatalogInscription>> {
     let heads: Vec<CatalogHeadRow> = sqlx::query_as(
         "SELECT height, tx_index, vin_index, reveal_txid, format, member_count, \
                 block_anchor_hash, block_anchor_height \
-         FROM v1_inscriptions \
+         FROM v1_inscriptions WHERE state_epoch = $1 \
          ORDER BY height ASC, tx_index ASC, vin_index ASC",
     )
+    .bind(epoch)
     .fetch_all(&mut **tx)
     .await
     .context("load v1_inscriptions")?;
 
     let member_rows: Vec<CatalogMemberRow> = sqlx::query_as(
         "SELECT height, tx_index, vin_index, member_index, pk, r \
-         FROM v1_inscription_members \
+         FROM v1_inscription_members WHERE state_epoch = $1 \
          ORDER BY height ASC, tx_index ASC, vin_index ASC, member_index ASC",
     )
+    .bind(epoch)
     .fetch_all(&mut **tx)
     .await
     .context("load v1_inscription_members")?;
@@ -761,8 +777,9 @@ async fn load_catalog(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<CatalogI
 
 /// Atomically replace the entire v1.1 engine snapshot with `snap`.
 ///
-/// Deletes previous rows and inserts the new set in one transaction so a
-/// crash cannot leave a partial NfLog or orphaned coin rows.
+/// `derived_state_epoch_meta.epoch` is the canonical head. Replacement bumps
+/// that epoch, thereby archiving all prior rows without deleting them, and
+/// writes the complete new snapshot into the new epoch in one transaction.
 ///
 /// ## Stack capability (transactional)
 ///
@@ -778,8 +795,8 @@ pub(crate) async fn persist_engine_snapshot(pool: &PgPool, snap: &EngineSnapshot
     require_stack_mode_for_update(&mut tx, ScanStackMode::V1)
         .await
         .context("v1 persist: stack_scan_mode capability check")?;
-    clear_all(&mut tx).await?;
-    write_all(&mut tx, snap).await?;
+    let epoch = clear_all(&mut tx).await?;
+    write_all(&mut tx, snap, epoch).await?;
     tx.commit().await.context("commit v1 persist tx")?;
     Ok(())
 }
@@ -817,8 +834,8 @@ pub(crate) async fn persist_engine_with_pending_members_ready(
     require_stack_mode_for_update(&mut tx, ScanStackMode::V1)
         .await
         .context("engine+members_ready persist: stack_scan_mode capability check")?;
-    clear_all(&mut tx).await?;
-    write_all(&mut tx, snap).await?;
+    let epoch = clear_all(&mut tx).await?;
+    write_all(&mut tx, snap, epoch).await?;
     insert_members_ready_row(
         &mut tx,
         owner,
@@ -945,8 +962,8 @@ pub(crate) async fn persist_engine_with_pending_members_ready_and_outbox_if_fina
         return Ok(false);
     }
 
-    clear_all(&mut tx).await?;
-    write_all(&mut tx, snap).await?;
+    let epoch = clear_all(&mut tx).await?;
+    write_all(&mut tx, snap, epoch).await?;
     insert_members_ready_row(
         &mut tx,
         account_owner,
@@ -1009,43 +1026,25 @@ async fn insert_members_ready_row(
     Ok(())
 }
 
-async fn clear_all(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
-    // Children first (FK), then parents, then meta.
-    // Catalog members CASCADE from heads; delete heads explicitly so a
-    // reorg/full rewrite never leaves half inscriptions.
-    sqlx::query("DELETE FROM v1_inscription_members")
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_inscriptions")
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_spendable_coins")
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_spent_coins")
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_accounts")
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_nullifier_index")
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_nflog_entries")
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("DELETE FROM v1_engine_meta")
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
+/// Advance the canonical head. Existing snapshot rows remain as history.
+async fn clear_all(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
+    let epoch = crate::db::bump_derived_state_epoch_in_tx(tx)
+        .await
+        .context("advance canonical derived-state epoch")?;
+    Ok(epoch)
 }
 
-async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) -> Result<()> {
+async fn write_all(
+    tx: &mut Transaction<'_, Postgres>,
+    snap: &EngineSnapshot,
+    epoch: i64,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO v1_engine_meta \
-         (id, network, activation_height, tip_height, tip_hash, fold_seq, updated_at) \
-         VALUES (1, $1, $2, $3, $4, $5, NOW())",
+         (state_epoch, id, network, activation_height, tip_height, tip_hash, fold_seq, updated_at) \
+         VALUES ($1, 1, $2, $3, $4, $5, $6, NOW())",
     )
+    .bind(epoch)
     .bind(network_label(snap.network))
     .bind(as_i64_u64(snap.activation_height, "activation_height")?)
     .bind(as_i64_u64(snap.tip_height, "tip_height")?)
@@ -1062,9 +1061,10 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
         let position = position as u64;
         sqlx::query(
             "INSERT INTO v1_nflog_entries \
-             (position, height, tx_index, vin_index, member_index, pk, r) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (state_epoch, position, height, tx_index, vin_index, member_index, pk, r) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
+        .bind(epoch)
         .bind(as_i64_u64(position, "position")?)
         .bind(as_i64_u64(chain_pos.height, "height")?)
         .bind(as_i64_u32(chain_pos.tx_index, "tx_index")?)
@@ -1080,13 +1080,17 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
     }
 
     for (pk, (position, r)) in &first_occ {
-        sqlx::query("INSERT INTO v1_nullifier_index (pk, position, r) VALUES ($1, $2, $3)")
-            .bind(pk.as_slice())
-            .bind(as_i64_u64(*position, "index.position")?)
-            .bind(r.as_slice())
-            .execute(&mut **tx)
-            .await
-            .with_context(|| format!("insert v1_nullifier_index pk={}", hex::encode(pk)))?;
+        sqlx::query(
+            "INSERT INTO v1_nullifier_index (state_epoch, pk, position, r) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(epoch)
+        .bind(pk.as_slice())
+        .bind(as_i64_u64(*position, "index.position")?)
+        .bind(r.as_slice())
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("insert v1_nullifier_index pk={}", hex::encode(pk)))?;
     }
 
     for account in &snap.accounts {
@@ -1111,10 +1115,11 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
         let op_secret_bytes = account.op_secret.map(|s| s.to_account_row_bytea());
         sqlx::query(
             "INSERT INTO v1_accounts \
-             (owner, account_state, nk, op_secret, genesis_pubkey, last_proof, last_nav_opening, \
-              last_nullifier, last_nullifier_pos, coin_history_root, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())",
+             (state_epoch, owner, account_state, nk, op_secret, genesis_pubkey, last_proof, \
+              last_nav_opening, last_nullifier, last_nullifier_pos, coin_history_root, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())",
         )
+        .bind(epoch)
         .bind(account.owner.0.as_slice())
         .bind(&state_bytes)
         .bind(account.nk.as_slice())
@@ -1133,9 +1138,10 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
             let coin_bytes = bincode::serialize(&tracked.coin).context("serialize Coin")?;
             sqlx::query(
                 "INSERT INTO v1_spendable_coins \
-                 (owner, coin_id, coin, creating_prev_ash, coin_index) \
-                 VALUES ($1, $2, $3, $4, $5)",
+                 (state_epoch, owner, coin_id, coin, creating_prev_ash, coin_index) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
             )
+            .bind(epoch)
             .bind(account.owner.0.as_slice())
             .bind(coin_id.as_slice())
             .bind(&coin_bytes)
@@ -1153,30 +1159,35 @@ async fn write_all(tx: &mut Transaction<'_, Postgres>, snap: &EngineSnapshot) ->
         }
 
         for coin_id in &account.spent_ids {
-            sqlx::query("INSERT INTO v1_spent_coins (owner, coin_id) VALUES ($1, $2)")
-                .bind(account.owner.0.as_slice())
-                .bind(coin_id.as_slice())
-                .execute(&mut **tx)
-                .await
-                .with_context(|| {
-                    format!(
-                        "insert spent owner={} coin={}",
-                        hex::encode(account.owner.0),
-                        hex::encode(coin_id)
-                    )
-                })?;
+            sqlx::query(
+                "INSERT INTO v1_spent_coins (state_epoch, owner, coin_id) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(epoch)
+            .bind(account.owner.0.as_slice())
+            .bind(coin_id.as_slice())
+            .execute(&mut **tx)
+            .await
+            .with_context(|| {
+                format!(
+                    "insert spent owner={} coin={}",
+                    hex::encode(account.owner.0),
+                    hex::encode(coin_id)
+                )
+            })?;
         }
     }
 
-    write_catalog(tx, &snap.inscriptions).await?;
+    write_catalog(tx, &snap.inscriptions, epoch).await?;
 
     Ok(())
 }
 
-/// Persist catalog heads + members. Caller must have cleared both tables.
+/// Persist catalog heads + members into the new canonical epoch.
 async fn write_catalog(
     tx: &mut Transaction<'_, Postgres>,
     inscriptions: &[CatalogInscription],
+    epoch: i64,
 ) -> Result<()> {
     for ins in inscriptions {
         let member_count = i32::try_from(ins.members.len()).with_context(|| {
@@ -1201,10 +1212,11 @@ async fn write_catalog(
         }
         sqlx::query(
             "INSERT INTO v1_inscriptions \
-             (height, tx_index, vin_index, reveal_txid, format, member_count, \
+             (state_epoch, height, tx_index, vin_index, reveal_txid, format, member_count, \
               block_anchor_hash, block_anchor_height) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
+        .bind(epoch)
         .bind(as_i64_u64(ins.height, "inscription.height")?)
         .bind(as_i64_u32(ins.tx_index, "inscription.tx_index")?)
         .bind(as_i64_u32(ins.vin_index, "inscription.vin_index")?)
@@ -1228,9 +1240,10 @@ async fn write_catalog(
         for (member_index, pk, r) in &ins.members {
             sqlx::query(
                 "INSERT INTO v1_inscription_members \
-                 (height, tx_index, vin_index, member_index, pk, r) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                 (state_epoch, height, tx_index, vin_index, member_index, pk, r) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
             )
+            .bind(epoch)
             .bind(as_i64_u64(ins.height, "member.height")?)
             .bind(as_i64_u32(ins.tx_index, "member.tx_index")?)
             .bind(as_i64_u32(ins.vin_index, "member.vin_index")?)

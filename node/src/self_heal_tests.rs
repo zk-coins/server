@@ -10,8 +10,8 @@
 //!   per-test Postgres schema (shared `postgres:17` container, issue
 //!   #181 Opt B) with SYNTHETIC digests + a stub canary outcome — the
 //!   heal logic never needs a real `Prover`, so the tests stay fast
-//!   while exercising every decision path end-to-end (rows actually
-//!   wiped / preserved / baselined, digest actually stored, both
+//!   while exercising every decision path end-to-end (rows canonically
+//!   archived / preserved / baselined, digest actually stored, both
 //!   detectors driven).
 //!
 //! This file is excluded from the coverage measurement (the gate's
@@ -151,7 +151,7 @@ fn reset_proof_store_dir_propagates_non_notfound_error() {
 // ----------------------------------------------------------------------
 
 /// Seed one account + an SMT/MMR snapshot so the Reset path has
-/// something to actually wipe.
+/// something to archive.
 async fn seed_proof_dependent_state(pool: &sqlx::PgPool) {
     // Stage 3 stack separation: exclusive claim before any write to
     // legacy scan/account tables (fail-closed, no claim-from-write).
@@ -182,10 +182,21 @@ async fn seed_proof_dependent_state(pool: &sqlx::PgPool) {
 }
 
 async fn count_accounts(pool: &sqlx::PgPool) -> i64 {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM accounts \
+         WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count canonical accounts");
+    n
+}
+
+async fn count_physical_accounts(pool: &sqlx::PgPool) -> i64 {
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
         .fetch_one(pool)
         .await
-        .expect("count accounts");
+        .expect("count physical accounts");
     n
 }
 
@@ -294,8 +305,8 @@ async fn heal_keep_leaves_everything_untouched_and_skips_canary() {
 }
 
 #[tokio::test]
-async fn heal_reset_on_digest_mismatch_wipes_state_and_skips_canary() {
-    // Detector 1: a persisted digest differs from the live one. Wipe,
+async fn heal_reset_on_digest_mismatch_archives_state_and_skips_canary() {
+    // Detector 1: a persisted digest differs from the live one. Archive,
     // and the canary must NOT run (detector 1 is authoritative).
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
@@ -316,7 +327,11 @@ async fn heal_reset_on_digest_mismatch_wipes_state_and_skips_canary() {
         .expect("heal ok");
 
     assert_eq!(decision, ResetDecision::Reset);
-    assert_eq!(count_accounts(&pool).await, 0, "stale account discarded");
+    assert_eq!(count_accounts(&pool).await, 0, "canonical account archived");
+    assert!(
+        count_physical_accounts(&pool).await >= 1,
+        "archived account must remain physically stored"
+    );
     assert_eq!(db::load_smt(&pool).await.unwrap(), None);
     assert_eq!(db::load_mmr(&pool).await.unwrap(), None);
     assert_eq!(db::load_latest_block(&pool).await.unwrap(), None);
@@ -328,11 +343,10 @@ async fn heal_reset_on_digest_mismatch_wipes_state_and_skips_canary() {
     assert!(!proofs_subdir.exists(), "proof-store dir wiped");
 }
 
-/// Under a v1.1 process claim, Reset must wipe v1 proof-dependent tables
-/// + leftover legacy `accounts`, while leaving structures v1.1 does not
-/// use (SMT/MMR/latest_block) intact.
+/// Under a v1.1 process claim, Reset archives every epoch-scoped v1 and
+/// legacy row. The new canonical head is empty while old rows remain stored.
 #[tokio::test]
-async fn heal_reset_under_v1_wipes_v1_state_preserves_unused_legacy_structures() {
+async fn heal_reset_under_v1_archives_all_epoch_scoped_state() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     let proofs = tempfile::tempdir().expect("tempdir");
@@ -342,7 +356,7 @@ async fn heal_reset_under_v1_wipes_v1_state_preserves_unused_legacy_structures()
     let proofs_dir = proofs_subdir.to_str().unwrap();
 
     // Claim v1.1 (empty DB). Seed proof-bearing accounts + orphan SMT/MMR
-    // rows via raw SQL (structures v1.1 does not use — must survive reset).
+    // rows via raw SQL; every row must survive physically after reset.
     claim_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
         .expect("claim v1");
@@ -350,20 +364,21 @@ async fn heal_reset_under_v1_wipes_v1_state_preserves_unused_legacy_structures()
 
     // Bypass stack writers: under a v1 claim `db::upsert_account` refuses
     // legacy `accounts` writes (Stage 3 stack separation). Seed the leftover
-    // legacy row with raw SQL so the wipe still has something to drop.
+    // legacy row with raw SQL so the epoch transition has something to archive.
     let owner = zkcoins_program::hash::digest_from_bytes(&[7u8; 32]);
     let asset_id = zkcoins_program::hash::digest_from_bytes(&[8u8; 32]);
     let key = crate::account_node::account_key_bytes(&owner, &asset_id);
     sqlx::query(
         "INSERT INTO accounts (address, data, updated_at) VALUES ($1, $2, NOW()) \
-         ON CONFLICT (address) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()",
+         ON CONFLICT (state_epoch, address) DO UPDATE \
+         SET data = EXCLUDED.data, updated_at = NOW()",
     )
     .bind(key.as_slice())
     .bind(b"stale-v1-account-blob".as_slice())
     .execute(&pool)
     .await
     .expect("seed leftover legacy account under v1 via raw SQL");
-    // Seed minimal v1 engine meta + one nflog row so the wipe has rows to drop.
+    // Seed minimal v1 engine meta + one nflog row for archival.
     sqlx::query(
         "INSERT INTO v1_engine_meta \
          (id, network, activation_height, tip_height, tip_hash, fold_seq, updated_at) \
@@ -391,7 +406,7 @@ async fn heal_reset_under_v1_wipes_v1_state_preserves_unused_legacy_structures()
          VALUES ($1, $2, $3, $4, $5, NULL, NULL, NULL, $6, NOW())",
     )
     .bind([0xDDu8; 32].as_slice())
-    .bind([0x01u8; 4].as_slice()) // garbage account_state blob — wipe only
+    .bind([0x01u8; 4].as_slice()) // garbage account_state blob — archival only
     .bind([0x02u8; 32].as_slice())
     .bind([0x03u8; 32].as_slice())
     .bind([0x04u8; 8].as_slice()) // last_proof present → proof-bearing
@@ -402,7 +417,7 @@ async fn heal_reset_under_v1_wipes_v1_state_preserves_unused_legacy_structures()
     // Bypass stack writers: raw insert of structures v1.1 never reads.
     sqlx::query(
         "INSERT INTO smt_state (id, data, updated_at) VALUES (1, $1, NOW()) \
-         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+         ON CONFLICT (state_epoch, id) DO UPDATE SET data = EXCLUDED.data",
     )
     .bind([0x51u8; 8].as_slice())
     .execute(&pool)
@@ -410,7 +425,7 @@ async fn heal_reset_under_v1_wipes_v1_state_preserves_unused_legacy_structures()
     .expect("seed smt_state");
     sqlx::query(
         "INSERT INTO mmr_state (id, data, updated_at) VALUES (1, $1, NOW()) \
-         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+         ON CONFLICT (state_epoch, id) DO UPDATE SET data = EXCLUDED.data",
     )
     .bind([0x52u8; 8].as_slice())
     .execute(&pool)
@@ -418,7 +433,7 @@ async fn heal_reset_under_v1_wipes_v1_state_preserves_unused_legacy_structures()
     .expect("seed mmr_state");
     sqlx::query(
         "INSERT INTO latest_block (id, block_hash, updated_at) VALUES (1, $1, NOW()) \
-         ON CONFLICT (id) DO UPDATE SET block_hash = EXCLUDED.block_hash",
+         ON CONFLICT (state_epoch, id) DO UPDATE SET block_hash = EXCLUDED.block_hash",
     )
     .bind([0x53u8; 32].as_slice())
     .execute(&pool)
@@ -442,45 +457,116 @@ async fn heal_reset_under_v1_wipes_v1_state_preserves_unused_legacy_structures()
     assert_eq!(
         count_accounts(&pool).await,
         0,
-        "v1.1 reset must clear legacy proof-bearing accounts"
+        "v1.1 reset must archive legacy proof-bearing accounts (canonical empty)"
+    );
+    assert!(
+        count_physical_accounts(&pool).await >= 1,
+        "archived legacy accounts must remain physically stored"
     );
     assert_eq!(
         db::load_circuit_digest(&pool).await.unwrap().as_deref(),
         Some(new.as_slice()),
         "digest must update to the live pin encoding"
     );
-    // v1 proof-dependent rows must be gone (changed digest triggers reset,
-    // not ignore).
-    let (v1_meta,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_engine_meta")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let (v1_nflog,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_nflog_entries")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let (v1_acc,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_accounts")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(v1_meta, 0, "v1_engine_meta wiped on digest mismatch");
-    assert_eq!(v1_nflog, 0, "v1_nflog_entries wiped on digest mismatch");
-    assert_eq!(v1_acc, 0, "v1_accounts wiped on digest mismatch");
-    // Structures v1.1 does not use must remain (not a full legacy wipe).
+    // Canonical head empty after shared-epoch archive (changed digest → reset).
+    let (v1_meta,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM v1_engine_meta \
+         WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (v1_nflog,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM v1_nflog_entries \
+         WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (v1_acc,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM v1_accounts \
+         WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        db::load_smt(&pool).await.unwrap().as_deref(),
-        Some([0x51u8; 8].as_slice()),
-        "smt_state must be preserved under v1.1 reset"
+        v1_meta, 0,
+        "v1_engine_meta archived (canonical epoch empty) on digest mismatch"
     );
     assert_eq!(
-        db::load_mmr(&pool).await.unwrap().as_deref(),
-        Some([0x52u8; 8].as_slice()),
-        "mmr_state must be preserved under v1.1 reset"
+        v1_nflog, 0,
+        "v1_nflog_entries archived (canonical epoch empty) on digest mismatch"
+    );
+    assert_eq!(
+        v1_acc, 0,
+        "v1_accounts archived (canonical epoch empty) on digest mismatch"
+    );
+    // Physical retention: prior-epoch rows stay stored.
+    let (v1_meta_phys,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_engine_meta")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (v1_nflog_phys,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_nflog_entries")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (v1_acc_phys,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_accounts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        v1_meta_phys >= 1,
+        "archived v1_engine_meta must remain physically stored"
+    );
+    assert!(
+        v1_nflog_phys >= 1,
+        "archived v1_nflog_entries must remain physically stored"
+    );
+    assert!(
+        v1_acc_phys >= 1,
+        "archived v1_accounts must remain physically stored"
+    );
+    // Shared-epoch archive: legacy smt/mmr/latest_block are canonically empty
+    // but rows remain physically stored.
+    assert_eq!(
+        db::load_smt(&pool).await.unwrap(),
+        None,
+        "smt_state canonical head empty after shared-epoch archive"
+    );
+    assert_eq!(
+        db::load_mmr(&pool).await.unwrap(),
+        None,
+        "mmr_state canonical head empty after shared-epoch archive"
     );
     assert_eq!(
         db::load_latest_block(&pool).await.unwrap(),
-        Some([0x53u8; 32]),
-        "latest_block must be preserved under v1.1 reset"
+        None,
+        "latest_block canonical head empty after shared-epoch archive"
+    );
+    let (smt_phys,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM smt_state")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (mmr_phys,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mmr_state")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (latest_block_phys,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM latest_block")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        smt_phys >= 1,
+        "archived smt_state must remain physically stored"
+    );
+    assert!(
+        mmr_phys >= 1,
+        "archived mmr_state must remain physically stored"
+    );
+    assert!(
+        latest_block_phys >= 1,
+        "archived latest_block must remain physically stored"
     );
     assert!(!proofs_subdir.exists(), "proof-store dir wiped");
 }
@@ -517,12 +603,12 @@ async fn heal_v1_changed_digest_triggers_reset_not_ignore() {
 }
 
 /// A v1.1 reset must leave no job that can later report `completed` for a
-/// transition whose engine state the reset removed. Plants a `broadcasting`
+/// transition whose engine state the reset archived. Plants a `broadcasting`
 /// job with durable finalisation + cached `completion_result` (the resume
 /// fast path that skips prove/apply), runs a digest-mismatch heal, and
 /// asserts the row is `failed` with the finalisation envelope stripped.
 ///
-/// Would go red if reset only wiped v1 tables and left jobs rows intact.
+/// Would go red if reset only archived v1 state and left jobs rows intact.
 #[tokio::test]
 async fn heal_v1_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
     let scope = setup_pool().await;
@@ -601,7 +687,7 @@ async fn heal_v1_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
     assert_eq!(
         row.error.as_deref(),
         Some(db::SELF_HEAL_RESET_JOB_ERROR),
-        "operator must see the self-heal wipe reason"
+        "operator must see the self-heal archive reason"
     );
     assert!(
         row.request_body.get("finalisation").is_none(),
@@ -626,14 +712,14 @@ async fn heal_v1_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
         .expect("complete_if_status");
     assert!(
         !completed,
-        "a failed job must not accept completion after the reset wiped its transition"
+        "a failed job must not accept completion after the reset archived its transition"
     );
     let again = store.load(job_id).await.unwrap().unwrap();
     assert_eq!(again.status, crate::job_store::JobStatus::Failed);
     assert_ne!(
         again.status,
         crate::job_store::JobStatus::Completed,
-        "job must not report completed for wiped work"
+        "job must not report completed for archived work"
     );
 }
 
@@ -642,7 +728,7 @@ async fn heal_v1_reset_fails_jobs_so_they_cannot_complete_for_wiped_work() {
 /// Interleaving: A loads a queued job → B commits the reset (bumps generation,
 /// fails non-terminal) → A calls unconditional `set_status` / `complete`
 /// matching `public_id` only. Without the generation fence those writes
-/// resurrect the row as proving/completed against wiped tables.
+/// resurrect the row as proving/completed against archived state.
 ///
 /// Would go red if `set_status` / `complete` matched `public_id` only.
 #[tokio::test]
@@ -765,7 +851,7 @@ async fn heal_v1_reset_fences_pre_loaded_job_resurrection() {
 }
 
 /// Defect 2: a job stamped with a stale generation after the reset cannot
-/// complete against wiped state (simulates an admit that raced past the
+/// complete against archived state (simulates an admit that raced past the
 /// fail-UPDATE with a pre-bump generation read).
 ///
 /// Would go red if job-advancing writes ignored `reset_generation`.
@@ -928,7 +1014,7 @@ async fn heal_legacy_reset_fences_pre_loaded_job_resurrection() {
     assert_eq!(
         row.error.as_deref(),
         Some(db::SELF_HEAL_RESET_JOB_ERROR),
-        "operator must see the self-heal wipe reason on the legacy path too"
+        "operator must see the self-heal archive reason on the legacy path too"
     );
 
     let resurrected = store
@@ -1274,8 +1360,9 @@ async fn heal_set_status_reports_zero_rows_on_generation_fence() {
     );
 }
 
-/// Flag-off path: process not claimed v1 → full legacy wipe on mismatch.
-/// Would go red if the v1-only wipe were applied under flag-off.
+/// Flag-off path: process not claimed v1 → full legacy archive (epoch bump)
+/// on mismatch. Would go red if the v1-only archive path were applied under
+/// flag-off.
 #[tokio::test]
 async fn heal_flag_off_self_heal_still_full_legacy_wipe() {
     let scope = setup_pool().await;
@@ -1299,16 +1386,44 @@ async fn heal_flag_off_self_heal_still_full_legacy_wipe() {
         .unwrap();
     assert_eq!(decision, ResetDecision::Reset);
     assert_eq!(count_accounts(&pool).await, 0);
+    assert!(
+        count_physical_accounts(&pool).await >= 1,
+        "archived accounts must remain physically stored"
+    );
     assert_eq!(db::load_smt(&pool).await.unwrap(), None);
     assert_eq!(db::load_mmr(&pool).await.unwrap(), None);
     assert_eq!(db::load_latest_block(&pool).await.unwrap(), None);
+    let (smt_phys,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM smt_state")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (mmr_phys,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mmr_state")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (latest_block_phys,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM latest_block")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        smt_phys >= 1,
+        "archived smt_state must remain physically stored"
+    );
+    assert!(
+        mmr_phys >= 1,
+        "archived mmr_state must remain physically stored"
+    );
+    assert!(
+        latest_block_phys >= 1,
+        "archived latest_block must remain physically stored"
+    );
     assert_eq!(
         db::load_circuit_digest(&pool).await.unwrap().as_deref(),
         Some(&b"NEW-LEGACY"[..])
     );
 }
 
-/// Adoption-boundary canary Stale under v1 must wipe v1 state.
+/// Adoption-boundary canary Stale under v1 must archive v1 state.
 #[tokio::test]
 async fn heal_v1_stale_canary_resets_v1_state() {
     let scope = setup_pool().await;
@@ -1337,11 +1452,25 @@ async fn heal_v1_stale_canary_resets_v1_state() {
         .await
         .unwrap();
     assert_eq!(decision, ResetDecision::Reset);
-    let (v1_meta,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_engine_meta")
+    let (v1_meta,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM v1_engine_meta \
+         WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        v1_meta, 0,
+        "stale canary must archive v1_engine_meta (canonical epoch empty)"
+    );
+    let (v1_meta_phys,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM v1_engine_meta")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(v1_meta, 0, "stale canary must wipe v1_engine_meta");
+    assert!(
+        v1_meta_phys >= 1,
+        "archived v1_engine_meta must remain physically stored"
+    );
     assert_eq!(
         db::load_circuit_digest(&pool).await.unwrap().as_deref(),
         Some(live.as_slice())
@@ -1368,7 +1497,11 @@ async fn heal_reset_on_adoption_boundary_stale_canary() {
         .expect("heal ok");
 
     assert_eq!(decision, ResetDecision::Reset);
-    assert_eq!(count_accounts(&pool).await, 0, "stale account wiped");
+    assert_eq!(count_accounts(&pool).await, 0, "stale account archived");
+    assert!(
+        count_physical_accounts(&pool).await >= 1,
+        "archived account must remain physically stored"
+    );
     assert_eq!(db::load_smt(&pool).await.unwrap(), None);
     assert_eq!(
         db::load_circuit_digest(&pool).await.unwrap().as_deref(),
@@ -1468,11 +1601,13 @@ async fn heal_propagates_error_from_store_digest_on_baseline() {
 
 #[tokio::test]
 async fn heal_propagates_error_from_reset_tx() {
-    // Detector 1 trips a reset (persisted digest differs). Drop the
-    // `accounts` table so the reset transaction's DELETE errors and the
-    // `?` on `db::reset_proof_dependent_state_tx` propagates. Claim the
-    // legacy stack first so the failure is the DROP (not the capability
-    // gate — that path has its own test).
+    // Detector 1 trips a reset (persisted digest differs). Under Data
+    // Permanence the reset no longer DELETEs derived state — it bumps the
+    // `derived_state_epoch_meta` epoch first (archive-and-recompute). Drop
+    // that table so the reset transaction's first write errors and the `?`
+    // on `db::reset_proof_dependent_state_tx` propagates. Claim the legacy
+    // stack first so the failure is the DROP (not the capability gate —
+    // that path has its own test).
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     claim_stack_scan_mode(&pool, ScanStackMode::Legacy)
@@ -1481,10 +1616,10 @@ async fn heal_propagates_error_from_reset_tx() {
     db::store_circuit_digest(&pool, b"OLD")
         .await
         .expect("store old digest");
-    sqlx::query("DROP TABLE accounts CASCADE")
+    sqlx::query("DROP TABLE derived_state_epoch_meta CASCADE")
         .execute(&pool)
         .await
-        .expect("drop accounts");
+        .expect("drop derived_state_epoch_meta");
 
     let err = heal_circuit_digest(&pool, b"NEW", "/tmp/whatever", &canary_must_not_run)
         .await

@@ -57,21 +57,33 @@ pub(crate) const STACK_CAPABILITY_REFUSAL: &str = "stack separation: refusing wr
 /// when no `mmr_root_index` entry is present, so emptiness must not be
 /// decided on the root-index alone.
 const LEGACY_SCAN_STATE_COUNT_SQL: &str = "SELECT \
-    (SELECT COUNT(*) FROM mmr_root_index) \
-  + (SELECT COUNT(*) FROM smt_state) \
-  + (SELECT COUNT(*) FROM mmr_state) \
-  + (SELECT COUNT(*) FROM latest_block)";
+    (SELECT COUNT(*) FROM mmr_root_index \
+     WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)) \
+  + (SELECT COUNT(*) FROM smt_state \
+     WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)) \
+  + (SELECT COUNT(*) FROM mmr_state \
+     WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)) \
+  + (SELECT COUNT(*) FROM latest_block \
+     WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1))";
 
 /// SQL: any durable v1.1 scan-stack row across the engine + catalog tables.
 const V1_SCAN_STATE_COUNT_SQL: &str = "SELECT \
-    (SELECT COUNT(*) FROM v1_engine_meta) \
-  + (SELECT COUNT(*) FROM v1_nflog_entries) \
-  + (SELECT COUNT(*) FROM v1_nullifier_index) \
-  + (SELECT COUNT(*) FROM v1_accounts) \
-  + (SELECT COUNT(*) FROM v1_spendable_coins) \
-  + (SELECT COUNT(*) FROM v1_spent_coins) \
-  + (SELECT COUNT(*) FROM v1_inscriptions) \
-  + (SELECT COUNT(*) FROM v1_inscription_members)";
+    (SELECT COUNT(*) FROM v1_engine_meta \
+     WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)) \
+  + (SELECT COUNT(*) FROM v1_nflog_entries \
+     WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)) \
+  + (SELECT COUNT(*) FROM v1_nullifier_index \
+     WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)) \
+  + (SELECT COUNT(*) FROM v1_accounts \
+     WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)) \
+  + (SELECT COUNT(*) FROM v1_spendable_coins \
+     WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)) \
+  + (SELECT COUNT(*) FROM v1_spent_coins \
+     WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)) \
+  + (SELECT COUNT(*) FROM v1_inscriptions \
+     WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1)) \
+  + (SELECT COUNT(*) FROM v1_inscription_members \
+     WHERE state_epoch = (SELECT epoch FROM derived_state_epoch_meta WHERE id = 1))";
 
 /// Load the claimed mode, if any.
 #[cfg(test)]
