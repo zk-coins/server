@@ -81,7 +81,7 @@ mod adapter;
 // (module is private).
 pub(crate) mod attest;
 /// Blossom blob-store client (§7.4): content-addressed fetch/upload against
-/// an untrusted peer. Crate-private; DELETE returns with §4.6 retention.
+/// an untrusted peer. Append-only (no DELETE; data permanence).
 pub(crate) mod blossom;
 /// Durable `v1_decrypt_index` (migration 0031) — SQL half of the private-record catalog.
 pub(crate) mod db_decrypt_index;

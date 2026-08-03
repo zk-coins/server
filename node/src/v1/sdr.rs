@@ -361,15 +361,9 @@ async fn try_finalize_one_from_snapshot(
 
     let subject = parse_hex32_field(&phase_a.subject_hex, "subject")?;
     let transition_pk = parse_hex32_field(&phase_a.transition_pk_hex, "transition_pk")?;
-    insert_sdr_outbox_pending(
-        pool,
-        subject,
-        transition_pk,
-        &material,
-        phase_a.replication_k,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("insert_sdr_outbox_pending: {e}"))?;
+    insert_sdr_outbox_pending(pool, subject, transition_pk, &material)
+        .await
+        .map_err(|e| anyhow::anyhow!("insert_sdr_outbox_pending: {e}"))?;
 
     db_sdr::mark_finalised(pool, &transition_pk)
         .await
@@ -517,7 +511,7 @@ pub(crate) async fn publish_sdr_outbox_row(
     rng: &std::sync::Mutex<Box<dyn SecureRandom + Send>>,
 ) -> Result<(), DeliveryError> {
     use super::blossom::{BlossomClient, RetentionClass, UploadBinding};
-    use super::db_outbox::{self, OutboxStatus, PublishArtefacts, StoredReceipt};
+    use super::db_outbox::{self, PublishArtefacts};
     use super::nostr::kinds::delivery::{
         delivery_rumor, DeliveryPayload, RecordKind as NostrRecordKind,
     };
@@ -533,11 +527,6 @@ pub(crate) async fn publish_sdr_outbox_row(
     if row.status.is_terminal() {
         return Err(DeliveryError::Relay(
             "refuse publish of terminal SDR outbox row".into(),
-        ));
-    }
-    if row.status == OutboxStatus::AwaitingReceipts {
-        return Err(DeliveryError::Relay(
-            "refuse SDR republish after ACK (awaiting_receipts)".into(),
         ));
     }
 
@@ -632,9 +621,8 @@ pub(crate) async fn publish_sdr_outbox_row(
         attempt_nonce: ack_nonce,
         retention: RetentionClass::Indefinite,
     };
-    let mut receipts = Vec::new();
     for holder in &mat.blob_holders {
-        let upload = client
+        let _upload = client
             .upload(
                 holder,
                 &zbe,
@@ -648,9 +636,6 @@ pub(crate) async fn publish_sdr_outbox_row(
                 holder: holder.clone(),
                 error: e,
             })?;
-        if let Some(r) = upload.receipt {
-            receipts.push(r);
-        }
     }
 
     let pool_relays = RelayPool::new(mat.recipient_relays.clone())
@@ -706,21 +691,6 @@ pub(crate) async fn publish_sdr_outbox_row(
     db_outbox::mark_published(pool, &row.outbox_id, &artefacts)
         .await
         .map_err(|e| DeliveryError::Relay(format!("SDR outbox mark_published: {e:#}")))?;
-
-    for r in &receipts {
-        db_outbox::store_receipt(
-            pool,
-            &row.outbox_id,
-            &StoredReceipt {
-                holder_op_pubkey: r.holder_op_pubkey,
-                receipt_json: r.receipt_json.clone(),
-                retention_class: r.retention_class.clone(),
-                stored_at: r.stored_at,
-            },
-        )
-        .await
-        .map_err(|e| DeliveryError::Relay(format!("SDR outbox store_receipt: {e:#}")))?;
-    }
 
     Ok(())
 }
@@ -799,7 +769,6 @@ mod tests {
             recipient_ivpk_hex: hex::encode([0x77u8; 32]),
             recipient_op_pk_hex: hex::encode([0x88u8; 32]),
             recipient_relays: vec!["wss://relay.example".into()],
-            replication_k: 3,
         }
     }
 

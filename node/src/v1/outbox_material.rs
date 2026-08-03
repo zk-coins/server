@@ -83,7 +83,6 @@ pub(crate) struct SdrPhaseAMaterial {
     pub recipient_ivpk_hex: String,
     pub recipient_op_pk_hex: String,
     pub recipient_relays: Vec<String>,
-    pub replication_k: i32,
 }
 
 /// SDR Phase-B material: already-finalised ZBE ciphertext + delivery targets.
@@ -285,12 +284,6 @@ impl SdrPhaseAMaterial {
         }
         if self.blob_holders.is_empty() {
             bail!("SdrPhaseAMaterial: empty blob_holders");
-        }
-        if self.replication_k < 2 {
-            bail!(
-                "SdrPhaseAMaterial: replication_k={} < 2 (§4.6 MUST NOT)",
-                self.replication_k
-            );
         }
         for (i, o) in self.output_refs.iter().enumerate() {
             if o.coin_id_hex.is_empty()
@@ -497,7 +490,6 @@ mod tests {
             recipient_ivpk_hex: hex::encode([0xBBu8; 32]),
             recipient_op_pk_hex: hex::encode([0xCCu8; 32]),
             recipient_relays: vec!["wss://relay.example".into()],
-            replication_k: 3,
         }
     }
 

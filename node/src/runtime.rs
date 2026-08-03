@@ -213,7 +213,6 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             (*pool).clone(),
             Arc::clone(&shared_delivery_retention),
             Box::new(crate::v1::OsSecureRandom),
-            crate::v1::db_outbox::DEFAULT_REPLICATION_K,
         ));
     // Shared CSPRNG for finalise-time Phase-A change-coin builds and the
     // outbox drive path (process-local; never invent keys).
@@ -277,7 +276,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                     }
                 }
 
-                // 2) ACK inbox → durable outbox awaiting_receipts.
+                // 2) ACK inbox → durable outbox completed (row retained).
                 let relay_pool =
                     match crate::v1::nostr::relay::RelayPool::new(vec![relay_url.clone()]) {
                         Ok(p) => p,
@@ -714,8 +713,6 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                         auth_expiration: now
                             .saturating_add(crate::v1::blossom::AUTH_REPLAY_WINDOW_SECS),
                         expected_network,
-                        // §4.6 default k=3 (MUST NOT be < 2).
-                        replication_k: crate::v1::db_outbox::DEFAULT_REPLICATION_K,
                         self_relays,
                         rng: delivery_rng.as_ref(),
                     });

@@ -23,7 +23,6 @@ pub(crate) enum KernelErrorCode {
     WrongPhase,
     StaleMessage,
     InvalidSignature,
-    RetentionHold,
     DependencyNotFinal,
     IdempotencyConflict,
     Unauthorized,
@@ -39,7 +38,7 @@ pub(crate) enum KernelErrorCode {
 impl KernelErrorCode {
     /// Every code in §7.8 order. The closed set is the contract, so this
     /// inventory is what makes it checkable — not a convenience list.
-    pub(crate) const ALL: [KernelErrorCode; 21] = [
+    pub(crate) const ALL: [KernelErrorCode; 20] = [
         Self::MalformedRequest,
         Self::BoundsExceeded,
         Self::InvalidInputCoin,
@@ -50,7 +49,6 @@ impl KernelErrorCode {
         Self::WrongPhase,
         Self::StaleMessage,
         Self::InvalidSignature,
-        Self::RetentionHold,
         Self::DependencyNotFinal,
         Self::IdempotencyConflict,
         Self::Unauthorized,
@@ -76,7 +74,6 @@ impl KernelErrorCode {
             Self::WrongPhase => "wrong_phase",
             Self::StaleMessage => "stale_message",
             Self::InvalidSignature => "invalid_signature",
-            Self::RetentionHold => "retention_hold",
             Self::DependencyNotFinal => "dependency_not_final",
             Self::IdempotencyConflict => "idempotency_conflict",
             Self::Unauthorized => "unauthorized",

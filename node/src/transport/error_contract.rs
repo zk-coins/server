@@ -124,11 +124,6 @@ pub(crate) fn describe(code: KernelErrorCode) -> ErrorDescriptor {
             http_status: 409,
             grpc_code: GrpcStatusCode::FailedPrecondition,
         },
-        KernelErrorCode::RetentionHold => ErrorDescriptor {
-            reason: "retention_hold",
-            http_status: 409,
-            grpc_code: GrpcStatusCode::FailedPrecondition,
-        },
         KernelErrorCode::DependencyNotFinal => ErrorDescriptor {
             reason: "dependency_not_final",
             http_status: 409,
@@ -266,7 +261,7 @@ fn validate_grpc_status_names() -> Result<(), String> {
 /// `KernelErrorCode::reason()` would give every failure of an affected code
 /// the wrong wire contract on **both** transports.
 pub(crate) fn validate_table() -> Result<(), String> {
-    let rows: [TableRow; 21] = KernelErrorCode::ALL.map(|code| {
+    let rows: [TableRow; 20] = KernelErrorCode::ALL.map(|code| {
         let d = describe(code);
         TableRow {
             label: code_label(code),
@@ -291,7 +286,6 @@ fn code_label(code: KernelErrorCode) -> &'static str {
         KernelErrorCode::WrongPhase => "WrongPhase",
         KernelErrorCode::StaleMessage => "StaleMessage",
         KernelErrorCode::InvalidSignature => "InvalidSignature",
-        KernelErrorCode::RetentionHold => "RetentionHold",
         KernelErrorCode::DependencyNotFinal => "DependencyNotFinal",
         KernelErrorCode::IdempotencyConflict => "IdempotencyConflict",
         KernelErrorCode::Unauthorized => "Unauthorized",

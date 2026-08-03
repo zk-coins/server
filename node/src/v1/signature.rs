@@ -960,8 +960,6 @@ pub(crate) struct FinaliseDeliveryDeps<'a> {
     pub auth_expiration: u64,
     /// Closed network label for post-send profile refresh (`mainnet`/…).
     pub expected_network: &'a str,
-    /// Replication factor k (§4.6; MUST be ≥ 2). Frozen into outbox rows.
-    pub replication_k: i32,
     /// Self-delivery recipient relays (bootstrap seed relays; non-empty).
     pub self_relays: Vec<String>,
     /// Process-local RNG for change-coin / Phase-A builds.
@@ -1497,7 +1495,6 @@ async fn stage_sdr_phase_a_after_mesh(
         recipient_ivpk_hex: hex::encode(self_ivpk),
         recipient_op_pk_hex: hex::encode(self_op_pk),
         recipient_relays: deps.self_relays.clone(),
-        replication_k: deps.replication_k,
     };
 
     stage_phase_a(adapter.pool(), &material).await?;
@@ -1589,7 +1586,6 @@ fn build_external_outbox_inserts(
         &coins,
         &deps.blob_holders,
         deps.max_blob_bytes,
-        deps.replication_k,
     )
 }
 
@@ -2108,7 +2104,6 @@ const CLOSED_OUTWARD_ERROR_CODES: &[&str] = &[
     "session_expired",
     "not_found",
     "payload_too_large",
-    "retention_hold",
     "rate_limited",
     "dependency_not_final",
     "internal_error",

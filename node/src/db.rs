@@ -809,7 +809,7 @@ this job cannot complete for a transition that no longer exists";
 ///
 /// Tables wiped (derived from migration 0019 / 0021 + legacy leftovers):
 ///
-/// * `v1_delivery_receipts` / `v1_delivery_outbox` — outstanding mesh deliveries
+/// * `v1_delivery_outbox` — durable mesh delivery log (proof-bound ZBE / K_tx)
 /// * `v1_sdr_phase_a` — §4.2 SDR Phase-A staging (pre-first-occurrence)
 /// * `v1_pending_publishes` — stale nullifier publish recovery rows
 /// * `v1_spendable_coins` / `v1_spent_coins` — CoinHist leaves
@@ -838,9 +838,7 @@ pub(crate) async fn reset_v1_proof_dependent_state_tx(
     // v1_pending_publishes has no FK to accounts but is proof-dependent.
     // Delivery outbox holds proof-bound materials (ZBE / K_tx) — wipe with
     // the rest of the proof-dependent surface on self-heal reset.
-    sqlx::query("DELETE FROM v1_delivery_receipts")
-        .execute(&mut *tx)
-        .await?;
+    // (Self-heal is a full proof-dependent reset, not a delivery drop path.)
     sqlx::query("DELETE FROM v1_delivery_outbox")
         .execute(&mut *tx)
         .await?;

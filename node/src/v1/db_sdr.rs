@@ -214,7 +214,6 @@ mod tests {
             recipient_ivpk_hex: hex::encode([0x77u8; 32]),
             recipient_op_pk_hex: hex::encode([0x88u8; 32]),
             recipient_relays: vec!["wss://r.example".into()],
-            replication_k: 3,
         }
     }
 

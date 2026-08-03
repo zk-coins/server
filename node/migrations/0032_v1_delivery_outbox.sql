@@ -1,4 +1,4 @@
--- §4.2 / §4.6 durable delivery outbox.
+-- §4.2 durable delivery outbox (data permanence).
 --
 -- Every outstanding mesh delivery (external CoinProof and SelfDeliveryRecordV1)
 -- lands here **before** the first network send attempt. Crash between
@@ -6,17 +6,18 @@
 -- non-terminal row.
 --
 -- State machine (CHECK-closed):
---   pending            — inserted atomically with the step that owes it;
---                        artefacts (blob_id / zbe / ack_nonce) may be absent
---   awaiting_ack       — published at least once; exponential republish until
---                        a valid recipient ACK (§4.2)
---   awaiting_receipts  — valid ACK in hand; collecting k independent
---                        ReplicaReceiptV1 (distinct trust-list operator IDs)
---   completed          — ACK + k receipts; MUST NEVER be republished
---   failed             — named permanent failure (operator-visible reason)
+--   pending       — inserted atomically with the step that owes it;
+--                   artefacts (blob_id / zbe / ack_nonce) may be absent
+--   awaiting_ack  — published at least once; exponential republish until
+--                   a valid recipient ACK (§4.2)
+--   completed     — valid ACK in hand; MUST NEVER be republished.
+--                   Row is retained indefinitely as a delivery log
+--                   (data permanence — no drop of outbox row or blob/SDR).
+--   failed        — named permanent failure (operator-visible reason)
 --
--- Drop rule (§4.2 / §4.6): retain until BOTH a valid ACK and a valid receipt
--- set of size ≥ replication_k. ACK alone never deletes the row.
+-- Data permanence: the sender keeps blob/SDR copies indefinitely. Completing
+-- an outbox row never deletes stored material. There is no receipt quorum,
+-- no k-target, and no drop-after-replication path.
 --
 -- Backoff parameters (normative RECOMMENDED values from §4.2, frozen in code):
 --   initial 30 s, doubling, cap 1 h. Stored as next_attempt_at + attempt_n.
@@ -34,7 +35,6 @@ CREATE TABLE IF NOT EXISTS v1_delivery_outbox (
     status TEXT NOT NULL CHECK (status IN (
         'pending',
         'awaiting_ack',
-        'awaiting_receipts',
         'completed',
         'failed'
     )),
@@ -57,8 +57,6 @@ CREATE TABLE IF NOT EXISTS v1_delivery_outbox (
     -- When the runtime may next publish / republish this row.
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     ack_received_at TIMESTAMPTZ,
-    -- Replication target k frozen at insert (§4.6 default 3; MUST NOT be < 2).
-    replication_k INTEGER NOT NULL CHECK (replication_k >= 2),
     fail_reason TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -77,17 +75,3 @@ CREATE INDEX IF NOT EXISTS v1_delivery_outbox_transition_idx
 CREATE INDEX IF NOT EXISTS v1_delivery_outbox_open_idx
     ON v1_delivery_outbox (status)
     WHERE status NOT IN ('completed', 'failed');
-
--- Distinct trust-list operator receipts counted toward k (§4.6).
-CREATE TABLE IF NOT EXISTS v1_delivery_receipts (
-    outbox_id BYTEA NOT NULL
-        REFERENCES v1_delivery_outbox (outbox_id) ON DELETE CASCADE,
-    -- holder_op_pubkey of ReplicaReceiptV1 — one receipt per operator ID.
-    holder_op_pubkey BYTEA NOT NULL CHECK (octet_length(holder_op_pubkey) = 32),
-    -- Canonical ReplicaReceiptV1 JSON body (closed schema, as received).
-    receipt_json BYTEA NOT NULL CHECK (octet_length(receipt_json) > 0),
-    retention_class TEXT NOT NULL CHECK (retention_class IN ('indefinite', 'policy')),
-    stored_at BIGINT NOT NULL CHECK (stored_at >= 0),
-    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (outbox_id, holder_op_pubkey)
-);
