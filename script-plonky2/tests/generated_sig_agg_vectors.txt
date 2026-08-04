@@ -1,7 +1,7 @@
 # generated_sig_agg_vectors.txt — V.5 signature + V.6 s_agg
 # Computed by script-plonky2 generate_sig_agg_vectors; never hand-edit.
 #
-# V.5 inputs (pinned by the spec / earlier generators):
+# V.5 inputs (reference-implementation output; proposed for V.5 in PR #124 draft):
 #   sk/Pk = V.2-ext sk₀/Pk₀ (BIP-340-normalised d used for signing)
 #   H(ProofData@0) = V.4 pin from generated_poseidon_vectors.txt
 #   nonce rule = V.8 fixture rule (deterministic; not production-normative)
