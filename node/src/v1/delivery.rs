@@ -1320,7 +1320,12 @@ pub(crate) async fn insert_sdr_outbox_pending(
     let material_bytes = material
         .encode()
         .map_err(|e| DeliveryError::Relay(format!("SDR material encode: {e:#}")))?;
-    // SDR has no coin_id — zero sentinel, one SDR per (subject, transition).
+    // SDR has no coin_id — zero sentinel. Per-transition dedup comes from
+    // outbox_id (SHA-256(kind ‖ subject ‖ coin_id ‖ transition_pk), the
+    // PRIMARY KEY, via ON CONFLICT DO NOTHING) and the
+    // (subject, coin_id, kind, transition_pk) UNIQUE constraint (migration
+    // 0035) — NOT from (subject, coin_id, kind) alone, which allowed only
+    // one self_delivery row ever per subject (fixed in 0035).
     let coin_id = [0u8; 32];
     let id = db_outbox::outbox_id(OutboxKind::SelfDelivery, &subject, &coin_id, &transition_pk);
     db_outbox::insert_pending(

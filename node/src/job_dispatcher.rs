@@ -2222,19 +2222,22 @@ fn resolve_send_auth_keys(
 // Receive (§2.3.3 / D11) — reconstitute slots → begin → awaiting_signature
 // ---------------------------------------------------------------------------
 
-/// Parsed receive job body: subject, next_pubkey, npk_rand, fold_coin_ids.
+/// Parsed receive job body: subject, next_pubkey, npk_rand, fold_coin_ids,
+/// optional genesis_pubkey.
 type ParsedReceiveJobBody = (
     crate::kernel::types::SubjectAddress,
     [u8; 32],
     [u8; 32],
     Vec<[u8; 32]>,
+    Option<[u8; 32]>,
 );
 
 /// Auth material for receive begin: nk, op_secret, current_pubkey.
 type ReceiveAuthKeys = ([u8; 32], zkcoins_prover::state_engine::OpSecret, [u8; 32]);
 
 /// Parse the normative receive job body (`subject`, `next_pubkey`,
-/// `npk_rand`, `fold_coin_ids`) that [`crate::kernel::jobs::submit`] encodes.
+/// `npk_rand`, `fold_coin_ids`, optional `genesis_pubkey`) that
+/// [`crate::kernel::jobs::submit`] encodes.
 fn parse_receive_job_body(body: &serde_json::Value) -> Result<ParsedReceiveJobBody, String> {
     let obj = body
         .as_object()
@@ -2266,11 +2269,21 @@ fn parse_receive_job_body(body: &serde_json::Value) -> Result<ParsedReceiveJobBo
             .ok_or_else(|| format!("fold_coin_ids[{i}] is not a hex string"))?;
         fold_coin_ids.push(parse_hex32_field(h, &format!("fold_coin_ids[{i}]"))?);
     }
+    let genesis_pubkey = match obj.get("genesis_pubkey") {
+        Some(v) => {
+            let h = v
+                .as_str()
+                .ok_or_else(|| "genesis_pubkey is not a hex string".to_string())?;
+            Some(parse_hex32_field(h, "genesis_pubkey")?)
+        }
+        None => None,
+    };
     Ok((
         crate::kernel::types::SubjectAddress(subject),
         next_pubkey,
         npk_rand,
         fold_coin_ids,
+        genesis_pubkey,
     ))
 }
 
@@ -2290,12 +2303,19 @@ fn parse_hex32_field(hex_str: &str, field: &str) -> Result<[u8; 32], String> {
 
 /// Resolve `nk` / `op_secret` / `current_pubkey` for a receive begin.
 ///
-/// - Registered engine account → live account fields (bundle must match).
-/// - Fresh account (InitialProof) → operational bundle + address-bound
-///   genesis key from the private-index account view when present.
+/// - Registered engine account → live rotated `current_pubkey`;
+///   `genesis_pubkey` MUST be absent (§7.5 presence rule) — refused if present.
+/// - Fresh account (InitialProof, no engine record yet) → the client-supplied
+///   `genesis_pubkey` (required). The engine's own `begin_receive` (in
+///   `script-plonky2/src/state_engine.rs`) independently re-checks
+///   `owner == H(current_pubkey ‖ nk_commit)` and fails closed on mismatch —
+///   this function does not duplicate that cryptographic check, it only
+///   resolves which value to hand the engine. Matches how
+///   `resolve_mint_auth_keys` uses `creator_pubkey`.
 fn resolve_receive_auth_keys(
     app_state: &AppState,
     subject: &crate::kernel::types::SubjectAddress,
+    genesis_pubkey: Option<[u8; 32]>,
 ) -> Result<ReceiveAuthKeys, String> {
     let bundle = app_state.bundles.get_active(subject).ok_or_else(|| {
         format!(
@@ -2326,29 +2346,23 @@ fn resolve_receive_auth_keys(
                     );
                 }
             }
+            if genesis_pubkey.is_some() {
+                return Err(
+                    "receive: genesis_pubkey must be absent for a registered (non-genesis) account (§7.5)"
+                        .into(),
+                );
+            }
             return Ok((rec.nk, op_secret, rec.state.current_pubkey));
         }
-        // InitialProof: need Pk₀ such that owner = H(Pk₀ ‖ nk_commit).
-        use crate::kernel::access::PrivateIndex;
-        let view = app_state
-            .private_index
-            .get_account_state(subject)
-            .map_err(|e| {
-                format!(
-                    "receive: InitialProof requires indexed AccountState.current_pubkey \
-                     (genesis Pk₀); private-index load failed: {e}"
-                )
-            })?;
-        let expected = shared::spec_v1::Address(shared::spec_v1::address(
-            &view.current_pubkey,
-            shared::spec_v1::nk_commit(&bundle.nk),
-        ));
-        if expected != owner {
-            return Err("receive: indexed current_pubkey does not open subject as \
-                 H(Pk₀ ‖ nk_commit); refusing InitialProof"
-                .to_string());
+        // GENESIS: engine verifies owner == H(genesis_pubkey ‖ nk_commit)
+        // inside begin_receive (state_engine.rs); a wrong value fails closed there.
+        match genesis_pubkey {
+            Some(pk) => Ok((bundle.nk, op_secret, pk)),
+            None => Err(
+                "receive: genesis_pubkey required for InitialProof (account's first transition) (§7.5)"
+                    .into(),
+            ),
         }
-        Ok((bundle.nk, op_secret, view.current_pubkey))
     })
 }
 
@@ -2421,7 +2435,7 @@ async fn process_receive_initial(
         Ok(())
     }
 
-    let (subject, next_pubkey, npk_rand, fold_coin_ids) =
+    let (subject, next_pubkey, npk_rand, fold_coin_ids, genesis_pubkey) =
         match parse_receive_job_body(&job.request_body) {
             Ok(v) => v,
             Err(e) => {
@@ -2452,20 +2466,21 @@ async fn process_receive_initial(
         }
     };
 
-    let (nk, op_secret, current_pubkey) = match resolve_receive_auth_keys(app_state, &subject) {
-        Ok(v) => v,
-        Err(e) => {
-            return fail_receive(
-                job_store,
-                app_state,
-                notify_map,
-                public_id,
-                "internal_error",
-                e,
-            )
-            .await;
-        }
-    };
+    let (nk, op_secret, current_pubkey) =
+        match resolve_receive_auth_keys(app_state, &subject, genesis_pubkey) {
+            Ok(v) => v,
+            Err(e) => {
+                return fail_receive(
+                    job_store,
+                    app_state,
+                    notify_map,
+                    public_id,
+                    "internal_error",
+                    e,
+                )
+                .await;
+            }
+        };
 
     // Reconstitute clause-10 slots (private index + live NfLog). MAX_RX_COINS
     // is enforced inside validate_fold_coin_ids_shape / reconstitute.
@@ -5000,6 +5015,7 @@ mod receive_job_path_and_decision_table_tests {
                     "next_pubkey": hex::encode([0x11u8; 32]),
                     "npk_rand": hex::encode([0x22u8; 32]),
                     "fold_coin_ids": [fold_hex],
+                    "genesis_pubkey": hex::encode(pk0),
                 }),
             )
             .await
@@ -5370,6 +5386,7 @@ mod receive_job_path_and_decision_table_tests {
                     idempotency_key: IdempotencyKey::from_validated("k-rx-await".to_string()),
                 },
                 fold_coin_ids: vec![Digest32(coin_id)],
+                genesis_pubkey: Some(XOnlyKey(pk0)),
             },
         )
         .await

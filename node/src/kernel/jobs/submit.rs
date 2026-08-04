@@ -500,11 +500,21 @@ fn encode_normative_request_body(command: &TransitionCommand) -> KernelResult<se
                 encode_output_templates(output_templates),
             );
         }
-        TransitionCommand::Receive { fold_coin_ids, .. } => {
+        TransitionCommand::Receive {
+            fold_coin_ids,
+            genesis_pubkey,
+            ..
+        } => {
             obj.insert(
                 "fold_coin_ids".to_string(),
                 encode_digest_list(fold_coin_ids),
             );
+            if let Some(pk) = genesis_pubkey {
+                obj.insert(
+                    "genesis_pubkey".to_string(),
+                    serde_json::Value::String(hex::encode(pk.0)),
+                );
+            }
         }
     }
 
@@ -657,6 +667,7 @@ pub(crate) mod fixtures {
         TransitionCommand::Receive {
             common: common_self(key),
             fold_coin_ids: vec![digest(0x22)],
+            genesis_pubkey: None,
         }
     }
 }

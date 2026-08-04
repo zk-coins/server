@@ -953,6 +953,7 @@ async function stage5_bob_receive(client, seed, bob, assetIdHex, bobCoinId) {
   const request = {
     kind: 'receive',
     fold_coin_ids: [discoveredCoinId],
+    genesis_pubkey: encodeHexLower(bob.sk0.publicKey),
   };
   const { job, spendPubkey } = await runSignedTransition(
     client,

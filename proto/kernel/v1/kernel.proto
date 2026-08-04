@@ -195,6 +195,9 @@ message TransitionRequest {
   repeated bytes fold_coin_ids = 8;
   Issuance issuance = 9;
   string idempotency_key = 10;             // §7.5 Idempotency-Key pass-through
+  bytes genesis_pubkey = 12;               // recipient's Pk₀ (32B x-only); required for a genesis
+                                            // receive (kind=="receive", no prior transition); empty
+                                            // (absent) otherwise (§7.5)
 }
 
 message JobHandle { string job_id = 1; string status = 2; }

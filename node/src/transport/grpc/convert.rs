@@ -606,6 +606,7 @@ pub(crate) fn parse_transition_request(
         "mint" => {
             refuse_nonempty_digests(&req.input_coins, "input_coins", "mint")?;
             refuse_nonempty_digests(&req.fold_coin_ids, "fold_coin_ids", "mint")?;
+            refuse_nonempty_bytes(&req.genesis_pubkey, "genesis_pubkey", "mint")?;
             let issuance = match req.issuance {
                 Some(i) => parse_issuance(i)?,
                 None => {
@@ -624,6 +625,7 @@ pub(crate) fn parse_transition_request(
         }
         "send" => {
             refuse_nonempty_digests(&req.fold_coin_ids, "fold_coin_ids", "send")?;
+            refuse_nonempty_bytes(&req.genesis_pubkey, "genesis_pubkey", "send")?;
             if req.issuance.is_some() {
                 return Err(KernelError::new(
                     KernelErrorCode::MalformedRequest,
@@ -653,9 +655,15 @@ pub(crate) fn parse_transition_request(
                 ));
             }
             let fold_coin_ids = parse_digest_list(&req.fold_coin_ids, "fold_coin_ids")?;
+            let genesis_pubkey = if req.genesis_pubkey.is_empty() {
+                None
+            } else {
+                Some(parse_xonly(&req.genesis_pubkey, "genesis_pubkey")?)
+            };
             Ok(TransitionCommand::Receive {
                 common,
                 fold_coin_ids,
+                genesis_pubkey,
             })
         }
         other => Err(KernelError::new(
@@ -667,6 +675,16 @@ pub(crate) fn parse_transition_request(
 
 fn refuse_nonempty_digests(list: &[Vec<u8>], field: &str, kind: &str) -> KernelResult<()> {
     if list.is_empty() {
+        return Ok(());
+    }
+    Err(KernelError::new(
+        KernelErrorCode::MalformedRequest,
+        format!("kind={kind} must not carry {field}"),
+    ))
+}
+
+fn refuse_nonempty_bytes(bytes: &[u8], field: &str, kind: &str) -> KernelResult<()> {
+    if bytes.is_empty() {
         return Ok(());
     }
     Err(KernelError::new(
@@ -1613,6 +1631,7 @@ mod tests {
             fold_coin_ids: vec![vec![0x22u8; 32]],
             issuance: None,
             idempotency_key: "k-rx".into(),
+            genesis_pubkey: vec![],
         }
     }
 
@@ -1625,6 +1644,34 @@ mod tests {
                 assert_eq!(fold_coin_ids[0].0, [0x22u8; 32]);
             }
             other => panic!("expected Receive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receive_with_genesis_pubkey_maps_to_some() {
+        let mut req = base_receive_request();
+        req.genesis_pubkey = vec![0xD0u8; 32];
+        let cmd = parse_transition_request(req).expect("valid receive with genesis_pubkey");
+        match cmd {
+            TransitionCommand::Receive {
+                genesis_pubkey: Some(k),
+                ..
+            } => {
+                assert_eq!(k.0, [0xD0u8; 32]);
+            }
+            other => panic!("expected Receive with Some(genesis_pubkey), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_receive_without_genesis_pubkey_maps_to_none() {
+        let cmd = parse_transition_request(base_receive_request()).expect("valid receive");
+        match cmd {
+            TransitionCommand::Receive {
+                genesis_pubkey: None,
+                ..
+            } => {}
+            other => panic!("expected Receive with genesis_pubkey: None, got {other:?}"),
         }
     }
 

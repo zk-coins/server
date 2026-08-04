@@ -203,6 +203,9 @@ pub(crate) enum TransitionCommand {
     },
     /// `kind == "receive"`: `fold_coin_ids` required;
     /// `input_coins` / `output_templates` / `issuance` absent by construction.
+    /// `genesis_pubkey` is optional and conditionally required (required for a
+    /// genesis receive — the account's first transition; MUST be absent
+    /// otherwise, §7.5).
     ///
     /// Shape validation and job admission share the mint/send path.
     /// Clause-10 slots, the operational bundle, and the wallet signature
@@ -211,6 +214,10 @@ pub(crate) enum TransitionCommand {
     Receive {
         common: TransitionCommon,
         fold_coin_ids: Vec<Digest32>,
+        /// Recipient's genesis Pk₀ — REQUIRED for a genesis receive (the
+        /// account's first transition); MUST be absent otherwise (§7.5).
+        /// Symmetric to `Issuance::{V1,V2}.creator_pubkey`.
+        genesis_pubkey: Option<XOnlyKey>,
     },
 }
 

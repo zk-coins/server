@@ -908,6 +908,68 @@ mod tests {
         assert_eq!(still.status, OutboxStatus::Pending);
     }
 
+    /// Regression (migration 0035): two self_delivery rows for the SAME
+    /// subject sharing the constant zero coin_id sentinel, but with
+    /// DIFFERENT transition_pk, must both insert successfully. Before 0035
+    /// the second insert violated the old (subject, coin_id, kind) UNIQUE
+    /// constraint — every 2nd-and-later transition's self-delivery failed.
+    #[tokio::test]
+    async fn two_self_delivery_rows_same_subject_zero_coin_id_different_transition_succeed() {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        let entry1 = OutboxInsert {
+            kind: OutboxKind::SelfDelivery,
+            subject: [0x11; 32],
+            transition_pk: [0xA1; 32],
+            coin_id: [0u8; 32],
+            material: br#"{"v":1,"self":1}"#.to_vec(),
+        };
+        let entry2 = OutboxInsert {
+            kind: OutboxKind::SelfDelivery,
+            subject: [0x11; 32],
+            transition_pk: [0xA2; 32],
+            coin_id: [0u8; 32],
+            material: br#"{"v":1,"self":2}"#.to_vec(),
+        };
+        insert_pending(&pool, std::slice::from_ref(&entry1))
+            .await
+            .expect("first self_delivery insert (transition A1)");
+        insert_pending(&pool, std::slice::from_ref(&entry2))
+            .await
+            .expect(
+                "second self_delivery insert for the same subject and the same \
+             zero coin_id, but a different transition_pk, must succeed (0035 fix)",
+            );
+
+        let id1 = outbox_id(
+            entry1.kind,
+            &entry1.subject,
+            &entry1.coin_id,
+            &entry1.transition_pk,
+        );
+        let id2 = outbox_id(
+            entry2.kind,
+            &entry2.subject,
+            &entry2.coin_id,
+            &entry2.transition_pk,
+        );
+        assert_ne!(
+            id1, id2,
+            "distinct transition_pk must yield distinct outbox_id"
+        );
+
+        let row1 = get_by_id(&pool, &id1)
+            .await
+            .expect("get 1")
+            .expect("row 1 present");
+        let row2 = get_by_id(&pool, &id2)
+            .await
+            .expect("get 2")
+            .expect("row 2 present");
+        assert_eq!(row1.transition_pk, entry1.transition_pk);
+        assert_eq!(row2.transition_pk, entry2.transition_pk);
+    }
+
     /// Schema has no receipts table and no replication_k column.
     #[tokio::test]
     async fn schema_has_no_receipts_table_or_replication_k() {
