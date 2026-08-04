@@ -104,18 +104,20 @@ export ZKCOINS_FEATURES="wallet,explorer"
 # Host-side wallets dial http://127.0.0.1:8080 → chan_bind host "127.0.0.1:8080".
 export ZKCOINS_PUBLIC_HOST="127.0.0.1:8080"
 export ZKCOINS_BLOSSOM_MAX_BLOB_BYTES="1048576"
-# Alice (account'=0) and Bob (account'=1) op_pubkey, derived from the
-# journey's fixed V.2-ext test mnemonic via m/1798'/<account>'/2' (same
-# derivation as journey.mjs buildAccount's `op`/`opPubkey`). Both must be
-# listed: this one shared node holds both wallets' operational bundles in
-# this local-stack topology. Empty allow-list = surface up, every Blossom
-# upload 403 (docs/local-stack.md gap 8).
+# Alice (account'=0), Bob (account'=1), and Carol (account'=2) op_pubkey,
+# derived from the journey's fixed V.2-ext test mnemonic via
+# m/1798'/<account>'/2' (same derivation as journey.mjs buildAccount's
+# `op`/`opPubkey`). All three must be listed: this one shared node holds all
+# three wallets' operational bundles in this local-stack topology. Carol is
+# the token-standard-2 issuer in journey stage 2b (non-owner emission →
+# mesh delivery → Blossom upload). Empty allow-list = surface up, every
+# Blossom upload 403 (docs/local-stack.md gap 8).
 #
 # Changing ZKCOINS_BLOSSOM_URL or ZKCOINS_BLOSSOM_ALLOWED_OPS (node-service
 # env) requires recreating the node container, not just a process restart:
 #   docker compose up -d --force-recreate node
 # The node reads these env vars only at container creation.
-export ZKCOINS_BLOSSOM_ALLOWED_OPS="6424b41eea59c6a3aa6169b802c96ff5194962d3bf5f941130e4ebc86de3b485,d91ad56adb703a1b31c40c7cd1d3c42d075c5bcd1c03d02e5e096856b6570f25"
+export ZKCOINS_BLOSSOM_ALLOWED_OPS="6424b41eea59c6a3aa6169b802c96ff5194962d3bf5f941130e4ebc86de3b485,d91ad56adb703a1b31c40c7cd1d3c42d075c5bcd1c03d02e5e096856b6570f25,43b816d0cbf5a71f775678c267318441e9a98178d033a59a39832adb766a7c8e"
 
 # ─── Optional / journey ───────────────────────────────────────────────────
 export RUST_LOG="${RUST_LOG:-info}"

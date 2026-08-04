@@ -308,6 +308,7 @@ zkcoins_prover_plonky2::state_engine::MintRequest::next_pubkey
 zkcoins_prover_plonky2::state_engine::MintRequest::nk
 zkcoins_prover_plonky2::state_engine::MintRequest::npk_rand
 zkcoins_prover_plonky2::state_engine::MintRequest::op_secret
+zkcoins_prover_plonky2::state_engine::MintRequest::output_templates
 zkcoins_prover_plonky2::state_engine::MintRequest::owner
 zkcoins_prover_plonky2::state_engine::MintRequest::terms_salt
 zkcoins_prover_plonky2::state_engine::OpSecret

@@ -155,6 +155,16 @@ pub struct MintRequest {
     pub cap_total: u128,
     /// Token-standard-2 terms salt; all-zero for standard 1.
     pub terms_salt: [u8; 32],
+    /// Mint-output recipients (§6.5). Symmetric to `SendRequest::output_templates`,
+    /// but a mint has no inputs, so there is no separate change computation: the
+    /// amounts of every entry (which must all carry this mint's derived `asset_id`
+    /// — conservation forbids any other asset in a mint's outputs) MUST sum to
+    /// exactly `amount`. Token-standard-1 conventionally carries one self-addressed
+    /// entry (today's implicit behaviour, now explicit). Token-standard-2 REQUIRES
+    /// at least one entry and forbids every entry from being self-addressed — the
+    /// circuit (`enforce_mint`) makes a self-addressed v2 output unprovable, not
+    /// merely uncredited.
+    pub output_templates: Vec<CoinTemplate>,
     pub npk_rand: [u8; 32],
 }
 
@@ -890,9 +900,9 @@ impl StateEngine {
     /// unsatisfiable cases by name before any witness is built:
     /// - amount `> cap_total` → §6.5 clause (e) / §2.1 clause 3
     /// - non-genesis account (re-issuance) → §6.5 clause (f) genesis binding
-    /// - otherwise emission-recipient missing → §6.5 clause (g) (MintRequest
-    ///   does not yet carry a non-owner recipient; self-credit would be
-    ///   unprovable, so we refuse rather than attempt it)
+    /// - otherwise (no non-owner `output_templates` entry) → §6.5 clause (g); every
+    ///   `output_templates` entry must be non-owner-addressed, or the circuit's `enforce_mint`
+    ///   makes the witness unprovable
     ///
     /// Circuit `C` still re-checks every mint clause in-circuit when a
     /// witness is eventually proved; the host checks are fail-closed
@@ -904,42 +914,11 @@ impl StateEngine {
             req.issuance_version
         );
         ensure!(req.amount > 0, "mint amount must be non-zero");
-
-        // Token-standard-2 host preflight — refuse naming the clause, never
-        // construct an unprovable witness. Order: cap (e) then genesis (f)
-        // then emission (g), so each refusal is independently testable.
-        if req.issuance_version == 2 {
-            ensure!(
-                req.amount <= req.cap_total,
-                "token-standard-2 mint refused: amount exceeds cap_total \
-                 (§6.5 clause (e) / §2.1 clause 3 cap enforcement)"
-            );
-            if let Some(existing) = self.accounts.get(&req.owner) {
-                // Clause (f): mint MUST be the issuing account's genesis
-                // transition (send_counter == 0 and current_pubkey == Pk₀).
-                let is_genesis = existing.state.send_counter == 0
-                    && existing.state.current_pubkey == existing.genesis_pubkey
-                    && req.current_pubkey == existing.genesis_pubkey;
-                ensure!(
-                    is_genesis,
-                    "token-standard-2 mint refused: re-issuance into a non-genesis account \
-                     (§6.5 clause (f) genesis binding / §2.1 clause 3)"
-                );
-            }
-            bail!(
-                "token-standard-2 mint requires an explicit non-owner emission recipient \
-                 (§6.5 clause (g) emission); MintRequest does not yet carry one — \
-                 refusing rather than constructing an unprovable self-credit witness"
-            );
-        }
-
         ensure!(
-            req.cap_total == 0,
-            "token-standard-1 mint requires cap_total == 0"
-        );
-        ensure!(
-            req.terms_salt == [0u8; 32],
-            "token-standard-1 mint requires all-zero terms_salt"
+            req.output_templates.len() <= MAX_TX_OUTPUTS,
+            "too many output templates: {} > {}",
+            req.output_templates.len(),
+            MAX_TX_OUTPUTS
         );
 
         let nk_commit = host::nk_commit(&req.nk);
@@ -987,19 +966,100 @@ impl StateEngine {
             );
         }
 
+        // Token-standard-2 host preflight — refuse naming the clause, never
+        // construct an unprovable witness. Order: cap (e) then genesis (f)
+        // then emission (g), so each refusal is independently testable.
+        if req.issuance_version == 2 {
+            ensure!(
+                req.amount <= req.cap_total,
+                "token-standard-2 mint refused: amount exceeds cap_total \
+                 (§6.5 clause (e) / §2.1 clause 3 cap enforcement)"
+            );
+            if let Some(existing) = self.accounts.get(&req.owner) {
+                // Clause (f): mint MUST be the issuing account's genesis
+                // transition (send_counter == 0 and current_pubkey == Pk₀).
+                let is_genesis = existing.state.send_counter == 0
+                    && existing.state.current_pubkey == existing.genesis_pubkey
+                    && req.current_pubkey == existing.genesis_pubkey;
+                ensure!(
+                    is_genesis,
+                    "token-standard-2 mint refused: re-issuance into a non-genesis account \
+                     (§6.5 clause (f) genesis binding / §2.1 clause 3)"
+                );
+            }
+            // Clause (g): the circuit (`enforce_mint`, program-plonky2/src/circuit/
+            // compliance/skeleton.rs) asserts `forbidden_v2 == 0` for every ACTIVE
+            // output whose asset_id matches the issuance — an outright in-circuit
+            // BAN on any self-addressed output of the minted asset, not a soft
+            // "admit but do not credit". Every template must therefore be present
+            // and non-owner-addressed, or the witness would be unprovable; refuse
+            // host-side rather than build it.
+            ensure!(
+                !req.output_templates.is_empty()
+                    && req
+                        .output_templates
+                        .iter()
+                        .all(|t| t.recipient != req.owner),
+                "token-standard-2 mint requires an explicit non-owner emission recipient \
+                 (§6.5 clause (g) emission); MintRequest.output_templates must contain at \
+                 least one entry and every entry's recipient must differ from owner — \
+                 refusing rather than constructing an unprovable self-credit witness"
+            );
+        } else {
+            ensure!(
+                req.cap_total == 0,
+                "token-standard-1 mint requires cap_total == 0"
+            );
+            ensure!(
+                req.terms_salt == [0u8; 32],
+                "token-standard-1 mint requires all-zero terms_salt"
+            );
+            // Token-standard-1 is self-retained issuance: the creator mints into
+            // its own account; only token-standard-2 emits to a non-owner (§6.5
+            // clause (g), exclusive to issuance_version == 2). Enforce the single
+            // self-output shape host-side, fail-closed. asset_id per entry is
+            // already validated later by the generic conservation loop below —
+            // this only pins recipient identity, entry count, and amount.
+            ensure!(
+                req.output_templates.len() == 1
+                    && req.output_templates[0].recipient == req.owner
+                    && req.output_templates[0].amount == req.amount,
+                "token-standard-1 mint requires exactly one self-addressed \
+                 output_templates entry whose amount equals the mint amount \
+                 (single-issuer, self-retained issuance); got {} entries",
+                req.output_templates.len()
+            );
+        }
+
         let name_hash = host::name_hash(&req.name).context("name_hash")?;
         let creator_pubkey = match self.accounts.get(&req.owner) {
             Some(rec) => rec.genesis_pubkey,
             None => req.current_pubkey,
         };
-        let asset_id = host::asset_id_v1(
-            host::GENESIS_TAG,
-            &creator_pubkey,
-            &name_hash,
-            req.decimals,
-            1,
-        );
-        let terms_hash = host::terms_hash_v1(asset_id, 1);
+        let asset_id = if req.issuance_version == 2 {
+            host::asset_id_v2(
+                host::GENESIS_TAG,
+                &creator_pubkey,
+                &name_hash,
+                req.decimals,
+                2,
+                req.cap_total,
+                &req.terms_salt,
+            )
+        } else {
+            host::asset_id_v1(
+                host::GENESIS_TAG,
+                &creator_pubkey,
+                &name_hash,
+                req.decimals,
+                1,
+            )
+        };
+        let terms_hash = if req.issuance_version == 2 {
+            host::terms_hash_v2(asset_id, 2, req.cap_total, &req.terms_salt)
+        } else {
+            host::terms_hash_v1(asset_id, 1)
+        };
         let issuance = AssetIssuance {
             asset_id,
             creator_pubkey,
@@ -1011,6 +1071,31 @@ impl StateEngine {
             cap_total: req.cap_total,
             terms_salt: req.terms_salt,
         };
+
+        // Every template must describe THIS mint's asset (conservation forbids any
+        // other asset in a mint's outputs — a mint has no inputs) and the amounts
+        // must sum to exactly `req.amount` (mandatory in-circuit for v2 via
+        // `enforce_mint`'s `connect_wide(selected_out, amount)`; chosen as the
+        // uniform host rule for v1 too — no implicit mint-side burn/change).
+        let mut templates_sum: u128 = 0;
+        for (i, template) in req.output_templates.iter().enumerate() {
+            ensure!(
+                template.amount > 0,
+                "output_templates[{i}] amount must be non-zero"
+            );
+            ensure!(
+                template.asset_id == asset_id,
+                "output_templates[{i}].asset_id does not match this mint's derived asset_id"
+            );
+            templates_sum = templates_sum
+                .checked_add(template.amount)
+                .context("output_templates amount overflow")?;
+        }
+        ensure!(
+            templates_sum == req.amount,
+            "sum of output_templates amounts ({templates_sum}) does not equal mint amount ({})",
+            req.amount
+        );
 
         let (
             mode,
@@ -1024,31 +1109,59 @@ impl StateEngine {
 
         let prev_ash =
             host::account_state_hash(&prev_account_state).context("hash prev account state")?;
-        let output_template = CoinTemplate {
-            recipient: req.owner,
-            amount: req.amount,
-            asset_id,
-        };
-        let output_coin = Coin {
-            identifier: host::coin_identifier(prev_ash, &req.owner.0, asset_id, req.amount, 0),
-            recipient: req.owner,
-            amount: req.amount,
-            asset_id,
-        };
 
-        // History: admit self-output 0→1 (no inputs / receives).
-        let output_id = host::digest_to_bytes(&output_coin.identifier);
-        let output_history = {
-            let hist = rebuild_coinhist(&hist_leaves)?;
-            hist.non_inclusion(output_id)
-                .context("self-output coin_id already present in coinhist")?
-        };
-        hist_leaves.insert(output_id, host::CoinHistState::Admitted);
+        // Build every output coin, mirroring begin_send's sequential
+        // self-output-admission loop (~line 1279-1334 of this file). A template is
+        // admitted to the issuer's own coin-history and credited to `balances`
+        // only when it is BOTH self-addressed AND token-standard-1 — a v2 mint can
+        // never reach this loop with a self-addressed template (refused above).
+        let mut hist_for_proofs = rebuild_coinhist(&hist_leaves)?;
+        let mut output_coins = Vec::with_capacity(req.output_templates.len());
+        let mut output_history_proofs = Vec::with_capacity(req.output_templates.len());
+        let mut new_balances = prev_account_state.balances.clone();
+        for (index, template) in req.output_templates.iter().enumerate() {
+            let coin = Coin {
+                identifier: host::coin_identifier(
+                    prev_ash,
+                    &template.recipient.0,
+                    asset_id,
+                    template.amount,
+                    index as u32,
+                ),
+                recipient: template.recipient,
+                amount: template.amount,
+                asset_id,
+            };
+            let is_self = template.recipient == req.owner;
+            let admits_self_credit = is_self && req.issuance_version == 1;
+            if admits_self_credit {
+                let id = host::digest_to_bytes(&coin.identifier);
+                let proof = hist_for_proofs
+                    .non_inclusion(id)
+                    .context("self-output coin_id already present")?;
+                ensure!(
+                    proof.verify(&id, hist_for_proofs.root()),
+                    "self-output history proof does not open the current sequential root"
+                );
+                output_history_proofs.push(Some(proof));
+                hist_for_proofs
+                    .admit(id)
+                    .context("apply sequential self-output admission to temporary coinhist")?;
+                hist_leaves.insert(id, host::CoinHistState::Admitted);
+                credit_balance(&mut new_balances, asset_id, template.amount)?;
+            } else {
+                output_history_proofs.push(None);
+            }
+            output_coins.push(coin);
+        }
+
         let new_hist = rebuild_coinhist(&hist_leaves)?;
+        ensure!(
+            hist_for_proofs.root() == new_hist.root(),
+            "temporary sequential coinhist diverges from rebuilt final tree"
+        );
         let new_root = new_hist.root();
 
-        let mut new_balances = prev_account_state.balances.clone();
-        credit_balance(&mut new_balances, asset_id, req.amount)?;
         let entry_send_counter = prev_account_state.send_counter;
         let new_send = entry_send_counter
             .checked_add(1)
@@ -1068,7 +1181,7 @@ impl StateEngine {
         let nav_opening = NavOpening { nav, nav_rand };
         let proof_data = compute_proof_data(
             &new_account_state,
-            std::slice::from_ref(&output_coin),
+            &output_coins,
             &[],
             &req.nk,
             (nav, &nav_rand, &req.next_pubkey, &req.npk_rand),
@@ -1081,9 +1194,9 @@ impl StateEngine {
             new_account_state,
             input_coins: Vec::new(),
             input_auth: Vec::new(),
-            output_templates: vec![output_template],
-            output_coins: vec![output_coin],
-            output_history_proofs: vec![Some(output_history)],
+            output_templates: req.output_templates.clone(),
+            output_coins,
+            output_history_proofs,
             received_coins: Vec::new(),
             received_auth: Vec::new(),
             asset_issuance: Some(issuance),
@@ -2688,22 +2801,45 @@ mod tests {
         let (_, _, next_pubkey) = normalized_key(deterministic_secret(
             b"zkCoins/v1/state-engine/test-mint/pk1",
         ));
+        let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
+        let name: Vec<u8> = b"State Engine Test Asset".to_vec();
+        let decimals = 2u8;
+        let amount = 100u128;
+        let cap_total = if issuance_version == 2 { 100 } else { 0 };
+        let terms_salt = if issuance_version == 2 {
+            [0x44; 32]
+        } else {
+            [0u8; 32]
+        };
+        // v1 default: one self-output for the full `amount` (today's implicit
+        // behaviour, now explicit). v2 default: EMPTY — token-standard-2 requires
+        // an explicit non-owner recipient (§6.5 clause (g)); tests that exercise a
+        // *valid* v2 mint set `req.output_templates` themselves.
+        let output_templates = if issuance_version == 1 {
+            let name_hash = host::name_hash(&name).expect("name_hash");
+            let asset_id =
+                host::asset_id_v1(host::GENESIS_TAG, &current_pubkey, &name_hash, decimals, 1);
+            vec![CoinTemplate {
+                recipient: owner,
+                amount,
+                asset_id,
+            }]
+        } else {
+            Vec::new()
+        };
         MintRequest {
-            owner: Address(host::address(&current_pubkey, host::nk_commit(&nk))),
+            owner,
             nk,
             op_secret: label_op_secret(b"zkCoins/v1/state-engine/test-mint/op_secret"),
             current_pubkey,
             next_pubkey,
-            name: b"State Engine Test Asset".to_vec(),
-            decimals: 2,
-            amount: 100,
+            name,
+            decimals,
+            amount,
             issuance_version,
-            cap_total: if issuance_version == 2 { 100 } else { 0 },
-            terms_salt: if issuance_version == 2 {
-                [0x44; 32]
-            } else {
-                [0; 32]
-            },
+            cap_total,
+            terms_salt,
+            output_templates,
             npk_rand: [0x22; 32],
         }
     }
@@ -2936,6 +3072,11 @@ mod tests {
             issuance_version: 1,
             cap_total: 0,
             terms_salt: [0u8; 32],
+            output_templates: vec![CoinTemplate {
+                recipient: first.owner,
+                amount: 40,
+                asset_id,
+            }],
             npk_rand: [0x44; 32],
         };
         let err = engine
@@ -3077,6 +3218,11 @@ mod tests {
             issuance_version: 1,
             cap_total: 0,
             terms_salt: [0u8; 32],
+            output_templates: vec![CoinTemplate {
+                recipient: first.owner,
+                amount: 40,
+                asset_id,
+            }],
             npk_rand: [0x44; 32],
         };
         let err = engine
@@ -3227,6 +3373,11 @@ mod tests {
             issuance_version: 1,
             cap_total: 0,
             terms_salt: [0u8; 32],
+            output_templates: vec![CoinTemplate {
+                recipient: first.owner,
+                amount: remint_amount,
+                asset_id,
+            }],
             npk_rand: [0x44; 32],
         };
         let pending = engine.begin_mint(remint).expect("std1 remint must succeed");
@@ -4714,6 +4865,8 @@ mod tests {
         // Re-issue on a brand-new empty engine using only the secret read
         // back from the reconstructed record (genesis path; the cold
         // account is deliberately not used for AccountUpdateProof).
+        let name_hash = host::name_hash(&name).expect("name_hash");
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &current_pubkey, &name_hash, 2, 1);
         let reissued = StateEngine::new(Network::Testnet, 0)
             .begin_mint(MintRequest {
                 owner,
@@ -4727,6 +4880,11 @@ mod tests {
                 issuance_version: 1,
                 cap_total: 0,
                 terms_salt: [0; 32],
+                output_templates: vec![CoinTemplate {
+                    recipient: owner,
+                    amount: 100,
+                    asset_id,
+                }],
                 npk_rand: [0x22; 32],
             })
             .expect("re-mint from restored secret");

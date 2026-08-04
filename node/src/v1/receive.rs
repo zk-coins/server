@@ -3214,6 +3214,8 @@ mod tests {
         ));
         let alice_owner = Address(host::address(&alice_pk0, host::nk_commit(&alice_nk)));
 
+        let mint_name_hash = host::name_hash(b"G3 sealed e2e asset").expect("name_hash");
+        let mint_asset_id = host::asset_id_v1(host::GENESIS_TAG, &alice_pk0, &mint_name_hash, 2, 1);
         let mint_pending = adapter
             .with_engine(|engine| {
                 engine.begin_mint(MintRequest {
@@ -3228,6 +3230,11 @@ mod tests {
                     issuance_version: 1,
                     cap_total: 0,
                     terms_salt: [0u8; 32],
+                    output_templates: vec![host::CoinTemplate {
+                        recipient: alice_owner,
+                        amount: 100,
+                        asset_id: mint_asset_id,
+                    }],
                     npk_rand: [0x22; 32],
                 })
             })

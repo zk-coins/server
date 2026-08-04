@@ -862,6 +862,7 @@ async fn process_mint(
         cap_total,
         terms_salt,
         creator_pubkey,
+        output_templates_raw,
     ) = match parse_mint_job_body(&job.request_body) {
         Ok(v) => v,
         Err(e) => {
@@ -941,6 +942,44 @@ async fn process_mint(
         }
     };
 
+    let output_templates: Result<Vec<_>, String> = output_templates_raw
+        .into_iter()
+        .enumerate()
+        .map(|(i, (recipient, asset_id_bytes, amount))| {
+            let asset_id = shared::spec_v1::encoding::digest_from_bytes(&asset_id_bytes)
+                .map_err(|e| format!("output_templates[{i}].asset_id: digest_from_bytes: {e}"))?;
+            Ok(shared::spec_v1::CoinTemplate {
+                recipient: shared::spec_v1::Address(recipient),
+                amount,
+                asset_id,
+            })
+        })
+        .collect();
+    let output_templates = match output_templates {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("invalid mint request body: {e}");
+            if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
+                tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(msg),
+                },
+            );
+            return Ok(());
+        }
+    };
+
     let mint_req = zkcoins_prover::state_engine::MintRequest {
         owner: shared::spec_v1::Address(subject.0),
         nk,
@@ -953,6 +992,7 @@ async fn process_mint(
         issuance_version,
         cap_total,
         terms_salt,
+        output_templates,
         npk_rand,
     };
 
@@ -1927,7 +1967,8 @@ async fn process_send_resume(
 /// Parsed mint job body from `encode_normative_request_body` / `encode_issuance`.
 ///
 /// `(subject, next_pubkey, npk_rand, name, decimals, amount, issuance_version,
-///  cap_total, terms_salt, creator_pubkey)`.
+///  cap_total, terms_salt, creator_pubkey, output_templates)` where each output
+/// template is `(recipient_raw32, asset_id_raw32, amount)`.
 type ParsedMintJobBody = (
     crate::kernel::types::SubjectAddress,
     [u8; 32],
@@ -1939,6 +1980,7 @@ type ParsedMintJobBody = (
     u128,
     [u8; 32],
     [u8; 32],
+    Vec<([u8; 32], [u8; 32], u128)>,
 );
 
 /// Auth material for mint begin: nk, op_secret, current_pubkey.
@@ -1981,10 +2023,41 @@ fn parse_mint_job_body(body: &serde_json::Value) -> Result<ParsedMintJobBody, St
         .get("issuance")
         .and_then(|v| v.as_object())
         .ok_or_else(|| "mint job body missing issuance object".to_string())?;
+    let out_arr = obj
+        .get("output_templates")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "mint job body missing output_templates".to_string())?;
 
     let subject = parse_hex32_field(subject_hex, "subject")?;
     let next_pubkey = parse_hex32_field(next_hex, "next_pubkey")?;
     let npk_rand = parse_hex32_field(npk_hex, "npk_rand")?;
+
+    let mut output_templates = Vec::with_capacity(out_arr.len());
+    for (i, v) in out_arr.iter().enumerate() {
+        let t = v
+            .as_object()
+            .ok_or_else(|| format!("output_templates[{i}] is not an object"))?;
+        // encode_output_templates hex-encodes the raw 32-byte address (not Bech32m).
+        let recipient_hex = t
+            .get("recipient")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("output_templates[{i}].recipient missing"))?;
+        let asset_hex = t
+            .get("asset_id")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("output_templates[{i}].asset_id missing"))?;
+        let amount_str = t
+            .get("amount")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("output_templates[{i}].amount missing"))?;
+        // has_delivery is admission-only; prove leg ignores it.
+        let recipient =
+            parse_hex32_field(recipient_hex, &format!("output_templates[{i}].recipient"))?;
+        let asset_id = parse_hex32_field(asset_hex, &format!("output_templates[{i}].asset_id"))?;
+        let amount =
+            parse_u128_decimal_field(amount_str, &format!("output_templates[{i}].amount"))?;
+        output_templates.push((recipient, asset_id, amount));
+    }
 
     let name = iss
         .get("name")
@@ -2047,6 +2120,7 @@ fn parse_mint_job_body(body: &serde_json::Value) -> Result<ParsedMintJobBody, St
         cap_total,
         terms_salt,
         creator_pubkey,
+        output_templates,
     ))
 }
 

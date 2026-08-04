@@ -183,18 +183,27 @@ mod tests {
         let (_, _, current_pubkey) =
             normalized_key(deterministic_secret(b"zkCoins/v1/g7-remint/pk0"));
         let (_, _, next_pubkey) = normalized_key(deterministic_secret(b"zkCoins/v1/g7-remint/pk1"));
+        let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
+        let name: Vec<u8> = b"G7 Remint Asset".to_vec();
+        let name_hash = host::name_hash(&name).expect("name_hash");
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &current_pubkey, &name_hash, 2, 1);
         MintRequest {
-            owner: Address(host::address(&current_pubkey, host::nk_commit(&nk))),
+            owner,
             nk,
             op_secret: g7_op_secret(),
             current_pubkey,
             next_pubkey,
-            name: b"G7 Remint Asset".to_vec(),
+            name,
             decimals: 2,
             amount: 100,
             issuance_version: 1,
             cap_total: 0,
             terms_salt: [0u8; 32],
+            output_templates: vec![host::CoinTemplate {
+                recipient: owner,
+                amount: 100,
+                asset_id,
+            }],
             npk_rand: [0x22; 32],
         }
     }
@@ -375,6 +384,11 @@ mod tests {
                 issuance_version: 1,
                 cap_total: 0,
                 terms_salt: [0u8; 32],
+                output_templates: vec![host::CoinTemplate {
+                    recipient: first.owner,
+                    amount: remint_amount,
+                    asset_id,
+                }],
                 npk_rand: [0x44; 32],
             };
 
@@ -537,6 +551,7 @@ mod tests {
             let engine = StateEngine::new(Network::Testnet, 0);
             let mut req = std1_request();
             req.amount = 1;
+            req.output_templates[0].amount = 1;
             let pending = begin_v1_mint(&engine, req).expect("amount-1 mint");
             assert_eq!(pending.witness_wip.output_coins.len(), 1);
             assert_eq!(pending.witness_wip.output_coins[0].amount, 1);

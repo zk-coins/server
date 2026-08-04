@@ -35,6 +35,7 @@ fn main() {
         issuance_version: 1,
         cap_total: 0,
         terms_salt: [0u8; 32],
+        output_templates: Vec::new(),
         npk_rand: [0u8; 32],
     };
     needs_serialize(&mint);

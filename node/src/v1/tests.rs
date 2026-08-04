@@ -221,6 +221,9 @@ async fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
 
     // --- Live node issues an opening (genesis mint, entry send_counter = 0) ---
     let engine = StateEngine::new(Network::Testnet, 0);
+    let mint_name_hash = host::name_hash(b"Req10 Restore Asset").expect("name_hash");
+    let mint_asset_id =
+        host::asset_id_v1(host::GENESIS_TAG, &current_pubkey, &mint_name_hash, 2, 1);
     let mint_req = MintRequest {
         owner,
         nk,
@@ -233,6 +236,11 @@ async fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
         issuance_version: 1,
         cap_total: 0,
         terms_salt: [0u8; 32],
+        output_templates: vec![host::CoinTemplate {
+            recipient: owner,
+            amount: 100,
+            asset_id: mint_asset_id,
+        }],
         npk_rand: [0x22; 32],
     };
     let pending = engine.begin_mint(mint_req).expect("begin_mint");
