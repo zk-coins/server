@@ -79,11 +79,8 @@
 //!   stages a v1.1 spend from the node. It consults the boot-time
 //!   [`ScanStackMode::V1`] claim; the mode is **not** a parameter.
 //! - The raw engine sink is module-private ([`engine_begin_send`]).
-//! - Under a v1.1 claim, residual legacy [`crate::account_node::AccountNode::send_coins`]
-//!   is refused ([`refuse_legacy_send_under_v1`]) so a process that
-//!   claimed v1.1 cannot still feed `InCoinSourceWitness` into a prove.
-//! - Flag off / Legacy claim: refuse gate is open; legacy `send_coins`
-//!   behaviour is byte-identical (this module does not touch its body).
+//! - Legacy residual `send_coins` / `InCoinSourceWitness` prove entries
+//!   are removed; there is no dual-accept path back into source-aggregator.
 //!
 //! Full prove/finalise of a send (Plonky2) remains the heavy engine path
 //! shared with G3 (`#[ignore]` e2e). Host `begin_send` witness construction
@@ -98,13 +95,6 @@ use zkcoins_prover::prover_bridge::ReceivedAuthorization;
 use zkcoins_prover::state_engine::{PendingTransition, SendRequest, StateEngine};
 
 use super::separation::{process_stack_mode, ScanStackMode};
-
-/// Refusal when the process has claimed the v1.1 stack but a caller still
-/// tries the legacy `send_coins` path (which builds `InCoinSourceWitness`).
-pub const LEGACY_SEND_REFUSED_UNDER_V1: &str =
-    "legacy send refused under ZKCOINS_V1_SHADOW=1; use the v1.1 send transition \
-     (begin_v1_send → InputAuthorization / CoinHist + creating_prev_ash). Silent \
-     fall-back to InCoinSourceWitness / source-aggregator is forbidden";
 
 /// Refusal when the process claim is not v1.1 — the CoinHist provenance
 /// path is not dual-accepted on the legacy stack.
@@ -128,19 +118,6 @@ pub fn ensure_v1_provenance_path() -> Result<()> {
              ScanStackMode::V1 at boot (ZKCOINS_V1_SHADOW=1). Process claim is unset — \
              refusing (no silent fall-through to InCoinSourceWitness dual-accept)"
         ),
-    }
-}
-
-/// Refuse the legacy `InCoinSourceWitness` send when this process has claimed
-/// the v1.1 stack. Call from residual legacy entry points so a v1.1 boot
-/// never stages a source-aggregator prove for a user transition.
-///
-/// Returns `Ok(())` when the process is **not** on the v1.1 claim (legacy
-/// / unclaimed). Fail-loud under v1.1 — never a silent allow.
-pub fn refuse_legacy_send_under_v1() -> Result<(), &'static str> {
-    match process_stack_mode() {
-        Some(ScanStackMode::V1) => Err(LEGACY_SEND_REFUSED_UNDER_V1),
-        Some(ScanStackMode::Legacy) | None => Ok(()),
     }
 }
 
@@ -675,34 +652,6 @@ mod tests {
             format!("{err:#}").contains("creating_prev_ash"),
             "unexpected: {err:#}"
         );
-    }
-
-    /// Unclaimed / Legacy: refuse gate stays open (process claim is monotonic;
-    /// V1 refusal is a separate process — see `refuse_legacy_send_under_v1_claim`).
-    #[test]
-    fn refuse_legacy_send_allows_unclaimed_and_legacy() {
-        assert!(refuse_legacy_send_under_v1().is_ok());
-        set_process_stack_mode(ScanStackMode::Legacy);
-        assert!(refuse_legacy_send_under_v1().is_ok());
-    }
-
-    #[test]
-    fn refuse_legacy_send_under_v1_claim() {
-        set_process_stack_mode(ScanStackMode::V1);
-        let err = refuse_legacy_send_under_v1().expect_err("must refuse");
-        assert!(
-            err.contains("legacy send refused") || err.contains("InCoinSourceWitness"),
-            "unexpected: {err}"
-        );
-    }
-
-    /// Verification item 5: flag-off / unclaimed / Legacy claim leaves the
-    /// refuse gate open so legacy `send_coins` stays the default.
-    #[test]
-    fn flag_off_legacy_send_gate_stays_open() {
-        assert!(refuse_legacy_send_under_v1().is_ok());
-        set_process_stack_mode(ScanStackMode::Legacy);
-        assert!(refuse_legacy_send_under_v1().is_ok());
     }
 
     #[test]

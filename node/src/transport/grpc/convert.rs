@@ -904,6 +904,7 @@ fn parse_issuance(i: ProtoIssuance) -> KernelResult<Issuance> {
         }
     };
     let amount = parse_u128_decimal(&i.amount, "issuance.amount")?;
+    let creator_pubkey = parse_xonly(&i.creator_pubkey, "issuance.creator_pubkey")?;
     match i.issuance_version {
         1 => {
             if !i.cap_total.trim().is_empty() || !i.terms_salt.is_empty() {
@@ -916,6 +917,7 @@ fn parse_issuance(i: ProtoIssuance) -> KernelResult<Issuance> {
                 name,
                 decimals,
                 amount,
+                creator_pubkey,
             })
         }
         2 => {
@@ -933,6 +935,7 @@ fn parse_issuance(i: ProtoIssuance) -> KernelResult<Issuance> {
                 amount,
                 cap_total,
                 terms_salt,
+                creator_pubkey,
             })
         }
         other => Err(KernelError::new(

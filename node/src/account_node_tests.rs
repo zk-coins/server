@@ -40,7 +40,6 @@ fn generate_test_public_key(private_key: &Xpriv, index: u32) -> BitcoinPublicKey
 }
 
 struct TestAccountData {
-    xpriv: Xpriv,
     address: Address,
 }
 
@@ -54,18 +53,7 @@ impl TestAccountData {
         // Address = H(Pk₀) = SHA-256(pubkey) per spec (#226).
         let address = sha256_to_digest(&initial_pk_bytes);
 
-        TestAccountData { xpriv, address }
-    }
-
-    fn new_generic(seed: &[u8; 32], network: Network) -> Self {
-        let xpriv = Xpriv::new_master(network, seed)
-            .expect("Failed to create private key for generic account.");
-
-        let initial_pk_bytes = generate_test_public_key(&xpriv, 0).serialize().to_vec();
-        // Address = H(Pk₀) = SHA-256(pubkey) per spec (#226).
-        let address = sha256_to_digest(&initial_pk_bytes);
-
-        TestAccountData { xpriv, address }
+        TestAccountData { address }
     }
 }
 
@@ -258,66 +246,6 @@ async fn test_load_from_pg_rejects_wrong_address_length() {
             err
         ),
     }
-}
-
-#[test]
-fn test_send_coins_returns_err_for_unknown_account() {
-    // Stage 3: `send_coins` is a refuse stub (legacy prove path deleted).
-    // The loud Stage-3 message supersedes the old "Unknown account" arm.
-    let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut node = AccountNode::new(state_arc);
-    let account_data = TestAccountData::new_generic(&[1u8; 32], Network::Bitcoin);
-
-    let recipient: Address = digest_from_bytes(&[2u8; 32]);
-    let invoice = Invoice::new(1, recipient, test_asset_id());
-
-    let current_pk = generate_test_public_key(&account_data.xpriv, 0);
-    let next_pk = generate_test_public_key(&account_data.xpriv, 1);
-
-    let result = node.send_coins(
-        vec![invoice],
-        account_data.address,
-        current_pk,
-        next_pk,
-        None,
-    );
-    let err = result.unwrap_err();
-    assert!(
-        err.contains("legacy send_coins deleted") || err.contains("Stage 3"),
-        "send_coins must refuse loud after Stage 3; got {err}"
-    );
-}
-
-#[test]
-fn test_send_coins_returns_err_insufficient_funds() {
-    // Stage 3: `send_coins` refuses before any funds check. Pin the
-    // loud deletion message rather than the pre-cutover "Insufficient funds".
-    let state_arc = Arc::new(Mutex::new(State::new()));
-    let mut node = AccountNode::new(state_arc);
-    let account_data = TestAccountData::new_generic(&[1u8; 32], Network::Bitcoin);
-    node.import_account(
-        account_data.address,
-        Account::new_for_asset(test_asset_id()),
-    );
-
-    let recipient: Address = digest_from_bytes(&[2u8; 32]);
-    let invoice = Invoice::new(100, recipient, test_asset_id());
-
-    let current_pk = generate_test_public_key(&account_data.xpriv, 0);
-    let next_pk = generate_test_public_key(&account_data.xpriv, 1);
-
-    let result = node.send_coins(
-        vec![invoice],
-        account_data.address,
-        current_pk,
-        next_pk,
-        None,
-    );
-    let err = result.unwrap_err();
-    assert!(
-        err.contains("legacy send_coins deleted") || err.contains("Stage 3"),
-        "send_coins must refuse loud after Stage 3; got {err}"
-    );
 }
 
 /// `warmup_prover` runs a synthetic `prove_initial` against a fresh

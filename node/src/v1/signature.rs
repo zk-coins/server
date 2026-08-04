@@ -974,7 +974,7 @@ pub(crate) struct FinaliseDeliveryDeps<'a> {
 /// then run §4.2 mesh delivery when [`FinaliseDeliveryDeps`] is provided.
 ///
 /// Order is safety-relevant and fixed:
-/// **persist → publish (nullifier) → deliver (mesh) → return Ok**
+/// **persist → mirror (read cache) → publish (nullifier) → deliver (mesh) → return Ok**
 /// (caller may then mark the job `completed`). A crash after this function
 /// returns leaves the account advanced, a progressive publish status, and
 /// (once the host edge finishes) a completed job. Publish failure returns
@@ -1003,6 +1003,11 @@ pub(crate) struct FinaliseDeliveryDeps<'a> {
 ///
 /// The multi-minute prove runs on `spawn_blocking` so the caller's async
 /// lease-renewal heartbeat can keep firing on the runtime.
+// Clippy too_many_arguments: every parameter is a distinct, required finalise
+// input (durable persist target, engine, private-index mirror, publish/deliver
+// deps) — bundling them into a struct would obscure the call surface without
+// reducing what the function actually needs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     adapter: &crate::v1::EngineAdapter,
     pending: PendingTransition,
@@ -1010,6 +1015,7 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     publisher_pubkey: Option<[u8; 32]>,
     fence: crate::job_store::FinaliseFence,
     publisher: &impl crate::v1::receive::NullifierBatchPublisher,
+    private_index: &crate::kernel::access::InMemoryPrivateIndex,
     delivery: Option<FinaliseDeliveryDeps<'_>>,
 ) -> Result<FinaliseOutcome, anyhow::Error> {
     use crate::job_store::FINALISE_FENCE_LOST;
@@ -1048,6 +1054,7 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
             "v1.1 finalise: pending publish already durable; \
              skipping re-prove/re-apply (crash-resume after stage)"
         );
+        mirror_finalised_account_state(adapter, pending.owner, private_index)?;
         publish_staged_nullifier_after_members_ready(adapter, publisher, signature.pk_i).await?;
         if let Some(deps) = delivery.as_ref() {
             // Mesh first (fills external outbox artefacts), then Phase A if
@@ -1228,10 +1235,12 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     // the direct receive path): scanner liveness must not wait on bitcoind.
     drop(_write_gate);
 
+    mirror_finalised_account_state(adapter, owner, private_index)?;
+
     // Hand off this staged row to the durable publisher. Failure keeps the
     // members_ready (or progressive) row for later resume — never mark done.
-    // Order: **persist → publish (nullifier) → deliver (mesh)** — delivery
-    // never runs before the durable write above.
+    // Order: **persist → mirror (read cache) → publish (nullifier) → deliver (mesh)** —
+    // delivery never runs before the durable write above.
     publish_staged_nullifier_after_members_ready(adapter, publisher, pk).await?;
 
     // §4.2 mesh delivery for external-recipient coins (after durable persist).
@@ -1266,6 +1275,57 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
         output_coin_ids,
         publisher_pubkey,
     })
+}
+
+/// Build the read-side [`crate::kernel::access::AccountStateView`] for one engine account
+/// record.
+///
+/// Single source of truth for both the boot-time hydrate (`runtime.rs`, iterating every
+/// account restored by `EngineAdapter::load_or_create`) and the post-finalise mirror below —
+/// always derived from the engine's own `AccountRecord` (`state` + `last_nullifier`), never
+/// from a transition-local snapshot, so a freshly restarted process and a live finalise agree.
+pub(crate) fn account_state_view_from_record(
+    rec: &zkcoins_prover::state_engine::AccountRecord,
+) -> Result<crate::kernel::access::AccountStateView, shared::spec_v1::SpecError> {
+    let account_state_bytes = shared::spec_v1::serialize::serialize_account_state(&rec.state)?;
+    let state_head_hash = shared::spec_v1::account_state_hash(&rec.state)?;
+    Ok(crate::kernel::access::AccountStateView {
+        account_state: account_state_bytes,
+        state_head: crate::kernel::types::Digest32(digest_to_bytes(&state_head_hash)),
+        head_record_id: None,
+        send_counter: rec.state.send_counter,
+        current_pubkey: rec.state.current_pubkey,
+        last_nullifier_pk: rec.last_nullifier.as_ref().map(|n| n.public_key),
+        last_nullifier_r: rec.last_nullifier.as_ref().map(|n| n.signature_r),
+    })
+}
+
+/// Mirror one account's just-finalised (durably persisted) engine state into the
+/// process-local `GetAccountState` read cache.
+///
+/// Fail-closed: any error here (missing engine account, serialize/hash failure, or a poisoned
+/// private-index mutex) propagates and fails the whole finalise call — the caller's
+/// crash-resume branch at the top of this function re-enters and retries this same mirror on
+/// the next attempt, exactly like every other durable-but-not-yet-fully-driven step here
+/// (publish, mesh delivery, SDR Phase A all already work this way).
+fn mirror_finalised_account_state(
+    adapter: &crate::v1::EngineAdapter,
+    owner: shared::spec_v1::Address,
+    private_index: &crate::kernel::access::InMemoryPrivateIndex,
+) -> Result<(), anyhow::Error> {
+    let view = adapter
+        .with_engine(|engine| engine.account(&owner).map(account_state_view_from_record))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "v1.1 finalise: mirror account state: engine has no account for owner {} \
+                 immediately after durable persist",
+                hex_lower(&owner.0)
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("v1.1 finalise: mirror account state serialize/hash: {e}"))?;
+    private_index
+        .insert_account(crate::kernel::types::SubjectAddress(owner.0), view)
+        .map_err(|e| anyhow::anyhow!("v1.1 finalise: mirror account state insert: {e}"))
 }
 
 /// Stage §4.2 Phase-A SDR material after mesh delivery of external coins.

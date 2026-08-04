@@ -55,15 +55,13 @@ fn test_state() -> AppState {
     // Per-test scratch dir for the ProofStore. Issue #181 Opt A flips
     // the CI to `--test-threads=8`, which means several `test_state()`
     // callers run concurrently in the same process; the previous
-    // hard-coded `/tmp/zkcoins-test-proofs` had every test share one
-    // directory and one `ProofStore::next_id` AtomicU64 root, so
-    // parallel writers could race on the same proof id. `keep()`
-    // returns the underlying `PathBuf` and disables the auto-cleanup
-    // Drop — we accept the leak (tests are best-effort cleaned up by
-    // the OS / CI runner reboot) so we don't have to thread a
-    // `TempDir` guard through every caller and the `AppState` struct.
-    // The canonical comment lives here; the second call-site below
-    // (the mint helper around line ~2260) just points back.
+    // hard-coded `/tmp/zkcoins-test-proofs` shared one directory across
+    // tests. `keep()` returns the underlying `PathBuf` and disables the
+    // auto-cleanup Drop — we accept the leak (tests are best-effort
+    // cleaned up by the OS / CI runner reboot) so we don't have to
+    // thread a `TempDir` guard through every caller and the `AppState`
+    // struct. The canonical comment lives here; the second call-site
+    // below (the mint helper around line ~2260) just points back.
     let proofs_dir = tempfile::tempdir().expect("create proofs tempdir").keep();
     AppState {
         account_node: Arc::new(Mutex::new(account_node)),
@@ -1731,50 +1729,10 @@ fn proof_store_proof_path_returns_none_for_nonexistent_directory() {
     // None branch we point at one that does not exist.
     let truly_missing = ProofStore {
         dir: "/this/path/genuinely/does/not/exist/zkcoins".to_string(),
-        next_id: std::sync::atomic::AtomicU64::new(0),
     };
     assert!(truly_missing.proof_path(7).is_none());
     // The real store was created and resolves fine for arbitrary ids.
     drop(store);
-}
-
-#[test]
-fn proof_store_new_picks_up_max_id_from_existing_files() {
-    // `tempfile::tempdir` removes the directory on Drop even when the
-    // test panics, so no /tmp/zkcoins-* tree leaks on failure.
-    let tmp = tempfile::tempdir().expect("create tempdir");
-    let dir = tmp.path();
-    // Drop a few well-formed and one malformed filename.
-    std::fs::write(dir.join("3.bin"), b"placeholder").unwrap();
-    std::fs::write(dir.join("17.bin"), b"placeholder").unwrap();
-    std::fs::write(dir.join("garbage.bin"), b"placeholder").unwrap();
-    std::fs::write(dir.join("notbin.txt"), b"placeholder").unwrap();
-
-    let store = ProofStore::new(dir.to_str().unwrap());
-    // next_id starts at max(3, 17) + 1 = 18; the malformed names are skipped.
-    let id = store.next_id.load(std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(id, 18);
-}
-
-#[test]
-fn persist_proof_bytes_logs_error_when_write_fails() {
-    // Pointing at a file inside a directory that does not exist guarantees
-    // `File::create` inside `atomic_write` returns an `Err` on both Linux
-    // and macOS. The function is best-effort: it logs and returns ().
-    // Exercising it covers the `if let Err(e) = ...` arm in router.rs
-    // that was reported uncovered on the Linux runner only.
-    let bad = std::path::Path::new("/this/path/does/not/exist/zkcoins/0.bin");
-    ProofStore::persist_proof_bytes(bad, b"payload", 42);
-}
-
-#[test]
-fn persist_proof_bytes_succeeds_when_write_succeeds() {
-    // Mirror test for the Ok arm so the helper is fully exercised.
-    // `tempfile::tempdir` cleans up on Drop, even on test panic.
-    let tmp = tempfile::tempdir().expect("create tempdir");
-    let path = tmp.path().join("99.bin");
-    ProofStore::persist_proof_bytes(&path, b"payload", 99);
-    assert_eq!(std::fs::read(&path).unwrap(), b"payload");
 }
 
 #[test]
@@ -1810,194 +1768,6 @@ fn lock_or_recover_username_store_poisoned() {
 
     assert!(store.is_poisoned());
     let _guard = lock_or_recover(&store);
-}
-
-// --- Item 1 (Issue #28) — HTTP error mapping for /api/send + /api/mint ---
-//
-// `map_send_coins_error` is the single source of truth for translating
-// `account_node::send_coins` failure strings into a `(StatusCode,
-// body)` pair. These unit tests pin every documented error string to
-// its mapped pair so adding a new error string anywhere in `send_coins`
-// will silently fall through the `_ => INTERNAL_SERVER_ERROR` arm of
-// the helper but loudly break one of these tests if the new string was
-// supposed to be mapped to a 4xx.
-
-#[test]
-fn map_send_coins_error_unknown_account_address_is_404() {
-    let (status, body) = crate::router::map_send_coins_error("Unknown account address");
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body, "Unknown account address");
-}
-
-/// Historical `"prev_commitment_pubkey required for account update"`
-/// 400 is unreachable as of the `Account::commitment_public_key`
-/// refactor — the server reads the previous commitment pubkey from
-/// its own state, and the `send_coins_inner` AccountUpdate branch no
-/// longer consults the caller-supplied `prev_commitment_pubkey`. The
-/// error string is no longer mapped, so it falls through the catch-all
-/// 500 arm. The test pins THAT (i.e. "if some future regression
-/// re-introduces this string, it must NOT be silently mapped to 400
-/// without also restoring the architectural choice it implies").
-#[test]
-fn map_send_coins_error_legacy_prev_commitment_pubkey_string_is_unmapped_500() {
-    let (status, body) =
-        crate::router::map_send_coins_error("prev_commitment_pubkey required for account update");
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body, "internal error");
-}
-
-#[test]
-fn map_send_coins_error_insufficient_funds_is_422() {
-    let (status, body) = crate::router::map_send_coins_error("Insufficient funds");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Insufficient funds");
-}
-
-#[test]
-fn map_send_coins_error_unable_to_get_merkle_proofs_is_422() {
-    // Reachable from send_coins via the prev_commitment_pubkey path
-    // (account_node::get_merkle_proofs:224). Caller supplied a
-    // public_key that has no associated commitment proof in state.
-    let (status, body) =
-        crate::router::map_send_coins_error("Unable to get merkle proofs for provided public key");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Unable to get merkle proofs for provided public key");
-}
-
-#[test]
-fn map_send_coins_error_unable_to_get_mmr_inclusion_proof_is_422() {
-    // Reachable from send_coins via get_merkle_proofs (account_node::236).
-    // Caller's previous_proof references a history root the node's MMR
-    // hasn't observed yet — stale snapshot, caller-fixable.
-    let (status, body) = crate::router::map_send_coins_error(
-        "Unable to get mmr inclusion proof for the previous root",
-    );
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(
-        body,
-        "Unable to get mmr inclusion proof for the previous root"
-    );
-}
-
-#[test]
-fn map_send_coins_error_proof_public_inputs_too_short_is_500() {
-    // Reachable from send_coins via get_merkle_proofs (account_node::232).
-    // The proof bytes stored against the account are too short to
-    // decode N_PROOF_DATA_PUBLIC_INPUTS field elements — node-side
-    // corruption or version mismatch, not caller-fixable.
-    let (status, body) = crate::router::map_send_coins_error("Proof public_inputs too short");
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body, "Proof public_inputs too short");
-}
-
-#[test]
-fn map_send_coins_error_phase_2b_shim_in_coin_not_in_source_ocr_is_422() {
-    let (status, body) =
-        crate::router::map_send_coins_error("In-coin not present in source's output_coins_root");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "In-coin not present in source's output_coins_root");
-}
-
-#[test]
-fn map_send_coins_error_phase_2b_shim_source_not_in_history_is_422() {
-    let (status, body) =
-        crate::router::map_send_coins_error("Source commitment not present in history MMR");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Source commitment not present in history MMR");
-}
-
-#[test]
-fn map_send_coins_error_coin_missing_commitment_is_422() {
-    let (status, body) = crate::router::map_send_coins_error("Coin is missing commitment");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Coin is missing commitment");
-}
-
-#[test]
-fn map_send_coins_error_missing_inclusion_proof_is_422() {
-    let (status, body) = crate::router::map_send_coins_error("Should provide an inclusion proof");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Should provide an inclusion proof");
-}
-
-#[test]
-fn map_send_coins_error_coin_already_in_coin_history_is_422() {
-    let (status, body) =
-        crate::router::map_send_coins_error("Coin should not exist in coin history tree");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Coin should not exist in coin history tree");
-}
-
-#[test]
-fn map_send_coins_error_coin_already_in_output_smt_is_422() {
-    let (status, body) = crate::router::map_send_coins_error("Coin should not exist in tree yet");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Coin should not exist in tree yet");
-}
-
-#[test]
-fn map_send_coins_error_too_many_in_coins_is_422() {
-    let (status, body) =
-        crate::router::map_send_coins_error("Too many in-coins for one transition");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Too many in-coins for one transition");
-}
-
-#[test]
-fn map_send_coins_error_legacy_send_refused_under_v1_is_422() {
-    // Gap G9: residual legacy send under a v1.1 claim maps to 422 so the
-    // client can switch to begin_v1_send (CoinHist provenance).
-    let (status, body) = crate::router::map_send_coins_error(
-        "legacy send refused under ZKCOINS_V1_SHADOW=1; use the v1.1 send transition \
-         (begin_v1_send → InputAuthorization / CoinHist + creating_prev_ash). Silent \
-         fall-back to InCoinSourceWitness / source-aggregator is forbidden",
-    );
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(
-        body.contains("legacy send refused") || body.contains("begin_v1_send"),
-        "body={body}"
-    );
-}
-
-#[test]
-fn map_send_coins_error_too_many_out_coins_is_422() {
-    let (status, body) =
-        crate::router::map_send_coins_error("Too many out-coins for one transition");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Too many out-coins for one transition");
-}
-
-#[test]
-fn map_send_coins_error_prove_failed_initial_collapses_to_500_prove_failed() {
-    // Per the threat-model note in map_send_coins_error, the prover-internal
-    // error string is intentionally collapsed to a generic "prove failed"
-    // body so 5xx responses don't leak prover state to callers.
-    let (status, body) = crate::router::map_send_coins_error(
-        "prove_initial_with_in_and_out_coins_and_sources failed",
-    );
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body, "prove failed");
-}
-
-#[test]
-fn map_send_coins_error_prove_failed_account_update_collapses_to_500_prove_failed() {
-    let (status, body) = crate::router::map_send_coins_error(
-        "prove_account_update_with_in_and_out_coins_and_sources failed",
-    );
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body, "prove failed");
-}
-
-#[test]
-fn map_send_coins_error_unknown_string_is_500_internal_error() {
-    // A new `send_coins` error string we haven't mapped yet must NOT
-    // accidentally surface as 200 OK / 4xx. The default arm is 500 with
-    // a generic "internal error" body so the wallet treats it as a
-    // node problem and the operator finds the unmapped string in the
-    // `eprintln!` log.
-    let (status, body) = crate::router::map_send_coins_error("a string we never added");
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body, "internal error");
 }
 
 // =======================================================================
@@ -2404,10 +2174,10 @@ fn mint_test_state() -> AppState {
     }
 }
 
-/// `MintStore::add` / `MintStore::take` are exercised in production only
-/// from `flow::{mint_flow, mint_commit_flow}` (coverage-excluded), so
-/// drive the store directly with a host-shaped staged mint. Stage 3
-/// deleted legacy `prepare_mint` (no Prover) — the store test only needs
+/// `MintStore::add` / `MintStore::take` are residual legacy helpers
+/// (prove-side `add` is test-only; `take` is used by
+/// `flow::mint_commit_flow`, coverage-excluded). Drive the store
+/// directly with a host-shaped staged mint — the store test only needs
 /// a well-formed `StagedMint` value, not a real circuit proof. `add`
 /// returns a 1-based id; `take` consumes — a second `take` of the same
 /// id returns `None`.

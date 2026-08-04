@@ -517,11 +517,13 @@ fn encode_issuance(issuance: &Issuance) -> serde_json::Value {
             name,
             decimals,
             amount,
+            creator_pubkey,
         } => serde_json::json!({
             "name": name,
             "decimals": decimals,
             "issuance_version": 1u32,
             "amount": amount.to_string(),
+            "creator_pubkey": hex::encode(creator_pubkey.0),
         }),
         Issuance::V2 {
             name,
@@ -529,6 +531,7 @@ fn encode_issuance(issuance: &Issuance) -> serde_json::Value {
             amount,
             cap_total,
             terms_salt,
+            creator_pubkey,
         } => serde_json::json!({
             "name": name,
             "decimals": decimals,
@@ -536,6 +539,7 @@ fn encode_issuance(issuance: &Issuance) -> serde_json::Value {
             "amount": amount.to_string(),
             "cap_total": cap_total.to_string(),
             "terms_salt": hex::encode(terms_salt.0),
+            "creator_pubkey": hex::encode(creator_pubkey.0),
         }),
     }
 }
@@ -635,6 +639,7 @@ pub(crate) mod fixtures {
                 name: "tkn".to_string(),
                 decimals: 8,
                 amount: 100,
+                creator_pubkey: xonly(0xD7),
             },
             output_templates: vec![one_output()],
         }
@@ -758,6 +763,7 @@ mod tests {
                 name: String::new(),
                 decimals: 8,
                 amount: 1,
+                creator_pubkey: xonly(0xD8),
             };
         }
         let err = validate_transition_command(&cmd).expect_err("empty name");
@@ -772,6 +778,7 @@ mod tests {
                 name: "x".repeat(MAX_ISSUANCE_NAME_BYTES + 1),
                 decimals: 8,
                 amount: 1,
+                creator_pubkey: xonly(0xD9),
             };
         }
         let err = validate_transition_command(&cmd).expect_err("long name");
@@ -919,6 +926,7 @@ mod tests {
                 name: "other".to_string(),
                 decimals: 8,
                 amount: 999,
+                creator_pubkey: xonly(0xDA),
             };
         }
         let err = submit_transition(deps(store.as_ref(), &tx, &bundles, &targets, &hw), other)

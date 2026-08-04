@@ -152,6 +152,8 @@ pub(crate) enum Issuance {
         name: String,
         decimals: u8,
         amount: u128,
+        /// Genesis spend key `Pk₀` (asset creator); required by the spec.
+        creator_pubkey: XOnlyKey,
     },
     /// `issuance_version == 2` — `cap_total` and `terms_salt` required.
     V2 {
@@ -160,6 +162,8 @@ pub(crate) enum Issuance {
         amount: u128,
         cap_total: u128,
         terms_salt: Digest32,
+        /// Genesis spend key `Pk₀` (asset creator); required by the spec.
+        creator_pubkey: XOnlyKey,
     },
 }
 

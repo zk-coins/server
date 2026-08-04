@@ -150,10 +150,7 @@ impl Account {
         }
     }
 
-    // Orphaned note (former coin-construction helper): caller (`send_coins`) is
-    // responsible for upstream balance + slot-count validation; once that is
-    // done that path cannot fail and returns `Vec<Coin>` directly so the call
-    // site has no dead `?` propagation path.
+    // Test helper: sum of on-account balance plus queued coin amounts.
     #[cfg(test)]
     pub(crate) fn get_balance(&self) -> Amount {
         self.coin_queue
@@ -361,28 +358,6 @@ impl AccountNode {
         Ok(())
     }
 
-    pub(crate) fn send_coins(
-        &mut self,
-        invoices: Vec<Invoice>,
-        account_address: Address,
-        public_key: PublicKey,
-        next_public_key: PublicKey,
-        prev_commitment_pubkey: Option<PublicKey>,
-    ) -> Result<Vec<CoinProof>, &'static str> {
-        crate::v1::refuse_legacy_send_under_v1()?;
-        let _ = (
-            invoices,
-            account_address,
-            public_key,
-            next_public_key,
-            prev_commitment_pubkey,
-            &self.accounts,
-        );
-        Err(
-            "legacy send_coins deleted (Stage 3): circuit::main builders and Prover are gone; use begin_v1_send / StateEngine",
-        )
-    }
-
     /// Legacy prove body **deleted** (Stage 3 Runde 4).
     #[allow(clippy::too_many_arguments)]
     #[allow(dead_code)]
@@ -400,70 +375,18 @@ impl AccountNode {
         )
     }
 
-    /// Prepare an issuer-mint transition WITHOUT mutating
-    /// `self.accounts` (phase 1 of the two-phase, creator-signed mint).
-    ///
-    /// Neutral, permissionless model: anyone can create their own asset
-    /// and mint their own supply. The `asset_id` is derived server-side
-    /// from `calculate_asset_id(creator_pubkey, calculate_name_hash(name),
-    /// decimals)` and the owner is the off-circuit address
-    /// `H(creator_pubkey) = SHA-256(creator_pubkey)` (#226, Variant B —
-    /// NOT bound in-circuit). The circuit's issuer-mint gate binds only
-    /// `account.asset_id == calculate_asset_id(...)` and
-    /// `account.public_key == creator_pubkey`; together with the
-    /// off-circuit creator-signature check at commit time, only the
-    /// asset's creator can bring it into existence with a non-zero balance
-    /// and nobody can forge or inflate a foreign asset.
-    ///
-    /// The mint is an Initial transition (or an AccountUpdate if the
-    /// creator already holds the asset) on the creator's OWN
-    /// `(owner, asset_id)` account that credits `amount` to the
-    /// creator's own balance — there is no privileged minting account
-    /// and no recipient coin. A deep clone of the creator account is
-    /// the unit of tentative state; the live map is untouched until the
-    /// wallet-signed commit leg ([`Self::commit_mint`]) lands.
-    ///
-    /// `coverage(off)`: drives the heavy Plonky2 prover and is invoked
-    /// only from `flow::mint_flow` (in CI's `--ignore-filename-regex`);
-    /// a unit test would have to pay a full prove. Exercised end-to-end
-    /// by the `router_tests` mint integration suite.
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare_mint(
-        &self,
-        creator_pubkey: &zkcoins_program::types::PublicKey,
-        name: &str,
-        decimals: u8,
-        amount: u64,
-        next_public_key: &zkcoins_program::types::PublicKey,
-    ) -> Result<(), &'static str> {
-        let _ = (
-            creator_pubkey,
-            name,
-            decimals,
-            amount,
-            next_public_key,
-            self,
-        );
-        Err(
-            "legacy prepare_mint deleted (Stage 3): circuit::main builders and Prover are gone; use begin_v1_mint / StateEngine",
-        )
-    }
-
     /// Atomically swap a wallet-committed issuer-mint account into the
-    /// in-memory map (phase 2 of the two-phase mint). Pair of
-    /// [`Self::prepare_mint`]; the caller MUST have verified the
-    /// creator-signed `Commitment` AND the soundness gate
-    /// (`commitment.public_key == account.public_key`) before invoking.
+    /// in-memory map (phase 2 of the residual two-phase mint). The
+    /// caller MUST have verified the creator-signed `Commitment` AND
+    /// the soundness gate (`commitment.public_key == account.public_key`)
+    /// before invoking.
     ///
     /// **Visibility (Stage 3 Runde 5):** `pub(crate)` — crate-internal
     /// only (`flow::mint_commit_flow` and unit tests). External crates
     /// must not install a pre-built legacy `Account` into the ledger
-    /// map; `prepare_mint` is already refused, so a public
-    /// `commit_mint` was a free write of old state. trybuild:
-    /// `legacy_commit_mint_unobtainable`.
+    /// map. trybuild: `legacy_commit_mint_unobtainable`.
     ///
-    /// `coverage(off)`: invoked exclusively by `flow::mint_flow` after a
+    /// `coverage(off)`: invoked by `flow::mint_commit_flow` after a
     /// successful broadcast; `flow.rs` is in the CI ignore-regex.
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn commit_mint(
@@ -765,12 +688,11 @@ impl From<sqlx::Error> for PersistAccountError {
 #[cfg(test)]
 mod inline_tests {
     //! Inline error-path tests that don't require a full Plonky2 prove.
-    //! They cover the early-return error paths in `send_coins` and the
-    //! single-line lookup paths in `get_minting_account_address`,
-    //! `get_account`, and `get_account_balance`. The Postgres-based
-    //! `load_from_pg` and `persist_account` paths are tested against a
-    //! real Postgres 17 container in `account_node_tests.rs`. The
-    //! richer prover-driven fixtures also live there.
+    //! They cover the single-line lookup paths in
+    //! `get_minting_account_address`, `get_account`, and
+    //! `get_account_balance`. The Postgres-based `load_from_pg` and
+    //! `persist_account` paths are tested against a real Postgres 17
+    //! container in `account_node_tests.rs`.
 
     use super::*;
 
@@ -878,42 +800,6 @@ mod inline_tests {
         assert_eq!(back.balance, 7);
     }
 
-    /// Helper: build a stable PublicKey for use in send_coins error
-    /// tests. Doesn't need to map to anything real — `send_coins`
-    /// returns "Unknown account address" before touching it.
-    fn dummy_secp_public_key() -> bitcoin::secp256k1::PublicKey {
-        use bitcoin::secp256k1::{Secp256k1, SecretKey};
-        let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[1u8; 32]).unwrap();
-        bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk)
-    }
-
-    #[test]
-    fn send_coins_deleted_refuses_under_any_claim() {
-        let mut node = fresh_node();
-        let account_address = zkcoins_program::hash::digest_from_bytes(&[4u8; 32]);
-        let pk = dummy_secp_public_key();
-        let result = node.send_coins(
-            vec![Invoice::new(
-                1,
-                zkcoins_program::hash::digest_from_bytes(&[5u8; 32]),
-                test_asset_id(),
-            )],
-            account_address,
-            pk,
-            pk,
-            None,
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("deleted")
-                || err.contains("legacy send")
-                || err.contains("begin_v1_send")
-                || err.contains("Prover"),
-            "unexpected refuse message: {err}"
-        );
-    }
-
     #[test]
     fn account_new_has_zero_balance_and_empty_queue() {
         let a = Account::new();
@@ -993,35 +879,6 @@ mod inline_tests {
             "unexpected: {:?}",
             err
         );
-    }
-
-    /// Mirror of `router_tests::lock_or_recover_recovers_from_poisoned_mutex`
-    /// for the `send_coins` site: poisoning the shared `state` mutex
-    /// must NOT crash the handler — the `unwrap_or_else(PoisonError::
-    /// into_inner)` recovery branch returns the inner guard so the
-    /// next check (the "Unknown account address" guard in this test)
-    /// is the one that surfaces in the response. Without this, the
-    /// recovery closure has no covering test and any future change to
-    /// the lock-acquire pattern would silently lose the poison-safe
-    /// behaviour.
-    #[test]
-    fn send_coins_deleted_does_not_touch_state_mutex() {
-        let mut node = fresh_node();
-        let pk = dummy_secp_public_key();
-        let err = node
-            .send_coins(
-                vec![Invoice::new(
-                    1,
-                    zkcoins_program::hash::digest_from_bytes(&[5u8; 32]),
-                    test_asset_id(),
-                )],
-                zkcoins_program::hash::digest_from_bytes(&[4u8; 32]),
-                pk,
-                pk,
-                None,
-            )
-            .unwrap_err();
-        assert!(err.contains("deleted") || err.contains("legacy"), "{err}");
     }
 
     #[test]

@@ -2,9 +2,12 @@
 //!
 //! Insert **before** the first mesh send attempt, atomically with the step
 //! that owes the delivery (engine + `members_ready` for external coins;
-//! Phase-B SDR finalisation for self-delivery). Completion requires a valid
-//! §4.2 ACK only. Rows remain after `completed` as a delivery log; blob/SDR
-//! material is never deleted (data permanence).
+//! Phase-B SDR finalisation for self-delivery). For `external_coin` rows,
+//! completion requires a valid §4.2 ACK only. For `self_delivery` rows,
+//! durable publish (blob stored + gift-wrap on at least one relay) is
+//! completion — there is no external counterparty to ACK. Rows remain after
+//! `completed` as a delivery log; blob/SDR material is never deleted
+//! (data permanence).
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -315,9 +318,14 @@ pub(crate) async fn list_open_for_transition(
 
 /// Record a successful publish / republish attempt.
 ///
-/// - `pending` → `awaiting_ack` with artefacts
-/// - `awaiting_ack` → stay, refresh artefacts (fresh ack_nonce) + attempt_n
-/// - **refuses** `completed` / `failed` (never republish after ACK / terminal)
+/// - `external_coin`: `pending` → `awaiting_ack` with artefacts; already
+///   `awaiting_ack` → stay, refresh artefacts (fresh ack_nonce) + attempt_n
+/// - `self_delivery`: `pending` / `awaiting_ack` → `completed` (durable
+///   publish is terminal — no external ACK is applicable)
+/// - **refuses** `completed` / `failed` (never republish after terminal)
+///
+/// Does not set `ack_received_at` — only [`mark_ack_received`] writes that
+/// column (real §4.2 ACK path for `external_coin`).
 pub(crate) async fn mark_published(
     pool: &PgPool,
     outbox_id: &[u8; 32],
@@ -335,22 +343,27 @@ pub(crate) async fn mark_published(
             bail!("mark_published: refuse republish of failed outbox entry");
         }
     }
+    let new_status = match row.kind {
+        OutboxKind::SelfDelivery => OutboxStatus::Completed,
+        OutboxKind::ExternalCoin => OutboxStatus::AwaitingAck,
+    };
     let new_attempt = row.attempt_n.saturating_add(1);
     let delay = republish_delay_secs(new_attempt);
     // next_attempt_at = NOW() + delay seconds (SQL interval).
     let result = sqlx::query(
         "UPDATE v1_delivery_outbox SET \
-             status = 'awaiting_ack', \
-             blob_id = $2, detect_tag = $3, epk = $4, k_tx = $5, ack_nonce = $6, event_id = $7, \
-             zbe_ciphertext = $8, out_ciphertext = $9, recipient_op_pk = $10, \
-             attempt_n = $11, \
+             status = $2, \
+             blob_id = $3, detect_tag = $4, epk = $5, k_tx = $6, ack_nonce = $7, event_id = $8, \
+             zbe_ciphertext = $9, out_ciphertext = $10, recipient_op_pk = $11, \
+             attempt_n = $12, \
              last_published_at = NOW(), \
-             next_attempt_at = NOW() + make_interval(secs => $12::double precision), \
+             next_attempt_at = NOW() + make_interval(secs => $13::double precision), \
              updated_at = NOW() \
          WHERE outbox_id = $1 \
            AND status IN ('pending', 'awaiting_ack')",
     )
     .bind(outbox_id.as_slice())
+    .bind(new_status.as_str())
     .bind(artefacts.blob_id.as_slice())
     .bind(artefacts.detect_tag.as_slice())
     .bind(artefacts.epk.as_slice())
@@ -536,6 +549,16 @@ mod tests {
         }
     }
 
+    fn sample_self_delivery_insert(coin: u8) -> OutboxInsert {
+        OutboxInsert {
+            kind: OutboxKind::SelfDelivery,
+            subject: [0x11; 32],
+            transition_pk: [0x22; 32],
+            coin_id: [coin; 32],
+            material: format!(r#"{{"v":1,"self":{coin}}}"#).into_bytes(),
+        }
+    }
+
     fn sample_artefacts(nonce: u8) -> PublishArtefacts {
         let zbe = vec![0xAB, 0xCD, nonce];
         PublishArtefacts {
@@ -609,6 +632,74 @@ mod tests {
             .expect("get")
             .expect("row survived reopen");
         assert_eq!(row.status, OutboxStatus::Pending);
+    }
+
+    /// Self-delivery: durable publish is terminal — no external ACK.
+    /// Row reaches `completed` and leaves `list_due` without `mark_ack_received`.
+    #[tokio::test]
+    async fn self_delivery_publish_completes_and_leaves_list_due() {
+        let scope = setup_pool().await;
+        let pool = scope.pool.clone();
+        let entry = sample_self_delivery_insert(0x91);
+        let id = outbox_id(
+            entry.kind,
+            &entry.subject,
+            &entry.coin_id,
+            &entry.transition_pk,
+        );
+        insert_pending(&pool, &[entry]).await.expect("insert");
+
+        // Pending self-delivery is due before publish.
+        let due_before = list_due(&pool).await.expect("due before");
+        assert!(
+            due_before.iter().any(|r| r.outbox_id == id),
+            "pending self_delivery must be due before publish"
+        );
+
+        let art = sample_artefacts(0xB1);
+        let zbe = art.zbe_ciphertext.clone();
+        let blob = art.blob_id;
+        mark_published(&pool, &id, &art)
+            .await
+            .expect("publish self_delivery");
+
+        let row = get_by_id(&pool, &id).await.expect("get").expect("row");
+        assert_eq!(
+            row.status,
+            OutboxStatus::Completed,
+            "self_delivery must complete on durable publish (no ACK)"
+        );
+        assert_eq!(row.kind, OutboxKind::SelfDelivery);
+        assert_eq!(row.attempt_n, 1);
+        assert_eq!(row.blob_id, Some(blob));
+        assert_eq!(row.zbe_ciphertext.as_deref(), Some(zbe.as_slice()));
+        // No fabricated ACK — only mark_ack_received sets ack_received_at.
+        let ack_is_null: bool = sqlx::query_scalar(
+            "SELECT ack_received_at IS NULL FROM v1_delivery_outbox WHERE outbox_id = $1",
+        )
+        .bind(id.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("ack_received_at IS NULL");
+        assert!(
+            ack_is_null,
+            "self_delivery completion must leave ack_received_at NULL"
+        );
+
+        let due_after = list_due(&pool).await.expect("due after");
+        assert!(
+            !due_after.iter().any(|r| r.outbox_id == id),
+            "completed self_delivery must never be due"
+        );
+
+        // Terminal: republish refused.
+        let err = mark_published(&pool, &id, &sample_artefacts(0xB2))
+            .await
+            .expect_err("completed self_delivery must never republish");
+        assert!(
+            err.to_string().contains("completed"),
+            "error names completed refuse: {err}"
+        );
     }
 
     /// Valid ACK completes the row; the row and stored artefacts remain

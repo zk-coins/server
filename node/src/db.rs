@@ -961,36 +961,10 @@ pub(crate) async fn resolve_username(
 
 // ---- Per-asset creator binding (off-circuit) ------------------------------
 
-/// Returns `Ok(true)` iff `asset_creators` already holds a row for
-/// `asset_id` whose `creator_pubkey` DIFFERS from the supplied one.
-/// `Ok(false)` when the asset is unregistered (a fresh mint) or when an
-/// existing row matches (an idempotent re-submit of the same creator).
-///
-/// This is the read leg of the off-circuit creator binding
-/// (MULTI_ASSET.md §5.3): `flow::mint_flow` calls it before staging a
-/// mint and rejects with 409 when it returns `true`, so a second party
-/// cannot mint an `asset_id` already claimed by someone else.
-pub(crate) async fn asset_creator_conflict(
-    pool: &PgPool,
-    asset_id: &[u8],
-    creator_pubkey: &[u8],
-) -> Result<bool, sqlx::Error> {
-    let row: Option<(Vec<u8>,)> =
-        sqlx::query_as("SELECT creator_pubkey FROM asset_creators WHERE asset_id = $1")
-            .bind(asset_id)
-            .fetch_optional(pool)
-            .await?;
-    Ok(match row {
-        Some((existing,)) => existing != creator_pubkey,
-        None => false,
-    })
-}
-
 /// Record `asset_id -> creator_pubkey` on a successful mint commit.
 /// `ON CONFLICT (asset_id) DO NOTHING` makes this idempotent: a re-run
 /// (or a concurrent commit that lost the race) leaves the first-writer
-/// row untouched. The caller has already verified there is no
-/// conflicting creator via [`asset_creator_conflict`].
+/// row untouched.
 /// **Visibility (Stage 3 Runde 6):** `pub(crate)`. Gated at the SQL sink.
 pub(crate) async fn register_asset_creator(
     pool: &PgPool,

@@ -181,6 +181,7 @@ message Issuance {
   string amount = 4;
   string cap_total = 5;                    // set iff issuance_version == 2
   bytes terms_salt = 6;                    // set iff issuance_version == 2
+  bytes creator_pubkey = 7;                // Pk₀ (32-byte x-only); required both versions
 }
 message TransitionRequest {
   string kind = 1;                         // "mint" | "send" | "receive"

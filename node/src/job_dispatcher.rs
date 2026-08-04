@@ -59,9 +59,9 @@ use dashmap::DashMap;
 use tokio::sync::{broadcast, mpsc, Notify};
 use uuid::Uuid;
 
-use crate::flow::{commit_flow, mint_commit_flow, mint_flow, send_flow, FlowError};
+use crate::flow::{commit_flow, mint_commit_flow, FlowError};
 use crate::job_store::{Job, JobKind, JobStatus, JobStore};
-use crate::router::{AppState, CommitRequest, MintRequest, SendCoinRequest};
+use crate::router::{AppState, CommitRequest};
 
 // `DashMap` and `Notify` are used inside the public types
 // (`JobNotifyMap`, `JobNotifier::commit_wake`) defined below — the
@@ -851,10 +851,21 @@ async fn process_mint(
         },
     );
 
-    let request: MintRequest = match serde_json::from_value(job.request_body.clone()) {
-        Ok(r) => r,
+    let (
+        subject,
+        next_pubkey,
+        npk_rand,
+        issuance_name,
+        decimals,
+        amount,
+        issuance_version,
+        cap_total,
+        terms_salt,
+        creator_pubkey,
+    ) = match parse_mint_job_body(&job.request_body) {
+        Ok(v) => v,
         Err(e) => {
-            let msg = format!("invalid mint request body: {}", e);
+            let msg = format!("invalid mint request body: {e}");
             // Allowed: proving → failed.
             if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
                 tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
@@ -877,19 +888,87 @@ async fn process_mint(
         }
     };
 
-    let (proof_id, commit_hashes) = match mint_flow(app_state, request).await {
-        Ok(out) => {
-            note_prove_outcome(app_state, Ok(())).await;
-            out
-        }
-        Err(FlowError { status, message }) => {
-            tracing::warn!(
-                "Job dispatcher: mint job {} prove leg failed ({}): {}",
+    let (nk, op_secret, current_pubkey) =
+        match resolve_mint_auth_keys(app_state, &subject, creator_pubkey) {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format!("invalid mint request body: {e}");
+                if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
+                    tracing::warn!(
+                        "Job dispatcher: fail matched 0 rows; not publishing failed event"
+                    );
+                    cleanup_pending_sign(job_store, app_state, public_id).await;
+                    notify_map.remove(&public_id);
+                    return Ok(());
+                }
+                publish_phase(
+                    notify_map,
+                    public_id,
+                    JobPhaseEvent {
+                        status: JobStatus::Failed,
+                        phase: "failed".to_string(),
+                        proof_id: None,
+                        result: None,
+                        error: Some(msg),
+                    },
+                );
+                return Ok(());
+            }
+        };
+
+    let adapter = match &app_state.v1_engine {
+        Some(a) => a,
+        None => {
+            let msg = "v1 EngineAdapter missing for mint job".to_string();
+            if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
+                tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
+            publish_phase(
+                notify_map,
                 public_id,
-                status.as_u16(),
-                message
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(msg),
+                },
             );
-            note_prove_outcome(app_state, Err(message.as_str())).await;
+            return Ok(());
+        }
+    };
+
+    let mint_req = zkcoins_prover::state_engine::MintRequest {
+        owner: shared::spec_v1::Address(subject.0),
+        nk,
+        op_secret,
+        current_pubkey,
+        next_pubkey,
+        name: issuance_name.into_bytes(),
+        decimals,
+        amount,
+        issuance_version,
+        cap_total,
+        terms_salt,
+        npk_rand,
+    };
+
+    let begin_result = adapter.with_engine(|engine| crate::v1::begin_v1_mint(engine, mint_req));
+    let pending = match begin_result {
+        Ok(p) => {
+            note_prove_outcome(app_state, Ok(())).await;
+            p
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Job dispatcher: mint job {} prove leg failed: {:#}",
+                public_id,
+                e
+            );
+            note_prove_outcome(app_state, Err("prove failed")).await;
             // Cancel may have won while proving; do not overwrite cancelled.
             if let Ok(Some(j)) = job_store.load(public_id).await {
                 if j.status == JobStatus::Cancelled {
@@ -898,6 +977,7 @@ async fn process_mint(
                     return Ok(());
                 }
             }
+            let message = fail_error_string(&format!("begin_v1_mint: {e:#}"));
             // Allowed: proving → failed.
             if !job_store
                 .fail(public_id, JobStatus::Proving, &message)
@@ -932,6 +1012,16 @@ async fn process_mint(
         }
     }
 
+    // Register live pending for stage_and_select_awaiting_signature (same
+    // receive handshake). Network from the exclusive engine.
+    let network = adapter.network();
+    let entry = crate::v1::PendingSignEntry::new(pending, network);
+    crate::v1::register_live_pending_after_begin(
+        &app_state.v1_live_pending_after_begin,
+        public_id,
+        entry,
+    );
+
     let notifier = notify_map
         .entry(public_id)
         .or_insert_with(|| Arc::new(JobNotifier::new()))
@@ -942,12 +1032,14 @@ async fn process_mint(
     // post-begin registry (begin_* → register_live_pending_after_begin) or
     // the optional test hook.
     let live_pending = resolve_live_pending_after_prove(app_state, public_id);
+    // Mint has no legacy ash/ocr surface — empty placeholders; under v1
+    // the staged PendingSignEntry supplies the §7.5 ProofData advertisement.
     let result = match stage_and_select_awaiting_signature(
         job_store,
         app_state,
         public_id,
-        &commit_hashes.account_state_hash,
-        &commit_hashes.output_coins_root,
+        "",
+        "",
         live_pending,
     )
     .await
@@ -983,8 +1075,11 @@ async fn process_mint(
             return Ok(());
         }
     };
+    // no file ProofStore id — use 0 as the sentinel already used for
+    // staged-only transitions
+    let proof_id: i64 = 0;
     match job_store
-        .set_awaiting_signature(public_id, proof_id as i64, result.clone())
+        .set_awaiting_signature(public_id, proof_id, result.clone())
         .await
     {
         Ok(true) => {}
@@ -1037,7 +1132,7 @@ async fn process_mint(
         JobPhaseEvent {
             status: JobStatus::AwaitingSignature,
             phase: "awaiting_signature".to_string(),
-            proof_id: Some(proof_id as i64),
+            proof_id: Some(proof_id),
             result: Some(result),
             error: None,
         },
@@ -1415,11 +1510,63 @@ async fn process_send_initial(
         },
     );
 
-    let request: SendCoinRequest = match serde_json::from_value(job.request_body.clone()) {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = format!("invalid send request body: {}", e);
-            // Allowed: proving → failed.
+    let (subject, next_pubkey, npk_rand, input_coins, output_templates_raw) =
+        match parse_send_job_body(&job.request_body) {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format!("invalid send request body: {e}");
+                // Allowed: proving → failed.
+                if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
+                    tracing::warn!(
+                        "Job dispatcher: fail matched 0 rows; not publishing failed event"
+                    );
+                    cleanup_pending_sign(job_store, app_state, public_id).await;
+                    notify_map.remove(&public_id);
+                    return Ok(());
+                }
+                publish_phase(
+                    notify_map,
+                    public_id,
+                    JobPhaseEvent {
+                        status: JobStatus::Failed,
+                        phase: "failed".to_string(),
+                        proof_id: None,
+                        result: None,
+                        error: Some(msg),
+                    },
+                );
+                return Ok(());
+            }
+        };
+
+    // Account must already exist (no genesis send). Engine reads nk/op_secret
+    // from the stored record — SendRequest carries neither.
+    if let Err(e) = resolve_send_auth_keys(app_state, &subject) {
+        let msg = format!("invalid send request body: {e}");
+        if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
+            tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+        publish_phase(
+            notify_map,
+            public_id,
+            JobPhaseEvent {
+                status: JobStatus::Failed,
+                phase: "failed".to_string(),
+                proof_id: None,
+                result: None,
+                error: Some(msg),
+            },
+        );
+        return Ok(());
+    }
+
+    let adapter = match &app_state.v1_engine {
+        Some(a) => a,
+        None => {
+            let msg = "v1 EngineAdapter missing for send job".to_string();
             if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
                 tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
                 cleanup_pending_sign(job_store, app_state, public_id).await;
@@ -1441,20 +1588,99 @@ async fn process_send_initial(
         }
     };
 
-    let (proof_id, commit_hashes) = match send_flow(app_state, request).await {
-        Ok(out) => {
+    let input_coin_ids: Result<Vec<_>, String> = input_coins
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| {
+            shared::spec_v1::encoding::digest_from_bytes(bytes)
+                .map_err(|e| format!("input_coins[{i}]: digest_from_bytes: {e}"))
+        })
+        .collect();
+    let input_coin_ids = match input_coin_ids {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("invalid send request body: {e}");
+            if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
+                tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(msg),
+                },
+            );
+            return Ok(());
+        }
+    };
+
+    let output_templates: Result<Vec<_>, String> = output_templates_raw
+        .into_iter()
+        .enumerate()
+        .map(|(i, (recipient, asset_id_bytes, amount))| {
+            let asset_id = shared::spec_v1::encoding::digest_from_bytes(&asset_id_bytes)
+                .map_err(|e| format!("output_templates[{i}].asset_id: digest_from_bytes: {e}"))?;
+            Ok(shared::spec_v1::CoinTemplate {
+                recipient: shared::spec_v1::Address(recipient),
+                amount,
+                asset_id,
+            })
+        })
+        .collect();
+    let output_templates = match output_templates {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("invalid send request body: {e}");
+            if !job_store.fail(public_id, JobStatus::Proving, &msg).await? {
+                tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
+            publish_phase(
+                notify_map,
+                public_id,
+                JobPhaseEvent {
+                    status: JobStatus::Failed,
+                    phase: "failed".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(msg),
+                },
+            );
+            return Ok(());
+        }
+    };
+
+    let send_req = zkcoins_prover::state_engine::SendRequest {
+        owner: shared::spec_v1::Address(subject.0),
+        input_coin_ids,
+        output_templates,
+        next_pubkey,
+        npk_rand,
+    };
+
+    let begin_result = adapter.with_engine(|engine| crate::v1::begin_v1_send(engine, send_req));
+    let pending = match begin_result {
+        Ok(p) => {
             // The prove leg succeeded (the job reaches awaiting_signature).
             note_prove_outcome(app_state, Ok(())).await;
-            out
+            p
         }
-        Err(FlowError { status, message }) => {
+        Err(e) => {
             tracing::warn!(
-                "Job dispatcher: send job {} prove leg failed ({}): {}",
+                "Job dispatcher: send job {} prove leg failed: {:#}",
                 public_id,
-                status.as_u16(),
-                message
+                e
             );
-            note_prove_outcome(app_state, Err(message.as_str())).await;
+            note_prove_outcome(app_state, Err("prove failed")).await;
             if let Ok(Some(j)) = job_store.load(public_id).await {
                 if j.status == JobStatus::Cancelled {
                     cleanup_pending_sign(job_store, app_state, public_id).await;
@@ -1462,6 +1688,7 @@ async fn process_send_initial(
                     return Ok(());
                 }
             }
+            let message = fail_error_string(&format!("begin_v1_send: {e:#}"));
             // Allowed: proving → failed.
             if !job_store
                 .fail(public_id, JobStatus::Proving, &message)
@@ -1496,6 +1723,15 @@ async fn process_send_initial(
         }
     }
 
+    // Register live pending for stage_and_select_awaiting_signature.
+    let network = adapter.network();
+    let entry = crate::v1::PendingSignEntry::new(pending, network);
+    crate::v1::register_live_pending_after_begin(
+        &app_state.v1_live_pending_after_begin,
+        public_id,
+        entry,
+    );
+
     // Register a JobNotifier *before* persisting `awaiting_signature`
     // so a fast wallet that polls and POSTs `/commit` immediately
     // observes a ready channel. `entry().or_insert_with()` is used so
@@ -1509,16 +1745,17 @@ async fn process_send_initial(
 
     // Under a v1.1 claim the job advertises the §7.5 ProofData surface
     // (from a staged PendingSignEntry), not legacy ash/ocr — a wallet
-    // that signed ash/ocr would be rejected at `/sign`. Flag-off keeps
-    // the legacy ash/ocr fields unchanged. Staging goes through
+    // that signed ash/ocr would be rejected at `/sign`. Staging goes through
     // stage_pending_sign (the only production writer of pending_sign_map).
     let live_pending = resolve_live_pending_after_prove(app_state, public_id);
+    // Send has no legacy ash/ocr surface — empty placeholders; under v1
+    // the staged PendingSignEntry supplies the §7.5 ProofData advertisement.
     let result = match stage_and_select_awaiting_signature(
         job_store,
         app_state,
         public_id,
-        &commit_hashes.account_state_hash,
-        &commit_hashes.output_coins_root,
+        "",
+        "",
         live_pending,
     )
     .await
@@ -1554,8 +1791,11 @@ async fn process_send_initial(
             return Ok(());
         }
     };
+    // no file ProofStore id — use 0 as the sentinel already used for
+    // staged-only transitions
+    let proof_id: i64 = 0;
     match job_store
-        .set_awaiting_signature(public_id, proof_id as i64, result.clone())
+        .set_awaiting_signature(public_id, proof_id, result.clone())
         .await
     {
         Ok(true) => {}
@@ -1605,7 +1845,7 @@ async fn process_send_initial(
         JobPhaseEvent {
             status: JobStatus::AwaitingSignature,
             phase: "awaiting_signature".to_string(),
-            proof_id: Some(proof_id as i64),
+            proof_id: Some(proof_id),
             result: Some(result),
             error: None,
         },
@@ -1678,6 +1918,304 @@ async fn process_send_resume(
         notifier,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Mint / Send (§2.3.1 / §2.3.2) — parse normative job body + auth resolution
+// ---------------------------------------------------------------------------
+
+/// Parsed mint job body from `encode_normative_request_body` / `encode_issuance`.
+///
+/// `(subject, next_pubkey, npk_rand, name, decimals, amount, issuance_version,
+///  cap_total, terms_salt, creator_pubkey)`.
+type ParsedMintJobBody = (
+    crate::kernel::types::SubjectAddress,
+    [u8; 32],
+    [u8; 32],
+    String,
+    u8,
+    u128,
+    u8,
+    u128,
+    [u8; 32],
+    [u8; 32],
+);
+
+/// Auth material for mint begin: nk, op_secret, current_pubkey.
+type MintAuthKeys = ([u8; 32], zkcoins_prover::state_engine::OpSecret, [u8; 32]);
+
+/// Parsed send job body from `encode_normative_request_body`.
+///
+/// `(subject, next_pubkey, npk_rand, input_coins, output_templates)` where each
+/// output template is `(recipient_raw32, asset_id_raw32, amount)`.
+type ParsedSendJobBody = (
+    crate::kernel::types::SubjectAddress,
+    [u8; 32],
+    [u8; 32],
+    Vec<[u8; 32]>,
+    Vec<([u8; 32], [u8; 32], u128)>,
+);
+
+fn parse_u128_decimal_field(s: &str, field: &str) -> Result<u128, String> {
+    s.parse::<u128>().map_err(|e| format!("{field}: {e}"))
+}
+
+/// Parse the normative mint job body that [`crate::kernel::jobs::submit`] encodes.
+fn parse_mint_job_body(body: &serde_json::Value) -> Result<ParsedMintJobBody, String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "mint job body is not a JSON object".to_string())?;
+    let subject_hex = obj
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "mint job body missing subject".to_string())?;
+    let next_hex = obj
+        .get("next_pubkey")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "mint job body missing next_pubkey".to_string())?;
+    let npk_hex = obj
+        .get("npk_rand")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "mint job body missing npk_rand".to_string())?;
+    let iss = obj
+        .get("issuance")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| "mint job body missing issuance object".to_string())?;
+
+    let subject = parse_hex32_field(subject_hex, "subject")?;
+    let next_pubkey = parse_hex32_field(next_hex, "next_pubkey")?;
+    let npk_rand = parse_hex32_field(npk_hex, "npk_rand")?;
+
+    let name = iss
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "issuance.name missing".to_string())?
+        .to_string();
+    let decimals_u64 = iss
+        .get("decimals")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "issuance.decimals missing or not a number".to_string())?;
+    let decimals = u8::try_from(decimals_u64)
+        .map_err(|_| format!("issuance.decimals must fit u8; got {decimals_u64}"))?;
+    let amount_str = iss
+        .get("amount")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "issuance.amount missing".to_string())?;
+    let amount = parse_u128_decimal_field(amount_str, "issuance.amount")?;
+    let version_u64 = iss
+        .get("issuance_version")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "issuance.issuance_version missing or not a number".to_string())?;
+    let issuance_version = u8::try_from(version_u64)
+        .map_err(|_| format!("issuance.issuance_version must fit u8; got {version_u64}"))?;
+    if issuance_version != 1 && issuance_version != 2 {
+        return Err(format!(
+            "issuance.issuance_version must be 1 or 2; got {issuance_version}"
+        ));
+    }
+    let creator_hex = iss
+        .get("creator_pubkey")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "issuance.creator_pubkey missing".to_string())?;
+    let creator_pubkey = parse_hex32_field(creator_hex, "issuance.creator_pubkey")?;
+
+    let (cap_total, terms_salt) = if issuance_version == 2 {
+        let cap_str = iss
+            .get("cap_total")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "issuance.cap_total required when issuance_version=2".to_string())?;
+        let cap = parse_u128_decimal_field(cap_str, "issuance.cap_total")?;
+        let salt_hex = iss
+            .get("terms_salt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "issuance.terms_salt required when issuance_version=2".to_string())?;
+        let salt = parse_hex32_field(salt_hex, "issuance.terms_salt")?;
+        (cap, salt)
+    } else {
+        // Standard-1: engine requires cap_total=0 and all-zero terms_salt.
+        (0u128, [0u8; 32])
+    };
+
+    Ok((
+        crate::kernel::types::SubjectAddress(subject),
+        next_pubkey,
+        npk_rand,
+        name,
+        decimals,
+        amount,
+        issuance_version,
+        cap_total,
+        terms_salt,
+        creator_pubkey,
+    ))
+}
+
+/// Resolve `nk` / `op_secret` / `current_pubkey` for a mint begin.
+///
+/// - Registered engine account (remint) → live rotated `current_pubkey`.
+/// - No account yet (genesis) → `creator_pubkey` (= Pk₀ from issuance).
+fn resolve_mint_auth_keys(
+    app_state: &AppState,
+    subject: &crate::kernel::types::SubjectAddress,
+    creator_pubkey: [u8; 32],
+) -> Result<MintAuthKeys, String> {
+    let bundle = app_state.bundles.get_active(subject).ok_or_else(|| {
+        format!(
+            "mint: no active operational bundle for subject {} (§7.7)",
+            hex::encode(subject.0)
+        )
+    })?;
+    let op_secret = zkcoins_prover::state_engine::OpSecret::new(bundle.op_secret);
+    let owner = shared::spec_v1::Address(subject.0);
+
+    let adapter = app_state
+        .v1_engine
+        .as_ref()
+        .ok_or_else(|| "mint: v1 EngineAdapter missing".to_string())?;
+
+    adapter.with_engine(|engine| {
+        if let Some(rec) = engine.account(&owner) {
+            // REMINT: wire current_pubkey is the live rotated key, not genesis.
+            if rec.nk != bundle.nk {
+                return Err(
+                    "mint: operational-bundle nk does not match registered account nk".into(),
+                );
+            }
+            if let Some(stored) = rec.op_secret {
+                if stored != op_secret {
+                    return Err(
+                        "mint: operational-bundle op_secret does not match registered account"
+                            .into(),
+                    );
+                }
+            }
+            return Ok((rec.nk, op_secret, rec.state.current_pubkey));
+        }
+        // GENESIS: engine verifies owner == H(creator_pubkey ‖ nk_commit)
+        // inside begin_mint (state_engine.rs); a wrong value fails closed there.
+        Ok((bundle.nk, op_secret, creator_pubkey))
+    })
+}
+
+/// Parse the normative send job body that [`crate::kernel::jobs::submit`] encodes.
+fn parse_send_job_body(body: &serde_json::Value) -> Result<ParsedSendJobBody, String> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| "send job body is not a JSON object".to_string())?;
+    let subject_hex = obj
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "send job body missing subject".to_string())?;
+    let next_hex = obj
+        .get("next_pubkey")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "send job body missing next_pubkey".to_string())?;
+    let npk_hex = obj
+        .get("npk_rand")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "send job body missing npk_rand".to_string())?;
+    let input_arr = obj
+        .get("input_coins")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "send job body missing input_coins".to_string())?;
+    let out_arr = obj
+        .get("output_templates")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "send job body missing output_templates".to_string())?;
+
+    let subject = parse_hex32_field(subject_hex, "subject")?;
+    let next_pubkey = parse_hex32_field(next_hex, "next_pubkey")?;
+    let npk_rand = parse_hex32_field(npk_hex, "npk_rand")?;
+
+    let mut input_coins = Vec::with_capacity(input_arr.len());
+    for (i, v) in input_arr.iter().enumerate() {
+        let h = v
+            .as_str()
+            .ok_or_else(|| format!("input_coins[{i}] is not a hex string"))?;
+        input_coins.push(parse_hex32_field(h, &format!("input_coins[{i}]"))?);
+    }
+
+    let mut output_templates = Vec::with_capacity(out_arr.len());
+    for (i, v) in out_arr.iter().enumerate() {
+        let t = v
+            .as_object()
+            .ok_or_else(|| format!("output_templates[{i}] is not an object"))?;
+        // encode_output_templates hex-encodes the raw 32-byte address (not Bech32m).
+        let recipient_hex = t
+            .get("recipient")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("output_templates[{i}].recipient missing"))?;
+        let asset_hex = t
+            .get("asset_id")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("output_templates[{i}].asset_id missing"))?;
+        let amount_str = t
+            .get("amount")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("output_templates[{i}].amount missing"))?;
+        // has_delivery is admission-only; prove leg ignores it.
+        let recipient =
+            parse_hex32_field(recipient_hex, &format!("output_templates[{i}].recipient"))?;
+        let asset_id = parse_hex32_field(asset_hex, &format!("output_templates[{i}].asset_id"))?;
+        let amount =
+            parse_u128_decimal_field(amount_str, &format!("output_templates[{i}].amount"))?;
+        output_templates.push((recipient, asset_id, amount));
+    }
+
+    Ok((
+        crate::kernel::types::SubjectAddress(subject),
+        next_pubkey,
+        npk_rand,
+        input_coins,
+        output_templates,
+    ))
+}
+
+/// Resolve that a send subject has an active operational bundle and a
+/// registered engine account whose nk/op_secret match the bundle.
+///
+/// Returns the live `current_pubkey` (not placed on `SendRequest` — the engine
+/// reads nk/op_secret/current_pubkey from its own store). Fail-closed when the
+/// subject has no active bundle or no engine account (no genesis send).
+fn resolve_send_auth_keys(
+    app_state: &AppState,
+    subject: &crate::kernel::types::SubjectAddress,
+) -> Result<[u8; 32], String> {
+    let bundle = app_state.bundles.get_active(subject).ok_or_else(|| {
+        format!(
+            "send: no active operational bundle for subject {} (§7.7)",
+            hex::encode(subject.0)
+        )
+    })?;
+    let op_secret = zkcoins_prover::state_engine::OpSecret::new(bundle.op_secret);
+    let owner = shared::spec_v1::Address(subject.0);
+
+    let adapter = app_state
+        .v1_engine
+        .as_ref()
+        .ok_or_else(|| "send: v1 EngineAdapter missing".to_string())?;
+
+    adapter.with_engine(|engine| {
+        let rec = engine.account(&owner).ok_or_else(|| {
+            format!(
+                "send: no registered account for subject {} — cannot send without a prior mint or receive",
+                hex::encode(subject.0)
+            )
+        })?;
+        if rec.nk != bundle.nk {
+            return Err(
+                "send: operational-bundle nk does not match registered account nk".into(),
+            );
+        }
+        if let Some(stored) = rec.op_secret {
+            if stored != op_secret {
+                return Err(
+                    "send: operational-bundle op_secret does not match registered account".into(),
+                );
+            }
+        }
+        Ok(rec.state.current_pubkey)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4490,18 +5028,20 @@ mod receive_job_path_and_decision_table_tests {
             },
         );
         let private_index = InMemoryPrivateIndex::shared();
-        private_index.insert_account(
-            SubjectAddress(subject),
-            AccountStateView {
-                account_state: vec![0u8; 140],
-                state_head: Digest32([0; 32]),
-                head_record_id: None,
-                send_counter: 0,
-                current_pubkey: pk0,
-                last_nullifier_pk: None,
-                last_nullifier_r: None,
-            },
-        );
+        private_index
+            .insert_account(
+                SubjectAddress(subject),
+                AccountStateView {
+                    account_state: vec![0u8; 140],
+                    state_head: Digest32([0; 32]),
+                    head_record_id: None,
+                    send_counter: 0,
+                    current_pubkey: pk0,
+                    last_nullifier_pk: None,
+                    last_nullifier_r: None,
+                },
+            )
+            .expect("insert account state fixture");
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let proof_dir = tmp.path().to_str().expect("utf8").to_string();
@@ -4779,18 +5319,20 @@ mod receive_job_path_and_decision_table_tests {
                 coin_id: Some(Digest32(coin_id)),
             })
             .expect("insert coin");
-        private_index.insert_account(
-            SubjectAddress(subject),
-            AccountStateView {
-                account_state: vec![0u8; 140],
-                state_head: Digest32([0; 32]),
-                head_record_id: None,
-                send_counter: 0,
-                current_pubkey: pk0,
-                last_nullifier_pk: None,
-                last_nullifier_r: None,
-            },
-        );
+        private_index
+            .insert_account(
+                SubjectAddress(subject),
+                AccountStateView {
+                    account_state: vec![0u8; 140],
+                    state_head: Digest32([0; 32]),
+                    head_record_id: None,
+                    send_counter: 0,
+                    current_pubkey: pk0,
+                    last_nullifier_pk: None,
+                    last_nullifier_r: None,
+                },
+            )
+            .expect("insert account state fixture");
         let bundles = BundleStore::shared();
         bundles.install_for_test(
             &SubjectAddress(subject),

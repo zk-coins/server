@@ -2,46 +2,37 @@
 //! `mint_handler` / `send_coin_handler` / `commit_handler` route
 //! handlers in `router.rs`. The Job-API refactor (PR1) moved every
 //! synchronous route off the request thread and into a single-worker
-//! background dispatcher (`job_dispatcher.rs`); the dispatcher calls
-//! the [`mint_flow`], [`send_flow`], and [`commit_flow`] entrypoints
-//! below to drive a `Job` through the state machine.
-//!
-//! The flow bodies are bit-for-bit identical to the pre-refactor
-//! handler bodies — only the I/O surface changed (no `axum::extract`s,
-//! no `Json` response; plain `Result<serde_json::Value, FlowError>`
-//! shaped responses). Every concurrency / state-advance / persistence
-//! invariant the previous handlers maintained (zk-coins/node#89's
-//! prepare-then-commit ordering, the Phase-E atomic state advance,
-//! the `commit_mint_tx` per-account upsert bundle) stays in place.
+//! background dispatcher (`job_dispatcher.rs`). Legacy prove-leg entry
+//! points (`mint_flow` / `send_flow`) are gone — mint/send prove now
+//! runs through `begin_v1_mint` / `begin_v1_send`. This module retains
+//! admit-time validators plus residual commit legs
+//! ([`commit_flow`], [`mint_commit_flow`]).
 //!
 //! ## Coverage scope
 //!
 //! This file is excluded from the 100% line / function coverage gate
 //! via the CI `--ignore-filename-regex` flag (alongside `runtime.rs`,
 //! `publisher.rs`, etc.). Rationale: the flow bodies own the
-//! interaction between the prover (a heavy synchronous engine
-//! gated behind a `tokio::task::spawn_blocking`), the publisher
-//! (which makes outbound Bitcoin broadcasts) and the database — a
-//! surface that is already proven correct by the
-//! `mint_handler_*` / `send_*` / `commit_*` integration tests in
-//! `router_tests.rs` (now driven through the `/api/jobs/*` admit
-//! handlers + the dispatcher, end-to-end).
+//! interaction between the publisher (outbound Bitcoin broadcasts) and
+//! the database — a surface that is already proven correct by the
+//! `mint_*` / `send_*` / `commit_*` integration tests in
+//! `router_tests.rs` (driven through the `/api/jobs/*` admit handlers
+//! + the dispatcher, end-to-end).
 
 use crate::account_node::{AccountNode, CoinProof};
 use crate::db;
 use crate::publisher::create_and_broadcast_inscription;
 use crate::router::{
-    lock_or_recover, map_send_coins_error, AppState, CommitRequest, MintRequest, ProofStore,
-    SendCoinRequest,
+    lock_or_recover, AppState, CommitRequest, MintRequest, ProofStore, SendCoinRequest,
 };
 use crate::NETWORK_CONFIG;
 use axum::http::StatusCode;
 use bitcoin::secp256k1::schnorr::Signature as SchnorrSignature;
 use serde_json::json;
 use shared::commitment::Commitment;
-use shared::{Invoice, ProofData};
+use shared::ProofData;
 use std::sync::Arc;
-use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
+use zkcoins_program::hash::digest_to_bytes;
 
 /// Result of a flow: either a JSON body + 2xx status code, or a
 /// (status, error_string) tuple that the dispatcher persists into the
@@ -65,14 +56,6 @@ impl FlowError {
             message: msg.into(),
         }
     }
-}
-
-/// Map a `send_coins`-style `&'static str` error onto a [`FlowError`]
-/// preserving the same status-code ladder the legacy
-/// `map_send_coins_error` produced.
-pub(crate) fn flow_err_from_send_coins(err: &str) -> FlowError {
-    let (status, body) = map_send_coins_error(err);
-    FlowError::new(status, body)
 }
 
 /// The server-derived identity of a mint: the creator's owner address
@@ -116,38 +99,6 @@ pub(crate) fn validate_mint_request(req: &MintRequest) -> Result<MintIdentity, F
     let asset_id =
         zkcoins_program::types::calculate_asset_id(&creator_pubkey, &name_hash, req.decimals);
     Ok(MintIdentity { owner, asset_id })
-}
-
-/// Resolve a caller-supplied `asset_id` hex string for a SEND.
-///
-/// There is no native / default asset (Model B): the field is REQUIRED.
-/// A missing, malformed, or wrong-length value is a hard `422` — never
-/// a silent fall-back, which would send the wrong asset under a `200`
-/// the caller cannot notice.
-fn parse_send_asset_id(
-    asset_id: Option<&str>,
-) -> Result<zkcoins_program::types::AssetId, FlowError> {
-    let hex_str = asset_id.ok_or_else(|| {
-        FlowError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "asset_id is required (no native asset)",
-        )
-    })?;
-    let raw = hex::decode(hex_str.trim_start_matches("0x")).map_err(|_| {
-        FlowError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "asset_id is not valid hex",
-        )
-    })?;
-    if raw.len() != 32 {
-        return Err(FlowError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "asset_id must be 32 bytes (64 hex chars)",
-        ));
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&raw);
-    Ok(digest_from_bytes(&arr))
 }
 
 /// Pre-flight validation of a `SendCoinRequest` body. The signature +
@@ -201,102 +152,6 @@ pub(crate) fn validate_send_request(
     from_b.copy_from_slice(&from);
     to_b.copy_from_slice(&to);
     Ok((from_b, to_b))
-}
-
-/// Drive the PROVE leg of a two-phase, creator-signed mint (phase 1).
-///
-/// Neutral, permissionless model: there is no central minting
-/// authority. The asset's creator signs the mint request; the node
-/// derives the owner (`H(creator_pubkey)`) and the asset_id, builds an
-/// issuer-mint proof on the creator's OWN `(owner, asset_id)` account
-/// that credits `amount` to the creator's own balance, and stages it.
-///
-/// This mirrors [`send_flow`]: the prove leg returns the
-/// `(proof_id, SendCommitHashes)` so the dispatcher can transition the
-/// job to `awaiting_signature` with the `account_state_hash` /
-/// `output_coins_root` hex on its result. The wallet signs those as a
-/// `Commitment` and POSTs them to `POST /api/jobs/:id/commit`; the
-/// broadcast + state-advance + apply leg lives in [`mint_commit_flow`].
-///
-/// The prove call is CPU-bound; it runs through `spawn_blocking` so the
-/// dispatcher's tokio worker is not blocked during the prove.
-pub(crate) async fn mint_flow(
-    state: &AppState,
-    request: MintRequest,
-) -> Result<(u64, SendCommitHashes), FlowError> {
-    // Stage 3: under the exclusive v1 process claim the legacy
-    // `prepare_mint` / `Prover::prove_initial` path is refused. Prove
-    // call sites go through StateEngine (`begin_v1_mint` → sign →
-    // finalise). A residual ash‖ocr mint job body cannot be served —
-    // fail loud, no silent fall-back to the legacy circuit.
-    if matches!(
-        crate::v1::process_stack_mode(),
-        Some(crate::v1::ScanStackMode::V1)
-    ) {
-        return Err(FlowError::new(
-            StatusCode::CONFLICT,
-            "Stage-3 v1 claim: legacy mint prove path refused; use begin_v1_mint \
-             (StateEngine / AssetIssuance + TransitionSignature). Silent fall-back \
-             to Prover::new / circuit::main is forbidden",
-        ));
-    }
-
-    // Re-validate (signature + timestamp). The admit handler already
-    // ran this, but the job may have been queued for a while;
-    // re-checking the timestamp here keeps the freshness window honest
-    // at prove time. `prepare_mint` re-derives owner/asset_id from the
-    // pubkey + name + decimals, so the derived identity is not needed
-    // here beyond the validation side-effect.
-    let identity = validate_mint_request(&request)?;
-    let creator_pubkey = request.creator_pubkey.serialize();
-    let next_public_key = request.next_public_key.serialize();
-    let name = request.name.clone();
-    let decimals = request.decimals;
-    let amount = request.amount;
-
-    // Off-circuit creator binding (MULTI_ASSET.md §5.3): reject a mint
-    // of an `asset_id` already claimed by a DIFFERENT creator before
-    // paying for the prove. A matching (or absent) creator passes.
-    if db::asset_creator_conflict(
-        &state.pool,
-        &digest_to_bytes(&identity.asset_id),
-        &creator_pubkey,
-    )
-    .await
-    .map_err(|e| {
-        FlowError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("asset_creator lookup failed: {}", e),
-        )
-    })? {
-        return Err(FlowError::new(
-            StatusCode::CONFLICT,
-            "asset_id is registered to a different creator",
-        ));
-    }
-
-    // Stage 3+: `prepare_mint` is a refuse stub (circuit::main / Prover gone).
-    // Keep the call so any residual legacy admit path still fails loud at the
-    // engine boundary rather than inventing a success envelope.
-    let account_node_clone = state.account_node.clone();
-    let refuse = tokio::task::spawn_blocking(move || {
-        let guard = lock_or_recover(&account_node_clone);
-        guard.prepare_mint(&creator_pubkey, &name, decimals, amount, &next_public_key)
-    })
-    .await
-    .map_err(|e| {
-        FlowError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("spawn_blocking join error: {}", e),
-        )
-    })?;
-    match refuse {
-        Ok(()) => Err(FlowError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "legacy prepare_mint returned Ok after Stage-3 deletion — refusing silent success",
-        )),
-        Err(msg) => Err(flow_err_from_send_coins(msg)),
-    }
 }
 
 /// Extract the `account_state_hash` / `output_coins_root` a mint proof
@@ -513,8 +368,9 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
 /// / `output_coins_root` hex the `mint` and `commit` completed results
 /// already carry. The wallet signs `SHA256(serialize(ash) ‖ serialize(ocr))`
 /// over them (see CONTRIBUTING "Trust model"). Bit-identical to the
-/// extraction in [`mint_flow`] / [`commit_flow`] so the value the wallet
-/// signs matches what `commit_flow` re-derives from the same proof.
+/// extraction in [`mint_proof_commit_hashes`] / [`commit_flow`] so the
+/// value the wallet signs matches what `commit_flow` re-derives from
+/// the same proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SendCommitHashes {
     /// `account_state_hash`, 32-byte digest as 64 lowercase hex chars.
@@ -541,102 +397,6 @@ pub(crate) fn send_commit_hashes(proof: &CoinProof) -> SendCommitHashes {
         account_state_hash: hex::encode(digest_to_bytes(&proof_data.account_state_hash)),
         output_coins_root: hex::encode(digest_to_bytes(&proof_data.output_coins_root)),
     }
-}
-
-/// Drive a `send` job up to and including proof generation. Returns
-/// the persisted `proof_id` plus the [`SendCommitHashes`] the wallet
-/// must sign, so the dispatcher can transition the job to
-/// `awaiting_signature` with the `account_state_hash` /
-/// `output_coins_root` hex on its result and the wallet's
-/// `POST /api/jobs/:id/commit` can look the proof up.
-///
-/// The post-signature broadcast leg lives in [`commit_flow`] — the
-/// dispatcher invokes it after the wallet signals on the per-job
-/// `Notify` channel.
-pub(crate) async fn send_flow(
-    state: &AppState,
-    request: SendCoinRequest,
-) -> Result<(u64, SendCommitHashes), FlowError> {
-    // Stage 3: residual legacy send builds InCoinSourceWitness +
-    // source-aggregator. Under the v1 claim that path is refused
-    // (also gated inside AccountNode::send_coins); fail here first so
-    // the job never touches the legacy Prover.
-    if matches!(
-        crate::v1::process_stack_mode(),
-        Some(crate::v1::ScanStackMode::V1)
-    ) {
-        return Err(FlowError::new(
-            StatusCode::CONFLICT,
-            crate::v1::LEGACY_SEND_REFUSED_UNDER_V1.to_string(),
-        ));
-    }
-
-    let (from_address_bytes, to_address_bytes) = validate_send_request(&request)?;
-    let from_address = digest_from_bytes(&from_address_bytes);
-    let to_address = digest_from_bytes(&to_address_bytes);
-
-    let public_key = request.public_key;
-    let next_public_key = request.next_public_key;
-    let prev_commitment_pubkey = request.prev_commitment_pubkey;
-    let amount = request.amount;
-    let send_asset_id = parse_send_asset_id(request.asset_id.as_deref())?;
-
-    // The prove call is CPU-bound; push it through spawn_blocking so
-    // the dispatcher's tokio worker is not blocked during the prove.
-    let account_node_clone = state.account_node.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<(CoinProof, Vec<u8>), FlowError> {
-        let mut guard = lock_or_recover(&account_node_clone);
-        let res = guard.send_coins(
-            vec![Invoice::new(amount, to_address, send_asset_id)],
-            from_address,
-            public_key,
-            next_public_key,
-            prev_commitment_pubkey,
-        );
-        match res {
-            Ok(mut coin_proofs) => {
-                let snap = AccountNode::serialize_account(
-                    guard
-                        .get_account(&from_address, &send_asset_id)
-                        .expect("send_coins Ok implies the sender account is in memory"),
-                );
-                let proof = coin_proofs
-                    .pop()
-                    .expect("send_coins returns at least one coin_proof on Ok");
-                Ok((proof, snap))
-            }
-            Err(e) => {
-                let mapped = map_send_coins_error(e);
-                tracing::warn!("send_coins rejected: {} (status={})", e, mapped.0);
-                Err(FlowError::new(mapped.0, mapped.1))
-            }
-        }
-    })
-    .await
-    .map_err(|e| {
-        FlowError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("spawn_blocking join error: {}", e),
-        )
-    })??;
-
-    let (coin_proof, updated_account_bytes) = result;
-    // Derive the commit hashes BEFORE the proof is moved into the
-    // store, from the same public-input path `commit_flow` re-derives —
-    // so the hex the wallet signs matches what the broadcast leg later
-    // verifies the commitment against.
-    let commit_hashes = send_commit_hashes(&coin_proof);
-    let proof_id = state.proof_store.add_proof(coin_proof);
-
-    // The sender account is keyed by `(from_address, send_asset_id)`.
-    let key_bytes = crate::account_node::account_key_bytes(&from_address, &send_asset_id);
-    if let Err(e) =
-        db::upsert_account_with_source(&state.pool, &key_bytes, &updated_account_bytes, "send")
-            .await
-    {
-        eprintln!("Failed to upsert sender account after send: {}", e);
-    }
-    Ok((proof_id, commit_hashes))
 }
 
 /// Parse + verify a `CommitRequest` and then broadcast the commitment

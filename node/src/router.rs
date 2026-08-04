@@ -21,7 +21,9 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -471,35 +473,18 @@ pub(crate) struct ReceiveCoinRequest {
 
 /// Persistent proof store — survives node restarts.
 /// Each proof is stored as an individual file: /data/proofs/{id}.bin
+///
+/// Write path (`add_proof` / `next_id`) removed with the legacy send prove
+/// leg; residual callers only read (`get_proof`) or plant test fixtures.
 pub(crate) struct ProofStore {
     dir: String,
-    next_id: AtomicU64,
 }
 
 impl ProofStore {
     pub(crate) fn new(dir: &str) -> Self {
         std::fs::create_dir_all(dir).ok();
-        // Scan existing files to find the highest ID
-        let max_id = std::fs::read_dir(dir)
-            .ok()
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| {
-                        e.file_name()
-                            .to_str()?
-                            .strip_suffix(".bin")?
-                            .parse::<u64>()
-                            .ok()
-                    })
-                    .max()
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
-
         ProofStore {
             dir: dir.to_string(),
-            next_id: AtomicU64::new(max_id + 1),
         }
     }
 
@@ -512,63 +497,11 @@ impl ProofStore {
         Some(base.join(format!("{}.bin", id)))
     }
 
-    // Vestigial: `add_proof` is only reachable from the now-removed
-    // synchronous `/api/send` handler. The Job-API replacement
-    // (`jobs_send_handler` → `dispatcher::process_send_job`) hands
-    // the resulting `CoinProof` directly to the wallet via the
-    // `proof_id` field on the job row and never writes to the file
-    // store. Kept on disk so a wallet that still posts to
-    // `/api/receive` with an old `proof_id` hits the legacy path
-    // (which now never produces one). Marked `coverage(off)` because
-    // an honest test would have to construct a `CoinProof` through
-    // the Plonky2 prover, which is a >40-s job for a handler that
-    // will be removed in the follow-up wallet-migration PR.
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    pub(crate) fn add_proof(&self, proof_with_commitment: CoinProof) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let path = self
-            .proof_path(id)
-            .expect("proof store directory exists (created in ProofStore::new)");
-        let bytes =
-            bincode::serialize(&proof_with_commitment).expect("CoinProof is always serializable");
-        Self::persist_proof_bytes(&path, &bytes, id);
-        id
-    }
-
-    /// Best-effort persist: write `bytes` to `path` atomically, log the
-    /// I/O error if the write fails. Extracted so the error arm can be
-    /// exercised directly without having to construct a real `CoinProof`
-    /// (which requires the Plonky2 prover to run).
-    ///
-    /// "Atomic" here means write-to-temp + rename. `File::create` +
-    /// `sync_all` flushes the data file before the rename, and the
-    /// final rename is a single inode swap from the OS's perspective,
-    /// so a crash between the two never leaves a half-written
-    /// `{id}.bin` for `get_proof` to find. Inlined (rather than calling
-    /// a shared `atomic_write` helper) because the only remaining
-    /// user after PR-A3 is this proof store — `accounts.bin`,
-    /// `usernames.bin`, and `minting_num_pubkeys.bin` all moved to
-    /// Postgres.
-    fn persist_proof_bytes(path: &std::path::Path, bytes: &[u8], id: u64) {
-        let path_str = path.to_str().unwrap_or("");
-        let tmp_path = format!("{}.tmp", path_str);
-        let result: std::io::Result<()> = (|| {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&tmp_path, path_str)?;
-            Ok(())
-        })();
-        if let Err(e) = result {
-            eprintln!("Failed to persist proof {}: {}", id, e);
-        }
-    }
-
-    // Vestigial pair to `add_proof`; the only call site
-    // (`get_proof_handler`) is reached via the legacy `/api/proof/:id`
-    // endpoint (now 410 Gone — Stage 3 Runde 5). See `add_proof` for the
-    // deprecation rationale and the coverage-off reason.
+    // Residual read path for `flow::commit_flow` (legacy ash‖ocr commit)
+    // and the 410-Gone `/api/proof/:id` handler. Marked `coverage(off)`
+    // because an honest production write would require a CoinProof from
+    // the deleted legacy prove leg; tests plant bytes via
+    // `plant_raw_for_test`.
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn get_proof(&self, id: u64) -> Option<CoinProof> {
         let path = self.proof_path(id)?;
@@ -588,10 +521,10 @@ impl ProofStore {
 }
 
 /// A staged issuer-mint awaiting the creator's signature (phase 1 → 2
-/// of the two-phase mint). Built by `flow::mint_flow`'s prove leg and
-/// consumed by `flow::mint_commit_flow` once the wallet returns a
-/// signed `Commitment`. Carries everything the commit leg needs to run
-/// the off-circuit creator binding and apply the balance increase.
+/// of the residual two-phase mint). Consumed by `flow::mint_commit_flow`
+/// once the wallet returns a signed `Commitment`. Carries everything the
+/// commit leg needs to run the off-circuit creator binding and apply the
+/// balance increase.
 pub(crate) struct StagedMint {
     /// The issuer-mint proof (no out-coins; increases the creator's own
     /// balance). The wallet signs its `account_state_hash ||
@@ -617,9 +550,8 @@ pub(crate) struct StagedMint {
 /// then times out at `awaiting_signature` and the creator re-submits
 /// (same boot-resume semantics as a send).
 /// Staged-mint map for residual legacy `mint_commit_flow`. Stage 3 deleted
-/// the prove-side `add` path (`prepare_mint` always refuses); the map stays
-/// so a commit against an unknown `proof_id` still returns 404 rather than
-/// a type-level hole.
+/// the prove-side `add` path; the map stays so a commit against an unknown
+/// `proof_id` still returns 404 rather than a type-level hole.
 #[derive(Default)]
 pub(crate) struct MintStore {
     #[cfg(test)]
@@ -666,99 +598,6 @@ pub(crate) struct SendCoinResponse {
     pub(crate) account_state_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) output_coins_root: Option<String>,
-}
-
-/// Map a `send_coins` error string to an HTTP status code plus a
-/// client-safe body message.
-///
-/// Threat model (memory `feedback_threat_model_over_checklist`):
-///
-/// - **422 UNPROCESSABLE_ENTITY** — the request is well-formed but the
-///   witness is invalid (insufficient balance, in-coin not in source's
-///   output_coins_root, source commitment not in history MMR, etc.).
-///   The defense-in-depth shim added in PR #26 (Stage 5d-next-5
-///   Phase 2b) produces two of these strings in microseconds before
-///   the minute-scale prove cost is paid; surfacing the specific
-///   string lets clients distinguish "fix your inclusion proof" from
-///   "fix your account selection".
-/// - **404 NOT_FOUND** — sender address is not known to the node.
-/// - **500 INTERNAL_SERVER_ERROR** — the prover failed. Body collapses
-///   to a generic `"prove failed"` to avoid leaking prover-internal
-///   state to the caller. The full error string is logged via
-///   `eprintln!` in the handler.
-///
-/// The historical 400 `"prev_commitment_pubkey required for account
-/// update"` is unreachable as of the
-/// [`Account::commitment_public_key`] refactor: the server reads the
-/// previous commitment pubkey from its own state instead of trusting
-/// the caller. The match arm is therefore gone.
-pub(crate) fn map_send_coins_error(err: &str) -> (StatusCode, &'static str) {
-    match err {
-        "Unknown account address" => (StatusCode::NOT_FOUND, "Unknown account address"),
-        "Insufficient funds" => (StatusCode::UNPROCESSABLE_ENTITY, "Insufficient funds"),
-        // `get_merkle_proofs` failures — reachable from `send_coins`
-        // via the `prev_commitment_pubkey` path. The client supplied
-        // the wrong public key, or the previous proof references a
-        // history root the node hasn't seen yet (stale snapshot).
-        // Both are caller-fixable, hence 422 rather than 500.
-        "Unable to get merkle proofs for provided public key" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Unable to get merkle proofs for provided public key",
-        ),
-        "Unable to get mmr inclusion proof for the previous root" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Unable to get mmr inclusion proof for the previous root",
-        ),
-        // Truncated proof public-inputs vector — the proof stored on
-        // the account is corrupt or was produced by an incompatible
-        // build of the prover. Not caller-fixable; surfaces as 500.
-        "Proof public_inputs too short" => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Proof public_inputs too short",
-        ),
-        "In-coin not present in source's output_coins_root" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "In-coin not present in source's output_coins_root",
-        ),
-        "Source commitment not present in history MMR" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Source commitment not present in history MMR",
-        ),
-        "Coin is missing commitment" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Coin is missing commitment",
-        ),
-        "Should provide an inclusion proof" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Should provide an inclusion proof",
-        ),
-        "Coin should not exist in coin history tree" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Coin should not exist in coin history tree",
-        ),
-        "Coin should not exist in tree yet" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Coin should not exist in tree yet",
-        ),
-        "Too many in-coins for one transition" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Too many in-coins for one transition",
-        ),
-        "Too many out-coins for one transition" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Too many out-coins for one transition",
-        ),
-        // Gap G9: residual legacy send under a v1.1 process claim. The
-        // body is the full `LEGACY_SEND_REFUSED_UNDER_V1` string; match
-        // by prefix so a wording tweak of the tail does not silently
-        // become a 500.
-        s if s.starts_with("legacy send refused under ZKCOINS_V1_SHADOW=1") => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "legacy send refused under v1.1; use begin_v1_send (CoinHist provenance)",
-        ),
-        s if s.ends_with("failed") => (StatusCode::INTERNAL_SERVER_ERROR, "prove failed"),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
-    }
 }
 
 /// Build a `SendCoinResponse` for a request-level failure (hex
@@ -1114,9 +953,9 @@ pub(crate) async fn receive_coin_handler(
 // not-found arm (404) is still covered by
 // `get_proof_handler_returns_404_for_unknown_id` so we keep the
 // behavioural test green; only the file-found branch is excluded
-// from coverage because the prover round-trip needed to populate
-// `next_id` and the on-disk `.bin` is the same prohibitive cost as
-// the receive happy path.
+// from coverage because constructing a real `CoinProof` for the
+// on-disk `.bin` is the same prohibitive cost as the receive happy
+// path (tests plant opaque bytes via `plant_raw_for_test`).
 #[utoipa::path(
     get,
     path = "/api/proof/{id}",

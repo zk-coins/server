@@ -68,10 +68,9 @@
 //! provenance is
 //! [`ReceivedAuthorization`](zkcoins_prover::prover_bridge::ReceivedAuthorization)
 //! (creating proof + clause-10 bindings). The legacy
-//! `InCoinSourceWitness` + source-aggregator path is refused on residual
-//! [`crate::account_node::AccountNode::send_coins`]
-//! ([`refuse_legacy_send_under_v1`]) and is unrepresentable on
-//! [`begin_v1_send`] (no parameter, no field). See [`provenance`].
+//! `InCoinSourceWitness` + source-aggregator path is unrepresentable on
+//! [`begin_v1_send`] (no parameter, no field); residual legacy send prove
+//! entries have been removed. See [`provenance`].
 
 mod adapter;
 // Orchestration modules: no public items of their own. External edge
@@ -170,7 +169,6 @@ pub use mode::{v1_boot_pins_from_env, v1_shadow_mode_from_env, V1BootPins, V1Sha
 pub use nostr::profile::PaymentInvoice;
 /// Kernel-API (§7.5): gRPC send begin — CoinHist provenance orchestration.
 pub use provenance::begin_v1_send;
-pub(crate) use provenance::{refuse_legacy_send_under_v1, LEGACY_SEND_REFUSED_UNDER_V1};
 pub use publish::{connect_v1_publisher, v1_publisher_env_from_env, V1Publisher, V1PublisherEnv};
 pub(crate) use receive::refuse_legacy_receive_under_v1;
 pub use receive::resume_all_pending_publishes;

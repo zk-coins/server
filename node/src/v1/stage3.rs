@@ -374,30 +374,6 @@ fn scanner_rejects_non_v3_payload() {
     );
 }
 
-/// Property 3 (runtime half): production AccountNode constructors that
-/// the binary uses carry no legacy Prover. Construction of `Prover`
-/// itself is sealed — see compile-fail matrix for `Prover::new`.
-#[test]
-fn stage3_account_node_has_no_legacy_prover() {
-    use crate::account_node::AccountNode;
-    use crate::state::State;
-    use std::sync::{Arc, Mutex};
-
-    let node = AccountNode::new(Arc::new(Mutex::new(State::new())));
-    // Under no process claim, prepare_mint reaches the prover borrow and
-    // refuses because Stage-3 nodes carry `prover: None`.
-    let err = node
-        .prepare_mint(&[0x02; 33], "x", 0, 1, &[0x03; 33])
-        .expect_err("prepare_mint without prover must refuse");
-    assert!(
-        err.contains("Stage-3")
-            || err.contains("unreachable")
-            || err.contains("legacy")
-            || err.contains("Prover"),
-        "unexpected refuse message: {err}"
-    );
-}
-
 /// Property 2 (capability half): the sealed legacy scan cap is only
 /// mintable under this crate's `#[cfg(test)]` — which this unit test
 /// is. That does **not** reopen the production edge; compile-fail

@@ -295,17 +295,45 @@ impl InMemoryPrivateIndex {
 
     /// Insert or replace authoritative account state for `subject`.
     ///
-    /// Test plant only today — production account state lands via the
-    /// receive/finalise engine path, not this process-local index. Kept
-    /// under `cfg(test)` so the lib target does not carry a dead writer.
-    #[cfg(test)]
-    pub(crate) fn insert_account(&self, subject: SubjectAddress, view: AccountStateView) {
-        let mut guard = self.accounts.lock().unwrap_or_else(|p| p.into_inner());
+    /// Production writer for the process-local account-state cache — called from the boot-time
+    /// hydrate (`runtime.rs`, reading every account the engine restored at startup) and from
+    /// the post-finalise mirror (`v1::signature::finalise_accepted_prove_persist_and_stage`,
+    /// immediately after a transition durably advances the engine's account state,
+    /// unconditionally). Also used by tests to plant fixtures.
+    ///
+    /// Monotonic guard: an existing slot is only overwritten when the incoming
+    /// `view.send_counter` is `>=` the stored slot's — an out-of-order / lapped write can never
+    /// clobber a newer cached balance with an older one. Belt-and-suspenders to the
+    /// `post == entry + 1` guard already enforced in `signature.rs`. A rejected (stale) write is
+    /// logged, not silently dropped — it is not itself a finalise-failing error: the engine's
+    /// own state is unaffected, only this read-side cache write is skipped.
+    pub(crate) fn insert_account(
+        &self,
+        subject: SubjectAddress,
+        view: AccountStateView,
+    ) -> KernelResult<()> {
+        let mut guard = self.accounts.lock().map_err(|e| {
+            KernelError::with_internal(
+                KernelErrorCode::InternalError,
+                "Failed to insert account state",
+                format!("private-index mutex poisoned: {e}"),
+            )
+        })?;
         if let Some((_, slot)) = guard.iter_mut().find(|(s, _)| *s == subject) {
-            *slot = view;
+            if view.send_counter >= slot.send_counter {
+                *slot = view;
+            } else {
+                tracing::warn!(
+                    subject = %hex::encode(subject.0),
+                    incoming_send_counter = view.send_counter,
+                    stored_send_counter = slot.send_counter,
+                    "insert_account: refusing to overwrite a newer cached account state with an older one"
+                );
+            }
         } else {
             guard.push((subject, view));
         }
+        Ok(())
     }
 
     /// Own-node load of a verified CoinProof body by `(subject, coin_id)`.
@@ -1121,18 +1149,20 @@ mod tests {
         let now = 3_000u64;
         let subj = subject(4);
 
-        index.insert_account(
-            subj,
-            AccountStateView {
-                account_state: vec![1, 2, 3],
-                state_head: digest(9),
-                head_record_id: None,
-                send_counter: 0,
-                current_pubkey: [0xEE; 32],
-                last_nullifier_pk: None,
-                last_nullifier_r: None,
-            },
-        );
+        index
+            .insert_account(
+                subj,
+                AccountStateView {
+                    account_state: vec![1, 2, 3],
+                    state_head: digest(9),
+                    head_record_id: None,
+                    send_counter: 0,
+                    current_pubkey: [0xEE; 32],
+                    last_nullifier_pk: None,
+                    last_nullifier_r: None,
+                },
+            )
+            .expect("insert account state fixture");
 
         let grant_pull = open_and_pull(OpenAndPullSetup {
             challenges: &challenges,
@@ -1183,6 +1213,42 @@ mod tests {
         .expect("ownership GetAccountState");
         assert_eq!(view.account_state, vec![1, 2, 3]);
         assert_eq!(view.send_counter, 0);
+    }
+
+    /// Monotonic guard: an older `send_counter` must not clobber a newer cached view.
+    #[test]
+    fn insert_account_refuses_stale_send_counter() {
+        let index = InMemoryPrivateIndex::new();
+        let subj = subject(7);
+        let newer = AccountStateView {
+            account_state: vec![0xAA],
+            state_head: digest(1),
+            head_record_id: None,
+            send_counter: 5,
+            current_pubkey: [0x11; 32],
+            last_nullifier_pk: Some([0x22; 32]),
+            last_nullifier_r: Some([0x33; 32]),
+        };
+        let older = AccountStateView {
+            account_state: vec![0xBB],
+            state_head: digest(2),
+            head_record_id: None,
+            send_counter: 4,
+            current_pubkey: [0x44; 32],
+            last_nullifier_pk: None,
+            last_nullifier_r: None,
+        };
+        index
+            .insert_account(subj, newer.clone())
+            .expect("insert newer");
+        index
+            .insert_account(subj, older)
+            .expect("stale insert is Ok (rejected by guard, not an error)");
+        let kept = index.get_account_state(&subj).expect("read");
+        assert_eq!(
+            kept, newer,
+            "newer cached state must survive a stale overwrite"
+        );
     }
 
     #[test]

@@ -650,6 +650,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             let delivery_port: Arc<dyn crate::v1::OutgoingDeliveryPort> =
                 Arc::clone(&shared_delivery_port);
             let delivery_rng = Arc::clone(&shared_delivery_rng);
+            let private_index = Arc::clone(&shared_private_index);
             // Self-delivery relays = bootstrap seed relays (non-empty after
             // verified BMF1). Empty → Phase A refuses (no invent).
             let self_relays: Vec<String> = manifest_store
@@ -666,6 +667,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                 let delivery_targets = Arc::clone(&delivery_targets);
                 let delivery_port = Arc::clone(&delivery_port);
                 let delivery_rng = Arc::clone(&delivery_rng);
+                let private_index = Arc::clone(&private_index);
                 let self_relays = self_relays.clone();
                 let ops_for_delivery = ops_for_delivery.clone();
                 // publisher_pubkey is filled by the dispatcher from the job
@@ -723,6 +725,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                         None,
                         fence,
                         publisher,
+                        private_index.as_ref(),
                         delivery_deps,
                     )
                     .await
@@ -1038,6 +1041,60 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                         "§7.6 hand-off queue: list_resumable_pending_publishes failed \
                          ({e:#}) — not treating as empty; drain starts without hydrate"
                     );
+                }
+            }
+        }
+
+        // Boot-hydrate the process-local `GetAccountState` read cache from the
+        // durably-reloaded engine. `shared_private_index` starts empty on every boot; without
+        // this, an account that does not transition again after a restart stays invisible to
+        // GetAccountState even though the engine already holds its state. Fail-closed: any
+        // serialize/hash error aborts boot rather than silently skipping that account (same
+        // view-builder the post-finalise mirror uses, so a restarted process and a live
+        // finalise agree on the same fields).
+        if let Some(engine) = v1_engine.as_ref() {
+            let hydrated: Result<
+                Vec<(
+                    crate::kernel::types::SubjectAddress,
+                    crate::kernel::access::AccountStateView,
+                )>,
+                anyhow::Error,
+            > = engine.with_engine(|state_engine| {
+                state_engine
+                    .accounts()
+                    .map(|(owner, rec)| {
+                        crate::v1::signature::account_state_view_from_record(rec)
+                            .map(|view| (crate::kernel::types::SubjectAddress(owner.0), view))
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "account_state_view_from_record for {}: {e}",
+                                    hex::encode(owner.0)
+                                )
+                            })
+                    })
+                    .collect()
+            });
+            match hydrated {
+                Ok(views) => {
+                    let n = views.len();
+                    for (subject, view) in views {
+                        shared_private_index
+                            .insert_account(subject, view)
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "boot-hydrate account-state cache: insert failed: {e}"
+                                )
+                            })?;
+                    }
+                    tracing::info!(
+                        accounts = n,
+                        "GetAccountState read cache hydrated from engine at boot"
+                    );
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "boot-hydrate account-state cache from engine failed: {e:#}"
+                    ));
                 }
             }
         }
