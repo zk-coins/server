@@ -154,6 +154,20 @@ async fn main() -> Result<(), Box<dyn StdError>> {
          prove path = StateEngine / ProverBridge (legacy Prover::new is not on \
          the binary path)"
     );
+    // §3.6 pins must be installed before ANY circuit C build — including the
+    // ledger-load `last_proof` bind inside `EngineAdapter::load_or_create_from_env`
+    // — so `ProverBridge::ensure_proving_identity` is armed for both roles.
+    let pins = v1::mode::v1_boot_pins_from_env().expect("v1 pins re-read after adapter boot");
+    zkcoins_prover::prover_bridge::ProverBridge::install_network_pins(
+        pins.network,
+        pins.network_params.circuit_digest_c(),
+        pins.network_params.circuit_digest_c_balance(),
+    )
+    .expect(
+        "install §3.6 circuit pins before any circuit build (ledger load or \
+         first prove) so every build is checked against the pinned digest — \
+         a boot that cannot arm the identity gate must fail loudly",
+    );
     let v1_adapter = Arc::new(
         node::v1::EngineAdapter::load_or_create_from_env((*pool).clone())
             .await
@@ -188,28 +202,77 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // Jobs in flight across the reset cannot advance (generation CAS).
     let proofs_dir = std::env::var("PROOFS_DIR").unwrap_or_else(|_| "./proofs".to_string());
 
-    let pins = v1::mode::v1_boot_pins_from_env().expect("v1 pins re-read after adapter boot");
-    let live_digest = v1::resolve_v1_live_digest(
-        pins.network,
-        &pins.network_params.circuit_digest_c(),
-        &pins.network_params.circuit_digest_c_balance(),
-    )
-    .unwrap_or_else(|e| {
-        panic!("v1 live circuit digest (just-built circuit vs §3.6 pins): {e}");
+    let verifier_cache_role = v1::verifier_cache_role_from_env().unwrap_or_else(|e| {
+        panic!("{e}");
     });
-    let verifier_cache_dir = std::env::var("ZKCOINS_VERIFIER_CACHE_DIR").expect(
-        "ZKCOINS_VERIFIER_CACHE_DIR must be set — a boot that cannot persist its trust anchor must fail loudly",
-    );
-    zkcoins_prover::verifier_cache::write_balance_verifier_cache(
-        pins.network,
-        std::path::Path::new(&verifier_cache_dir),
-    )
-    .expect("write C_balance verifier cache to ZKCOINS_VERIFIER_CACHE_DIR");
-    println!(
-        "v1 self-heal: live digest = tagged C||C_balance from the circuits \
-         just built through ProverBridge (matched §3.6 pins at construction; \
-         set ZKCOINS_V1_SLOW_CANARY=1 for verify_transition canary)"
-    );
+    let live_digest = match verifier_cache_role {
+        v1::VerifierCacheRole::Primary => {
+            let live_digest = v1::resolve_v1_live_digest(
+                pins.network,
+                &pins.network_params.circuit_digest_c(),
+                &pins.network_params.circuit_digest_c_balance(),
+            )
+            .unwrap_or_else(|e| {
+                panic!("v1 live circuit digest (just-built circuit vs §3.6 pins): {e}");
+            });
+            let verifier_cache_dir = std::env::var("ZKCOINS_VERIFIER_CACHE_DIR").expect(
+                "ZKCOINS_VERIFIER_CACHE_DIR must be set — a boot that cannot persist its trust anchor must fail loudly",
+            );
+            zkcoins_prover::verifier_cache::write_balance_verifier_cache(
+                pins.network,
+                std::path::Path::new(&verifier_cache_dir),
+            )
+            .expect("write C_balance verifier cache to ZKCOINS_VERIFIER_CACHE_DIR");
+            println!(
+                "v1 self-heal: live digest = tagged C||C_balance from the circuits \
+                 just built through ProverBridge (matched §3.6 pins at construction; \
+                 set ZKCOINS_V1_SLOW_CANARY=1 for verify_transition canary)"
+            );
+            live_digest
+        }
+        v1::VerifierCacheRole::Secondary => {
+            // Intentionally re-read here (not hoisted): the Primary arm must
+            // keep its historical statement order, including its own env read.
+            let verifier_cache_dir = std::env::var("ZKCOINS_VERIFIER_CACHE_DIR").expect(
+                "ZKCOINS_VERIFIER_CACHE_DIR must be set — a boot that cannot persist its trust anchor must fail loudly",
+            );
+            let cached = zkcoins_prover::verifier_cache::load_balance_verifier_cache_checked(
+                pins.network,
+                std::path::Path::new(&verifier_cache_dir),
+                &pins.network_params.circuit_digest_c_balance(),
+            )
+            .expect(
+                "secondary boot: shared C_balance verifier cache at ZKCOINS_VERIFIER_CACHE_DIR \
+                 must already exist (written by a primary boot) and pass the §3.6 pin check — \
+                 secondary never builds C_balance (at boot or at prove time; identity is \
+                 satisfied from this cache-verified digest)",
+            );
+            // Cache load already recomputed C_balance's digest and checked it
+            // against the pin; mark the balance identity gate so first
+            // prove_transition builds only the small C circuit.
+            zkcoins_prover::prover_bridge::ProverBridge::mark_balance_identity_verified_from_cache(
+                pins.network,
+                cached.balance_circuit_digest_bytes(),
+            )
+            .expect(
+                "mark C_balance identity verified from the loaded cache so the secondary satisfies \
+                 the balance gate without rebuilding the ~100 GiB circuit",
+            );
+            let live_digest = v1::secondary_boot_live_digest(
+                &pins.network_params.circuit_digest_c(),
+                &cached.balance_circuit_digest_bytes(),
+            );
+            println!(
+                "v1 self-heal: secondary boot — live digest = tagged C||C_balance from \
+                 cache-verified C_balance (recomputed digest matched §3.6 pin; identity \
+                 marked ready at boot — secondary never builds C_balance) and pin C \
+                 (small C is built and pin-checked lazily on first prove_transition / \
+                 verify_transition via ProverBridge::ensure_proving_identity; \
+                 set ZKCOINS_V1_SLOW_CANARY=1 for verify_transition canary)"
+            );
+            live_digest
+        }
+    };
     let heal_decision =
         node::self_heal::heal_circuit_digest(&pool, &live_digest, &proofs_dir, &|| {
             v1::v1_canary_for_heal(&v1_adapter)

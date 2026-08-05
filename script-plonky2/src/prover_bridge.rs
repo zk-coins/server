@@ -586,8 +586,13 @@ impl ProverBridge {
         };
         match pins_slot(network).set(pins) {
             Ok(()) => Ok(()),
-            Err(existing) => {
-                if existing.c == pin_c && existing.c_balance == pin_c_balance {
+            Err(_rejected) => {
+                // OnceLock::set returns Err(the value we passed), NOT the stored value.
+                // Read the actually-stored pins to compare (no silent pin swap).
+                let stored = pins_slot(network)
+                    .get()
+                    .expect("pins slot is initialised after set() was rejected");
+                if stored.c == pin_c && stored.c_balance == pin_c_balance {
                     Ok(())
                 } else {
                     bail!(
@@ -598,6 +603,42 @@ impl ProverBridge {
                 }
             }
         }
+    }
+
+    /// Record that C_balance's construction-time identity is satisfied for
+    /// `network` from a verified verifier-data cache (§1.7.9). The caller MUST
+    /// have loaded the cache through `verifier_cache::load_balance_verifier_cache_checked`,
+    /// which recomputes C_balance's circuit_digest from the loaded constants and
+    /// requires it to equal the pinned digest — cryptographically equivalent to a
+    /// local build's digest check. This lets a secondary node satisfy the balance
+    /// identity gate WITHOUT rebuilding the ~100 GiB C_balance circuit; the actual
+    /// prover circuit is still built lazily if this node ever PROVES a balance
+    /// statement (see `balance_circuit`).
+    pub fn mark_balance_identity_verified_from_cache(
+        network: Network,
+        verified_c_balance_digest: [u8; 32],
+    ) -> Result<()> {
+        // Belt-and-suspenders: the cache-verified digest must match the installed pin.
+        match pins_slot(network).get() {
+            Some(pins) => {
+                if pins.c_balance != verified_c_balance_digest {
+                    bail!(
+                        "cache-verified C_balance digest does not match installed pin for \
+                         {:?}; refusing to mark verified",
+                        network
+                    );
+                }
+            }
+            None => {
+                bail!(
+                    "install_network_pins must run before \
+                     mark_balance_identity_verified_from_cache for {:?}",
+                    network
+                );
+            }
+        }
+        balance_verified_flag(network).store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Whether both circuits for this network have been built and pin-checked
@@ -694,9 +735,16 @@ impl ProverBridge {
     /// Refuse proving when pins are installed but construction-time identity
     /// has not passed for both circuits yet.
     fn ensure_proving_identity(&self) -> Result<()> {
-        if pins_slot(self.network).get().is_some() && !self.identity_ready() {
-            // Force construction (runs the pin check at build completion).
-            let _ = self.require_live_identity()?;
+        if pins_slot(self.network).get().is_some() {
+            if !c_verified_flag(self.network).load(Ordering::Acquire) {
+                // Builds C and runs the construction-time pin check; sets c_verified_flag.
+                let _ = self.circuit_digest_bytes_result()?;
+            }
+            if !balance_verified_flag(self.network).load(Ordering::Acquire) {
+                // Builds C_balance and runs the pin check; sets balance_verified_flag
+                // (unless already set by mark_balance_identity_verified_from_cache).
+                let _ = self.balance_circuit_digest_bytes_result()?;
+            }
         }
         if pins_slot(self.network).get().is_some() && !self.identity_ready() {
             bail!(
@@ -2721,6 +2769,86 @@ pub(crate) mod tests {
             "prover bridge gates: C={} C_balance={}",
             bridge.compliance_gate_count(),
             bridge.balance_gate_count()
+        );
+    }
+
+    /// `install_network_pins` is idempotent for the same pair and refuses a
+    /// different pair. Uses `Network::Mainnet` because no other non-ignored
+    /// test in this binary installs Mainnet pins (ignored circuit-build tests
+    /// that do are outside the default suite). Touches only the pins
+    /// `OnceLock` — no circuit construction.
+    #[test]
+    fn install_network_pins_idempotent_same_pair_refuses_different() {
+        // Distinct from any real pin so a collision with a prior install of
+        // production digests would still surface as a hard error rather than
+        // a silent pass.
+        let pin_c = [0xAAu8; 32];
+        let pin_c_balance = [0xBBu8; 32];
+        let network = Network::Mainnet;
+
+        ProverBridge::install_network_pins(network, pin_c, pin_c_balance)
+            .expect("first install of synthetic Mainnet pins must succeed");
+        ProverBridge::install_network_pins(network, pin_c, pin_c_balance)
+            .expect("re-install of the identical pin pair must be idempotent Ok");
+
+        let mut different_c = pin_c;
+        different_c[0] ^= 0xFF;
+        let err = ProverBridge::install_network_pins(network, different_c, pin_c_balance)
+            .expect_err("installing a different pin pair must refuse overwrite");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already installed") || msg.contains("refusing to overwrite"),
+            "error must name the no-overwrite refusal: {msg}"
+        );
+    }
+
+    /// `mark_balance_identity_verified_from_cache` refuses without pins / on
+    /// digest mismatch, and sets `balance_verified_flag` only when the
+    /// cache-verified digest matches the installed `c_balance` pin.
+    /// Uses `Network::Regtest` so the process-global Mainnet pins of
+    /// `install_network_pins_idempotent_same_pair_refuses_different` are
+    /// never touched. Synthetic digests only — no circuit construction.
+    #[test]
+    fn mark_balance_identity_verified_from_cache_requires_matching_pin() {
+        use std::sync::atomic::Ordering;
+
+        let pin_c = [0xCCu8; 32];
+        let pin_c_balance = [0xDDu8; 32];
+        let network = Network::Regtest;
+
+        let err_no_pins =
+            ProverBridge::mark_balance_identity_verified_from_cache(network, pin_c_balance)
+                .expect_err("mark without install_network_pins must refuse");
+        let msg_no_pins = format!("{err_no_pins:#}");
+        assert!(
+            msg_no_pins.contains("install_network_pins must run before"),
+            "error must name the missing-pins refusal: {msg_no_pins}"
+        );
+
+        ProverBridge::install_network_pins(network, pin_c, pin_c_balance)
+            .expect("first install of synthetic Regtest pins must succeed");
+
+        let mut wrong_balance = pin_c_balance;
+        wrong_balance[0] ^= 0xFF;
+        let err_mismatch =
+            ProverBridge::mark_balance_identity_verified_from_cache(network, wrong_balance)
+                .expect_err("mark with digest ≠ installed c_balance pin must refuse");
+        let msg_mismatch = format!("{err_mismatch:#}");
+        assert!(
+            msg_mismatch.contains("does not match installed pin")
+                || msg_mismatch.contains("refusing to mark verified"),
+            "error must name the pin-mismatch refusal: {msg_mismatch}"
+        );
+        assert!(
+            !super::balance_verified_flag(network).load(Ordering::Acquire),
+            "balance_verified_flag must stay false after a refused mark"
+        );
+
+        ProverBridge::mark_balance_identity_verified_from_cache(network, pin_c_balance)
+            .expect("mark with digest == installed c_balance pin must succeed");
+        assert!(
+            super::balance_verified_flag(network).load(Ordering::Acquire),
+            "balance_verified_flag must be true after a successful cache-backed mark"
         );
     }
 }

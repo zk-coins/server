@@ -78,6 +78,78 @@ pub fn v1_shadow_mode_from_env() -> Result<V1ShadowMode, V1ShadowModeError> {
     }
 }
 
+/// Boot role for the shared `C_balance` verifier-cache volume.
+///
+/// | value | role |
+/// |---|---|
+/// | unset / `"primary"` | Primary — build circuits, write cache |
+/// | `"secondary"` | Secondary — load shared C_balance cache (never builds C_balance); still lazily builds the small C circuit on first prove |
+/// | anything else (including `""`) | `Err` (fail loud) |
+///
+/// Unset defaults to Primary so existing production configs that never set
+/// `ZKCOINS_VERIFIER_CACHE_ROLE` keep the historical boot path byte-for-byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifierCacheRole {
+    Primary,
+    Secondary,
+}
+
+/// Error when `ZKCOINS_VERIFIER_CACHE_ROLE` is set to an unsupported value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifierCacheRoleError {
+    pub raw: String,
+}
+
+impl fmt::Display for VerifierCacheRoleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ZKCOINS_VERIFIER_CACHE_ROLE={:?} is not supported — use unset / \"primary\" \
+             for primary boot (build circuits and write the C_balance verifier cache), \
+             or \"secondary\" to reuse a shared C_balance verifier cache already written \
+             by a primary. Refusing to start (no silent fall-back)",
+            self.raw
+        )
+    }
+}
+
+impl std::error::Error for VerifierCacheRoleError {}
+
+/// Resolve the verifier-cache role from an optional env string (testable
+/// without mutating process env).
+///
+/// | value | role |
+/// |---|---|
+/// | `None` | Primary |
+/// | `"primary"` | Primary |
+/// | `"secondary"` | Secondary |
+/// | anything else (including `""`) | `Err` (fail loud) |
+///
+/// Case-sensitive, no whitespace trim: `"Primary"` / `" secondary"` all fail.
+pub(crate) fn resolve_verifier_cache_role(
+    raw: Option<&str>,
+) -> Result<VerifierCacheRole, VerifierCacheRoleError> {
+    match raw {
+        None => Ok(VerifierCacheRole::Primary),
+        Some("primary") => Ok(VerifierCacheRole::Primary),
+        Some("secondary") => Ok(VerifierCacheRole::Secondary),
+        Some(other) => Err(VerifierCacheRoleError {
+            raw: other.to_string(),
+        }),
+    }
+}
+
+/// Read `ZKCOINS_VERIFIER_CACHE_ROLE` from the process environment.
+pub fn verifier_cache_role_from_env() -> Result<VerifierCacheRole, VerifierCacheRoleError> {
+    match env::var("ZKCOINS_VERIFIER_CACHE_ROLE") {
+        Err(env::VarError::NotPresent) => resolve_verifier_cache_role(None),
+        Err(env::VarError::NotUnicode(_)) => Err(VerifierCacheRoleError {
+            raw: "<non-utf8>".to_string(),
+        }),
+        Ok(v) => resolve_verifier_cache_role(Some(v.as_str())),
+    }
+}
+
 /// Closed network vocabulary for `ZKCOINS_NETWORK`.
 pub(crate) fn parse_network_label(s: &str) -> Result<Network, String> {
     match s {
@@ -348,6 +420,36 @@ mod unit_tests {
         assert!(resolve_v1_shadow_mode(Some(" 1")).is_err());
         assert!(resolve_v1_shadow_mode(Some("legacy")).is_err());
         assert!(resolve_v1_shadow_mode(Some("0")).is_err());
+    }
+
+    #[test]
+    fn verifier_cache_role_from_env_defaults_primary_and_parses_secondary() {
+        assert_eq!(
+            resolve_verifier_cache_role(None).unwrap(),
+            VerifierCacheRole::Primary
+        );
+        assert_eq!(
+            resolve_verifier_cache_role(Some("primary")).unwrap(),
+            VerifierCacheRole::Primary
+        );
+        assert_eq!(
+            resolve_verifier_cache_role(Some("secondary")).unwrap(),
+            VerifierCacheRole::Secondary
+        );
+    }
+
+    #[test]
+    fn verifier_cache_role_unknown_value_fails_loud() {
+        let err = resolve_verifier_cache_role(Some("")).unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+        assert!(err.to_string().contains("no silent fall-back"));
+        // Case-sensitive / no silent normalize / no whitespace trim.
+        assert!(resolve_verifier_cache_role(Some("Primary")).is_err());
+        assert!(resolve_verifier_cache_role(Some("SECONDARY")).is_err());
+        assert!(resolve_verifier_cache_role(Some("secondary ")).is_err());
+        assert!(resolve_verifier_cache_role(Some(" secondary")).is_err());
+        assert!(resolve_verifier_cache_role(Some("standby")).is_err());
+        assert!(resolve_verifier_cache_role(Some("1")).is_err());
     }
 
     #[test]

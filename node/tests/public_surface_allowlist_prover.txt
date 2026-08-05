@@ -102,6 +102,7 @@ zkcoins_prover_plonky2::prover_bridge::ProverBridge::circuit_digest_bytes_result
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::compliance_gate_count
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::identity_ready
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::install_network_pins
+zkcoins_prover_plonky2::prover_bridge::ProverBridge::mark_balance_identity_verified_from_cache
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::network
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::new
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::prove_attestation

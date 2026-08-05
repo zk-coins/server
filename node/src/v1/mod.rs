@@ -168,7 +168,10 @@ pub(crate) use delivery::{MeshDeliveryPort, OutgoingDeliveryPort, PendingDeliver
 pub(crate) use incoming::poll_incoming_deliveries;
 /// Kernel-API (§7.5): gRPC mint begin — process-claim-gated orchestration.
 pub use mint::begin_v1_mint;
-pub use mode::{v1_boot_pins_from_env, v1_shadow_mode_from_env, V1BootPins, V1ShadowMode};
+pub use mode::{
+    v1_boot_pins_from_env, v1_shadow_mode_from_env, verifier_cache_role_from_env, V1BootPins,
+    V1ShadowMode, VerifierCacheRole,
+};
 /// §4.3 amount-specific Invoice for [`DeliveryTargetStore::insert_verified_invoice`].
 pub use nostr::profile::PaymentInvoice;
 /// Kernel-API (§7.5): gRPC send begin — CoinHist provenance orchestration.
@@ -195,7 +198,7 @@ pub use scan::{
 };
 /// §4.2 Phase B: binary scan-loop hook after each NfLog fold.
 pub use sdr::finalize_due_phase_b_adapter;
-pub use self_heal::{resolve_v1_live_digest, v1_canary_for_heal};
+pub use self_heal::{resolve_v1_live_digest, secondary_boot_live_digest, v1_canary_for_heal};
 pub use separation::{
     claim_process_stack_from_v1_shadow_env, enforce_stack_scan_mode, ScanStackMode,
 };

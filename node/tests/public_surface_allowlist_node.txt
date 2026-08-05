@@ -242,6 +242,7 @@ node::v1::V1ReceiveRequest::op_secret
 node::v1::V1ReceiveRequest::owner
 node::v1::V1ReceiveRequest::slots
 node::v1::V1ShadowMode
+node::v1::VerifierCacheRole
 node::v1::WalletSignSubmission
 node::v1::WalletSignSubmission::s2c_nonce
 node::v1::WalletSignSubmission::signature
@@ -287,8 +288,12 @@ node::v1::mode::V1BootPins::network_params
 node::v1::mode::V1ShadowMode
 node::v1::mode::V1ShadowModeError
 node::v1::mode::V1ShadowModeError::raw
+node::v1::mode::VerifierCacheRole
+node::v1::mode::VerifierCacheRoleError
+node::v1::mode::VerifierCacheRoleError::raw
 node::v1::mode::v1_boot_pins_from_env
 node::v1::mode::v1_shadow_mode_from_env
+node::v1::mode::verifier_cache_role_from_env
 node::v1::observation_tip_still_live
 node::v1::publish
 node::v1::publish::V1Publisher
@@ -362,13 +367,16 @@ node::v1::scan::observation_tip_still_live
 node::v1::scan::reconcile_persisted_tip
 node::v1::scan::record_scanned_block_hashes
 node::v1::scan::v1_bitcoind_rpc_from_env
+node::v1::secondary_boot_live_digest
 node::v1::self_heal
 node::v1::self_heal::resolve_v1_live_digest
+node::v1::self_heal::secondary_boot_live_digest
 node::v1::self_heal::v1_canary_for_heal
 node::v1::v1_boot_pins_from_env
 node::v1::v1_canary_for_heal
 node::v1::v1_publisher_env_from_env
 node::v1::v1_shadow_mode_from_env
+node::v1::verifier_cache_role_from_env
 node::v1::verify_and_begin_receive
 node::v1::attest_verify
 node::v1::attest_verify::DecodeBalanceAttestationError

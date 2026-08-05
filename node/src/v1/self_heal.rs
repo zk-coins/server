@@ -108,6 +108,37 @@ pub(crate) fn encode_v1_live_digest(c: &[u8; 32], c_balance: &[u8; 32]) -> Vec<u
     out
 }
 
+/// Secondary-boot live digest: tagged `C || C_balance` without building either circuit.
+///
+/// # Secondary trust model
+///
+/// * `verified_c_balance` is **not** "the pin". It is
+///   [`CachedBalanceVerifier::balance_circuit_digest_bytes`](zkcoins_prover::verifier_cache::CachedBalanceVerifier::balance_circuit_digest_bytes),
+///   the digest **recomputed** from the on-disk cache's own serialized
+///   verifier data and already checked equal to the §3.6 pin by
+///   [`load_balance_verifier_cache_checked`](zkcoins_prover::verifier_cache::load_balance_verifier_cache_checked)
+///   (cryptographic verification — no trust placed in the cache file's
+///   self-reported digest field alone).
+/// * `pin_c`, by contrast, is taken on faith *inside this helper*: `C` is
+///   **not** built here. The §3.6 pins are installed once, early, in
+///   `main.rs` (before `EngineAdapter::load_or_create_from_env` and before
+///   the primary/secondary role branch), so the `ProverBridge` identity gate
+///   is armed for the whole process from that point on. `C` itself is
+///   pin-checked the first time it is actually built — whichever of these
+///   happens first: (a) the ledger-load `last_proof` bind path
+///   (`ProverBridge::bind_loaded_prev_proof` / `bind_prev_proof_identity`,
+///   reached from `EngineAdapter::load_or_create_from_env` via
+///   `node/src/v1/db_v1.rs`) if the loaded account row has a persisted
+///   `last_proof`, or (b) the first `prove_transition` /
+///   `verify_transition` call via `ProverBridge::ensure_proving_identity` /
+///   `require_live_identity`.
+///
+/// This is a deliberately separate path from [`resolve_v1_live_digest`]
+/// (primary boot), which forces a live build of both circuits.
+pub fn secondary_boot_live_digest(pin_c: &[u8; 32], verified_c_balance: &[u8; 32]) -> Vec<u8> {
+    encode_v1_live_digest(pin_c, verified_c_balance)
+}
+
 /// Resolve the live v1.1 self-heal digest from the circuits **just built**.
 ///
 /// 1. Obtains the just-built `C` / `C_balance` digests (via
@@ -468,6 +499,17 @@ mod unit_tests {
         let (c2, b2) = decode_v1_live_digest(&blob).expect("decode");
         assert_eq!(c2, c);
         assert_eq!(b2, b);
+    }
+
+    #[test]
+    fn secondary_boot_live_digest_matches_encode_v1_live_digest() {
+        let c = [0x11u8; 32];
+        let b = [0x22u8; 32];
+        assert_eq!(
+            secondary_boot_live_digest(&c, &b),
+            encode_v1_live_digest(&c, &b),
+            "secondary boot digest must be the same tagged encoding as encode_v1_live_digest"
+        );
     }
 
     #[test]
