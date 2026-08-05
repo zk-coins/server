@@ -37,6 +37,11 @@ set -euo pipefail
 # Generate:  openssl rand -hex 32
 export PUBLISHER_KEY="REPLACE_ME_PUBLISHER_KEY_64_LOWERCASE_HEX"
 
+# 32-byte secp256k1 secret as 64 lowercase hex, for node2's identity — DISTINCT from
+# PUBLISHER_KEY above (two nodes must not share a publisher key).
+# Generate:  openssl rand -hex 32
+export PUBLISHER_KEY_2="REPLACE_ME_PUBLISHER_KEY_2_64_LOWERCASE_HEX"
+
 # Username domain returned by residual /api/info surfaces.
 export USERNAME_DOMAIN="local.zkcoins.test"
 
@@ -88,6 +93,9 @@ export ZKCOINS_RELAY_URL="ws://nostr-relay:8080/"
 # itself, not the api container. "api" is the compose DNS name for the
 # api service, which serves Blossom on :8080 in-network (compose.yaml).
 export ZKCOINS_BLOSSOM_URL="http://api:8080/"
+# node2 Blossom base (compose-internal DNS to api2). Required by node2's
+# ZKCOINS_BLOSSOM_URL env pin (compose ${ZKCOINS_BLOSSOM_URL_2:?…}).
+export ZKCOINS_BLOSSOM_URL_2="http://api2:8080/"
 export ZKCOINS_MAX_BLOB_BYTES="1048576"
 export ZKCOINS_KERNEL_PARTS="scanner,prover,publisher"
 # Required when KERNEL_PARTS includes publisher — no invented default.
@@ -96,6 +104,9 @@ export KERNEL_GRPC_ADDR="0.0.0.0:50051"
 
 # ─── Publish path (bitcoind wallet must match up.sh createwallet) ──────────
 export ZKCOINS_V1_BITCOIND_WALLET="zkcoins"
+# node2's own funded bitcoind wallet on the SHARED bitcoind (separate wallet name from
+# ZKCOINS_V1_BITCOIND_WALLET above — must not collide, up.sh creates/funds both).
+export ZKCOINS_V1_BITCOIND_WALLET_2="zkcoins2"
 export ZKCOINS_V1_FEE_RATE_SAT_PER_VB="2"
 export ZKCOINS_V1_REVEAL_OUTPUT_SATS="1000"
 
@@ -125,6 +136,10 @@ export RUST_LOG="${RUST_LOG:-info}"
 # Public REST base used by journey.sh / journey.mjs (host → published ports).
 export ZKCOINS_API_URL="${ZKCOINS_API_URL:-http://127.0.0.1:8080}"
 export ZKCOINS_NODE_URL="${ZKCOINS_NODE_URL:-http://127.0.0.1:4242}"
+
+# Public REST base / node URL for node2 (host → published ports 8081 / 4243).
+export ZKCOINS_API_URL_2="${ZKCOINS_API_URL_2:-http://127.0.0.1:8081}"
+export ZKCOINS_NODE_URL_2="${ZKCOINS_NODE_URL_2:-http://127.0.0.1:4243}"
 
 # Compose project file (repo root). up.sh / down.sh honour this.
 export COMPOSE_FILE="${COMPOSE_FILE:-${_REPO_ROOT}/compose.yaml}"

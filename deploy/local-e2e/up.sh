@@ -159,10 +159,13 @@ require_env ZKCOINS_BOOTSTRAP_PUBKEY
 require_env ZKCOINS_EXPECTED_PARAMS_IDENTIFIER
 require_env ZKCOINS_V1_BOOTSTRAP_MANIFEST_HOST_PATH
 require_env ZKCOINS_V1_BITCOIND_WALLET
+require_env PUBLISHER_KEY_2
+require_env ZKCOINS_V1_BITCOIND_WALLET_2
 require_env ZKCOINS_V1_FEE_RATE_SAT_PER_VB
 require_env ZKCOINS_V1_REVEAL_OUTPUT_SATS
 require_env ZKCOINS_RELAY_URL
 require_env ZKCOINS_BLOSSOM_URL
+require_env ZKCOINS_BLOSSOM_URL_2
 require_env ZKCOINS_MAX_BLOB_BYTES
 require_env ZKCOINS_KERNEL_PARTS
 require_env ZKCOINS_PUBLISH_BATCH_ETA_SECS
@@ -296,8 +299,47 @@ wait_http_ok "node /health (post-restart)" "http://127.0.0.1:4242/health" 120 "o
 wait_healthy "api" 300
 wait_http_ok "api /health (post-restart)" "http://127.0.0.1:8080/health" 120 "ok"
 
+# ─── node2 regtest wallet + mature coinbase (own funded wallet, shared bitcoind) ──
+
+WALLET2="${ZKCOINS_V1_BITCOIND_WALLET_2}"
+
+log "ensuring bitcoind wallet '${WALLET2}' exists (node2)…"
+if ! "${BTC_CLI[@]}" -rpcwallet="${WALLET2}" getwalletinfo >/dev/null 2>&1; then
+  if ! "${BTC_CLI[@]}" loadwallet "${WALLET2}" >/dev/null 2>&1; then
+    "${BTC_CLI[@]}" createwallet "${WALLET2}" \
+      || die "failed to create bitcoind wallet '${WALLET2}'"
+  fi
+fi
+
+"${BTC_CLI[@]}" -rpcwallet="${WALLET2}" getwalletinfo >/dev/null \
+  || die "wallet '${WALLET2}' not usable after create/load"
+
+ADDR2="$("${BTC_CLI[@]}" -rpcwallet="${WALLET2}" getnewaddress | tr -d '\r\n')"
+[[ -n "${ADDR2}" ]] || die "getnewaddress (node2) returned empty"
+
+log "mining ${MINE_COUNT} regtest blocks to ${ADDR2} (node2 coinbase maturity + fees)…"
+"${BTC_CLI[@]}" -rpcwallet="${WALLET2}" generatetoaddress "${MINE_COUNT}" "${ADDR2}" >/dev/null \
+  || die "generatetoaddress (node2) failed"
+
+BAL2="$("${BTC_CLI[@]}" -rpcwallet="${WALLET2}" getbalance | tr -d '\r\n')"
+log "node2 publisher wallet balance: ${BAL2} BTC"
+if [[ "${BAL2}" == "0" || "${BAL2}" == "0.00000000" ]]; then
+  die "node2 publisher wallet balance is zero after mining — cannot fund inscriptions"
+fi
+
+log "restarting node2 so publisher binds the funded wallet…"
+docker compose -f "${COMPOSE_FILE}" restart node2 \
+  || die "docker compose restart node2 failed"
+wait_healthy "node2" "${NODE_HEALTH_TIMEOUT_S}" \
+  "post-restart circuit rebuild may take many minutes; /health waits until circuits stand"
+wait_http_ok "node2 /health (post-restart)" "http://127.0.0.1:4243/health" 120 "ok"
+wait_healthy "api2" 300
+wait_http_ok "api2 /health (post-restart)" "http://127.0.0.1:8081/health" 120 "ok"
+
 log "stack is up."
 log "  api:  http://127.0.0.1:8080/health"
 log "  node: http://127.0.0.1:4242/health"
+log "  api2:  http://127.0.0.1:8081/health"
+log "  node2: http://127.0.0.1:4243/health"
 log "  next: ./deploy/local-e2e/journey.sh"
 exit 0
