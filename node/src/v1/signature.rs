@@ -1091,6 +1091,7 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
                     &proof_bytes,
                     tip_height_u32,
                     tip_hash,
+                    private_index,
                     deps,
                 )
                 .await
@@ -1261,6 +1262,7 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
             &proof_bytes,
             tip_height_u32,
             tip_hash,
+            private_index,
             deps,
         )
         .await
@@ -1332,16 +1334,23 @@ fn mirror_finalised_account_state(
 ///
 /// External `output_ref`s come from durable outbox artefacts (same blob_id
 /// the mesh published). Change/self coins are built locally for recovery
-/// envelopes only. Incomplete material → named error (fail-closed).
+/// envelopes and immediate local disclosure. Incomplete material → named
+/// error (fail-closed).
 async fn stage_sdr_phase_a_after_mesh(
     adapter: &crate::v1::EngineAdapter,
     snap: &DeliverySnapshot,
     proof_bytes: &[u8],
     tip_height: u32,
     tip_hash: [u8; 32],
+    private_index: &crate::kernel::access::InMemoryPrivateIndex,
     deps: &FinaliseDeliveryDeps<'_>,
 ) -> Result<(), crate::v1::delivery::DeliveryError> {
+    use crate::kernel::access::TransitionKind;
     use crate::kernel::types::SubjectAddress;
+    use crate::v1::db_decrypt_index::decrypt_record_id;
+    use crate::v1::db_self_delivery_index::{
+        insert_and_mirror_self_delivery, SelfDeliveryIndexRow,
+    };
     use crate::v1::delivery::{build_coin_delivery, external_delivery_coins};
     use crate::v1::outbox_material::{SdrPhaseAMaterial, SdrPhaseAOutputRef};
     use crate::v1::sdr::{output_ref_from_built, stage_phase_a};
@@ -1474,7 +1483,8 @@ async fn stage_sdr_phase_a_after_mesh(
     }
 
     // Change / self-output coins: build local CoinProof envelopes for SDR
-    // output_refs (no mesh publish).
+    // output_refs (no mesh publish) and durably index their canonical bodies
+    // for immediate ownership/grant disclosure.
     let change_coins: Vec<_> = snap
         .output_coins
         .iter()
@@ -1482,6 +1492,16 @@ async fn stage_sdr_phase_a_after_mesh(
         .filter(|(_, c)| c.recipient.0 == snap.owner)
         .collect();
     if !change_coins.is_empty() {
+        let transition_kind = match snap.record_kind {
+            0x01 => TransitionKind::Mint,
+            0x02 => TransitionKind::Send,
+            0x03 => TransitionKind::Receive,
+            other => {
+                return Err(crate::v1::delivery::DeliveryError::SelfDeliveryIndex(
+                    format!("unknown transition record_kind 0x{other:02x}"),
+                ));
+            }
+        };
         let all_output_ids: Vec<_> = snap.output_coins.iter().map(|c| c.identifier).collect();
         let creating_nullifier = crate::v1::delivery::creating_nullifier_from_parts(
             snap.pk_create,
@@ -1490,10 +1510,6 @@ async fn stage_sdr_phase_a_after_mesh(
         );
         let nav_opening =
             crate::v1::delivery::bundle_nav_opening(snap.nav_size, snap.nav_mth, snap.nav_rand);
-        let mut rng = deps
-            .rng
-            .lock()
-            .expect("finalise delivery rng mutex poisoned");
         for (leaf_index, coin) in change_coins {
             let material = crate::v1::delivery::OutgoingCoinMaterial {
                 coin: coin.clone(),
@@ -1508,17 +1524,40 @@ async fn stage_sdr_phase_a_after_mesh(
                 recipient_op_pk: self_op_pk,
                 recipient_relays: deps.self_relays.clone(),
             };
-            let built = build_coin_delivery(
-                &material,
-                &bundle.op,
-                &bundle.ovk,
-                &deps.blob_holders,
-                deps.now,
-                rng.as_mut(),
-            )?;
+            let built = {
+                let mut rng = deps
+                    .rng
+                    .lock()
+                    .expect("finalise delivery rng mutex poisoned");
+                build_coin_delivery(
+                    &material,
+                    &bundle.op,
+                    &bundle.ovk,
+                    &deps.blob_holders,
+                    deps.now,
+                    rng.as_mut(),
+                )?
+            };
+            let coin_id = digest_to_bytes(&coin.identifier);
+            let row = SelfDeliveryIndexRow {
+                record_id: decrypt_record_id(&snap.owner, &coin_id, &built.blob_id),
+                subject: snap.owner,
+                coin_id,
+                blob_id: built.blob_id,
+                detect_tag: built.keys.detect_tag,
+                canonical: built.canonical.clone(),
+                asset_id: digest_to_bytes(&coin.asset_id),
+                transition_kind,
+                occurred_at: 0,
+            };
+            insert_and_mirror_self_delivery(adapter.pool(), private_index, &row)
+                .await
+                .map_err(|e| {
+                    crate::v1::delivery::DeliveryError::SelfDeliveryIndex(format!("{e:#}"))
+                })?;
             output_refs.push(
                 output_ref_from_built(
-                    digest_to_bytes(&coin.identifier),
+                    coin_id,
                     built.blob_id,
                     built.keys.epk,
                     &built.out_ciphertext,

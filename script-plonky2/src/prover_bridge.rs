@@ -807,6 +807,18 @@ impl ProverBridge {
         Ok(proof)
     }
 
+    /// Load a §1.7.9 native wire `C_balance` proof (`ProofWithPublicInputs::to_bytes` encoding,
+    /// the same encoding `encode_c_balance_proof_bytes` in node's attest.rs produces) and parse it
+    /// against this bridge's network's balance circuit. Does NOT run Plonky2 `verify` — call
+    /// `verify_attestation` separately. Mirrors `load_transition_proof_bytes` but for `C_balance`.
+    pub fn load_balance_proof_bytes(&self, bytes: &[u8]) -> Result<BalanceProof> {
+        self.ensure_proving_identity()?;
+        let circuit = balance_circuit(self.network)?;
+        BalanceProof::from_bytes(bytes.to_vec(), &circuit.data.common).context(
+            "native Plonky2 proof bytes rejected by from_bytes (C_balance attestation proof)",
+        )
+    }
+
     /// Bind an already-deserialized proof to circuit `C` identity (same
     /// gate as [`Self::bind_loaded_prev_proof`]).
     pub fn bind_prev_proof_identity(&self, proof: &ComplianceProof) -> Result<()> {
@@ -883,22 +895,26 @@ impl ProverBridge {
         })
     }
 
-    /// Verify a non-cyclic `C_balance` proof with ordinary Plonky2
-    /// verification. `C_balance` itself pins the embedded `C` proof's
+    /// Verify a non-cyclic `C_balance` proof with ordinary Plonky2 verification, THEN re-extract its
+    /// own public inputs and return them. `C_balance` itself pins the embedded `C` proof's
     /// verifier-data tail, so no outer cyclic-tail check applies here.
     ///
-    /// This is necessary but not sufficient for acceptance. The caller
-    /// **must additionally** establish from its own >=6-confirmation-final
-    /// scan that `nav_ceiling`/`size_ceiling` is canonical, and that the
-    /// disclosed `(Pk_anchor, R_anchor)` is the completed first occurrence at
-    /// the disclosed Bitcoin anchor. Those §5.7 host checks are outside this
-    /// bridge (P1-E.2/P1-G).
-    pub fn verify_attestation(&self, proof: &BalanceProof) -> Result<()> {
+    /// Returning the extracted [`BalancePublicStatement`] (rather than `()`) makes it structurally
+    /// hard for a caller to skip binding a claimed header to the proof that actually proves it — the
+    /// same pattern [`Self::verify_proved_transition_wrapper`] documents for `C`. This is still
+    /// necessary but not sufficient for acceptance on its own: the caller must additionally bind
+    /// every field of the returned statement to whatever header it is validating (never trust a
+    /// separately-carried header/wrapper value without this comparison), and must additionally
+    /// establish from its own >=6-confirmation-final scan that `nav_ceiling`/`size_ceiling` is
+    /// canonical and that the disclosed `(Pk_anchor, R_anchor)` is the completed first occurrence at
+    /// the disclosed Bitcoin anchor. Those §5.7 host checks are outside this bridge (P1-E.2/P1-G).
+    pub fn verify_attestation(&self, proof: &BalanceProof) -> Result<BalancePublicStatement> {
         self.ensure_proving_identity()?;
         balance_circuit(self.network)?
             .data
             .verify(proof.clone())
-            .context("balance-attestation proof verification failed")
+            .context("balance-attestation proof verification failed")?;
+        extract_balance_public_inputs(proof)
     }
 }
 
@@ -948,7 +964,7 @@ fn compliance_circuit(network: Network) -> Result<&'static SkeletonCircuit> {
 
 /// Build `C_balance` once per network (depends on `C`). Same construction-
 /// time pin check as [`compliance_circuit`].
-fn balance_circuit(network: Network) -> Result<&'static BalanceCircuit> {
+pub(crate) fn balance_circuit(network: Network) -> Result<&'static BalanceCircuit> {
     static MAINNET: OnceLock<CircuitSlot<BalanceCircuit>> = OnceLock::new();
     static TESTNET: OnceLock<CircuitSlot<BalanceCircuit>> = OnceLock::new();
     static REGTEST: OnceLock<CircuitSlot<BalanceCircuit>> = OnceLock::new();
@@ -2073,6 +2089,81 @@ fn extract_transition_public_inputs(
     Ok((proof_data, consumed_pubkey, digest(36)))
 }
 
+/// Every `C_balance` application public input (§2.5), decoded from the proof itself — never
+/// from a wrapper/header value supplied alongside it. `nav_ceiling` is the disclosed accumulator
+/// ROOT digest (matches `BalanceAttestationStatement.nav_ceiling.root()`, NOT a raw `mth`).
+/// Must be `pub`: it is the `Ok` type of the `pub fn verify_attestation`, so Rust's
+/// private-type-in-public-interface rule forces it public (mirrors why `DecodedBalanceAttestation`
+/// / `VerifyBalanceAttestationError` had to be `pub` in `node`'s `attest_verify` module last round).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BalancePublicStatement {
+    pub subject: Address,
+    pub asset_id: HashDigest,
+    pub balance: u128,
+    pub nav_ceiling: HashDigest,
+    pub size_ceiling: u64,
+    pub anchor: BalanceAnchor,
+    pub network_id: HashDigest,
+}
+
+/// Decode the frozen 60-element `C_balance` public-input vector (order fixed by
+/// `program-plonky2/src/circuit/balance/targets.rs:251-262`) into a typed statement. Mirrors
+/// `extract_transition_public_inputs` exactly (same `digest()` closure shape, same
+/// `bytes_from_u32_le_limbs` reuse for 32-byte fields); stays a crate-private free fn so the
+/// checked verifier-cache wrapper can reuse exactly the same extraction logic.
+pub(crate) fn extract_balance_public_inputs(
+    proof: &BalanceProof,
+) -> Result<BalancePublicStatement> {
+    ensure!(
+        proof.public_inputs.len() == 60,
+        "balance-attestation proof has {} public inputs, expected 60",
+        proof.public_inputs.len()
+    );
+    let pi = &proof.public_inputs;
+    let digest = |offset: usize| HashOut {
+        elements: pi[offset..offset + 4]
+            .try_into()
+            .expect("validated PI slice length"),
+    };
+    let u32_limb = |t: F| -> Result<u64> {
+        let v = t.to_canonical_u64();
+        ensure!(
+            v <= u64::from(u32::MAX),
+            "public input limb is not a canonical u32"
+        );
+        Ok(v)
+    };
+    let subject_bytes = bytes_from_u32_le_limbs(&pi[0..8])?;
+    let asset_id = digest(8);
+    let mut balance: u128 = 0;
+    for index in 0..4 {
+        balance |= (u32_limb(pi[12 + index])? as u128) << (32 * index);
+    }
+    let nav_ceiling = digest(16);
+    let size_ceiling = u32_limb(pi[20])? | (u32_limb(pi[21])? << 32);
+    let anchor_txid = bytes_from_u32_le_limbs(&pi[22..30])?;
+    let anchor_block_hash = bytes_from_u32_le_limbs(&pi[30..38])?;
+    let anchor_height = u32_limb(pi[38])? | (u32_limb(pi[39])? << 32);
+    let anchor_pk = bytes_from_u32_le_limbs(&pi[40..48])?;
+    let anchor_r = bytes_from_u32_le_limbs(&pi[48..56])?;
+    let network_id = digest(56);
+    Ok(BalancePublicStatement {
+        subject: Address(subject_bytes),
+        asset_id,
+        balance,
+        nav_ceiling,
+        size_ceiling,
+        anchor: BalanceAnchor {
+            txid: anchor_txid,
+            block_hash: anchor_block_hash,
+            height: anchor_height,
+            public_key: anchor_pk,
+            signature_r: anchor_r,
+        },
+        network_id,
+    })
+}
+
 fn bytes_from_u32_le_limbs(limbs: &[F]) -> Result<[u8; 32]> {
     ensure!(limbs.len() == 8, "expected eight u32 limbs");
     let mut bytes = [0u8; 32];
@@ -2219,7 +2310,7 @@ pub mod test_signing {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
 
     use plonky2::field::types::Field;
@@ -2538,6 +2629,21 @@ mod tests {
         panic!("pinned digests file missing required key `{key}`");
     }
 
+    pub(crate) fn real_balance_attestation_fixture(
+    ) -> (ProverBridge, ProvedAttestation, BalanceAttestationStatement) {
+        let bridge = ProverBridge::new(Network::Testnet);
+        let genesis = genesis_fixture();
+        let proved_genesis = bridge
+            .prove_transition(&genesis.witness)
+            .expect("genuine genesis/mint proof for verifier-cache fixture");
+        let witness = attestation_witness(&genesis, &proved_genesis);
+        let expected_statement = witness.statement;
+        let proved_attestation = bridge
+            .prove_attestation(&witness)
+            .expect("genuine C_balance proof for verifier-cache fixture");
+        (bridge, proved_attestation, expected_statement)
+    }
+
     #[test]
     #[ignore = "heavy: real Plonky2 prove end-to-end (minutes); run with --ignored --release"]
     fn prover_bridge_real_end_to_end() {
@@ -2578,9 +2684,34 @@ mod tests {
         let proved_attestation = bridge
             .prove_attestation(&attestation)
             .expect("genuine C_balance proof");
-        bridge
+        let extracted_public_inputs = bridge
             .verify_attestation(&proved_attestation.proof)
             .expect("valid C_balance proof");
+        assert_eq!(
+            extracted_public_inputs.subject,
+            attestation.statement.subject
+        );
+        assert_eq!(
+            extracted_public_inputs.asset_id,
+            attestation.statement.asset_id
+        );
+        assert_eq!(
+            extracted_public_inputs.balance,
+            attestation.statement.balance
+        );
+        assert_eq!(
+            extracted_public_inputs.nav_ceiling,
+            attestation.statement.nav_ceiling.root()
+        );
+        assert_eq!(
+            extracted_public_inputs.size_ceiling,
+            attestation.statement.nav_ceiling.size
+        );
+        assert_eq!(extracted_public_inputs.anchor, attestation.statement.anchor);
+        assert_eq!(
+            extracted_public_inputs.network_id,
+            network_id(bridge.network())
+        );
         assert_eq!(
             bridge.balance_gate_count(),
             pinned_circuit_metric("circuit_c_balance_gates"),

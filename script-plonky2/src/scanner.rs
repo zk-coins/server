@@ -860,6 +860,21 @@ impl Scanner {
         &self.accepted_inscriptions
     }
 
+    /// First-occurrence winner `ChainPosition` for `pk`, or `None` if `pk` never won a fold on this
+    /// scan. O(1) — reads the existing `winner_by_pk` index (already maintained by
+    /// `rebuild_winner_index` / `fold_verified_nullifiers`; this is a pure read-only accessor, no
+    /// new state).
+    pub fn winner_chain_position(&self, pk: [u8; 32]) -> Option<ChainPosition> {
+        self.winner_by_pk.get(&pk).copied()
+    }
+
+    /// Block hash this scanner actually observed at `height` while scanning, or `None` if this
+    /// scanner has never scanned that height. Reads the existing `scanned_blocks` map (retained for
+    /// every scanned height, pruned only on reorg to the fork point — never by a sliding window).
+    pub fn block_hash_at_height(&self, height: u64) -> Option<BlockHash> {
+        self.scanned_blocks.get(&height).copied()
+    }
+
     /// Scanner configuration (network, activation height, …).
     pub fn config(&self) -> &ScannerConfig {
         &self.config

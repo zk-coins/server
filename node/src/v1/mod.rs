@@ -79,6 +79,8 @@ mod adapter;
 // name sealed sinks via `node::v1::{mint,provenance}::…` still fail
 // (module is private).
 pub(crate) mod attest;
+/// Independent, trustless §5.7 `BalanceAttestationV1` verify (decode + host checks).
+pub mod attest_verify;
 /// Blossom blob-store client (§7.4): content-addressed fetch/upload against
 /// an untrusted peer. Append-only (no DELETE; data permanence).
 pub(crate) mod blossom;
@@ -88,6 +90,8 @@ pub(crate) mod db_decrypt_index;
 pub(crate) mod db_outbox;
 /// Durable `v1_sdr_phase_a` (migration 0033) — §4.2 SDR Phase-A staging.
 pub(crate) mod db_sdr;
+/// Durable local self-delivery catalog (migration 0036), without invented ACK fields.
+pub(crate) mod db_self_delivery_index;
 pub mod db_v1;
 /// §4.2 send-path delivery: finished transition → gift-wrapped kind-1059.
 /// Port pattern matches the nullifier publisher; kernel stays transport-free.
@@ -185,8 +189,9 @@ pub use receive::{
 pub(crate) use reconstitute::ReconstituteError;
 pub use scan::{
     apply_canonical_survivors, apply_forward_scan, first_boot_requires_full_replace,
-    folded_keys_from_nflog_mirror, observation_tip_still_live, reconcile_persisted_tip, FoldStats,
-    PersistedTipReconciliation, ResolvedBlock, TipReconcileOutcome,
+    folded_keys_from_nflog_mirror, observation_tip_still_live, reconcile_persisted_tip,
+    record_scanned_block_hashes, FoldStats, PersistedTipReconciliation, ResolvedBlock,
+    TipReconcileOutcome,
 };
 /// §4.2 Phase B: binary scan-loop hook after each NfLog fold.
 pub use sdr::finalize_due_phase_b_adapter;

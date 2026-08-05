@@ -234,6 +234,7 @@ services:
       KERNEL_GRPC_ADDR: ${KERNEL_GRPC_ADDR:?set KERNEL_GRPC_ADDR e.g. 0.0.0.0:50051}
 
       PROOFS_DIR: /data/proofs
+      ZKCOINS_VERIFIER_CACHE_DIR: /data/verifier_cache
       RUST_LOG: ${RUST_LOG:-info}
     healthcheck:
       # Liveness only: GET /health returns "ok" once the TCP listener is bound

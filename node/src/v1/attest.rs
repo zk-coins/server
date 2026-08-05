@@ -743,6 +743,45 @@ pub(crate) fn require_completed_anchor(
     Ok(())
 }
 
+/// Independent-scan generalisation of [`require_completed_anchor`] (§5.7 "completed" gate):
+/// same two checks — first-occurrence classification, then position inside `size_final` — but
+/// sourced from an arbitrary caller-supplied [`shared::spec_v1::NfLogAccumulator`] (e.g. a
+/// verifier's own freshly-scanned accumulator) instead of the producing engine's own
+/// `record.last_nullifier_pos` / `engine.nflog()`. Returns the accumulator log position on
+/// success (for callers that want it; current callers may ignore it).
+pub(crate) fn require_completed_anchor_independent(
+    pk: [u8; 32],
+    r: [u8; 32],
+    accumulator: &shared::spec_v1::NfLogAccumulator,
+    tip_height: u64,
+) -> Result<u64, AttestError> {
+    let classification = accumulator.classify(pk, r);
+    if classification != SpendClassification::ValidFirstSpend {
+        return Err(AttestError::ProvingFailed(format!(
+            "anchor (pk, r) is not the first occurrence on the independent scan's NfLog \
+             (classification={classification:?}); state is not completed"
+        )));
+    }
+    let pos = match accumulator.lookup(pk) {
+        shared::spec_v1::LookupResult::Present { pos, .. } => pos,
+        shared::spec_v1::LookupResult::Absent => {
+            return Err(AttestError::Internal(
+                "internal inconsistency: classify() returned ValidFirstSpend but lookup() \
+                 returned Absent"
+                    .into(),
+            ))
+        }
+    };
+    let size_final = accumulator.size_final(tip_height);
+    if pos >= size_final {
+        return Err(AttestError::ProvingFailed(format!(
+            "anchor nullifier position {pos} is not inside independently-scanned size_final \
+             {size_final} (not >=6-confirmation-final; state is not completed)"
+        )));
+    }
+    Ok(pos)
+}
+
 /// Extract the 32-byte `network_id` field from a serialized attestation.
 ///
 /// Offset: subject(32)+asset(32)+balance(16)+nav_ceiling(32)+size(8)+txid(32)
@@ -845,7 +884,11 @@ pub(crate) struct AttestMaterials {
     nav_opening: zkcoins_prover::prover_bridge::NavOpening,
     nullifier: zkcoins_prover::prover_bridge::NullifierOpening,
     nullifier_pos: u64,
+    /// NfLog chain position of the first-occurrence nullifier (durable catalog key).
     nullifier_height: u64,
+    nullifier_tx_index: u32,
+    nullifier_vin_index: u32,
+    nullifier_member_index: u32,
     size_final_nav: Nav,
     consistency: Vec<HashDigest>,
     /// Resolved Bitcoin locator, if available.
@@ -885,11 +928,32 @@ pub(crate) fn collect_materials(
                 "account has no last nullifier — nothing to bind as §5.7 anchor".into(),
             )
         })?;
-        let nullifier_pos = record.last_nullifier_pos.ok_or_else(|| {
-            AttestError::ProvingFailed(
-                "account has no last_nullifier_pos — anchor not yet folded into NfLog".into(),
-            )
-        })?;
+        // Production never backfills `last_nullifier_pos` after scan-fold
+        // (receive leaves it `None` until fold; fold only appends to the
+        // engine NfLog). Derive the first-occurrence position from the
+        // live NfLog when the cache is empty — same pattern as
+        // AccountUpdateProof in state_engine.
+        let nullifier_pos = match record.last_nullifier_pos {
+            Some(pos) => pos,
+            None => match engine.nflog().lookup(nullifier.public_key) {
+                shared::spec_v1::LookupResult::Present { pos, r, .. } => {
+                    if r != nullifier.signature_r {
+                        return Err(AttestError::ProvingFailed(
+                            "NfLog entry at looked-up position has signature_r that does not \
+                             match account last_nullifier — state inconsistency"
+                                .into(),
+                        ));
+                    }
+                    pos
+                }
+                shared::spec_v1::LookupResult::Absent => {
+                    return Err(AttestError::ProvingFailed(
+                        "account has no last_nullifier_pos — anchor not yet folded into NfLog"
+                            .into(),
+                    ));
+                }
+            },
+        };
 
         let mirror = engine.nflog_mirror();
         if nullifier_pos as usize >= mirror.len() {
@@ -904,7 +968,13 @@ pub(crate) fn collect_materials(
                 "last_nullifier does not match NfLog entry at last_nullifier_pos".into(),
             ));
         }
+        // Thread full ChainPosition out of this with_engine closure so
+        // resolve_anchor_locator can look up the durable catalog without
+        // re-entering the adapter mutex from inside with_engine (deadlock).
         let nullifier_height = chain_pos.height;
+        let nullifier_tx_index = chain_pos.tx_index;
+        let nullifier_vin_index = chain_pos.vin_index;
+        let nullifier_member_index = chain_pos.member_index;
 
         // size_final ceiling (RECOMMENDED default §5.7).
         let size_final = engine.nflog().size_final(engine.tip_height());
@@ -986,6 +1056,9 @@ pub(crate) fn collect_materials(
             nullifier,
             nullifier_pos,
             nullifier_height,
+            nullifier_tx_index,
+            nullifier_vin_index,
+            nullifier_member_index,
             size_final_nav: ceiling,
             consistency,
             anchor_txid: None,
@@ -1026,27 +1099,85 @@ pub(crate) fn block_hash_for_anchor_height(
     }
 }
 
-/// Resolve Bitcoin locator from still-live pending publishes (partial path).
+/// Resolve Bitcoin locator for a completed NfLog anchor.
 ///
 /// Yields `(reveal_txid, inclusion_block_hash)` when both can be resolved:
-/// - `txid` from `v1_pending_publishes.reveal_txid` for this Pk
+/// - **Primary `txid`**: durable chain-scanned inscription catalog
+///   ([`EngineAdapter::catalog_snapshot`]) at
+///   `(height, tx_index, vin_index)` matching the NfLog chain position,
+///   with member `(pk, r)` asserted at `member_index` (same match the
+///   independent verifier performs in Check 3c against its own scan).
+/// - **Fallback `txid`**: `v1_pending_publishes.reveal_txid` for this Pk,
+///   only when the catalog has no entry for the triple yet (very-recent
+///   local publish not yet folded via scan).
 /// - `block_hash` via [`block_hash_for_anchor_height`] — tip hash when the
 ///   nullifier sits at the tip, otherwise the `block_log` hash for the
 ///   inclusion height (so a completed anchor at height `h` with tip
-///   `≥ h+5` still resolves).
+///   `≥ h+5` still resolves). Never from
+///   `CatalogInscription.block_anchor_hash` (that is the payload's own
+///   freshness anchor, not the inclusion block hash).
 ///
 /// For a confirmed-but-not-tip anchor this therefore returns
 /// `Some(reveal_txid)` + `Some(block_log_hash_at_nullifier_height)`, not
-/// the live tip hash.
+/// the live tip hash. Both sources absent → `(None, None)` so
+/// [`require_resolved_anchor`] surfaces [`ATTEST_ANCHOR_LOCATOR_EDGE`].
+///
+/// Catalog entry present but member `(pk, r)` mismatch is a hard
+/// [`AttestError::Internal`] (producer NfLog ↔ catalog inconsistency).
+///
+/// Must not be called from inside `adapter.with_engine` — both
+/// `catalog_snapshot` and `with_engine` lock the same non-reentrant mutex.
 pub(crate) async fn resolve_anchor_locator(
     adapter: &EngineAdapter,
     pk: &[u8; 32],
+    signature_r: &[u8; 32],
     nullifier_height: u64,
+    nullifier_tx_index: u32,
+    nullifier_vin_index: u32,
+    nullifier_member_index: u32,
 ) -> Result<(Option<[u8; 32]>, Option<[u8; 32]>), AttestError> {
-    let pending = db_v1::load_pending_publish(adapter.pool(), *pk)
-        .await
-        .map_err(|e| AttestError::Internal(format!("load pending publish: {e}")))?;
-    let txid = pending.and_then(|p| p.reveal_txid);
+    // Primary: durable catalog written at fold time (independent of
+    // this node's own publish bookkeeping).
+    let catalog = adapter.catalog_snapshot();
+    let catalog_match = catalog.iter().find(|ins| {
+        ins.height == nullifier_height
+            && ins.tx_index == nullifier_tx_index
+            && ins.vin_index == nullifier_vin_index
+    });
+
+    let txid = if let Some(ins) = catalog_match {
+        // Member match mirrors verifier Check 3c, but CatalogInscription
+        // carries member_index explicitly — match on that field, not Vec position.
+        let (_idx, member_pk, member_r) = ins
+            .members
+            .iter()
+            .find(|(idx, _, _)| *idx == nullifier_member_index)
+            .ok_or_else(|| {
+                AttestError::Internal(format!(
+                    "catalog inscription at height={nullifier_height} \
+                     tx_index={nullifier_tx_index} vin_index={nullifier_vin_index} \
+                     has no member_index={nullifier_member_index} — NfLog/catalog \
+                     state inconsistency"
+                ))
+            })?;
+        if member_pk != pk || member_r != signature_r {
+            return Err(AttestError::Internal(format!(
+                "catalog members[member_index={nullifier_member_index}] at \
+                 height={nullifier_height} tx_index={nullifier_tx_index} \
+                 vin_index={nullifier_vin_index} does not equal disclosed \
+                 (pk, r) — NfLog/catalog state inconsistency"
+            )));
+        }
+        Some(ins.reveal_txid)
+    } else {
+        // Fallback: still-live pending-publish row for a very-recent anchor
+        // not yet present in the durable catalog.
+        let pending = db_v1::load_pending_publish(adapter.pool(), *pk)
+            .await
+            .map_err(|e| AttestError::Internal(format!("load pending publish: {e}")))?;
+        pending.and_then(|p| p.reveal_txid)
+    };
+
     if txid.is_none() {
         return Ok((None, None));
     }
@@ -1118,7 +1249,11 @@ pub(crate) async fn prove_attestation_for_job(
     let (txid, block_hash) = resolve_anchor_locator(
         adapter,
         &materials.nullifier.public_key,
+        &materials.nullifier.signature_r,
         materials.nullifier_height,
+        materials.nullifier_tx_index,
+        materials.nullifier_vin_index,
+        materials.nullifier_member_index,
     )
     .await?;
     materials.anchor_txid = txid;
@@ -1812,13 +1947,82 @@ mod tests {
         }
     }
 
+    /// Pending-publish fixture `reveal_txid` (transient bookkeeping path).
+    const FIXTURE_PENDING_REVEAL_TXID: [u8; 32] = [0x31u8; 32];
+    /// Catalog fixture `reveal_txid` — distinct so assertions can tell the
+    /// durable catalog path from the pending-publish fallback.
+    const FIXTURE_CATALOG_REVEAL_TXID: [u8; 32] = [0x55u8; 32];
+
     /// Seed an adapter with one first-occurrence nullifier at `fold_height`,
     /// tip advanced to `tip_height`, and a subject account whose last
     /// nullifier points at that fold. Classification is derived from the
     /// live NfLog (not caller-supplied).
+    ///
+    /// `last_nullifier_pos` is the account-record cache field (production
+    /// always has `None`; tests historically pass `Some(0)`). When
+    /// `fold_account_nullifier` is false the account's (pk, r) is **not**
+    /// appended to the NfLog — used to exercise the Absent fail-closed path.
+    ///
+    /// Default seed (via [`seeded_attest_adapter`] /
+    /// [`seeded_attest_adapter_cfg`]): pending-publish row present, no
+    /// catalog entry — preserves historical observable behaviour.
     async fn seeded_attest_adapter(
         fold_height: u64,
         tip_height: u64,
+    ) -> (
+        crate::test_db::SchemaScope,
+        EngineAdapter,
+        Address,
+        [u8; 32],
+        [u8; 32],
+        [u8; 32],
+    ) {
+        seeded_attest_adapter_cfg(fold_height, tip_height, Some(0), true).await
+    }
+
+    async fn seeded_attest_adapter_cfg(
+        fold_height: u64,
+        tip_height: u64,
+        last_nullifier_pos: Option<u64>,
+        fold_account_nullifier: bool,
+    ) -> (
+        crate::test_db::SchemaScope,
+        EngineAdapter,
+        Address,
+        [u8; 32],
+        [u8; 32],
+        [u8; 32],
+    ) {
+        seeded_attest_adapter_cfg_full(
+            fold_height,
+            tip_height,
+            last_nullifier_pos,
+            fold_account_nullifier,
+            /* seed_pending_publish */ true,
+            /* seed_catalog */ false,
+        )
+        .await
+    }
+
+    /// Full fixture control for locator-resolution tests.
+    ///
+    /// - `seed_pending_publish`: insert `v1_pending_publishes` with
+    ///   `reveal_txid = FIXTURE_PENDING_REVEAL_TXID`.
+    /// - `seed_catalog`: append a matching [`CatalogInscription`] with
+    ///   `reveal_txid = FIXTURE_CATALOG_REVEAL_TXID` at the fold chain pos.
+    ///
+    /// `block_log` at `fold_height` is always seeded (orthogonal to txid).
+    /// Returned 5th tuple element is the pending-publish fixture txid
+    /// (`FIXTURE_PENDING_REVEAL_TXID`) regardless of seed flags — callers
+    /// that exercise the catalog path assert `FIXTURE_CATALOG_REVEAL_TXID`
+    /// directly.
+    async fn seeded_attest_adapter_cfg_full(
+        fold_height: u64,
+        tip_height: u64,
+        last_nullifier_pos: Option<u64>,
+        fold_account_nullifier: bool,
+        seed_pending_publish: bool,
+        seed_catalog: bool,
     ) -> (
         crate::test_db::SchemaScope,
         EngineAdapter,
@@ -1833,6 +2037,7 @@ mod tests {
         use zkcoins_prover::prover_bridge::{NavOpening, NullifierOpening};
         use zkcoins_prover::state_engine::{AccountRecord, OpSecret, ScannedNullifier};
 
+        use super::super::db_v1::CatalogInscription;
         use super::super::separation::{
             claim_stack_scan_mode, set_process_stack_mode, ScanStackMode,
         };
@@ -1862,19 +2067,21 @@ mod tests {
         adapter
             .with_engine_mut(|engine| {
                 engine.set_tip_height(fold_height);
-                let pos = engine
-                    .append_nullifier(ScannedNullifier::from_survivor(&PublishedNullifier {
-                        chain_pos: ChainPosition {
-                            height: fold_height,
-                            tx_index: 0,
-                            vin_index: 0,
-                            member_index: 0,
-                        },
-                        pk,
-                        r,
-                    }))
-                    .expect("fold winning nullifier");
-                assert_eq!(pos, 0);
+                if fold_account_nullifier {
+                    let pos = engine
+                        .append_nullifier(ScannedNullifier::from_survivor(&PublishedNullifier {
+                            chain_pos: ChainPosition {
+                                height: fold_height,
+                                tx_index: 0,
+                                vin_index: 0,
+                                member_index: 0,
+                            },
+                            pk,
+                            r,
+                        }))
+                        .expect("fold winning nullifier");
+                    assert_eq!(pos, 0);
+                }
 
                 let mut balances = BTreeMap::new();
                 balances.insert(asset_id, 7u128);
@@ -1907,7 +2114,7 @@ mod tests {
                         signature_r: r,
                         r_prime,
                     }),
-                    last_nullifier_pos: Some(0),
+                    last_nullifier_pos,
                 };
                 engine
                     .insert_account(owner, record)
@@ -1919,27 +2126,46 @@ mod tests {
             .expect("mutate engine");
         adapter.set_tip_hash(tip_hash).expect("tip hash");
 
-        // Retain reveal_txid for this node's own publish of the nullifier.
-        sqlx::query(
-            "INSERT INTO v1_pending_publishes \
-             (pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
-              commit_tx, reveal_tx, commit_txid, reveal_txid, status, created_at, updated_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'reveal_broadcast',NOW(),NOW())",
-        )
-        .bind(pk.as_slice())
-        .bind(owner.0.as_slice())
-        .bind(r.as_slice())
-        .bind([0x44u8; 32].as_slice())
-        .bind(r_prime.as_slice())
-        .bind(i64::try_from(fold_height).unwrap())
-        .bind(inclusion_hash.as_slice())
-        .bind([0x01u8; 8].as_slice()) // dummy commit_tx
-        .bind([0x02u8; 8].as_slice()) // dummy reveal_tx
-        .bind([0x03u8; 32].as_slice()) // commit_txid
-        .bind([0x31u8; 32].as_slice()) // reveal_txid
-        .execute(&pool)
-        .await
-        .expect("insert pending publish with reveal_txid");
+        if seed_pending_publish {
+            // Retain reveal_txid for this node's own publish of the nullifier.
+            sqlx::query(
+                "INSERT INTO v1_pending_publishes \
+                 (pk, owner, r, s, r_prime, build_tip_height, build_tip_hash, \
+                  commit_tx, reveal_tx, commit_txid, reveal_txid, status, created_at, updated_at) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'reveal_broadcast',NOW(),NOW())",
+            )
+            .bind(pk.as_slice())
+            .bind(owner.0.as_slice())
+            .bind(r.as_slice())
+            .bind([0x44u8; 32].as_slice())
+            .bind(r_prime.as_slice())
+            .bind(i64::try_from(fold_height).unwrap())
+            .bind(inclusion_hash.as_slice())
+            .bind([0x01u8; 8].as_slice()) // dummy commit_tx
+            .bind([0x02u8; 8].as_slice()) // dummy reveal_tx
+            .bind([0x03u8; 32].as_slice()) // commit_txid
+            .bind(FIXTURE_PENDING_REVEAL_TXID.as_slice()) // reveal_txid
+            .execute(&pool)
+            .await
+            .expect("insert pending publish with reveal_txid");
+        }
+
+        if seed_catalog {
+            // Durable chain-scanned inscription at the same triple the NfLog
+            // fold used — distinct reveal_txid so catalog vs pending is observable.
+            adapter
+                .append_catalog(&[CatalogInscription {
+                    height: fold_height,
+                    tx_index: 0,
+                    vin_index: 0,
+                    reveal_txid: FIXTURE_CATALOG_REVEAL_TXID,
+                    format: 0x00,
+                    members: vec![(0, pk, r)],
+                    block_anchor_hash: [0u8; 32],
+                    block_anchor_height: 0,
+                }])
+                .expect("append catalog inscription");
+        }
 
         // Durable inclusion hash for the fold height (confirmed-but-not-tip).
         crate::db::insert_block_log(
@@ -1959,7 +2185,7 @@ mod tests {
             adapter,
             owner,
             asset_id,
-            [0x31u8; 32],
+            FIXTURE_PENDING_REVEAL_TXID,
             inclusion_hash,
         )
     }
@@ -1994,7 +2220,11 @@ mod tests {
         let (txid, block_hash) = resolve_anchor_locator(
             &adapter,
             &materials.nullifier.public_key,
+            &materials.nullifier.signature_r,
             materials.nullifier_height,
+            materials.nullifier_tx_index,
+            materials.nullifier_vin_index,
+            materials.nullifier_member_index,
         )
         .await
         .expect("locator resolve");
@@ -2005,6 +2235,200 @@ mod tests {
             "confirmed-but-not-tip block_hash from block_log at fold height, not tip_hash"
         );
         require_resolved_anchor(txid, block_hash).expect("resolved locator");
+    }
+
+    /// Settled anchor with no live pending-publish row: durable catalog is
+    /// the primary source and must resolve without ATTEST_ANCHOR_LOCATOR_EDGE.
+    /// Distinct catalog reveal_txid proves the catalog path fired (not a
+    /// leftover pending-publish fallback).
+    #[tokio::test]
+    async fn settled_anchor_resolves_from_durable_catalog_without_pending_publish() {
+        let fold_height = 100u64;
+        let tip_height = 105u64; // ≥ fold + 5 → size_final covers pos 0
+        let (_scope, adapter, owner, asset_id, _pending_txid, inclusion_hash) =
+            seeded_attest_adapter_cfg_full(
+                fold_height,
+                tip_height,
+                Some(0),
+                true,
+                /* seed_pending_publish */ false,
+                /* seed_catalog */ true,
+            )
+            .await;
+
+        let materials = collect_materials(&adapter, &owner, &asset_id, None)
+            .expect("completed first-occurrence inside size_final must collect");
+        assert_eq!(materials.nullifier_height, fold_height);
+        assert_eq!(materials.nullifier_tx_index, 0);
+        assert_eq!(materials.nullifier_vin_index, 0);
+        assert_eq!(materials.nullifier_member_index, 0);
+
+        let (txid, block_hash) = resolve_anchor_locator(
+            &adapter,
+            &materials.nullifier.public_key,
+            &materials.nullifier.signature_r,
+            materials.nullifier_height,
+            materials.nullifier_tx_index,
+            materials.nullifier_vin_index,
+            materials.nullifier_member_index,
+        )
+        .await
+        .expect("locator resolve from durable catalog");
+        assert_eq!(
+            txid,
+            Some(FIXTURE_CATALOG_REVEAL_TXID),
+            "txid must come from catalog reveal_txid, not pending fallback"
+        );
+        assert_ne!(
+            txid,
+            Some(FIXTURE_PENDING_REVEAL_TXID),
+            "must not silently use pending fixture value when catalog is the source"
+        );
+        assert_eq!(
+            block_hash,
+            Some(inclusion_hash),
+            "confirmed-but-not-tip block_hash from block_log at fold height"
+        );
+        require_resolved_anchor(txid, block_hash).expect("resolved locator");
+    }
+
+    /// Production write path: a below-tip inclusion hash is durable only after
+    /// [`crate::v1::record_scanned_block_hashes`] (the live scan-loop entry
+    /// point). Must not call `crate::db::insert_block_log` directly — that is
+    /// the test-only shortcut the fixture uses for read-side tests and would
+    /// paper over a missing production writer.
+    #[tokio::test]
+    async fn settled_anchor_block_hash_resolves_via_record_scanned_block_hashes() {
+        use bitcoin::hashes::Hash;
+        use bitcoin::BlockHash;
+        use zkcoins_prover::scanner::BlockScanResult;
+
+        let fold_height = 100u64;
+        let tip_height = 105u64; // ≥ fold + 5 → size_final covers pos 0
+        let (_scope, adapter, owner, asset_id, _pending_txid, inclusion_hash) =
+            seeded_attest_adapter_cfg_full(
+                fold_height,
+                tip_height,
+                Some(0),
+                true,
+                /* seed_pending_publish */ false,
+                /* seed_catalog */ true,
+            )
+            .await;
+
+        // Fixture always seeds block_log for the read-side tests; clear it so
+        // this test has no independent block_log source until the production
+        // write path runs.
+        sqlx::query("DELETE FROM block_log")
+            .execute(adapter.pool())
+            .await
+            .expect("clear fixture block_log seed");
+
+        let materials = collect_materials(&adapter, &owner, &asset_id, None)
+            .expect("completed first-occurrence inside size_final must collect");
+        assert_eq!(materials.nullifier_height, fold_height);
+
+        let (txid_before, block_hash_before) = resolve_anchor_locator(
+            &adapter,
+            &materials.nullifier.public_key,
+            &materials.nullifier.signature_r,
+            materials.nullifier_height,
+            materials.nullifier_tx_index,
+            materials.nullifier_vin_index,
+            materials.nullifier_member_index,
+        )
+        .await
+        .expect("locator resolve before production write");
+        assert_eq!(
+            txid_before,
+            Some(FIXTURE_CATALOG_REVEAL_TXID),
+            "catalog still resolves reveal_txid without block_log"
+        );
+        assert_eq!(
+            block_hash_before, None,
+            "below-tip block_hash absent until production write path runs"
+        );
+
+        let blocks = [BlockScanResult {
+            height: fold_height,
+            block_hash: BlockHash::from_byte_array(inclusion_hash),
+            inscriptions_seen: 0,
+            rejected: vec![],
+            admitted: vec![],
+            duplicates: 0,
+            duplicate_details: vec![],
+        }];
+        crate::v1::record_scanned_block_hashes(adapter.pool(), &blocks)
+            .await
+            .expect("production write path records scanned block hashes");
+
+        let (txid, block_hash) = resolve_anchor_locator(
+            &adapter,
+            &materials.nullifier.public_key,
+            &materials.nullifier.signature_r,
+            materials.nullifier_height,
+            materials.nullifier_tx_index,
+            materials.nullifier_vin_index,
+            materials.nullifier_member_index,
+        )
+        .await
+        .expect("locator resolve after production write");
+        assert_eq!(
+            txid,
+            Some(FIXTURE_CATALOG_REVEAL_TXID),
+            "txid must come from catalog reveal_txid"
+        );
+        assert_eq!(
+            block_hash,
+            Some(inclusion_hash),
+            "below-tip block_hash from record_scanned_block_hashes → block_log"
+        );
+        require_resolved_anchor(txid, block_hash).expect("resolved locator");
+    }
+
+    /// Fail-closed when neither durable catalog nor pending-publish has the
+    /// reveal_txid — must still surface the named ATTEST_ANCHOR_LOCATOR_EDGE.
+    #[tokio::test]
+    async fn anchor_locator_edge_when_neither_catalog_nor_pending_has_txid() {
+        let fold_height = 100u64;
+        let tip_height = 105u64;
+        let (_scope, adapter, owner, asset_id, _pending_txid, _inclusion_hash) =
+            seeded_attest_adapter_cfg_full(
+                fold_height,
+                tip_height,
+                Some(0),
+                true,
+                /* seed_pending_publish */ false,
+                /* seed_catalog */ false,
+            )
+            .await;
+
+        // collect_materials must still succeed (NfLog fold + account present).
+        let materials = collect_materials(&adapter, &owner, &asset_id, None)
+            .expect("materials collect must succeed without locator sources");
+
+        let (txid, block_hash) = resolve_anchor_locator(
+            &adapter,
+            &materials.nullifier.public_key,
+            &materials.nullifier.signature_r,
+            materials.nullifier_height,
+            materials.nullifier_tx_index,
+            materials.nullifier_vin_index,
+            materials.nullifier_member_index,
+        )
+        .await
+        .expect("resolve returns Ok((None, None)) when both sources absent");
+        assert_eq!(txid, None, "no catalog and no pending → no txid");
+        // block_hash is only computed after a txid is found; both None.
+        assert_eq!(block_hash, None);
+
+        let err = require_resolved_anchor(txid, block_hash)
+            .expect_err("both sources absent must surface ATTEST_ANCHOR_LOCATOR_EDGE");
+        assert!(
+            matches!(err, AttestError::ProvingFailed(ref m) if m.contains("ATTEST_ANCHOR_LOCATOR_EDGE")),
+            "got {err:?}"
+        );
+        assert_eq!(err.message(), ATTEST_ANCHOR_LOCATOR_EDGE);
     }
 
     /// Defect 3: completed-anchor gate is bound on the production path
@@ -2041,6 +2465,82 @@ mod tests {
         assert!(
             err.message().contains("size_final") || err.message().contains("completed"),
             "production gate message: {}",
+            err.message()
+        );
+    }
+
+    /// Production always leaves `last_nullifier_pos = None` after apply and
+    /// never backfills it on scan-fold. When the account's last nullifier is
+    /// already first-occurrence on the engine NfLog, `collect_materials` must
+    /// derive that position (here: 0) and succeed — same outcome as the
+    /// historical `Some(0)` cache path.
+    #[tokio::test]
+    async fn collect_materials_derives_nullifier_pos_from_nflog_when_cache_none() {
+        let fold_height = 100u64;
+        let tip_height = 105u64; // ≥ fold + 5 → size_final covers pos 0
+        let (_scope, adapter, owner, asset_id, _reveal_txid, _inclusion_hash) =
+            seeded_attest_adapter_cfg(fold_height, tip_height, None, true).await;
+
+        // Cache is empty (production shape); NfLog still holds the fold at 0.
+        let (cached, lookup_pos) = adapter.with_engine(|e| {
+            let rec = e.account(&owner).expect("account");
+            let nf = rec.last_nullifier.as_ref().expect("nullifier");
+            assert!(
+                rec.last_nullifier_pos.is_none(),
+                "fixture must leave last_nullifier_pos None"
+            );
+            let lookup_pos = match e.nflog().lookup(nf.public_key) {
+                shared::spec_v1::LookupResult::Present { pos, r, .. } => {
+                    assert_eq!(r, nf.signature_r);
+                    pos
+                }
+                shared::spec_v1::LookupResult::Absent => {
+                    panic!("fixture must fold the account nullifier into NfLog")
+                }
+            };
+            (rec.last_nullifier_pos, lookup_pos)
+        });
+        assert!(cached.is_none());
+        assert_eq!(lookup_pos, 0);
+
+        let materials = collect_materials(&adapter, &owner, &asset_id, None)
+            .expect("folded nullifier with empty cache must collect via NfLog lookup");
+        assert_eq!(
+            materials.nullifier_pos, 0,
+            "derived pos must match first-occurrence fold position"
+        );
+        assert_eq!(materials.nullifier_height, fold_height);
+    }
+
+    /// Unscanned / unfolded anchor: cache empty and NfLog lookup Absent —
+    /// still fail-closed (same as the old hard `last_nullifier_pos` require).
+    #[tokio::test]
+    async fn collect_materials_fails_closed_when_nullifier_not_in_nflog_and_cache_none() {
+        let fold_height = 100u64;
+        let tip_height = 105u64;
+        let (_scope, adapter, owner, asset_id, _txid, _hash) =
+            seeded_attest_adapter_cfg(fold_height, tip_height, None, false).await;
+
+        adapter.with_engine(|e| {
+            let rec = e.account(&owner).expect("account");
+            let nf = rec.last_nullifier.as_ref().expect("nullifier");
+            assert!(rec.last_nullifier_pos.is_none());
+            assert!(
+                matches!(
+                    e.nflog().lookup(nf.public_key),
+                    shared::spec_v1::LookupResult::Absent
+                ),
+                "fixture must leave account nullifier absent from NfLog"
+            );
+        });
+
+        let err = collect_materials(&adapter, &owner, &asset_id, None)
+            .expect_err("unfolded nullifier with empty cache must fail closed");
+        assert!(matches!(err, AttestError::ProvingFailed(_)), "got {err:?}");
+        assert!(
+            err.message().contains("last_nullifier_pos")
+                || err.message().contains("not yet folded"),
+            "fail-closed message: {}",
             err.message()
         );
     }

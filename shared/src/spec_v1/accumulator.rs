@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 
 use super::error::SpecError;
-use super::nflog::{inclusion_path, nflog_empty, nflog_mth, Nav, NfLogEntry, NflogIncrementalMth};
+use super::nflog::{
+    inclusion_path, nflog_empty, nflog_mth, nflog_root, Nav, NfLogEntry, NflogIncrementalMth,
+};
 use zkcoins_program::hash::HashDigest;
 
 /// Protocol-pinned finality depth (§3.9): six confirmations.
@@ -184,6 +186,27 @@ impl NfLogAccumulator {
             return mth == self.mth;
         }
         nflog_mth(&self.log[..size as usize]) == mth
+    }
+
+    /// The committed §3.7 accumulator ROOT (`nflog_root(size, mth)`) this accumulator would report
+    /// for prefix length `size`, or `None` if `size` exceeds how many entries this accumulator has
+    /// actually folded. Same size-branching as `is_canonical` (reuse the cached tip `mth` at
+    /// `size == log.len()`, `nflog_empty()` at `size == 0`, else recompute `nflog_mth` over the
+    /// prefix) but returns the committed root digest instead of a bool, because callers that only
+    /// have a disclosed ROOT (not a raw `mth`) need something to compare against directly.
+    pub fn root_at(&self, size: u64) -> Option<HashDigest> {
+        let n = self.log.len() as u64;
+        if size > n {
+            return None;
+        }
+        let mth = if size == n {
+            self.mth
+        } else if size == 0 {
+            nflog_empty()
+        } else {
+            nflog_mth(&self.log[..size as usize])
+        };
+        Some(nflog_root(size, mth))
     }
 
     pub fn lookup(&self, pk: [u8; 32]) -> LookupResult {

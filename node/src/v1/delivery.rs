@@ -131,6 +131,8 @@ pub(crate) enum DeliveryError {
     /// SDR Phase-A `output_ref` could not be built from delivery material
     /// (empty holders and/or empty `out_ciphertext`).
     SdrOutputRef(String),
+    /// Durable/local disclosure indexing of a self-delivered coin failed.
+    SelfDeliveryIndex(String),
     /// Outer gift-wrap tags are not exactly `zkdt` + `zkepk`.
     OuterTagsInvalid { detail: String },
     /// Profile / Invoice resolution failed for a recipient (named check).
@@ -195,6 +197,9 @@ impl fmt::Display for DeliveryError {
             DeliveryError::InclusionProof(msg) => write!(f, "inclusion_proof: {msg}"),
             DeliveryError::ProofBytes(msg) => write!(f, "proof bytes: {msg}"),
             DeliveryError::SdrOutputRef(msg) => write!(f, "SDR output_ref: {msg}"),
+            DeliveryError::SelfDeliveryIndex(msg) => {
+                write!(f, "self-delivery private index: {msg}")
+            }
             DeliveryError::OuterTagsInvalid { detail } => {
                 write!(f, "gift-wrap outer tags invalid: {detail}")
             }
@@ -244,6 +249,8 @@ impl DeliveryError {
             DeliveryError::NoRelayAccepted { .. } => false,
             // DB / pool / mark_published wiring after a mesh attempt — retry.
             DeliveryError::Relay(_) => false,
+            // Database/mirror availability may recover on finalise resume.
+            DeliveryError::SelfDeliveryIndex(_) => false,
             // Fixed material / local construction: waiting never helps.
             DeliveryError::Spec(_)
             | DeliveryError::Nip44(_)
@@ -585,12 +592,15 @@ pub(crate) struct DeliveryOperatorContext {
 
 /// Result of the pure build steps for one coin (before network I/O).
 ///
-/// Intermediate `CoinProof` is sealed into `zbe_ciphertext` and not retained
-/// as a separate field — re-open via ZBE under `k_tx` if needed. `out_ciphertext`
-/// is retained on [`RetainedDeliveryAttempt`] (SDR / §1.3), not here.
+/// The canonical serialized `CoinProof` is retained byte-for-byte so a local
+/// self-delivery can be durably disclosed without attempting to reconstruct
+/// randomized note-encryption material. `out_ciphertext` is retained on
+/// [`RetainedDeliveryAttempt`] (SDR / §1.3), not here.
 #[derive(Clone, Debug)]
 pub(crate) struct BuiltCoinDelivery {
     pub keys: PerCoinKeys,
+    /// Canonical §7.1 `serialize(CoinProof)` bytes sealed by ZBE below.
+    pub canonical: Vec<u8>,
     /// ZBE ciphertext — the only blob hashed for `blob_id`.
     pub zbe_ciphertext: Vec<u8>,
     pub blob_id: [u8; 32],
@@ -701,6 +711,7 @@ pub(crate) fn build_coin_delivery(
 
     Ok(BuiltCoinDelivery {
         keys,
+        canonical: bundle_plaintext,
         zbe_ciphertext,
         blob_id,
         ack_nonce,
@@ -1894,6 +1905,7 @@ mod tests {
     use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
     use sha2::{Digest, Sha256};
     use shared::spec_v1::datastructures::Address;
+    use shared::spec_v1::note_encryption::zbe_open;
     use zkcoins_program::hash::ZERO_HASH;
 
     /// Deterministic CSPRNG for tests (not for production).
@@ -2004,6 +2016,11 @@ mod tests {
         assert!(
             !built.out_ciphertext.is_empty(),
             "out_ciphertext must be sealed for SDR output_ref"
+        );
+        assert_eq!(
+            zbe_open(&built.keys.k_tx, &built.zbe_ciphertext).expect("open built ZBE"),
+            built.canonical,
+            "retained canonical body must be the exact plaintext sealed into the blob"
         );
 
         // Kind is gift-wrap.

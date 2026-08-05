@@ -29,6 +29,7 @@ import {
   assetIdV2,
   addressFromParts,
   bip340NormaliseSecret,
+  buildOwnershipProof,
   canonicalHostFromApiUrl,
   chanBindForHost,
   decodeHexExact,
@@ -43,7 +44,9 @@ import {
   nkCommit,
   parseExpiryDecimal,
   pullChallengeMessage,
+  SCOPE_NOT_AFTER_UNBOUNDED,
   seedFromMnemonicV1,
+  V1ApiError,
   ZkCoinsV1Client,
 } from '@zkcoins/sdk';
 
@@ -88,6 +91,10 @@ const EUR_DEMO = {
 /** `terms_salt_fixture = H("zkCoins/v1/test-vector/terms_salt")` (SHA-256). */
 const TERMS_SALT_FIXTURE_HEX = createHash('sha256')
   .update('zkCoins/v1/test-vector/terms_salt', 'utf8')
+  .digest('hex');
+/** Deterministic grantee secret for stage 11 (not Alice/Bob/Carol). */
+const GRANTEE_SECRET_FIXTURE_HEX = createHash('sha256')
+  .update('zkCoins/v1/journey/stage11/grantee', 'utf8')
   .digest('hex');
 const SEND_AMOUNT = '250000';
 /** Alice balance after fee-less send of SEND_AMOUNT from USD_DEMO.amount. */
@@ -1026,34 +1033,190 @@ async function stage9_portability() {
   );
 }
 
-async function stage10_attestation(alice) {
-  const ch = await httpJson('POST', `${API_URL}/v1/attest/balance/challenge`, {
-    subject: alice.subject,
-  });
-  if (ch.status >= 500) {
-    fail(10, `attest challenge hard-failed HTTP ${ch.status}: ${ch.text}`);
-  }
-  fail(
-    10,
-    'TODO: Attestation control (Requirement 9(b)) — Alice POST /v1/attest/balance for ' +
-      'USD-Demo; fresh verifier validates proof, host-side anchors, nav_ceiling against own scan. ' +
-      `Challenge endpoint responded HTTP ${ch.status} (surface present). Full verify path not automated.`,
+function runVerifyAttestation(attestationHex) {
+  // The attestation hex is large (proof ~180 KB → ~360 KB hex), far past the OS
+  // argv length limit ("argument list too long"), so feed it on stdin instead of
+  // an --attestation-hex arg (the CLI reads trimmed stdin when the flag is absent).
+  return spawnSync(
+    'docker',
+    ['compose', '-f', COMPOSE_FILE, 'exec', '-T', 'node', 'verify_attestation'],
+    { encoding: 'utf8', input: attestationHex },
   );
 }
 
-async function stage11_grants(alice) {
-  const ch = await httpJson('POST', `${API_URL}/v1/grants/challenge`, {
-    subject: alice.subject,
-  });
-  if (ch.status >= 500) {
-    fail(11, `grants challenge hard-failed HTTP ${ch.status}: ${ch.text}`);
+async function stage10_attestation(client, seed, alice, host, usdAssetIdHex) {
+  if (typeof usdAssetIdHex !== 'string' || usdAssetIdHex.length === 0) {
+    fail('10', 'usdAssetIdHex missing/empty — stage 10 requires Alice USD asset id from stage 2');
   }
-  fail(
-    11,
-    'TODO: Grant control (Requirement 9(c)) — Alice issues USD-Demo-scoped view grant; ' +
-      'grantee pulls in-scope records only and cannot pull EUR-Demo (scope clamp). ' +
-      `Challenge endpoint responded HTTP ${ch.status}. Needs EUR-Demo (stage 2b) + grant pull harness.`,
+
+  // Produce a real BalanceAttestationV1 via the SDK (challenge is opened inside attestBalance).
+  const assetIdBytes = decodeHexExact(usdAssetIdHex, 32, 'usdAssetIdHex');
+  const accepted = await client.attestBalance({
+    subject: alice.subject,
+    sk0: alice.sk0.secretKey,
+    nkCommit: alice.nkCommit,
+    assetId: assetIdBytes,
+    host,
+  });
+  const attestJob = await waitJobStatus(client, accepted.job_id, 'completed', '10');
+  const attestationHex = attestJob.result?.attestation;
+  if (typeof attestationHex !== 'string' || attestationHex.length === 0) {
+    fail('10', 'attest job completed but result.attestation missing/empty');
+  }
+  pass(
+    '10',
+    `attestation job completed (job ${accepted.job_id}, ${attestationHex.length / 2} bytes)`,
   );
+
+  // Independent verifier CLI against the untampered attestation (PASS).
+  const verifyReal = runVerifyAttestation(attestationHex);
+  if (verifyReal.status !== 0) {
+    fail(
+      '10',
+      `independent verifier rejected a VALID attestation (exit ${verifyReal.status}): ` +
+        `${verifyReal.stdout}${verifyReal.stderr}`,
+    );
+  }
+  pass('10', 'independent verifier accepted Alice attestation (PASS)');
+
+  // Tamper the LAST byte of the balance field (wire offset 64, 16-byte u128 BE →
+  // hex chars [158, 160)) so header.balance no longer matches the proof's public input.
+  const balanceLastByteHex = attestationHex.slice(158, 160);
+  const tamperedByte = (parseInt(balanceLastByteHex, 16) ^ 0x01).toString(16).padStart(2, '0');
+  const tamperedAttestationHex =
+    attestationHex.slice(0, 158) + tamperedByte + attestationHex.slice(160);
+  if (tamperedAttestationHex === attestationHex) {
+    fail(
+      '10',
+      'tamper byte XOR produced no change — attestation hex too short or offset math wrong',
+    );
+  }
+
+  const verifyTampered = runVerifyAttestation(tamperedAttestationHex);
+  const stderrTampered = verifyTampered.stderr || '';
+  if (verifyTampered.status === 0) {
+    fail('10', 'CRITICAL: verifier accepted a header-tampered attestation');
+  }
+  if (!stderrTampered.includes('public input `balance` does not match')) {
+    fail(
+      '10',
+      `tampered attestation rejected but not for the expected balance mismatch ` +
+        `(exit ${verifyTampered.status}): ${verifyTampered.stdout}${stderrTampered}`,
+    );
+  }
+  pass('10', 'tampered attestation rejected by independent verifier (FAIL, binding holds)');
+}
+
+async function stage11_grants(client, alice, host, usdAssetIdHex, eurAssetIdHex) {
+  const d = decodeHexExact(GRANTEE_SECRET_FIXTURE_HEX, 32, 'grantee_secret_d');
+  const { pkBytes: granteePk } = bip340NormaliseSecret(d);
+  const usdAssetIdBytes = decodeHexExact(usdAssetIdHex, 32, 'usdAssetIdHex');
+  const eurAssetIdBytes = decodeHexExact(eurAssetIdHex, 32, 'eurAssetIdHex');
+
+  // 1. Issue USD-Demo-scoped view grant for the deterministic grantee.
+  const issued = await client.issueViewGrant({
+    subject: alice.subject,
+    sk0: alice.sk0.secretKey,
+    nkCommit: alice.nkCommit,
+    granteePk,
+    scope: {
+      assetIds: [usdAssetIdBytes],
+      notBefore: 0n,
+      notAfter: SCOPE_NOT_AFTER_UNBOUNDED,
+    },
+    grantExpiry: 9999999999n,
+    host,
+  });
+  const grant = issued && issued.grant;
+  if (typeof grant !== 'string' || grant.length === 0) {
+    fail('11', 'issueViewGrant returned missing/empty grant string');
+  }
+  pass('11', 'USD-scoped view grant issued');
+
+  // 2. In-scope grant pull (USD only) — must return Alice's USD history.
+  const grantPull = await client.openGrantPullSession(
+    { subject: alice.subject, grant, granteeSecret: d },
+    { assetIds: [usdAssetIdBytes] },
+  );
+  if (!Array.isArray(grantPull.records)) {
+    fail('11', 'grant pull in-scope USD: records missing/not an array');
+  }
+  if (grantPull.records.length === 0) {
+    fail(
+      '11',
+      'grant pull in-scope USD returned 0 records — Alice must hold USD-Demo history from stage 2',
+    );
+  }
+  pass('11', `grantee pulled in-scope USD records (N=${grantPull.records.length})`);
+
+  // 3. Exact-scope cross-check: Alice's own ownership pull with the same USD scope.
+  const aliceChallenge = await client.openPullChallenge(alice.subject);
+  const aliceProof = buildOwnershipProof({
+    subject: alice.subject,
+    sk0: alice.sk0.secretKey,
+    nkCommit: alice.nkCommit,
+    challenge: aliceChallenge,
+    host,
+  });
+  const aliceScopedPull = await client.openPullSession({
+    challenge: aliceChallenge,
+    proof: aliceProof,
+    scope: { assetIds: [usdAssetIdBytes] },
+  });
+  if (!Array.isArray(aliceScopedPull.records)) {
+    fail('11', 'Alice ownership scoped pull: records missing/not an array');
+  }
+
+  const grantIds = new Set(grantPull.records.map((r) => r.record_id));
+  const aliceIds = new Set(aliceScopedPull.records.map((r) => r.record_id));
+  const grantSorted = [...grantIds].sort().join(',');
+  const aliceSorted = [...aliceIds].sort().join(',');
+  let setsEqual = grantIds.size === aliceIds.size;
+  if (setsEqual) {
+    for (const id of grantIds) {
+      if (!aliceIds.has(id)) {
+        setsEqual = false;
+        break;
+      }
+    }
+  }
+  if (!setsEqual) {
+    fail(
+      '11',
+      `grant pull record-id set != ownership pull set: grant=[${grantSorted}] ownership=[${aliceSorted}]`,
+    );
+  }
+  pass('11', 'grant pull record-id set == ownership pull set (exact scope)');
+
+  // 4. Out-of-scope EUR pull under USD-only grant must be refused with 403 scope_exceeded.
+  try {
+    const eurPull = await client.openGrantPullSession(
+      { subject: alice.subject, grant, granteeSecret: d },
+      { assetIds: [eurAssetIdBytes] },
+    );
+    const n = Array.isArray(eurPull.records) ? eurPull.records.length : 'not-an-array';
+    fail(
+      '11',
+      `CRITICAL: grant scope clamp breached — EUR pulled under USD-only grant (records=${n})`,
+    );
+  } catch (err) {
+    if (
+      !(err instanceof V1ApiError) ||
+      err.status !== 403 ||
+      err.machineCode !== 'scope_exceeded'
+    ) {
+      const name = err && err.constructor && err.constructor.name;
+      const status = err instanceof V1ApiError ? err.status : undefined;
+      const machineCode = err instanceof V1ApiError ? err.machineCode : undefined;
+      const msg = err instanceof Error ? err.message : String(err);
+      fail(
+        '11',
+        `out-of-scope EUR pull threw unexpected error: ` +
+          `name=${name} status=${status} machineCode=${machineCode} message=${msg}`,
+      );
+    }
+    pass('11', 'out-of-scope EUR pull refused (403 scope_exceeded)');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,9 +1234,10 @@ const STAGES = {
   7: 'reorg control N-09 (TODO)',
   8: 'recovery control Req 6 (TODO)',
   9: 'portability control Req 10 (TODO)',
-  10: 'attestation control Req 9(b) (TODO)',
-  11: 'grant control Req 9(c) (TODO)',
+  10: 'attestation round-trip Req 9(b): produce + independent verify + tamper-reject',
+  11: 'grant control Req 9(c): issue USD-scoped grant, in-scope pull ok, EUR out-of-scope refused',
 };
+
 
 function parseArgs(argv) {
   /** @type {{ list: boolean, stages: string[] }} */
@@ -1229,10 +1393,16 @@ async function main() {
         await stage9_portability();
         break;
       case '10':
-        await stage10_attestation(alice);
+        if (!ctx.assetIdHex) {
+          fail('10', 'stage 10 requires stage 2 in the same run (Alice USD asset id)');
+        }
+        await stage10_attestation(client, seed, alice, host, ctx.assetIdHex);
         break;
       case '11':
-        await stage11_grants(alice);
+        if (!ctx.assetIdHex || !ctx.eurAssetIdHex) {
+          fail('11', 'stage 11 requires stage 2 AND stage 2b in the same run (USD + EUR asset ids)');
+        }
+        await stage11_grants(client, alice, host, ctx.assetIdHex, ctx.eurAssetIdHex);
         break;
       default:
         fail('cli', `unknown stage ${s}; use --list`);

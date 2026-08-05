@@ -72,6 +72,7 @@
 //! state.
 
 use anyhow::{bail, Context, Result};
+use bitcoin::hashes::Hash;
 use shared::spec_v1::{ChainPosition, PublishedNullifier};
 use zkcoins_prover::state_engine::StateEngine;
 
@@ -250,6 +251,53 @@ pub(crate) fn replace_engine_nflog_from_survivors(
         .context("replace_engine_nflog_from_survivors: into_engine")?;
     *engine = rebuilt;
     Ok(stats)
+}
+
+/// Durably record the block hash of every block the scanner observed this poll.
+///
+/// Writes one `block_log` row per entry in `blocks` via
+/// [`crate::db::insert_block_log`] (`ON CONFLICT (block_hash) DO NOTHING`).
+/// The live v1.1 scan loop calls this **unconditionally** after each
+/// successful `scan_to_tip` so below-tip §5.7 anchor locators can resolve
+/// inclusion hashes through [`crate::db::load_block_hash_at_height`].
+///
+/// Does not touch the in-memory engine or the durable inscription catalog —
+/// only the append-only block-observation audit log.
+pub async fn record_scanned_block_hashes(
+    pool: &sqlx::PgPool,
+    blocks: &[zkcoins_prover::scanner::BlockScanResult],
+) -> Result<()> {
+    for block in blocks {
+        let block_height = i64::try_from(block.height).with_context(|| {
+            format!(
+                "record_scanned_block_hashes: block height {} does not fit i64",
+                block.height
+            )
+        })?;
+        let inscription_count = i32::try_from(block.inscriptions_seen).with_context(|| {
+            format!(
+                "record_scanned_block_hashes: inscriptions_seen {} at height {} does not fit i32",
+                block.inscriptions_seen, block.height
+            )
+        })?;
+        let entry = crate::db::BlockLogEntry {
+            block_hash: block.block_hash.to_byte_array().to_vec(),
+            block_height: Some(block_height),
+            inscription_count,
+            processing_duration_us: None,
+        };
+        crate::db::insert_block_log(pool, &entry)
+            .await
+            .with_context(|| {
+                format!(
+                    "record_scanned_block_hashes: insert block_log failed \
+                     at height {} hash={}",
+                    block.height,
+                    hex::encode(block.block_hash.to_byte_array())
+                )
+            })?;
+    }
+    Ok(())
 }
 
 /// Forward-scan apply on the live adapter: fold new survivors, set tip, persist.

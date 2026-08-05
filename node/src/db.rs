@@ -1438,8 +1438,13 @@ pub(crate) async fn insert_root_index(
     Ok(())
 }
 
-// Stage 4: test-only residual of legacy durable helper.
-#[cfg(test)]
+/// Append-only scanner observation: one row per confirmed block hash.
+///
+/// Production caller: [`crate::v1::record_scanned_block_hashes`] from the
+/// v1.1 scan loop (so below-tip §5.7 anchor locators can load inclusion
+/// hashes via [`load_block_hash_at_height`]). Also used by unit-test
+/// fixtures that seed a known height → hash binding.
+///
 /// Insert (or no-op on UNIQUE conflict — replayed blocks land twice
 /// when the scanner restarts mid-stream). Marks `processed_at = NOW()`
 /// in the same statement so the row reflects "scanner saw + processed
@@ -1463,8 +1468,7 @@ pub(crate) async fn insert_block_log(
     Ok(())
 }
 
-// Stage 4: test-only residual of legacy durable helper.
-#[cfg(test)]
+/// One `block_log` row written by the live scan loop (or a test fixture).
 #[derive(Debug, Clone)]
 pub(crate) struct BlockLogEntry {
     pub block_hash: Vec<u8>,

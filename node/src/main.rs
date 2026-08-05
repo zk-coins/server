@@ -197,6 +197,14 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     .unwrap_or_else(|e| {
         panic!("v1 live circuit digest (just-built circuit vs §3.6 pins): {e}");
     });
+    let verifier_cache_dir = std::env::var("ZKCOINS_VERIFIER_CACHE_DIR").expect(
+        "ZKCOINS_VERIFIER_CACHE_DIR must be set — a boot that cannot persist its trust anchor must fail loudly",
+    );
+    zkcoins_prover::verifier_cache::write_balance_verifier_cache(
+        pins.network,
+        std::path::Path::new(&verifier_cache_dir),
+    )
+    .expect("write C_balance verifier cache to ZKCOINS_VERIFIER_CACHE_DIR");
     println!(
         "v1 self-heal: live digest = tagged C||C_balance from the circuits \
          just built through ProverBridge (matched §3.6 pins at construction; \
@@ -617,6 +625,12 @@ async fn run_v1_scan_loop(
             .ok_or("v1.1 scanner has no scanned_through tip after successful scan_to_tip")?;
         let tip_height = tip.0;
         let tip_hash = tip.1.to_byte_array();
+        // Durable inclusion hashes for every block this poll observed (forward
+        // and reorg-replacement). Below-tip §5.7 anchor locators read these
+        // via block_log; without this write settled anchors fail ATTEST_ANCHOR_LOCATOR_EDGE.
+        v1::record_scanned_block_hashes(adapter.pool(), &report.blocks)
+            .await
+            .map_err(|e| format!("v1.1 record scanned block hashes failed: {e:#}"))?;
         // Scanner streams only: accepted inscriptions + survivors. Expansion
         // and coupling live inside apply_canonical_survivors /
         // apply_forward_scan (immediately before mutate) so a second caller

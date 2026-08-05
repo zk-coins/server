@@ -54,7 +54,9 @@
 //!   (`EngineAdapter`, `ScanStackMode`, `V1ShadowMode`, boot pins,
 //!   live-digest and canary, tip reconcile and fold apply, publisher
 //!   connect and resume, §4.2 Phase-B scan hook
-//!   (`finalize_due_phase_b_adapter`), `db_v1::list_resumable_pending_publishes` /
+//!   (`finalize_due_phase_b_adapter`), `record_scanned_block_hashes`
+//!   (durable per-height block_hash for below-tip §5.7 anchor locators),
+//!   `db_v1::list_resumable_pending_publishes` /
 //!   `PendingPublishRow`, `enforce_stack_scan_mode`,
 //!   `claim_process_stack_from_v1_shadow_env` for `recover_inscription`).
 //!   **Kernel-API (§7.5)** for the forthcoming gRPC layer: receive

@@ -74,6 +74,7 @@ pub mod prover_bridge;
 pub mod publisher;
 pub mod scanner;
 pub mod state_engine;
+pub mod verifier_cache;
 
 use plonky2::plonk::proof::ProofWithPublicInputs;
 

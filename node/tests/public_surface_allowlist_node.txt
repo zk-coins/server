@@ -339,6 +339,7 @@ node::v1::receive::resume_all_pending_publishes
 node::v1::receive::resume_pending_publish
 node::v1::receive::verify_and_begin_receive
 node::v1::reconcile_persisted_tip
+node::v1::record_scanned_block_hashes
 node::v1::register_live_pending_after_begin
 node::v1::resolve_v1_live_digest
 node::v1::resume_all_pending_publishes
@@ -359,6 +360,7 @@ node::v1::scan::first_boot_requires_full_replace
 node::v1::scan::folded_keys_from_nflog_mirror
 node::v1::scan::observation_tip_still_live
 node::v1::scan::reconcile_persisted_tip
+node::v1::scan::record_scanned_block_hashes
 node::v1::scan::v1_bitcoind_rpc_from_env
 node::v1::self_heal
 node::v1::self_heal::resolve_v1_live_digest
@@ -368,3 +370,17 @@ node::v1::v1_canary_for_heal
 node::v1::v1_publisher_env_from_env
 node::v1::v1_shadow_mode_from_env
 node::v1::verify_and_begin_receive
+node::v1::attest_verify
+node::v1::attest_verify::DecodeBalanceAttestationError
+node::v1::attest_verify::DecodedBalanceAttestation
+node::v1::attest_verify::DecodedBalanceAttestation::anchor
+node::v1::attest_verify::DecodedBalanceAttestation::asset_id
+node::v1::attest_verify::DecodedBalanceAttestation::balance
+node::v1::attest_verify::DecodedBalanceAttestation::nav_ceiling_root
+node::v1::attest_verify::DecodedBalanceAttestation::network_id
+node::v1::attest_verify::DecodedBalanceAttestation::proof_bytes
+node::v1::attest_verify::DecodedBalanceAttestation::size_ceiling
+node::v1::attest_verify::DecodedBalanceAttestation::subject
+node::v1::attest_verify::VerifyBalanceAttestationError
+node::v1::attest_verify::decode_balance_attestation_v1
+node::v1::attest_verify::verify_balance_attestation

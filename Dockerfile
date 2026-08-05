@@ -71,6 +71,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/node /usr/local/bin/zkcoins-node
+COPY --from=builder /app/target/release/verify_attestation /usr/local/bin/verify_attestation
 
 ENV RUST_LOG=info
 WORKDIR /data
