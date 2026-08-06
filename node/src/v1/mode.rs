@@ -521,4 +521,522 @@ mod unit_tests {
             "unexpected error: {err}"
         );
     }
+
+    // --- env mutation serialisation (nextest --test-threads=8) ---
+
+    /// Serialise process-env mutations across tests in this module.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    const BOOT_ENV_KEYS: &[&'static str] = &[
+        "ZKCOINS_NETWORK",
+        "ZKCOINS_ACTIVATION_HEIGHT",
+        "ZKCOINS_EXPECTED_PARAMS_IDENTIFIER",
+        "ZKCOINS_CIRCUIT_DIGEST_C",
+        "ZKCOINS_CIRCUIT_DIGEST_C_BALANCE",
+        "ZKCOINS_BOOTSTRAP_PUBKEY",
+    ];
+
+    /// Snapshot of env vars restored on drop (panic-safe cleanup).
+    struct SavedEnv {
+        entries: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl SavedEnv {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                entries: keys.iter().map(|&k| (k, std::env::var_os(k))).collect(),
+            }
+        }
+    }
+
+    impl Drop for SavedEnv {
+        fn drop(&mut self) {
+            for (k, prev) in self.entries.drain(..) {
+                match prev {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// Fixed digests used by the boot-env baseline (same shape as `fixture_params`).
+    const BASE_DIGEST_C: [u8; 32] = [1u8; 32];
+    const BASE_DIGEST_BAL: [u8; 32] = [2u8; 32];
+    const BASE_BOOTSTRAP: [u8; 32] = [3u8; 32];
+    const BASE_HEIGHT: u64 = 2_500_000;
+
+    /// Build a mutually consistent testnet boot-env baseline and install it.
+    fn install_testnet_boot_baseline() {
+        let tag = network_tag_for(Network::Testnet)
+            .expect("testnet tag")
+            .to_string();
+        let params = NetworkParams::new(
+            tag,
+            BASE_DIGEST_C,
+            BASE_DIGEST_BAL,
+            BASE_HEIGHT,
+            6,
+            BASE_BOOTSTRAP,
+        )
+        .expect("baseline NetworkParams");
+        let expected = hex::encode(params.identifier().expect("baseline identifier"));
+        std::env::set_var("ZKCOINS_NETWORK", "testnet");
+        std::env::set_var("ZKCOINS_ACTIVATION_HEIGHT", BASE_HEIGHT.to_string());
+        std::env::set_var("ZKCOINS_EXPECTED_PARAMS_IDENTIFIER", expected);
+        std::env::set_var("ZKCOINS_CIRCUIT_DIGEST_C", hex::encode(BASE_DIGEST_C));
+        std::env::set_var(
+            "ZKCOINS_CIRCUIT_DIGEST_C_BALANCE",
+            hex::encode(BASE_DIGEST_BAL),
+        );
+        std::env::set_var("ZKCOINS_BOOTSTRAP_PUBKEY", hex::encode(BASE_BOOTSTRAP));
+    }
+
+    // --- A. v1_shadow_mode_from_env ---
+
+    #[test]
+    fn v1_shadow_mode_from_env_unset_is_off() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(&["ZKCOINS_V1_SHADOW"]);
+        std::env::remove_var("ZKCOINS_V1_SHADOW");
+        assert_eq!(
+            v1_shadow_mode_from_env().expect("unset"),
+            V1ShadowMode::Off
+        );
+    }
+
+    #[test]
+    fn v1_shadow_mode_from_env_one_is_on() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(&["ZKCOINS_V1_SHADOW"]);
+        std::env::set_var("ZKCOINS_V1_SHADOW", "1");
+        assert_eq!(v1_shadow_mode_from_env().expect("1"), V1ShadowMode::On);
+    }
+
+    #[test]
+    fn v1_shadow_mode_from_env_garbage_fails() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(&["ZKCOINS_V1_SHADOW"]);
+        std::env::set_var("ZKCOINS_V1_SHADOW", "garbage");
+        let err = v1_shadow_mode_from_env().expect_err("garbage");
+        assert_eq!(err.raw, "garbage");
+        assert!(err.to_string().contains("not supported"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v1_shadow_mode_from_env_non_utf8_fails() {
+        use std::os::unix::ffi::OsStringExt;
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(&["ZKCOINS_V1_SHADOW"]);
+        std::env::set_var(
+            "ZKCOINS_V1_SHADOW",
+            std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
+        );
+        let err = v1_shadow_mode_from_env().expect_err("non-utf8");
+        assert_eq!(err.raw, "<non-utf8>");
+    }
+
+    // --- B. verifier_cache_role_from_env ---
+
+    #[test]
+    fn verifier_cache_role_from_env_unset_is_primary() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(&["ZKCOINS_VERIFIER_CACHE_ROLE"]);
+        std::env::remove_var("ZKCOINS_VERIFIER_CACHE_ROLE");
+        assert_eq!(
+            verifier_cache_role_from_env().expect("unset"),
+            VerifierCacheRole::Primary
+        );
+    }
+
+    #[test]
+    fn verifier_cache_role_from_env_secondary() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(&["ZKCOINS_VERIFIER_CACHE_ROLE"]);
+        std::env::set_var("ZKCOINS_VERIFIER_CACHE_ROLE", "secondary");
+        assert_eq!(
+            verifier_cache_role_from_env().expect("secondary"),
+            VerifierCacheRole::Secondary
+        );
+    }
+
+    #[test]
+    fn verifier_cache_role_from_env_bogus_fails() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(&["ZKCOINS_VERIFIER_CACHE_ROLE"]);
+        std::env::set_var("ZKCOINS_VERIFIER_CACHE_ROLE", "bogus");
+        let err = verifier_cache_role_from_env().expect_err("bogus");
+        assert_eq!(err.raw, "bogus");
+        assert!(err.to_string().contains("not supported"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verifier_cache_role_from_env_non_utf8_fails() {
+        use std::os::unix::ffi::OsStringExt;
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(&["ZKCOINS_VERIFIER_CACHE_ROLE"]);
+        std::env::set_var(
+            "ZKCOINS_VERIFIER_CACHE_ROLE",
+            std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
+        );
+        let err = verifier_cache_role_from_env().expect_err("non-utf8");
+        assert_eq!(err.raw, "<non-utf8>");
+    }
+
+    // --- C. network_label ---
+
+    #[test]
+    fn network_label_covers_all_variants() {
+        assert_eq!(network_label(Network::Mainnet), "mainnet");
+        assert_eq!(network_label(Network::Testnet), "testnet");
+        assert_eq!(network_label(Network::Regtest), "regtest");
+        // parse_network_label mainnet arm (existing tests only exercise regtest success).
+        assert_eq!(parse_network_label("mainnet").unwrap(), Network::Mainnet);
+        assert_eq!(parse_network_label("testnet").unwrap(), Network::Testnet);
+    }
+
+    // --- D. validate_v1_boot_pins tag-mismatch branch ---
+
+    #[test]
+    fn boot_pins_reject_network_tag_mismatch() {
+        let tag = network_tag_for(Network::Testnet).unwrap();
+        let params = fixture_params(tag, 2_500_000);
+        let id = params.identifier().expect("id");
+        // Identifier matches params, but caller claims Mainnet → tag arm fires.
+        let err = validate_v1_boot_pins(Network::Mainnet, 2_500_000, &params, id)
+            .expect_err("tag mismatch must fail");
+        assert!(
+            err.contains("network_tag") || err.contains("correspond"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // --- E. parse_hex_32 (private; reachable via super from this child module) ---
+
+    #[test]
+    fn parse_hex_32_valid_and_trimmed() {
+        let raw = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let expected = hex::decode(raw).expect("fixture hex");
+        let expected: [u8; 32] = expected.try_into().expect("32 bytes");
+        assert_eq!(
+            super::parse_hex_32(raw, "TEST_HEX").expect("valid"),
+            expected
+        );
+        // Leading/trailing whitespace is trimmed before length/charset checks.
+        let padded = format!("  {raw}  ");
+        assert_eq!(
+            super::parse_hex_32(&padded, "TEST_HEX").expect("trimmed"),
+            expected
+        );
+    }
+
+    #[test]
+    fn parse_hex_32_wrong_length_fails() {
+        let short = "a".repeat(63);
+        let err = super::parse_hex_32(&short, "TEST_HEX").expect_err("too short");
+        assert!(
+            err.contains("64") || err.contains("lowercase hex characters"),
+            "unexpected: {err}"
+        );
+        let long = "a".repeat(65);
+        let err = super::parse_hex_32(&long, "TEST_HEX").expect_err("too long");
+        assert!(
+            err.contains("64") || err.contains("lowercase hex characters"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_hex_32_uppercase_and_non_hex_fail() {
+        let upper = format!("AA{}", "a".repeat(62));
+        let err = super::parse_hex_32(&upper, "TEST_HEX").expect_err("uppercase");
+        assert!(
+            err.contains("not lowercase hex"),
+            "unexpected: {err}"
+        );
+        let non_hex = format!("g{}", "a".repeat(63));
+        let err = super::parse_hex_32(&non_hex, "TEST_HEX").expect_err("non-hex");
+        assert!(
+            err.contains("not lowercase hex"),
+            "unexpected: {err}"
+        );
+    }
+
+    // --- F. v1_boot_pins_from_env ---
+
+    #[test]
+    fn v1_boot_pins_from_env_happy_path() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        let pins = v1_boot_pins_from_env().expect("happy path");
+        assert_eq!(pins.network, Network::Testnet);
+        assert_eq!(pins.activation_height, BASE_HEIGHT);
+        let id = pins.network_params.identifier().expect("id");
+        assert_eq!(id, pins.expected_params_identifier);
+        let expected_from_env =
+            hex::decode(std::env::var("ZKCOINS_EXPECTED_PARAMS_IDENTIFIER").unwrap())
+                .expect("env identifier hex");
+        assert_eq!(pins.expected_params_identifier.as_slice(), expected_from_env.as_slice());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_network_unset() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::remove_var("ZKCOINS_NETWORK");
+        let err = v1_boot_pins_from_env().expect_err("network unset");
+        assert_eq!(err, V1_BOOT_CONFIG_ERROR.to_string());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_network_blank() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::set_var("ZKCOINS_NETWORK", "  ");
+        let err = v1_boot_pins_from_env().expect_err("network blank");
+        assert_eq!(err, V1_BOOT_CONFIG_ERROR.to_string());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_network_unknown() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::set_var("ZKCOINS_NETWORK", "notanetwork");
+        let err = v1_boot_pins_from_env().expect_err("unknown network");
+        assert_ne!(err, V1_BOOT_CONFIG_ERROR.to_string());
+        assert!(
+            err.contains("not a known network tag"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_height_unset() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::remove_var("ZKCOINS_ACTIVATION_HEIGHT");
+        let err = v1_boot_pins_from_env().expect_err("height unset");
+        assert_eq!(err, V1_BOOT_CONFIG_ERROR.to_string());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_height_blank() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::set_var("ZKCOINS_ACTIVATION_HEIGHT", "");
+        let err = v1_boot_pins_from_env().expect_err("height blank");
+        assert_eq!(err, V1_BOOT_CONFIG_ERROR.to_string());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_height_not_integer() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::set_var("ZKCOINS_ACTIVATION_HEIGHT", "not-a-number");
+        let err = v1_boot_pins_from_env().expect_err("height garbage");
+        assert_ne!(err, V1_BOOT_CONFIG_ERROR.to_string());
+        assert!(
+            err.contains("not a non-negative integer"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_expected_id_unset() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::remove_var("ZKCOINS_EXPECTED_PARAMS_IDENTIFIER");
+        let err = v1_boot_pins_from_env().expect_err("expected id unset");
+        assert_eq!(err, V1_BOOT_CONFIG_ERROR.to_string());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_expected_id_blank() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::set_var("ZKCOINS_EXPECTED_PARAMS_IDENTIFIER", "");
+        let err = v1_boot_pins_from_env().expect_err("expected id blank");
+        assert_eq!(err, V1_BOOT_CONFIG_ERROR.to_string());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_expected_id_too_short() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::set_var("ZKCOINS_EXPECTED_PARAMS_IDENTIFIER", "tooshort");
+        let err = v1_boot_pins_from_env().expect_err("expected id short");
+        assert_ne!(err, V1_BOOT_CONFIG_ERROR.to_string());
+        assert!(
+            err.contains("64") || err.contains("lowercase hex"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_digest_c_unset() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::remove_var("ZKCOINS_CIRCUIT_DIGEST_C");
+        let err = v1_boot_pins_from_env().expect_err("digest_c unset");
+        assert_eq!(err, V1_BOOT_CONFIG_ERROR.to_string());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_digest_c_blank() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::set_var("ZKCOINS_CIRCUIT_DIGEST_C", "");
+        let err = v1_boot_pins_from_env().expect_err("digest_c blank");
+        assert_eq!(err, V1_BOOT_CONFIG_ERROR.to_string());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_digest_c_invalid_hex() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::set_var(
+            "ZKCOINS_CIRCUIT_DIGEST_C",
+            format!("zz{}", "0".repeat(62)),
+        );
+        let err = v1_boot_pins_from_env().expect_err("digest_c bad hex");
+        assert_ne!(err, V1_BOOT_CONFIG_ERROR.to_string());
+        assert!(
+            err.contains("not lowercase hex") || err.contains("ZKCOINS_CIRCUIT_DIGEST_C"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_digest_balance_unset() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::remove_var("ZKCOINS_CIRCUIT_DIGEST_C_BALANCE");
+        let err = v1_boot_pins_from_env().expect_err("digest_bal unset");
+        assert_eq!(err, V1_BOOT_CONFIG_ERROR.to_string());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_digest_balance_blank() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::set_var("ZKCOINS_CIRCUIT_DIGEST_C_BALANCE", "");
+        let err = v1_boot_pins_from_env().expect_err("digest_bal blank");
+        assert_eq!(err, V1_BOOT_CONFIG_ERROR.to_string());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_bootstrap_unset() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::remove_var("ZKCOINS_BOOTSTRAP_PUBKEY");
+        let err = v1_boot_pins_from_env().expect_err("bootstrap unset");
+        assert_eq!(err, V1_BOOT_CONFIG_ERROR.to_string());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_bootstrap_blank() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        std::env::set_var("ZKCOINS_BOOTSTRAP_PUBKEY", "");
+        let err = v1_boot_pins_from_env().expect_err("bootstrap blank");
+        assert_eq!(err, V1_BOOT_CONFIG_ERROR.to_string());
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_regtest_nonzero_activation_fails() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        // Internally consistent regtest set with nonzero height so validation
+        // reaches the §3.6 regtest pin check (not the identifier arm).
+        let height = 7u64;
+        let tag = network_tag_for(Network::Regtest)
+            .expect("regtest tag")
+            .to_string();
+        let params = NetworkParams::new(
+            tag,
+            BASE_DIGEST_C,
+            BASE_DIGEST_BAL,
+            height,
+            6,
+            BASE_BOOTSTRAP,
+        )
+        .expect("regtest params");
+        let expected = hex::encode(params.identifier().expect("id"));
+        std::env::set_var("ZKCOINS_NETWORK", "regtest");
+        std::env::set_var("ZKCOINS_ACTIVATION_HEIGHT", height.to_string());
+        std::env::set_var("ZKCOINS_EXPECTED_PARAMS_IDENTIFIER", expected);
+        std::env::set_var("ZKCOINS_CIRCUIT_DIGEST_C", hex::encode(BASE_DIGEST_C));
+        std::env::set_var(
+            "ZKCOINS_CIRCUIT_DIGEST_C_BALANCE",
+            hex::encode(BASE_DIGEST_BAL),
+        );
+        std::env::set_var("ZKCOINS_BOOTSTRAP_PUBKEY", hex::encode(BASE_BOOTSTRAP));
+        let err = v1_boot_pins_from_env().expect_err("regtest nonzero");
+        assert!(
+            err.contains("regtest") || err.contains("§3.6"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn v1_boot_pins_from_env_wrong_expected_identifier_fails() {
+        let _guard = env_lock();
+        let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
+        install_testnet_boot_baseline();
+        // Well-formed 64-char lowercase hex that does not match the built params.
+        std::env::set_var(
+            "ZKCOINS_EXPECTED_PARAMS_IDENTIFIER",
+            "00".repeat(32),
+        );
+        let err = v1_boot_pins_from_env().expect_err("wrong identifier");
+        assert!(
+            err.contains("identifier"),
+            "unexpected: {err}"
+        );
+    }
+
+    // UNREACHABLE: mode.rs:181-183 — network_tag_for map_err body:
+    // NETWORK_TAG_{MAINNET,TESTNET,REGTEST} are fixed valid-ASCII literals in
+    // shared/src/spec_v1/tags.rs; std::str::from_utf8 on them cannot fail.
+    //
+    // UNREACHABLE: mode.rs:228-230 — validate_v1_boot_pins identifier().map_err:
+    // every NetworkParams obtainable here is built via NetworkParams::new(),
+    // which already rejects the only input that could make .identifier() fail
+    // (oversized tag) at construction time.
+    //
+    // UNREACHABLE: mode.rs:305-306 — parse_hex_32 hex::decode map_err:
+    // reached only after len==64 and every byte is an ASCII hex digit — which
+    // is exactly the set hex::decode always accepts.
+    //
+    // UNREACHABLE: mode.rs:308-309 — parse_hex_32 try_into map_err:
+    // a successful hex::decode of a 64-hex-char string always yields 32 bytes.
+    //
+    // UNREACHABLE: mode.rs:375 — v1_boot_pins_from_env NetworkParams::new map_err:
+    // finality_confirmations is hardcoded 6 and the tag always comes from
+    // network_tag_for (one of three short fixed strings under the 255-byte
+    // limit); neither of NetworkParams::new's two failure conditions can fire.
 }
