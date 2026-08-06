@@ -1067,4 +1067,473 @@ mod tests {
             "fold of {N} took {elapsed:?} — still looks quadratic?"
         );
     }
+
+    // --- §3.9 reorg finality depth suite (depths 1..=7 + edge cases) ---
+
+    /// Build a dense chain: one nullifier per height `0..=old_tip` with
+    /// `pk(h)/r(h)`. Position index equals height under this construction.
+    fn fold_dense_chain_0_to(acc: &mut NfLogAccumulator, old_tip: u64) {
+        for h in 0..=old_tip {
+            acc.fold(pos(h), pk(h as u8), r(h as u8))
+                .expect("fold dense chain");
+        }
+    }
+
+    /// Canonical stream for a content-changing reorg of depth `d` at tip
+    /// `old_tip`: heights `0..=old_tip-d` keep original `pk(h)/r(h)`; heights
+    /// `old_tip-d+1..=old_tip` get offset-100 replacements.
+    fn canonical_stream_reorg_depth(old_tip: u64, d: u64) -> Vec<PublishedNullifier> {
+        assert!(d >= 1 && d <= old_tip);
+        let mut stream = Vec::with_capacity((old_tip + 1) as usize);
+        for h in 0..=(old_tip - d) {
+            stream.push(published(h, h as u8, h as u8));
+        }
+        for h in (old_tip - d + 1)..=old_tip {
+            stream.push(published(h, 100 + h as u8, 100 + h as u8));
+        }
+        stream
+    }
+
+    /// Shared body for the seven depth-finality tests.
+    fn assert_reorg_depth_finality(d: u64, expect_broken: bool, expect_displaced: u64) {
+        const OLD_TIP: u64 = 20;
+        let mut acc = NfLogAccumulator::new(0);
+        fold_dense_chain_0_to(&mut acc, OLD_TIP);
+
+        let old_final = acc.size_final(OLD_TIP);
+        assert_eq!(
+            old_final, 16,
+            "depth {d}: size_final({OLD_TIP}) must be 16 (heights 0..=15 final)"
+        );
+
+        let stream = canonical_stream_reorg_depth(OLD_TIP, d);
+        let outcome = acc
+            .reorg_replay(OLD_TIP, stream)
+            .unwrap_or_else(|e| panic!("depth {d}: reorg_replay must succeed: {e:?}"));
+
+        assert_eq!(
+            outcome.finality_broken, expect_broken,
+            "depth {d}: finality_broken expected {expect_broken}, got {}",
+            outcome.finality_broken
+        );
+        assert_eq!(
+            outcome.displaced_final_count, expect_displaced,
+            "depth {d}: expected displaced_final_count={expect_displaced}, got {}",
+            outcome.displaced_final_count
+        );
+
+        // Position 0 is never in the replaced range for d <= 7.
+        assert_eq!(
+            acc.log[0].pk,
+            pk(0),
+            "depth {d}: final position 0 pk must remain pk(0)"
+        );
+        assert_eq!(
+            acc.log[0].r,
+            r(0),
+            "depth {d}: final position 0 r must remain r(0)"
+        );
+
+        // Position 15 (height 15) stays untouched only when the reorg starts
+        // at height > 15, i.e. d <= 5 (first replaced = OLD_TIP-d+1 >= 16).
+        if d <= 5 {
+            assert_eq!(
+                acc.log[15].pk,
+                pk(15),
+                "depth {d}: final position 15 pk must remain pk(15) (not replaced)"
+            );
+            assert_eq!(
+                acc.log[15].r,
+                r(15),
+                "depth {d}: final position 15 r must remain r(15) (not replaced)"
+            );
+        }
+    }
+
+    #[test]
+    fn reorg_depth_1_finality() {
+        // Replaced heights 20..=20 — all > 15 → no final displacement.
+        assert_reorg_depth_finality(1, false, 0);
+    }
+
+    #[test]
+    fn reorg_depth_2_finality() {
+        // Replaced heights 19..=20 — all > 15 → no final displacement.
+        assert_reorg_depth_finality(2, false, 0);
+    }
+
+    #[test]
+    fn reorg_depth_3_finality() {
+        // Replaced heights 18..=20 — all > 15 → no final displacement.
+        assert_reorg_depth_finality(3, false, 0);
+    }
+
+    #[test]
+    fn reorg_depth_4_finality() {
+        // Replaced heights 17..=20 — all > 15 → no final displacement.
+        assert_reorg_depth_finality(4, false, 0);
+    }
+
+    #[test]
+    fn reorg_depth_5_finality() {
+        // Replaced heights 16..=20 — all > 15 → no final displacement.
+        assert_reorg_depth_finality(5, false, 0);
+    }
+
+    #[test]
+    fn reorg_depth_6_finality() {
+        // Replaced heights 15..=20 → final position 15 displaced → count 1.
+        assert_reorg_depth_finality(6, true, 1);
+    }
+
+    #[test]
+    fn reorg_depth_7_finality() {
+        // Replaced heights 14..=20 → final positions 14 and 15 displaced → count 2.
+        assert_reorg_depth_finality(7, true, 2);
+    }
+
+    #[test]
+    fn reorg_depth_6_content_preserving_not_broken() {
+        // Same depth-6 height range (15..=20) but identical (pk,r) content —
+        // displacement is content-based, not depth-based.
+        const OLD_TIP: u64 = 20;
+        let mut acc = NfLogAccumulator::new(0);
+        fold_dense_chain_0_to(&mut acc, OLD_TIP);
+        assert_eq!(acc.size_final(OLD_TIP), 16);
+
+        // "New" stream is byte-identical to the original chain.
+        let stream: Vec<PublishedNullifier> = (0..=OLD_TIP)
+            .map(|h| published(h, h as u8, h as u8))
+            .collect();
+        let outcome = acc
+            .reorg_replay(OLD_TIP, stream)
+            .expect("content-preserving depth-6 reorg_replay");
+
+        assert!(
+            !outcome.finality_broken,
+            "depth 6 content-preserving: finality_broken must be false"
+        );
+        assert_eq!(
+            outcome.displaced_final_count, 0,
+            "depth 6 content-preserving: displaced_final_count must be 0, got {}",
+            outcome.displaced_final_count
+        );
+        assert_eq!(acc.log[0].pk, pk(0));
+        assert_eq!(acc.log[15].pk, pk(15));
+        assert_eq!(acc.log[15].r, r(15));
+    }
+
+    #[test]
+    fn reorg_depth_7_shrinks_final_position_missing() {
+        // Depth-7 style shrink: drop heights 14..=20 entirely so former final
+        // positions 14 and 15 no longer exist after replay (None, not mismatch).
+        const OLD_TIP: u64 = 20;
+        let mut acc = NfLogAccumulator::new(0);
+        fold_dense_chain_0_to(&mut acc, OLD_TIP);
+        let old_final = acc.size_final(OLD_TIP);
+        assert_eq!(old_final, 16, "precondition: 16 final positions");
+
+        // Keep only heights 0..=13 (OLD_TIP - 7); omit the depth-7 range.
+        let stream: Vec<PublishedNullifier> = (0..=(OLD_TIP - 7))
+            .map(|h| published(h, h as u8, h as u8))
+            .collect();
+        let outcome = acc
+            .reorg_replay(OLD_TIP, stream)
+            .expect("shrinking depth-7 reorg_replay");
+
+        assert!(
+            outcome.finality_broken,
+            "depth 7 shrink: finality_broken must be true when final positions vanish"
+        );
+        assert!(
+            outcome.displaced_final_count >= 1,
+            "depth 7 shrink: displaced_final_count >= 1, got {}",
+            outcome.displaced_final_count
+        );
+        assert_eq!(
+            outcome.displaced_final_count, 2,
+            "depth 7 shrink: positions 14 and 15 missing → displaced=2, got {}",
+            outcome.displaced_final_count
+        );
+        // Explicit "missing" evidence (not pk/r mismatch at an existing slot).
+        assert!(
+            acc.log.len() < 16,
+            "depth 7 shrink: log must be shorter than old_final=16, len={}",
+            acc.log.len()
+        );
+        assert!(
+            acc.log.get(15).is_none(),
+            "depth 7 shrink: log.get(15) must be None (position missing)"
+        );
+        assert!(
+            acc.log.get(14).is_none(),
+            "depth 7 shrink: log.get(14) must be None (position missing)"
+        );
+        // Surviving finals still match the snapshot.
+        assert_eq!(acc.log[0].pk, pk(0));
+        assert_eq!(acc.log[13].pk, pk(13));
+    }
+
+    #[test]
+    fn size_final_boundaries() {
+        // --- empty log: every tip yields 0 ---
+        let empty = NfLogAccumulator::new(0);
+        assert_eq!(empty.size_final(0), 0, "empty: tip=0 → 0");
+        assert_eq!(empty.size_final(1), 0, "empty: tip=1 → 0");
+        assert_eq!(empty.size_final(4), 0, "empty: tip=4 → 0");
+        assert_eq!(empty.size_final(5), 0, "empty: tip=5 → 0 (no entries)");
+        assert_eq!(empty.size_final(100), 0, "empty: tip=100 → 0");
+
+        // --- dense low heights ---
+        let mut low = NfLogAccumulator::new(0);
+        fold_dense_chain_0_to(&mut low, 3); // heights 0,1,2,3
+        assert_eq!(low.size_final(0), 0, "dense low: tip=0 → 0 (checked_sub)");
+        assert_eq!(low.size_final(1), 0, "dense low: tip=1 → 0");
+        assert_eq!(low.size_final(4), 0, "dense low: tip=4 → 0");
+        // tip=5 → max_final=0 → only height 0
+        assert_eq!(low.size_final(5), 1, "dense low: tip=5 → 1 (height 0 only)");
+        // tip=8 → max_final=3 → all four entries final
+        assert_eq!(low.size_final(8), 4, "dense low: tip=8 → all 4 final");
+
+        // --- gapped heights (not every height has an entry) ---
+        // Fold heights 0, 1, 10, 11, 12, 20 — distinct from the existing
+        // size_final_confirmation_boundary suite (which uses 10,11,12,20 only).
+        let mut gapped = NfLogAccumulator::new(0);
+        for (h, b) in [(0u64, 1u8), (1, 2), (10, 3), (11, 4), (12, 5), (20, 6)] {
+            gapped
+                .fold(pos(h), pk(b), r(b))
+                .expect("fold gapped chain");
+        }
+        assert_eq!(gapped.nav().size, 6);
+
+        assert_eq!(gapped.size_final(0), 0, "gapped: tip=0 → 0");
+        assert_eq!(gapped.size_final(4), 0, "gapped: tip=4 → 0");
+        // tip=5 → max_final=0 → height 0 → 1
+        assert_eq!(gapped.size_final(5), 1, "gapped: tip=5 → 1 (height 0)");
+        // tip=6 → max_final=1 → heights 0,1 → 2
+        assert_eq!(gapped.size_final(6), 2, "gapped: tip=6 → 2 (heights 0,1)");
+        // tip=14 → max_final=9 → still only 0,1 (next is 10) → 2
+        assert_eq!(
+            gapped.size_final(14),
+            2,
+            "gapped: tip=14 → 2 (gap before height 10; max_final=9)"
+        );
+        // tip=15 → max_final=10 → heights 0,1,10 → 3
+        assert_eq!(gapped.size_final(15), 3, "gapped: tip=15 → 3");
+        // tip=16 → max_final=11 → +height 11 → 4
+        assert_eq!(gapped.size_final(16), 4, "gapped: tip=16 → 4");
+        // tip=17 → max_final=12 → +height 12 → 5
+        assert_eq!(gapped.size_final(17), 5, "gapped: tip=17 → 5");
+        // tip=24 → max_final=19 → still 5 (height 20 not yet final)
+        assert_eq!(
+            gapped.size_final(24),
+            5,
+            "gapped: tip=24 → 5 (height 20 not final; max_final=19)"
+        );
+        // tip=25 → max_final=20 → all six
+        assert_eq!(gapped.size_final(25), 6, "gapped: tip=25 → all 6 final");
+    }
+
+    #[test]
+    fn reorg_replay_empty_stream() {
+        const OLD_TIP: u64 = 20;
+        let mut acc = NfLogAccumulator::new(0);
+        fold_dense_chain_0_to(&mut acc, OLD_TIP);
+        let old_final = acc.size_final(OLD_TIP);
+        // old_final = 16 (heights 0..=15); empty replay displaces every one.
+        assert_eq!(old_final, 16, "empty-stream: pre-reorg old_final must be 16");
+
+        let outcome = acc
+            .reorg_replay(OLD_TIP, vec![])
+            .expect("empty-stream reorg_replay");
+
+        assert!(
+            outcome.finality_broken,
+            "empty-stream: finality_broken must be true"
+        );
+        assert_eq!(
+            outcome.displaced_final_count, old_final,
+            "empty-stream: displaced_final_count must equal old_final={old_final}, got {}",
+            outcome.displaced_final_count
+        );
+        assert_eq!(acc.nav().size, 0, "empty-stream: log must be fully cleared");
+        assert!(acc.log.get(0).is_none());
+    }
+
+    #[test]
+    fn reorg_replay_identical_stream_no_break() {
+        const OLD_TIP: u64 = 20;
+        let mut acc = NfLogAccumulator::new(0);
+        fold_dense_chain_0_to(&mut acc, OLD_TIP);
+        assert_eq!(acc.size_final(OLD_TIP), 16);
+
+        let stream: Vec<PublishedNullifier> = (0..=OLD_TIP)
+            .map(|h| published(h, h as u8, h as u8))
+            .collect();
+        let outcome = acc
+            .reorg_replay(OLD_TIP, stream)
+            .expect("identical-stream reorg_replay");
+
+        assert!(
+            !outcome.finality_broken,
+            "identical-stream: finality_broken must be false"
+        );
+        assert_eq!(
+            outcome.displaced_final_count, 0,
+            "identical-stream: displaced_final_count must be 0, got {}",
+            outcome.displaced_final_count
+        );
+        assert_eq!(acc.nav().size, 21, "identical-stream: full chain restored");
+        assert_eq!(acc.log[0].pk, pk(0));
+        assert_eq!(acc.log[15].pk, pk(15));
+        assert_eq!(acc.log[20].pk, pk(20));
+    }
+
+    #[test]
+    fn reorg_replay_reorders_only_nonfinal() {
+        // Content-swap only non-final heights (16..=20); finals 0..=15 intact.
+        const OLD_TIP: u64 = 20;
+        let mut acc = NfLogAccumulator::new(0);
+        fold_dense_chain_0_to(&mut acc, OLD_TIP);
+        let old_final = acc.size_final(OLD_TIP);
+        assert_eq!(old_final, 16);
+
+        let mut stream: Vec<PublishedNullifier> = Vec::new();
+        for h in 0..=15u64 {
+            stream.push(published(h, h as u8, h as u8));
+        }
+        for h in 16..=OLD_TIP {
+            // Distinct replacement content at non-final heights only.
+            stream.push(published(h, 100 + h as u8, 100 + h as u8));
+        }
+
+        let outcome = acc
+            .reorg_replay(OLD_TIP, stream)
+            .expect("nonfinal-only reorg_replay");
+
+        assert!(
+            !outcome.finality_broken,
+            "nonfinal-only: finality_broken must be false"
+        );
+        assert_eq!(
+            outcome.displaced_final_count, 0,
+            "nonfinal-only: displaced_final_count must be 0, got {}",
+            outcome.displaced_final_count
+        );
+        // Finals unchanged; non-finals carry the new bytes.
+        assert_eq!(acc.log[0].pk, pk(0));
+        assert_eq!(acc.log[15].pk, pk(15));
+        assert_eq!(acc.log[15].r, r(15));
+        assert_eq!(
+            acc.log[16].pk,
+            pk(116),
+            "nonfinal-only: height 16 must carry replacement pk"
+        );
+        assert_eq!(acc.log[20].pk, pk(120));
+    }
+
+    #[test]
+    fn reorg_replay_out_of_order_stream_still_sorts() {
+        // Depth-1 reorg stream delivered sorted vs. a fixed permutation — both
+        // must yield identical ReorgOutcome and final log (internal sort).
+        const OLD_TIP: u64 = 20;
+        let d = 1u64;
+
+        let mut acc_sorted = NfLogAccumulator::new(0);
+        fold_dense_chain_0_to(&mut acc_sorted, OLD_TIP);
+        let mut acc_shuffled = NfLogAccumulator::new(0);
+        fold_dense_chain_0_to(&mut acc_shuffled, OLD_TIP);
+
+        let sorted_stream = canonical_stream_reorg_depth(OLD_TIP, d);
+        // Deterministic permutation: reverse, then swap a few fixed indices.
+        let mut shuffled_stream = sorted_stream.clone();
+        shuffled_stream.reverse();
+        if shuffled_stream.len() >= 4 {
+            let n = shuffled_stream.len();
+            shuffled_stream.swap(0, 3);
+            shuffled_stream.swap(1, n - 1);
+            shuffled_stream.swap(2, 5.min(n - 1));
+        }
+        // Sanity: permutation is not already sorted by chain_pos.
+        let mut probe = shuffled_stream.clone();
+        probe.sort_by_key(|e| e.chain_pos);
+        assert_ne!(
+            shuffled_stream
+                .iter()
+                .map(|e| e.chain_pos)
+                .collect::<Vec<_>>(),
+            probe.iter().map(|e| e.chain_pos).collect::<Vec<_>>(),
+            "out-of-order test: shuffled stream must differ from sorted order"
+        );
+
+        let outcome_sorted = acc_sorted
+            .reorg_replay(OLD_TIP, sorted_stream)
+            .expect("sorted reorg_replay");
+        let outcome_shuffled = acc_shuffled
+            .reorg_replay(OLD_TIP, shuffled_stream)
+            .expect("shuffled reorg_replay");
+
+        assert_eq!(
+            outcome_sorted, outcome_shuffled,
+            "out-of-order: ReorgOutcome must match sorted vs shuffled stream"
+        );
+        assert_eq!(
+            acc_sorted.log, acc_shuffled.log,
+            "out-of-order: final log must match sorted vs shuffled stream"
+        );
+        assert_eq!(
+            acc_sorted.heights, acc_shuffled.heights,
+            "out-of-order: heights must match sorted vs shuffled stream"
+        );
+        assert_eq!(
+            acc_sorted.nav(),
+            acc_shuffled.nav(),
+            "out-of-order: nav must match sorted vs shuffled stream"
+        );
+        // Depth-1: no final displacement.
+        assert!(!outcome_sorted.finality_broken);
+        assert_eq!(outcome_sorted.displaced_final_count, 0);
+    }
+
+    #[test]
+    fn reorg_replay_propagates_fold_error() {
+        // Non-empty pre-state so the clear+refold path is exercised; then a
+        // stream with two identical chain_pos values triggers OutOfOrderFold.
+        let mut acc = NfLogAccumulator::new(0);
+        for h in 0..=5u64 {
+            acc.fold(pos(h), pk(h as u8), r(h as u8))
+                .expect("pre-state fold");
+        }
+        assert!(acc.nav().size > 0);
+
+        let dup_pos = pos(50);
+        let stream = vec![
+            published(10, 10, 10),
+            PublishedNullifier {
+                chain_pos: dup_pos,
+                pk: pk(50),
+                r: r(50),
+            },
+            PublishedNullifier {
+                chain_pos: dup_pos, // identical chain_pos → fold rejects second
+                pk: pk(51),
+                r: r(51),
+            },
+            published(60, 60, 60),
+        ];
+
+        let err = acc
+            .reorg_replay(5, stream)
+            .expect_err("duplicate chain_pos must propagate fold error");
+
+        assert_eq!(
+            err,
+            SpecError::OutOfOrderFold {
+                previous: dup_pos,
+                attempted: dup_pos,
+            },
+            "propagates_fold_error: expected OutOfOrderFold at pos(50), got {err:?}"
+        );
+    }
 }
+
