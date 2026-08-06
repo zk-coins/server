@@ -393,106 +393,112 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                      entrusteed operational bundle before scanning)"
                 );
                 tokio::spawn(async move {
-                    // Bounded re-scan for late relay propagation: a complete
-                    // gapless scan can still install nothing when the origin
-                    // delivery outbox has not yet published the needed
-                    // record. Hard errors and partial installs never retry.
-                    for attempt in 0..RECOVERY_CAMPAIGN_MAX_ATTEMPTS {
-                        let deps = crate::v1::recovery::RecoveryCampaignDeps {
-                            seed_relays: seed_relays.clone(),
-                            bundles: Arc::clone(&bundles),
-                            adapter: Arc::clone(&engine),
-                            pool: Arc::clone(&pool),
-                            index: Arc::clone(&private_index),
-                            receipts: Arc::clone(&receipt_hub),
-                            max_blob_bytes: ops.max_blob_bytes,
-                            expected_network: network_label.clone(),
-                        };
-                        match crate::v1::recovery::run_recovery_campaign(
-                            recovery_config.clone(),
-                            deps,
-                        )
-                        .await
-                        {
-                            Ok(report) if report.restored => {
-                                tracing::info!(
-                                    accepted = report.coin_proof_accepted,
-                                    sdr_discards = report.sdr_discards.len(),
-                                    sdr_coins_folded = report.sdr_coins_folded,
-                                    replayed_heads = report.replayed_heads.len(),
-                                    "§4.5 recovery campaign: restored=true"
-                                );
-                                for discard in &report.sdr_discards {
-                                    tracing::warn!(
-                                        subject = %hex::encode(discard.subject),
-                                        blob_id = %hex::encode(discard.blob_id),
-                                        record_kind = ?discard.record_kind,
-                                        send_counter = ?discard.send_counter,
-                                        reason = %discard.reason,
-                                        "§4.5 recovery SDR discard (replay could not accept candidate)"
-                                    );
-                                }
-                                break;
-                            }
-                            Ok(report)
-                                if !report.restored
-                                    && report.replayed_heads.is_empty()
-                                    && matches!(
-                                        report.scan_status,
-                                        crate::v1::recovery::GaplessScanStatus::Complete
-                                    )
-                                    && attempt + 1 < RECOVERY_CAMPAIGN_MAX_ATTEMPTS =>
+                    loop {
+                        // Bounded re-scan for late relay propagation: a complete
+                        // gapless scan can still install nothing when the origin
+                        // delivery outbox has not yet published the needed
+                        // record. Hard errors and partial installs never retry.
+                        for attempt in 0..RECOVERY_CAMPAIGN_MAX_ATTEMPTS {
+                            let deps = crate::v1::recovery::RecoveryCampaignDeps {
+                                seed_relays: seed_relays.clone(),
+                                bundles: Arc::clone(&bundles),
+                                adapter: Arc::clone(&engine),
+                                pool: Arc::clone(&pool),
+                                index: Arc::clone(&private_index),
+                                receipts: Arc::clone(&receipt_hub),
+                                max_blob_bytes: ops.max_blob_bytes,
+                                expected_network: network_label.clone(),
+                            };
+                            match crate::v1::recovery::run_recovery_campaign(
+                                recovery_config.clone(),
+                                deps,
+                            )
+                            .await
                             {
-                                // Pure relay-propagation race: complete scan,
-                                // nothing installed — safe to re-scan.
-                                tracing::info!(
+                                Ok(report) if report.restored => {
+                                    tracing::info!(
+                                        accepted = report.coin_proof_accepted,
+                                        sdr_discards = report.sdr_discards.len(),
+                                        sdr_coins_folded = report.sdr_coins_folded,
+                                        replayed_heads = report.replayed_heads.len(),
+                                        "§4.5 recovery campaign: restored=true"
+                                    );
+                                    for discard in &report.sdr_discards {
+                                        tracing::warn!(
+                                            subject = %hex::encode(discard.subject),
+                                            blob_id = %hex::encode(discard.blob_id),
+                                            record_kind = ?discard.record_kind,
+                                            send_counter = ?discard.send_counter,
+                                            reason = %discard.reason,
+                                            "§4.5 recovery SDR discard (replay could not accept candidate)"
+                                        );
+                                    }
+                                    break;
+                                }
+                                Ok(report)
+                                    if should_retry_recovery(
+                                        &report,
+                                        attempt,
+                                        RECOVERY_CAMPAIGN_MAX_ATTEMPTS,
+                                    ) =>
+                                {
+                                    // Pure relay-propagation race: complete scan,
+                                    // nothing installed — safe to re-scan.
+                                    tracing::info!(
                                     attempt = attempt + 1,
                                     max_attempts = RECOVERY_CAMPAIGN_MAX_ATTEMPTS,
                                     "§4.5 recovery: complete scan installed no head yet — re-scanning for late relay propagation"
                                 );
-                                for discard in &report.sdr_discards {
-                                    tracing::warn!(
-                                        subject = %hex::encode(discard.subject),
-                                        blob_id = %hex::encode(discard.blob_id),
-                                        record_kind = ?discard.record_kind,
-                                        send_counter = ?discard.send_counter,
-                                        reason = %discard.reason,
-                                        "§4.5 recovery SDR discard (replay could not accept candidate)"
-                                    );
+                                    for discard in &report.sdr_discards {
+                                        tracing::warn!(
+                                            subject = %hex::encode(discard.subject),
+                                            blob_id = %hex::encode(discard.blob_id),
+                                            record_kind = ?discard.record_kind,
+                                            send_counter = ?discard.send_counter,
+                                            reason = %discard.reason,
+                                            "§4.5 recovery SDR discard (replay could not accept candidate)"
+                                        );
+                                    }
+                                    tokio::time::sleep(RECOVERY_PROPAGATION_RETRY_INTERVAL).await;
+                                    continue;
                                 }
-                                tokio::time::sleep(RECOVERY_PROPAGATION_RETRY_INTERVAL).await;
-                                continue;
-                            }
-                            Ok(report) => {
-                                tracing::error!(
-                                    scan_status = ?report.scan_status,
-                                    accepted = report.coin_proof_accepted,
-                                    sdr_discards = report.sdr_discards.len(),
-                                    sdr_coins_folded = report.sdr_coins_folded,
-                                    replayed_heads = report.replayed_heads.len(),
-                                    "§4.5 recovery campaign: restored=false — do not \
-                                     treat this node as fully recovered"
-                                );
-                                for discard in &report.sdr_discards {
-                                    tracing::warn!(
-                                        subject = %hex::encode(discard.subject),
-                                        blob_id = %hex::encode(discard.blob_id),
-                                        record_kind = ?discard.record_kind,
-                                        send_counter = ?discard.send_counter,
-                                        reason = %discard.reason,
-                                        "§4.5 recovery SDR discard (replay could not accept candidate)"
+                                Ok(report) => {
+                                    tracing::error!(
+                                        scan_status = ?report.scan_status,
+                                        accepted = report.coin_proof_accepted,
+                                        sdr_discards = report.sdr_discards.len(),
+                                        sdr_coins_folded = report.sdr_coins_folded,
+                                        replayed_heads = report.replayed_heads.len(),
+                                        "§4.5 recovery campaign: restored=false — do not \
+                                         treat this node as fully recovered"
                                     );
+                                    for discard in &report.sdr_discards {
+                                        tracing::warn!(
+                                            subject = %hex::encode(discard.subject),
+                                            blob_id = %hex::encode(discard.blob_id),
+                                            record_kind = ?discard.record_kind,
+                                            send_counter = ?discard.send_counter,
+                                            reason = %discard.reason,
+                                            "§4.5 recovery SDR discard (replay could not accept candidate)"
+                                        );
+                                    }
+                                    break;
                                 }
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    "§4.5 recovery campaign failed — node is NOT restored"
-                                );
-                                break;
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "§4.5 recovery campaign failed — node is NOT restored"
+                                    );
+                                    break;
+                                }
                             }
                         }
+                        tracing::info!(
+                            watch_interval_secs = RECOVERY_CAMPAIGN_WATCH_INTERVAL.as_secs(),
+                            "§4.5 recovery campaign pass finished — watching for newly-entrusted \
+         subjects before the next pass"
+                        );
+                        tokio::time::sleep(RECOVERY_CAMPAIGN_WATCH_INTERVAL).await;
                     }
                 });
             }
@@ -1326,6 +1332,34 @@ const RECOVERY_PROPAGATION_RETRY_INTERVAL: std::time::Duration = std::time::Dura
 /// never an unbounded loop. After exhaustion the existing restored=false
 /// fail-closed path fires unchanged.
 const RECOVERY_CAMPAIGN_MAX_ATTEMPTS: usize = 12;
+
+/// Idle interval for the OUTER, persistent §4.5 recovery watch loop.
+///
+/// After the bounded inner retry loop finishes (restored, gave up, or hard
+/// error), the driver sleeps this long before re-running the campaign — so a
+/// LATER `EntrustOperationalBundle` (a second account served by this node, or
+/// portability re-pointing a wallet after an earlier entrust already
+/// succeeded) is picked up without a node restart. The task is `tokio::spawn`ed
+/// once at startup and is meant to run for the node's lifetime.
+const RECOVERY_CAMPAIGN_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether a §4.5 recovery campaign report warrants another bounded re-scan.
+///
+/// Pure relay-propagation race only: complete gapless scan, nothing installed,
+/// and attempts remain. Partial installs and incomplete scans never retry.
+pub(crate) fn should_retry_recovery(
+    report: &crate::v1::recovery::RecoveryRunReport,
+    attempt: usize,
+    max_attempts: usize,
+) -> bool {
+    !report.restored
+        && report.replayed_heads.is_empty()
+        && matches!(
+            report.scan_status,
+            crate::v1::recovery::GaplessScanStatus::Complete
+        )
+        && attempt + 1 < max_attempts
+}
 
 /// Idle backoff between §7.6 multi-member drain sweeps.
 ///

@@ -87,7 +87,7 @@ use super::nostr::relay::{Filter, RelayClient, RelayError};
 use super::receive::extract_compliance_public_inputs;
 use super::OsSecureRandom;
 use crate::kernel::access::{
-    InMemoryPrivateIndex, InsertRecordOutcome, ReceiptHub, TransitionKind,
+    InMemoryPrivateIndex, InsertRecordOutcome, PrivateIndex, ReceiptHub, TransitionKind,
 };
 use crate::kernel::bootstrap::{BundleStore, OperationalBundle};
 use crate::kernel::types::SubjectAddress;
@@ -1823,6 +1823,21 @@ pub(crate) struct RecoveryCampaignDeps {
 ///
 /// Partial CoinProof indexing on an incomplete scan is still attempted (useful
 /// salvage) but **never** upgrades the restored flag.
+/// Subjects in `active` that already have a servable recovered head on this
+/// node (checked via the same private-index read `/v1/pull`'s
+/// `get_account_state` uses) — a re-run of the campaign must not re-scan,
+/// re-replay, or re-install these; it only needs to make progress on the rest.
+fn already_recovered_subjects(
+    index: &InMemoryPrivateIndex,
+    active: &[(SubjectAddress, OperationalBundle)],
+) -> HashSet<[u8; 32]> {
+    active
+        .iter()
+        .filter(|(subject, _)| index.get_account_state(subject).is_ok())
+        .map(|(subject, _)| subject.0)
+        .collect()
+}
+
 pub(crate) async fn run_recovery_campaign(
     config: RecoveryCampaignConfig,
     deps: RecoveryCampaignDeps,
@@ -1840,6 +1855,17 @@ pub(crate) async fn run_recovery_campaign(
     // run without an operational bundle (see [`RecoveryError::NoOperationalBundle`]
     // text). There is no path that starts the scan with an empty subject set.
     let active = wait_for_active_bundles(&deps.bundles).await;
+    let already_recovered = already_recovered_subjects(&deps.index, &active);
+    if !already_recovered.is_empty() {
+        tracing::info!(
+            subjects = already_recovered.len(),
+            "§4.5 recovery campaign: skipping already-recovered subject(s) this pass"
+        );
+    }
+    let pending: Vec<&(SubjectAddress, OperationalBundle)> = active
+        .iter()
+        .filter(|(subject, _)| !already_recovered.contains(&subject.0))
+        .collect();
 
     let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_secs(),
@@ -1898,7 +1924,7 @@ pub(crate) async fn run_recovery_campaign(
     let mut sdr_candidates: HashMap<[u8; 32], Vec<SdrGiftWrapCandidate>> = HashMap::new();
 
     for event in &scan.events {
-        for (subject, bundle) in &active {
+        for (subject, bundle) in &pending {
             // Classify first so SDR matches are queued for §4.2 replay
             // (the receive path silently ignores record_kind).
             let classified = deps.adapter.with_engine(|engine| {
@@ -2334,6 +2360,10 @@ pub(crate) async fn run_recovery_campaign(
 
     let expected_subjects: HashSet<[u8; 32]> =
         active.iter().map(|(subject, _)| subject.0).collect();
+    let subjects_with_committed_heads: HashSet<[u8; 32]> = subjects_with_heads
+        .union(&already_recovered)
+        .copied()
+        .collect();
     let subjects_with_infra_gap: HashSet<[u8; 32]> = report
         .sdr_discards
         .iter()
@@ -2341,12 +2371,13 @@ pub(crate) async fn run_recovery_campaign(
         .map(|discard| discard.subject)
         .collect();
     let sdr_replay_ok = expected_subjects.iter().all(|subject| {
-        subjects_with_heads.contains(subject) && !subjects_with_infra_gap.contains(subject)
+        subjects_with_committed_heads.contains(subject)
+            && !subjects_with_infra_gap.contains(subject)
     });
     report.restored = restored_decision(
         &report.scan_status,
         &expected_subjects,
-        &subjects_with_heads,
+        &subjects_with_committed_heads,
         &subjects_with_infra_gap,
     );
 
@@ -2775,6 +2806,75 @@ mod tests {
             .expect("consistent recovered snapshot must reconstruct");
         let mut engine = StateEngine::new(Network::Testnet, 0);
         assert!(engine.insert_account(owner, record).is_ok());
+    }
+
+    #[test]
+    fn recovered_head_registered_in_private_index_is_servable_via_get_account_state() {
+        use crate::kernel::access::PrivateIndex;
+
+        let owner = Address([0x11; 32]);
+        let pk = [0x22; 32];
+        let nk = [0x33; 32];
+        let nk_commitment = host::nk_commit(&nk);
+        let asset_id = host::nk_commit(&[0x44; 32]);
+        let genesis = AccountState::new(
+            owner,
+            nk_commitment,
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("genesis AccountState");
+        let genesis_ash = host::account_state_hash(&genesis).expect("genesis ash");
+        let coin = host::Coin {
+            identifier: host::coin_identifier(genesis_ash, &owner.0, asset_id, 50, 0),
+            recipient: owner,
+            amount: 50,
+            asset_id,
+        };
+        let coin_id = host::digest_to_bytes(&coin.identifier);
+        let mut coinhist = host::CoinHistTree::new();
+        coinhist.admit(coin_id).expect("admit coin");
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), coin.amount);
+        let state = AccountState::new(owner, nk_commitment, balances, pk, 1, coinhist.root())
+            .expect("recovered AccountState");
+        let snapshot = crate::v1::db_v1::AccountSnapshot {
+            owner,
+            state,
+            nk,
+            op_secret: Some(OpSecret::new([0xAA; 32])),
+            genesis_pubkey: pk,
+            spendable: vec![(
+                coin_id,
+                TrackedCoin {
+                    coin,
+                    creating_prev_ash: genesis_ash,
+                    coin_index: 0,
+                },
+            )],
+            spent_ids: vec![],
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+
+        let record = snapshot
+            .into_record()
+            .expect("consistent recovered snapshot must reconstruct");
+        let view = crate::v1::signature::account_state_view_from_record(&record).expect("view");
+        let index = InMemoryPrivateIndex::new();
+        index
+            .insert_account(crate::kernel::types::SubjectAddress(owner.0), view.clone())
+            .expect("insert");
+        let served = index
+            .get_account_state(&crate::kernel::types::SubjectAddress(owner.0))
+            .expect("served");
+        assert_eq!(served, view);
+        assert_eq!(served.send_counter, record.state.send_counter);
+        assert!(!served.account_state.is_empty());
     }
 
     #[test]

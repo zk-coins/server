@@ -688,3 +688,107 @@ async fn boot_resume_cannot_fail_job_claimed_since_snapshot() {
 
     drop(scope);
 }
+
+// ---------------------------------------------------------------------------
+// should_retry_recovery — pure predicate unit tests
+// ---------------------------------------------------------------------------
+
+use crate::runtime::should_retry_recovery;
+use crate::v1::nostr::kinds::delivery::RecordKind;
+use crate::v1::recovery::{GaplessScanStatus, RecoveryRunReport, ReplayedAccountHead};
+use shared::spec_v1::bundle::BlockAnchor;
+use shared::spec_v1::{AccountState, Address, ProofData, ZERO_HASH};
+use std::collections::BTreeMap;
+
+fn empty_recovery_report(
+    restored: bool,
+    scan_status: GaplessScanStatus,
+    replayed_heads: Vec<ReplayedAccountHead>,
+) -> RecoveryRunReport {
+    RecoveryRunReport {
+        scan_status,
+        unique_event_count: 0,
+        coin_proof_accepted: 0,
+        coin_proof_rejected: 0,
+        ignored: 0,
+        sdr_discards: Vec::new(),
+        sdr_coins_folded: 0,
+        replayed_heads,
+        restored,
+    }
+}
+
+fn trivial_replayed_head() -> ReplayedAccountHead {
+    let account_state = AccountState::new(
+        Address([0u8; 32]),
+        ZERO_HASH,
+        BTreeMap::new(),
+        [0u8; 32],
+        0,
+        ZERO_HASH,
+    )
+    .expect("trivial AccountState");
+    ReplayedAccountHead {
+        subject: [0u8; 32],
+        record_kind: RecordKind::Mint,
+        send_counter: 0,
+        account_state,
+        account_state_ash: [0u8; 32],
+        recursive_proof: Vec::new(),
+        proof_data: ProofData {
+            new_account_state_hash: ZERO_HASH,
+            output_coins_root: ZERO_HASH,
+            input_nullifiers_root: ZERO_HASH,
+            coin_history_root: ZERO_HASH,
+            nav_commitment: ZERO_HASH,
+            npk_commit: [0u8; 32],
+        },
+        inclusion_block: BlockAnchor {
+            block_hash: [0u8; 32],
+            height: 0,
+        },
+        occurred_at: 0,
+    }
+}
+
+#[test]
+fn should_retry_recovery_false_when_restored() {
+    let report = empty_recovery_report(true, GaplessScanStatus::Complete, Vec::new());
+    assert!(!should_retry_recovery(&report, 0, 12));
+}
+
+#[test]
+fn should_retry_recovery_true_when_complete_empty_and_attempts_remain() {
+    let report = empty_recovery_report(false, GaplessScanStatus::Complete, Vec::new());
+    assert!(should_retry_recovery(&report, 0, 12));
+}
+
+#[test]
+fn should_retry_recovery_false_when_replayed_heads_non_empty() {
+    let report = empty_recovery_report(
+        false,
+        GaplessScanStatus::Complete,
+        vec![trivial_replayed_head()],
+    );
+    assert!(!should_retry_recovery(&report, 0, 12));
+}
+
+#[test]
+fn should_retry_recovery_false_when_scan_incomplete() {
+    let report = empty_recovery_report(
+        false,
+        GaplessScanStatus::Incomplete {
+            stuck_at: 0,
+            until_cursor: 0,
+            relay_urls: vec!["wss://example.invalid".into()],
+        },
+        Vec::new(),
+    );
+    assert!(!should_retry_recovery(&report, 0, 12));
+}
+
+#[test]
+fn should_retry_recovery_false_on_last_attempt() {
+    let report = empty_recovery_report(false, GaplessScanStatus::Complete, Vec::new());
+    assert!(!should_retry_recovery(&report, 11, 12));
+}

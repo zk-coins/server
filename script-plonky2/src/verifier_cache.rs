@@ -848,17 +848,13 @@ mod tests {
 
         let mut wrong_blob_hash = test_blob_hash(&dummy);
         wrong_blob_hash[0] ^= 0xFF;
-        let error = match load_compliance_verifier_cache_checked(
-            network,
-            &dir,
-            &pin,
-            &wrong_blob_hash,
-        ) {
-            Ok(_) => panic!(
+        let error =
+            match load_compliance_verifier_cache_checked(network, &dir, &pin, &wrong_blob_hash) {
+                Ok(_) => panic!(
                 "a wrong full-blob hash must be rejected even when circuit_digest matches its pin"
             ),
-            Err(error) => error,
-        };
+                Err(error) => error,
+            };
         assert!(
             error.to_string().contains("full-blob hash"),
             "unexpected error: {error:#}"

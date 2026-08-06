@@ -544,18 +544,22 @@ async function waitInscriptionCompletedForPubkey(pubkeyHex, stage) {
   fail(stage, `no inscription with confirmation_state=completed for pubkey ${pubkeyHex}`);
 }
 
-function publisherPubkeyHex() {
-  const skHex = process.env.PUBLISHER_KEY;
+function publisherPubkeyHexFromEnv(envName, stage = 'publisher') {
+  const skHex = process.env[envName];
   if (!skHex || skHex.startsWith('REPLACE_ME_')) {
     return null;
   }
   try {
-    const sk = decodeHexExact(skHex, 32, 'PUBLISHER_KEY');
+    const sk = decodeHexExact(skHex, 32, envName);
     const { pkBytes } = bip340NormaliseSecret(sk);
     return encodeHexLower(pkBytes);
   } catch (e) {
-    fail('publisher', `cannot derive publisher pubkey from PUBLISHER_KEY: ${e}`);
+    fail(stage, `cannot derive publisher pubkey from ${envName}: ${e}`);
   }
+}
+
+function publisherPubkeyHex() {
+  return publisherPubkeyHexFromEnv('PUBLISHER_KEY');
 }
 
 function usdDemoAssetId(alicePk0) {
@@ -976,6 +980,28 @@ async function stage3_4_alice_send(client, seed, alice, bob, host, assetIdHex, a
   const bobReceipt = await receiptWait;
   pass(3, `Bob receipt discovered coin_id=${bobReceipt.coin_id.slice(0, 16)}…`);
 
+  // Send outputs are ordered as caller recipient templates followed by
+  // per-asset change. Preserve Alice's real change coin for the later
+  // portability send: pull/account-state exposes the counter but no coin id.
+  const outputCoinIds = job.result?.output_coin_ids;
+  if (!Array.isArray(outputCoinIds) || outputCoinIds.length !== 2) {
+    fail(
+      3,
+      `Alice→Bob send expected recipient + change output_coin_ids, got ` +
+        JSON.stringify(outputCoinIds),
+    );
+  }
+  if (outputCoinIds[0] !== bobReceipt.coin_id) {
+    fail(
+      3,
+      `Alice→Bob recipient output coin id ${outputCoinIds[0]} does not match Bob receipt ${bobReceipt.coin_id}`,
+    );
+  }
+  const aliceChangeCoinId = outputCoinIds[1];
+  if (typeof aliceChangeCoinId !== 'string' || aliceChangeCoinId.length === 0) {
+    fail(3, 'Alice→Bob send result missing Alice change coin id');
+  }
+
   const balances = await pullBalances(client, alice);
   const expectedAfterSend = { [assetIdHex]: ALICE_AFTER_SEND };
   if (typeof eurAssetIdHex === 'string' && eurAssetIdHex.length > 0) {
@@ -995,6 +1021,7 @@ async function stage3_4_alice_send(client, seed, alice, bob, host, assetIdHex, a
     sendJob: job,
     sendSpendPubkey: spendPubkey,
     bobCoinId: bobReceipt.coin_id,
+    aliceChangeCoinId,
   };
 }
 
@@ -1192,13 +1219,142 @@ async function stage8_recovery() {
   }
 }
 
-async function stage9_portability() {
-  fail(
-    9,
-    'TODO: Portability control (Requirement 10) — repoint Alice wallet to a freshly synced ' +
-      'second node by configuration only; balances identical; send from new node succeeds. ' +
-      'Needs: second node+api compose service and wallet config switch.',
-  );
+async function stage9_portability(ctx) {
+  try {
+    const seed = seedFromMnemonicV1(MNEMONIC);
+    const alice = buildAccount(seed, 0);
+    const bob = buildAccount(seed, 1);
+    const carol = buildAccount(seed, 2);
+
+    const node1Client = new ZkCoinsV1Client({
+      apiUrl: API_URL,
+      network: 'regtest',
+      requestTimeoutMs: 120_000,
+    });
+    const node2Client = new ZkCoinsV1Client({
+      apiUrl: API_URL_2,
+      network: 'regtest',
+      requestTimeoutMs: 120_000,
+    });
+
+    const usdAssetIdHex = usdDemoAssetId(alice.sk0.publicKey);
+    const eurAssetIdHex = eurDemoAssetId(carol.sk0.publicKey);
+    const expectedNode1Balances = {
+      [usdAssetIdHex]: ALICE_AFTER_SEND,
+      [eurAssetIdHex]: EUR_DEMO.amount,
+    };
+
+    // Node1 is the source of truth, but also pin the expected complete map so
+    // a coincidentally equal incomplete recovery cannot satisfy portability.
+    const node1Balances = await pullBalances(node1Client, alice);
+    assertBalancesExact(9, node1Balances, expectedNode1Balances);
+    const node1Map = Object.fromEntries(node1Balances);
+
+    // Repointing is configuration-only: same seed-derived wallet material,
+    // different API URL and channel-binding host.
+    await entrustBundle(alice, '127.0.0.1:8081', API_URL_2);
+
+    const deadline = Date.now() + 180_000;
+    let node2Balances = null;
+    let last = 'none';
+    while (Date.now() < deadline) {
+      try {
+        const candidate = await pullBalances(node2Client, alice);
+        last =
+          candidate.size === 0
+            ? 'empty map'
+            : [...candidate.entries()].map(([k, v]) => `${k.slice(0, 16)}…=${v}`).join(', ');
+        const exact =
+          candidate.size === node1Balances.size &&
+          [...node1Balances].every(([assetId, amount]) => candidate.get(assetId) === amount);
+        if (exact) {
+          node2Balances = candidate;
+          break;
+        }
+      } catch (e) {
+        // Expected while node2's §4.5 campaign has not installed Alice's
+        // recovered AccountState yet. The backend fails closed with HTTP 500;
+        // keep polling, but fail if the deadline expires.
+        last = `pending (${(e && e.message ? e.message : String(e)).slice(0, 80)})`;
+      }
+      await sleep(3000);
+    }
+    if (node2Balances === null) {
+      fail(9, `portability recovery did not reproduce Alice's node1 balances: got ${last}`);
+    }
+    assertBalancesExact(9, node2Balances, node1Map);
+    pass(9, 'portability (Req 10): node2 balances identical to node1');
+
+    const aliceChangeCoinId = ctx?.aliceChangeCoinId;
+    if (typeof aliceChangeCoinId !== 'string' || aliceChangeCoinId.length === 0) {
+      fail(9, 'stage 9 requires Alice change coin id from stage 3/4 in the same run');
+    }
+
+    // The coin id is threaded from the completed stage-3 job because pull
+    // records are opaque and the JS SDK has no canonical CoinProof decoder.
+    // The key counter, however, is live wallet state and is read from node2.
+    const pull = await node2Client.openOwnershipPullSession({
+      subject: alice.subject,
+      sk0: alice.sk0.secretKey,
+      nkCommit: alice.nkCommit,
+    });
+    const state = await node2Client.getAccountState(pull.session);
+    if (!Number.isSafeInteger(state.send_counter) || state.send_counter < 0) {
+      fail(9, `node2 returned invalid Alice send_counter ${JSON.stringify(state.send_counter)}`);
+    }
+    alice.sendCounter = state.send_counter;
+    const expectedCurrentPubkey = encodeHexLower(
+      spendAt(seed, alice.accountIndex, alice.sendCounter).publicKey,
+    );
+    if (state.current_pubkey !== expectedCurrentPubkey) {
+      fail(
+        9,
+        `node2 Alice current_pubkey does not match seed-derived spend key at counter ${alice.sendCounter}`,
+      );
+    }
+
+    const publisher = publisherPubkeyHexFromEnv('PUBLISHER_KEY_2', 9);
+    if (!publisher) {
+      fail(9, 'PUBLISHER_KEY_2 required for the node2 portability send');
+    }
+    const amount = '1000';
+    const bobInvoice = await issueInvoice({
+      amount,
+      assetId: usdAssetIdHex,
+      relays: [RELAY_URL],
+      sk0Secret: bob.sk0.secretKey,
+      nkCommit: bob.nkCommit,
+      ivpk: bob.ivpk,
+      opSecret: bob.op,
+    });
+    const request = {
+      kind: 'send',
+      input_coins: [aliceChangeCoinId],
+      output_templates: [
+        {
+          recipient: bob.subject,
+          asset_id: usdAssetIdHex,
+          amount,
+          delivery: { type: 'invoice', invoice: bobInvoice },
+        },
+      ],
+      publisher_pubkey: publisher,
+    };
+    const { job, spendPubkey } = await runSignedTransition(
+      node2Client,
+      seed,
+      alice,
+      request,
+      '9-send',
+    );
+    if (job.status !== 'completed') {
+      fail(9, `node2 portability send job ended in ${JSON.stringify(job.status)}`);
+    }
+    await postTransitionOnChain(spendPubkey, '9');
+    pass(9, 'portability (Req 10): send from repointed node2 succeeded');
+  } catch (err) {
+    fail(9, err.message);
+  }
 }
 
 function runVerifyAttestation(attestationHex) {
@@ -1401,7 +1557,7 @@ const STAGES = {
   6: 'confirmation link §3.10 completed',
   7: 'reorg control N-09',
   8: 'recovery control Req 6 (TODO)',
-  9: 'portability control Req 10 (TODO)',
+  9: 'portability control Req 10',
   10: 'attestation round-trip Req 9(b): produce + independent verify + tamper-reject',
   11: 'grant control Req 9(c): issue USD-scoped grant, in-scope pull ok, EUR out-of-scope refused',
 };
@@ -1474,6 +1630,7 @@ async function main() {
    *   sendJob?: object,
    *   sendSpendPubkey?: Uint8Array,
    *   bobCoinId?: string,
+   *   aliceChangeCoinId?: string,
    *   eurAssetIdHex?: string,
    * }}
    */
@@ -1559,7 +1716,7 @@ async function main() {
         await stage8_recovery();
         break;
       case '9':
-        await stage9_portability();
+        await stage9_portability(ctx);
         break;
       case '10':
         if (!ctx.assetIdHex) {
