@@ -136,3 +136,30 @@ cargo llvm-cov report --release --json --ignore-filename-regex "$IGNORE"
 After a higher measurement, raise the `--fail-under-*` integers in
 `ci.yaml` and update the tables above in the same PR. Never lower them
 to greenwash a drop.
+
+## Shared crate: reachable code covered, residual is provably unreachable
+
+As of 2026-08-06 the `shared` crate's own files (`spec_v1/*`, `commitment.rs`)
+are covered at ~99% lines; `error`, `network_params`, `trees`, `datastructures`,
+`nflog` are at 100%. The remaining uncovered lines are **provably-unreachable
+defensive code** — not test gaps. They are documented here (rule 3) rather than
+silently ignored, and are NOT worth artificial tests:
+
+- `commitment.rs:71` — `Err(_)` after `Message::from_digest_slice(msg_hash)`; the
+  input is always exactly 32 bytes, so the conversion cannot fail.
+- `spec_v1/encoding.rs:41` — `ByteStringTooLong` needs a ~72 PB slice (not allocatable).
+- `spec_v1/hashes.rs:406-407` — `NameTooLong` via `u32::try_from` needs a >4 GiB local-part.
+- `spec_v1/bootstrap_manifest.rs:611-612` — `fixture_sk` rehash second iteration needs a
+  SHA-256 digest outside `[1,n)` (~2⁻¹²⁸).
+- `spec_v1/coinhist.rs:155` — `Absent` is never stored in `leaves`; no public path reaches it.
+- `spec_v1/bundle.rs:444-453,485,497,605-608,615-616` — defensive arms after a preceding
+  `validate_*` / bounds check already guarantees the non-divergent branch.
+- `spec_v1/accumulator.rs:427,1006`, `spec_v1/serialize.rs:141` — implicit else-region of an
+  `if let` whose predecessor assert guarantees no divergence / block whose only content is a
+  terminating `return` (llvm-cov closing-brace region artifact).
+- `spec_v1/nflog_boundary.rs:51,107,369,380,773,860` — test-fixture module (`test-fixtures`
+  feature) defensive `assert!`/overflow guards on inputs the suite never violates.
+
+Reaching a literal 100% would require `#[cfg_attr(coverage_nightly, coverage(off))]` on these
+functions (the established mechanism in this repo) — deferred, since annotating single defensive
+arms inside otherwise-covered functions would over-exclude their covered lines.
