@@ -271,15 +271,12 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                         continue;
                     }
                 };
-                let auth_expiration =
-                    now.saturating_add(crate::v1::blossom::AUTH_REPLAY_WINDOW_SECS);
                 match crate::v1::delivery::drive_due_outbox_entries(
                     &pg,
                     bundles.as_ref(),
                     retention.as_ref(),
                     rng.as_ref(),
                     now,
-                    auth_expiration,
                 )
                 .await
                 {
@@ -761,7 +758,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                             Err(_) => {
                                 return Err(anyhow::anyhow!(
                                     "v1.1 finalise: wall clock before UNIX epoch — \
-                                 refusing delivery auth timestamps (no silent 0)"
+                                 refusing delivery timestamps (no silent 0)"
                                 ));
                             }
                         };
@@ -785,9 +782,6 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                         blob_holders,
                         max_blob_bytes,
                         now,
-                        // Kind-24242: expiration = now + §7.4 replay window.
-                        auth_expiration: now
-                            .saturating_add(crate::v1::blossom::AUTH_REPLAY_WINDOW_SECS),
                         expected_network,
                         self_relays,
                         rng: delivery_rng.as_ref(),

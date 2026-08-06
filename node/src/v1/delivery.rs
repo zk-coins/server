@@ -53,6 +53,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use shared::spec_v1::bundle::{
     serialize_blob_locator_set, serialize_coin_proof, BlobLocatorSet, CoinProof, CreatingNullifier,
@@ -118,6 +119,8 @@ pub(crate) enum DeliveryError {
     RecipientRelaysEmpty { recipient: [u8; 32] },
     /// No Blossom holder base URL was configured for this delivery.
     BlobHoldersEmpty,
+    /// The wall clock cannot produce a valid unix timestamp for Blossom auth.
+    BlossomAuthClockBeforeUnixEpoch,
     /// Blossom upload failed for one holder.
     Blossom { holder: String, error: BlossomError },
     /// Relay pool construction / empty list.
@@ -183,6 +186,10 @@ impl fmt::Display for DeliveryError {
             DeliveryError::BlobHoldersEmpty => {
                 write!(f, "blob holder list is empty (no default Blossom store)")
             }
+            DeliveryError::BlossomAuthClockBeforeUnixEpoch => write!(
+                f,
+                "Blossom auth wall clock before UNIX epoch (no timestamp fallback)"
+            ),
             DeliveryError::Blossom { holder, error } => {
                 write!(f, "Blossom upload to {holder}: {error}")
             }
@@ -243,6 +250,8 @@ impl DeliveryError {
         match self {
             // OS entropy can recover; do not bury the row.
             DeliveryError::RandomSourceFailed => false,
+            // A broken wall clock may be corrected; retain the row for retry.
+            DeliveryError::BlossomAuthClockBeforeUnixEpoch => false,
             // Process-local BundleStore may be refilled after restart/load.
             DeliveryError::OperationalBundleMissing { .. } => false,
             // Peer/network: all relays down or rejecting is usually temporary.
@@ -580,10 +589,8 @@ pub(crate) struct DeliveryOperatorContext {
     pub blob_holders: Vec<String>,
     /// From `/v1/info` — required, no default.
     pub max_blob_bytes: u64,
-    /// Wall clock for auth / seal `created_at` upper bound.
+    /// Wall clock for delivery-event / seal `created_at`.
     pub now: u64,
-    /// Kind-24242 auth expiration (absolute unix seconds).
-    pub auth_expiration: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -762,8 +769,6 @@ pub(crate) async fn upload_built_coin_blob(
     built: &BuiltCoinDelivery,
     op_sk: &[u8; 32],
     max_blob_bytes: u64,
-    now: u64,
-    auth_expiration: u64,
 ) -> Result<(), DeliveryError> {
     let client = BlossomClient::new(max_blob_bytes).map_err(|e| DeliveryError::Blossom {
         holder: String::new(),
@@ -779,13 +784,16 @@ pub(crate) async fn upload_built_coin_blob(
     };
 
     for holder in &built.blob_holders {
+        // The build/finalise timestamp may precede multi-minute proving. Read
+        // the wall clock at the network boundary for every kind-24242 event.
+        let (auth_created_at, auth_expiration) = fresh_blossom_auth_timestamps()?;
         let _upload = client
             .upload(
                 holder,
                 &built.zbe_ciphertext,
                 Some(&binding),
                 op_sk,
-                now,
+                auth_created_at,
                 auth_expiration,
             )
             .await
@@ -798,15 +806,30 @@ pub(crate) async fn upload_built_coin_blob(
     Ok(())
 }
 
+/// Return a fresh kind-24242 auth window for an imminent Blossom upload.
+///
+/// This stays outside [`BlossomClient::upload`] so that the HTTP client keeps
+/// its explicit timestamp injection boundary for deterministic unit tests.
+pub(crate) fn fresh_blossom_auth_timestamps() -> Result<(u64, u64), DeliveryError> {
+    blossom_auth_timestamps_at(SystemTime::now())
+}
+
+fn blossom_auth_timestamps_at(wall_clock: SystemTime) -> Result<(u64, u64), DeliveryError> {
+    let created_at = wall_clock
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| DeliveryError::BlossomAuthClockBeforeUnixEpoch)?
+        .as_secs();
+    let expiration = created_at.saturating_add(super::blossom::AUTH_REPLAY_WINDOW_SECS);
+    Ok((created_at, expiration))
+}
+
 /// Upload ZBE blob to every holder, then publish gift-wrap to every relay.
 pub(crate) async fn publish_built_delivery(
     built: &BuiltCoinDelivery,
     op_sk: &[u8; 32],
     max_blob_bytes: u64,
-    now: u64,
-    auth_expiration: u64,
 ) -> Result<CoinDeliveryReport, DeliveryError> {
-    upload_built_coin_blob(built, op_sk, max_blob_bytes, now, auth_expiration).await?;
+    upload_built_coin_blob(built, op_sk, max_blob_bytes).await?;
 
     let pool = RelayPool::new(built.recipient_relays.clone())
         .map_err(|e| DeliveryError::Relay(e.to_string()))?;
@@ -1153,8 +1176,6 @@ pub(crate) async fn publish_outbox_row(
         &built,
         &operator.op_sk,
         operator.max_blob_bytes,
-        operator.now,
-        operator.auth_expiration,
     )
     .await?;
 
@@ -1204,7 +1225,6 @@ pub(crate) async fn drive_due_outbox_entries(
     retention: &PendingDeliveryStore,
     rng: &Mutex<Box<dyn SecureRandom + Send>>,
     now: u64,
-    auth_expiration: u64,
 ) -> Result<usize, DeliveryError> {
     let due = db_outbox::list_due(pool)
         .await
@@ -1230,7 +1250,6 @@ pub(crate) async fn drive_due_outbox_entries(
                     &row,
                     &bundle.op,
                     now,
-                    auth_expiration,
                     rng,
                 )
                 .await
@@ -1283,7 +1302,6 @@ pub(crate) async fn drive_due_outbox_entries(
                     blob_holders: mat.blob_holders.clone(),
                     max_blob_bytes: mat.max_blob_bytes,
                     now,
-                    auth_expiration,
                 };
                 match publish_outbox_row(pool, &row, &outgoing, &operator, retention, rng).await {
                     Ok(_) => {
@@ -1915,10 +1933,15 @@ mod tests {
     use crate::v1::nostr::kinds::ack::sign_ack;
     use crate::v1::nostr::kinds::delivery::encode_delivery_payload;
     use crate::v1::nostr::nip59::OsSecureRandom;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+    use serde_json::Value;
     use sha2::{Digest, Sha256};
     use shared::spec_v1::datastructures::Address;
     use shared::spec_v1::note_encryption::zbe_open;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
     use zkcoins_program::hash::ZERO_HASH;
 
     /// Deterministic CSPRNG for tests (not for production).
@@ -2001,6 +2024,122 @@ mod tests {
             recipient_op_pk: op_pk,
             recipient_relays: vec!["ws://127.0.0.1:9/".into()],
         }
+    }
+
+    struct CapturingBlossomUpload {
+        auth: Arc<Mutex<Option<String>>>,
+        blob_id_hex: String,
+    }
+
+    impl Respond for CapturingBlossomUpload {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let auth = request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            *self.auth.lock().expect("auth capture lock") = auth;
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "blob_id": self.blob_id_hex,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn blossom_auth_timestamps_are_refreshed_at_upload_boundary() {
+        let server = MockServer::start().await;
+        let (op_sk, _) = fixture_sk(b"zkCoins/v1/test/delivery/fresh-auth-op");
+        let (ovk, _) = fixture_sk(b"zkCoins/v1/test/delivery/fresh-auth-ovk");
+        let (_, recipient_ivpk) = fixture_sk(b"zkCoins/v1/test/delivery/fresh-auth-ivk");
+        let (_, recipient_op_pk) = fixture_sk(b"zkCoins/v1/test/delivery/fresh-auth-recipient-op");
+
+        let before_build = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test wall clock after UNIX epoch")
+            .as_secs();
+        let stale_hook_entry = before_build
+            .saturating_sub(super::super::blossom::AUTH_REPLAY_WINDOW_SECS + 60);
+        let material = sample_material(recipient_ivpk, recipient_op_pk);
+        let mut rng = ChainRng::new(b"zkCoins/v1/test/delivery/fresh-auth-rng");
+        let built = build_coin_delivery(
+            &material,
+            &op_sk,
+            &ovk,
+            &[server.uri()],
+            stale_hook_entry,
+            &mut rng,
+        )
+        .expect("build with deliberately stale finalise timestamp");
+
+        let captured_auth = Arc::new(Mutex::new(None));
+        Mock::given(method("PUT"))
+            .and(path("/blossom/upload"))
+            .respond_with(CapturingBlossomUpload {
+                auth: Arc::clone(&captured_auth),
+                blob_id_hex: hex::encode(built.blob_id),
+            })
+            .mount(&server)
+            .await;
+
+        let before_upload = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test wall clock after UNIX epoch")
+            .as_secs();
+        upload_built_coin_blob(&built, &op_sk, 1_048_576)
+            .await
+            .expect("upload");
+        let after_upload = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test wall clock after UNIX epoch")
+            .as_secs();
+
+        let auth = captured_auth
+            .lock()
+            .expect("auth capture lock")
+            .clone()
+            .expect("Authorization header");
+        let event_bytes = B64
+            .decode(auth.strip_prefix("Nostr ").expect("Nostr auth scheme"))
+            .expect("base64 auth event");
+        let event: Value = serde_json::from_slice(&event_bytes).expect("auth event JSON");
+        let created_at = event["created_at"].as_u64().expect("created_at u64");
+        let expiration = event["tags"]
+            .as_array()
+            .expect("tags array")
+            .iter()
+            .find(|tag| tag[0] == "expiration")
+            .and_then(|tag| tag[1].as_str())
+            .expect("expiration tag")
+            .parse::<u64>()
+            .expect("expiration u64");
+
+        assert!(
+            (before_upload..=after_upload).contains(&created_at),
+            "auth created_at must come from the upload boundary: \
+             stale_hook_entry={stale_hook_entry}, before={before_upload}, \
+             created_at={created_at}, after={after_upload}"
+        );
+        assert!(
+            created_at.saturating_sub(stale_hook_entry)
+                > super::super::blossom::AUTH_REPLAY_WINDOW_SECS,
+            "the deliberately stale hook-entry timestamp must not reach Blossom auth"
+        );
+        assert_eq!(
+            expiration,
+            created_at.saturating_add(super::super::blossom::AUTH_REPLAY_WINDOW_SECS),
+            "expiration must be derived from the same fresh upload timestamp"
+        );
+    }
+
+    #[test]
+    fn blossom_auth_clock_before_unix_epoch_is_named_and_fail_closed() {
+        let before_epoch = UNIX_EPOCH
+            .checked_sub(Duration::from_secs(1))
+            .expect("representable pre-epoch test time");
+        let err = blossom_auth_timestamps_at(before_epoch)
+            .expect_err("pre-epoch clock must not invent auth timestamps");
+        assert_eq!(err, DeliveryError::BlossomAuthClockBeforeUnixEpoch);
+        assert!(err.to_string().contains("no timestamp fallback"));
     }
 
     // -----------------------------------------------------------------------

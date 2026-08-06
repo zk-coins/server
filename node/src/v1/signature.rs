@@ -956,8 +956,6 @@ pub(crate) struct FinaliseDeliveryDeps<'a> {
     pub blob_holders: Vec<String>,
     pub max_blob_bytes: u64,
     pub now: u64,
-    /// Kind-24242 auth expiration (absolute unix seconds).
-    pub auth_expiration: u64,
     /// Closed network label for post-send profile refresh (`mainnet`/…).
     pub expected_network: &'a str,
     /// Self-delivery recipient relays (bootstrap seed relays; non-empty).
@@ -1540,14 +1538,7 @@ async fn stage_sdr_phase_a_after_mesh(
                     rng.as_mut(),
                 )?
             };
-            upload_built_coin_blob(
-                &built,
-                &bundle.op,
-                deps.max_blob_bytes,
-                deps.now,
-                deps.auth_expiration,
-            )
-            .await?;
+            upload_built_coin_blob(&built, &bundle.op, deps.max_blob_bytes).await?;
             let coin_id = digest_to_bytes(&coin.identifier);
             let row = SelfDeliveryIndexRow {
                 record_id: decrypt_record_id(&snap.owner, &coin_id, &built.blob_id),
@@ -1813,7 +1804,6 @@ async fn resume_outbox_after_crash(
             blob_holders: deps.blob_holders.clone(),
             max_blob_bytes: deps.max_blob_bytes,
             now: deps.now,
-            auth_expiration: deps.auth_expiration,
         },
     };
     let report = deps.port.deliver_outgoing(request).await?;
@@ -1862,7 +1852,6 @@ async fn deliver_outgoing_after_persist(
             blob_holders: deps.blob_holders.clone(),
             max_blob_bytes: deps.max_blob_bytes,
             now: deps.now,
-            auth_expiration: deps.auth_expiration,
         },
     };
 

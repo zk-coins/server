@@ -597,7 +597,6 @@ pub(crate) async fn publish_sdr_outbox_row(
     row: &super::db_outbox::OutboxRow,
     operator_op_sk: &[u8; 32],
     now: u64,
-    auth_expiration: u64,
     rng: &std::sync::Mutex<Box<dyn SecureRandom + Send>>,
 ) -> Result<(), DeliveryError> {
     use super::blossom::{BlossomClient, RetentionClass, UploadBinding};
@@ -712,13 +711,17 @@ pub(crate) async fn publish_sdr_outbox_row(
         retention: RetentionClass::Indefinite,
     };
     for holder in &mat.blob_holders {
+        // `now` above belongs to the delivery event. Blossom auth must be
+        // timestamped at each actual HTTP upload, not at driver wake-up.
+        let (auth_created_at, auth_expiration) =
+            super::delivery::fresh_blossom_auth_timestamps()?;
         let _upload = client
             .upload(
                 holder,
                 &zbe,
                 Some(&binding),
                 operator_op_sk,
-                now,
+                auth_created_at,
                 auth_expiration,
             )
             .await
