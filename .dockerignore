@@ -3,4 +3,5 @@
 target/
 .git/
 deploy/local-e2e/data/
+deploy/local-e2e/coverage-data/
 **/*.log

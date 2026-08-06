@@ -11,3 +11,7 @@ target/
 # rustc internal-compiler-error dumps (written into the workspace root on an
 # ICE; never part of the tree).
 rustc-ice-*.txt
+
+# Host-mounted LLVM profiles and derived E2E coverage reports.
+deploy/local-e2e/coverage-data/
+*.profraw

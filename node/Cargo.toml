@@ -47,7 +47,7 @@ hmac = "0.12"
 # Standard Base64 (with padding) for the v2 payload string. Already locked
 # at 0.22 via other crates; declared direct for the Nostr payload codec.
 base64 = "0.22"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "time", "sync", "signal"] }
 # Event-driven chain ingestion (issue #84): WebSocket subscription to
 # the Esplora-compatible block-event stream replaces the previous
 # 30-s tip polling loop. `rustls-tls-webpki-roots` keeps the TLS
@@ -327,6 +327,10 @@ trybuild = "1.0"
 # binary at compile time via `#[cfg(feature = "…")]`, so the disabled code
 # cannot run, crash, or be exploited at runtime.
 default = []
+# Test/orchestrator-only process lifecycle hook. The implementation is also
+# gated on `coverage_nightly`, so enabling this feature without LLVM coverage
+# instrumentation cannot alter signal handling or reference the profile runtime.
+coverage-flush = []
 address-list = []
 lnurl = []
 # Self-host operator opt-in: write path for usernames. Resolve + display

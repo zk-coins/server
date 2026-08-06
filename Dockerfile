@@ -60,7 +60,19 @@ COPY . .
 # here are excluded from the binary at compile time, so the disabled
 # code cannot run, crash, or be exploited at runtime.
 ARG FEATURES=
-RUN if [ -z "$FEATURES" ]; then \
+# Non-empty only for deploy/local-e2e/compose.coverage.yaml. This adds LLVM
+# instrumentation and the matching signal-flush hook; the default branch below
+# remains the production build path.
+ARG COVERAGE=
+RUN if [ -n "$COVERAGE" ]; then \
+        if [ -z "$FEATURES" ]; then \
+            RUSTFLAGS="-C instrument-coverage --cfg coverage_nightly" \
+                cargo build --release -p node --features coverage-flush; \
+        else \
+            RUSTFLAGS="-C instrument-coverage --cfg coverage_nightly" \
+                cargo build --release -p node --features "$FEATURES,coverage-flush"; \
+        fi; \
+    elif [ -z "$FEATURES" ]; then \
         cargo build --release -p node; \
     else \
         cargo build --release -p node --features "$FEATURES"; \

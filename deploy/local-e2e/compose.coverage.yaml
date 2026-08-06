@@ -1,0 +1,28 @@
+# Docker Compose override for the instrumented local E2E run.
+#
+# `collect-integration-coverage.sh` exports ZKCOINS_COVERAGE_DATA_DIR as an
+# absolute, per-run host directory before Compose reads this file. Keeping the
+# two processes in separate bind mounts makes profile-name collisions
+# impossible even if the containers happen to use the same PID/build ID.
+services:
+  node:
+    build:
+      args:
+        COVERAGE: "1"
+    environment:
+      LLVM_PROFILE_FILE: /cov/node1/node-%p-%m.profraw
+    volumes:
+      - type: bind
+        source: ${ZKCOINS_COVERAGE_DATA_DIR:?set by collect-integration-coverage.sh}/node1
+        target: /cov/node1
+
+  node2:
+    build:
+      args:
+        COVERAGE: "1"
+    environment:
+      LLVM_PROFILE_FILE: /cov/node2/node-%p-%m.profraw
+    volumes:
+      - type: bind
+        source: ${ZKCOINS_COVERAGE_DATA_DIR:?set by collect-integration-coverage.sh}/node2
+        target: /cov/node2

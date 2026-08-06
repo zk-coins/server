@@ -27,6 +27,46 @@ use crate::account_node::AccountNode;
 use crate::router::{create_router, AppState, ProofStore};
 use crate::username::UsernameStore;
 
+#[cfg(all(feature = "coverage-flush", coverage_nightly))]
+unsafe extern "C" {
+    fn __llvm_profile_write_file() -> libc::c_int;
+}
+
+/// Install the lifecycle hook used only by the instrumented integration image.
+///
+/// LLVM's compiler-rt profiling runtime exports `__llvm_profile_write_file`;
+/// it writes the active counters to the path selected by `LLVM_PROFILE_FILE`.
+/// The Cargo feature and `coverage_nightly` cfg deliberately form a double
+/// gate: a normal production build neither installs signal handlers nor even
+/// references the profiling-runtime symbol.
+#[cfg(all(feature = "coverage-flush", coverage_nightly))]
+fn spawn_coverage_flush_signal_handler() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    tokio::spawn(async {
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("coverage build must install its SIGTERM listener");
+        let mut sigint = signal(SignalKind::interrupt())
+            .expect("coverage build must install its SIGINT listener");
+
+        let signal_name = tokio::select! {
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigint.recv() => "SIGINT",
+        };
+        tracing::info!(signal = signal_name, "flushing LLVM coverage profile");
+
+        // SAFETY: LLVM's profiling runtime is linked by `-C instrument-coverage`.
+        // This function is compiled only when that flag's companion cfg and the
+        // opt-in Cargo feature are both present.
+        let status = unsafe { __llvm_profile_write_file() };
+        if status != 0 {
+            tracing::error!(status, "LLVM coverage profile flush failed");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    });
+}
+
 /// Optional v1.1 readiness handles shared with the exclusive scan loop.
 ///
 /// Under the legacy stack both fields are `None` and readiness ignores
@@ -1311,6 +1351,9 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     // alive (vs. `let _ =`) so a future shutdown signal can call
     // `.abort()` once a signal handler is wired in.
     let _warmup_handle = warmup_handle;
+
+    #[cfg(all(feature = "coverage-flush", coverage_nightly))]
+    spawn_coverage_flush_signal_handler();
 
     // `into_make_service_with_connect_info::<SocketAddr>()` exposes the
     // peer's TCP socket to extractors — the audit middleware reads it
