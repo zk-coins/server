@@ -10,6 +10,10 @@
 //! circuit, and host-side prover wiring will land in follow-up commits.
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+// Exclude the whole circuit-program crate from coverage instrumentation (see
+// script-plonky2/src/lib.rs): justifiably excluded from the coverage floor, and
+// instrumenting the circuit math makes an instrumented node build too slow.
+#![cfg_attr(coverage_nightly, coverage(off))]
 
 extern crate alloc;
 

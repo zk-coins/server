@@ -71,6 +71,11 @@
 //! via a symlink — Plonky2 requires `feature(specialization)`.
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+// Exclude the whole prover/circuit crate from coverage instrumentation: it is
+// justifiably excluded from the coverage floor (docs/coverage-baseline.md), and
+// instrumenting the ~1.38M-gate C construction makes an instrumented node build
+// too slow to run the integration-coverage journey. No effect on normal builds.
+#![cfg_attr(coverage_nightly, coverage(off))]
 
 pub mod circuit_identity;
 pub mod half_agg;
