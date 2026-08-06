@@ -163,3 +163,34 @@ silently ignored, and are NOT worth artificial tests:
 Reaching a literal 100% would require `#[cfg_attr(coverage_nightly, coverage(off))]` on these
 functions (the established mechanism in this repo) — deferred, since annotating single defensive
 arms inside otherwise-covered functions would over-exclude their covered lines.
+
+## Node crate: unit + integration coverage (2026-08-07)
+
+A large part of the `node` crate is integration code (Scanner/bitcoind RPC, PgPool, the async
+job-dispatcher) that a pure unit test cannot reach — it only runs against the live stack. That code
+IS exercised by the end-to-end journey, but a normal `cargo llvm-cov nextest` run does not instrument
+the journey, so it was counted as uncovered. The **integration-coverage pipeline** closes this:
+
+- `deploy/local-e2e/collect-integration-coverage.sh` builds the node image with coverage
+  instrumentation scoped to **workspace crates only** (`RUSTC_WORKSPACE_WRAPPER`, so the external
+  `plonky2` prover is NOT instrumented and stays fast; the circuit workspace crates carry crate-level
+  `#![cfg_attr(coverage_nightly, coverage(off))]`), runs the journey 1→9 against it, flushes coverage
+  on SIGTERM (a `coverage-flush`-feature handler calling `__llvm_profile_write_file`), and merges the
+  resulting `integration.lcov` with the unit-test `unit.lcov`.
+- Reproduce: bring the dev stack (`zkcoins-local`) down first (port 18443), `source` env.local.sh,
+  `export COMPOSE_PROJECT_NAME=zkcoins-local-coverage`, `brew install lcov`, then run the script.
+
+**Measured node-src line coverage (2026-08-07):**
+
+| Source | Coverage |
+|---|---|
+| Unit tests only | 76.3% |
+| Journey/integration only | 47.8% |
+| **Combined (unit ∪ integration)** | **83.09%** (40379 / 48595) |
+
+The remaining gap to 100% is (a) error/fault branches in the integration code that the happy-path
+journey does not hit (need fault-injection integration tests — regtest bitcoind/DB made to fail), and
+(b) more unit-testable files (raise sequentially with codex lanes; parallel lanes collide via the
+nested `node/node/src` path). Known-flaky in the unit re-run: `router::tests::health_publisher_*`
+(esplora-dependent) — reuse a pre-generated `unit.lcov` via `ZKCOINS_REUSE_UNIT_LCOV=1` for a
+self-contained pipeline run.
