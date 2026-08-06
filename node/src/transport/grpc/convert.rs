@@ -1365,6 +1365,13 @@ pub(crate) fn revoke_result_to_proto(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::access::{ReceiptState, RecordType, SessionToken, TransitionKind};
+    use crate::kernel::bootstrap::{EntrustResult, RevokeResult};
+    use crate::kernel::chain::{
+        KernelNetwork, KernelPart, ListedNullifier, NullifierMemberState, Readiness,
+        ReadyReason, RevealConfirmationState,
+    };
+    use crate::kernel::publish::PublishRejectReason;
     use crate::kernel::types::{JobEventKind, JobKind, JobPayload, NormativeJobStatus};
     use uuid::Uuid;
 
@@ -1618,6 +1625,12 @@ mod tests {
         shared::spec_v1::Address([0xA1u8; 32]).to_bech32m()
     }
 
+    fn wrong_width_subject_bech32() -> String {
+        let hrp = bitcoin::bech32::Hrp::parse("zk").expect("zk HRP");
+        bitcoin::bech32::encode::<bitcoin::bech32::Bech32m>(hrp, &[0xA1; 31])
+            .expect("31-byte Bech32m payload")
+    }
+
     fn base_receive_request() -> ProtoTransitionRequest {
         ProtoTransitionRequest {
             kind: "receive".into(),
@@ -1632,6 +1645,208 @@ mod tests {
             issuance: None,
             idempotency_key: "k-rx".into(),
             genesis_pubkey: vec![],
+        }
+    }
+
+    fn all_assets_scope() -> ProtoScope {
+        ProtoScope {
+            asset_ids: vec![],
+            all_assets: true,
+            not_before: 7,
+            not_after: 99,
+        }
+    }
+
+    fn base_attest_request() -> ProtoAttestRequest {
+        ProtoAttestRequest {
+            subject: receive_subject_bech32(),
+            asset_id: vec![0x11; 32],
+            nav_ceiling: vec![],
+            size_ceiling: 0,
+            nonce: vec![0x22; 32],
+            chan_bind: vec![0x33; 32],
+        }
+    }
+
+    fn base_grant_request() -> ProtoGrantRequest {
+        ProtoGrantRequest {
+            subject: receive_subject_bech32(),
+            grantee_pk: vec![0x21; 32],
+            scope: Some(all_assets_scope()),
+            expiry: 123,
+            nonce: vec![0x22; 32],
+            chan_bind: vec![0x23; 32],
+        }
+    }
+
+    fn base_pull_request() -> ProtoPullRequest {
+        ProtoPullRequest {
+            nonce: vec![0x31; 32],
+            subject: receive_subject_bech32(),
+            resolved_scope: Some(all_assets_scope()),
+            chan_bind: vec![0x32; 32],
+        }
+    }
+
+    fn base_issuance(version: u32) -> ProtoIssuance {
+        ProtoIssuance {
+            name: "asset".into(),
+            decimals: 8,
+            issuance_version: version,
+            amount: "42".into(),
+            cap_total: if version == 2 {
+                "1000".into()
+            } else {
+                String::new()
+            },
+            terms_salt: if version == 2 {
+                vec![0x41; 32]
+            } else {
+                vec![]
+            },
+            creator_pubkey: vec![0x42; 32],
+        }
+    }
+
+    fn base_output_template() -> ProtoOutputTemplate {
+        ProtoOutputTemplate {
+            recipient: receive_subject_bech32(),
+            asset_id: vec![0x51; 32],
+            amount: "17".into(),
+            delivery: None,
+        }
+    }
+
+    fn base_mint_request() -> ProtoTransitionRequest {
+        ProtoTransitionRequest {
+            kind: "mint".into(),
+            subject: receive_subject_bech32(),
+            next_pubkey: vec![0x52; 32],
+            npk_rand: vec![0x53; 32],
+            input_coins: vec![],
+            output_templates: vec![base_output_template()],
+            publisher_pubkey: vec![],
+            fee_address: String::new(),
+            fold_coin_ids: vec![],
+            issuance: Some(base_issuance(1)),
+            idempotency_key: "k-mint".into(),
+            genesis_pubkey: vec![],
+        }
+    }
+
+    fn base_send_request() -> ProtoTransitionRequest {
+        ProtoTransitionRequest {
+            kind: "send".into(),
+            subject: receive_subject_bech32(),
+            next_pubkey: vec![0x61; 32],
+            npk_rand: vec![0x62; 32],
+            input_coins: vec![vec![0x63; 32]],
+            output_templates: vec![base_output_template()],
+            publisher_pubkey: vec![0x64; 32],
+            fee_address: String::new(),
+            fold_coin_ids: vec![],
+            issuance: None,
+            idempotency_key: "k-send".into(),
+            genesis_pubkey: vec![],
+        }
+    }
+
+    fn base_invoice() -> ProtoInvoice {
+        ProtoInvoice {
+            amount: "17".into(),
+            recipient: receive_subject_bech32(),
+            asset_id: vec![0x51; 32],
+            memo: String::new(),
+            pk0: vec![0x71; 32],
+            nk_commit: vec![0x72; 32],
+            ivpk: vec![0x73; 32],
+            op_pubkey: vec![0x74; 32],
+            relays: vec!["wss://relay.example".into()],
+            addr_sig: vec![0x75; 64],
+            sig: vec![0x76; 64],
+        }
+    }
+
+    fn signed_kind0_proto(tags_json_empty: bool) -> ProtoKind0Event {
+        let tags = if tags_json_empty {
+            vec![]
+        } else {
+            vec![vec!["p".to_string(), hex32(0x81)]]
+        };
+        let event = crate::v1::nostr::event::Event::sign(
+            &[0x01; 32],
+            1_700_000_000,
+            0,
+            tags.clone(),
+            "{\"name\":\"alice\"}".to_string(),
+        )
+        .expect("deterministic kind-0 signing key");
+        ProtoKind0Event {
+            id: event.id.to_vec(),
+            pubkey: event.pubkey.to_vec(),
+            created_at: event.created_at,
+            kind: event.kind,
+            tags_json: if tags_json_empty {
+                String::new()
+            } else {
+                serde_json::to_string(&tags).expect("serialize tags")
+            },
+            content: event.content,
+            sig: event.sig.to_vec(),
+        }
+    }
+
+    fn base_publish_request() -> ProtoPublishRequest {
+        ProtoPublishRequest {
+            public_key: vec![0x91; 32],
+            r: vec![0x92; 32],
+            s: vec![0x93; 32],
+            r_prime: vec![0x94; 32],
+            fee_blob_id: vec![],
+            block_anchor: Some(kernel_proto::BlockAnchor {
+                block_hash: vec![0x95; 32],
+                height: 321,
+            }),
+            fee_epk: vec![],
+            fee_blob_locators: vec![],
+        }
+    }
+
+    fn bootstrap_manifest() -> DomainBootstrapManifest {
+        DomainBootstrapManifest {
+            network: KernelNetwork::Regtest,
+            protocol_version: "v1".into(),
+            seed_relays: vec!["wss://seed.example".into()],
+            blob_stores: vec!["https://blob.example".into()],
+            operator_ids: vec![XOnlyKey([0xA2; 32])],
+            issued_at: 10,
+            expires_at: 20,
+            manifest_sig: [0xA3; 64],
+        }
+    }
+
+    fn kernel_info(readiness: Readiness) -> KernelInfo {
+        KernelInfo {
+            network: KernelNetwork::Regtest,
+            protocol_version: "v1",
+            circuit_digest_c: Digest32([0xA4; 32]),
+            circuit_digest_c_balance: Digest32([0xA5; 32]),
+            relay_url: "wss://relay.example".into(),
+            blossom_url: "https://blob.example".into(),
+            finality_confirmations: 6,
+            max_tx_inputs: 4,
+            max_tx_outputs: 8,
+            max_rx_coins: 16,
+            max_account_assets: 32,
+            readiness,
+            bitcoin_tip_height: 1234,
+            accumulator_root: Digest32([0xA6; 32]),
+            scanner_lag: 2,
+            max_blob_bytes: 1_000_000,
+            activation_height: 100,
+            bootstrap: bootstrap_manifest(),
+            kernel_parts: vec![KernelPart::Scanner, KernelPart::Prover],
+            bootstrap_pubkey: XOnlyKey([0xA7; 32]),
         }
     }
 
@@ -1746,5 +1961,1360 @@ mod tests {
         t.delivery = None;
         let ok = parse_output_templates(&[t]).expect("absent delivery parses");
         assert!(ok[0].delivery.is_none());
+    }
+
+    #[test]
+    fn parse_attest_request_covers_ceiling_shapes_and_all_width_checks() {
+        let cmd = parse_attest_request(base_attest_request()).expect("node-default ceiling");
+        assert_eq!(cmd.subject, SubjectAddress([0xA1; 32]));
+        assert_eq!(cmd.asset_id, Digest32([0x11; 32]));
+        assert_eq!(cmd.ceiling, AttestCeiling::NodeDefault);
+        assert_eq!(cmd.nonce, [0x22; 32]);
+        assert_eq!(cmd.chan_bind, ChanBind([0x33; 32]));
+
+        let mut explicit = base_attest_request();
+        explicit.nav_ceiling = vec![0x44; 32];
+        explicit.size_ceiling = 55;
+        let cmd = parse_attest_request(explicit).expect("explicit ceiling");
+        assert_eq!(
+            cmd.ceiling,
+            AttestCeiling::Explicit {
+                nav_ceiling: Digest32([0x44; 32]),
+                size_ceiling: 55,
+            }
+        );
+
+        let mut explicit_zero_size = base_attest_request();
+        explicit_zero_size.nav_ceiling = vec![0x45; 32];
+        let cmd = parse_attest_request(explicit_zero_size).expect("explicit zero-size ceiling");
+        assert_eq!(
+            cmd.ceiling,
+            AttestCeiling::Explicit {
+                nav_ceiling: Digest32([0x45; 32]),
+                size_ceiling: 0,
+            }
+        );
+
+        let mut mixed = base_attest_request();
+        mixed.size_ceiling = 1;
+        let err = parse_attest_request(mixed).expect_err("size without nav");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(err.public_message.contains("both"));
+
+        for (field, mut req) in [
+            ("subject", {
+                let mut r = base_attest_request();
+                r.subject = wrong_width_subject_bech32();
+                r
+            }),
+            ("asset_id", {
+                let mut r = base_attest_request();
+                r.asset_id = vec![0; 31];
+                r
+            }),
+            ("nonce", {
+                let mut r = base_attest_request();
+                r.nonce = vec![0; 31];
+                r
+            }),
+            ("chan_bind", {
+                let mut r = base_attest_request();
+                r.chan_bind = vec![0; 33];
+                r
+            }),
+            ("nav_ceiling", {
+                let mut r = base_attest_request();
+                r.nav_ceiling = vec![0; 31];
+                r
+            }),
+        ] {
+            let err = parse_attest_request(req).expect_err("invalid attest field");
+            assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+            assert!(err.public_message.contains(field), "{}", err.public_message);
+        }
+    }
+
+    #[test]
+    fn parse_grant_request_and_scope_cover_all_presence_shapes() {
+        let cmd = parse_grant_request(base_grant_request()).expect("valid grant");
+        assert_eq!(cmd.subject, SubjectAddress([0xA1; 32]));
+        assert_eq!(cmd.grantee_pk, XOnlyKey([0x21; 32]));
+        assert_eq!(cmd.scope.assets, GrantAssetScope::All);
+        assert_eq!(cmd.scope.not_before, 7);
+        assert_eq!(cmd.scope.not_after, 99);
+        assert_eq!(cmd.expiry, 123);
+        assert_eq!(cmd.nonce, [0x22; 32]);
+        assert_eq!(cmd.chan_bind, ChanBind([0x23; 32]));
+
+        let mut missing = base_grant_request();
+        missing.scope = None;
+        let err = parse_grant_request(missing).expect_err("scope required");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(err.public_message.contains("scope is required"));
+
+        for (field, req) in [
+            ("subject", {
+                let mut r = base_grant_request();
+                r.subject = wrong_width_subject_bech32();
+                r
+            }),
+            ("grantee_pk", {
+                let mut r = base_grant_request();
+                r.grantee_pk = vec![0; 31];
+                r
+            }),
+            ("nonce", {
+                let mut r = base_grant_request();
+                r.nonce = vec![0; 31];
+                r
+            }),
+            ("chan_bind", {
+                let mut r = base_grant_request();
+                r.chan_bind = vec![0; 31];
+                r
+            }),
+        ] {
+            let err = parse_grant_request(req).expect_err("invalid grant field");
+            assert!(err.public_message.contains(field), "{}", err.public_message);
+        }
+
+        let err = parse_grant_scope(ProtoScope {
+            asset_ids: vec![vec![0x11; 32]],
+            all_assets: true,
+            not_before: 0,
+            not_after: 0,
+        })
+        .expect_err("all-assets cannot include ids");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(err.public_message.contains("all_assets=true"));
+
+        let err = parse_grant_scope(ProtoScope {
+            asset_ids: vec![],
+            all_assets: false,
+            not_before: 0,
+            not_after: 0,
+        })
+        .expect_err("selected scope requires ids");
+        assert!(err.public_message.contains("non-empty asset_ids"));
+
+        let selected = parse_grant_scope(ProtoScope {
+            asset_ids: vec![vec![0x31; 32], vec![0x32; 32]],
+            all_assets: false,
+            not_before: 1,
+            not_after: 2,
+        })
+        .expect("selected scope");
+        assert_eq!(
+            selected,
+            GrantScope {
+                assets: GrantAssetScope::Selected(vec![
+                    Digest32([0x31; 32]),
+                    Digest32([0x32; 32]),
+                ]),
+                not_before: 1,
+                not_after: 2,
+            }
+        );
+
+        let err = parse_grant_scope(ProtoScope {
+            asset_ids: vec![vec![0x31; 32], vec![0; 31]],
+            all_assets: false,
+            not_before: 0,
+            not_after: 0,
+        })
+        .expect_err("bad selected id");
+        assert!(err.public_message.contains("scope.asset_ids[1]"));
+    }
+
+    #[test]
+    fn parse_pull_request_preserves_both_authorities_and_requires_scope() {
+        for authority in [SessionAuthority::Ownership, SessionAuthority::Grant] {
+            let cmd = parse_pull_request(base_pull_request(), authority).expect("valid pull");
+            assert_eq!(cmd.nonce, [0x31; 32]);
+            assert_eq!(cmd.subject, SubjectAddress([0xA1; 32]));
+            assert_eq!(cmd.resolved_scope.assets, GrantAssetScope::All);
+            assert_eq!(cmd.chan_bind, ChanBind([0x32; 32]));
+            assert_eq!(cmd.authority, authority);
+        }
+        let mut req = base_pull_request();
+        req.resolved_scope = None;
+        let err = parse_pull_request(req, SessionAuthority::Ownership).expect_err("scope required");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(err.public_message.contains("resolved_scope is required"));
+
+        for (field, req) in [
+            ("nonce", {
+                let mut r = base_pull_request();
+                r.nonce = vec![0; 31];
+                r
+            }),
+            ("subject", {
+                let mut r = base_pull_request();
+                r.subject = wrong_width_subject_bech32();
+                r
+            }),
+            ("chan_bind", {
+                let mut r = base_pull_request();
+                r.chan_bind = vec![0; 31];
+                r
+            }),
+        ] {
+            let err = parse_pull_request(req, SessionAuthority::Grant)
+                .expect_err("invalid pull field");
+            assert!(err.public_message.contains(field), "{}", err.public_message);
+        }
+    }
+
+    #[test]
+    fn pull_record_and_coin_proof_conversions_preserve_fields() {
+        let result = PullResult {
+            records: vec![
+                RecordRef {
+                    record_id: Digest32([0x01; 32]),
+                    record_type: RecordType::CoinProof,
+                    transition_kind: None,
+                    blob_id: Digest32([0x02; 32]),
+                    occurred_at: 3,
+                },
+                RecordRef {
+                    record_id: Digest32([0x04; 32]),
+                    record_type: RecordType::SelfDelivery,
+                    transition_kind: Some(TransitionKind::Send),
+                    blob_id: Digest32([0x05; 32]),
+                    occurred_at: 6,
+                },
+            ],
+            session: SessionToken("session-token".into()),
+            session_expiry: 77,
+        };
+        let proto = pull_result_to_proto(&result);
+        assert_eq!(proto.session, "session-token");
+        assert_eq!(proto.session_expiry, 77);
+        assert_eq!(proto.records[0].record_id, vec![0x01; 32]);
+        assert_eq!(proto.records[0].record_type, "coinproof");
+        assert_eq!(proto.records[0].transition_kind, "");
+        assert_eq!(proto.records[0].blob_id, vec![0x02; 32]);
+        assert_eq!(proto.records[0].occurred_at, 3);
+        assert_eq!(proto.records[1].transition_kind, "send");
+
+        let record = parse_record_request(ProtoRecordRequest {
+            record_id: vec![0x11; 32],
+            session: "s".into(),
+            chan_bind: vec![0x12; 32],
+        })
+        .expect("record request");
+        assert_eq!(record.record_id, Digest32([0x11; 32]));
+        assert_eq!(record.session, "s");
+        assert_eq!(record.chan_bind, ChanBind([0x12; 32]));
+        let err = parse_record_request(ProtoRecordRequest {
+            record_id: vec![0; 31],
+            session: String::new(),
+            chan_bind: vec![0; 32],
+        })
+        .expect_err("record id width");
+        assert!(err.public_message.contains("record_id"));
+        let err = parse_record_request(ProtoRecordRequest {
+            record_id: vec![0; 32],
+            session: String::new(),
+            chan_bind: vec![0; 31],
+        })
+        .expect_err("record channel width");
+        assert!(err.public_message.contains("chan_bind"));
+
+        for transition_kind in [None, Some(TransitionKind::Mint)] {
+            let blob = DomainRecordBlob {
+                canonical: vec![1, 2, 3],
+                record_type: RecordType::SelfDelivery,
+                transition_kind,
+            };
+            let proto = record_blob_to_proto(&blob);
+            assert_eq!(proto.canonical, vec![1, 2, 3]);
+            assert_eq!(proto.record_type, "self_delivery");
+            assert_eq!(
+                proto.transition_kind,
+                transition_kind.map(|k| k.as_str()).unwrap_or_default()
+            );
+        }
+
+        let proof = parse_coin_proof_request(ProtoCoinProofRequest {
+            coin_id: vec![0x21; 32],
+            session: "proof-session".into(),
+            chan_bind: vec![0x22; 32],
+        })
+        .expect("coin proof request");
+        assert_eq!(proof.coin_id, Digest32([0x21; 32]));
+        assert_eq!(proof.session, "proof-session");
+        assert_eq!(proof.chan_bind, ChanBind([0x22; 32]));
+        let err = parse_coin_proof_request(ProtoCoinProofRequest {
+            coin_id: vec![0; 31],
+            session: String::new(),
+            chan_bind: vec![0; 32],
+        })
+        .expect_err("coin id width");
+        assert!(err.public_message.contains("coin_id"));
+        let err = parse_coin_proof_request(ProtoCoinProofRequest {
+            coin_id: vec![0; 32],
+            session: String::new(),
+            chan_bind: vec![0; 31],
+        })
+        .expect_err("coin proof channel width");
+        assert!(err.public_message.contains("chan_bind"));
+        assert_eq!(coin_proof_blob_to_proto(vec![9, 8]).canonical, vec![9, 8]);
+    }
+
+    #[test]
+    fn session_receipt_and_account_state_conversions_cover_optional_pairs() {
+        let bound = parse_session_bound("session".into(), vec![0x31; 32]).expect("session bound");
+        assert_eq!(bound.session, "session");
+        assert_eq!(bound.chan_bind, ChanBind([0x31; 32]));
+        let err = parse_session_bound(String::new(), vec![0; 31]).expect_err("channel width");
+        assert!(err.public_message.contains("chan_bind"));
+
+        let receipt = CreditReceipt {
+            subject: SubjectAddress([0x32; 32]),
+            coin_id: Digest32([0x33; 32]),
+            asset_id: Digest32([0x34; 32]),
+            amount: u128::MAX,
+            state: ReceiptState::Pending,
+            credited_at: 35,
+        };
+        let proto = receipt_to_proto(&receipt);
+        assert_eq!(proto.coin_id, vec![0x33; 32]);
+        assert_eq!(proto.asset_id, vec![0x34; 32]);
+        assert_eq!(proto.amount, u128::MAX.to_string());
+        assert_eq!(proto.state, "pending");
+        assert_eq!(proto.credited_at, 35);
+
+        let base = AccountStateView {
+            account_state: vec![1, 2],
+            state_head: Digest32([0x41; 32]),
+            head_record_id: Some(Digest32([0x42; 32])),
+            send_counter: 43,
+            current_pubkey: [0x44; 32],
+            last_nullifier_pk: Some([0x45; 32]),
+            last_nullifier_r: Some([0x46; 32]),
+        };
+        let proto = account_state_to_proto(&base).expect("complete state");
+        assert_eq!(proto.account_state, vec![1, 2]);
+        assert_eq!(proto.state_head, vec![0x41; 32]);
+        assert_eq!(proto.head_record_id, vec![0x42; 32]);
+        assert_eq!(proto.send_counter, 43);
+        assert_eq!(proto.current_pubkey, vec![0x44; 32]);
+        assert_eq!(proto.last_nullifier_pk, vec![0x45; 32]);
+        assert_eq!(proto.last_nullifier_r, vec![0x46; 32]);
+
+        let mut empty = base.clone();
+        empty.head_record_id = None;
+        empty.last_nullifier_pk = None;
+        empty.last_nullifier_r = None;
+        let proto = account_state_to_proto(&empty).expect("absent pair");
+        assert!(proto.head_record_id.is_empty());
+        assert!(proto.last_nullifier_pk.is_empty());
+        assert!(proto.last_nullifier_r.is_empty());
+
+        for (pk, r) in [(Some([1; 32]), None), (None, Some([2; 32]))] {
+            let mut corrupt = empty.clone();
+            corrupt.last_nullifier_pk = pk;
+            corrupt.last_nullifier_r = r;
+            let err = account_state_to_proto(&corrupt).expect_err("asymmetric pair");
+            assert_eq!(err.code, KernelErrorCode::InternalError);
+            assert_eq!(err.public_message, "Corrupt account state");
+            assert!(err.internal_context.expect("detail").detail.contains("both"));
+        }
+    }
+
+    #[test]
+    fn session_authority_and_exact_width_parsers_cover_all_arms() {
+        assert_eq!(parse_session_authority(" ownership ").unwrap(), SessionAuthority::Ownership);
+        assert_eq!(parse_session_authority("\tgrant\n").unwrap(), SessionAuthority::Grant);
+        let err = parse_session_authority("  ").expect_err("blank authority");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(err.public_message.contains("required"));
+        let err = parse_session_authority(" admin ").expect_err("unknown authority");
+        assert!(err.public_message.contains("admin"));
+
+        assert_eq!(parse_subject_address(&format!(" {} ", receive_subject_bech32())).unwrap(), SubjectAddress([0xA1; 32]));
+        let err = parse_subject_address(" \t ").expect_err("blank subject");
+        assert!(err.public_message.contains("subject is required"));
+        let err = parse_subject_address("zk1invalid").expect_err("invalid bech32m");
+        assert!(err.public_message.contains("Bech32m"));
+
+        for (field, err) in [
+            ("x", parse_xonly(&[0; 31], "x").expect_err("short xonly")),
+            ("digest", parse_digest32(&[0; 33], "digest").expect_err("long digest")),
+            ("exact32", parse_exact_32(&[0; 31], "exact32").expect_err("short exact32")),
+            ("exact64", parse_exact_64(&[0; 63], "exact64").expect_err("short exact64")),
+        ] {
+            assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+            assert!(err.public_message.contains(field));
+        }
+    }
+
+    #[test]
+    fn list_inscriptions_parses_origin_partial_cursors_and_limits() {
+        let origin = parse_list_inscriptions_request(ProtoListInscriptionsRequest {
+            from_height: None,
+            limit: None,
+            from_tx_index: None,
+            from_vin_index: None,
+        })
+        .expect("origin defaults");
+        assert_eq!(origin.from, InscriptionCursor::origin());
+        assert_eq!(origin.limit.get(), 100);
+
+        let partial = parse_list_inscriptions_request(ProtoListInscriptionsRequest {
+            from_height: Some(10),
+            limit: Some(1000),
+            from_tx_index: None,
+            from_vin_index: Some(12),
+        })
+        .expect("partial cursor defaults remaining values");
+        assert_eq!(
+            partial.from,
+            InscriptionCursor {
+                height: 10,
+                tx_index: 0,
+                vin_index: 12,
+            }
+        );
+        assert_eq!(partial.limit.get(), 1000);
+
+        for invalid in [0, 1001] {
+            let err = parse_list_inscriptions_request(ProtoListInscriptionsRequest {
+                from_height: None,
+                limit: Some(invalid),
+                from_tx_index: None,
+                from_vin_index: None,
+            })
+            .expect_err("out-of-bounds limit");
+            assert_eq!(err.code, KernelErrorCode::BoundsExceeded);
+            assert!(err.public_message.contains(&invalid.to_string()));
+        }
+    }
+
+    #[test]
+    fn chain_request_and_projection_helpers_preserve_every_field() {
+        let req = parse_nullifier_path_request(ProtoNullifierPathRequest {
+            pubkey: vec![0x11; 32],
+        })
+        .expect("nullifier request");
+        assert_eq!(req.pubkey, XOnlyKey([0x11; 32]));
+        let err = parse_nullifier_path_request(ProtoNullifierPathRequest {
+            pubkey: vec![0; 31],
+        })
+        .expect_err("pubkey width");
+        assert!(err.public_message.contains("pubkey"));
+
+        let tip = DomainAccumulatorTip {
+            root: Digest32([0x12; 32]),
+            tip_block_hash: Digest32([0x13; 32]),
+            tip_height: 14,
+            size: 15,
+        };
+        let proto = accumulator_tip_to_proto(&tip);
+        assert_eq!(proto.root, vec![0x12; 32]);
+        assert_eq!(proto.tip_block_hash, vec![0x13; 32]);
+        assert_eq!(proto.tip_height, 14);
+        assert_eq!(proto.size, 15);
+
+        let inscription = ListedInscription {
+            txid: [0x21; 32],
+            height: 22,
+            tx_index: 23,
+            vin_index: 24,
+            format: 1,
+            count: 1,
+            nullifiers: vec![ListedNullifier {
+                pubkey: [0x25; 32],
+                r: [0x26; 32],
+                state: NullifierMemberState::Completed,
+            }],
+            confirmation_state: RevealConfirmationState::Pending,
+        };
+        let proto = inscription_to_proto(&inscription);
+        assert_eq!(proto.txid, vec![0x21; 32]);
+        assert_eq!(proto.height, 22);
+        assert_eq!(proto.tx_index, 23);
+        assert_eq!(proto.vin_index, 24);
+        assert_eq!(proto.format, 1);
+        assert_eq!(proto.count, 1);
+        assert_eq!(proto.nullifiers.len(), 1);
+        assert_eq!(proto.nullifiers[0].pubkey, vec![0x25; 32]);
+        assert_eq!(proto.nullifiers[0].r, vec![0x26; 32]);
+        assert_eq!(proto.nullifiers[0].state, "completed");
+        assert_eq!(proto.confirmation_state, "pending");
+    }
+
+    #[test]
+    fn nullifier_path_projection_covers_present_and_absent_defaults() {
+        let present = DomainNullifierPath::Present {
+            root: Digest32([0x31; 32]),
+            tip_height: 32,
+            tip_block_hash: Digest32([0x33; 32]),
+            leaf: Digest32([0x34; 32]),
+            position: 35,
+            audit_path: vec![Digest32([0x36; 32]), Digest32([0x37; 32])],
+            tree_size: 38,
+        };
+        let proto = nullifier_path_to_proto(&present);
+        assert_eq!(proto.root, vec![0x31; 32]);
+        assert_eq!(proto.tip_height, 32);
+        assert!(proto.present);
+        assert_eq!(proto.leaf, vec![0x34; 32]);
+        assert_eq!(proto.position, 35);
+        assert_eq!(proto.audit_path, vec![vec![0x36; 32], vec![0x37; 32]]);
+        assert_eq!(proto.tree_size, 38);
+        assert_eq!(proto.tip_block_hash, vec![0x33; 32]);
+
+        let absent = DomainNullifierPath::Absent {
+            root: Digest32([0x41; 32]),
+            tip_height: 42,
+            tip_block_hash: Digest32([0x43; 32]),
+            tree_size: 44,
+        };
+        let proto = nullifier_path_to_proto(&absent);
+        assert_eq!(proto.root, vec![0x41; 32]);
+        assert_eq!(proto.tip_height, 42);
+        assert!(!proto.present);
+        assert!(proto.leaf.is_empty());
+        assert_eq!(proto.position, 0);
+        assert!(proto.audit_path.is_empty());
+        assert_eq!(proto.tree_size, 44);
+        assert_eq!(proto.tip_block_hash, vec![0x43; 32]);
+    }
+
+    #[test]
+    fn kernel_info_and_bootstrap_projection_cover_readiness_states() {
+        let ready = kernel_info_to_proto(&kernel_info(Readiness::Ready));
+        assert_eq!(ready.network, "regtest");
+        assert_eq!(ready.protocol_version, "v1");
+        assert_eq!(ready.circuit_digests.get("C"), Some(&vec![0xA4; 32]));
+        assert_eq!(ready.circuit_digests.get("C_balance"), Some(&vec![0xA5; 32]));
+        assert_eq!(ready.relay_url, "wss://relay.example");
+        assert_eq!(ready.blossom_url, "https://blob.example");
+        assert_eq!(ready.finality_confirmations, 6);
+        assert_eq!(ready.max_tx_inputs, 4);
+        assert_eq!(ready.max_tx_outputs, 8);
+        assert_eq!(ready.max_rx_coins, 16);
+        assert_eq!(ready.max_account_assets, 32);
+        assert!(ready.ready);
+        assert_eq!(ready.ready_reason, None);
+        assert_eq!(ready.bitcoin_tip_height, 1234);
+        assert_eq!(ready.accumulator_root, vec![0xA6; 32]);
+        assert_eq!(ready.scanner_lag, 2);
+        assert_eq!(ready.max_blob_bytes, 1_000_000);
+        assert_eq!(ready.activation_height, 100);
+        assert_eq!(ready.kernel_parts, vec!["scanner", "prover"]);
+        assert_eq!(ready.bootstrap_pubkey, vec![0xA7; 32]);
+        let bootstrap = ready.bootstrap.expect("bootstrap");
+        assert_eq!(bootstrap.network, "regtest");
+        assert_eq!(bootstrap.protocol_version, "v1");
+        assert_eq!(bootstrap.seed_relays, vec!["wss://seed.example"]);
+        assert_eq!(bootstrap.blob_stores, vec!["https://blob.example"]);
+        assert_eq!(bootstrap.operator_ids, vec![vec![0xA2; 32]]);
+        assert_eq!(bootstrap.issued_at, 10);
+        assert_eq!(bootstrap.expires_at, 20);
+        assert_eq!(bootstrap.manifest_sig, vec![0xA3; 64]);
+
+        let not_ready = kernel_info_to_proto(&kernel_info(Readiness::NotReady {
+            reason: ReadyReason::ScannerLag,
+        }));
+        assert!(!not_ready.ready);
+        assert_eq!(not_ready.ready_reason.as_deref(), Some("scanner_lag"));
+    }
+
+    #[test]
+    fn parse_sign_request_rejects_non_uuid_job_id() {
+        let err = parse_sign_request(ProtoSignRequest {
+            job_id: "definitely-not-a-uuid".into(),
+            signature: vec![0; 64],
+            s2c_nonce: vec![0; 32],
+        })
+        .expect_err("invalid UUID");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert_eq!(err.public_message, "job_id must be a UUID");
+    }
+
+    #[test]
+    fn parse_mint_and_send_happy_paths_preserve_all_fields() {
+        let mint = parse_transition_request(base_mint_request()).expect("mint");
+        match mint {
+            TransitionCommand::Mint {
+                common,
+                issuance,
+                output_templates,
+            } => {
+                assert_eq!(common.subject, SubjectAddress([0xA1; 32]));
+                assert_eq!(common.next_pubkey, XOnlyKey([0x52; 32]));
+                assert_eq!(common.npk_rand, Digest32([0x53; 32]));
+                assert_eq!(common.publisher, PublisherChoice::SelfPublish);
+                assert_eq!(common.idempotency_key.as_str(), "k-mint");
+                assert_eq!(
+                    issuance,
+                    Issuance::V1 {
+                        name: "asset".into(),
+                        decimals: 8,
+                        amount: 42,
+                        creator_pubkey: XOnlyKey([0x42; 32]),
+                    }
+                );
+                assert_eq!(output_templates.len(), 1);
+                assert_eq!(output_templates[0].recipient, SubjectAddress([0xA1; 32]));
+                assert_eq!(output_templates[0].asset_id, Digest32([0x51; 32]));
+                assert_eq!(output_templates[0].amount, 17);
+                assert!(output_templates[0].delivery.is_none());
+            }
+            other => panic!("expected Mint, got {other:?}"),
+        }
+
+        let send = parse_transition_request(base_send_request()).expect("send");
+        match send {
+            TransitionCommand::Send {
+                common,
+                input_coins,
+                output_templates,
+            } => {
+                assert_eq!(common.subject, SubjectAddress([0xA1; 32]));
+                assert_eq!(common.next_pubkey, XOnlyKey([0x61; 32]));
+                assert_eq!(common.npk_rand, Digest32([0x62; 32]));
+                assert_eq!(
+                    common.publisher,
+                    PublisherChoice::FeeLessHandOff {
+                        publisher_pubkey: XOnlyKey([0x64; 32]),
+                    }
+                );
+                assert_eq!(common.idempotency_key.as_str(), "k-send");
+                assert_eq!(input_coins, vec![Digest32([0x63; 32])]);
+                assert_eq!(output_templates.len(), 1);
+            }
+            other => panic!("expected Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transition_presence_matrix_rejects_every_forbidden_shape_and_kind() {
+        for (field, mut req) in [
+            ("input_coins", {
+                let mut r = base_mint_request();
+                r.input_coins = vec![vec![0; 32]];
+                r
+            }),
+            ("fold_coin_ids", {
+                let mut r = base_mint_request();
+                r.fold_coin_ids = vec![vec![0; 32]];
+                r
+            }),
+            ("genesis_pubkey", {
+                let mut r = base_mint_request();
+                r.genesis_pubkey = vec![0; 32];
+                r
+            }),
+        ] {
+            let err = parse_transition_request(req).expect_err("forbidden mint field");
+            assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+            assert!(err.public_message.contains(field));
+        }
+        let mut missing_issuance = base_mint_request();
+        missing_issuance.issuance = None;
+        let err = parse_transition_request(missing_issuance).expect_err("mint issuance required");
+        assert!(err.public_message.contains("requires issuance"));
+
+        let mut send_issuance = base_send_request();
+        send_issuance.issuance = Some(base_issuance(1));
+        let err = parse_transition_request(send_issuance).expect_err("send issuance forbidden");
+        assert!(err.public_message.contains("must not carry issuance"));
+        let mut send_fold = base_send_request();
+        send_fold.fold_coin_ids = vec![vec![0; 32]];
+        let err = parse_transition_request(send_fold).expect_err("send fold forbidden");
+        assert!(err.public_message.contains("fold_coin_ids"));
+        let mut send_genesis = base_send_request();
+        send_genesis.genesis_pubkey = vec![0; 32];
+        let err = parse_transition_request(send_genesis).expect_err("send genesis forbidden");
+        assert!(err.public_message.contains("genesis_pubkey"));
+
+        let mut receive_issuance = base_receive_request();
+        receive_issuance.issuance = Some(base_issuance(1));
+        let err = parse_transition_request(receive_issuance).expect_err("receive issuance forbidden");
+        assert!(err.public_message.contains("issuance"));
+
+        let mut blank = base_send_request();
+        blank.kind = " \t ".into();
+        let err = parse_transition_request(blank).expect_err("blank kind");
+        assert!(err.public_message.contains("kind is required"));
+        let mut unknown = base_send_request();
+        unknown.kind = " burn ".into();
+        let err = parse_transition_request(unknown).expect_err("unknown kind");
+        assert!(err.public_message.contains("burn"));
+    }
+
+    #[test]
+    fn refusal_helpers_cover_empty_and_nonempty_inputs() {
+        assert_eq!(refuse_nonempty_digests(&[], "items", "mint"), Ok(()));
+        let err = refuse_nonempty_digests(&[vec![0; 32]], "items", "mint")
+            .expect_err("nonempty digests");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(err.public_message.contains("kind=mint"));
+        assert!(err.public_message.contains("items"));
+        assert_eq!(refuse_nonempty_bytes(&[], "bytes", "send"), Ok(()));
+        let err = refuse_nonempty_bytes(&[1], "bytes", "send").expect_err("nonempty bytes");
+        assert!(err.public_message.contains("kind=send"));
+        assert!(err.public_message.contains("bytes"));
+    }
+
+    #[test]
+    fn publisher_choice_and_digest_list_cover_all_shapes() {
+        let err = parse_publisher_choice(&[], " \t fee ").expect_err("fee address forbidden");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(err.public_message.contains("fee_address"));
+        assert_eq!(parse_publisher_choice(&[], "  ").unwrap(), PublisherChoice::SelfPublish);
+        assert_eq!(
+            parse_publisher_choice(&[0x11; 32], "").unwrap(),
+            PublisherChoice::FeeLessHandOff {
+                publisher_pubkey: XOnlyKey([0x11; 32]),
+            }
+        );
+        let err = parse_publisher_choice(&[0; 31], "").expect_err("publisher width");
+        assert!(err.public_message.contains("publisher_pubkey"));
+
+        assert!(parse_digest_list(&[], "ids").unwrap().is_empty());
+        assert_eq!(
+            parse_digest_list(&[vec![0x21; 32]], "ids").unwrap(),
+            vec![Digest32([0x21; 32])]
+        );
+        let err = parse_digest_list(&[vec![0; 32], vec![0; 31]], "ids")
+            .expect_err("indexed width");
+        assert!(err.public_message.contains("ids[1]"));
+    }
+
+    #[test]
+    fn output_templates_cover_empty_none_invoice_profile_and_field_errors() {
+        assert!(parse_output_templates(&[]).unwrap().is_empty());
+        let none = parse_output_templates(&[base_output_template()]).expect("no delivery");
+        assert_eq!(none.len(), 1);
+        assert!(none[0].delivery.is_none());
+
+        let mut invoice_template = base_output_template();
+        invoice_template.delivery = Some(ProtoDeliveryCredential {
+            body: Some(kernel_proto::delivery_credential::Body::Invoice(base_invoice())),
+        });
+        let parsed = parse_output_templates(&[invoice_template]).expect("invoice delivery");
+        match parsed[0].delivery.as_ref().expect("delivery") {
+            DeliveryCredential::Invoice(inv) => {
+                assert_eq!(inv.amount, 17);
+                assert_eq!(inv.recipient, [0xA1; 32]);
+                assert_eq!(inv.asset_id, [0x51; 32]);
+            }
+            other => panic!("expected invoice, got {other:?}"),
+        }
+
+        let mut profile_template = base_output_template();
+        profile_template.delivery = Some(ProtoDeliveryCredential {
+            body: Some(kernel_proto::delivery_credential::Body::ProfileEvent(
+                signed_kind0_proto(false),
+            )),
+        });
+        let parsed = parse_output_templates(&[profile_template]).expect("profile delivery");
+        match parsed[0].delivery.as_ref().expect("delivery") {
+            DeliveryCredential::Profile(event) => {
+                assert_eq!(event.kind, 0);
+                assert_eq!(event.tags.len(), 1);
+                assert_eq!(event.content, "{\"name\":\"alice\"}");
+            }
+            other => panic!("expected profile, got {other:?}"),
+        }
+
+        let mut bad_recipient = base_output_template();
+        bad_recipient.recipient = "bad".into();
+        let err = parse_output_templates(&[bad_recipient]).expect_err("recipient error");
+        assert!(err.public_message.starts_with("output_templates[0].recipient: "));
+        let mut bad_asset = base_output_template();
+        bad_asset.asset_id = vec![0; 31];
+        let err = parse_output_templates(&[bad_asset]).expect_err("asset error");
+        assert!(err.public_message.contains("output_templates[0].asset_id"));
+        let mut bad_amount = base_output_template();
+        bad_amount.amount = "not-a-number".into();
+        let err = parse_output_templates(&[bad_amount]).expect_err("amount error");
+        assert!(err.public_message.contains("output_templates[0].amount"));
+    }
+
+    #[test]
+    fn delivery_credential_directly_covers_invoice_and_profile_arms() {
+        let invoice = ProtoDeliveryCredential {
+            body: Some(kernel_proto::delivery_credential::Body::Invoice(base_invoice())),
+        };
+        match parse_delivery_credential(&invoice, 2).expect("invoice arm") {
+            DeliveryCredential::Invoice(inv) => assert_eq!(inv.pk0, [0x71; 32]),
+            other => panic!("expected invoice, got {other:?}"),
+        }
+        let profile = ProtoDeliveryCredential {
+            body: Some(kernel_proto::delivery_credential::Body::ProfileEvent(
+                signed_kind0_proto(true),
+            )),
+        };
+        match parse_delivery_credential(&profile, 3).expect("profile arm") {
+            DeliveryCredential::Profile(event) => assert!(event.tags.is_empty()),
+            other => panic!("expected profile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wire_invoice_preserves_all_fields_and_memo_presence() {
+        let parsed = parse_wire_invoice(&base_invoice(), "out").expect("invoice");
+        assert_eq!(parsed.amount, 17);
+        assert_eq!(parsed.recipient, [0xA1; 32]);
+        assert_eq!(parsed.asset_id, [0x51; 32]);
+        assert_eq!(parsed.memo, None);
+        assert_eq!(parsed.pk0, [0x71; 32]);
+        assert_eq!(parsed.nk_commit, [0x72; 32]);
+        assert_eq!(parsed.ivpk, [0x73; 32]);
+        assert_eq!(parsed.op_pubkey, [0x74; 32]);
+        assert_eq!(parsed.relays, vec!["wss://relay.example"]);
+        assert_eq!(parsed.addr_sig, [0x75; 64]);
+        assert_eq!(parsed.sig, [0x76; 64]);
+
+        let mut with_memo = base_invoice();
+        with_memo.memo = "  hello  ".into();
+        let parsed = parse_wire_invoice(&with_memo, "out").expect("memo");
+        assert_eq!(parsed.memo.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn wire_invoice_rejects_each_malformed_field() {
+        let mut bad_recipient = base_invoice();
+        bad_recipient.recipient = "bad".into();
+        let err = parse_wire_invoice(&bad_recipient, "out").expect_err("recipient");
+        assert!(err.public_message.starts_with("out.invoice.recipient: "));
+
+        let mut bad_amount = base_invoice();
+        bad_amount.amount.clear();
+        let err = parse_wire_invoice(&bad_amount, "out").expect_err("empty amount");
+        assert!(err.public_message.contains("out.invoice.amount"));
+        let mut bad_amount = base_invoice();
+        bad_amount.amount = "x".into();
+        let err = parse_wire_invoice(&bad_amount, "out").expect_err("nonnumeric amount");
+        assert!(err.public_message.contains("decimal u128"));
+
+        for (field, inv) in [
+            ("asset_id", {
+                let mut x = base_invoice();
+                x.asset_id = vec![0; 31];
+                x
+            }),
+            ("pk0", {
+                let mut x = base_invoice();
+                x.pk0 = vec![0; 31];
+                x
+            }),
+            ("nk_commit", {
+                let mut x = base_invoice();
+                x.nk_commit = vec![0; 31];
+                x
+            }),
+            ("ivpk", {
+                let mut x = base_invoice();
+                x.ivpk = vec![0; 31];
+                x
+            }),
+            ("op_pubkey", {
+                let mut x = base_invoice();
+                x.op_pubkey = vec![0; 31];
+                x
+            }),
+            ("addr_sig", {
+                let mut x = base_invoice();
+                x.addr_sig = vec![0; 63];
+                x
+            }),
+            ("sig", {
+                let mut x = base_invoice();
+                x.sig = vec![0; 65];
+                x
+            }),
+        ] {
+            let err = parse_wire_invoice(&inv, "out").expect_err("invoice width");
+            assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+            assert!(err.public_message.contains(field), "{}", err.public_message);
+        }
+
+        let mut no_relays = base_invoice();
+        no_relays.relays.clear();
+        let err = parse_wire_invoice(&no_relays, "out").expect_err("relay required");
+        assert!(err.public_message.contains("must contain at least one relay URL"));
+    }
+
+    #[test]
+    fn wire_kind0_event_accepts_signed_events_and_empty_tags_encoding() {
+        let tagged = signed_kind0_proto(false);
+        let event = parse_wire_kind0_event(&tagged, "out").expect("signed event");
+        assert_eq!(event.id.to_vec(), tagged.id);
+        assert_eq!(event.pubkey.to_vec(), tagged.pubkey);
+        assert_eq!(event.created_at, tagged.created_at);
+        assert_eq!(event.kind, 0);
+        assert_eq!(event.tags.len(), 1);
+        assert_eq!(event.content, tagged.content);
+        assert_eq!(event.sig.to_vec(), tagged.sig);
+
+        let empty = signed_kind0_proto(true);
+        let event = parse_wire_kind0_event(&empty, "out").expect("empty tags_json");
+        assert!(event.tags.is_empty());
+    }
+
+    #[test]
+    fn wire_kind0_event_rejects_json_kind_width_and_crypto_failures() {
+        let mut bad_json = signed_kind0_proto(true);
+        bad_json.tags_json = "not-json".into();
+        let err = parse_wire_kind0_event(&bad_json, "out").expect_err("invalid tags JSON");
+        assert!(err.public_message.contains("JSON array of tag arrays"));
+
+        let mut bad_kind = signed_kind0_proto(true);
+        bad_kind.kind = 1;
+        let err = parse_wire_kind0_event(&bad_kind, "out").expect_err("wrong kind");
+        assert!(err.public_message.contains("got 1"));
+
+        for (field, event) in [
+            ("id", {
+                let mut e = signed_kind0_proto(true);
+                e.id = vec![0; 31];
+                e
+            }),
+            ("pubkey", {
+                let mut e = signed_kind0_proto(true);
+                e.pubkey = vec![0; 33];
+                e
+            }),
+            ("sig", {
+                let mut e = signed_kind0_proto(true);
+                e.sig = vec![0; 63];
+                e
+            }),
+        ] {
+            let err = parse_wire_kind0_event(&event, "out").expect_err("event width");
+            assert!(err.public_message.contains(field));
+        }
+
+        let mut wrong_id = signed_kind0_proto(true);
+        wrong_id.id = vec![0xFF; 32];
+        let err = parse_wire_kind0_event(&wrong_id, "out").expect_err("id mismatch");
+        assert!(err.public_message.contains("failed NIP-01 verification"));
+
+        let mut wrong_sig = signed_kind0_proto(true);
+        wrong_sig.sig[0] ^= 1;
+        let err = parse_wire_kind0_event(&wrong_sig, "out").expect_err("bad signature");
+        assert!(err.public_message.contains("failed NIP-01 verification"));
+    }
+
+    #[test]
+    fn issuance_versions_preserve_fields_and_enforce_presence() {
+        assert_eq!(
+            parse_issuance(base_issuance(1)).expect("v1 issuance"),
+            Issuance::V1 {
+                name: "asset".into(),
+                decimals: 8,
+                amount: 42,
+                creator_pubkey: XOnlyKey([0x42; 32]),
+            }
+        );
+        assert_eq!(
+            parse_issuance(base_issuance(2)).expect("v2 issuance"),
+            Issuance::V2 {
+                name: "asset".into(),
+                decimals: 8,
+                amount: 42,
+                cap_total: 1000,
+                terms_salt: Digest32([0x41; 32]),
+                creator_pubkey: XOnlyKey([0x42; 32]),
+            }
+        );
+
+        for invalid_v1 in [{
+            let mut i = base_issuance(1);
+            i.cap_total = "1".into();
+            i
+        }, {
+            let mut i = base_issuance(1);
+            i.terms_salt = vec![0; 32];
+            i
+        }] {
+            let err = parse_issuance(invalid_v1).expect_err("v1 extras forbidden");
+            assert!(err.public_message.contains("must not carry cap_total or terms_salt"));
+        }
+
+        let mut missing_cap = base_issuance(2);
+        missing_cap.cap_total = " \t ".into();
+        let err = parse_issuance(missing_cap).expect_err("v2 cap required");
+        assert!(err.public_message.contains("requires cap_total"));
+
+        let mut unknown = base_issuance(1);
+        unknown.issuance_version = 3;
+        let err = parse_issuance(unknown).expect_err("unknown issuance version");
+        assert!(err.public_message.contains("got 3"));
+
+        let mut decimals = base_issuance(1);
+        decimals.decimals = 256;
+        let err = parse_issuance(decimals).expect_err("decimals overflow");
+        assert!(err.public_message.contains("must fit u8"));
+
+        let mut amount = base_issuance(1);
+        amount.amount = "nope".into();
+        let err = parse_issuance(amount).expect_err("amount invalid");
+        assert!(err.public_message.contains("issuance.amount"));
+
+        let mut creator = base_issuance(1);
+        creator.creator_pubkey = vec![0; 31];
+        let err = parse_issuance(creator).expect_err("creator width");
+        assert!(err.public_message.contains("issuance.creator_pubkey"));
+
+        let mut cap = base_issuance(2);
+        cap.cap_total = "nope".into();
+        let err = parse_issuance(cap).expect_err("cap invalid");
+        assert!(err.public_message.contains("issuance.cap_total"));
+        let mut salt = base_issuance(2);
+        salt.terms_salt = vec![0; 31];
+        let err = parse_issuance(salt).expect_err("salt width");
+        assert!(err.public_message.contains("issuance.terms_salt"));
+    }
+
+    #[test]
+    fn decimal_u128_parser_covers_required_invalid_trimmed_and_max() {
+        let err = parse_u128_decimal(" \t ", "amount").expect_err("required decimal");
+        assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+        assert!(err.public_message.contains("amount is required"));
+        let err = parse_u128_decimal("12x", "amount").expect_err("invalid decimal");
+        assert!(err.public_message.contains("decimal u128 string"));
+        assert_eq!(parse_u128_decimal(" 42 ", "amount").unwrap(), 42);
+        assert_eq!(
+            parse_u128_decimal(&u128::MAX.to_string(), "amount").unwrap(),
+            u128::MAX
+        );
+    }
+
+    #[test]
+    fn job_projection_covers_cancelled_proving_publishing_and_progress_edges() {
+        let cancelled = Job {
+            id: JobId(Uuid::from_u128(0xC1)),
+            kind: JobKind::Send,
+            phase: "cancelling".into(),
+            progress: 75,
+            state: JobState::Cancelled {
+                error: Some(v1::encode_job_error("internal_error", "cancelled by user")),
+            },
+        };
+        assert_eq!(cancelled.normative_status(), NormativeJobStatus::Cancelled);
+        let proto = job_to_proto(&cancelled).expect("cancelled");
+        assert_eq!(proto.status, "cancelled");
+        assert!(proto.phase.is_empty());
+        assert_eq!(proto.progress, 0.75);
+        let error = proto.error.expect("cancelled error");
+        assert_eq!(error.error, "internal_error");
+        assert_eq!(error.message, "cancelled by user");
+
+        for (state, status, phase) in [
+            (JobState::Proving, "proving", "witness"),
+            (JobState::Publishing, "publishing", "broadcasting"),
+        ] {
+            let job = Job {
+                id: JobId(Uuid::from_u128(0xC2)),
+                kind: JobKind::Receive,
+                phase: phase.into(),
+                progress: 10,
+                state,
+            };
+            let proto = job_to_proto(&job).expect("nonterminal job");
+            assert_eq!(proto.status, status);
+            assert_eq!(proto.phase, phase);
+            assert!(proto.awaiting_signature.is_none());
+            assert!(proto.result.is_none());
+            assert!(proto.error.is_none());
+        }
+        assert_eq!(v1_progress_fraction(0), 0.0);
+        assert_eq!(v1_progress_fraction(100), 1.0);
+    }
+
+    #[test]
+    fn proto_job_error_covers_cancelled_default_and_non_string_message_failure() {
+        let cancelled = proto_job_error(None, true).expect("cancelled default");
+        assert_eq!(cancelled.error, "internal_error");
+        assert_eq!(cancelled.message, "cancelled");
+
+        let raw = r#"{"error":"proving_failed","message":7}"#;
+        let err = proto_job_error(Some(raw), false).expect_err("message must be string");
+        assert_eq!(err.code, KernelErrorCode::InternalError);
+        assert!(
+            err.internal_context
+                .expect("detail")
+                .detail
+                .contains("without message field")
+        );
+    }
+
+    #[test]
+    fn awaiting_and_completed_decoders_reject_non_objects_and_cover_receive_publisher() {
+        let err = decode_awaiting_signature(&JobPayload(serde_json::json!([1, 2, 3])))
+            .expect_err("awaiting object required");
+        assert_eq!(err.code, KernelErrorCode::InternalError);
+        assert!(err.internal_context.expect("detail").detail.contains("not a JSON object"));
+
+        let err = decode_job_result(JobKind::Send, &JobPayload(serde_json::json!("string")))
+            .expect_err("result object required");
+        assert!(err.internal_context.expect("detail").detail.contains("not a JSON object"));
+
+        let mut value = sample_completed_payload().0;
+        value
+            .as_object_mut()
+            .expect("sample object")
+            .insert("publisher_pubkey".into(), serde_json::json!(hex32(0xD1)));
+        let result = decode_job_result(JobKind::Receive, &JobPayload(value)).expect("receive result");
+        assert_eq!(result.new_account_state_hash, vec![0xA1; 32]);
+        assert_eq!(result.output_coins_root, vec![0xA2; 32]);
+        assert_eq!(result.input_nullifiers_root, vec![0xA3; 32]);
+        assert_eq!(result.output_coin_ids, vec![vec![0xB1; 32]]);
+        assert_eq!(result.publisher_pubkey, vec![0xD1; 32]);
+        assert!(result.attestation.is_empty());
+    }
+
+    #[test]
+    fn required_hex_helpers_cover_missing_empty_invalid_odd_and_success() {
+        let object = serde_json::json!({"field": hex32(0x11)});
+        let obj = object.as_object().expect("object");
+        assert_eq!(require_hex_bytes(obj, "field", 32).unwrap(), vec![0x11; 32]);
+        let err = require_hex_bytes(obj, "missing", 32).expect_err("missing fixed hex");
+        assert!(err.internal_context.expect("detail").detail.contains("missing"));
+
+        for (value, expected) in [
+            (serde_json::json!({}), "missing required hex field"),
+            (serde_json::json!({"blob": ""}), "is empty hex"),
+            (serde_json::json!({"blob": "zz"}), "is not hex"),
+            (serde_json::json!({"blob": "abc"}), "hex decode failed"),
+        ] {
+            let err = require_hex_bytes_unbounded(value.as_object().unwrap(), "blob")
+                .expect_err("invalid unbounded hex");
+            assert!(
+                err.internal_context.expect("detail").detail.contains(expected),
+                "expected {expected}"
+            );
+        }
+        let value = serde_json::json!({"blob": "00ff"});
+        assert_eq!(
+            require_hex_bytes_unbounded(value.as_object().unwrap(), "blob").unwrap(),
+            vec![0, 255]
+        );
+    }
+
+    #[test]
+    fn optional_hex_helper_covers_absent_null_type_empty_valid_and_width_error() {
+        for value in [serde_json::json!({}), serde_json::json!({"key": null})] {
+            assert!(optional_hex_bytes(value.as_object().unwrap(), "key", 32)
+                .unwrap()
+                .is_empty());
+        }
+        let value = serde_json::json!({"key": 1});
+        let err = optional_hex_bytes(value.as_object().unwrap(), "key", 32)
+            .expect_err("non-string optional hex");
+        assert!(err.internal_context.expect("detail").detail.contains("not a string"));
+        let value = serde_json::json!({"key": ""});
+        assert!(optional_hex_bytes(value.as_object().unwrap(), "key", 32)
+            .unwrap()
+            .is_empty());
+        let value = serde_json::json!({"key": hex32(0x22)});
+        assert_eq!(
+            optional_hex_bytes(value.as_object().unwrap(), "key", 32).unwrap(),
+            vec![0x22; 32]
+        );
+        let value = serde_json::json!({"key": "00"});
+        let err = optional_hex_bytes(value.as_object().unwrap(), "key", 32)
+            .expect_err("optional width");
+        assert!(err.internal_context.expect("detail").detail.contains("64 hex chars"));
+    }
+
+    #[test]
+    fn hex_array_and_u64_helpers_cover_every_failure_shape() {
+        for value in [serde_json::json!({}), serde_json::json!({"ids": "no"})] {
+            let err = require_hex_bytes_array(value.as_object().unwrap(), "ids", 32)
+                .expect_err("array required");
+            assert!(err.internal_context.expect("detail").detail.contains("array field"));
+        }
+        let value = serde_json::json!({"ids": [hex32(0x31), 7]});
+        let err = require_hex_bytes_array(value.as_object().unwrap(), "ids", 32)
+            .expect_err("element string required");
+        assert!(err.internal_context.expect("detail").detail.contains("ids[1]"));
+        let value = serde_json::json!({"ids": ["00"]});
+        let err = require_hex_bytes_array(value.as_object().unwrap(), "ids", 32)
+            .expect_err("element width");
+        assert!(err.internal_context.expect("detail").detail.contains("ids[0]"));
+        let value = serde_json::json!({"ids": [hex32(0x32)]});
+        assert_eq!(
+            require_hex_bytes_array(value.as_object().unwrap(), "ids", 32).unwrap(),
+            vec![vec![0x32; 32]]
+        );
+
+        let value = serde_json::json!({});
+        let err = require_u64(value.as_object().unwrap(), "n").expect_err("missing u64");
+        assert!(err.internal_context.expect("detail").detail.contains("missing required field"));
+        let value = serde_json::json!({"n": "1"});
+        let err = require_u64(value.as_object().unwrap(), "n").expect_err("number required");
+        assert!(err.internal_context.expect("detail").detail.contains("not a number"));
+        let value = serde_json::json!({"n": -1});
+        let err = require_u64(value.as_object().unwrap(), "n").expect_err("nonnegative required");
+        assert!(err.internal_context.expect("detail").detail.contains("non-negative integer"));
+        let value = serde_json::json!({"n": 42});
+        assert_eq!(require_u64(value.as_object().unwrap(), "n").unwrap(), 42);
+    }
+
+    #[test]
+    fn decode_hex_exact_covers_length_alphabet_and_success() {
+        let err = decode_hex_exact("00", "digest", 32).expect_err("wrong text length");
+        assert!(err.internal_context.expect("detail").detail.contains("64 hex chars"));
+        let err = decode_hex_exact(&"z".repeat(64), "digest", 32).expect_err("non-hex alphabet");
+        assert!(err.internal_context.expect("detail").detail.contains("is not hex"));
+        assert_eq!(decode_hex_exact(&hex32(0x41), "digest", 32).unwrap(), vec![0x41; 32]);
+    }
+
+    #[test]
+    fn publish_request_happy_path_and_fee_rejection_preserve_contract() {
+        let cmd = parse_publish_request(base_publish_request()).expect("publish request");
+        assert_eq!(cmd.public_key, XOnlyKey([0x91; 32]));
+        assert_eq!(cmd.r, XOnlyKey([0x92; 32]));
+        assert_eq!(cmd.s, Digest32([0x93; 32]));
+        assert_eq!(cmd.r_prime, XOnlyKey([0x94; 32]));
+        assert_eq!(cmd.block_anchor.block_hash, Digest32([0x95; 32]));
+        assert_eq!(cmd.block_anchor.height, 321);
+
+        for (field, req) in [
+            ("fee_blob_id", {
+                let mut r = base_publish_request();
+                r.fee_blob_id = vec![1];
+                r
+            }),
+            ("fee_epk", {
+                let mut r = base_publish_request();
+                r.fee_epk = vec![1];
+                r
+            }),
+            ("fee_blob_locators", {
+                let mut r = base_publish_request();
+                r.fee_blob_locators = vec![1];
+                r
+            }),
+        ] {
+            let err = parse_publish_request(req).expect_err("v1 fee fields forbidden");
+            assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+            assert!(err.public_message.contains(field));
+        }
+    }
+
+    #[test]
+    fn publish_request_rejects_missing_anchor_and_every_width_error() {
+        let mut missing = base_publish_request();
+        missing.block_anchor = None;
+        let err = parse_publish_request(missing).expect_err("anchor required");
+        assert!(err.public_message.contains("block_anchor is required"));
+
+        for (field, req) in [
+            ("public_key", {
+                let mut r = base_publish_request();
+                r.public_key = vec![0; 31];
+                r
+            }),
+            ("r", {
+                let mut r = base_publish_request();
+                r.r = vec![0; 31];
+                r
+            }),
+            ("s", {
+                let mut r = base_publish_request();
+                r.s = vec![0; 31];
+                r
+            }),
+            ("r_prime", {
+                let mut r = base_publish_request();
+                r.r_prime = vec![0; 31];
+                r
+            }),
+            ("block_anchor.block_hash", {
+                let mut r = base_publish_request();
+                r.block_anchor.as_mut().unwrap().block_hash = vec![0; 31];
+                r
+            }),
+        ] {
+            let err = parse_publish_request(req).expect_err("publish width");
+            assert_eq!(err.code, KernelErrorCode::MalformedRequest);
+            assert!(err.public_message.contains(field), "{}", err.public_message);
+        }
+    }
+
+    #[test]
+    fn publish_outcome_projection_covers_accepted_and_rejected() {
+        let accepted = publish_outcome_to_proto(PublishOutcome::Accepted { batch_eta: 17 });
+        assert!(accepted.accepted);
+        assert_eq!(accepted.reason, None);
+        assert_eq!(accepted.batch_eta, Some(17));
+
+        let rejected = publish_outcome_to_proto(PublishOutcome::Rejected {
+            reason: PublishRejectReason::AnchorStale,
+        });
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.reason.as_deref(), Some("anchor_stale"));
+        assert_eq!(rejected.batch_eta, None);
+    }
+
+    #[test]
+    fn entrust_and_revoke_conversions_cover_success_and_width_failures() {
+        let entrust = parse_entrust_request(ProtoEntrustRequest {
+            nonce: vec![0x11; 32],
+            subject: receive_subject_bech32(),
+            bundle: vec![1, 2, 3],
+            chan_bind: vec![0x12; 32],
+        })
+        .expect("entrust");
+        assert_eq!(entrust.subject, SubjectAddress([0xA1; 32]));
+        assert_eq!(entrust.nonce, [0x11; 32]);
+        assert_eq!(entrust.chan_bind, ChanBind([0x12; 32]));
+        assert_eq!(entrust.bundle_bytes, vec![1, 2, 3]);
+        assert!(entrust_result_to_proto(EntrustResult { accepted: true }).accepted);
+
+        for (field, req) in [
+            ("nonce", ProtoEntrustRequest {
+                nonce: vec![0; 31],
+                subject: receive_subject_bech32(),
+                bundle: vec![],
+                chan_bind: vec![0; 32],
+            }),
+            ("chan_bind", ProtoEntrustRequest {
+                nonce: vec![0; 32],
+                subject: receive_subject_bech32(),
+                bundle: vec![],
+                chan_bind: vec![0; 31],
+            }),
+        ] {
+            let err = parse_entrust_request(req).expect_err("entrust width");
+            assert!(err.public_message.contains(field));
+        }
+
+        let revoke = parse_revoke_request(ProtoRevokeRequest {
+            nonce: vec![0x21; 32],
+            subject: receive_subject_bech32(),
+            chan_bind: vec![0x22; 32],
+        })
+        .expect("revoke");
+        assert_eq!(revoke.subject, SubjectAddress([0xA1; 32]));
+        assert_eq!(revoke.nonce, [0x21; 32]);
+        assert_eq!(revoke.chan_bind, ChanBind([0x22; 32]));
+        assert!(revoke_result_to_proto(RevokeResult { revoked: true }).revoked);
+
+        for (field, req) in [
+            ("nonce", ProtoRevokeRequest {
+                nonce: vec![0; 31],
+                subject: receive_subject_bech32(),
+                chan_bind: vec![0; 32],
+            }),
+            ("chan_bind", ProtoRevokeRequest {
+                nonce: vec![0; 32],
+                subject: receive_subject_bech32(),
+                chan_bind: vec![0; 31],
+            }),
+        ] {
+            let err = parse_revoke_request(req).expect_err("revoke width");
+            assert!(err.public_message.contains(field));
+        }
     }
 }

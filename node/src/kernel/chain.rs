@@ -2327,4 +2327,596 @@ mod tests {
         reversed.reverse();
         assert_ne!(page.inscriptions[0].txid, reversed);
     }
+
+    /// Every engine and wire network variant maps to the closed kernel label.
+    #[test]
+    fn kernel_network_maps_all_engine_and_wire_variants() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        assert_eq!(KernelNetwork::Mainnet.as_str(), "mainnet");
+        assert_eq!(KernelNetwork::Testnet.as_str(), "testnet");
+        assert_eq!(KernelNetwork::Regtest.as_str(), "regtest");
+
+        assert_eq!(KernelNetwork::from_v1(Network::Mainnet), KernelNetwork::Mainnet);
+        assert_eq!(KernelNetwork::from_v1(Network::Testnet), KernelNetwork::Testnet);
+        assert_eq!(KernelNetwork::from_v1(Network::Regtest), KernelNetwork::Regtest);
+
+        assert_eq!(
+            KernelNetwork::from_wire("mainnet").expect("mainnet wire label"),
+            KernelNetwork::Mainnet
+        );
+        assert_eq!(
+            KernelNetwork::from_wire("testnet").expect("testnet wire label"),
+            KernelNetwork::Testnet
+        );
+        assert_eq!(
+            KernelNetwork::from_wire("regtest").expect("regtest wire label"),
+            KernelNetwork::Regtest
+        );
+        let err = KernelNetwork::from_wire("").expect_err("empty wire label must fail");
+        assert!(
+            matches!(
+                err,
+                ChainIdentityError::InvalidVar { name, ref detail }
+                    if name == "bootstrap.network"
+                        && detail.contains("unknown network")
+                        && detail.contains("mainnet")
+            ),
+            "empty wire label must name the closed network vocabulary, got: {err:?}"
+        );
+    }
+
+    /// Reveal confirmation variants expose their exact closed wire labels.
+    #[test]
+    fn reveal_confirmation_state_maps_all_wire_labels() {
+        assert_eq!(RevealConfirmationState::Pending.as_str(), "pending");
+        assert_eq!(RevealConfirmationState::Completed.as_str(), "completed");
+    }
+
+    /// Stored catalog rows are copied field-for-field into the chain view model.
+    #[test]
+    fn catalog_entry_from_stored_preserves_every_field() {
+        let members = vec![
+            (3, [0x31; 32], [0x32; 32]),
+            (7, [0x71; 32], [0x72; 32]),
+        ];
+        let row = crate::v1::db_v1::CatalogInscription {
+            height: 987_654,
+            tx_index: 123,
+            vin_index: 456,
+            reveal_txid: [0xA1; 32],
+            format: 1,
+            members: members.clone(),
+            block_anchor_hash: [0xB2; 32],
+            block_anchor_height: 789,
+        };
+
+        let entry = CatalogEntry::from_stored(&row);
+        assert_eq!(entry.height, 987_654);
+        assert_eq!(entry.tx_index, 123);
+        assert_eq!(entry.vin_index, 456);
+        assert_eq!(entry.reveal_txid, [0xA1; 32]);
+        assert_eq!(entry.format, 1);
+        assert_eq!(entry.members, members);
+        assert_eq!(entry.block_anchor_hash, [0xB2; 32]);
+        assert_eq!(entry.block_anchor_height, 789);
+    }
+
+    /// Catalog cursors widen both u32 indices without changing their values.
+    #[test]
+    fn catalog_entry_cursor_widens_indices_exactly() {
+        let entry = catalog_entry(
+            42,
+            u32::MAX - 1,
+            u32::MAX,
+            0,
+            vec![(0, pk(1), r(1))],
+            0x42,
+        );
+        assert_eq!(
+            entry.cursor(),
+            InscriptionCursor {
+                height: 42,
+                tx_index: u64::from(u32::MAX - 1),
+                vin_index: u64::from(u32::MAX),
+            }
+        );
+    }
+
+    /// Queue failure, scan presence, and the finality boundary drive one classifier.
+    #[test]
+    fn classify_member_state_covers_precedence_and_finality_boundary() {
+        assert_eq!(
+            classify_member_state(MemberChainObservation {
+                queue_failed: true,
+                first_occurrence: false,
+                inclusion_height: None,
+                tip_height: 100,
+            }),
+            NullifierMemberState::Failed,
+            "durable queue failure must take precedence over every chain field"
+        );
+        assert_eq!(
+            classify_member_state(MemberChainObservation {
+                queue_failed: false,
+                first_occurrence: true,
+                inclusion_height: None,
+                tip_height: 100,
+            }),
+            NullifierMemberState::Pending,
+            "a member without a scanned inclusion cannot be finished"
+        );
+        assert_eq!(
+            classify_member_state(MemberChainObservation {
+                queue_failed: false,
+                first_occurrence: false,
+                inclusion_height: Some(50),
+                tip_height: 100,
+            }),
+            NullifierMemberState::Failed,
+            "a later occurrence must fail even after finality depth"
+        );
+        assert_eq!(
+            classify_member_state(MemberChainObservation {
+                queue_failed: false,
+                first_occurrence: true,
+                inclusion_height: Some(50),
+                tip_height: 55,
+            }),
+            NullifierMemberState::Completed,
+            "six confirmations must complete the first occurrence"
+        );
+        assert_eq!(
+            classify_member_state(MemberChainObservation {
+                queue_failed: false,
+                first_occurrence: true,
+                inclusion_height: Some(50),
+                tip_height: 54,
+            }),
+            NullifierMemberState::Pending,
+            "five confirmations must remain pending"
+        );
+    }
+
+    /// Finished is exactly completed, never pending or failed.
+    #[test]
+    fn member_is_finished_only_for_completed_observation() {
+        assert!(member_is_finished(MemberChainObservation {
+            queue_failed: false,
+            first_occurrence: true,
+            inclusion_height: Some(50),
+            tip_height: 55,
+        }));
+        assert!(!member_is_finished(MemberChainObservation {
+            queue_failed: false,
+            first_occurrence: true,
+            inclusion_height: Some(50),
+            tip_height: 54,
+        }));
+        assert!(!member_is_finished(MemberChainObservation {
+            queue_failed: true,
+            first_occurrence: true,
+            inclusion_height: Some(50),
+            tip_height: 55,
+        }));
+    }
+
+    /// Member confirmation depth is inclusive and saturates below inclusion.
+    #[test]
+    fn member_confirmation_state_handles_boundary_and_saturation() {
+        assert_eq!(
+            member_confirmation_state(105, 100),
+            NullifierMemberState::Completed
+        );
+        assert_eq!(
+            member_confirmation_state(104, 100),
+            NullifierMemberState::Pending
+        );
+        assert_eq!(
+            member_confirmation_state(0, 100),
+            NullifierMemberState::Pending,
+            "tip below inclusion must saturate instead of underflowing"
+        );
+    }
+
+    /// Reveal confirmation depth uses the same inclusive six-block boundary.
+    #[test]
+    fn reveal_confirmation_state_handles_finality_boundary() {
+        assert_eq!(
+            reveal_confirmation_state(105, 100),
+            RevealConfirmationState::Completed
+        );
+        assert_eq!(
+            reveal_confirmation_state(104, 100),
+            RevealConfirmationState::Pending
+        );
+    }
+
+    /// Readiness covers absent flags, both false causes, and finality precedence.
+    #[test]
+    fn chain_readiness_flags_evaluate_all_combinations() {
+        let flag = |value| Some(Arc::new(AtomicBool::new(value)));
+
+        assert_eq!(ChainReadinessFlags::default().evaluate(), Readiness::Ready);
+        assert_eq!(
+            ChainReadinessFlags {
+                scan_caught_up: None,
+                finality_ok: flag(false),
+            }
+            .evaluate(),
+            Readiness::NotReady {
+                reason: ReadyReason::DeepReorg,
+            }
+        );
+        assert_eq!(
+            ChainReadinessFlags {
+                scan_caught_up: flag(false),
+                finality_ok: flag(false),
+            }
+            .evaluate(),
+            Readiness::NotReady {
+                reason: ReadyReason::DeepReorg,
+            },
+            "deep reorg must take precedence over scanner lag"
+        );
+        assert_eq!(
+            ChainReadinessFlags {
+                scan_caught_up: flag(false),
+                finality_ok: flag(true),
+            }
+            .evaluate(),
+            Readiness::NotReady {
+                reason: ReadyReason::ScannerLag,
+            }
+        );
+        assert_eq!(
+            ChainReadinessFlags {
+                scan_caught_up: flag(true),
+                finality_ok: flag(true),
+            }
+            .evaluate(),
+            Readiness::Ready
+        );
+        assert_eq!(
+            ChainReadinessFlags {
+                scan_caught_up: flag(false),
+                finality_ok: None,
+            }
+            .evaluate(),
+            Readiness::NotReady {
+                reason: ReadyReason::ScannerLag,
+            }
+        );
+        assert_eq!(
+            ChainReadinessFlags {
+                scan_caught_up: flag(true),
+                finality_ok: None,
+            }
+            .evaluate(),
+            Readiness::Ready
+        );
+    }
+
+    /// Required URLs accept the exact byte limit and reject one byte more.
+    #[test]
+    fn parse_required_url_enforces_exact_length_boundary() {
+        let at_limit = "a".repeat(URL_MAX_BYTES);
+        assert_eq!(
+            parse_required_url(RELAY_URL_ENV, Some(&at_limit)).expect("URL at byte limit"),
+            at_limit
+        );
+
+        let over_limit = "a".repeat(URL_MAX_BYTES + 1);
+        let err = parse_required_url(RELAY_URL_ENV, Some(&over_limit))
+            .expect_err("URL over byte limit must fail");
+        assert!(
+            matches!(
+                err,
+                ChainIdentityError::InvalidVar { name, ref detail }
+                    if name == RELAY_URL_ENV && detail.contains("exceeds max")
+            ),
+            "oversized URL must name the bound, got: {err:?}"
+        );
+    }
+
+    /// Present but blank max-blob input is missing, not an integer error.
+    #[test]
+    fn parse_max_blob_bytes_rejects_blank_as_missing() {
+        let err = parse_max_blob_bytes(Some("   ")).expect_err("blank max blob value");
+        assert_eq!(
+            err,
+            ChainIdentityError::MissingVar {
+                name: MAX_BLOB_BYTES_ENV,
+            }
+        );
+    }
+
+    /// Blank part lists are missing; an interior empty token is invalid.
+    #[test]
+    fn parse_kernel_parts_rejects_blank_and_empty_token() {
+        let blank = parse_kernel_parts(Some("   ")).expect_err("blank kernel parts");
+        assert_eq!(
+            blank,
+            ChainIdentityError::MissingVar {
+                name: KERNEL_PARTS_ENV,
+            }
+        );
+
+        let empty_token = parse_kernel_parts(Some("scanner,,publisher"))
+            .expect_err("interior empty kernel part token");
+        assert!(
+            matches!(
+                empty_token,
+                ChainIdentityError::InvalidVar { name, ref detail }
+                    if name == KERNEL_PARTS_ENV && detail.contains("empty token")
+            ),
+            "empty token must name its cause, got: {empty_token:?}"
+        );
+    }
+
+    /// Process env values are read and parsed without defaults or rewriting.
+    #[test]
+    fn chain_identity_ops_from_env_reads_present_values() {
+        use std::sync::{Mutex, OnceLock};
+        fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+        }
+        let _guard = env_lock();
+        let keys = [
+            RELAY_URL_ENV,
+            BLOSSOM_URL_ENV,
+            MAX_BLOB_BYTES_ENV,
+            KERNEL_PARTS_ENV,
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        std::env::set_var(RELAY_URL_ENV, "wss://r.example");
+        std::env::set_var(BLOSSOM_URL_ENV, "https://b.example");
+        std::env::set_var(MAX_BLOB_BYTES_ENV, "1000");
+        std::env::set_var(KERNEL_PARTS_ENV, "scanner,prover");
+
+        let ops = chain_identity_ops_from_env().expect("all operational env values are valid");
+        assert_eq!(
+            ops,
+            ChainIdentityOps {
+                relay_url: "wss://r.example".into(),
+                blossom_url: "https://b.example".into(),
+                max_blob_bytes: 1000,
+                kernel_parts: vec![KernelPart::Scanner, KernelPart::Prover],
+            }
+        );
+
+        // Restore.
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// Non-UTF-8 process env values fail loud before operational parsing.
+    #[cfg(unix)]
+    #[test]
+    fn chain_identity_ops_from_env_rejects_non_utf8_value() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::{Mutex, OnceLock};
+        fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+        }
+        let _guard = env_lock();
+        let keys = [
+            RELAY_URL_ENV,
+            BLOSSOM_URL_ENV,
+            MAX_BLOB_BYTES_ENV,
+            KERNEL_PARTS_ENV,
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        std::env::set_var(
+            RELAY_URL_ENV,
+            std::ffi::OsStr::from_bytes(&[0xFF, 0xFE]),
+        );
+        std::env::set_var(BLOSSOM_URL_ENV, "https://b.example");
+        std::env::set_var(MAX_BLOB_BYTES_ENV, "1000");
+        std::env::set_var(KERNEL_PARTS_ENV, "scanner,prover");
+
+        let err = chain_identity_ops_from_env().expect_err("non-UTF-8 relay URL must fail");
+        assert!(
+            matches!(
+                err,
+                ChainIdentityError::InvalidVar { name, ref detail }
+                    if name == RELAY_URL_ENV && detail.contains("UTF-8")
+            ),
+            "non-UTF-8 value must name the variable and encoding failure, got: {err:?}"
+        );
+
+        // Restore.
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// Verified manifests reject every invalid field after network parsing.
+    #[test]
+    fn bootstrap_manifest_from_verified_rejects_invalid_required_fields() {
+        fn assert_invalid_field(fields: VerifiedManifestFields<'_>, expected_name: &'static str) {
+            let err = bootstrap_manifest_from_verified(fields)
+                .expect_err("invalid verified manifest field must fail");
+            assert!(
+                matches!(
+                    err,
+                    ChainIdentityError::InvalidVar { name, .. } if name == expected_name
+                ),
+                "invalid manifest field must name {expected_name}, got: {err:?}"
+            );
+        }
+
+        let relays = ["wss://r".to_string()];
+        let blobs = ["https://b".to_string()];
+        let operators = [[0x11; 32]];
+        let sig = [0x22; 64];
+        assert_invalid_field(
+            VerifiedManifestFields {
+                network_label: "regtest",
+                protocol_version: "v2",
+                seed_relays: &relays,
+                blob_stores: &blobs,
+                operator_ids: &operators,
+                issued_at: 1,
+                expires_at: 2,
+                manifest_sig: &sig,
+            },
+            "bootstrap.protocol_version",
+        );
+        assert_invalid_field(
+            VerifiedManifestFields {
+                network_label: "regtest",
+                protocol_version: "v1",
+                seed_relays: &[],
+                blob_stores: &blobs,
+                operator_ids: &operators,
+                issued_at: 1,
+                expires_at: 2,
+                manifest_sig: &sig,
+            },
+            "bootstrap.seed_relays",
+        );
+        assert_invalid_field(
+            VerifiedManifestFields {
+                network_label: "regtest",
+                protocol_version: "v1",
+                seed_relays: &relays,
+                blob_stores: &[],
+                operator_ids: &operators,
+                issued_at: 1,
+                expires_at: 2,
+                manifest_sig: &sig,
+            },
+            "bootstrap.blob_stores",
+        );
+        assert_invalid_field(
+            VerifiedManifestFields {
+                network_label: "regtest",
+                protocol_version: "v1",
+                seed_relays: &relays,
+                blob_stores: &blobs,
+                operator_ids: &[],
+                issued_at: 1,
+                expires_at: 2,
+                manifest_sig: &sig,
+            },
+            "bootstrap.operator_ids",
+        );
+    }
+
+    /// A valid but misdirected index position must fail as internal corruption.
+    #[test]
+    fn get_nullifier_path_rejects_index_entry_divergence() {
+        let mut view = fold_view(
+            &[
+                (pos(1, 0, 0, 0), pk(1), r(1)),
+                (pos(2, 0, 0, 0), pk(2), r(2)),
+            ],
+            10,
+        );
+        view.index.insert(pk(9), (0, r(9)));
+
+        let err = get_nullifier_path(
+            &view,
+            NullifierPathRequest {
+                pubkey: XOnlyKey(pk(9)),
+            },
+        )
+        .expect_err("divergent index entry must not yield a path or absence");
+        let detail = err
+            .internal_context
+            .as_ref()
+            .map(|context| context.detail.as_str())
+            .unwrap_or("");
+        assert_eq!(err.code, KernelErrorCode::InternalError);
+        assert!(
+            err.public_message.contains("nullifier path")
+                && (detail.contains("diverges") || detail.contains("claimed position")),
+            "error must name the index/log divergence, got: {err:?}"
+        );
+    }
+
+    /// An internally consistent mirror must still verify against the committed MTH.
+    #[test]
+    fn get_nullifier_path_rejects_path_against_foreign_mth() {
+        let mut view = fold_view(
+            &[
+                (pos(1, 0, 0, 0), pk(1), r(1)),
+                (pos(2, 0, 0, 0), pk(2), r(2)),
+                (pos(3, 0, 0, 0), pk(3), r(3)),
+            ],
+            10,
+        );
+        let foreign_view = fold_view(
+            &[
+                (pos(4, 0, 0, 0), pk(4), r(4)),
+                (pos(5, 0, 0, 0), pk(5), r(5)),
+                (pos(6, 0, 0, 0), pk(6), r(6)),
+            ],
+            10,
+        );
+        view.nav.mth = foreign_view.nav.mth;
+
+        let err = get_nullifier_path(
+            &view,
+            NullifierPathRequest {
+                pubkey: XOnlyKey(pk(2)),
+            },
+        )
+        .expect_err("path must fail against an unrelated committed MTH");
+        let detail = err
+            .internal_context
+            .as_ref()
+            .map(|context| context.detail.as_str())
+            .unwrap_or("");
+        assert_eq!(err.code, KernelErrorCode::InternalError);
+        assert!(
+            detail.contains("does not verify") && detail.contains("tip mth"),
+            "error must name failed inclusion verification, got: {err:?}"
+        );
+    }
+
+    /// Test view construction rejects accumulator/mirror length divergence.
+    #[test]
+    fn chain_view_from_accumulator_rejects_size_mirror_mismatch() {
+        let acc = NfLogAccumulator::new(0);
+        let mirror = vec![(
+            pos(1, 0, 0, 0),
+            NfLogEntry {
+                pk: pk(1),
+                r: r(1),
+            },
+        )];
+        let err = chain_view_from_accumulator_with_catalog(
+            &acc,
+            1,
+            [0xAB; 32],
+            mirror,
+            Vec::new(),
+        )
+        .expect_err("accumulator and mirror length mismatch must fail");
+        let detail = err
+            .internal_context
+            .as_ref()
+            .map(|context| context.detail.as_str())
+            .unwrap_or("");
+        assert_eq!(err.code, KernelErrorCode::InternalError);
+        assert!(
+            detail.contains("accumulator size") && detail.contains("mirror length"),
+            "error must name both sides of the mismatch, got: {err:?}"
+        );
+    }
 }
