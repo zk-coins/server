@@ -148,6 +148,15 @@ mod tests {
     }
 
     #[test]
+    fn encode_digest_returns_elements() {
+        let d = ZERO_HASH;
+        assert_eq!(encode_digest(d), d.elements);
+        let mut d2 = ZERO_HASH;
+        d2.elements[0] = F::from_canonical_u64(7);
+        assert_eq!(encode_digest(d2), d2.elements);
+    }
+
+    #[test]
     fn encode_byte_string_abcdefg_hand_check() {
         // E(b"ABCDEFG"): length 7 + one 7-byte BE chunk "ABCDEFG"
         // u64 = 0x0041424344454647

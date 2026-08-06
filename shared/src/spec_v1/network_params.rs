@@ -175,6 +175,12 @@ mod tests {
     }
 
     #[test]
+    fn finality_confirmations_getter() {
+        let p = fixture_params();
+        assert_eq!(p.finality_confirmations(), 6);
+    }
+
+    #[test]
     fn identifier_deterministic_and_sensitive_to_each_field() {
         let base = fixture_params();
         let id = base.identifier().expect("valid");

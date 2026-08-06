@@ -575,13 +575,12 @@ mod tests {
     // V.10 derivation table — every row
     // -----------------------------------------------------------------------
 
-    /// `int(H(label)) mod n` for a 32-byte SHA-256 digest (at most one subtraction).
-    fn sha256_mod_n(label: &[u8]) -> [u8; 32] {
-        let h: [u8; 32] = Sha256::digest(label).into();
+    /// Reduce a 32-byte big-endian integer mod secp256k1 `n` (at most one subtraction).
+    fn reduce_mod_n(h: [u8; 32]) -> [u8; 32] {
         if h.as_slice() < SECP256K1_ORDER_N.as_slice() {
             return h;
         }
-        // h − n (big-endian); a 256-bit hash is < 2n so one subtraction suffices.
+        // h − n (big-endian); a 256-bit value is < 2n so one subtraction suffices.
         let mut out = [0u8; 32];
         let mut borrow: u8 = 0;
         for i in (0..32).rev() {
@@ -592,6 +591,30 @@ mod tests {
         }
         assert_eq!(borrow, 0, "SHA-256 digest must be < 2n");
         out
+    }
+
+    /// `int(H(label)) mod n` for a 32-byte SHA-256 digest.
+    fn sha256_mod_n(label: &[u8]) -> [u8; 32] {
+        reduce_mod_n(Sha256::digest(label).into())
+    }
+
+    #[test]
+    fn reduce_mod_n_subtracts_when_h_ge_n() {
+        // h == n → result is 0 (subtraction path, not the early return).
+        let reduced = reduce_mod_n(SECP256K1_ORDER_N);
+        assert_eq!(reduced, [0u8; 32]);
+        // h == n+1 → result is 1.
+        let mut n_plus_1 = SECP256K1_ORDER_N;
+        let mut carry = 1u16;
+        for i in (0..32).rev() {
+            let s = n_plus_1[i] as u16 + carry;
+            n_plus_1[i] = s as u8;
+            carry = s >> 8;
+        }
+        assert_eq!(carry, 0, "n+1 fits in 256 bits");
+        let mut expected = [0u8; 32];
+        expected[31] = 1;
+        assert_eq!(reduce_mod_n(n_plus_1), expected);
     }
 
     #[test]
@@ -1260,5 +1283,39 @@ mod tests {
             derive_note_key(&ss, &[0u8; 32]),
             Err(SpecError::XOnlyOffCurve)
         );
+    }
+
+    #[test]
+    fn zbe_chunk_too_short_rejected() {
+        // Magic + N=1 + length=1 (< Poly1305 tag) + 1 payload byte.
+        let mut ct = ZBE_MAGIC.to_vec();
+        ct.extend_from_slice(&1u32.to_be_bytes());
+        ct.extend_from_slice(&1u32.to_be_bytes());
+        ct.push(0x00);
+        let k = zbe_test_k_tx();
+        assert_eq!(
+            zbe_open(&k, &ct),
+            Err(SpecError::ZbeChunkTooShort {
+                chunk_index: 0,
+                len: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn base64url_rejects_invalid_char() {
+        assert_eq!(
+            base64url_decode_no_pad("AAA@"),
+            Err(SpecError::Base64UrlInvalidChar { ch: '@' })
+        );
+    }
+
+    #[test]
+    fn base64url_roundtrip_rem_eq_3() {
+        // 2 input bytes → encoded length % 4 == 3 (rem==3 decode path).
+        let data = [0x01u8, 0x02];
+        let enc = base64url_encode_no_pad(&data);
+        assert_eq!(enc.len() % 4, 3);
+        assert_eq!(base64url_decode_no_pad(&enc).expect("decode"), data);
     }
 }

@@ -677,6 +677,20 @@ mod tests {
         assert!(verify_consistency(m as u64, mth_a, n as u64, mth_b, &proof));
     }
 
+    /// Explicit m=0 consistency path (degenerate pair branch + continue).
+    #[test]
+    fn consistency_m_eq_0_against_n_eq_1() {
+        let entries = synthetic_entries(1);
+        let proof = consistency_proof(0, &entries).expect("ok");
+        assert!(verify_consistency(
+            0,
+            nflog_empty(),
+            1,
+            nflog_mth(&entries),
+            &proof
+        ));
+    }
+
     #[test]
     fn boundary_suite_inclusion_and_consistency() {
         for k in 0..=12u32 {
@@ -718,16 +732,11 @@ mod tests {
             for (m, n) in pairs {
                 if m == 0 || n == 0 || m >= n {
                     // m==0 covered elsewhere; skip degenerate when pow==1 etc.
+                    // Explicit m=0 path (also hit at k=0 → (0,1)).
                     if m == 0 && n > 0 {
                         let entries = synthetic_entries(n);
                         let proof = consistency_proof(0, &entries).expect("ok");
-                        assert!(verify_consistency(
-                            0,
-                            nflog_empty(),
-                            n as u64,
-                            nflog_mth(&entries),
-                            &proof
-                        ));
+                        assert!(verify_consistency(0, nflog_empty(), n as u64, nflog_mth(&entries), &proof));
                     }
                     continue;
                 }
@@ -849,11 +858,8 @@ mod tests {
         ];
         for &(m, n) in cases {
             assert!(m < n, "need positive growth: m={m} n={n}");
-            assert!(
-                m.count_ones() >= 3,
-                "m={m} should have 3+ set bits (got {})",
-                m.count_ones()
-            );
+            let ones = m.count_ones();
+            assert!(ones >= 3, "m={m} should have 3+ set bits (got {ones})");
 
             let entries = synthetic_entries(n);
             let mth_a = nflog_mth(&entries[..m]);

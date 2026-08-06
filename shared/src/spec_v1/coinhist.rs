@@ -466,4 +466,18 @@ mod tests {
             SpecError::CoinAlreadySpent { coin_id: id }
         );
     }
+
+    #[test]
+    fn proof_verify_rejects_wrong_sibling_count() {
+        let proof = CoinHistProof {
+            state: CoinHistState::Admitted,
+            siblings: vec![],
+        };
+        assert!(!proof.verify(&[0u8; 32], coinhist_empty_root()));
+    }
+
+    #[test]
+    fn default_tree_matches_new() {
+        assert_eq!(CoinHistTree::default().root(), CoinHistTree::new().root());
+    }
 }

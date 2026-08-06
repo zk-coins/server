@@ -1019,4 +1019,10 @@ mod tests {
             Err(SpecError::TooManyBalances { .. })
         ));
     }
+
+    #[test]
+    #[should_panic(expected = "NETWORK_TAG_* constants")]
+    fn network_label_of_trailing_slash_unreachable() {
+        let _ = network_label_of(b"zkCoins/v1/");
+    }
 }

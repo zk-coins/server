@@ -933,20 +933,31 @@ mod tests {
             (case.flip)(&mut m);
             // Isolation: after flipping `field`, restoring only that field
             // must recover the base — proves the row changed nothing else.
+            // Closed if/else chain (no dead `other` arm): an unknown field
+            // leaves `restored != base` and fails the assert below.
             let mut restored = m.clone();
-            match case.field {
-                "network" => restored.network = base.network.clone(),
-                "seed_relays[0]" => restored.seed_relays[0] = base.seed_relays[0].clone(),
-                "seed_relays[1]" => restored.seed_relays[1] = base.seed_relays[1].clone(),
-                "seed_relays[2]" => restored.seed_relays[2] = base.seed_relays[2].clone(),
-                "blob_stores[0]" => restored.blob_stores[0] = base.blob_stores[0].clone(),
-                "blob_stores[1]" => restored.blob_stores[1] = base.blob_stores[1].clone(),
-                "operator_ids[0]" => restored.operator_ids[0] = base.operator_ids[0],
-                "operator_ids[1]" => restored.operator_ids[1] = base.operator_ids[1],
-                "operator_ids[2]" => restored.operator_ids[2] = base.operator_ids[2],
-                "issued_at" => restored.issued_at = base.issued_at,
-                "expires_at" => restored.expires_at = base.expires_at,
-                other => panic!("flip table row {other:?} missing from isolation match"),
+            if case.field == "network" {
+                restored.network = base.network.clone();
+            } else if case.field == "seed_relays[0]" {
+                restored.seed_relays[0] = base.seed_relays[0].clone();
+            } else if case.field == "seed_relays[1]" {
+                restored.seed_relays[1] = base.seed_relays[1].clone();
+            } else if case.field == "seed_relays[2]" {
+                restored.seed_relays[2] = base.seed_relays[2].clone();
+            } else if case.field == "blob_stores[0]" {
+                restored.blob_stores[0] = base.blob_stores[0].clone();
+            } else if case.field == "blob_stores[1]" {
+                restored.blob_stores[1] = base.blob_stores[1].clone();
+            } else if case.field == "operator_ids[0]" {
+                restored.operator_ids[0] = base.operator_ids[0];
+            } else if case.field == "operator_ids[1]" {
+                restored.operator_ids[1] = base.operator_ids[1];
+            } else if case.field == "operator_ids[2]" {
+                restored.operator_ids[2] = base.operator_ids[2];
+            } else if case.field == "issued_at" {
+                restored.issued_at = base.issued_at;
+            } else if case.field == "expires_at" {
+                restored.expires_at = base.expires_at;
             }
             assert_eq!(
                 restored, base,
@@ -1227,13 +1238,7 @@ mod tests {
             body.extend_from_slice(&[0xC3, 0x28]); // invalid UTF-8
             let err = deserialize(&body).expect_err("utf8");
             assert!(
-                matches!(
-                    err,
-                    SpecError::BootstrapInvalidUtf8 {
-                        field: BootstrapStringField::Network,
-                        ..
-                    }
-                ),
+                matches!(err, SpecError::BootstrapInvalidUtf8 { field: BootstrapStringField::Network, .. }),
                 "{err:?}"
             );
         }
@@ -1280,5 +1285,221 @@ mod tests {
             validate_closed_network("mutinynet"),
             Err(SpecError::NetworkUnknown { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Structural / decode / verify edge paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_structure_rejects_bad_protocol_and_empty_lists() {
+        let mut m = sample_unsigned();
+        m.protocol_version = "v2".into();
+        assert!(matches!(
+            serialize(&m),
+            Err(SpecError::BootstrapProtocolVersionInvalid { .. })
+        ));
+
+        let mut m = sample_unsigned();
+        m.seed_relays.clear();
+        assert_eq!(serialize(&m), Err(SpecError::BootstrapSeedRelayCountZero));
+
+        let mut m = sample_unsigned();
+        m.blob_stores.clear();
+        assert_eq!(serialize(&m), Err(SpecError::BootstrapBlobStoreCountZero));
+
+        let mut m = sample_unsigned();
+        m.operator_ids.clear();
+        assert_eq!(serialize(&m), Err(SpecError::BootstrapOperatorIdCountZero));
+    }
+
+    #[test]
+    fn validate_structure_rejects_empty_and_overlong_url() {
+        let mut m = sample_unsigned();
+        m.seed_relays[0] = String::new();
+        assert_eq!(
+            serialize(&m),
+            Err(SpecError::BootstrapUrlEmpty {
+                which: BootstrapUrlKind::SeedRelay,
+                index: 0,
+            })
+        );
+
+        let mut m = sample_unsigned();
+        m.blob_stores[0] = "x".repeat(MAX_BOOTSTRAP_URL_LEN + 1);
+        assert_eq!(
+            serialize(&m),
+            Err(SpecError::BootstrapUrlTooLong {
+                which: BootstrapUrlKind::BlobStore,
+                index: 0,
+                len: MAX_BOOTSTRAP_URL_LEN + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_closed_network_rejects_empty() {
+        assert_eq!(validate_closed_network(""), Err(SpecError::NetworkEmpty));
+    }
+
+    #[test]
+    #[should_panic(expected = "NETWORK_TAG_* constants")]
+    fn network_label_of_trailing_slash_unreachable() {
+        // Tag ending in `/` yields an empty label → unreachable! arm.
+        let _ = network_label_of(b"zkCoins/v1/");
+    }
+
+    #[test]
+    fn deserialize_rejects_bad_protocol_and_empty_counts() {
+        // protocol_version != "v1"
+        {
+            let mut body = Vec::new();
+            body.extend_from_slice(BMF1_MAGIC);
+            body.push(BMF1_VERSION);
+            write_u8_len_str("regtest", &mut body).unwrap();
+            write_u8_len_str("v2", &mut body).unwrap();
+            assert!(matches!(
+                deserialize(&body),
+                Err(SpecError::BootstrapProtocolVersionInvalid { got }) if got == "v2"
+            ));
+        }
+        // blob_store_count == 0 (after one valid seed relay)
+        {
+            let mut body = Vec::new();
+            body.extend_from_slice(BMF1_MAGIC);
+            body.push(BMF1_VERSION);
+            write_u8_len_str("regtest", &mut body).unwrap();
+            write_u8_len_str("v1", &mut body).unwrap();
+            body.extend_from_slice(&1u16.to_be_bytes());
+            let url = b"wss://x";
+            body.extend_from_slice(&(url.len() as u32).to_be_bytes());
+            body.extend_from_slice(url);
+            body.extend_from_slice(&0u16.to_be_bytes()); // blob_store_count = 0
+            assert_eq!(
+                deserialize(&body).expect_err("blob0"),
+                SpecError::BootstrapBlobStoreCountZero
+            );
+        }
+        // operator_id_count == 0
+        {
+            let mut body = Vec::new();
+            body.extend_from_slice(BMF1_MAGIC);
+            body.push(BMF1_VERSION);
+            write_u8_len_str("regtest", &mut body).unwrap();
+            write_u8_len_str("v1", &mut body).unwrap();
+            body.extend_from_slice(&1u16.to_be_bytes());
+            let url = b"wss://x";
+            body.extend_from_slice(&(url.len() as u32).to_be_bytes());
+            body.extend_from_slice(url);
+            body.extend_from_slice(&1u16.to_be_bytes());
+            body.extend_from_slice(&(url.len() as u32).to_be_bytes());
+            body.extend_from_slice(url);
+            body.extend_from_slice(&0u16.to_be_bytes()); // operator_id_count = 0
+            assert_eq!(
+                deserialize(&body).expect_err("op0"),
+                SpecError::BootstrapOperatorIdCountZero
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_issued_after_expiry() {
+        let mut body = Vec::new();
+        body.extend_from_slice(BMF1_MAGIC);
+        body.push(BMF1_VERSION);
+        write_u8_len_str("regtest", &mut body).unwrap();
+        write_u8_len_str("v1", &mut body).unwrap();
+        body.extend_from_slice(&1u16.to_be_bytes());
+        let url = b"wss://x";
+        body.extend_from_slice(&(url.len() as u32).to_be_bytes());
+        body.extend_from_slice(url);
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&(url.len() as u32).to_be_bytes());
+        body.extend_from_slice(url);
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&[0x11; 32]);
+        body.extend_from_slice(&100u64.to_be_bytes()); // issued_at
+        body.extend_from_slice(&50u64.to_be_bytes()); // expires_at < issued
+        body.extend_from_slice(&[0u8; 64]); // sig
+        assert_eq!(
+            deserialize(&body).expect_err("issued>expires"),
+            SpecError::BootstrapIssuedAfterExpiry {
+                issued_at: 100,
+                expires_at: 50,
+            }
+        );
+    }
+
+    #[test]
+    fn verify_rejects_protocol_version_mismatch() {
+        let (m, pk) = sample_signed();
+        let err = verify_bootstrap_manifest(
+            &m,
+            VerifyBootstrapManifest {
+                pinned_bootstrap_pubkey: &pk,
+                expected_network: "regtest",
+                expected_protocol_version: "v2",
+                clock: ManifestClock::Unavailable,
+            },
+        )
+        .expect_err("proto mismatch");
+        assert_eq!(
+            err,
+            SpecError::BootstrapProtocolVersionMismatch {
+                expected: "v2".into(),
+                actual: "v1".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_non_utf8_seed_relay_url() {
+        let mut body = Vec::new();
+        body.extend_from_slice(BMF1_MAGIC);
+        body.push(BMF1_VERSION);
+        write_u8_len_str("regtest", &mut body).unwrap();
+        write_u8_len_str("v1", &mut body).unwrap();
+        body.extend_from_slice(&1u16.to_be_bytes());
+        // url_len=2, invalid UTF-8 bytes
+        body.extend_from_slice(&2u32.to_be_bytes());
+        body.extend_from_slice(&[0xC3, 0x28]);
+        let err = deserialize(&body).expect_err("url utf8");
+        assert!(
+            matches!(
+                err,
+                SpecError::BootstrapInvalidUtf8 {
+                    field: BootstrapStringField::SeedRelay { index: 0 },
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_non_utf8_blob_store_url() {
+        let mut body = Vec::new();
+        body.extend_from_slice(BMF1_MAGIC);
+        body.push(BMF1_VERSION);
+        write_u8_len_str("regtest", &mut body).unwrap();
+        write_u8_len_str("v1", &mut body).unwrap();
+        body.extend_from_slice(&1u16.to_be_bytes());
+        let url = b"wss://x";
+        body.extend_from_slice(&(url.len() as u32).to_be_bytes());
+        body.extend_from_slice(url);
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&2u32.to_be_bytes());
+        body.extend_from_slice(&[0xFF, 0xFE]);
+        let err = deserialize(&body).expect_err("blob utf8");
+        assert!(
+            matches!(
+                err,
+                SpecError::BootstrapInvalidUtf8 {
+                    field: BootstrapStringField::BlobStore { index: 0 },
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 }

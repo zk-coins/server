@@ -875,3 +875,92 @@ pub fn case_id_consistency(k: u32, m: u64, n: u64) -> u64 {
 pub fn case_id_peaks(k: u32) -> u64 {
     (u64::from(k) << 16) | 0xA000
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec_v1::nflog::nflog_empty;
+
+    #[test]
+    #[should_panic(expected = "ref_mth_run pos overflow")]
+    fn ref_mth_run_pos_overflow_panics() {
+        // Independent `start` near u64::MAX so the first peak step overflows.
+        let _ = ref_mth_run(0, u64::MAX - 3, 8);
+    }
+
+    #[test]
+    fn inclusion_path_len_n_eq_1_is_zero() {
+        // Outer n==1 early-exit runs before the top_k assert.
+        assert_eq!(inclusion_path_len_with_top_pivot(0, 1, 999), 0);
+    }
+
+    #[test]
+    fn ref_build_inclusion_with_top_pivot_position_in_left() {
+        // position < top_k takes the left branch (lines 251–259). top_k=2 is a
+        // genuinely wrong pivot (honest ref_split_point(8) == 4), so the rebuilt
+        // root must differ from the honest witness.
+        let w = ref_build_inclusion_with_top_pivot(0, 1, 8, 2);
+        assert_eq!(w.path.len(), inclusion_path_len_with_top_pivot(1, 8, 2));
+        assert!(!w.path.is_empty());
+        let honest = ref_build_inclusion(0, 1, 8);
+        assert_ne!(w.mth, honest.mth);
+    }
+
+    #[test]
+    fn try_inclusion_wrong_pivot_size_below_3() {
+        let r = try_inclusion_wrong_pivot(0, 0, 2);
+        assert!(
+            matches!(r, PivotMutation::Unreachable { .. }),
+            "got {r:?}"
+        );
+    }
+
+    #[test]
+    fn consistency_len_and_build_with_m_eq_top_k() {
+        // m == top_k early-terminates the left subproof (len = 1).
+        assert_eq!(consistency_proof_len_with_top_pivot(4, 10, 4), 1);
+        let w = ref_build_consistency_with_top_pivot(0, 4, 10, 4);
+        assert_eq!(w.proof.len(), 1);
+        // m < top_k takes the honest left subproof + sibling branch.
+        let len_lt = consistency_proof_len_with_top_pivot(3, 10, 4);
+        let w_lt = ref_build_consistency_with_top_pivot(0, 3, 10, 4);
+        assert_eq!(w_lt.proof.len(), len_lt);
+        assert!(len_lt >= 1);
+    }
+
+    #[test]
+    fn try_consistency_wrong_pivot_m_out_of_range() {
+        assert!(matches!(
+            try_consistency_wrong_pivot(0, 0, 5),
+            ConsistencyPivotMutation::Unreachable { .. }
+        ));
+        assert!(matches!(
+            try_consistency_wrong_pivot(0, 5, 5),
+            ConsistencyPivotMutation::Unreachable { .. }
+        ));
+    }
+
+    #[test]
+    fn ref_verify_consistency_m_gt_n_and_m_eq_n() {
+        let empty_proof: Vec<HashDigest> = vec![];
+        let h = nflog_empty();
+        assert!(!ref_verify_consistency(5, h, 3, h, &empty_proof));
+        // m == n requires empty proof and equal roots.
+        assert!(ref_verify_consistency(3, h, 3, h, &empty_proof));
+        assert!(!ref_verify_consistency(3, h, 3, h, &[h]));
+    }
+
+    #[test]
+    fn find_inclusion_wrong_pivot_none_on_small_size() {
+        // size < 3 ⇒ every position is Unreachable ⇒ None.
+        assert!(find_inclusion_wrong_pivot(0, 2).is_none());
+        assert!(find_inclusion_wrong_pivot(0, 1).is_none());
+    }
+
+    #[test]
+    fn ref_verify_inclusion_rejects_empty_or_oob() {
+        let leaf = fixture_range(0, 0, 1);
+        assert!(!ref_verify_inclusion(leaf, 0, &[], 0, leaf));
+        assert!(!ref_verify_inclusion(leaf, 5, &[], 3, leaf));
+    }
+}

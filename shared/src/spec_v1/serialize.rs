@@ -500,4 +500,95 @@ mod tests {
             Err(SpecError::BalancesNotAscending { index: 1 })
         ));
     }
+
+    #[test]
+    fn deserialize_coin_wrong_length() {
+        assert_eq!(
+            deserialize_coin(&[0u8; 111]),
+            Err(SpecError::WrongLength {
+                expected: 112,
+                actual: 111,
+            })
+        );
+        assert_eq!(
+            deserialize_coin(&[0u8; 113]),
+            Err(SpecError::WrongLength {
+                expected: 112,
+                actual: 113,
+            })
+        );
+    }
+
+    #[test]
+    fn serialize_account_state_rejects_zero_amount() {
+        let mut balances = BTreeMap::new();
+        balances.insert([0x01u8; 32], 0u128);
+        let bad = AccountState {
+            owner: Address([0u8; 32]),
+            nk_commit: ZERO_HASH,
+            balances,
+            current_pubkey: [0u8; 32],
+            send_counter: 0,
+            coin_history_root: ZERO_HASH,
+        };
+        assert_eq!(
+            serialize_account_state(&bad),
+            Err(SpecError::ZeroAmountBalance)
+        );
+    }
+
+    #[test]
+    fn parse_account_state_too_many_balances() {
+        let count = (MAX_ACCOUNT_ASSETS + 1) as u32;
+        let mut bytes = vec![0u8; 140];
+        bytes[136..140].copy_from_slice(&count.to_be_bytes());
+        // Body length need not match — count check fires first.
+        assert_eq!(
+            parse_account_state(&bytes),
+            Err(SpecError::TooManyBalances {
+                count: MAX_ACCOUNT_ASSETS + 1,
+                max: MAX_ACCOUNT_ASSETS,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_account_state_wrong_body_length() {
+        // count=1 ⇒ expected 188, but only 140 bytes of prefix.
+        let mut bytes = vec![0u8; 140];
+        bytes[136..140].copy_from_slice(&1u32.to_be_bytes());
+        assert_eq!(
+            parse_account_state(&bytes),
+            Err(SpecError::WrongLength {
+                expected: 188,
+                actual: 140,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_account_state_zero_amount_on_wire() {
+        let mut bytes = vec![0u8; 188];
+        bytes[136..140].copy_from_slice(&1u32.to_be_bytes());
+        // asset_id at 140..172 already zero; amount at 172..188 is zero → reject.
+        assert_eq!(
+            parse_account_state(&bytes),
+            Err(SpecError::ZeroAmountBalance)
+        );
+    }
+
+    #[test]
+    fn parse_account_state_duplicate_asset_ids() {
+        let mut bytes = vec![0u8; 140 + 48 * 2];
+        bytes[136..140].copy_from_slice(&2u32.to_be_bytes());
+        // Two identical asset_ids with non-zero amounts.
+        bytes[140..172].fill(0xAA);
+        bytes[172..188].copy_from_slice(&1u128.to_be_bytes());
+        bytes[188..220].fill(0xAA);
+        bytes[220..236].copy_from_slice(&2u128.to_be_bytes());
+        assert_eq!(
+            parse_account_state(&bytes),
+            Err(SpecError::BalancesNotAscending { index: 1 })
+        );
+    }
 }

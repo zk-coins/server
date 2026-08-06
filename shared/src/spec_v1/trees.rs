@@ -109,4 +109,18 @@ mod tests {
         let root = merkle_root(TreeKind::CoinsRoot, &[ZERO_HASH, b_d]);
         assert_eq!(root, node_hash(TreeKind::CoinsRoot, a, b));
     }
+
+    #[test]
+    fn nullifiers_root_node_hash_domain() {
+        let a = leaf_hash(TreeKind::NullifiersRoot, ZERO_HASH);
+        let mut b_d = ZERO_HASH;
+        b_d.elements[0] = zkcoins_program::F::from_canonical_u64(1);
+        let b = leaf_hash(TreeKind::NullifiersRoot, b_d);
+        let root = merkle_root(TreeKind::NullifiersRoot, &[ZERO_HASH, b_d]);
+        assert_eq!(root, node_hash(TreeKind::NullifiersRoot, a, b));
+        assert_ne!(
+            node_hash(TreeKind::NullifiersRoot, a, b),
+            node_hash(TreeKind::CoinsRoot, a, b)
+        );
+    }
 }

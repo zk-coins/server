@@ -347,13 +347,11 @@ mod tests {
             acc.fold(pos(101), pk(1), r(1)).expect("fold"),
             FoldOutcome::DuplicateIgnored
         );
-        match acc.lookup(pk(1)) {
-            LookupResult::Present { pos, r: got_r, .. } => {
-                assert_eq!(pos, 0);
-                assert_eq!(got_r, r(1));
-            }
-            LookupResult::Absent => panic!("expected present"),
-        }
+        let result = acc.lookup(pk(1));
+        assert!(
+            matches!(result, LookupResult::Present { pos: 0, r: got_r, .. } if got_r == r(1)),
+            "expected Present{{pos:0,r:r(1)}}, got {result:?}"
+        );
         assert_eq!(acc.nav().size, 1);
     }
 
@@ -368,13 +366,11 @@ mod tests {
             acc.fold(pos(101), pk(1), r(20)).expect("fold"),
             FoldOutcome::DuplicateIgnored
         );
-        match acc.lookup(pk(1)) {
-            LookupResult::Present { pos, r: got_r, .. } => {
-                assert_eq!(pos, 0);
-                assert_eq!(got_r, r(10));
-            }
-            LookupResult::Absent => panic!("expected present"),
-        }
+        let result = acc.lookup(pk(1));
+        assert!(
+            matches!(result, LookupResult::Present { pos: 0, r: got_r, .. } if got_r == r(10)),
+            "expected Present{{pos:0,r:r(10)}}, got {result:?}"
+        );
         assert_eq!(
             acc.classify(pk(1), r(20)),
             SpendClassification::RejectedDoubleSpend
@@ -405,28 +401,29 @@ mod tests {
         let size = independent.len() as u64;
 
         let target_pk = pk(3);
-        match acc.lookup(target_pk) {
-            LookupResult::Present {
-                pos,
+        let result = acc.lookup(target_pk);
+        assert!(
+            matches!(&result, LookupResult::Present { pos: 2, r: found_r, .. } if *found_r == r(3)),
+            "expected Present{{pos:2,r:r(3)}}, got {result:?}"
+        );
+        if let LookupResult::Present {
+            pos,
+            r: got_r,
+            inclusion_proof,
+        } = result
+        {
+            let entry = NfLogEntry {
+                pk: target_pk,
                 r: got_r,
-                inclusion_proof,
-            } => {
-                assert_eq!(pos, 2);
-                assert_eq!(got_r, r(3));
-                let entry = NfLogEntry {
-                    pk: target_pk,
-                    r: got_r,
-                };
-                let leaf = nflog_leaf_hash(pos, &entry);
-                assert!(verify_inclusion(
-                    leaf,
-                    pos,
-                    &inclusion_proof,
-                    size,
-                    independent_mth
-                ));
-            }
-            LookupResult::Absent => panic!("expected present"),
+            };
+            let leaf = nflog_leaf_hash(pos, &entry);
+            assert!(verify_inclusion(
+                leaf,
+                pos,
+                &inclusion_proof,
+                size,
+                independent_mth
+            ));
         }
     }
 
@@ -460,14 +457,16 @@ mod tests {
         ];
         assert_eq!(acc.nav().mth, nflog_mth(&independent));
 
-        match acc.lookup(e.pk) {
-            LookupResult::Present { pos, .. } => assert_eq!(pos, 2),
-            LookupResult::Absent => panic!("E should be present"),
-        }
-        match acc.lookup(f.pk) {
-            LookupResult::Present { pos, .. } => assert_eq!(pos, 3),
-            LookupResult::Absent => panic!("F should be present"),
-        }
+        let e_lookup = acc.lookup(e.pk);
+        assert!(
+            matches!(e_lookup, LookupResult::Present { pos: 2, .. }),
+            "E should be present at 2, got {e_lookup:?}"
+        );
+        let f_lookup = acc.lookup(f.pk);
+        assert!(
+            matches!(f_lookup, LookupResult::Present { pos: 3, .. }),
+            "F should be present at 3, got {f_lookup:?}"
+        );
         assert_eq!(acc.lookup(c.pk), LookupResult::Absent);
         assert_eq!(acc.lookup(d.pk), LookupResult::Absent);
     }
@@ -685,10 +684,11 @@ mod tests {
         assert!(!outcome.finality_broken);
         assert_eq!(outcome.displaced_final_count, 0);
         assert_eq!(acc.lookup(c.pk), LookupResult::Absent);
-        match acc.lookup(e.pk) {
-            LookupResult::Present { pos, .. } => assert_eq!(pos, 2),
-            LookupResult::Absent => panic!("E should be present"),
-        }
+        let e_lookup = acc.lookup(e.pk);
+        assert!(
+            matches!(e_lookup, LookupResult::Present { pos: 2, .. }),
+            "E should be present at 2, got {e_lookup:?}"
+        );
     }
 
     #[test]
@@ -747,13 +747,11 @@ mod tests {
         for e in [win, other, later_same_pk] {
             acc.fold(e.chain_pos, e.pk, e.r).expect("fold");
         }
-        match acc.lookup(pk(1)) {
-            LookupResult::Present { pos, r: got_r, .. } => {
-                assert_eq!(pos, 0);
-                assert_eq!(got_r, r(10));
-            }
-            LookupResult::Absent => panic!("expected present"),
-        }
+        let pre = acc.lookup(pk(1));
+        assert!(
+            matches!(pre, LookupResult::Present { pos: 0, r: got_r, .. } if got_r == r(10)),
+            "expected Present{{pos:0,r:r(10)}}, got {pre:?}"
+        );
 
         // Orphan block 100; keep 101 and the later same-Pk occurrence.
         let outcome = acc
@@ -762,13 +760,11 @@ mod tests {
         // tip=102 → max_final=97 → nothing was final.
         assert!(!outcome.finality_broken);
 
-        match acc.lookup(pk(1)) {
-            LookupResult::Present { pos, r: got_r, .. } => {
-                assert_eq!(pos, 1); // after `other` at pos 0
-                assert_eq!(got_r, r(20));
-            }
-            LookupResult::Absent => panic!("surviving Pk should be promoted"),
-        }
+        let post = acc.lookup(pk(1));
+        assert!(
+            matches!(post, LookupResult::Present { pos: 1, r: got_r, .. } if got_r == r(20)),
+            "surviving Pk should be promoted to pos 1 with r(20), got {post:?}"
+        );
         assert_eq!(
             acc.classify(pk(1), r(20)),
             SpendClassification::ValidFirstSpend
@@ -807,13 +803,11 @@ mod tests {
             .expect("reorg_replay");
         assert!(!outcome.finality_broken);
 
-        match acc.lookup(pk(1)) {
-            LookupResult::Present { pos, r: got_r, .. } => {
-                assert_eq!(pos, 0);
-                assert_eq!(got_r, r(20));
-            }
-            LookupResult::Absent => panic!("new winner must be present"),
-        }
+        let winner = acc.lookup(pk(1));
+        assert!(
+            matches!(winner, LookupResult::Present { pos: 0, r: got_r, .. } if got_r == r(20)),
+            "new winner must be present at 0 with r(20), got {winner:?}"
+        );
         assert_eq!(
             acc.classify(pk(1), r(20)),
             SpendClassification::ValidFirstSpend
@@ -987,27 +981,28 @@ mod tests {
 
         // Inclusion at several positions, including power-of-two edges.
         for &p in &[0u64, 1, 7, 8, 15, 16, 31, 32, 63] {
-            match acc.lookup(entries[p as usize].pk) {
-                LookupResult::Present {
+            let result = acc.lookup(entries[p as usize].pk);
+            assert!(
+                matches!(&result, LookupResult::Present { pos, r, .. } if *pos == p && *r == entries[p as usize].r),
+                "expected present at p={p}, got {result:?}"
+            );
+            if let LookupResult::Present {
+                pos,
+                r: got_r,
+                inclusion_proof,
+            } = result
+            {
+                let leaf = nflog_leaf_hash(
                     pos,
-                    r: got_r,
-                    inclusion_proof,
-                } => {
-                    assert_eq!(pos, p);
-                    assert_eq!(got_r, entries[p as usize].r);
-                    let leaf = nflog_leaf_hash(
-                        pos,
-                        &NfLogEntry {
-                            pk: entries[p as usize].pk,
-                            r: got_r,
-                        },
-                    );
-                    assert!(
-                        verify_inclusion(leaf, pos, &inclusion_proof, tip.size, tip.mth),
-                        "inclusion failed at p={p}"
-                    );
-                }
-                LookupResult::Absent => panic!("expected present at p={p}"),
+                    &NfLogEntry {
+                        pk: entries[p as usize].pk,
+                        r: got_r,
+                    },
+                );
+                assert!(
+                    verify_inclusion(leaf, pos, &inclusion_proof, tip.size, tip.mth),
+                    "inclusion failed at p={p}"
+                );
             }
         }
 
@@ -1256,10 +1251,10 @@ mod tests {
             outcome.displaced_final_count
         );
         // Explicit "missing" evidence (not pk/r mismatch at an existing slot).
+        let log_len = acc.log.len();
         assert!(
-            acc.log.len() < 16,
-            "depth 7 shrink: log must be shorter than old_final=16, len={}",
-            acc.log.len()
+            log_len < 16,
+            "depth 7 shrink: log must be shorter than old_final=16, len={log_len}"
         );
         assert!(
             acc.log.get(15).is_none(),
@@ -1533,6 +1528,49 @@ mod tests {
                 attempted: dup_pos,
             },
             "propagates_fold_error: expected OutOfOrderFold at pos(50), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn root_at_size_branches() {
+        let mut acc = NfLogAccumulator::new(0);
+        for i in 0..4u64 {
+            acc.fold(pos(100 + i), pk(i as u8 + 1), r(i as u8 + 1))
+                .expect("fold");
+        }
+        let n = acc.nav().size;
+        assert_eq!(n, 4);
+
+        // size > n → None
+        assert_eq!(acc.root_at(n + 1), None);
+        assert_eq!(acc.root_at(100), None);
+
+        // size == n → cached tip mth
+        let at_n = acc.root_at(n).expect("at tip");
+        assert_eq!(at_n, nflog_root(n, acc.nav().mth));
+
+        // size == 0 → empty root
+        assert_eq!(acc.root_at(0), Some(nflog_root(0, nflog_empty())));
+
+        // 0 < size < n → recompute prefix mth
+        let entries: Vec<NfLogEntry> = (0..4u64)
+            .map(|i| NfLogEntry {
+                pk: pk(i as u8 + 1),
+                r: r(i as u8 + 1),
+            })
+            .collect();
+        let prefix = 2u64;
+        let expected = nflog_root(prefix, nflog_mth(&entries[..prefix as usize]));
+        assert_eq!(acc.root_at(prefix), Some(expected));
+    }
+
+    #[test]
+    fn classify_pending_for_unknown_pk() {
+        let mut acc = NfLogAccumulator::new(0);
+        acc.fold(pos(100), pk(1), r(1)).expect("fold");
+        assert_eq!(
+            acc.classify(pk(99), r(1)),
+            SpendClassification::Pending
         );
     }
 }

@@ -207,3 +207,23 @@ fn commitment_serde_roundtrip_preserves_verification() {
         "deserialized commitment must still verify"
     );
 }
+
+#[test]
+fn commitment_debug_contains_fields() {
+    let commitment =
+        Commitment::new(&secret_key_a(), b"debug fields".to_vec()).expect("sign succeeds");
+    let dbg = format!("{:?}", commitment);
+    assert!(dbg.contains("Commitment"), "got {dbg}");
+    assert!(
+        dbg.contains(&commitment.public_key.to_string()),
+        "public_key missing from {dbg}"
+    );
+    assert!(
+        dbg.contains(&hex::encode(commitment.signature.as_ref())),
+        "signature missing from {dbg}"
+    );
+    assert!(
+        dbg.contains(&hex::encode(&commitment.message)),
+        "message missing from {dbg}"
+    );
+}

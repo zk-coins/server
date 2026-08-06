@@ -304,6 +304,21 @@ mod tests {
     }
 
     #[test]
+    fn big_array64_expecting_on_short_seq() {
+        // Visitor::expecting is invoked via invalid_length when the seq ends
+        // before 64 elements (private BigArray64 helper, reachable from tests).
+        use serde::de::value::{Error as ValueError, SeqDeserializer};
+        let short = [0u8; 63];
+        let de = SeqDeserializer::<_, ValueError>::new(short.into_iter());
+        let err = BigArray64::deserialize(de).expect_err("63 elements");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[u8; 64]") || msg.contains("invalid length"),
+            "expecting() message should surface, got {msg}"
+        );
+    }
+
+    #[test]
     fn coin_eq_clone_debug_bincode() {
         let coin = Coin {
             identifier: ZERO_HASH,

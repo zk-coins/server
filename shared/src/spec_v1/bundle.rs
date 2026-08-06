@@ -1197,13 +1197,7 @@ mod tests {
         injected.extend_from_slice(&bytes[after_name..]);
         let err = deserialize_coin_proof(&injected).expect_err("v1+cap wire");
         assert!(
-            matches!(
-                err,
-                SpecError::BundleLengthOverrun { .. }
-                    | SpecError::BundleTrailingBytes { .. }
-                    | SpecError::BundleTruncated { .. }
-                    | SpecError::NonCanonicalDigestLimb { .. }
-            ),
+            matches!(err, SpecError::BundleLengthOverrun { .. } | SpecError::BundleTrailingBytes { .. } | SpecError::BundleTruncated { .. } | SpecError::NonCanonicalDigestLimb { .. }),
             "v1+cap wire must not parse cleanly, got {err:?}"
         );
     }
@@ -1395,13 +1389,14 @@ mod tests {
         // every entry: validation runs on `holders.len()` first.
         let holders = vec!["https://x.example".into(); (u16::MAX as usize) + 1];
         let err = serialize_blob_locator_set(&BlobLocatorSet { holders }).expect_err("u16+1");
-        match err {
-            SpecError::BlobLocatorCountTooHigh { count, max } => {
-                assert_eq!(count, (u16::MAX as usize) + 1);
-                assert_eq!(max, MAX_BLOB_HOLDERS);
-            }
-            other => panic!("expected BlobLocatorCountTooHigh with actual count, got {other:?}"),
-        }
+        assert!(
+            matches!(
+                &err,
+                SpecError::BlobLocatorCountTooHigh { count, max }
+                    if *count == (u16::MAX as usize) + 1 && *max == MAX_BLOB_HOLDERS
+            ),
+            "expected BlobLocatorCountTooHigh with actual count, got {err:?}"
+        );
     }
 
     #[test]
@@ -1626,6 +1621,203 @@ mod tests {
         assert_eq!(
             serialize_self_delivery_record(&sdr).unwrap(),
             serialize_self_delivery_record(&sdr).unwrap()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct private-writer / edge-path coverage (validation-bypass arms)
+    // -----------------------------------------------------------------------
+
+    /// `write_blob_locator_set` re-checks count after a future caller skips
+    /// `validate_blob_locator_set`: holders.len() in (MAX_BLOB_HOLDERS, u16::MAX].
+    #[test]
+    fn write_blob_locator_set_rejects_count_above_max_holders() {
+        let holders = vec!["https://x.example".into(); MAX_BLOB_HOLDERS + 1];
+        let set = BlobLocatorSet { holders };
+        let mut out = Vec::new();
+        let err = write_blob_locator_set(&set, &mut out).expect_err("max+1");
+        assert_eq!(
+            err,
+            SpecError::BlobLocatorCountTooHigh {
+                count: MAX_BLOB_HOLDERS + 1,
+                max: MAX_BLOB_HOLDERS,
+            }
+        );
+    }
+
+    /// Same private writer: holders.len() > u16::MAX hits the try_from arm.
+    #[test]
+    fn write_blob_locator_set_rejects_count_above_u16() {
+        let holders = vec!["https://x.example".into(); (u16::MAX as usize) + 1];
+        let set = BlobLocatorSet { holders };
+        let mut out = Vec::new();
+        let err = write_blob_locator_set(&set, &mut out).expect_err("u16+1");
+        assert_eq!(
+            err,
+            SpecError::BlobLocatorCountTooHigh {
+                count: (u16::MAX as usize) + 1,
+                max: MAX_BLOB_HOLDERS,
+            }
+        );
+    }
+
+    /// Holder URL whose UTF-8 byte length exceeds u16::MAX (validation bypass).
+    #[test]
+    fn write_blob_locator_set_rejects_url_above_u16() {
+        let set = BlobLocatorSet {
+            holders: vec!["x".repeat((u16::MAX as usize) + 1)],
+        };
+        let mut out = Vec::new();
+        let err = write_blob_locator_set(&set, &mut out).expect_err("url u16+");
+        assert_eq!(
+            err,
+            SpecError::BlobLocatorUrlTooLong {
+                index: 0,
+                len: (u16::MAX as usize) + 1,
+            }
+        );
+    }
+
+    /// Wire count > MAX_BLOB_HOLDERS is rejected on read (not only on write).
+    #[test]
+    fn read_blob_locator_set_count_above_max_holders() {
+        // count = MAX_BLOB_HOLDERS + 1 = 17, no holder payloads needed.
+        let bytes = [0x00, 0x11]; // u16 BE = 17
+        let mut cur: &[u8] = &bytes;
+        let err = read_blob_locator_set(&mut cur).expect_err("count 17");
+        assert_eq!(
+            err,
+            SpecError::BlobLocatorCountTooHigh {
+                count: MAX_BLOB_HOLDERS + 1,
+                max: MAX_BLOB_HOLDERS,
+            }
+        );
+    }
+
+    /// Wire url_len > MAX_HOLDER_URL_LEN is rejected before reading the body.
+    #[test]
+    fn read_blob_locator_set_url_len_above_max() {
+        let url_len = (MAX_HOLDER_URL_LEN + 1) as u16;
+        let mut bytes = vec![0x00, 0x01]; // count = 1
+        bytes.extend_from_slice(&url_len.to_be_bytes());
+        // No body bytes — length check fires first.
+        let mut cur: &[u8] = &bytes;
+        let err = read_blob_locator_set(&mut cur).expect_err("url_len");
+        assert_eq!(
+            err,
+            SpecError::BlobLocatorUrlTooLong {
+                index: 0,
+                len: MAX_HOLDER_URL_LEN + 1,
+            }
+        );
+    }
+
+    /// Wire URL containing a NUL byte is rejected.
+    #[test]
+    fn read_blob_locator_set_url_contains_nul() {
+        let bytes = [0x00, 0x01, 0x00, 0x03, b'a', 0x00, b'b'];
+        let mut cur: &[u8] = &bytes;
+        let err = read_blob_locator_set(&mut cur).expect_err("nul");
+        assert_eq!(err, SpecError::BlobLocatorUrlContainsNul { index: 0 });
+    }
+
+    /// v2 wire truncated after cap_total but before terms_salt maps to
+    /// CoinProofAssetTermsVersionFieldsMismatch (not a generic truncate).
+    #[test]
+    fn asset_terms_v2_truncated_salt_on_wire_malformed() {
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x09; 32],
+            decimals: 1,
+            issuance_version: 2,
+            name: b"T".to_vec(),
+            cap_total: Some(7),
+            terms_salt: Some([0x77; 32]),
+        };
+        let mut bytes = serialize_coin_proof(&sample_coin_proof(Some(terms))).expect("ser");
+        let ct_len = sample_coin_proof(None).ciphertext.len();
+        // Keep cap(16), drop salt(32)+epk(32)+u32+ct+tag(32).
+        let tail_after_cap = 32 + 32 + 4 + ct_len + 32;
+        assert!(bytes.len() > tail_after_cap);
+        bytes.truncate(bytes.len() - tail_after_cap);
+        let err = deserialize_coin_proof(&bytes).expect_err("truncated salt");
+        assert_eq!(
+            err,
+            SpecError::CoinProofAssetTermsVersionFieldsMismatch {
+                issuance_version: 2,
+                cap_fields_present: false,
+            }
+        );
+    }
+
+    /// out_ciphertext longer than u16::MAX is rejected on SDR serialize.
+    #[test]
+    fn sdr_output_ciphertext_above_u16_rejected() {
+        let mut oref = sample_output_ref();
+        oref.out_ciphertext = vec![0xAB; (u16::MAX as usize) + 1];
+        let sdr = sample_sdr(RecordKind::Send, vec![], vec![oref]);
+        let err = serialize_self_delivery_record(&sdr).expect_err("ct u16+");
+        assert_eq!(
+            err,
+            SpecError::ByteStringTooLong {
+                len: (u16::MAX as usize) + 1,
+            }
+        );
+    }
+
+    /// spent_or_folded_coin_ids longer than u16::MAX is rejected.
+    #[test]
+    fn sdr_spent_ids_above_u16_rejected() {
+        let spent = vec![[0u8; 32]; (u16::MAX as usize) + 1];
+        let sdr = sample_sdr(RecordKind::Send, spent, vec![]);
+        let err = serialize_self_delivery_record(&sdr).expect_err("spent u16+");
+        assert_eq!(
+            err,
+            SpecError::ByteStringTooLong {
+                len: (u16::MAX as usize) + 1,
+            }
+        );
+    }
+
+    /// output_refs longer than u16::MAX is rejected.
+    #[test]
+    fn sdr_output_refs_above_u16_rejected() {
+        let minimal = OutputRef {
+            coin_id: [0; 32],
+            blob_id: [0; 32],
+            epk: [0; 32],
+            out_ciphertext: vec![0x01],
+            blob_locators: BlobLocatorSet {
+                holders: vec!["h".into()],
+            },
+        };
+        let outputs = vec![minimal; (u16::MAX as usize) + 1];
+        let sdr = sample_sdr(RecordKind::Send, vec![], outputs);
+        let err = serialize_self_delivery_record(&sdr).expect_err("refs u16+");
+        assert_eq!(
+            err,
+            SpecError::ByteStringTooLong {
+                len: (u16::MAX as usize) + 1,
+            }
+        );
+    }
+
+    /// `write_output_ref` rejects out_ciphertext longer than u16::MAX.
+    #[test]
+    fn write_output_ref_ciphertext_above_u16() {
+        let oref = OutputRef {
+            coin_id: [0; 32],
+            blob_id: [0; 32],
+            epk: [0; 32],
+            out_ciphertext: vec![0xCD; (u16::MAX as usize) + 1],
+            blob_locators: sample_holders(),
+        };
+        let mut out = Vec::new();
+        let err = write_output_ref(&oref, &mut out).expect_err("ct");
+        assert_eq!(
+            err,
+            SpecError::ByteStringTooLong {
+                len: (u16::MAX as usize) + 1,
+            }
         );
     }
 }
