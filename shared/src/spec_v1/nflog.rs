@@ -727,8 +727,14 @@ mod tests {
             }
 
             // Consistency for adjacent pairs (2^k - 1, 2^k) and (2^k, 2^k + 1)
-            let pairs: [(usize, usize); 2] =
-                [(pow.saturating_sub(1), pow), (pow, pow.saturating_add(1))];
+            let mut pairs: Vec<(usize, usize)> =
+                vec![(pow.saturating_sub(1), pow), (pow, pow.saturating_add(1))];
+            if k == 0 {
+                // Degenerierter Fall m==0 && n==0: deckt den bisher nie genommenen
+                // false-Zweig von `if m == 0 && n > 0` ab. n==0 ist mit
+                // pow = 1<<k >= 1 durch die reguläre Paar-Konstruktion nie erreichbar.
+                pairs.push((0usize, 0usize));
+            }
             for (m, n) in pairs {
                 if m == 0 || n == 0 || m >= n {
                     // m==0 covered elsewhere; skip degenerate when pow==1 etc.

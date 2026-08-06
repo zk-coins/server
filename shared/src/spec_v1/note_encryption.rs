@@ -1318,4 +1318,15 @@ mod tests {
         assert_eq!(enc.len() % 4, 3);
         assert_eq!(base64url_decode_no_pad(&enc).expect("decode"), data);
     }
+
+    #[test]
+    fn base64url_roundtrip_rem_eq_0() {
+        // 3 input bytes → encoded length exactly divisible by 4 (rem==0 path;
+        // neither rem==2 nor rem==3 is entered after the full-quartet loop).
+        let data = [0x01u8, 0x02, 0x03];
+        let enc = base64url_encode_no_pad(&data);
+        assert_eq!(enc.len() % 4, 0);
+        assert!(!enc.is_empty());
+        assert_eq!(base64url_decode_no_pad(&enc).expect("decode"), data);
+    }
 }

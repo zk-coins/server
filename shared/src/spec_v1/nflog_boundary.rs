@@ -929,6 +929,15 @@ mod tests {
     }
 
     #[test]
+    fn consistency_top_pivot_hits_m_eq_top_pivot_split_base_case_b_true() {
+        // m=1 < top_k=2: subproof_honest recurses to m==n==1 with b=true
+        // (early left termination, empty residual — line 577 in subproof_honest).
+        let w = ref_build_consistency_with_top_pivot(0, 1, 10, 2);
+        assert_eq!(w.proof.len(), consistency_proof_len_with_top_pivot(1, 10, 2));
+        assert!(!w.proof.is_empty());
+    }
+
+    #[test]
     fn try_consistency_wrong_pivot_m_out_of_range() {
         assert!(matches!(
             try_consistency_wrong_pivot(0, 0, 5),
