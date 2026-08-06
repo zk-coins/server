@@ -50,6 +50,13 @@ ENV SQLX_OFFLINE=true
 COPY rust-toolchain ./
 RUN rustup show
 
+# Use RUSTC_WORKSPACE_WRAPPER instead of global RUSTFLAGS so external deps such as plonky2 stay uninstrumented.
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        'exec "$@" -C instrument-coverage --cfg coverage_nightly' \
+        > /usr/local/bin/coverage-rustc-wrapper.sh \
+    && chmod +x /usr/local/bin/coverage-rustc-wrapper.sh
+
 COPY . .
 
 # Cargo features for non-MVP routes. Empty by default — both DEV and
@@ -66,10 +73,10 @@ ARG FEATURES=
 ARG COVERAGE=
 RUN if [ -n "$COVERAGE" ]; then \
         if [ -z "$FEATURES" ]; then \
-            RUSTFLAGS="-C instrument-coverage --cfg coverage_nightly" \
+            RUSTC_WORKSPACE_WRAPPER=/usr/local/bin/coverage-rustc-wrapper.sh \
                 cargo build --release -p node --features coverage-flush; \
         else \
-            RUSTFLAGS="-C instrument-coverage --cfg coverage_nightly" \
+            RUSTC_WORKSPACE_WRAPPER=/usr/local/bin/coverage-rustc-wrapper.sh \
                 cargo build --release -p node --features "$FEATURES,coverage-flush"; \
         fi; \
     elif [ -z "$FEATURES" ]; then \
