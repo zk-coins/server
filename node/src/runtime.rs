@@ -393,53 +393,105 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                      entrusteed operational bundle before scanning)"
                 );
                 tokio::spawn(async move {
-                    match crate::v1::recovery::run_recovery_campaign(
-                        recovery_config,
-                        crate::v1::recovery::RecoveryCampaignDeps {
-                            seed_relays,
-                            bundles,
-                            adapter: engine,
-                            pool,
-                            index: private_index,
-                            receipts: receipt_hub,
+                    // Bounded re-scan for late relay propagation: a complete
+                    // gapless scan can still install nothing when the origin
+                    // delivery outbox has not yet published the needed
+                    // record. Hard errors and partial installs never retry.
+                    for attempt in 0..RECOVERY_CAMPAIGN_MAX_ATTEMPTS {
+                        let deps = crate::v1::recovery::RecoveryCampaignDeps {
+                            seed_relays: seed_relays.clone(),
+                            bundles: Arc::clone(&bundles),
+                            adapter: Arc::clone(&engine),
+                            pool: Arc::clone(&pool),
+                            index: Arc::clone(&private_index),
+                            receipts: Arc::clone(&receipt_hub),
                             max_blob_bytes: ops.max_blob_bytes,
-                            expected_network: network_label,
-                        },
-                    )
-                    .await
-                    {
-                        Ok(report) => {
-                            if report.restored {
+                            expected_network: network_label.clone(),
+                        };
+                        match crate::v1::recovery::run_recovery_campaign(
+                            recovery_config.clone(),
+                            deps,
+                        )
+                        .await
+                        {
+                            Ok(report) if report.restored => {
                                 tracing::info!(
                                     accepted = report.coin_proof_accepted,
-                                    sdr_gaps = report.sdr_named_gaps.len(),
-                                    sdr_replay = ?crate::v1::recovery::SDR_REPLAY_STATUS,
+                                    sdr_discards = report.sdr_discards.len(),
+                                    sdr_coins_folded = report.sdr_coins_folded,
+                                    replayed_heads = report.replayed_heads.len(),
                                     "§4.5 recovery campaign: restored=true"
                                 );
-                            } else {
+                                for discard in &report.sdr_discards {
+                                    tracing::warn!(
+                                        subject = %hex::encode(discard.subject),
+                                        blob_id = %hex::encode(discard.blob_id),
+                                        record_kind = ?discard.record_kind,
+                                        send_counter = ?discard.send_counter,
+                                        reason = %discard.reason,
+                                        "§4.5 recovery SDR discard (replay could not accept candidate)"
+                                    );
+                                }
+                                break;
+                            }
+                            Ok(report)
+                                if !report.restored
+                                    && report.replayed_heads.is_empty()
+                                    && matches!(
+                                        report.scan_status,
+                                        crate::v1::recovery::GaplessScanStatus::Complete
+                                    )
+                                    && attempt + 1 < RECOVERY_CAMPAIGN_MAX_ATTEMPTS =>
+                            {
+                                // Pure relay-propagation race: complete scan,
+                                // nothing installed — safe to re-scan.
+                                tracing::info!(
+                                    attempt = attempt + 1,
+                                    max_attempts = RECOVERY_CAMPAIGN_MAX_ATTEMPTS,
+                                    "§4.5 recovery: complete scan installed no head yet — re-scanning for late relay propagation"
+                                );
+                                for discard in &report.sdr_discards {
+                                    tracing::warn!(
+                                        subject = %hex::encode(discard.subject),
+                                        blob_id = %hex::encode(discard.blob_id),
+                                        record_kind = ?discard.record_kind,
+                                        send_counter = ?discard.send_counter,
+                                        reason = %discard.reason,
+                                        "§4.5 recovery SDR discard (replay could not accept candidate)"
+                                    );
+                                }
+                                tokio::time::sleep(RECOVERY_PROPAGATION_RETRY_INTERVAL).await;
+                                continue;
+                            }
+                            Ok(report) => {
                                 tracing::error!(
                                     scan_status = ?report.scan_status,
                                     accepted = report.coin_proof_accepted,
-                                    sdr_gaps = report.sdr_named_gaps.len(),
-                                    sdr_replay = ?crate::v1::recovery::SDR_REPLAY_STATUS,
+                                    sdr_discards = report.sdr_discards.len(),
+                                    sdr_coins_folded = report.sdr_coins_folded,
+                                    replayed_heads = report.replayed_heads.len(),
                                     "§4.5 recovery campaign: restored=false — do not \
                                      treat this node as fully recovered"
                                 );
+                                for discard in &report.sdr_discards {
+                                    tracing::warn!(
+                                        subject = %hex::encode(discard.subject),
+                                        blob_id = %hex::encode(discard.blob_id),
+                                        record_kind = ?discard.record_kind,
+                                        send_counter = ?discard.send_counter,
+                                        reason = %discard.reason,
+                                        "§4.5 recovery SDR discard (replay could not accept candidate)"
+                                    );
+                                }
+                                break;
                             }
-                            for gap in &report.sdr_named_gaps {
-                                tracing::warn!(
-                                    blob_id = %hex::encode(gap.blob_id),
-                                    record_kind = ?gap.record_kind,
-                                    status = ?gap.status,
-                                    "§4.5 recovery SDR named gap (replay unavailable)"
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "§4.5 recovery campaign failed — node is NOT restored"
                                 );
+                                break;
                             }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "§4.5 recovery campaign failed — node is NOT restored"
-                            );
                         }
                     }
                 });
@@ -1258,6 +1310,22 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Backoff between §4.5 recovery campaign re-scans when a complete gapless
+/// scan installed no head yet (relay-propagation race against the origin
+/// delivery outbox's ~30–90s publish cycle).
+///
+/// Ceiling with [`RECOVERY_CAMPAIGN_MAX_ATTEMPTS`]: 12 × 10s ≈ 120s stays
+/// under the recovery journey's test window while covering a worst-case
+/// outbox lag plus a few extra scans.
+const RECOVERY_PROPAGATION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Hard upper bound on §4.5 recovery campaign attempts (including the first).
+///
+/// Statically bounded `for attempt in 0..RECOVERY_CAMPAIGN_MAX_ATTEMPTS` —
+/// never an unbounded loop. After exhaustion the existing restored=false
+/// fail-closed path fires unchanged.
+const RECOVERY_CAMPAIGN_MAX_ATTEMPTS: usize = 12;
 
 /// Idle backoff between §7.6 multi-member drain sweeps.
 ///

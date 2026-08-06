@@ -49,6 +49,9 @@
 //!   - [`scanner::Scanner::accepted_inscriptions`] — read the post-scan
 //!     accepted stream (including first-occurrence losers the NfLog
 //!     ignores) so the node can fold catalog + NfLog in one apply.
+//!   - [`scanner::evaluate_anchor_bound`] — pure §3.5 `block_anchor` bound
+//!     predicate (strict ancestor, `MAX_ANCHOR_GAP`, hash match); node's
+//!     §4.5 SDR replay reuses it for check (vi).
 //! - [`half_agg`] — production half-aggregation edge (untouched this round).
 //! - [`circuit_identity`] — `require_live_digests_match_pins` (node boot
 //!   canary). `require_one_live_digest_matches_pin` is `pub(crate)`.

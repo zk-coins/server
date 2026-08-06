@@ -157,6 +157,24 @@ pub(crate) async fn get_by_subject_coin(
     }
 }
 
+/// All verified received-CoinProof rows for `subject`. §4.5 step 6 head
+/// reconstruction only.
+pub(crate) async fn list_by_subject(
+    pool: &PgPool,
+    subject: &[u8; 32],
+) -> Result<Vec<DecryptIndexRow>> {
+    let rows: Vec<DecryptIndexSqlRow> = sqlx::query_as(
+        "SELECT record_id, subject, coin_id, blob_id, detect_tag, canonical, asset_id, \
+                verification_status, delivery_event_id, ack_nonce, occurred_at \
+         FROM v1_decrypt_index WHERE subject = $1",
+    )
+    .bind(subject.as_slice())
+    .fetch_all(pool)
+    .await
+    .context("v1_decrypt_index list_by_subject")?;
+    rows.into_iter().map(DecryptIndexSqlRow::into_row).collect()
+}
+
 /// Map a durable row into the kernel [`IndexedRecord`] shape.
 pub(crate) fn to_indexed_record(row: &DecryptIndexRow) -> IndexedRecord {
     IndexedRecord {

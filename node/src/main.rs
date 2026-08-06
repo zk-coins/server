@@ -168,6 +168,103 @@ async fn main() -> Result<(), Box<dyn StdError>> {
          first prove) so every build is checked against the pinned digest — \
          a boot that cannot arm the identity gate must fail loudly",
     );
+
+    // Verifier-cache role: read now (before the ledger load below), not at
+    // its historical later position. A Secondary must have BOTH circuit-
+    // identity gates satisfied from its shared cache before
+    // `EngineAdapter::load_or_create_from_env` runs: that load's per-account
+    // `bind_loaded_prev_proof` → `ProverBridge::ensure_proving_identity` path
+    // builds whichever circuit is not yet marked ready — on a Secondary with
+    // ledger history and the marks installed only afterward (this block's
+    // previous position), that meant building the ~90-100 GiB `C` from
+    // scratch during boot, defeating the cache entirely. The cache-verified
+    // C_balance digest is captured below and reused by the live-digest
+    // role-match after the load so the cache files are each read exactly
+    // once (never twice).
+    let verifier_cache_role = v1::verifier_cache_role_from_env().unwrap_or_else(|e| {
+        panic!("{e}");
+    });
+    let secondary_cached_balance_digest: Option<[u8; 32]> = match verifier_cache_role {
+        v1::VerifierCacheRole::Primary => None,
+        v1::VerifierCacheRole::Secondary => {
+            let verifier_cache_dir = std::env::var("ZKCOINS_VERIFIER_CACHE_DIR").expect(
+                "ZKCOINS_VERIFIER_CACHE_DIR must be set — a boot that cannot persist its trust anchor must fail loudly",
+            );
+            let balance_blob_hash =
+                zkcoins_prover::verifier_cache::balance_verifier_blob_hash_for_network(
+                    pins.network,
+                )
+                .expect(
+                    "§3.6 full-VerifierCircuitData blob-hash pin for C_balance on this \
+                         network must be generated (see \
+                         script-plonky2::verifier_cache::print_canonical_verifier_blob_hash) \
+                         before a secondary can trust the shared cache — refusing a \
+                         partially-pinned cache load",
+                );
+            let cached = zkcoins_prover::verifier_cache::load_balance_verifier_cache_checked(
+                pins.network,
+                std::path::Path::new(&verifier_cache_dir),
+                &pins.network_params.circuit_digest_c_balance(),
+                &balance_blob_hash,
+            )
+            .expect(
+                "secondary boot: shared C_balance verifier cache at ZKCOINS_VERIFIER_CACHE_DIR \
+                 must already exist (written by a primary boot) and pass the §3.6 pin check — \
+                 secondary never builds C_balance (at boot or at prove time; identity is \
+                 satisfied from this cache-verified digest)",
+            );
+            let balance_digest = cached.balance_circuit_digest_bytes();
+            // Cache load already recomputed C_balance's digest and checked it
+            // against the pin; mark the balance identity gate BEFORE the
+            // ledger load below so its last_proof bind never rebuilds it.
+            zkcoins_prover::prover_bridge::ProverBridge::mark_balance_identity_verified_from_cache(
+                pins.network,
+                balance_digest,
+            )
+            .expect(
+                "mark C_balance identity verified from the loaded cache so the secondary satisfies \
+                 the balance gate without rebuilding C_balance (2^18, the lighter circuit — C at \
+                 2^21 is the ~90-100 GiB one; the analogous cache for C is loaded right below)",
+            );
+            let compliance_blob_hash =
+                zkcoins_prover::verifier_cache::compliance_verifier_blob_hash_for_network(
+                    pins.network,
+                )
+                .expect(
+                    "§3.6 full-VerifierCircuitData blob-hash pin for C on this network must be \
+                     generated (see \
+                     script-plonky2::verifier_cache::print_canonical_verifier_blob_hash) before a \
+                     secondary can trust the shared cache — refusing a partially-pinned cache load",
+                );
+            let cached_c = zkcoins_prover::verifier_cache::load_compliance_verifier_cache_checked(
+                pins.network,
+                std::path::Path::new(&verifier_cache_dir),
+                &pins.network_params.circuit_digest_c(),
+                &compliance_blob_hash,
+            )
+            .expect(
+                "secondary boot: shared C verifier cache at ZKCOINS_VERIFIER_CACHE_DIR must \
+                 already exist (written by a primary boot) and pass the §3.6 pin check — \
+                 secondary never builds C (at boot, at prove time, or at verify time; \
+                 verify_transition uses this cache-verified verifier data instead)",
+            );
+            let cached_c_digest = cached_c.compliance_circuit_digest_bytes();
+            // Mark BEFORE the ledger load below so its last_proof bind
+            // (`bind_loaded_prev_proof` → `bind_prev_proof_identity` →
+            // `ensure_proving_identity`) never rebuilds the ~1.38M-gate C.
+            zkcoins_prover::prover_bridge::ProverBridge::mark_compliance_verifier_from_cache(
+                pins.network,
+                cached_c_digest,
+                cached_c.into_verifier_data(),
+            )
+            .expect(
+                "mark C identity verified from the loaded cache so verify_transition uses the \
+                 cached verifier without ever rebuilding the ~1.38M-gate (2^21) circuit",
+            );
+            Some(balance_digest)
+        }
+    };
+
     let v1_adapter = Arc::new(
         node::v1::EngineAdapter::load_or_create_from_env((*pool).clone())
             .await
@@ -202,9 +299,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // Jobs in flight across the reset cannot advance (generation CAS).
     let proofs_dir = std::env::var("PROOFS_DIR").unwrap_or_else(|_| "./proofs".to_string());
 
-    let verifier_cache_role = v1::verifier_cache_role_from_env().unwrap_or_else(|e| {
-        panic!("{e}");
-    });
     let live_digest = match verifier_cache_role {
         v1::VerifierCacheRole::Primary => {
             let live_digest = v1::resolve_v1_live_digest(
@@ -223,6 +317,11 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 std::path::Path::new(&verifier_cache_dir),
             )
             .expect("write C_balance verifier cache to ZKCOINS_VERIFIER_CACHE_DIR");
+            zkcoins_prover::verifier_cache::write_compliance_verifier_cache(
+                pins.network,
+                std::path::Path::new(&verifier_cache_dir),
+            )
+            .expect("write C verifier cache to ZKCOINS_VERIFIER_CACHE_DIR");
             println!(
                 "v1 self-heal: live digest = tagged C||C_balance from the circuits \
                  just built through ProverBridge (matched §3.6 pins at construction; \
@@ -231,44 +330,23 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             live_digest
         }
         v1::VerifierCacheRole::Secondary => {
-            // Intentionally re-read here (not hoisted): the Primary arm must
-            // keep its historical statement order, including its own env read.
-            let verifier_cache_dir = std::env::var("ZKCOINS_VERIFIER_CACHE_DIR").expect(
-                "ZKCOINS_VERIFIER_CACHE_DIR must be set — a boot that cannot persist its trust anchor must fail loudly",
-            );
-            let cached = zkcoins_prover::verifier_cache::load_balance_verifier_cache_checked(
-                pins.network,
-                std::path::Path::new(&verifier_cache_dir),
-                &pins.network_params.circuit_digest_c_balance(),
-            )
-            .expect(
-                "secondary boot: shared C_balance verifier cache at ZKCOINS_VERIFIER_CACHE_DIR \
-                 must already exist (written by a primary boot) and pass the §3.6 pin check — \
-                 secondary never builds C_balance (at boot or at prove time; identity is \
-                 satisfied from this cache-verified digest)",
-            );
-            // Cache load already recomputed C_balance's digest and checked it
-            // against the pin; mark the balance identity gate so first
-            // prove_transition builds only the small C circuit.
-            zkcoins_prover::prover_bridge::ProverBridge::mark_balance_identity_verified_from_cache(
-                pins.network,
-                cached.balance_circuit_digest_bytes(),
-            )
-            .expect(
-                "mark C_balance identity verified from the loaded cache so the secondary satisfies \
-                 the balance gate without rebuilding the ~100 GiB circuit",
+            let balance_digest = secondary_cached_balance_digest.expect(
+                "secondary cache-load + marks must have already run before the ledger load \
+                 above (see the pre-load block right after install_network_pins) — None here \
+                 would mean this match observed a different role than the pre-load block did",
             );
             let live_digest = v1::secondary_boot_live_digest(
                 &pins.network_params.circuit_digest_c(),
-                &cached.balance_circuit_digest_bytes(),
+                &balance_digest,
             );
             println!(
                 "v1 self-heal: secondary boot — live digest = tagged C||C_balance from \
-                 cache-verified C_balance (recomputed digest matched §3.6 pin; identity \
-                 marked ready at boot — secondary never builds C_balance) and pin C \
-                 (small C is built and pin-checked lazily on first prove_transition / \
-                 verify_transition via ProverBridge::ensure_proving_identity; \
-                 set ZKCOINS_V1_SLOW_CANARY=1 for verify_transition canary)"
+                 cache-verified C_balance (recomputed digest matched §3.6 pin) and pin C. \
+                 Both circuit-identity gates (C and C_balance) were already marked ready \
+                 from the shared cache above, before the ledger load — so \
+                 `EngineAdapter::load_or_create_from_env`'s last_proof bind never rebuilds \
+                 either circuit, even for an account with proof history. Set \
+                 ZKCOINS_V1_SLOW_CANARY=1 for the verify_transition canary."
             );
             live_digest
         }
@@ -597,6 +675,12 @@ async fn run_v1_scan_loop(
 
     let pins = v1::mode::v1_boot_pins_from_env().map_err(|e| e.to_string())?;
     let (rpc_url, cookie_path) = v1::scan::v1_bitcoind_rpc_from_env().map_err(|e| e.to_string())?;
+
+    let sdr_phase_b_client = bitcoincore_rpc::Client::new(
+        rpc_url.trim_end_matches('/'),
+        bitcoincore_rpc::Auth::CookieFile(cookie_path.clone()),
+    )
+    .map_err(|e| format!("bitcoind RPC client for SDR Phase B inclusion/MTP: {e}"))?;
 
     let scanner_config = zkcoins_prover::scanner::ScannerConfig {
         rpc_url: rpc_url.clone(),
@@ -965,23 +1049,11 @@ async fn run_v1_scan_loop(
         // whose own nullifier is now first-occurrence + size_final completed.
         // Same poll guard as the scan loop — no parallel scheduler.
         {
-            let occurred_at =
-                match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-                    Ok(d) => d.as_secs(),
-                    Err(_) => {
-                        eprintln!(
-                            "v1.1 scanner: wall clock before UNIX epoch — \
-                             skipping SDR Phase B this tick (no silent 0 MTP)"
-                        );
-                        tokio::time::sleep(Duration::from_secs(5)).await; // scanner-polling-ok: scan_to_tip idle backoff (bitcoind block-signal subscription is follow-up; no Esplora WS on this path)
-                        continue;
-                    }
-                };
-            // Inclusion / MTP: the adapter builds a **named provisional**
-            // (tip_hash + wall-clock) only on regtest/testnet. Mainnet is
-            // fail-closed until first-occurrence inclusion + BIP-113 MTP via
-            // bitcoind is wired (`provisional_inclusion_mtp_for_network`).
-            let n = v1::finalize_due_phase_b_adapter(&adapter, tip_hash, occurred_at)
+            // Inclusion / MTP: real bitcoind-backed source (canonical hash at
+            // first-occurrence height + BIP-113 mediantime via getblockheader),
+            // uniform on every network. The resolver verifies finality before
+            // sealing and stores the hash in Bitcoin's internal byte order.
+            let n = v1::finalize_due_phase_b_adapter(&adapter, &sdr_phase_b_client)
                 .await
                 .map_err(|e| format!("v1.1 SDR Phase B finalise failed: {e:#}"))?;
             if n > 0 {

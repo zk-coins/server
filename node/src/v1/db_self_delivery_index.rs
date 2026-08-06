@@ -54,6 +54,82 @@ pub(crate) async fn insert_and_mirror_self_delivery(
     Ok(sql_outcome)
 }
 
+/// Insert every staged row for one subject's fold set in one SQL transaction.
+///
+/// Only after the transaction commits are the durable winners (new rows or
+/// pre-existing conflict winners) mirrored into `private_index`. Thus a SQL
+/// failure cannot leave either a partial durable fold or a mirror of data that
+/// did not commit.
+pub(crate) async fn insert_and_mirror_self_delivery_batch(
+    pool: &PgPool,
+    private_index: &InMemoryPrivateIndex,
+    rows: &[SelfDeliveryIndexRow],
+) -> Result<Vec<(SelfDeliveryIndexRow, InsertRecordOutcome)>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("v1_self_delivery_index batch begin")?;
+    let mut durable_outcomes = Vec::with_capacity(rows.len());
+    for row in rows {
+        ensure_row_shape(row)?;
+        let result = sqlx::query(
+            "INSERT INTO v1_self_delivery_index (\
+                 record_id, subject, coin_id, blob_id, detect_tag, canonical, asset_id, \
+                 transition_kind, occurred_at\
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(row.record_id.as_slice())
+        .bind(row.subject.as_slice())
+        .bind(row.coin_id.as_slice())
+        .bind(row.blob_id.as_slice())
+        .bind(row.detect_tag.as_slice())
+        .bind(&row.canonical)
+        .bind(row.asset_id.as_slice())
+        .bind(row.transition_kind.as_str())
+        .bind(i64::try_from(row.occurred_at).context("occurred_at fits i64")?)
+        .execute(&mut *tx)
+        .await
+        .context("v1_self_delivery_index batch insert")?;
+
+        let (durable, outcome) = if result.rows_affected() == 0 {
+            let existing = sqlx::query_as::<_, SelfDeliveryIndexSqlRow>(
+                "SELECT record_id, subject, coin_id, blob_id, detect_tag, canonical, asset_id, \
+                        transition_kind, occurred_at \
+                 FROM v1_self_delivery_index WHERE subject = $1 AND coin_id = $2",
+            )
+            .bind(row.subject.as_slice())
+            .bind(row.coin_id.as_slice())
+            .fetch_optional(&mut *tx)
+            .await
+            .context("v1_self_delivery_index batch conflict lookup")?
+            .context(
+                "v1_self_delivery_index batch conflict without an existing (subject, coin_id) row",
+            )?
+            .into_row()?;
+            (existing, InsertRecordOutcome::AlreadyPresent)
+        } else {
+            (row.clone(), InsertRecordOutcome::Inserted)
+        };
+        durable_outcomes.push((durable, outcome));
+    }
+
+    tx.commit()
+        .await
+        .context("v1_self_delivery_index batch commit")?;
+
+    for (durable, _) in &durable_outcomes {
+        private_index
+            .insert_record(to_indexed_record(durable))
+            .map_err(|e| anyhow::anyhow!("v1_self_delivery_index batch mirror insert: {e}"))?;
+    }
+    Ok(durable_outcomes)
+}
+
 /// Insert one row, returning a named replay on any unique conflict.
 pub(crate) async fn insert_self_delivery(
     pool: &PgPool,
@@ -104,6 +180,28 @@ pub(crate) async fn get_by_subject_coin(
     .await
     .context("v1_self_delivery_index get_by_subject_coin")?;
     row.map(SelfDeliveryIndexSqlRow::into_row).transpose()
+}
+
+/// All folded self-delivery rows for `subject` — every self-created output
+/// coin recorded across the account's reconstructed lineage. §4.5 step 6 head
+/// reconstruction only; the online fold path uses `get_by_subject_coin` /
+/// the batch insert instead.
+pub(crate) async fn list_by_subject(
+    pool: &PgPool,
+    subject: &[u8; 32],
+) -> Result<Vec<SelfDeliveryIndexRow>> {
+    let rows: Vec<SelfDeliveryIndexSqlRow> = sqlx::query_as(
+        "SELECT record_id, subject, coin_id, blob_id, detect_tag, canonical, asset_id, \
+                transition_kind, occurred_at \
+         FROM v1_self_delivery_index WHERE subject = $1",
+    )
+    .bind(subject.as_slice())
+    .fetch_all(pool)
+    .await
+    .context("v1_self_delivery_index list_by_subject")?;
+    rows.into_iter()
+        .map(SelfDeliveryIndexSqlRow::into_row)
+        .collect()
 }
 
 pub(crate) fn to_indexed_record(row: &SelfDeliveryIndexRow) -> IndexedRecord {

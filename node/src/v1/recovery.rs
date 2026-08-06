@@ -10,11 +10,15 @@
 //! |---|---|
 //! | 3 | Paginated gapless kind-1059 scan (i)/(ii)/(iii) over seed relays |
 //! | 5 | Re-run §2.3.3 via [`super::incoming::verify_coin_proof_for_index`];
-//!     name the SDR gap; durable decrypt-index fill via the receive path |
+//!     durable decrypt-index fill via the receive path |
+//! | 6 | §4.2 SelfDeliveryRecordV1 VERIFY-ONLY replay: fetch/ZBE/decode,
+//!     checks (i)–(vi), order, fold output coins into the durable
+//!     self-delivery index, reconstruct/install/persist account heads;
+//!     report heads + every discard (never silent) |
 //!
-//! Steps 2 (NfLog rebuild from Bitcoin) and 6 (AccountState replay) are not
-//! owned here — step 2 is the existing scanner path; step 6 needs the SDR
-//! replay path that is still an open gap (see [`SdrReplayStatus`]).
+//! Step 2 (NfLog rebuild from Bitcoin) is the existing scanner path — not
+//! owned here. Step 6 installs each fully reconstructed account into the live
+//! engine and durably persists the resulting full-engine snapshot.
 //!
 //! # Step 1 is intentionally absent (wallet-side only)
 //!
@@ -40,29 +44,51 @@
 //!
 //! Spec: §1.2, §2.3.3, §4.2, §4.4, §4.5, §7.7.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use shared::spec_v1::bundle::CoinProof;
+use shared::spec_v1::bundle::{
+    deserialize_coin_proof, deserialize_self_delivery_record, CoinProof,
+};
+use shared::spec_v1::encoding::digest_to_bytes;
+use shared::spec_v1::hashes::{account_state_hash, address, hash_proof_data, nk_commit};
+use shared::spec_v1::note_encryption::{
+    derive_note_key, derive_out_key, envelope_open, zbe_open, COIN_CIPHERTEXT_LEN,
+    ENVELOPE_LABEL_COIN, ENVELOPE_LABEL_K_TX, OUT_CIPHERTEXT_LEN,
+};
+use shared::spec_v1::serialize::{serialize_coin, serialize_proof_data};
+use shared::spec_v1::{self as host, AccountState, Address, LookupResult, SpendClassification};
 use sqlx::PgPool;
-use zkcoins_prover::prover_bridge::ProverBridge;
-use zkcoins_prover::state_engine::StateEngine;
+use zkcoins_prover::half_agg::comm_verify;
+use zkcoins_prover::prover_bridge::{NavOpening, NullifierOpening, ProverBridge};
+use zkcoins_prover::state_engine::{OpSecret, StateEngine, TrackedCoin};
 
 use super::adapter::EngineAdapter;
+use super::blossom::BlossomClient;
+use super::db_decrypt_index::decrypt_record_id;
+use super::db_self_delivery_index::{
+    get_by_subject_coin as get_self_delivery_by_subject_coin,
+    insert_and_mirror_self_delivery_batch, SelfDeliveryIndexRow,
+};
 use super::incoming::{
-    extract_scan_tags, match_detect_tag, process_delivery_candidate, verify_coin_proof_for_index,
-    AckClock, CandidateNetwork, CandidateOutcome, CandidateSecrets, CandidateStores, IncomingError,
+    extract_scan_tags, fetch_blob_from_holders, match_detect_tag, process_delivery_candidate,
+    verify_coin_proof_for_index, AckClock, CandidateNetwork, CandidateOutcome, CandidateSecrets,
+    CandidateStores, IncomingError,
 };
 use super::nostr::event::Event;
 use super::nostr::kinds::delivery::{decode_delivery_payload, RecordKind};
+use super::nostr::nip44;
 use super::nostr::nip59::{unwrap_gift, KIND_GIFT_WRAP};
 use super::nostr::relay::{Filter, RelayClient, RelayError};
+use super::receive::extract_compliance_public_inputs;
 use super::OsSecureRandom;
-use crate::kernel::access::{InMemoryPrivateIndex, ReceiptHub};
+use crate::kernel::access::{
+    InMemoryPrivateIndex, InsertRecordOutcome, ReceiptHub, TransitionKind,
+};
 use crate::kernel::bootstrap::{BundleStore, OperationalBundle};
 use crate::kernel::types::SubjectAddress;
 
@@ -188,21 +214,801 @@ pub(crate) struct GaplessScanResult {
     pub unique_event_count: usize,
 }
 
-/// Status of the §4.2 SelfDeliveryRecordV1 replay path in this tree.
-///
-/// The send-path module documents SDR Phase B as not finalised (needs
-/// first-occurrence MTP). Recovery **names** matched SDRs instead of
-/// silently dropping them — a restore that omits SDRs cannot claim a
-/// proven account head. Operator-visible reports surface this status
-/// (see [`RecoveryRunReport::sdr_named_gaps`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SdrReplayStatus {
-    /// Path not wired — matched records are reported, not replayed.
-    Unavailable,
+/// Why one SelfDeliveryRecordV1 candidate was discarded — §4.2 checks (i)-(vi) plus the
+/// ordering-stage equivocation/monotonicity rules. Never a bare "invalid"; always names which
+/// check failed and enough detail to debug it (no silent drop, per project policy).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SdrDiscardReason {
+    /// Blob fetch failed (dispatch 2 populates call sites).
+    FetchFailed { detail: String },
+    /// ZBE open failed (dispatch 2).
+    ZbeOpenFailed { detail: String },
+    /// SelfDeliveryRecordV1 decode failed (dispatch 2).
+    DecodeFailed { detail: String },
+    /// Decoded SDR owner does not equal the recovery subject.
+    AccountOwnerMismatch { detail: String },
+    /// Decoded SDR nk commitment does not bind the entrusteed bundle nk.
+    NkCommitMismatch { detail: String },
+    /// Outer ordering counter does not equal the authenticated account-state counter.
+    SendCounterMismatch { detail: String },
+    /// First accepted post-genesis transition did not use counter 1.
+    GenesisCounterInvalid { detail: String },
+    /// First accepted transition's genesis preimage does not bind the subject.
+    GenesisIdentityMismatch { detail: String },
+    /// A later authenticated counter did not immediately follow the previous one.
+    SendCounterNotSequential { detail: String },
+    /// Outer delivery record kind does not equal the decoded SDR kind.
+    RecordKindMismatch { detail: String },
+    /// Durable idempotency lookup failed before a fold could be staged.
+    IndexLookupFailed { detail: String },
+    /// The per-subject atomic fold transaction failed.
+    FoldCommitFailed { detail: String },
+    /// §4.5 step 6: reconstructing or installing the recovered `AccountRecord`
+    /// failed for a reason that is a conclusive contradiction (coinhist root
+    /// mismatch, a spendable coin with no recoverable source, an unresolvable
+    /// NAV-opening/nullifier-position reconstruction, or an engine that already
+    /// holds a *different, older* account for this subject with no safe in-place
+    /// update path) — never an availability/retry situation.
+    HeadReconstructionFailed { detail: String },
+    /// §4.5 step 6: the head reconstructed and installed cleanly into the live
+    /// engine, but the durable engine-snapshot persist failed. The live engine
+    /// is rolled back to its pre-install snapshot before this is reported, so
+    /// memory and disk never diverge.
+    HeadPersistFailed { detail: String },
+    /// CoinProof coin identifier does not equal the naming OutputRef.
+    FoldCoinIdMismatch { detail: String },
+    /// CoinProof ephemeral key does not equal the naming OutputRef.
+    FoldEpkMismatch { detail: String },
+    /// CoinProof creation proof/nullifier does not equal the accepted SDR transition.
+    FoldCreatingTransitionMismatch { detail: String },
+    /// CoinProof ciphertext does not authenticate its serialized coin under recovered K_tx.
+    FoldCiphertextBindingFailed { detail: String },
+    /// Check (ii): `account_state_hash(account_state) ≠ proof_data.new_account_state_hash`.
+    AccountStateHashMismatch,
+    /// Check (iii-a): recursive transition proof load or verify failed.
+    ProofVerifyFailed { detail: String },
+    /// Check (iii-b): proof public inputs do not equal the record's `proof_data`.
+    ProofDataMismatch,
+    /// Check (iv): Fresh-Key-Substitution — `consumed_pubkey ≠ own_nullifier.pk_create`.
+    ConsumedPubkeyMismatch,
+    /// Check (iv): nullifier is not a ValidFirstSpend first-occurrence on NfLog.
+    NotFirstOccurrence { detail: String },
+    /// Check (v): inclusion block height/hash does not match NfLog + block_log.
+    InclusionBlockMismatch { detail: String },
+    /// Check (v): `occurred_at` is zero (invalid; BIP-113 MTP not re-derived here).
+    OccurredAtInvalid { detail: String },
+    /// Check (v) ordering stage: `occurred_at` regressed vs a previously accepted record.
+    OccurredAtNotMonotonic { detail: String },
+    /// Check (vi): proof_block_anchor fails the §3.5 gap-bound predicate.
+    AnchorBoundFailed { detail: String },
+    /// Check (i) ordering stage: `prev_state_head` does not equal the expected prior ash.
+    PrevStateHeadMismatch { detail: String },
+    /// Ordering stage: same `send_counter` with divergent account-state ashes.
+    Equivocation { detail: String },
 }
 
-/// Fixed status of the SDR replay path today.
-pub(crate) const SDR_REPLAY_STATUS: SdrReplayStatus = SdrReplayStatus::Unavailable;
+impl SdrDiscardReason {
+    /// Availability failures gate `restored` but do not establish invalidity.
+    pub(crate) fn is_infra_availability(&self) -> bool {
+        match self {
+            SdrDiscardReason::FetchFailed { .. }
+            | SdrDiscardReason::IndexLookupFailed { .. }
+            | SdrDiscardReason::FoldCommitFailed { .. }
+            | SdrDiscardReason::HeadPersistFailed { .. } => true,
+            SdrDiscardReason::ZbeOpenFailed { .. }
+            | SdrDiscardReason::DecodeFailed { .. }
+            | SdrDiscardReason::AccountOwnerMismatch { .. }
+            | SdrDiscardReason::NkCommitMismatch { .. }
+            | SdrDiscardReason::SendCounterMismatch { .. }
+            | SdrDiscardReason::GenesisCounterInvalid { .. }
+            | SdrDiscardReason::GenesisIdentityMismatch { .. }
+            | SdrDiscardReason::SendCounterNotSequential { .. }
+            | SdrDiscardReason::RecordKindMismatch { .. }
+            | SdrDiscardReason::FoldCoinIdMismatch { .. }
+            | SdrDiscardReason::FoldEpkMismatch { .. }
+            | SdrDiscardReason::FoldCreatingTransitionMismatch { .. }
+            | SdrDiscardReason::FoldCiphertextBindingFailed { .. }
+            | SdrDiscardReason::AccountStateHashMismatch
+            | SdrDiscardReason::ProofVerifyFailed { .. }
+            | SdrDiscardReason::ProofDataMismatch
+            | SdrDiscardReason::ConsumedPubkeyMismatch
+            | SdrDiscardReason::NotFirstOccurrence { .. }
+            | SdrDiscardReason::InclusionBlockMismatch { .. }
+            | SdrDiscardReason::OccurredAtInvalid { .. }
+            | SdrDiscardReason::OccurredAtNotMonotonic { .. }
+            | SdrDiscardReason::AnchorBoundFailed { .. }
+            | SdrDiscardReason::PrevStateHeadMismatch { .. }
+            | SdrDiscardReason::Equivocation { .. }
+            | SdrDiscardReason::HeadReconstructionFailed { .. } => false,
+        }
+    }
+}
+
+impl fmt::Display for SdrDiscardReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SdrDiscardReason::FetchFailed { detail } => {
+                write!(f, "SDR fetch failed: {detail}")
+            }
+            SdrDiscardReason::ZbeOpenFailed { detail } => {
+                write!(f, "SDR ZBE open failed: {detail}")
+            }
+            SdrDiscardReason::DecodeFailed { detail } => {
+                write!(f, "SDR decode failed: {detail}")
+            }
+            SdrDiscardReason::AccountOwnerMismatch { detail } => {
+                write!(f, "SDR subject binding: account owner mismatch: {detail}")
+            }
+            SdrDiscardReason::NkCommitMismatch { detail } => {
+                write!(f, "SDR subject binding: nk_commit mismatch: {detail}")
+            }
+            SdrDiscardReason::SendCounterMismatch { detail } => {
+                write!(f, "SDR authenticated send_counter mismatch: {detail}")
+            }
+            SdrDiscardReason::GenesisCounterInvalid { detail } => {
+                write!(f, "SDR genesis counter invalid: {detail}")
+            }
+            SdrDiscardReason::GenesisIdentityMismatch { detail } => {
+                write!(f, "SDR genesis identity mismatch: {detail}")
+            }
+            SdrDiscardReason::SendCounterNotSequential { detail } => {
+                write!(f, "SDR authenticated send_counter not sequential: {detail}")
+            }
+            SdrDiscardReason::RecordKindMismatch { detail } => {
+                write!(f, "SDR outer/inner record_kind mismatch: {detail}")
+            }
+            SdrDiscardReason::IndexLookupFailed { detail } => {
+                write!(f, "SDR fold index lookup failed: {detail}")
+            }
+            SdrDiscardReason::FoldCommitFailed { detail } => {
+                write!(f, "SDR fold batch commit failed: {detail}")
+            }
+            SdrDiscardReason::HeadReconstructionFailed { detail } => {
+                write!(f, "SDR head reconstruction failed: {detail}")
+            }
+            SdrDiscardReason::HeadPersistFailed { detail } => {
+                write!(f, "SDR head persist failed: {detail}")
+            }
+            SdrDiscardReason::FoldCoinIdMismatch { detail } => {
+                write!(f, "SDR fold coin_id binding failed: {detail}")
+            }
+            SdrDiscardReason::FoldEpkMismatch { detail } => {
+                write!(f, "SDR fold epk binding failed: {detail}")
+            }
+            SdrDiscardReason::FoldCreatingTransitionMismatch { detail } => {
+                write!(f, "SDR fold creating transition binding failed: {detail}")
+            }
+            SdrDiscardReason::FoldCiphertextBindingFailed { detail } => {
+                write!(f, "SDR fold ciphertext binding failed: {detail}")
+            }
+            SdrDiscardReason::AccountStateHashMismatch => write!(
+                f,
+                "SDR check (ii): account_state_hash does not match proof_data.new_account_state_hash"
+            ),
+            SdrDiscardReason::ProofVerifyFailed { detail } => {
+                write!(f, "SDR check (iii-a): transition proof verify failed: {detail}")
+            }
+            SdrDiscardReason::ProofDataMismatch => write!(
+                f,
+                "SDR check (iii-b): recursive proof public inputs ≠ record.proof_data"
+            ),
+            SdrDiscardReason::ConsumedPubkeyMismatch => write!(
+                f,
+                "SDR check (iv): consumed_pubkey ≠ own_nullifier.pk_create (Fresh-Key-Substitution)"
+            ),
+            SdrDiscardReason::NotFirstOccurrence { detail } => {
+                write!(f, "SDR check (iv): not first-occurrence: {detail}")
+            }
+            SdrDiscardReason::InclusionBlockMismatch { detail } => {
+                write!(f, "SDR check (v): inclusion block mismatch: {detail}")
+            }
+            SdrDiscardReason::OccurredAtInvalid { detail } => {
+                write!(f, "SDR check (v): occurred_at invalid: {detail}")
+            }
+            SdrDiscardReason::OccurredAtNotMonotonic { detail } => {
+                write!(f, "SDR check (v): occurred_at not monotonic: {detail}")
+            }
+            SdrDiscardReason::AnchorBoundFailed { detail } => {
+                write!(f, "SDR check (vi): anchor bound failed: {detail}")
+            }
+            SdrDiscardReason::PrevStateHeadMismatch { detail } => {
+                write!(f, "SDR check (i): prev_state_head mismatch: {detail}")
+            }
+            SdrDiscardReason::Equivocation { detail } => {
+                write!(f, "SDR ordering: equivocation at send_counter: {detail}")
+            }
+        }
+    }
+}
+
+/// One record accepted through checks (i)-(vi), in ascending `send_counter` order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AcceptedSdr {
+    /// Content-address of the SelfDeliveryRecordV1 ZBE blob that produced this record.
+    pub blob_id: [u8; 32],
+    pub record: host::SelfDeliveryRecordV1,
+    /// `digest_to_bytes(account_state_hash(&record.account_state))`.
+    pub account_state_ash: [u8; 32],
+}
+
+/// Verified fold result before any durable write for the subject batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StagedFoldOutcome {
+    Row(SelfDeliveryIndexRow),
+    AlreadyPresent { coin_id: [u8; 32] },
+    NotOurs,
+}
+
+/// One SDR candidate that could not be replayed — operator-visible, never silent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SdrDiscard {
+    pub subject: [u8; 32],
+    pub blob_id: [u8; 32],
+    pub record_kind: RecordKind,
+    /// `None` when the record could not be decoded far enough to read `send_counter`
+    /// (fetch/ZBE/decode failure) or when discarded before ordering assigned one.
+    pub send_counter: Option<u64>,
+    pub reason: SdrDiscardReason,
+}
+
+/// One recovered lineage head per subject that had at least one accepted SDR —
+/// the uniquely-highest verified `send_counter` for that subject.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReplayedAccountHead {
+    pub subject: [u8; 32],
+    pub record_kind: RecordKind,
+    pub send_counter: u64,
+    pub account_state: host::AccountState,
+    pub account_state_ash: [u8; 32],
+    pub recursive_proof: Vec<u8>,
+    pub proof_data: host::ProofData,
+    pub inclusion_block: host::BlockAnchor,
+    pub occurred_at: u64,
+}
+
+/// Genesis ("empty account") ash for the subject — the expected `prev_state_head`
+/// of the first accepted SelfDeliveryRecordV1.
+///
+/// Builds `AccountState::new(owner=Address(subject), nk_commit(nk), empty balances,
+/// pk0, send_counter=0, coinhist_empty_root)` and returns its ash. `pk0` is the
+/// creating nullifier's `pk_create` of the lowest-`send_counter` record in the
+/// chain being verified (the account's own `current_pubkey` immediately before
+/// that first transition).
+pub(crate) fn canonical_genesis_account_state_ash(
+    subject: &[u8; 32],
+    nk: &[u8; 32],
+    pk0: [u8; 32],
+) -> Result<host::HashDigest, host::SpecError> {
+    let owner = Address(*subject);
+    let nkc = nk_commit(nk);
+    let empty = AccountState::new(
+        owner,
+        nkc,
+        BTreeMap::new(),
+        pk0,
+        0,
+        host::coinhist_empty_root(),
+    )
+    .expect("empty account is always constructible");
+    account_state_hash(&empty)
+}
+
+/// Panic-isolated load, recursive verification, and public-input extraction for
+/// attacker-controlled transition proof bytes.
+fn load_verify_transition_public_inputs(
+    bridge: &ProverBridge,
+    proof_bytes: &[u8],
+    context: &str,
+) -> Result<(host::ProofData, [u8; 32]), SdrDiscardReason> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> anyhow::Result<(host::ProofData, [u8; 32])> {
+            let proof = bridge.load_transition_proof_bytes(proof_bytes)?;
+            bridge.verify_transition(&proof)?;
+            let (proof_data, consumed_pubkey, _network_id) =
+                extract_compliance_public_inputs(&proof)?;
+            Ok((proof_data, consumed_pubkey))
+        },
+    ));
+    match result {
+        Ok(Ok(public_inputs)) => Ok(public_inputs),
+        Ok(Err(e)) => Err(SdrDiscardReason::ProofVerifyFailed {
+            detail: format!("{context}: {e:#}"),
+        }),
+        Err(payload) => {
+            let panic_detail = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_owned());
+            tracing::error!(
+                proof_context = context,
+                panic = %panic_detail,
+                "attacker-controlled transition proof parser/verifier panicked; isolated"
+            );
+            Err(SdrDiscardReason::ProofVerifyFailed {
+                detail: format!("{context}: proof parser/verifier panicked: {panic_detail}"),
+            })
+        }
+    }
+}
+
+/// Subject binding and §4.2 checks that do not need the state engine.
+///
+/// This runs before taking the [`EngineAdapter`] mutex. VERIFY-ONLY: it loads
+/// and verifies the recursive proof but never proves a transition.
+pub(crate) fn verify_sdr_record_pre_engine(
+    bridge: &ProverBridge,
+    subject: &[u8; 32],
+    nk: &[u8; 32],
+    record: &host::SelfDeliveryRecordV1,
+) -> Result<([u8; 32], [u8; 32]), SdrDiscardReason> {
+    if record.account_state.owner.0 != *subject {
+        return Err(SdrDiscardReason::AccountOwnerMismatch {
+            detail: format!(
+                "account_state.owner {} != recovery subject {}",
+                hex::encode(record.account_state.owner.0),
+                hex::encode(subject)
+            ),
+        });
+    }
+    let expected_nkc = nk_commit(nk);
+    if record.account_state.nk_commit != expected_nkc {
+        return Err(SdrDiscardReason::NkCommitMismatch {
+            detail: format!(
+                "account_state.nk_commit {} != bundle nk_commit {}",
+                hex::encode(digest_to_bytes(&record.account_state.nk_commit)),
+                hex::encode(digest_to_bytes(&expected_nkc))
+            ),
+        });
+    }
+    if record.send_counter != record.account_state.send_counter {
+        return Err(SdrDiscardReason::SendCounterMismatch {
+            detail: format!(
+                "outer {} != account_state {}",
+                record.send_counter, record.account_state.send_counter
+            ),
+        });
+    }
+
+    // (ii) ash(account_state) == proof_data.new_account_state_hash
+    let ash = match account_state_hash(&record.account_state) {
+        Ok(a) => a,
+        Err(_) => return Err(SdrDiscardReason::AccountStateHashMismatch),
+    };
+    if ash != record.proof_data.new_account_state_hash {
+        return Err(SdrDiscardReason::AccountStateHashMismatch);
+    }
+
+    // (iii-b) proof public inputs == record.proof_data (full ProofData equality)
+    let (creating_pd, consumed_pubkey) = load_verify_transition_public_inputs(
+        bridge,
+        &record.recursive_proof,
+        "SDR recursive_proof",
+    )?;
+    if creating_pd != record.proof_data {
+        return Err(SdrDiscardReason::ProofDataMismatch);
+    }
+
+    // (iv) Fresh-Key-Substitution + R/R' opens H(ProofData). NfLog access is
+    // deliberately deferred to `verify_sdr_record_engine_checks`.
+    if consumed_pubkey != record.own_nullifier.pk_create {
+        return Err(SdrDiscardReason::ConsumedPubkeyMismatch);
+    }
+    let pk_create = record.own_nullifier.pk_create;
+    let r_create = record.own_nullifier.r_create;
+    let h_pd = hash_proof_data(&serialize_proof_data(&record.proof_data));
+    comm_verify(
+        &record.own_nullifier.r_create,
+        &h_pd,
+        &record.own_nullifier.r_prime_create,
+    )
+    .map_err(|e| SdrDiscardReason::NotFirstOccurrence {
+        detail: format!("S2C opening does not bind H(ProofData): {e:#}"),
+    })?;
+    Ok((pk_create, r_create))
+}
+
+/// Engine-only part of §4.2 check (iv): NfLog classification, lookup, and
+/// mirror-height resolution. No attacker-controlled proof parsing occurs here.
+pub(crate) fn verify_sdr_record_engine_checks(
+    engine: &StateEngine,
+    pk_create: [u8; 32],
+    r_create: [u8; 32],
+) -> Result<u64 /* inclusion_height */, SdrDiscardReason> {
+    match engine.nflog().classify(pk_create, r_create) {
+        SpendClassification::ValidFirstSpend => {}
+        SpendClassification::RejectedDoubleSpend => {
+            return Err(SdrDiscardReason::NotFirstOccurrence {
+                detail: "creating Pk is present with a different R (double-spend loser)".into(),
+            });
+        }
+        SpendClassification::Pending => {
+            return Err(SdrDiscardReason::NotFirstOccurrence {
+                detail: "creating nullifier is not a first-occurrence on receiver NfLog".into(),
+            });
+        }
+    }
+    let inclusion_pos = match engine.nflog().lookup(pk_create) {
+        LookupResult::Present { pos, r, .. } if r == r_create => pos,
+        LookupResult::Present { r, .. } => {
+            return Err(SdrDiscardReason::NotFirstOccurrence {
+                detail: format!(
+                    "NfLog first-occurrence R mismatches creating_nullifier.R (log has {})",
+                    hex::encode(r)
+                ),
+            });
+        }
+        LookupResult::Absent => {
+            return Err(SdrDiscardReason::NotFirstOccurrence {
+                detail: "creating Pk vanished between classify and lookup".into(),
+            });
+        }
+    };
+    // Resolve inclusion height from the NfLog mirror (needed by async (v)/(vi)).
+    // Height/hash equality vs the sealed record is checked in the async half.
+    let inclusion_height = match engine.nflog_mirror().get(inclusion_pos as usize) {
+        Some((cp, _)) => cp.height,
+        None => {
+            return Err(SdrDiscardReason::InclusionBlockMismatch {
+                detail: format!(
+                    "NfLog mirror has no entry at pos {inclusion_pos} for inclusion height"
+                ),
+            });
+        }
+    };
+    Ok(inclusion_height)
+}
+
+/// Reconstruct the exact `NavOpening` that opens `target_nav_commitment` under
+/// `nav_rand`, by scanning every canonical NfLog prefix length this node has
+/// scanned so far (`0..=engine.nflog_mirror().len()`).
+///
+/// The wallet originally proved this transition against some historical
+/// `size_final(tip_height)` <= the accumulator size at that time <= today's
+/// accumulator size (the NfLog only grows; a canonical prefix root never
+/// changes once fixed — see `NflogIncrementalMth`'s documented equivalence).
+/// So the search is exhaustive over every value the original opening could
+/// have been. `nav_commitment` is a collision-resistant hash binding, so a
+/// match is (cryptographically) unique. Returns `None` only if this node's
+/// NfLog genuinely lacks the prefix that was used — a real reconstruction gap.
+fn reconstruct_nav_opening(
+    engine: &StateEngine,
+    nav_rand: [u8; 32],
+    target_nav_commitment: host::HashDigest,
+) -> Option<NavOpening> {
+    let opens =
+        |root: host::HashDigest| host::nav_commitment(root, &nav_rand) == target_nav_commitment;
+
+    if opens(host::nflog_root(0, host::nflog_empty())) {
+        return Some(NavOpening {
+            nav: host::Nav {
+                size: 0,
+                mth: host::nflog_empty(),
+            },
+            nav_rand,
+        });
+    }
+    let mirror = engine.nflog_mirror();
+    let mut acc = shared::spec_v1::nflog::NflogIncrementalMth::new();
+    for (_, entry) in &mirror {
+        acc.append(entry);
+        let mth = acc.mth();
+        let size = acc.size();
+        if opens(host::nflog_root(size, mth)) {
+            return Some(NavOpening {
+                nav: host::Nav { size, mth },
+                nav_rand,
+            });
+        }
+    }
+    None
+}
+
+/// §4.2 checks (v except monotonicity) and (vi) — async half (block_log + anchor bound).
+///
+/// Takes only `inclusion_height` (a plain `u64` from the sync half); no `&StateEngine`.
+pub(crate) async fn verify_sdr_record_checks_v_vi_async(
+    pool: &PgPool,
+    inclusion_height: u64,
+    record: &host::SelfDeliveryRecordV1,
+) -> Result<(), SdrDiscardReason> {
+    // (v) inclusion height/hash + occurred_at ≠ 0 (monotonicity is ordering-stage)
+    if record.occurred_at == 0 {
+        return Err(SdrDiscardReason::OccurredAtInvalid {
+            detail: "occurred_at is zero (refusing non-deterministic MTP re-derivation; \
+                     require a non-zero sealed value)"
+                .into(),
+        });
+    }
+    if u64::from(record.inclusion_block.height) != inclusion_height {
+        return Err(SdrDiscardReason::InclusionBlockMismatch {
+            detail: format!(
+                "inclusion_block.height {} ≠ NfLog first-occurrence height {inclusion_height}",
+                record.inclusion_block.height
+            ),
+        });
+    }
+    let stored_inclusion_hash = crate::db::load_block_hash_at_height(pool, inclusion_height)
+        .await
+        .map_err(|e| SdrDiscardReason::InclusionBlockMismatch {
+            detail: format!("block_log lookup at inclusion height {inclusion_height}: {e}"),
+        })?;
+    let Some(stored_inclusion_hash) = stored_inclusion_hash else {
+        return Err(SdrDiscardReason::InclusionBlockMismatch {
+            detail: format!(
+                "no block_log row for inclusion height {inclusion_height} (node has not scanned it)"
+            ),
+        });
+    };
+    if record.inclusion_block.block_hash != stored_inclusion_hash {
+        return Err(SdrDiscardReason::InclusionBlockMismatch {
+            detail: format!(
+                "inclusion_block.block_hash {} ≠ block_log hash {} at height {inclusion_height}",
+                hex::encode(record.inclusion_block.block_hash),
+                hex::encode(stored_inclusion_hash)
+            ),
+        });
+    }
+
+    // (vi) §3.5 anchor bound via the shared scanner predicate
+    let sp_anchor = zkcoins_prover::half_agg::BlockAnchor {
+        block_hash: record.proof_block_anchor.block_hash,
+        height: record.proof_block_anchor.height,
+    };
+    let anchor_hash =
+        crate::db::load_block_hash_at_height(pool, u64::from(record.proof_block_anchor.height))
+            .await
+            .map_err(|e| SdrDiscardReason::AnchorBoundFailed {
+                detail: format!(
+                    "block_log lookup at proof_block_anchor height {}: {e}",
+                    record.proof_block_anchor.height
+                ),
+            })?;
+    let Some(anchor_hash) = anchor_hash else {
+        return Err(SdrDiscardReason::AnchorBoundFailed {
+            detail: format!(
+                "no block_log row for proof_block_anchor height {} (node has not scanned it)",
+                record.proof_block_anchor.height
+            ),
+        });
+    };
+    zkcoins_prover::scanner::evaluate_anchor_bound(&sp_anchor, inclusion_height, anchor_hash)
+        .map_err(|detail| SdrDiscardReason::AnchorBoundFailed { detail })?;
+
+    Ok(())
+}
+
+/// Group survivors by the authenticated account-state counter, drop groups
+/// with divergent account-state ashes, and collapse only full-struct-equal
+/// republish duplicates.
+///
+/// Same-ash but non-identical records remain candidates, deterministically
+/// ordered by blob id, so chain validation names and resolves each one.
+pub(crate) fn resolve_equivocation_and_order(
+    survivors: Vec<([u8; 32], RecordKind, host::SelfDeliveryRecordV1)>,
+) -> (
+    Vec<([u8; 32], RecordKind, host::SelfDeliveryRecordV1)>,
+    Vec<(u64, [u8; 32], RecordKind, SdrDiscardReason)>,
+) {
+    let mut by_counter: BTreeMap<u64, Vec<([u8; 32], RecordKind, host::SelfDeliveryRecordV1)>> =
+        BTreeMap::new();
+    for (blob_id, record_kind, record) in survivors {
+        by_counter
+            .entry(record.account_state.send_counter)
+            .or_default()
+            .push((blob_id, record_kind, record));
+    }
+
+    let mut ordered = Vec::new();
+    let mut discards = Vec::new();
+    for (send_counter, group) in by_counter {
+        // Survivors already passed check (ii), so ash is well-defined.
+        let ashes: Vec<[u8; 32]> = group
+            .iter()
+            .map(|(_, _, r)| {
+                digest_to_bytes(
+                    &account_state_hash(&r.account_state)
+                        .expect("survivor passed check (ii); ash is defined"),
+                )
+            })
+            .collect();
+        let first = ashes[0];
+        if ashes.iter().all(|a| *a == first) {
+            let mut distinct = Vec::new();
+            let mut sorted = group;
+            sorted.sort_by_key(|(blob_id, _, _)| *blob_id);
+            for candidate in sorted {
+                if !distinct.iter().any(
+                    |(_, _, existing): &([u8; 32], RecordKind, host::SelfDeliveryRecordV1)| {
+                        existing == &candidate.2
+                    },
+                ) {
+                    distinct.push(candidate);
+                }
+            }
+            ordered.extend(distinct);
+        } else {
+            let distinct: HashSet<[u8; 32]> = ashes.into_iter().collect();
+            let detail = format!(
+                "send_counter {send_counter}: {} records with {} distinct account_state ashes — rejecting all",
+                group.len(),
+                distinct.len()
+            );
+            // Name every member of the equivocating group (never silent).
+            for (blob_id, record_kind, _) in group {
+                discards.push((
+                    send_counter,
+                    blob_id,
+                    record_kind,
+                    SdrDiscardReason::Equivocation {
+                        detail: detail.clone(),
+                    },
+                ));
+            }
+        }
+    }
+    (ordered, discards)
+}
+
+/// Walk an ascending, unique-per-`send_counter` chain applying check (i)
+/// (`prev_state_head`) and check (v) monotonicity of `occurred_at`.
+///
+/// Does **not** break the loop on a broken link: every broken record is named
+/// and a later record that still chains from the same still-current `prev_ash`
+/// is still evaluated. Only accepted records advance `prev_ash` /
+/// `prev_occurred_at`. The outer record kind is carried without fallback.
+pub(crate) fn apply_ordered_chain(
+    subject: &[u8; 32],
+    nk: &[u8; 32],
+    ordered: Vec<([u8; 32], RecordKind, host::SelfDeliveryRecordV1)>,
+) -> (
+    Vec<AcceptedSdr>,
+    Vec<(u64, [u8; 32], RecordKind, SdrDiscardReason)>,
+) {
+    let mut accepted = Vec::new();
+    let mut discards = Vec::new();
+    let mut prev_ash: Option<host::HashDigest> = None;
+    let mut prev_occurred_at: Option<u64> = None;
+    let mut prev_send_counter: Option<u64> = None;
+
+    for (blob_id, record_kind, record) in ordered {
+        let send_counter = record.account_state.send_counter;
+        let expected_prev = match prev_ash {
+            None => {
+                if send_counter != 1 {
+                    discards.push((
+                        send_counter,
+                        blob_id,
+                        record_kind,
+                        SdrDiscardReason::GenesisCounterInvalid {
+                            detail: format!(
+                                "first post-genesis authenticated counter is {send_counter}, expected 1"
+                            ),
+                        },
+                    ));
+                    continue;
+                }
+                let derived_subject = address(
+                    &record.own_nullifier.pk_create,
+                    record.account_state.nk_commit,
+                );
+                if derived_subject != *subject {
+                    discards.push((
+                        send_counter,
+                        blob_id,
+                        record_kind,
+                        SdrDiscardReason::GenesisIdentityMismatch {
+                            detail: format!(
+                                "address(pk_create, nk_commit) {} != recovery subject {}",
+                                hex::encode(derived_subject),
+                                hex::encode(subject)
+                            ),
+                        },
+                    ));
+                    continue;
+                }
+                match canonical_genesis_account_state_ash(
+                    subject,
+                    nk,
+                    record.own_nullifier.pk_create,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        discards.push((
+                            send_counter,
+                            blob_id,
+                            record_kind,
+                            SdrDiscardReason::PrevStateHeadMismatch {
+                                detail: format!("genesis ash construction failed: {e}"),
+                            },
+                        ));
+                        continue;
+                    }
+                }
+            }
+            Some(a) => a,
+        };
+
+        if let Some(previous) = prev_send_counter {
+            if previous.checked_add(1) != Some(send_counter) {
+                discards.push((
+                    send_counter,
+                    blob_id,
+                    record_kind,
+                    SdrDiscardReason::SendCounterNotSequential {
+                        detail: format!(
+                            "authenticated counter {send_counter} does not immediately follow {previous}"
+                        ),
+                    },
+                ));
+                continue;
+            }
+        }
+
+        if record.prev_state_head != expected_prev {
+            discards.push((
+                send_counter,
+                blob_id,
+                record_kind,
+                SdrDiscardReason::PrevStateHeadMismatch {
+                    detail: format!(
+                        "send_counter {send_counter}: prev_state_head {} ≠ expected {}",
+                        hex::encode(digest_to_bytes(&record.prev_state_head)),
+                        hex::encode(digest_to_bytes(&expected_prev))
+                    ),
+                },
+            ));
+            // Do not advance state; continue so later links from the same head are tried.
+            continue;
+        }
+
+        if prev_occurred_at.is_some_and(|p| record.occurred_at < p) {
+            discards.push((
+                send_counter,
+                blob_id,
+                record_kind,
+                SdrDiscardReason::OccurredAtNotMonotonic {
+                    detail: format!(
+                        "send_counter {send_counter}: occurred_at {} < previous accepted {}",
+                        record.occurred_at,
+                        prev_occurred_at.expect("is_some_and implies Some")
+                    ),
+                },
+            ));
+            continue;
+        }
+
+        // Accept — ash recompute is the same value proven equal to
+        // proof_data.new_account_state_hash by check (ii).
+        let new_ash = match account_state_hash(&record.account_state) {
+            Ok(a) => a,
+            Err(e) => {
+                discards.push((
+                    send_counter,
+                    blob_id,
+                    record_kind,
+                    SdrDiscardReason::PrevStateHeadMismatch {
+                        detail: format!(
+                            "send_counter {send_counter}: account_state_hash failed after chain link: {e}"
+                        ),
+                    },
+                ));
+                continue;
+            }
+        };
+        let occurred_at = record.occurred_at;
+        accepted.push(AcceptedSdr {
+            blob_id,
+            account_state_ash: digest_to_bytes(&new_ash),
+            record,
+        });
+        prev_ash = Some(new_ash);
+        prev_occurred_at = Some(occurred_at);
+        prev_send_counter = Some(send_counter);
+    }
+
+    (accepted, discards)
+}
 
 /// Outcome of classifying + verifying one matched recovery candidate (§4.5 step 5).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,29 +1019,25 @@ pub(crate) enum RecoveredCandidateOutcome {
     CoinProofVerified { blob_id: [u8; 32] },
     /// Incoming CoinProof failed a check — discarded.
     CoinProofDiscarded { error: IncomingError },
-    /// Self-delivery record matched detect_tag, but §4.2 replay is not
-    /// available. **Named** — not silently skipped.
-    SelfDeliveryNamedGap {
+    /// Self-delivery gift-wrap matched this ivk — a candidate for §4.2 replay,
+    /// not yet fetched/decoded. Carries everything `run_recovery_campaign`
+    /// needs to do so without re-parsing the gift-wrap.
+    SelfDeliveryCandidate {
         record_kind: RecordKind,
         blob_id: [u8; 32],
-        status: SdrReplayStatus,
+        holders: Vec<String>,
+        ss: [u8; 32],
+        epk: [u8; 32],
     },
-}
-
-/// One SDR the campaign matched and could not replay — operator-visible.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SdrNamedGap {
-    pub record_kind: RecordKind,
-    pub blob_id: [u8; 32],
-    /// Always [`SDR_REPLAY_STATUS`] today; carried so the report names the gap.
-    pub status: SdrReplayStatus,
 }
 
 /// Operator-visible outcome of one recovery campaign.
 ///
 /// [`Self::restored`] is `true` **only** when the gapless scan is
-/// [`GaplessScanStatus::Complete`]. An incomplete drain never upgrades to
-/// restored, even if some CoinProofs were indexed.
+/// [`GaplessScanStatus::Complete`] **and** every entrusteed subject produced a
+/// non-empty accepted, durably committed chain without an availability gap.
+/// Partial committed heads remain visible for salvage/operator diagnosis, but
+/// never upgrade `restored` when another expected subject is incomplete.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RecoveryRunReport {
     pub scan_status: GaplessScanStatus,
@@ -243,10 +1045,34 @@ pub(crate) struct RecoveryRunReport {
     pub coin_proof_accepted: usize,
     pub coin_proof_rejected: usize,
     pub ignored: usize,
-    /// Matched self-delivery records with [`SdrReplayStatus`] — never silent.
-    pub sdr_named_gaps: Vec<SdrNamedGap>,
-    /// `true` only on a complete scan; incomplete → `false` (fail-closed).
+    /// Every SDR candidate that could not be replayed, across every scanned
+    /// subject — never silently dropped.
+    pub sdr_discards: Vec<SdrDiscard>,
+    /// Output-ref coins folded into the durable self-delivery index this run
+    /// (newly inserted rows only — already-present / not-ours outcomes are not
+    /// counted here but are still traced at debug level, never silent).
+    pub sdr_coins_folded: usize,
+    /// One recovered lineage head per subject whose accepted chain's complete
+    /// fold set committed. Heads may be reported despite an infra gap elsewhere
+    /// for the same subject, but such a gap still gates `restored`.
+    pub replayed_heads: Vec<ReplayedAccountHead>,
+    /// `true` only on a complete scan with successful SDR replay for every
+    /// subject that had candidates; incomplete / empty accepted → `false`.
     pub restored: bool,
+}
+
+fn restored_decision(
+    scan_status: &GaplessScanStatus,
+    expected_subjects: &HashSet<[u8; 32]>,
+    subjects_with_committed_heads: &HashSet<[u8; 32]>,
+    subjects_with_infra_gap: &HashSet<[u8; 32]>,
+) -> bool {
+    matches!(scan_status, GaplessScanStatus::Complete)
+        && !expected_subjects.is_empty()
+        && expected_subjects.iter().all(|subject| {
+            subjects_with_committed_heads.contains(subject)
+                && !subjects_with_infra_gap.contains(subject)
+        })
 }
 
 impl RecoveryRunReport {
@@ -257,7 +1083,9 @@ impl RecoveryRunReport {
             coin_proof_accepted: 0,
             coin_proof_rejected: 0,
             ignored: 0,
-            sdr_named_gaps: Vec::new(),
+            sdr_discards: Vec::new(),
+            sdr_coins_folded: 0,
+            replayed_heads: Vec::new(),
             restored: false,
         }
     }
@@ -455,7 +1283,11 @@ pub(crate) async fn gapless_scan_kind_1059<S: RecoveryRelaySource>(
                 limit: Some(page_limit),
                 ..Filter::default()
             };
-            let page = source.query(url, &filter).await?;
+            let page = match source.query(url, &filter).await {
+                Ok(page) => page,
+                Err(RecoveryError::Relay { .. }) => continue,
+                Err(e) => return Err(e),
+            };
             for event in page.events {
                 if event.kind != KIND_GIFT_WRAP {
                     continue;
@@ -565,9 +1397,9 @@ enum DrainFailure {
 
 /// Limit-free full drain of one second `t` across all relays.
 ///
-/// Filter: `since = t, until = t`, **no** `limit`. Every reachable relay
-/// must return `truncated = false`. If any reachable relay truncates, or
-/// none are reachable, `t` is incomplete — caller must not set
+/// Filter: `since = t, until = t`, **no** `limit`. One reachable relay that
+/// returns `truncated = false` proves the second complete. If all reachable
+/// relays truncate, or none are reachable, caller must not set
 /// `until = t − 1`. The incomplete result always carries the blocking
 /// relay URL(s) so the operator can inspect the right peer.
 async fn drain_timestamp<S: RecoveryRelaySource>(
@@ -586,6 +1418,7 @@ async fn drain_timestamp<S: RecoveryRelaySource>(
     };
 
     let mut reachable: usize = 0;
+    let mut fully_drained_by_any_relay = false;
     let mut truncated_relays: Vec<String> = Vec::new();
     let mut attempted: Vec<String> = Vec::new();
 
@@ -604,6 +1437,8 @@ async fn drain_timestamp<S: RecoveryRelaySource>(
         reachable = reachable.saturating_add(1);
         if page.truncated {
             truncated_relays.push(url.clone());
+        } else {
+            fully_drained_by_any_relay = true;
         }
         for event in page.events {
             if event.kind != KIND_GIFT_WRAP || event.created_at != t {
@@ -620,7 +1455,7 @@ async fn drain_timestamp<S: RecoveryRelaySource>(
             relay_urls: attempted,
         });
     }
-    if !truncated_relays.is_empty() {
+    if !fully_drained_by_any_relay {
         return Err(DrainFailure::Incomplete {
             relay_urls: truncated_relays,
         });
@@ -636,15 +1471,15 @@ async fn drain_timestamp<S: RecoveryRelaySource>(
 /// existing §2.3.3 checks in [`verify_coin_proof_for_index`].
 ///
 /// Self-delivery payloads are **not** ignored: they are returned as
-/// [`RecoveredCandidateOutcome::SelfDeliveryNamedGap`] so recovery cannot
-/// silently claim a balance it cannot rebuild from SDRs.
+/// [`RecoveredCandidateOutcome::SelfDeliveryCandidate`] so the campaign can
+/// fetch/decode/verify/order them (never silent).
 ///
 /// Blob fetch / ZBE open for CoinProof is the caller's responsibility when
 /// assembling a [`CoinProof`]; this function is the pure verify gate once
 /// the plaintext bundle is in hand (same split as the receive path's
 /// decode-then-verify). For detect-only classification without a blob, pass
-/// `opened_coin_proof = None` — a match with `record_kind` still names the
-/// SDR gap; a CoinProof match without plaintext is reported as discarded.
+/// `opened_coin_proof = None` — a match with `record_kind` still yields a
+/// candidate; a CoinProof match without plaintext is reported as discarded.
 pub(crate) fn verify_recovered_candidate(
     wrap: &Event,
     ivk: &[u8; 32],
@@ -667,8 +1502,8 @@ pub(crate) fn verify_recovered_candidate(
             };
         }
     };
-    match match_detect_tag(ivk, &outer_dt, &epk) {
-        Ok(_) => {}
+    let (ss, _) = match match_detect_tag(ivk, &outer_dt, &epk) {
+        Ok(v) => v,
         Err(IncomingError::DetectTagMismatch { .. }) => {
             return RecoveredCandidateOutcome::Ignored {
                 reason: "detect_tag not for this ivk",
@@ -677,7 +1512,7 @@ pub(crate) fn verify_recovered_candidate(
         Err(e) => {
             return RecoveredCandidateOutcome::CoinProofDiscarded { error: e };
         }
-    }
+    };
 
     // Unwrap to read the delivery payload (kind-1420). Failure is discard.
     let unwrapped = match unwrap_gift(wrap, ivk) {
@@ -702,14 +1537,18 @@ pub(crate) fn verify_recovered_candidate(
         }
     };
 
-    // Self-delivery: name the gap — do not treat as CoinProof, do not ignore.
+    // Self-delivery: queue for §4.2 replay — do not treat as CoinProof, do not ignore.
     if let Some(record_kind) = payload.record_kind {
-        return RecoveredCandidateOutcome::SelfDeliveryNamedGap {
+        return RecoveredCandidateOutcome::SelfDeliveryCandidate {
             record_kind,
             blob_id: payload.blob_id,
-            status: SDR_REPLAY_STATUS,
+            holders: payload.holders,
+            ss,
+            epk,
         };
     }
+    // CoinProof path does not use the detect-tag shared secret further.
+    let _ = ss;
 
     // CoinProof path: §2.3.3 via the **existing** verify function only.
     let Some(cp) = opened_coin_proof else {
@@ -728,8 +1567,235 @@ pub(crate) fn verify_recovered_candidate(
 }
 
 // ---------------------------------------------------------------------------
+// Output-coin fold — reproduce the ONLINE self-delivery index rows exactly
+// ---------------------------------------------------------------------------
+
+/// Map a host `RecordKind` (SDR wire) to the delivery-payload `RecordKind`
+/// used in recovery reports.
+fn delivery_record_kind(k: host::RecordKind) -> RecordKind {
+    match k {
+        host::RecordKind::Mint => RecordKind::Mint,
+        host::RecordKind::Send => RecordKind::Send,
+        host::RecordKind::Receive => RecordKind::Receive,
+    }
+}
+
+fn verify_delivery_record_kind(
+    outer: RecordKind,
+    record: &host::SelfDeliveryRecordV1,
+) -> Result<(), SdrDiscardReason> {
+    let inner = delivery_record_kind(record.record_kind);
+    if inner != outer {
+        return Err(SdrDiscardReason::RecordKindMismatch {
+            detail: format!("outer {outer:?} != decoded SDR {inner:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Map a host `RecordKind` to the durable `TransitionKind` (same mapping as
+/// `signature.rs` online writer: 0x01/Mint, 0x02/Send, 0x03/Receive).
+fn transition_kind_from_host_record_kind(k: host::RecordKind) -> TransitionKind {
+    match k {
+        host::RecordKind::Mint => TransitionKind::Mint,
+        host::RecordKind::Send => TransitionKind::Send,
+        host::RecordKind::Receive => TransitionKind::Receive,
+    }
+}
+
+/// Subject + OVK for output-ref fold (OVK recovers `K_tx` from `out_ciphertext`).
+///
+/// No [`Debug`]: `ovk` is a secret (never log this bag).
+#[derive(Clone, Copy)]
+pub(crate) struct FoldOutputRefSecrets<'a> {
+    pub subject: &'a [u8; 32],
+    pub ovk: &'a [u8; 32],
+}
+
+/// Durable SQL store for the fold write path.
+///
+/// Argument group (clippy `too_many_arguments`), not pure config.
+#[derive(Clone, Copy)]
+pub(crate) struct FoldOutputRefStores<'a> {
+    pub pool: &'a sqlx::PgPool,
+}
+
+fn verify_fold_static_bindings(
+    cp: &CoinProof,
+    oref: &host::OutputRef,
+    accepted_record: &host::SelfDeliveryRecordV1,
+) -> Result<[u8; 32], SdrDiscardReason> {
+    let coin_id = digest_to_bytes(&cp.coin.identifier);
+    if coin_id != oref.coin_id {
+        return Err(SdrDiscardReason::FoldCoinIdMismatch {
+            detail: format!(
+                "CoinProof coin.identifier {} != OutputRef coin_id {}",
+                hex::encode(coin_id),
+                hex::encode(oref.coin_id)
+            ),
+        });
+    }
+    if cp.epk != oref.epk {
+        return Err(SdrDiscardReason::FoldEpkMismatch {
+            detail: format!(
+                "CoinProof epk {} != OutputRef epk {}",
+                hex::encode(cp.epk),
+                hex::encode(oref.epk)
+            ),
+        });
+    }
+    if cp.creating_nullifier != accepted_record.own_nullifier {
+        return Err(SdrDiscardReason::FoldCreatingTransitionMismatch {
+            detail: "CoinProof creating_nullifier != accepted SDR own_nullifier".into(),
+        });
+    }
+    Ok(coin_id)
+}
+
+/// Fetch, decrypt, bind, and verify one output ref without writing it.
+async fn stage_output_ref_inner(
+    stores: FoldOutputRefStores<'_>,
+    bridge: &ProverBridge,
+    secrets: FoldOutputRefSecrets<'_>,
+    accepted_record: &host::SelfDeliveryRecordV1,
+    transition_kind: TransitionKind,
+    oref: &host::OutputRef,
+    max_blob_bytes: u64,
+    verify: impl FnOnce(&CoinProof) -> Result<(), IncomingError>,
+) -> Result<StagedFoldOutcome, SdrDiscardReason> {
+    // 1. Recover K_tx from out_ciphertext under K_out (OVK path).
+    let k_out =
+        derive_out_key(secrets.ovk, &oref.epk).map_err(|e| SdrDiscardReason::ZbeOpenFailed {
+            detail: format!("derive_out_key: {e}"),
+        })?;
+    let payload = String::from_utf8(oref.out_ciphertext.clone()).map_err(|e| {
+        SdrDiscardReason::ZbeOpenFailed {
+            detail: format!("out_ciphertext is not UTF-8: {e}"),
+        }
+    })?;
+    let sealed = nip44::decrypt(&k_out, &payload).map_err(|e| SdrDiscardReason::ZbeOpenFailed {
+        detail: format!("NIP-44 decrypt out_ciphertext: {e}"),
+    })?;
+    let k_tx_vec =
+        envelope_open(&sealed, ENVELOPE_LABEL_K_TX, OUT_CIPHERTEXT_LEN).map_err(|e| {
+            SdrDiscardReason::ZbeOpenFailed {
+                detail: format!("envelope_open K_tx: {e}"),
+            }
+        })?;
+    let k_tx: [u8; 32] =
+        k_tx_vec
+            .try_into()
+            .map_err(|v: Vec<u8>| SdrDiscardReason::ZbeOpenFailed {
+                detail: format!(
+                    "K_tx length {} ≠ {OUT_CIPHERTEXT_LEN} after envelope_open",
+                    v.len()
+                ),
+            })?;
+
+    // 2. Fetch the coin's own ZBE blob.
+    let client = BlossomClient::new(max_blob_bytes).map_err(|e| SdrDiscardReason::FetchFailed {
+        detail: format!("BlossomClient: {e}"),
+    })?;
+    let (zbe_ciphertext, _attempts) =
+        fetch_blob_from_holders(&client, &oref.blob_id, &oref.blob_locators.holders)
+            .await
+            .map_err(|e| SdrDiscardReason::FetchFailed {
+                detail: e.to_string(),
+            })?;
+
+    // 3. ZBE-open under recovered K_tx.
+    let plaintext =
+        zbe_open(&k_tx, &zbe_ciphertext).map_err(|e| SdrDiscardReason::ZbeOpenFailed {
+            detail: format!("zbe_open coin blob: {e}"),
+        })?;
+
+    // 4. Deserialize CoinProof.
+    let cp = deserialize_coin_proof(&plaintext).map_err(|e| SdrDiscardReason::DecodeFailed {
+        detail: format!("deserialize_coin_proof: {e}"),
+    })?;
+
+    // 5. Not ours → ok, not an error.
+    if cp.coin.recipient.0 != *secrets.subject {
+        return Ok(StagedFoldOutcome::NotOurs);
+    }
+
+    // 6. Bind the fetched CoinProof to the OutputRef and accepted SDR.
+    let coin_id = verify_fold_static_bindings(&cp, oref, accepted_record)?;
+    let (creating_pd, _) =
+        load_verify_transition_public_inputs(bridge, &cp.proof, "fold CoinProof creating proof")
+            .map_err(|e| SdrDiscardReason::FoldCreatingTransitionMismatch {
+                detail: e.to_string(),
+            })?;
+    if creating_pd != accepted_record.proof_data {
+        return Err(SdrDiscardReason::FoldCreatingTransitionMismatch {
+            detail: "CoinProof creating ProofData != accepted SDR proof_data".into(),
+        });
+    }
+
+    let coin_ciphertext = String::from_utf8(cp.ciphertext.clone()).map_err(|e| {
+        SdrDiscardReason::FoldCiphertextBindingFailed {
+            detail: format!("CoinProof ciphertext is not UTF-8: {e}"),
+        }
+    })?;
+    let coin_sealed = nip44::decrypt(&k_tx, &coin_ciphertext).map_err(|e| {
+        SdrDiscardReason::FoldCiphertextBindingFailed {
+            detail: format!("NIP-44 decrypt CoinProof ciphertext: {e}"),
+        }
+    })?;
+    let opened_coin = envelope_open(&coin_sealed, ENVELOPE_LABEL_COIN, COIN_CIPHERTEXT_LEN)
+        .map_err(|e| SdrDiscardReason::FoldCiphertextBindingFailed {
+            detail: format!("envelope_open coin: {e}"),
+        })?;
+    if opened_coin.as_slice() != serialize_coin(&cp.coin).as_slice() {
+        return Err(SdrDiscardReason::FoldCiphertextBindingFailed {
+            detail: "opened CoinProof ciphertext != serialize_coin(cp.coin)".into(),
+        });
+    }
+
+    // 7. Same §2.3.3 verify as the online receive path.
+    verify(&cp).map_err(|e| SdrDiscardReason::DecodeFailed {
+        detail: format!("coin proof verify: {e}"),
+    })?;
+
+    // 8. Idempotent durable presence check.
+    if get_self_delivery_by_subject_coin(stores.pool, secrets.subject, &coin_id)
+        .await
+        .map_err(|e| SdrDiscardReason::IndexLookupFailed {
+            detail: format!("index presence lookup: {e:#}"),
+        })?
+        .is_some()
+    {
+        return Ok(StagedFoldOutcome::AlreadyPresent { coin_id });
+    }
+
+    // 9. Stage EXACTLY the online row shape (signature.rs:1542-1557).
+    let row = SelfDeliveryIndexRow {
+        record_id: decrypt_record_id(secrets.subject, &coin_id, &oref.blob_id),
+        subject: *secrets.subject,
+        coin_id,
+        blob_id: oref.blob_id,
+        detect_tag: digest_to_bytes(&cp.detect_tag),
+        canonical: plaintext,
+        asset_id: digest_to_bytes(&cp.coin.asset_id),
+        transition_kind,
+        occurred_at: 0,
+    };
+    Ok(StagedFoldOutcome::Row(row))
+}
+
+// ---------------------------------------------------------------------------
 // Production campaign — scan + classify + decrypt-index fill
 // ---------------------------------------------------------------------------
+
+/// One self-delivery gift-wrap candidate queued during classify for §4.2 replay.
+#[derive(Clone, Debug)]
+pub(crate) struct SdrGiftWrapCandidate {
+    pub record_kind: RecordKind,
+    pub blob_id: [u8; 32],
+    pub holders: Vec<String>,
+    pub ss: [u8; 32],
+    pub epk: [u8; 32],
+}
 
 /// Dependencies for one background recovery campaign (runtime-owned handles).
 pub(crate) struct RecoveryCampaignDeps {
@@ -744,14 +1810,16 @@ pub(crate) struct RecoveryCampaignDeps {
 }
 
 /// Wait for at least one entrusteed operational bundle, then run one recovery
-/// campaign: gapless scan → per-event classify (SDR named) → receive-path
-/// verify + durable decrypt-index fill.
+/// campaign: gapless scan → per-event classify (SDR candidates + CoinProof
+/// receive path) → §4.2 VERIFY-ONLY SDR replay + output-coin fold.
 ///
 /// # Fail-closed restored claim
 ///
 /// * No seed relays / no bundle → [`RecoveryError`] (caller logs; not restored).
 /// * Scan [`GaplessScanStatus::Incomplete`] → report with `restored = false`.
-/// * Only [`GaplessScanStatus::Complete`] may set `restored = true`.
+/// * Complete scan **and** every expected subject got a recovered head that
+///   was installed and persisted (or was already present at or beyond that
+///   head) → may set `restored = true`.
 ///
 /// Partial CoinProof indexing on an incomplete scan is still attempted (useful
 /// salvage) but **never** upgrades the restored flag.
@@ -825,32 +1893,43 @@ pub(crate) async fn run_recovery_campaign(
     let bridge = deps.adapter.bridge();
     let mut rng = OsSecureRandom;
 
+    // Per-subject SDR candidates collected during classify (replayed after the
+    // CoinProof loop so fetch/ZBE does not interleave with receive-path work).
+    let mut sdr_candidates: HashMap<[u8; 32], Vec<SdrGiftWrapCandidate>> = HashMap::new();
+
     for event in &scan.events {
         for (subject, bundle) in &active {
-            // Classify first so SDR matches are named with SdrReplayStatus
+            // Classify first so SDR matches are queued for §4.2 replay
             // (the receive path silently ignores record_kind).
             let classified = deps.adapter.with_engine(|engine| {
                 verify_recovered_candidate(event, &bundle.ivk, &subject.0, engine, &bridge, None)
             });
             match classified {
-                RecoveredCandidateOutcome::SelfDeliveryNamedGap {
+                RecoveredCandidateOutcome::SelfDeliveryCandidate {
                     record_kind,
                     blob_id,
-                    status,
+                    holders,
+                    ss,
+                    epk,
                 } => {
-                    tracing::warn!(
+                    tracing::info!(
                         subject = %hex::encode(subject.0),
                         blob_id = %hex::encode(blob_id),
                         record_kind = ?record_kind,
-                        status = ?status,
-                        "§4.5 recovery: SelfDeliveryRecord matched but SDR replay \
-                         is unavailable — named gap, not credited, not ignored"
+                        holders = holders.len(),
+                        "§4.5 recovery: SelfDeliveryRecord matched — queued as \
+                         SDR replay candidate"
                     );
-                    report.sdr_named_gaps.push(SdrNamedGap {
-                        record_kind,
-                        blob_id,
-                        status,
-                    });
+                    sdr_candidates
+                        .entry(subject.0)
+                        .or_default()
+                        .push(SdrGiftWrapCandidate {
+                            record_kind,
+                            blob_id,
+                            holders,
+                            ss,
+                            epk,
+                        });
                     continue;
                 }
                 RecoveredCandidateOutcome::Ignored { .. } => {
@@ -922,30 +2001,645 @@ pub(crate) async fn run_recovery_campaign(
         }
     }
 
-    // Restored only on a complete gapless scan. Incomplete stays false.
-    report.restored = matches!(report.scan_status, GaplessScanStatus::Complete);
+    // -----------------------------------------------------------------------
+    // §4.2 SDR replay phase — per subject with collected candidates
+    // -----------------------------------------------------------------------
+    let subjects_with_heads: HashSet<[u8; 32]> = {
+        let mut heads = HashSet::new();
+        for (subject, bundle) in &active {
+            let Some(candidates) = sdr_candidates.get(&subject.0) else {
+                continue;
+            };
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let mut subject_coins_folded: usize = 0;
+            let mut survivors: Vec<([u8; 32], RecordKind, host::SelfDeliveryRecordV1)> = Vec::new();
+
+            // (a) fetch + ZBE-open + deserialize each candidate
+            for candidate in candidates {
+                let client = match BlossomClient::new(deps.max_blob_bytes) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        report.sdr_discards.push(SdrDiscard {
+                            subject: subject.0,
+                            blob_id: candidate.blob_id,
+                            record_kind: candidate.record_kind,
+                            send_counter: None,
+                            reason: SdrDiscardReason::FetchFailed {
+                                detail: format!("BlossomClient: {e}"),
+                            },
+                        });
+                        continue;
+                    }
+                };
+                let zbe_ciphertext =
+                    match fetch_blob_from_holders(&client, &candidate.blob_id, &candidate.holders)
+                        .await
+                    {
+                        Ok((body, _)) => body,
+                        Err(e) => {
+                            report.sdr_discards.push(SdrDiscard {
+                                subject: subject.0,
+                                blob_id: candidate.blob_id,
+                                record_kind: candidate.record_kind,
+                                send_counter: None,
+                                reason: SdrDiscardReason::FetchFailed {
+                                    detail: e.to_string(),
+                                },
+                            });
+                            continue;
+                        }
+                    };
+                let k_tx = match derive_note_key(&candidate.ss, &candidate.epk) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        report.sdr_discards.push(SdrDiscard {
+                            subject: subject.0,
+                            blob_id: candidate.blob_id,
+                            record_kind: candidate.record_kind,
+                            send_counter: None,
+                            reason: SdrDiscardReason::ZbeOpenFailed {
+                                detail: format!("derive_note_key: {e}"),
+                            },
+                        });
+                        continue;
+                    }
+                };
+                let plaintext = match zbe_open(&k_tx, &zbe_ciphertext) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        report.sdr_discards.push(SdrDiscard {
+                            subject: subject.0,
+                            blob_id: candidate.blob_id,
+                            record_kind: candidate.record_kind,
+                            send_counter: None,
+                            reason: SdrDiscardReason::ZbeOpenFailed {
+                                detail: format!("zbe_open SDR: {e}"),
+                            },
+                        });
+                        continue;
+                    }
+                };
+                let record = match deserialize_self_delivery_record(&plaintext) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        report.sdr_discards.push(SdrDiscard {
+                            subject: subject.0,
+                            blob_id: candidate.blob_id,
+                            record_kind: candidate.record_kind,
+                            send_counter: None,
+                            reason: SdrDiscardReason::DecodeFailed {
+                                detail: format!("deserialize_self_delivery_record: {e}"),
+                            },
+                        });
+                        continue;
+                    }
+                };
+
+                if let Err(reason) = verify_delivery_record_kind(candidate.record_kind, &record) {
+                    report.sdr_discards.push(SdrDiscard {
+                        subject: subject.0,
+                        blob_id: candidate.blob_id,
+                        record_kind: candidate.record_kind,
+                        send_counter: Some(record.send_counter),
+                        reason,
+                    });
+                    continue;
+                }
+
+                // (b) Subject/proof checks run before the mutex; only NfLog
+                // access is performed under the short engine borrow.
+                let (pk_create, r_create) =
+                    match verify_sdr_record_pre_engine(&bridge, &subject.0, &bundle.nk, &record) {
+                        Ok(values) => values,
+                        Err(reason) => {
+                            report.sdr_discards.push(SdrDiscard {
+                                subject: subject.0,
+                                blob_id: candidate.blob_id,
+                                record_kind: candidate.record_kind,
+                                send_counter: Some(record.send_counter),
+                                reason,
+                            });
+                            continue;
+                        }
+                    };
+                let inclusion_height = match deps.adapter.with_engine(|engine| {
+                    verify_sdr_record_engine_checks(engine, pk_create, r_create)
+                }) {
+                    Ok(height) => height,
+                    Err(reason) => {
+                        report.sdr_discards.push(SdrDiscard {
+                            subject: subject.0,
+                            blob_id: candidate.blob_id,
+                            record_kind: candidate.record_kind,
+                            send_counter: Some(record.send_counter),
+                            reason,
+                        });
+                        continue;
+                    }
+                };
+                if let Err(reason) = verify_sdr_record_checks_v_vi_async(
+                    deps.pool.as_ref(),
+                    inclusion_height,
+                    &record,
+                )
+                .await
+                {
+                    report.sdr_discards.push(SdrDiscard {
+                        subject: subject.0,
+                        blob_id: candidate.blob_id,
+                        record_kind: candidate.record_kind,
+                        send_counter: Some(record.send_counter),
+                        reason,
+                    });
+                    continue;
+                }
+
+                survivors.push((candidate.blob_id, candidate.record_kind, record));
+            }
+
+            // (c) order + chain
+            let (ordered, eq_discards) = resolve_equivocation_and_order(survivors);
+            for (send_counter, blob_id, record_kind, reason) in eq_discards {
+                report.sdr_discards.push(SdrDiscard {
+                    subject: subject.0,
+                    blob_id,
+                    record_kind,
+                    send_counter: Some(send_counter),
+                    reason,
+                });
+            }
+
+            let (accepted, chain_discards) = apply_ordered_chain(&subject.0, &bundle.nk, ordered);
+            for (send_counter, blob_id, record_kind, reason) in chain_discards {
+                report.sdr_discards.push(SdrDiscard {
+                    subject: subject.0,
+                    blob_id,
+                    record_kind,
+                    send_counter: Some(send_counter),
+                    reason,
+                });
+            }
+
+            // (d) Verify and stage every output_ref before any subject write.
+            let mut staged_rows = Vec::new();
+            let mut fold_failed = false;
+            for accepted_sdr in &accepted {
+                let tk = transition_kind_from_host_record_kind(accepted_sdr.record.record_kind);
+                let rk = delivery_record_kind(accepted_sdr.record.record_kind);
+                for oref in &accepted_sdr.record.output_refs {
+                    // Engine borrow cannot span blob I/O (`with_engine` is sync);
+                    // Campaign staging runs verify under a short engine borrow.
+                    let outcome = stage_output_ref_via_adapter(
+                        &deps,
+                        &bridge,
+                        FoldOutputRefSecrets {
+                            subject: &subject.0,
+                            ovk: &bundle.ovk,
+                        },
+                        &accepted_sdr.record,
+                        tk,
+                        oref,
+                    )
+                    .await;
+                    match outcome {
+                        Ok(StagedFoldOutcome::Row(row)) => staged_rows.push(row),
+                        Ok(StagedFoldOutcome::AlreadyPresent { coin_id }) => {
+                            tracing::debug!(
+                                subject = %hex::encode(subject.0),
+                                coin_id = %hex::encode(coin_id),
+                                oref_blob = %hex::encode(oref.blob_id),
+                                "§4.5 recovery: output_ref already present in self-delivery index"
+                            );
+                        }
+                        Ok(StagedFoldOutcome::NotOurs) => {
+                            tracing::debug!(
+                                subject = %hex::encode(subject.0),
+                                oref_blob = %hex::encode(oref.blob_id),
+                                "§4.5 recovery: output_ref recipient ≠ subject (NotOurs)"
+                            );
+                        }
+                        Err(reason) => {
+                            fold_failed = true;
+                            report.sdr_discards.push(SdrDiscard {
+                                subject: subject.0,
+                                blob_id: oref.blob_id,
+                                record_kind: rk,
+                                send_counter: Some(accepted_sdr.record.send_counter),
+                                reason,
+                            });
+                        }
+                    }
+                }
+            }
+
+            if fold_failed {
+                tracing::warn!(
+                    subject = %hex::encode(subject.0),
+                    staged_rows = staged_rows.len(),
+                    "§4.5 recovery: subject fold verification failed; staged batch discarded"
+                );
+                continue;
+            }
+
+            let durable = match insert_and_mirror_self_delivery_batch(
+                deps.pool.as_ref(),
+                deps.index.as_ref(),
+                &staged_rows,
+            )
+            .await
+            {
+                Ok(outcomes) => outcomes,
+                Err(e) => {
+                    let Some(last) = accepted.last() else {
+                        continue;
+                    };
+                    report.sdr_discards.push(SdrDiscard {
+                        subject: subject.0,
+                        blob_id: last.blob_id,
+                        record_kind: delivery_record_kind(last.record.record_kind),
+                        send_counter: Some(last.record.send_counter),
+                        reason: SdrDiscardReason::FoldCommitFailed {
+                            detail: format!("per-subject transaction: {e:#}"),
+                        },
+                    });
+                    continue;
+                }
+            };
+            for (row, outcome) in durable {
+                if outcome == InsertRecordOutcome::Inserted {
+                    subject_coins_folded = subject_coins_folded.saturating_add(1);
+                    report.sdr_coins_folded = report.sdr_coins_folded.saturating_add(1);
+                    tracing::debug!(
+                        subject = %hex::encode(subject.0),
+                        coin_id = %hex::encode(row.coin_id),
+                        oref_blob = %hex::encode(row.blob_id),
+                        "§4.5 recovery: staged output_ref committed in subject batch"
+                    );
+                }
+            }
+
+            // (e) report head from last accepted (highest send_counter, ascending walk)
+            if let Some(last) = accepted.last() {
+                report.replayed_heads.push(ReplayedAccountHead {
+                    subject: subject.0,
+                    record_kind: delivery_record_kind(last.record.record_kind),
+                    send_counter: last.record.send_counter,
+                    account_state: last.record.account_state.clone(),
+                    account_state_ash: last.account_state_ash,
+                    recursive_proof: last.record.recursive_proof.clone(),
+                    proof_data: last.record.proof_data.clone(),
+                    inclusion_block: last.record.inclusion_block,
+                    occurred_at: last.record.occurred_at,
+                });
+                match install_and_persist_recovered_head(
+                    &deps, &bridge, subject.0, bundle, &accepted,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        heads.insert(subject.0);
+                    }
+                    Err(reason) => {
+                        tracing::error!(
+                            subject = %hex::encode(subject.0),
+                            reason = %reason,
+                            "§4.5 recovery: SDR replay verified a head but it could not be \
+                             installed or persisted — head is reported for salvage/diagnosis \
+                             but this subject is not restored"
+                        );
+                        report.sdr_discards.push(SdrDiscard {
+                            subject: subject.0,
+                            blob_id: last.blob_id,
+                            record_kind: delivery_record_kind(last.record.record_kind),
+                            send_counter: Some(last.record.send_counter),
+                            reason,
+                        });
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    subject = %hex::encode(subject.0),
+                    candidates = candidates.len(),
+                    subject_coins_folded,
+                    "§4.5 recovery: SDR candidates present but no accepted chain \
+                     — no replayed head for this subject"
+                );
+            }
+        }
+        heads
+    };
+
+    let expected_subjects: HashSet<[u8; 32]> =
+        active.iter().map(|(subject, _)| subject.0).collect();
+    let subjects_with_infra_gap: HashSet<[u8; 32]> = report
+        .sdr_discards
+        .iter()
+        .filter(|discard| discard.reason.is_infra_availability())
+        .map(|discard| discard.subject)
+        .collect();
+    let sdr_replay_ok = expected_subjects.iter().all(|subject| {
+        subjects_with_heads.contains(subject) && !subjects_with_infra_gap.contains(subject)
+    });
+    report.restored = restored_decision(
+        &report.scan_status,
+        &expected_subjects,
+        &subjects_with_heads,
+        &subjects_with_infra_gap,
+    );
+
     if report.restored {
         tracing::info!(
             accepted = report.coin_proof_accepted,
             rejected = report.coin_proof_rejected,
             ignored = report.ignored,
-            sdr_gaps = report.sdr_named_gaps.len(),
-            sdr_replay = ?SDR_REPLAY_STATUS,
-            "§4.5 recovery campaign finished — scan complete; restored=true \
-             (SDR replay status included above; gaps are named not credited)"
+            sdr_discards = report.sdr_discards.len(),
+            sdr_coins_folded = report.sdr_coins_folded,
+            replayed_heads = report.replayed_heads.len(),
+            "§4.5 recovery campaign finished — scan complete and SDR replay \
+             installed and persisted a head for every expected subject; restored=true"
         );
     } else {
         tracing::error!(
             accepted = report.coin_proof_accepted,
             rejected = report.coin_proof_rejected,
-            sdr_gaps = report.sdr_named_gaps.len(),
+            sdr_discards = report.sdr_discards.len(),
+            sdr_coins_folded = report.sdr_coins_folded,
+            replayed_heads = report.replayed_heads.len(),
             scan_status = ?report.scan_status,
+            sdr_replay_ok,
             "§4.5 recovery campaign finished — restored=false (incomplete scan \
-             or incomplete prerequisites); operator must not treat this node as \
-             fully recovered"
+             or SDR replay could not install and persist a gap-free head for every \
+             expected subject); operator must not treat this node as fully recovered"
         );
     }
     Ok(report)
+}
+
+/// Campaign staging path: verifies without writing and obtains `&StateEngine`
+/// only for the §2.3.3 gate via a short sync borrow.
+async fn stage_output_ref_via_adapter(
+    deps: &RecoveryCampaignDeps,
+    bridge: &ProverBridge,
+    secrets: FoldOutputRefSecrets<'_>,
+    accepted_record: &host::SelfDeliveryRecordV1,
+    transition_kind: TransitionKind,
+    oref: &host::OutputRef,
+) -> Result<StagedFoldOutcome, SdrDiscardReason> {
+    stage_output_ref_inner(
+        FoldOutputRefStores {
+            pool: deps.pool.as_ref(),
+        },
+        bridge,
+        secrets,
+        accepted_record,
+        transition_kind,
+        oref,
+        deps.max_blob_bytes,
+        |cp| {
+            deps.adapter.with_engine(|engine| {
+                verify_coin_proof_for_index(engine, bridge, cp, secrets.subject)
+            })
+        },
+    )
+    .await
+}
+
+/// §4.5 step 6: reconstruct the full `AccountRecord` for `subject` from the
+/// accepted, ordered, already-fold-committed SDR chain, install it into the
+/// live engine, and durably persist. VERIFY-ONLY — never proves anything;
+/// `last_proof` is bound from the already-recovered/verified `recursive_proof`
+/// bytes, never freshly generated.
+///
+/// Idempotent across repeat campaign runs: if the engine already holds this
+/// subject at a send_counter >= the reconstructed head's, this is a no-op
+/// success (already installed). If it holds an *older* account, that is a
+/// fail-closed contradiction (no in-place update path exists for a live
+/// account — this task never adds one).
+async fn install_and_persist_recovered_head(
+    deps: &RecoveryCampaignDeps,
+    bridge: &ProverBridge,
+    subject: [u8; 32],
+    bundle: &OperationalBundle,
+    accepted: &[AcceptedSdr],
+) -> Result<(), SdrDiscardReason> {
+    let owner = Address(subject);
+    let head = accepted
+        .last()
+        .expect("caller checked accepted is non-empty");
+    let genesis = accepted.first().expect("non-empty implies a first element");
+
+    let existing_send_counter = deps
+        .adapter
+        .with_engine(|engine| engine.account(&owner).map(|r| r.state.send_counter));
+    if let Some(existing) = existing_send_counter {
+        if existing >= head.record.account_state.send_counter {
+            tracing::info!(
+                subject = %hex::encode(subject),
+                existing_send_counter = existing,
+                head_send_counter = head.record.account_state.send_counter,
+                "§4.5 recovery: engine already holds this subject at or beyond the \
+                 reconstructed head — treating as already installed"
+            );
+            return Ok(());
+        }
+        return Err(SdrDiscardReason::HeadReconstructionFailed {
+            detail: format!(
+                "engine already holds account at send_counter {existing}, behind the \
+                 reconstructed head {} — no in-place account update path exists; refusing \
+                 to overwrite (nothing was changed)",
+                head.record.account_state.send_counter
+            ),
+        });
+    }
+
+    // 1. Admitted coin universe: this account's own self-created outputs
+    // (durably folded just above, across every accepted SDR, not only the
+    // head) plus every independently verified received CoinProof.
+    let self_rows = super::db_self_delivery_index::list_by_subject(deps.pool.as_ref(), &subject)
+        .await
+        .map_err(|e| SdrDiscardReason::IndexLookupFailed {
+            detail: format!("list self-delivery rows for head install: {e:#}"),
+        })?;
+    let received_rows = super::db_decrypt_index::list_by_subject(deps.pool.as_ref(), &subject)
+        .await
+        .map_err(|e| SdrDiscardReason::IndexLookupFailed {
+            detail: format!("list decrypt-index rows for head install: {e:#}"),
+        })?;
+
+    let mut coin_sources: BTreeMap<[u8; 32], CoinProof> = BTreeMap::new();
+    for row in &self_rows {
+        let cp =
+            deserialize_coin_proof(&row.canonical).map_err(|e| SdrDiscardReason::DecodeFailed {
+                detail: format!(
+                    "self-delivery canonical decode for coin {}: {e}",
+                    hex::encode(row.coin_id)
+                ),
+            })?;
+        coin_sources.insert(row.coin_id, cp);
+    }
+    for row in &received_rows {
+        let cp =
+            deserialize_coin_proof(&row.canonical).map_err(|e| SdrDiscardReason::DecodeFailed {
+                detail: format!(
+                    "decrypt-index canonical decode for coin {}: {e}",
+                    hex::encode(row.coin_id)
+                ),
+            })?;
+        coin_sources.entry(row.coin_id).or_insert(cp);
+    }
+
+    // 2. Spent set: union of `spent_or_folded_coin_ids` across every accepted
+    // SDR in the reconstructed lineage (not only the head).
+    let mut spent_ids: BTreeSet<[u8; 32]> = BTreeSet::new();
+    for sdr in accepted {
+        for id in &sdr.record.spent_or_folded_coin_ids {
+            spent_ids.insert(*id);
+        }
+    }
+
+    // 3. Spendable = admitted \ spent, with TrackedCoin sourced from the
+    // matching CoinProof (coin_index from its inclusion_proof leaf_index).
+    let mut spendable: Vec<([u8; 32], TrackedCoin)> = Vec::new();
+    for (coin_id, cp) in &coin_sources {
+        if spent_ids.contains(coin_id) {
+            continue;
+        }
+        let inclusion =
+            super::incoming::parse_inclusion_proof_wire(&cp.inclusion_proof).map_err(|e| {
+                SdrDiscardReason::DecodeFailed {
+                    detail: format!("coin {} inclusion_proof parse: {e}", hex::encode(coin_id)),
+                }
+            })?;
+        spendable.push((
+            *coin_id,
+            TrackedCoin {
+                coin: cp.coin.clone(),
+                creating_prev_ash: cp.creating_prev_ash,
+                coin_index: inclusion.leaf_index,
+            },
+        ));
+    }
+
+    // 4. NAV opening + canonical nullifier position for the head transition
+    // itself, resolved under one live-engine read borrow.
+    let entry_send_counter = head
+        .record
+        .account_state
+        .send_counter
+        .checked_sub(1)
+        .expect("apply_ordered_chain guarantees an accepted head's send_counter >= 1");
+    let nav_rand = OpSecret::new(bundle.op_secret).derive_nav_rand(entry_send_counter);
+    let target_nav_commitment = head.record.proof_data.nav_commitment;
+    let head_pk_create = head.record.own_nullifier.pk_create;
+    let head_r_create = head.record.own_nullifier.r_create;
+
+    let engine_result = deps.adapter.with_engine(|engine| {
+        let nav = reconstruct_nav_opening(engine, nav_rand, target_nav_commitment);
+        let pos = match engine.nflog().lookup(head_pk_create) {
+            LookupResult::Present { pos, r, .. } if r == head_r_create => Some(pos),
+            _ => None,
+        };
+        (nav, pos)
+    });
+    let (nav_opening, nullifier_pos) = match engine_result {
+        (Some(nav), Some(pos)) => (nav, pos),
+        (None, _) => {
+            return Err(SdrDiscardReason::HeadReconstructionFailed {
+                detail: "no canonical NfLog prefix this node has scanned opens the head \
+                         transition's nav_commitment"
+                    .into(),
+            });
+        }
+        (_, None) => {
+            return Err(SdrDiscardReason::HeadReconstructionFailed {
+                detail: "head own_nullifier is no longer a first-occurrence match on this \
+                         node's live NfLog at install time"
+                    .into(),
+            });
+        }
+    };
+
+    // 5. Bind the recovered native-wire proof bytes to circuit-C identity —
+    // load only, never re-proves (VERIFY-ONLY).
+    let last_proof = bridge
+        .load_transition_proof_bytes(&head.record.recursive_proof)
+        .map_err(|e| SdrDiscardReason::ProofVerifyFailed {
+            detail: format!("head last_proof bind at install time: {e:#}"),
+        })?;
+
+    let snapshot = super::db_v1::AccountSnapshot {
+        owner,
+        state: head.record.account_state.clone(),
+        nk: bundle.nk,
+        op_secret: Some(OpSecret::new(bundle.op_secret)),
+        genesis_pubkey: genesis.record.own_nullifier.pk_create,
+        spendable,
+        spent_ids: spent_ids.into_iter().collect(),
+        last_proof: Some(last_proof),
+        last_nav_opening: Some(nav_opening),
+        last_nullifier: Some(NullifierOpening {
+            public_key: head_pk_create,
+            signature_r: head_r_create,
+            r_prime: head.record.own_nullifier.r_prime_create,
+        }),
+        last_nullifier_pos: Some(nullifier_pos),
+    };
+    let record =
+        snapshot
+            .into_record()
+            .map_err(|e| SdrDiscardReason::HeadReconstructionFailed {
+                detail: format!("{e:#}"),
+            })?;
+
+    let recovered_view =
+        crate::v1::signature::account_state_view_from_record(&record).map_err(|e| {
+            SdrDiscardReason::HeadReconstructionFailed {
+                detail: format!(
+                    "account_state_view_from_record for private-index registration: {e:#}"
+                ),
+            }
+        })?;
+
+    // 6. Install, then persist durably; roll the live engine back on a
+    // persist failure so memory and disk never diverge.
+    let pre = deps.adapter.snapshot_live();
+    let insert_result = deps
+        .adapter
+        .with_engine_mut(|engine| engine.insert_account(owner, record))
+        .map_err(|e| SdrDiscardReason::HeadReconstructionFailed {
+            detail: format!("stack claim for account install: {e:#}"),
+        })?;
+    insert_result.map_err(|e| SdrDiscardReason::HeadReconstructionFailed {
+        detail: format!("insert_account: {e:#}"),
+    })?;
+
+    if let Err(e) = deps.adapter.persist().await {
+        let _ = deps.adapter.restore_live(pre);
+        return Err(SdrDiscardReason::HeadPersistFailed {
+            detail: format!("durable persist of recovered head failed (engine rolled back): {e:#}"),
+        });
+    }
+
+    deps.index
+        .insert_account(
+            crate::kernel::types::SubjectAddress(owner.0),
+            recovered_view,
+        )
+        .map_err(|e| SdrDiscardReason::HeadReconstructionFailed {
+            detail: format!("register recovered head in private-index (pull cache): {e:#}"),
+        })?;
+
+    tracing::info!(
+        subject = %hex::encode(subject),
+        send_counter = head.record.account_state.send_counter,
+        spendable = coin_sources.len(),
+        "§4.5 recovery: SDR replay reconstructed, installed, and durably persisted the \
+         account head"
+    );
+    Ok(())
 }
 
 /// Block until [`BundleStore::list_active`] is non-empty.
@@ -998,8 +2692,9 @@ mod tests {
     use super::*;
     use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
     use sha2::{Digest, Sha256};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
+    use zkcoins_program::circuit::compliance::Network;
 
     // -----------------------------------------------------------------------
     // Fixtures
@@ -1022,6 +2717,136 @@ mod tests {
     fn signed_gift_wrap(sk: &[u8; 32], created_at: u64, content: &str) -> Event {
         Event::sign(sk, created_at, KIND_GIFT_WRAP, vec![], content.to_string())
             .expect("sign gift-wrap")
+    }
+
+    #[test]
+    fn recovered_snapshot_with_consistent_coinhist_installs() {
+        let owner = Address([0x11; 32]);
+        let pk = [0x22; 32];
+        let nk = [0x33; 32];
+        let nk_commitment = host::nk_commit(&nk);
+        let asset_id = host::nk_commit(&[0x44; 32]);
+        let genesis = AccountState::new(
+            owner,
+            nk_commitment,
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("genesis AccountState");
+        let genesis_ash = host::account_state_hash(&genesis).expect("genesis ash");
+        let coin = host::Coin {
+            identifier: host::coin_identifier(genesis_ash, &owner.0, asset_id, 50, 0),
+            recipient: owner,
+            amount: 50,
+            asset_id,
+        };
+        let coin_id = host::digest_to_bytes(&coin.identifier);
+        let mut coinhist = host::CoinHistTree::new();
+        coinhist.admit(coin_id).expect("admit coin");
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), coin.amount);
+        let state = AccountState::new(owner, nk_commitment, balances, pk, 1, coinhist.root())
+            .expect("recovered AccountState");
+        let snapshot = crate::v1::db_v1::AccountSnapshot {
+            owner,
+            state,
+            nk,
+            op_secret: Some(OpSecret::new([0xAA; 32])),
+            genesis_pubkey: pk,
+            spendable: vec![(
+                coin_id,
+                TrackedCoin {
+                    coin,
+                    creating_prev_ash: genesis_ash,
+                    coin_index: 0,
+                },
+            )],
+            spent_ids: vec![],
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+
+        let record = snapshot
+            .into_record()
+            .expect("consistent recovered snapshot must reconstruct");
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        assert!(engine.insert_account(owner, record).is_ok());
+    }
+
+    #[test]
+    fn recovered_snapshot_with_mismatched_coinhist_fails_closed_and_does_not_install() {
+        let owner = Address([0x51; 32]);
+        let pk = [0x52; 32];
+        let nk = [0x53; 32];
+        let nk_commitment = host::nk_commit(&nk);
+        let asset_id = host::nk_commit(&[0x54; 32]);
+        let genesis = AccountState::new(
+            owner,
+            nk_commitment,
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("genesis AccountState");
+        let genesis_ash = host::account_state_hash(&genesis).expect("genesis ash");
+        let coin = host::Coin {
+            identifier: host::coin_identifier(genesis_ash, &owner.0, asset_id, 50, 0),
+            recipient: owner,
+            amount: 50,
+            asset_id,
+        };
+        let coin_id = host::digest_to_bytes(&coin.identifier);
+        let mut coinhist = host::CoinHistTree::new();
+        coinhist.admit(coin_id).expect("admit coin");
+        assert_ne!(coinhist.root(), host::coinhist_empty_root());
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), coin.amount);
+        let state = AccountState::new(
+            owner,
+            nk_commitment,
+            balances,
+            pk,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .expect("recovered AccountState with deliberately mismatched root");
+        let snapshot = crate::v1::db_v1::AccountSnapshot {
+            owner,
+            state,
+            nk,
+            op_secret: Some(OpSecret::new([0xAA; 32])),
+            genesis_pubkey: pk,
+            spendable: vec![(
+                coin_id,
+                TrackedCoin {
+                    coin,
+                    creating_prev_ash: genesis_ash,
+                    coin_index: 0,
+                },
+            )],
+            spent_ids: vec![],
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+
+        let err = match snapshot.into_record() {
+            Ok(_) => panic!("coinhist root mismatch must fail before install"),
+            Err(err) => err,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(
+                "coinhist root after rebuild does not match AccountState.coin_history_root"
+            ),
+            "expected coinhist-root-vs-state contradiction, got: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1394,52 +3219,64 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Step 5 — §2.3.3 path identity + SDR named gap
+    // Step 5 — §2.3.3 path identity + SDR candidate (never silent ignore)
     // -----------------------------------------------------------------------
 
     #[test]
     fn sdr_matched_is_named_gap_not_silent_ignore() {
-        // Build a minimal kind-1059 that will fail detect (no tags) vs a
-        // structural unit: SelfDeliveryNamedGap construction path is
-        // exercised via the outcome type + constant status.
-        assert_eq!(SDR_REPLAY_STATUS, SdrReplayStatus::Unavailable);
-
-        // Directly assert the outcome variant carries the gap name — the
-        // production branch returns this when payload.record_kind is set.
-        let outcome = RecoveredCandidateOutcome::SelfDeliveryNamedGap {
+        // SDR match must never be silently ignored: the outcome is a
+        // SelfDeliveryCandidate the campaign can fetch+decode, not Ignored.
+        let outcome = RecoveredCandidateOutcome::SelfDeliveryCandidate {
             record_kind: RecordKind::Send,
             blob_id: [0xAB; 32],
-            status: SDR_REPLAY_STATUS,
+            holders: vec!["https://blossom.example".into()],
+            ss: [0x11; 32],
+            epk: [0x22; 32],
         };
         match outcome {
-            RecoveredCandidateOutcome::SelfDeliveryNamedGap {
+            RecoveredCandidateOutcome::SelfDeliveryCandidate {
                 record_kind,
-                status,
-                ..
+                blob_id,
+                holders,
+                ss,
+                epk,
             } => {
                 assert_eq!(record_kind, RecordKind::Send);
-                assert_eq!(status, SdrReplayStatus::Unavailable);
+                assert_eq!(blob_id, [0xAB; 32]);
+                assert_eq!(holders, vec!["https://blossom.example".to_string()]);
+                assert_eq!(ss, [0x11; 32]);
+                assert_eq!(epk, [0x22; 32]);
             }
-            other => panic!("expected SelfDeliveryNamedGap, got {other:?}"),
+            other => panic!("expected SelfDeliveryCandidate, got {other:?}"),
         }
 
-        // Operator report carries the same status (not a comment-only constant).
-        let gap = SdrNamedGap {
-            record_kind: RecordKind::Send,
+        // Operator report names every discard (never silent).
+        let discard = SdrDiscard {
+            subject: [0x01; 32],
             blob_id: [0xAB; 32],
-            status: SDR_REPLAY_STATUS,
+            record_kind: RecordKind::Send,
+            send_counter: None,
+            reason: SdrDiscardReason::FetchFailed {
+                detail: "fixture".into(),
+            },
         };
-        assert_eq!(gap.status, SdrReplayStatus::Unavailable);
         let report = RecoveryRunReport {
             scan_status: GaplessScanStatus::Complete,
             unique_event_count: 1,
             coin_proof_accepted: 0,
             coin_proof_rejected: 0,
             ignored: 0,
-            sdr_named_gaps: vec![gap],
+            sdr_discards: vec![discard],
+            sdr_coins_folded: 0,
+            replayed_heads: Vec::new(),
             restored: true,
         };
-        assert_eq!(report.sdr_named_gaps[0].status, SDR_REPLAY_STATUS);
+        assert_eq!(report.sdr_discards.len(), 1);
+        assert_eq!(report.sdr_discards[0].blob_id, [0xAB; 32]);
+        assert!(matches!(
+            report.sdr_discards[0].reason,
+            SdrDiscardReason::FetchFailed { .. }
+        ));
     }
 
     #[test]
@@ -1512,16 +3349,20 @@ mod tests {
         let subject = [0u8; 32];
         let out = verify_recovered_candidate(&wrap, &ivk, &subject, &engine, &bridge, None);
         match out {
-            RecoveredCandidateOutcome::SelfDeliveryNamedGap {
+            RecoveredCandidateOutcome::SelfDeliveryCandidate {
                 record_kind,
                 blob_id,
-                status,
+                holders,
+                ss: got_ss,
+                epk: got_epk,
             } => {
                 assert_eq!(record_kind, RecordKind::Send);
                 assert_eq!(blob_id, [0xcd; 32]);
-                assert_eq!(status, SdrReplayStatus::Unavailable);
+                assert_eq!(holders, vec!["https://blossom.recovery.test".to_string()]);
+                assert_eq!(got_ss, ss);
+                assert_eq!(got_epk, epk);
             }
-            other => panic!("SDR must be named as gap, not ignored/discarded: {other:?}"),
+            other => panic!("SDR must be SelfDeliveryCandidate, not ignored/discarded: {other:?}"),
         }
     }
 
@@ -1556,5 +3397,936 @@ mod tests {
             verify_coin_proof_for_index;
         // Use the function so the binding is not eliminated.
         let _ = f as usize;
+    }
+
+    // -----------------------------------------------------------------------
+    // §4.2 SDR replay — pure/sync unit tests (no real Plonky2 proof)
+    // -----------------------------------------------------------------------
+
+    /// Minimal valid `SelfDeliveryRecordV1` for ordering / check-(ii)/(iii) unit tests.
+    ///
+    /// Only fields the pure path actually reads need realism:
+    /// `send_counter`, `prev_state_head`, `account_state`,
+    /// `proof_data.new_account_state_hash`, `own_nullifier.pk_create`, `occurred_at`.
+    /// `recursive_proof` is intentionally empty/garbage — never a success path here.
+    fn sample_sdr_record(
+        send_counter: u64,
+        prev_state_head: host::HashDigest,
+        account_state: AccountState,
+        own_nullifier_pk: [u8; 32],
+        occurred_at: u64,
+    ) -> host::SelfDeliveryRecordV1 {
+        let ash = account_state_hash(&account_state).expect("sample account_state ash");
+        host::SelfDeliveryRecordV1 {
+            record_kind: host::RecordKind::Send,
+            send_counter,
+            prev_state_head,
+            account_state,
+            recursive_proof: vec![],
+            proof_data: host::ProofData {
+                new_account_state_hash: ash,
+                output_coins_root: host::ZERO_HASH,
+                input_nullifiers_root: host::ZERO_HASH,
+                coin_history_root: host::ZERO_HASH,
+                nav_commitment: host::ZERO_HASH,
+                npk_commit: [0u8; 32],
+            },
+            own_nullifier: host::CreatingNullifier {
+                pk_create: own_nullifier_pk,
+                r_create: [0u8; 32],
+                r_prime_create: [0u8; 32],
+            },
+            proof_block_anchor: host::BlockAnchor {
+                block_hash: [0u8; 32],
+                height: 0,
+            },
+            inclusion_block: host::BlockAnchor {
+                block_hash: [0u8; 32],
+                height: 0,
+            },
+            occurred_at,
+            spent_or_folded_coin_ids: vec![],
+            output_refs: vec![],
+            self_blob_locators: host::BlobLocatorSet {
+                holders: vec!["https://x.test".into()],
+            },
+        }
+    }
+
+    /// Distinct, constructible account state for chain / ash fixtures.
+    fn sample_account_state_for(
+        subject: [u8; 32],
+        nk: [u8; 32],
+        current_pubkey: [u8; 32],
+        send_counter: u64,
+    ) -> AccountState {
+        AccountState::new(
+            Address(subject),
+            nk_commit(&nk),
+            std::collections::BTreeMap::new(),
+            current_pubkey,
+            send_counter,
+            host::coinhist_empty_root(),
+        )
+        .expect("sample account_state")
+    }
+
+    #[test]
+    fn verify_sdr_rejects_foreign_account_owner() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let subject = [0x81u8; 32];
+        let foreign_subject = [0x82u8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/foreign-owner-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/foreign-owner-pk");
+        let account = sample_account_state_for(foreign_subject, nk, pk, 1);
+        let record = sample_sdr_record(1, host::ZERO_HASH, account, pk, 100);
+        let bridge = ProverBridge::new(Network::Regtest);
+
+        let err = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
+            .expect_err("foreign account owner must be rejected before proof loading");
+        assert!(
+            matches!(err, SdrDiscardReason::AccountOwnerMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_sdr_rejects_wrong_nk_commit() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let subject = [0x83u8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/nk-commit-expected");
+        let wrong_nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/nk-commit-wrong");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/nk-commit-pk");
+        let account = sample_account_state_for(subject, wrong_nk, pk, 1);
+        let record = sample_sdr_record(1, host::ZERO_HASH, account, pk, 100);
+        assert_ne!(record.account_state.nk_commit, nk_commit(&nk));
+        let bridge = ProverBridge::new(Network::Regtest);
+
+        let err = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
+            .expect_err("wrong nk_commit must be rejected before proof loading");
+        assert!(
+            matches!(err, SdrDiscardReason::NkCommitMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_sdr_rejects_outer_authenticated_counter_mismatch() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let subject = [0x84u8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/counter-mismatch-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/counter-mismatch-pk");
+        let account = sample_account_state_for(subject, nk, pk, 1);
+        let record = sample_sdr_record(u64::MAX, host::ZERO_HASH, account, pk, 100);
+        let bridge = ProverBridge::new(Network::Regtest);
+
+        let err = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
+            .expect_err("outer/authenticated counter mismatch must precede proof loading");
+        assert!(
+            matches!(err, SdrDiscardReason::SendCounterMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn apply_ordered_chain_rejects_nonsequential_authenticated_counter() {
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/nonsequential-nk");
+        let pk0 = fixture_sk(b"zkCoins/v1/test-vector/recovery/nonsequential-pk0");
+        let pk1 = fixture_sk(b"zkCoins/v1/test-vector/recovery/nonsequential-pk1");
+        let subject = address(&pk0, nk_commit(&nk));
+        let genesis = canonical_genesis_account_state_ash(&subject, &nk, pk0).expect("genesis ash");
+        let first_account = sample_account_state_for(subject, nk, pk1, 1);
+        let skipped_account = sample_account_state_for(subject, nk, pk1, 3);
+        let first = sample_sdr_record(1, genesis, first_account, pk0, 100);
+        let skipped = sample_sdr_record(3, host::ZERO_HASH, skipped_account, pk1, 200);
+        let first_blob = [0x31u8; 32];
+        let skipped_blob = [0x33u8; 32];
+
+        let (accepted, discards) = apply_ordered_chain(
+            &subject,
+            &nk,
+            vec![
+                (first_blob, RecordKind::Send, first),
+                (skipped_blob, RecordKind::Send, skipped),
+            ],
+        );
+
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].blob_id, first_blob);
+        assert_eq!(discards.len(), 1);
+        assert_eq!(discards[0].1, skipped_blob);
+        assert!(
+            matches!(
+                &discards[0].3,
+                SdrDiscardReason::SendCounterNotSequential { .. }
+            ),
+            "got {:?}",
+            discards[0].3
+        );
+    }
+
+    #[test]
+    fn apply_ordered_chain_rejects_genesis_identity_mismatch() {
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/genesis-identity-nk");
+        let subject_pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/genesis-identity-subject-pk");
+        let rogue_pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/genesis-identity-rogue-pk");
+        let subject = address(&subject_pk, nk_commit(&nk));
+        assert_ne!(address(&rogue_pk, nk_commit(&nk)), subject);
+        let account = sample_account_state_for(subject, nk, subject_pk, 1);
+        let record = sample_sdr_record(1, host::ZERO_HASH, account, rogue_pk, 100);
+        let blob_id = [0x41u8; 32];
+
+        let (accepted, discards) =
+            apply_ordered_chain(&subject, &nk, vec![(blob_id, RecordKind::Send, record)]);
+
+        assert!(accepted.is_empty());
+        assert_eq!(discards.len(), 1);
+        assert_eq!(discards[0].1, blob_id);
+        assert!(
+            matches!(
+                &discards[0].3,
+                SdrDiscardReason::GenesisIdentityMismatch { .. }
+            ),
+            "got {:?}",
+            discards[0].3
+        );
+    }
+
+    #[test]
+    fn apply_ordered_chain_rejects_invalid_genesis_counter() {
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/genesis-counter-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/genesis-counter-pk");
+        let subject = address(&pk, nk_commit(&nk));
+        let account = sample_account_state_for(subject, nk, pk, 2);
+        let record = sample_sdr_record(2, host::ZERO_HASH, account, pk, 100);
+        let blob_id = [0x42u8; 32];
+
+        let (accepted, discards) =
+            apply_ordered_chain(&subject, &nk, vec![(blob_id, RecordKind::Send, record)]);
+
+        assert!(accepted.is_empty());
+        assert_eq!(discards.len(), 1);
+        assert_eq!(discards[0].1, blob_id);
+        assert!(
+            matches!(
+                &discards[0].3,
+                SdrDiscardReason::GenesisCounterInvalid { .. }
+            ),
+            "got {:?}",
+            discards[0].3
+        );
+    }
+
+    #[test]
+    fn verify_fold_static_bindings_rejects_coin_id_mismatch() {
+        let subject = [0x85u8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/fold-binding-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/fold-binding-pk");
+        let account = sample_account_state_for(subject, nk, pk, 1);
+        let accepted_record = sample_sdr_record(1, host::ZERO_HASH, account, pk, 100);
+        let epk = [0x51u8; 32];
+        let cp = host::CoinProof {
+            coin: host::Coin {
+                identifier: host::ZERO_HASH,
+                recipient: Address(subject),
+                amount: 1,
+                asset_id: host::ZERO_HASH,
+            },
+            proof: vec![],
+            inclusion_proof: vec![],
+            creating_prev_ash: host::ZERO_HASH,
+            creating_nullifier: accepted_record.own_nullifier,
+            nav_opening: host::NavOpening {
+                size: 0,
+                mth: host::ZERO_HASH,
+                nav_rand: [0u8; 32],
+            },
+            asset_terms: None,
+            epk,
+            ciphertext: vec![],
+            detect_tag: host::ZERO_HASH,
+        };
+        let oref = host::OutputRef {
+            coin_id: [0x52u8; 32],
+            blob_id: [0u8; 32],
+            epk,
+            out_ciphertext: vec![],
+            blob_locators: host::BlobLocatorSet {
+                holders: vec!["https://x.test".into()],
+            },
+        };
+        assert_ne!(digest_to_bytes(&cp.coin.identifier), oref.coin_id);
+
+        let err = verify_fold_static_bindings(&cp, &oref, &accepted_record)
+            .expect_err("coin identifier must bind to OutputRef coin_id");
+        assert!(
+            matches!(err, SdrDiscardReason::FoldCoinIdMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn same_ash_divergent_records_are_retained_with_deterministic_winner() {
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/same-ash-nk");
+        let pk0 = fixture_sk(b"zkCoins/v1/test-vector/recovery/same-ash-pk0");
+        let pk1 = fixture_sk(b"zkCoins/v1/test-vector/recovery/same-ash-pk1");
+        let subject = address(&pk0, nk_commit(&nk));
+        let genesis = canonical_genesis_account_state_ash(&subject, &nk, pk0).expect("genesis ash");
+        let account = sample_account_state_for(subject, nk, pk1, 1);
+        let genuine_record = sample_sdr_record(1, genesis, account.clone(), pk0, 100);
+        let rogue_record = sample_sdr_record(1, genesis, account, pk0, 200);
+        assert_eq!(
+            account_state_hash(&genuine_record.account_state).expect("genuine ash"),
+            account_state_hash(&rogue_record.account_state).expect("rogue ash")
+        );
+        assert_ne!(genuine_record, rogue_record);
+        let genuine_blob = [0x01u8; 32];
+        let rogue_blob = [0x99u8; 32];
+
+        let (ordered, equivocation_discards) = resolve_equivocation_and_order(vec![
+            (rogue_blob, RecordKind::Send, rogue_record),
+            (genuine_blob, RecordKind::Send, genuine_record),
+        ]);
+        assert_eq!(ordered.len(), 2);
+        assert!(
+            equivocation_discards.is_empty(),
+            "discards={equivocation_discards:?}"
+        );
+
+        let (accepted, chain_discards) = apply_ordered_chain(&subject, &nk, ordered);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].blob_id, genuine_blob);
+        assert_eq!(chain_discards.len(), 1);
+        assert_eq!(chain_discards[0].1, rogue_blob);
+        assert!(
+            matches!(
+                &chain_discards[0].3,
+                SdrDiscardReason::SendCounterNotSequential { .. }
+            ),
+            "got {:?}",
+            chain_discards[0].3
+        );
+    }
+
+    #[test]
+    fn verify_delivery_record_kind_rejects_outer_inner_mismatch() {
+        let subject = [0x86u8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/record-kind-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/record-kind-pk");
+        let account = sample_account_state_for(subject, nk, pk, 1);
+        let mut record = sample_sdr_record(1, host::ZERO_HASH, account, pk, 100);
+        record.record_kind = host::RecordKind::Mint;
+
+        let err = verify_delivery_record_kind(RecordKind::Send, &record)
+            .expect_err("outer Send must not authenticate decoded Mint");
+        assert!(
+            matches!(err, SdrDiscardReason::RecordKindMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[ignore = "heavy: panic-catch path first builds circuit C (~2^21 gates, minutes) regardless \
+                of proof validity; run with --ignored --release"]
+    #[test]
+    fn load_verify_transition_public_inputs_catches_noncanonical_proof_panic() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let bridge = ProverBridge::new(Network::Regtest);
+        let err = load_verify_transition_public_inputs(&bridge, &[0xffu8; 64], "test context")
+            .expect_err("non-canonical proof bytes must be panic-isolated");
+        assert!(
+            matches!(err, SdrDiscardReason::ProofVerifyFailed { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn restored_decision_rejects_empty_expected_subject_set() {
+        let expected_subjects = HashSet::<[u8; 32]>::new();
+        let subjects_with_committed_heads = HashSet::<[u8; 32]>::new();
+        let subjects_with_infra_gap = HashSet::<[u8; 32]>::new();
+
+        assert!(!restored_decision(
+            &GaplessScanStatus::Complete,
+            &expected_subjects,
+            &subjects_with_committed_heads,
+            &subjects_with_infra_gap,
+        ));
+    }
+
+    #[test]
+    fn apply_ordered_chain_prev_state_head_mismatch() {
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-chain-nk");
+        let pk0 = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-chain-pk0");
+        let subject = address(&pk0, nk_commit(&nk));
+        let account = sample_account_state_for(subject, nk, pk0, 1);
+        // Deliberately wrong head — not the canonical genesis ash.
+        let record = sample_sdr_record(1, host::ZERO_HASH, account, pk0, 100);
+        let blob_id = [0x01u8; 32];
+
+        let (accepted, discards) =
+            apply_ordered_chain(&subject, &nk, vec![(blob_id, RecordKind::Send, record)]);
+
+        assert!(accepted.is_empty(), "wrong prev_state_head must not accept");
+        assert_eq!(discards.len(), 1);
+        assert_eq!(discards[0].0, 1);
+        assert_eq!(discards[0].1, blob_id);
+        assert!(
+            matches!(
+                discards[0].3,
+                SdrDiscardReason::PrevStateHeadMismatch { .. }
+            ),
+            "got {:?}",
+            discards[0].3
+        );
+    }
+
+    #[test]
+    fn apply_ordered_chain_genesis_positive() {
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-genesis-nk");
+        let pk0 = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-genesis-pk0");
+        let subject = address(&pk0, nk_commit(&nk));
+        let genesis = canonical_genesis_account_state_ash(&subject, &nk, pk0).expect("genesis ash");
+        let account = sample_account_state_for(subject, nk, pk0, 1);
+        let record = sample_sdr_record(1, genesis, account, pk0, 100);
+        let blob_id = [0x02u8; 32];
+
+        let (accepted, discards) =
+            apply_ordered_chain(&subject, &nk, vec![(blob_id, RecordKind::Send, record)]);
+
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].record.send_counter, 1);
+        assert_eq!(accepted[0].blob_id, blob_id);
+        assert!(discards.is_empty(), "discards={discards:?}");
+    }
+
+    #[test]
+    fn apply_ordered_chain_three_record_ascending() {
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-asc-nk");
+        let pk0 = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-asc-pk0");
+        let subject = address(&pk0, nk_commit(&nk));
+        let pk1 = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-asc-pk1");
+        let pk2 = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-asc-pk2");
+        let pk3 = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-asc-pk3");
+
+        let as0 = sample_account_state_for(subject, nk, pk1, 1);
+        let as1 = sample_account_state_for(subject, nk, pk2, 2);
+        let as2 = sample_account_state_for(subject, nk, pk3, 3);
+        let ash0 = account_state_hash(&as0).expect("ash0");
+        let ash1 = account_state_hash(&as1).expect("ash1");
+
+        let genesis = canonical_genesis_account_state_ash(&subject, &nk, pk0).expect("genesis ash");
+        let r0 = sample_sdr_record(1, genesis, as0, pk0, 100);
+        let r1 = sample_sdr_record(2, ash0, as1, pk1, 100);
+        let r2 = sample_sdr_record(3, ash1, as2, pk2, 200);
+        let b0 = [0x10u8; 32];
+        let b1 = [0x11u8; 32];
+        let b2 = [0x12u8; 32];
+
+        let (accepted, discards) = apply_ordered_chain(
+            &subject,
+            &nk,
+            vec![
+                (b0, RecordKind::Send, r0),
+                (b1, RecordKind::Send, r1),
+                (b2, RecordKind::Send, r2),
+            ],
+        );
+
+        assert!(discards.is_empty(), "discards={discards:?}");
+        assert_eq!(accepted.len(), 3);
+        assert_eq!(accepted[0].record.send_counter, 1);
+        assert_eq!(accepted[1].record.send_counter, 2);
+        assert_eq!(accepted[2].record.send_counter, 3);
+        assert_eq!(accepted.last().unwrap().record.send_counter, 3);
+    }
+
+    #[test]
+    fn apply_ordered_chain_occurred_at_regression() {
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-mono-nk");
+        let pk0 = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-mono-pk0");
+        let subject = address(&pk0, nk_commit(&nk));
+        let pk1 = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-mono-pk1");
+        let pk2 = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-mono-pk2");
+        let pk3 = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-mono-pk3");
+
+        let as0 = sample_account_state_for(subject, nk, pk1, 1);
+        let as1 = sample_account_state_for(subject, nk, pk2, 2);
+        let as2 = sample_account_state_for(subject, nk, pk3, 3);
+        let ash0 = account_state_hash(&as0).expect("ash0");
+        let ash1 = account_state_hash(&as1).expect("ash1");
+
+        let genesis = canonical_genesis_account_state_ash(&subject, &nk, pk0).expect("genesis ash");
+        // Same chain as ascending, but counter=2 regresses occurred_at under 1's.
+        let r0 = sample_sdr_record(1, genesis, as0, pk0, 100);
+        let r1 = sample_sdr_record(2, ash0, as1, pk1, 200);
+        let r2 = sample_sdr_record(3, ash1, as2, pk2, 150); // < 200
+        let b0 = [0x20u8; 32];
+        let b1 = [0x21u8; 32];
+        let b2 = [0x22u8; 32];
+
+        let (accepted, discards) = apply_ordered_chain(
+            &subject,
+            &nk,
+            vec![
+                (b0, RecordKind::Send, r0),
+                (b1, RecordKind::Send, r1),
+                (b2, RecordKind::Send, r2),
+            ],
+        );
+
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(accepted[0].record.send_counter, 1);
+        assert_eq!(accepted[1].record.send_counter, 2);
+        assert_eq!(discards.len(), 1);
+        assert_eq!(discards[0].0, 3);
+        assert_eq!(discards[0].1, b2);
+        assert!(
+            matches!(
+                discards[0].3,
+                SdrDiscardReason::OccurredAtNotMonotonic { .. }
+            ),
+            "got {:?}",
+            discards[0].3
+        );
+    }
+
+    #[test]
+    fn resolve_equivocation_and_order_equivocation() {
+        let subject = [0xAEu8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-eq-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-eq-pk");
+        // Same send_counter, divergent account_state ashes → equivocation.
+        let as_a = sample_account_state_for(subject, nk, [0x01; 32], 1);
+        let as_b = sample_account_state_for(subject, nk, [0x02; 32], 1);
+        assert_ne!(
+            account_state_hash(&as_a).unwrap(),
+            account_state_hash(&as_b).unwrap()
+        );
+        let record_a = sample_sdr_record(1, host::ZERO_HASH, as_a, pk, 100);
+        let record_b = sample_sdr_record(1, host::ZERO_HASH, as_b, pk, 100);
+        let blob_a = [0xAAu8; 32];
+        let blob_b = [0xBBu8; 32];
+
+        let (ordered, discards) = resolve_equivocation_and_order(vec![
+            (blob_a, RecordKind::Send, record_a),
+            (blob_b, RecordKind::Send, record_b),
+        ]);
+
+        assert!(
+            ordered.is_empty() || ordered.iter().all(|(_, _, r)| r.send_counter != 1),
+            "equivocating counter must not appear in ordered; got {ordered:?}"
+        );
+        assert_eq!(discards.len(), 2);
+        for (sc, _blob, _record_kind, reason) in &discards {
+            assert_eq!(*sc, 1);
+            assert!(
+                matches!(reason, SdrDiscardReason::Equivocation { .. }),
+                "got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_equivocation_and_order_legitimate_duplicate() {
+        let subject = [0xAFu8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-dup-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-dup-pk");
+        let account = sample_account_state_for(subject, nk, pk, 1);
+        let record = sample_sdr_record(1, host::ZERO_HASH, account, pk, 100);
+        let blob_a = [0xCAu8; 32];
+        let blob_b = [0xCBu8; 32];
+        // Re-published SDR: identical body, only blob_id differs.
+        let record_b = record.clone();
+
+        let (ordered, discards) = resolve_equivocation_and_order(vec![
+            (blob_a, RecordKind::Send, record),
+            (blob_b, RecordKind::Send, record_b),
+        ]);
+
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].2.send_counter, 1);
+        assert!(discards.is_empty(), "discards={discards:?}");
+    }
+
+    #[test]
+    fn verify_sdr_checks_ii_account_state_hash_mismatch() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let subject = [0xB0u8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-ii-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-ii-pk");
+        let account = sample_account_state_for(subject, nk, pk, 1);
+        let mut record = sample_sdr_record(1, host::ZERO_HASH, account, pk, 100);
+        // Break check (ii): proof_data ash ≠ account_state ash.
+        record.proof_data.new_account_state_hash = host::ZERO_HASH;
+        // Ensure it really is a mismatch (empty account ash is never ZERO_HASH).
+        let real_ash = account_state_hash(&record.account_state).expect("ash");
+        assert_ne!(real_ash, record.proof_data.new_account_state_hash);
+
+        let bridge = ProverBridge::new(Network::Regtest);
+        let err = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
+            .expect_err("check (ii) must fail");
+        assert_eq!(err, SdrDiscardReason::AccountStateHashMismatch);
+    }
+
+    #[ignore = "heavy: first verify_transition call in a fresh process builds circuit C (~2^21 gates, \
+                minutes) regardless of proof validity; run with --ignored --release"]
+    #[test]
+    fn verify_sdr_checks_iii_a_proof_verify_failed() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let subject = [0xB1u8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-iii-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/sdr-iii-pk");
+        let account = sample_account_state_for(subject, nk, pk, 1);
+        // sample_sdr_record already sets new_account_state_hash correctly → (ii) passes.
+        let mut record = sample_sdr_record(1, host::ZERO_HASH, account, pk, 100);
+        // Empty / truncated wire: `load_transition_proof_bytes` must return Err
+        // (mapped to ProofVerifyFailed). Prefer empty over 0xFF-filled bytes —
+        // Plonky2 `from_bytes` panics on non-canonical Goldilocks limbs rather
+        // than returning Err, which would not exercise the discard path.
+        record.recursive_proof = vec![];
+
+        let bridge = ProverBridge::new(Network::Regtest);
+        let err = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
+            .expect_err("garbage proof must fail check (iii-a)");
+        assert!(
+            matches!(err, SdrDiscardReason::ProofVerifyFailed { .. }),
+            "got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // §4.2 SDR replay — heavy tests (real prove + verify_transition / circuit C)
+    // -----------------------------------------------------------------------
+
+    /// Real, valid genesis MINT transition + its NfLog fold + matching `block_log` rows,
+    /// mapped into a valid `host::SelfDeliveryRecordV1`. Callers mutate exactly one field
+    /// to produce their specific negative case; the untouched fixture is "fully valid".
+    ///
+    /// When `fold_nullifier` is false, the mint nullifier is **not** folded into the
+    /// engine (check (iv) classify → Pending). Used only by the NotFirstOccurrence case.
+    async fn build_real_mint_sdr_fixture_maybe_fold(
+        pool: &sqlx::PgPool,
+        fold_nullifier: bool,
+    ) -> (
+        host::SelfDeliveryRecordV1,
+        StateEngine,
+        [u8; 32], /* subject */
+        [u8; 32], /* nk */
+    ) {
+        use shared::spec_v1::{ChainPosition, PublishedNullifier};
+        use zkcoins_program::circuit::compliance::Network;
+        use zkcoins_prover::prover_bridge::test_signing::{
+            deterministic_secret, normalized_key, sign_transition,
+        };
+        use zkcoins_prover::state_engine::{MintRequest, OpSecret, ScannedNullifier};
+
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/recovery-heavy-test/nk").into();
+        let (secret0, public0, pk0) =
+            normalized_key(deterministic_secret(b"zkCoins/v1/recovery-heavy-test/sk0"));
+        let (_, _, pk1) =
+            normalized_key(deterministic_secret(b"zkCoins/v1/recovery-heavy-test/sk1"));
+        let owner = host::Address(host::address(&pk0, host::nk_commit(&nk)));
+
+        let name_hash = host::name_hash(b"recovery-heavy-test-asset").expect("name_hash");
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk0, &name_hash, 2, 1);
+
+        let mut engine = StateEngine::new(Network::Regtest, 0);
+        let pending = engine
+            .begin_mint(MintRequest {
+                owner,
+                nk,
+                op_secret: OpSecret::new(
+                    Sha256::digest(b"zkCoins/v1/recovery-heavy-test/op_secret").into(),
+                ),
+                current_pubkey: pk0,
+                next_pubkey: pk1,
+                name: b"recovery-heavy-test-asset".to_vec(),
+                decimals: 2,
+                amount: 100,
+                issuance_version: 1,
+                cap_total: 0,
+                terms_salt: [0u8; 32],
+                output_templates: vec![host::CoinTemplate {
+                    recipient: owner,
+                    amount: 100,
+                    asset_id,
+                }],
+                npk_rand: [0x22; 32],
+            })
+            .expect("begin_mint");
+        let sig = sign_transition(secret0, public0, &pending.proof_data, Network::Regtest);
+        let applied = engine
+            .finalise(pending, sig.transition.clone())
+            .expect("finalise mint (real prove happens here)");
+
+        let inclusion_height: u64 = 100;
+        let anchor_height: u64 = 50;
+        let inclusion_hash = [0xAAu8; 32];
+        let anchor_hash = [0xBBu8; 32];
+
+        if fold_nullifier {
+            engine
+                .append_nullifier(ScannedNullifier::from_survivor(&PublishedNullifier {
+                    chain_pos: ChainPosition {
+                        height: inclusion_height,
+                        tx_index: 0,
+                        vin_index: 0,
+                        member_index: 0,
+                    },
+                    pk: applied.nullifier().0,
+                    r: applied.nullifier().1,
+                }))
+                .expect("fold mint nullifier");
+        }
+        engine.set_tip_height(inclusion_height + 10);
+
+        crate::db::insert_block_log(
+            pool,
+            &crate::db::BlockLogEntry {
+                block_hash: inclusion_hash.to_vec(),
+                block_height: Some(inclusion_height as i64),
+                inscription_count: 0,
+                processing_duration_us: None,
+            },
+        )
+        .await
+        .expect("insert inclusion block_log row");
+        crate::db::insert_block_log(
+            pool,
+            &crate::db::BlockLogEntry {
+                block_hash: anchor_hash.to_vec(),
+                block_height: Some(anchor_height as i64),
+                inscription_count: 0,
+                processing_duration_us: None,
+            },
+        )
+        .await
+        .expect("insert anchor block_log row");
+
+        let account_state = engine.account(&owner).expect("account").state.clone();
+        let proof_data = applied.proved().proof_data.clone();
+        let recursive_proof = applied.proved().proof.to_bytes();
+        let record = host::SelfDeliveryRecordV1 {
+            record_kind: host::RecordKind::Mint,
+            send_counter: account_state.send_counter,
+            prev_state_head: canonical_genesis_account_state_ash(&owner.0, &nk, pk0)
+                .expect("genesis ash"),
+            account_state,
+            recursive_proof,
+            proof_data,
+            own_nullifier: host::CreatingNullifier {
+                pk_create: applied.nullifier().0,
+                r_create: applied.nullifier().1,
+                r_prime_create: sig.transition.r_prime,
+            },
+            proof_block_anchor: host::BlockAnchor {
+                block_hash: anchor_hash,
+                height: anchor_height as u32,
+            },
+            inclusion_block: host::BlockAnchor {
+                block_hash: inclusion_hash,
+                height: inclusion_height as u32,
+            },
+            occurred_at: 1_700_000_000,
+            spent_or_folded_coin_ids: vec![],
+            output_refs: vec![],
+            self_blob_locators: host::BlobLocatorSet {
+                holders: vec!["https://recovery-heavy-test.example".into()],
+            },
+        };
+        (record, engine, owner.0, nk)
+    }
+
+    /// Fully valid fixture (nullifier folded into NfLog).
+    async fn build_real_mint_sdr_fixture(
+        pool: &sqlx::PgPool,
+    ) -> (
+        host::SelfDeliveryRecordV1,
+        StateEngine,
+        [u8; 32], /* subject */
+        [u8; 32], /* nk */
+    ) {
+        build_real_mint_sdr_fixture_maybe_fold(pool, true).await
+    }
+
+    #[ignore = "heavy: first verify_transition call in a fresh process builds circuit C (~2^21 gates, \
+            minutes) regardless of proof validity; run with --ignored --release"]
+    #[tokio::test]
+    async fn verify_sdr_checks_iii_b_proof_data_mismatch() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let scope = crate::test_db::setup_pool().await;
+        let (mut record, _engine, subject, nk) = build_real_mint_sdr_fixture(&scope.pool).await;
+        // (iii-b) only: break proof_data equality while leaving new_account_state_hash
+        // intact so check (ii) still passes.
+        let real_root = record.proof_data.output_coins_root;
+        if real_root != host::ZERO_HASH {
+            record.proof_data.output_coins_root = host::ZERO_HASH;
+        } else {
+            let mut bytes = digest_to_bytes(&real_root);
+            bytes[0] ^= 0x01;
+            record.proof_data.output_coins_root =
+                host::digest_from_bytes(&bytes).expect("digest_from_bytes");
+        }
+        assert_ne!(
+            record.proof_data.output_coins_root, real_root,
+            "fixture must actually diverge output_coins_root"
+        );
+
+        let bridge = ProverBridge::new(Network::Regtest);
+        let err = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
+            .expect_err("check (iii-b) must fail");
+        assert_eq!(err, SdrDiscardReason::ProofDataMismatch);
+    }
+
+    #[ignore = "heavy: first verify_transition call in a fresh process builds circuit C (~2^21 gates, \
+            minutes) regardless of proof validity; run with --ignored --release"]
+    #[tokio::test]
+    async fn verify_sdr_checks_iv_consumed_pubkey_mismatch() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let scope = crate::test_db::setup_pool().await;
+        let (mut record, _engine, subject, nk) = build_real_mint_sdr_fixture(&scope.pool).await;
+        // (iv) Fresh-Key-Substitution only — leave proof_data and other fields alone.
+        record.own_nullifier.pk_create = [0x77u8; 32];
+
+        let bridge = ProverBridge::new(Network::Regtest);
+        let err = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
+            .expect_err("check (iv) FKS must fail");
+        assert_eq!(err, SdrDiscardReason::ConsumedPubkeyMismatch);
+    }
+
+    #[ignore = "heavy: first verify_transition call in a fresh process builds circuit C (~2^21 gates, \
+            minutes) regardless of proof validity; run with --ignored --release"]
+    #[tokio::test]
+    async fn verify_sdr_checks_iv_not_first_occurrence() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let scope = crate::test_db::setup_pool().await;
+        // Valid mint + proof, but nullifier never folded → classify Pending.
+        let (record, engine, subject, nk) =
+            build_real_mint_sdr_fixture_maybe_fold(&scope.pool, false).await;
+
+        let bridge = ProverBridge::new(Network::Regtest);
+        let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
+            .expect("pre-engine checks must pass");
+        let err = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
+            .expect_err("check (iv) first-occurrence must fail");
+        assert!(
+            matches!(err, SdrDiscardReason::NotFirstOccurrence { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[ignore = "heavy: first verify_transition call in a fresh process builds circuit C (~2^21 gates, \
+            minutes) regardless of proof validity; run with --ignored --release"]
+    #[tokio::test]
+    async fn verify_sdr_checks_v_inclusion_block_mismatch() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let scope = crate::test_db::setup_pool().await;
+        let (mut record, engine, subject, nk) = build_real_mint_sdr_fixture(&scope.pool).await;
+        // (v) only: wrong inclusion hash for the real height in block_log.
+        record.inclusion_block.block_hash = [0xCCu8; 32];
+
+        let bridge = ProverBridge::new(Network::Regtest);
+        let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
+            .expect("pre-engine checks must still pass");
+        let inclusion_height = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
+            .expect("engine checks must still pass");
+        let err = verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
+            .await
+            .expect_err("check (v) inclusion hash must fail");
+        assert!(
+            matches!(err, SdrDiscardReason::InclusionBlockMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[ignore = "heavy: first verify_transition call in a fresh process builds circuit C (~2^21 gates, \
+            minutes) regardless of proof validity; run with --ignored --release"]
+    #[tokio::test]
+    async fn verify_sdr_checks_v_occurred_at_invalid() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let scope = crate::test_db::setup_pool().await;
+        let (mut record, engine, subject, nk) = build_real_mint_sdr_fixture(&scope.pool).await;
+        // (v) only: zero occurred_at is invalid (no MTP re-derivation).
+        record.occurred_at = 0;
+
+        let bridge = ProverBridge::new(Network::Regtest);
+        let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
+            .expect("pre-engine checks must still pass");
+        let inclusion_height = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
+            .expect("engine checks must still pass");
+        let err = verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
+            .await
+            .expect_err("check (v) occurred_at must fail");
+        assert!(
+            matches!(err, SdrDiscardReason::OccurredAtInvalid { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[ignore = "heavy: first verify_transition call in a fresh process builds circuit C (~2^21 gates, \
+            minutes) regardless of proof validity; run with --ignored --release"]
+    #[tokio::test]
+    async fn verify_sdr_checks_vi_anchor_bound_failed() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let scope = crate::test_db::setup_pool().await;
+        let (mut record, engine, subject, nk) = build_real_mint_sdr_fixture(&scope.pool).await;
+        // (vi) only: anchor height must be a strict ancestor of inclusion height.
+        record.proof_block_anchor.height = record.inclusion_block.height;
+
+        let bridge = ProverBridge::new(Network::Regtest);
+        let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
+            .expect("pre-engine checks must still pass");
+        let inclusion_height = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
+            .expect("engine checks must still pass");
+        let err = verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
+            .await
+            .expect_err("check (vi) anchor bound must fail");
+        assert!(
+            matches!(err, SdrDiscardReason::AnchorBoundFailed { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[ignore = "heavy: first verify_transition call in a fresh process builds circuit C (~2^21 gates, \
+            minutes) regardless of proof validity; run with --ignored --release"]
+    #[tokio::test]
+    async fn sdr_fully_valid_record_is_replayed() {
+        use zkcoins_program::circuit::compliance::Network;
+
+        let scope = crate::test_db::setup_pool().await;
+        let (record, engine, subject, nk) = build_real_mint_sdr_fixture(&scope.pool).await;
+
+        let bridge = ProverBridge::new(Network::Regtest);
+        let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
+            .expect("fully valid record must pass pre-engine checks");
+        let inclusion_height = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
+            .expect("fully valid record must pass engine checks");
+        verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
+            .await
+            .expect("fully valid record must pass checks (v)/(vi)");
+
+        let (accepted, discards) = apply_ordered_chain(
+            &subject,
+            &nk,
+            vec![([0x01u8; 32], RecordKind::Mint, record.clone())],
+        );
+        assert!(
+            discards.is_empty(),
+            "fully valid record must not be discarded: {discards:?}"
+        );
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].record.send_counter, record.send_counter);
     }
 }

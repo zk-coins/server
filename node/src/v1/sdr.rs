@@ -10,6 +10,9 @@
 //! Drive/Resume/Backoff machine publishes it.
 
 use anyhow::{bail, Context, Result};
+use bitcoin::hashes::Hash;
+use bitcoin::BlockHash;
+use bitcoincore_rpc::RpcApi;
 use shared::spec_v1::accumulator::{LookupResult, SpendClassification};
 use shared::spec_v1::bundle::BlobLocatorSet;
 use shared::spec_v1::bundle::{
@@ -37,6 +40,14 @@ use super::OsSecureRandom;
 
 /// Stable token in the mainnet provisional-MTP refusal message (tests + logs).
 pub(crate) const PROVISIONAL_MTP_MAINNET_REFUSED: &str = "PROVISIONAL_MTP_MAINNET_REFUSED";
+
+/// Protocol-pinned finality depth (§3.9): six confirmations.
+///
+/// This mirrors the protocol-pinned §3.9 depth also enforced independently by
+/// `shared::spec_v1::accumulator::FINALITY_CONFIRMATIONS`, which is private to
+/// `shared` and cannot be imported here. Keep the two constants in sync by
+/// hand.
+pub(crate) const FINALITY_CONFIRMATIONS: u64 = 6;
 
 /// Build the **named provisional** Inclusion/MTP stand-in used until
 /// bitcoind first-occurrence inclusion + BIP-113 MTP is wired.
@@ -104,6 +115,109 @@ impl InclusionMtpSource for FixedInclusionMtp {
     }
 }
 
+/// Header fields needed to validate a canonical inclusion block and obtain its
+/// BIP-113 median-time-past.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InclusionBlockHeader {
+    height: u64,
+    confirmations: i32,
+    median_time: Option<u64>,
+}
+
+/// Minimal chain boundary used by the production Inclusion/MTP resolver.
+///
+/// Keeping the blocking RPC calls behind this trait lets unit tests exercise
+/// every canonicality and finality branch without a live bitcoind.
+trait InclusionChainSource: Send + Sync {
+    fn canonical_block_hash(&self, height: u64) -> Result<BlockHash>;
+    fn block_header(&self, hash: &BlockHash) -> Result<InclusionBlockHeader>;
+}
+
+impl InclusionChainSource for bitcoincore_rpc::Client {
+    fn canonical_block_hash(&self, height: u64) -> Result<BlockHash> {
+        Ok(self.get_block_hash(height)?)
+    }
+
+    fn block_header(&self, hash: &BlockHash) -> Result<InclusionBlockHeader> {
+        let header = self.get_block_header_info(hash)?;
+        Ok(InclusionBlockHeader {
+            height: u64::try_from(header.height).context("getblockheader height exceeds u64")?,
+            confirmations: header.confirmations,
+            median_time: header
+                .median_time
+                .map(u64::try_from)
+                .transpose()
+                .context("getblockheader mediantime exceeds u64")?,
+        })
+    }
+}
+
+/// Production Inclusion/MTP source: bitcoind's canonical block hash at the
+/// first-occurrence height plus that block's BIP-113 median-time-past.
+/// Fail-closed on RPC errors, non-final/orphaned headers, height mismatches, or
+/// absent mediantime — never consults the append-only audit log and never
+/// substitutes tip/wall-clock.
+pub(crate) struct BitcoindInclusionMtp<'a> {
+    chain: &'a dyn InclusionChainSource,
+}
+
+impl<'a> BitcoindInclusionMtp<'a> {
+    fn new(chain: &'a dyn InclusionChainSource) -> Self {
+        Self { chain }
+    }
+}
+
+impl InclusionMtpSource for BitcoindInclusionMtp<'_> {
+    fn inclusion_and_mtp(&self, height: u64) -> InclusionMtpFuture<'_> {
+        Box::pin(async move {
+            let height_u32 = u32::try_from(height).context("inclusion height exceeds u32")?;
+            let (canonical_hash, header) = tokio::task::block_in_place(|| {
+                let canonical_hash = self
+                    .chain
+                    .canonical_block_hash(height)
+                    .context("getblockhash for SDR canonical inclusion block")?;
+                let header = self
+                    .chain
+                    .block_header(&canonical_hash)
+                    .context("getblockheader for SDR inclusion MTP")?;
+                Ok::<_, anyhow::Error>((canonical_hash, header))
+            })?;
+
+            if header.height != height {
+                bail!(
+                    "getblockheader height {} != inclusion height {height}",
+                    header.height
+                );
+            }
+
+            let minimum_confirmations =
+                i32::try_from(FINALITY_CONFIRMATIONS).context("SDR finality depth exceeds i32")?;
+            if header.confirmations < minimum_confirmations {
+                bail!(
+                    "getblockheader confirmations {} below required finality depth \
+                     {FINALITY_CONFIRMATIONS} at inclusion height {height}",
+                    header.confirmations
+                );
+            }
+
+            let median_time = header.median_time.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "getblockheader returned no mediantime for inclusion height {height} — \
+                     cannot seal SDR without BIP-113 MTP"
+                )
+            })?;
+
+            Ok((
+                BlockAnchor {
+                    block_hash: canonical_hash.to_byte_array(),
+                    height: height_u32,
+                },
+                median_time,
+            ))
+        })
+    }
+}
+
 /// Map transition witness shape → SDR `RecordKind` (§4.2 / §7.1).
 pub(crate) fn record_kind_from_witness(asset_issuance: bool, has_received: bool) -> RecordKind {
     if asset_issuance {
@@ -161,46 +275,22 @@ pub(crate) async fn stage_phase_a(
 /// Public so the binary crate can call it; the trait-based core stays
 /// crate-private.
 ///
-/// **Inclusion / MTP source.** Until bitcoind first-occurrence inclusion +
-/// BIP-113 MTP is wired, this path uses a **named provisional** stand-in
-/// (`tip_hash` + wall-clock `occurred_at`) via
-/// [`provisional_inclusion_mtp_for_network`]. That stand-in is **fail-closed
-/// on mainnet** (no provisional seal; Phase-A rows left open). Regtest and
-/// testnet may still use it.
+/// **Inclusion / MTP source.** Resolves bitcoind's canonical block hash at the
+/// nullifier's first-occurrence height and its BIP-113 median-time-past,
+/// uniformly on every network ([`BitcoindInclusionMtp`]). RPC errors,
+/// non-final/orphaned headers, height mismatches, and missing mediantime fail
+/// closed (per-row [`db_sdr::mark_failed`]).
 ///
 /// Incomplete material → named [`db_sdr::mark_failed`] (no silent skip).
 /// Success → `insert_sdr_outbox_pending` + [`db_sdr::mark_finalised`] so
 /// Drive/Resume pick up the sealed SDR.
 pub async fn finalize_due_phase_b_adapter(
     adapter: &EngineAdapter,
-    tip_hash: [u8; 32],
-    occurred_at: u64,
+    client: &bitcoincore_rpc::Client,
 ) -> Result<usize> {
-    let mtp = match provisional_inclusion_mtp_for_network(adapter.network(), tip_hash, occurred_at)
-    {
-        Ok(m) => m,
-        Err(e) => {
-            // Mainnet (or any network that refuses provisional): do not write
-            // non-normative SDRs. Leave Phase-A open for a future real MTP path
-            // — do not mark_failed (that would destroy recoverable material).
-            let open = db_sdr::list_awaiting_first_occurrence(adapter.pool())
-                .await
-                .context(
-                    "SDR Phase B: list open Phase A under provisional Inclusion/MTP refusal",
-                )?;
-            if !open.is_empty() {
-                tracing::error!(
-                    open_phase_a = open.len(),
-                    network = ?adapter.network(),
-                    error = %e,
-                    "SDR Phase B withheld: provisional Inclusion/MTP refused; Phase-A left open"
-                );
-            }
-            return Ok(0);
-        }
-    };
+    let src = BitcoindInclusionMtp::new(client);
     let mut rng = OsSecureRandom;
-    finalize_due_phase_b_with_mtp(adapter, &mtp, &mut rng).await
+    finalize_due_phase_b_with_mtp(adapter, &src, &mut rng).await
 }
 
 /// Async-friendly Phase-B loop: engine lock is not held across await points.
@@ -722,6 +812,191 @@ mod tests {
         }
     }
 
+    struct FakeInclusionChainSource {
+        canonical_hash: Option<BlockHash>,
+        header: Option<InclusionBlockHeader>,
+    }
+
+    impl InclusionChainSource for FakeInclusionChainSource {
+        fn canonical_block_hash(&self, height: u64) -> Result<BlockHash> {
+            self.canonical_hash.ok_or_else(|| {
+                anyhow::anyhow!("fake canonical chain has no block at height {height}")
+            })
+        }
+
+        fn block_header(&self, _hash: &BlockHash) -> Result<InclusionBlockHeader> {
+            self.header
+                .ok_or_else(|| anyhow::anyhow!("fake canonical block header is unavailable"))
+        }
+    }
+
+    fn fake_inclusion_chain(
+        canonical_internal: [u8; 32],
+        height: u64,
+        confirmations: i32,
+        median_time: Option<u64>,
+    ) -> FakeInclusionChainSource {
+        FakeInclusionChainSource {
+            canonical_hash: Some(BlockHash::from_byte_array(canonical_internal)),
+            header: Some(InclusionBlockHeader {
+                height,
+                confirmations,
+                median_time,
+            }),
+        }
+    }
+
+    fn finality_confirmations_i32() -> i32 {
+        i32::try_from(FINALITY_CONFIRMATIONS).expect("protocol finality depth must fit i32")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoind_inclusion_mtp_happy_path_uses_internal_hash_and_mtp() {
+        let canonical_internal = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
+            0x1C, 0x1D, 0x1E, 0x1F,
+        ];
+        let source = fake_inclusion_chain(
+            canonical_internal,
+            840_000,
+            finality_confirmations_i32(),
+            Some(1_710_000_000),
+        );
+
+        let (anchor, median_time) = BitcoindInclusionMtp::new(&source)
+            .inclusion_and_mtp(840_000)
+            .await
+            .expect("final canonical inclusion block must resolve");
+
+        assert_eq!(anchor.block_hash, canonical_internal);
+        assert_eq!(anchor.height, 840_000);
+        assert_eq!(median_time, 1_710_000_000);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoind_inclusion_mtp_recanonicalizes_flipflop_orphan() {
+        // The append-only block_log still contains this later-observed B row,
+        // but bitcoind's active chain has flipped back to A at the same height.
+        let stale_orphaned_block_log_hash = [0xB2; 32];
+        let canonical_internal = [0xA2; 32];
+        let source = fake_inclusion_chain(
+            canonical_internal,
+            840_001,
+            finality_confirmations_i32(),
+            Some(1_710_000_600),
+        );
+
+        let (anchor, _) = BitcoindInclusionMtp::new(&source)
+            .inclusion_and_mtp(840_001)
+            .await
+            .expect("canonical A must self-heal the stale B audit-log observation");
+
+        assert_eq!(anchor.block_hash, canonical_internal);
+        assert_ne!(anchor.block_hash, stale_orphaned_block_log_hash);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoind_inclusion_mtp_missing_canonical_block_fails_closed() {
+        let source = FakeInclusionChainSource {
+            canonical_hash: None,
+            header: None,
+        };
+
+        let err = BitcoindInclusionMtp::new(&source)
+            .inclusion_and_mtp(840_002)
+            .await
+            .expect_err("missing canonical block must fail closed");
+
+        assert!(err.to_string().contains("getblockhash"), "{err:#}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoind_inclusion_mtp_missing_header_fails_closed() {
+        let source = FakeInclusionChainSource {
+            canonical_hash: Some(BlockHash::from_byte_array([0xA3; 32])),
+            header: None,
+        };
+
+        let err = BitcoindInclusionMtp::new(&source)
+            .inclusion_and_mtp(840_003)
+            .await
+            .expect_err("missing canonical header must fail closed");
+
+        assert!(err.to_string().contains("getblockheader"), "{err:#}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoind_inclusion_mtp_header_height_mismatch_fails_closed() {
+        let source = fake_inclusion_chain(
+            [0xA4; 32],
+            840_005,
+            finality_confirmations_i32(),
+            Some(1_710_001_200),
+        );
+
+        let err = BitcoindInclusionMtp::new(&source)
+            .inclusion_and_mtp(840_004)
+            .await
+            .expect_err("mismatched header height must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("height 840005 != inclusion height 840004"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoind_inclusion_mtp_nonfinal_and_orphaned_headers_fail_closed() {
+        for confirmations in [finality_confirmations_i32() - 1, -1] {
+            let source =
+                fake_inclusion_chain([0xA5; 32], 840_006, confirmations, Some(1_710_001_800));
+
+            let err = BitcoindInclusionMtp::new(&source)
+                .inclusion_and_mtp(840_006)
+                .await
+                .expect_err("non-final or orphaned header must fail closed");
+
+            let expected = format!("below required finality depth {FINALITY_CONFIRMATIONS}");
+            assert!(
+                err.to_string().contains(&expected),
+                "confirmations={confirmations}: {err:#}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoind_inclusion_mtp_missing_median_time_fails_closed() {
+        let source = fake_inclusion_chain([0xA6; 32], 840_007, finality_confirmations_i32(), None);
+
+        let err = BitcoindInclusionMtp::new(&source)
+            .inclusion_and_mtp(840_007)
+            .await
+            .expect_err("missing BIP-113 MTP must fail closed");
+
+        assert!(err.to_string().contains("no mediantime"), "{err:#}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitcoind_inclusion_mtp_height_above_u32_fails_closed() {
+        let source = FakeInclusionChainSource {
+            canonical_hash: None,
+            header: None,
+        };
+        let height = u64::from(u32::MAX) + 1;
+
+        let err = BitcoindInclusionMtp::new(&source)
+            .inclusion_and_mtp(height)
+            .await
+            .expect_err("height above the BlockAnchor domain must fail closed");
+
+        assert!(
+            err.to_string().contains("inclusion height exceeds u32"),
+            "{err:#}"
+        );
+    }
+
     fn sample_phase_a(pk: [u8; 32]) -> SdrPhaseAMaterial {
         // Minimal account_state: 140 zero bytes is invalid (zero balances ok if empty).
         // serialize_account_state needs a real AccountState — use zeros for
@@ -852,85 +1127,6 @@ mod tests {
             assert_eq!(mtp.block_hash, [0xBB; 32]);
             assert_eq!(mtp.occurred_at, 42);
         }
-    }
-
-    /// Production adapter path on mainnet: provisional Inclusion/MTP is
-    /// refused, Phase-A stays open (not `mark_failed`), no SDR seal, no
-    /// `self_delivery` outbox. Exercises `finalize_due_phase_b_adapter`, not
-    /// only the helper.
-    #[tokio::test]
-    async fn mainnet_finalize_due_phase_b_adapter_leaves_phase_a_open() {
-        use super::super::adapter::EngineAdapter;
-        use super::super::separation::{
-            claim_stack_scan_mode, set_process_stack_mode, ScanStackMode,
-        };
-
-        // Process claim is monotonic; nextest isolates per test.
-        set_process_stack_mode(ScanStackMode::V1);
-
-        let scope = setup_pool().await;
-        let pool = scope.pool.clone();
-        claim_stack_scan_mode(&pool, ScanStackMode::V1)
-            .await
-            .expect("claim v1 stack mode");
-
-        let adapter = EngineAdapter::load_or_create(pool.clone(), Network::Mainnet, 0)
-            .await
-            .expect("mainnet adapter");
-        assert_eq!(adapter.network(), Network::Mainnet);
-
-        let pk = [0xDDu8; 32];
-        let mat = sample_phase_a(pk);
-        db_sdr::insert_phase_a(&pool, &pk, &[0x11u8; 32], &mat)
-            .await
-            .expect("insert phase a");
-
-        let n = finalize_due_phase_b_adapter(&adapter, [0xAAu8; 32], 1_700_000_000)
-            .await
-            .expect("mainnet adapter path returns Ok(0), not Err");
-        assert_eq!(
-            n, 0,
-            "mainnet must finalise zero Phase-B rows under provisional MTP"
-        );
-
-        let row = db_sdr::get_phase_a(&pool, &pk)
-            .await
-            .expect("get")
-            .expect("phase-a row must remain");
-        assert_eq!(
-            row.status,
-            db_sdr::SdrPhaseAStatus::AwaitingFirstOccurrence,
-            "Phase A must stay open — not finalised and not mark_failed"
-        );
-        assert!(
-            row.fail_reason.is_none(),
-            "mainnet refusal must not mark_failed: {:?}",
-            row.fail_reason
-        );
-
-        let open = db_sdr::list_awaiting_first_occurrence(&pool)
-            .await
-            .expect("list open");
-        assert!(
-            open.iter().any(|r| r.transition_pk == pk),
-            "open Phase-A list must still contain the mainnet-withheld row"
-        );
-
-        // list_due only sees pending/awaiting_ack; list_open_for_transition
-        // excludes completed/failed. A terminal self_delivery row would be
-        // invisible to both — count every status for this transition.
-        let self_delivery_n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM v1_delivery_outbox \
-             WHERE transition_pk = $1 AND kind = 'self_delivery'",
-        )
-        .bind(pk.as_slice())
-        .fetch_one(&pool)
-        .await
-        .expect("count self_delivery over all statuses");
-        assert_eq!(
-            self_delivery_n, 0,
-            "no self_delivery outbox row (any status) after mainnet provisional refusal"
-        );
     }
 
     #[tokio::test]

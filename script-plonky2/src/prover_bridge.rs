@@ -29,7 +29,7 @@ use plonky2::field::types::{Field, PrimeField, PrimeField64};
 use plonky2::hash::hash_types::HashOut;
 use plonky2::iop::target::Target;
 use plonky2::iop::witness::{PartialWitness, WitnessWrite};
-use plonky2::plonk::circuit_data::{CircuitConfig, VerifierOnlyCircuitData};
+use plonky2::plonk::circuit_data::{CircuitConfig, VerifierCircuitData, VerifierOnlyCircuitData};
 use plonky2::plonk::proof::ProofWithPublicInputs;
 use plonky2::recursion::cyclic_recursion::check_cyclic_proof_verifier_data;
 use sha2::{Digest, Sha256};
@@ -531,6 +531,21 @@ fn balance_verified_flag(network: Network) -> &'static AtomicBool {
     }
 }
 
+/// Process-global slot for a cache-verified `C` `VerifierCircuitData`, populated by
+/// [`ProverBridge::mark_compliance_verifier_from_cache`]. When this is populated,
+/// `verify_transition` / `load_transition_proof_bytes` / `bind_prev_proof_identity` verify
+/// against it instead of building the full `C` `CircuitData` via `compliance_circuit`.
+fn compliance_verifier_slot(network: Network) -> &'static OnceLock<VerifierCircuitData<F, C, D>> {
+    static MAINNET: OnceLock<VerifierCircuitData<F, C, D>> = OnceLock::new();
+    static TESTNET: OnceLock<VerifierCircuitData<F, C, D>> = OnceLock::new();
+    static REGTEST: OnceLock<VerifierCircuitData<F, C, D>> = OnceLock::new();
+    match network {
+        Network::Mainnet => &MAINNET,
+        Network::Testnet => &TESTNET,
+        Network::Regtest => &REGTEST,
+    }
+}
+
 /// Outcome of a circuit cache slot: the built circuit, or a permanent refusal
 /// if construction-time pin check failed (or digests could not be determined).
 ///
@@ -611,9 +626,12 @@ impl ProverBridge {
     /// which recomputes C_balance's circuit_digest from the loaded constants and
     /// requires it to equal the pinned digest — cryptographically equivalent to a
     /// local build's digest check. This lets a secondary node satisfy the balance
-    /// identity gate WITHOUT rebuilding the ~100 GiB C_balance circuit; the actual
-    /// prover circuit is still built lazily if this node ever PROVES a balance
-    /// statement (see `balance_circuit`).
+    /// identity gate WITHOUT rebuilding
+    /// `C_balance` (2^18, 191,268 gates — the lighter of the two circuits; `C` at 2^21 /
+    /// 1,382,481 gates is the one in the ~90-100 GiB range per `docs/build-report.md`. The
+    /// analogous cache for `C` is `mark_compliance_verifier_from_cache`, below). The actual
+    /// prover circuit is still built lazily if this node ever PROVES a balance statement (see
+    /// `balance_circuit`).
     pub fn mark_balance_identity_verified_from_cache(
         network: Network,
         verified_c_balance_digest: [u8; 32],
@@ -638,6 +656,65 @@ impl ProverBridge {
             }
         }
         balance_verified_flag(network).store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Record that `C`'s construction-time identity is satisfied for `network` from a verified
+    /// verifier-data cache (§1.7.9), AND install the cache-loaded `VerifierCircuitData` as this
+    /// process's verifier for `C`. The caller MUST have loaded the cache through
+    /// `verifier_cache::load_compliance_verifier_cache_checked`, which recomputes `C`'s
+    /// circuit_digest from the loaded constants and requires it to equal the pinned digest —
+    /// cryptographically equivalent to a local build's digest check. This lets a secondary node
+    /// satisfy the compliance identity gate AND verify cyclic transition proofs WITHOUT ever
+    /// building the ~1.38M-gate (2^21), ~90-100 GiB `C` circuit. If this node ever PROVES a
+    /// transition (which a secondary never does), `compliance_circuit` still builds `C` lazily at
+    /// that point — this slot only carries verifier-only data, not a prover key.
+    ///
+    /// In addition to matching `verified_c_digest` against the installed pin, this function
+    /// asserts that `verifier_data`'s own embedded `verifier_only.circuit_digest` equals
+    /// `verified_c_digest` before installing (self-bound invariant — the two parameters can never
+    /// be allowed to disagree).
+    pub fn mark_compliance_verifier_from_cache(
+        network: Network,
+        verified_c_digest: [u8; 32],
+        verifier_data: VerifierCircuitData<F, C, D>,
+    ) -> Result<()> {
+        match pins_slot(network).get() {
+            Some(pins) => {
+                if pins.c != verified_c_digest {
+                    bail!(
+                        "cache-verified C digest does not match installed pin for \
+                         {:?}; refusing to mark verified",
+                        network
+                    );
+                }
+            }
+            None => {
+                bail!(
+                    "install_network_pins must run before \
+                     mark_compliance_verifier_from_cache for {:?}",
+                    network
+                );
+            }
+        }
+        ensure!(
+            host::digest_to_bytes(&verifier_data.verifier_only.circuit_digest) == verified_c_digest,
+            "cache-verified C digest does not match verifier_data's own circuit_digest for \
+             {:?} (verified_c_digest and verifier_data disagree even though verified_c_digest \
+             matches the installed pin); refusing to install a verifier whose embedded \
+             identity disagrees with the digest it was marked with — self-bound invariant",
+            network
+        );
+        compliance_verifier_slot(network)
+            .set(verifier_data)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "compliance verifier cache already marked for {:?}; refusing to overwrite \
+                 (no silent replace)",
+                    network
+                )
+            })?;
+        c_verified_flag(network).store(true, Ordering::Release);
         Ok(())
     }
 
@@ -808,6 +885,14 @@ impl ProverBridge {
     /// (P1-E.2/P1-G).
     pub fn verify_transition(&self, proof: &ComplianceProof) -> Result<()> {
         self.ensure_proving_identity()?;
+        if let Some(cached) = compliance_verifier_slot(self.network).get() {
+            cached
+                .verify(proof.clone())
+                .context("compliance proof verification failed (cached verifier)")?;
+            check_cyclic_proof_verifier_data(proof, &cached.verifier_only, &cached.common)
+                .context("compliance proof cyclic verifier-data tail is not canonical")?;
+            return Ok(());
+        }
         let circuit = compliance_circuit(self.network)?;
         circuit
             .data
@@ -848,9 +933,14 @@ impl ProverBridge {
     /// ([`Self::verify_transition`]) — identity bind alone is not credit.
     pub fn load_transition_proof_bytes(&self, bytes: &[u8]) -> Result<ComplianceProof> {
         self.ensure_proving_identity()?;
-        let circuit = compliance_circuit(self.network)?;
-        let proof = ComplianceProof::from_bytes(bytes.to_vec(), &circuit.data.common)
-            .context("native Plonky2 proof bytes rejected by from_bytes (CoinProof.proof)")?;
+        let proof = if let Some(cached) = compliance_verifier_slot(self.network).get() {
+            ComplianceProof::from_bytes(bytes.to_vec(), &cached.common)
+                .context("native Plonky2 proof bytes rejected by from_bytes (CoinProof.proof)")?
+        } else {
+            let circuit = compliance_circuit(self.network)?;
+            ComplianceProof::from_bytes(bytes.to_vec(), &circuit.data.common)
+                .context("native Plonky2 proof bytes rejected by from_bytes (CoinProof.proof)")?
+        };
         self.bind_prev_proof_identity(&proof)?;
         Ok(proof)
     }
@@ -882,6 +972,14 @@ impl ProverBridge {
             proof.public_inputs.len()
         );
         self.ensure_proving_identity()?;
+        if let Some(cached) = compliance_verifier_slot(self.network).get() {
+            check_cyclic_proof_verifier_data(proof, &cached.verifier_only, &cached.common)
+                .context(
+                    "last_proof / prev_proof is not bound to circuit C identity \
+                     (wrong circuit or corrupt verifier-data tail); refusing as prev_proof",
+                )?;
+            return Ok(());
+        }
         let circuit = compliance_circuit(self.network)?;
         check_cyclic_proof_verifier_data(proof, &circuit.data.verifier_only, &circuit.data.common)
             .context(
@@ -970,7 +1068,7 @@ impl ProverBridge {
 /// circuit that was **just built** is compared to the pin immediately —
 /// that is the §1.7.9 check (not an embedded text file, not the pins
 /// compared to themselves).
-fn compliance_circuit(network: Network) -> Result<&'static SkeletonCircuit> {
+pub(crate) fn compliance_circuit(network: Network) -> Result<&'static SkeletonCircuit> {
     static MAINNET: OnceLock<CircuitSlot<SkeletonCircuit>> = OnceLock::new();
     static TESTNET: OnceLock<CircuitSlot<SkeletonCircuit>> = OnceLock::new();
     static REGTEST: OnceLock<CircuitSlot<SkeletonCircuit>> = OnceLock::new();
@@ -2692,6 +2790,18 @@ pub(crate) mod tests {
         (bridge, proved_attestation, expected_statement)
     }
 
+    /// A genuine `(ProverBridge, ProvedTransition)` pair for the compliance verifier-cache
+    /// round-trip test in `verifier_cache.rs` — same pattern as
+    /// `real_balance_attestation_fixture`, but for circuit `C` itself.
+    pub(crate) fn real_transition_fixture() -> (ProverBridge, ProvedTransition) {
+        let bridge = ProverBridge::new(Network::Testnet);
+        let genesis = genesis_fixture();
+        let proved_genesis = bridge
+            .prove_transition(&genesis.witness)
+            .expect("genuine genesis/mint proof for verifier-cache fixture");
+        (bridge, proved_genesis)
+    }
+
     #[test]
     #[ignore = "heavy: real Plonky2 prove end-to-end (minutes); run with --ignored --release"]
     fn prover_bridge_real_end_to_end() {
@@ -2849,6 +2959,200 @@ pub(crate) mod tests {
         assert!(
             super::balance_verified_flag(network).load(Ordering::Acquire),
             "balance_verified_flag must be true after a successful cache-backed mark"
+        );
+    }
+
+    /// `mark_compliance_verifier_from_cache` refuses without pins / on pin
+    /// mismatch / on a FIX3 self-bind digest mismatch (verified_c_digest
+    /// matches the installed pin but disagrees with verifier_data's OWN
+    /// embedded circuit_digest), and installs the verifier + sets
+    /// `c_verified_flag` only when all three agree. A second mark call after
+    /// a successful one refuses (no silent replace). Uses `Network::Testnet`
+    /// — see the module-level comment above this test for why. Dummy
+    /// circuits only (built via a bare `CircuitBuilder`, not
+    /// `compliance_circuit`) — no real ~1.38M-gate circuit construction.
+    #[test]
+    fn mark_compliance_verifier_from_cache_requires_matching_pin_and_self_bound_digest() {
+        use plonky2::plonk::circuit_builder::CircuitBuilder;
+
+        fn dummy_compliance_verifier_data(
+            num_public_inputs: usize,
+        ) -> VerifierCircuitData<F, C, D> {
+            let mut builder =
+                CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+            for _ in 0..num_public_inputs {
+                let target = builder.add_virtual_target();
+                builder.register_public_input(target);
+            }
+            builder.build::<C>().verifier_data()
+        }
+
+        let network = Network::Testnet;
+        let matching = dummy_compliance_verifier_data(1);
+        let matching_digest = host::digest_to_bytes(&matching.verifier_only.circuit_digest);
+        let mismatched = dummy_compliance_verifier_data(3);
+        let mismatched_digest = host::digest_to_bytes(&mismatched.verifier_only.circuit_digest);
+        assert_ne!(
+            matching_digest, mismatched_digest,
+            "the two dummy circuits must have distinct digests for this test to mean anything"
+        );
+
+        let err_no_pins = ProverBridge::mark_compliance_verifier_from_cache(
+            network,
+            matching_digest,
+            matching.clone(),
+        )
+        .expect_err("mark without install_network_pins must refuse");
+        assert!(
+            format!("{err_no_pins:#}").contains("install_network_pins must run before"),
+            "error must name the missing-pins refusal: {err_no_pins:#}"
+        );
+
+        // Install Testnet pins with pin_c pinned to `matching`'s own real
+        // digest (pin_c_balance is irrelevant to this function; any value).
+        ProverBridge::install_network_pins(network, matching_digest, [0x11u8; 32])
+            .expect("install synthetic Testnet pins pinned to the dummy circuit's real digest");
+
+        let mut wrong_pin_digest = matching_digest;
+        wrong_pin_digest[0] ^= 0xFF;
+        let err_pin_mismatch = ProverBridge::mark_compliance_verifier_from_cache(
+            network,
+            wrong_pin_digest,
+            matching.clone(),
+        )
+        .expect_err("verified_c_digest != installed pin must refuse");
+        assert!(
+            format!("{err_pin_mismatch:#}").contains("does not match installed pin"),
+            "error must name the pin-mismatch refusal: {err_pin_mismatch:#}"
+        );
+
+        // FIX3: verified_c_digest matches the installed pin, but disagrees
+        // with verifier_data's OWN embedded circuit_digest.
+        let err_self_bind =
+            ProverBridge::mark_compliance_verifier_from_cache(network, matching_digest, mismatched)
+                .expect_err("verifier_data digest disagreeing with verified_c_digest must refuse");
+        assert!(
+            format!("{err_self_bind:#}").contains("verifier_data's own circuit_digest"),
+            "error must name the self-bind refusal: {err_self_bind:#}"
+        );
+        assert!(
+            !super::c_verified_flag(network).load(std::sync::atomic::Ordering::Acquire),
+            "c_verified_flag must stay false after every refused mark above"
+        );
+
+        // All three agree: succeeds.
+        ProverBridge::mark_compliance_verifier_from_cache(network, matching_digest, matching)
+            .expect("matching digest + matching verifier_data must succeed");
+        assert!(
+            super::c_verified_flag(network).load(std::sync::atomic::Ordering::Acquire),
+            "c_verified_flag must be true after a successful cache-backed mark"
+        );
+
+        // Double mark: the OnceLock slot refuses a second install (same
+        // digest as `matching`, so this exercises ONLY the no-overwrite path,
+        // not a fresh pin/self-bind refusal).
+        let second = dummy_compliance_verifier_data(1);
+        let err_double =
+            ProverBridge::mark_compliance_verifier_from_cache(network, matching_digest, second)
+                .expect_err("a second mark for the same network must refuse (no silent replace)");
+        assert!(
+            format!("{err_double:#}").contains("already marked"),
+            "error must name the no-overwrite refusal: {err_double:#}"
+        );
+    }
+
+    /// Exercises `verify_transition` / `load_transition_proof_bytes` /
+    /// `bind_prev_proof_identity`'s CACHED-slot branch (populated via
+    /// `mark_compliance_verifier_from_cache`) with a genuine proof (must
+    /// accept) and a tampered proof (must reject on all three). The existing
+    /// `verifier_cache.rs` real round-trip test covers
+    /// `CachedComplianceVerifier` directly; this test covers `ProverBridge`'s
+    /// own cached-slot methods, which is the code path Secondary boots
+    /// actually use. Heavy: builds the real ~1.38M-gate (2^21) `C` circuit.
+    #[test]
+    #[ignore = "heavy: real Plonky2 C build + prove, exercises ProverBridge's cached-verifier-slot \
+                verify paths (minutes; C is ~1.38M gates / ~90-100 GiB per docs/build-report.md)"]
+    fn mark_compliance_verifier_from_cache_exercises_cached_verify_paths() {
+        fn pinned_digest_32(key: &str) -> [u8; 32] {
+            const PINNED_DIGESTS: &str = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/generated_circuit_digests.txt"
+            ));
+            let value = PINNED_DIGESTS
+                .lines()
+                .find_map(|line| {
+                    let (candidate, value) = line.split_once(" = ")?;
+                    (candidate == key).then_some(value)
+                })
+                .unwrap_or_else(|| panic!("pinned digests file missing required key `{key}`"));
+            let hex = value
+                .strip_prefix("0x")
+                .unwrap_or_else(|| panic!("pinned digest `{key}` lacks 0x prefix"));
+            assert_eq!(hex.len(), 64, "pinned digest `{key}` must contain 32 bytes");
+            let mut out = [0u8; 32];
+            for (index, byte) in out.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+                    .unwrap_or_else(|e| panic!("pinned digest `{key}` has invalid hex: {e}"));
+            }
+            out
+        }
+
+        let network = Network::Testnet;
+        let pin_c = pinned_digest_32("circuit_digest_c_testnet");
+        let pin_c_balance = pinned_digest_32("circuit_digest_c_balance_testnet");
+        ProverBridge::install_network_pins(network, pin_c, pin_c_balance)
+            .expect("install matching testnet circuit pins before construction");
+
+        // Genuine proof through the warm real circuit — same fixture the
+        // verifier_cache.rs real round-trip test uses.
+        let (bridge, proved_genesis) = real_transition_fixture();
+
+        let circuit = compliance_circuit(network).expect("C already built above");
+        let verifier_data = circuit.data.verifier_data();
+        let verified_c_digest = host::digest_to_bytes(&verifier_data.verifier_only.circuit_digest);
+        assert_eq!(verified_c_digest, pin_c);
+        ProverBridge::mark_compliance_verifier_from_cache(
+            network,
+            verified_c_digest,
+            verifier_data,
+        )
+        .expect("mark the real C verifier data into the cached slot");
+
+        bridge
+            .verify_transition(&proved_genesis.proof)
+            .expect("genuine proof must verify through the cached-slot path");
+
+        let wire_bytes = proved_genesis.proof.to_bytes();
+        let loaded = bridge
+            .load_transition_proof_bytes(&wire_bytes)
+            .expect("genuine wire-encoded proof must load + bind through the cached-slot path");
+        assert_eq!(loaded.public_inputs, proved_genesis.proof.public_inputs);
+
+        bridge
+            .bind_prev_proof_identity(&proved_genesis.proof)
+            .expect("genuine proof must bind to C identity through the cached-slot path");
+
+        let mut tampered = proved_genesis.proof.clone();
+        tampered.public_inputs[40] += F::ONE;
+        assert!(
+            bridge.verify_transition(&tampered).is_err(),
+            "tampered proof must fail verify_transition through the cached-slot path"
+        );
+        assert!(
+            bridge.bind_prev_proof_identity(&tampered).is_err(),
+            "tampered proof must fail bind_prev_proof_identity through the cached-slot path"
+        );
+        let tampered_wire_bytes = tampered.to_bytes();
+        assert!(
+            bridge
+                .load_transition_proof_bytes(&tampered_wire_bytes)
+                .is_err(),
+            "tampered wire-encoded proof must be rejected by load_transition_proof_bytes \
+             through the cached-slot path"
+        );
+
+        println!(
+            "prover bridge cached-verifier-slot paths: PASS (genuine accepted, tampered rejected)"
         );
     }
 }

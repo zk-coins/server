@@ -103,6 +103,7 @@ zkcoins_prover_plonky2::prover_bridge::ProverBridge::compliance_gate_count
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::identity_ready
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::install_network_pins
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::mark_balance_identity_verified_from_cache
+zkcoins_prover_plonky2::prover_bridge::ProverBridge::mark_compliance_verifier_from_cache
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::network
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::new
 zkcoins_prover_plonky2::prover_bridge::ProverBridge::prove_attestation
@@ -272,6 +273,7 @@ zkcoins_prover_plonky2::scanner::ScannerConfig::expected_params_identifier
 zkcoins_prover_plonky2::scanner::ScannerConfig::network
 zkcoins_prover_plonky2::scanner::ScannerConfig::network_params
 zkcoins_prover_plonky2::scanner::ScannerConfig::rpc_url
+zkcoins_prover_plonky2::scanner::evaluate_anchor_bound
 zkcoins_prover_plonky2::state_engine
 zkcoins_prover_plonky2::state_engine::AccountRecord
 zkcoins_prover_plonky2::state_engine::AccountRecord::coinhist
@@ -394,6 +396,14 @@ zkcoins_prover_plonky2::verifier_cache::CachedBalanceVerifier::balance_circuit_d
 zkcoins_prover_plonky2::verifier_cache::CachedBalanceVerifier::load_balance_proof_bytes
 zkcoins_prover_plonky2::verifier_cache::CachedBalanceVerifier::network
 zkcoins_prover_plonky2::verifier_cache::CachedBalanceVerifier::verify_attestation
+zkcoins_prover_plonky2::verifier_cache::CachedComplianceVerifier
+zkcoins_prover_plonky2::verifier_cache::CachedComplianceVerifier::compliance_circuit_digest_bytes
+zkcoins_prover_plonky2::verifier_cache::CachedComplianceVerifier::into_verifier_data
+zkcoins_prover_plonky2::verifier_cache::CachedComplianceVerifier::network
 zkcoins_prover_plonky2::verifier_cache::ZkCoinsGateSerializer
+zkcoins_prover_plonky2::verifier_cache::balance_verifier_blob_hash_for_network
+zkcoins_prover_plonky2::verifier_cache::compliance_verifier_blob_hash_for_network
 zkcoins_prover_plonky2::verifier_cache::load_balance_verifier_cache_checked
+zkcoins_prover_plonky2::verifier_cache::load_compliance_verifier_cache_checked
 zkcoins_prover_plonky2::verifier_cache::write_balance_verifier_cache
+zkcoins_prover_plonky2::verifier_cache::write_compliance_verifier_cache

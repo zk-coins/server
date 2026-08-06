@@ -461,8 +461,8 @@ async function runSignedTransition(client, seed, acct, request, stage) {
 // Entrust + pull balances
 // ---------------------------------------------------------------------------
 
-async function entrustBundle(acct, host) {
-  const ch = await httpJson('POST', `${API_URL}/v1/bootstrap/challenge`, {
+async function entrustBundle(acct, host, apiUrl = API_URL) {
+  const ch = await httpJson('POST', `${apiUrl}/v1/bootstrap/challenge`, {
     subject: acct.subject,
     action: 'entrust',
   });
@@ -481,7 +481,7 @@ async function entrustBundle(acct, host) {
     host,
     expectedDomain: 'zkCoins/v1/EntrustChallenge',
   });
-  const en = await httpJson('POST', `${API_URL}/v1/bootstrap/entrust`, {
+  const en = await httpJson('POST', `${apiUrl}/v1/bootstrap/entrust`, {
     challenge: { nonce: ch.json.nonce, expiry: String(ch.json.expiry) },
     ownership_proof: proof,
     bundle: acct.bundleHex,
@@ -895,7 +895,7 @@ async function stage2b_carol_eur(client, seed, alice, carol, host, usdAssetIdHex
   return { eurAssetIdHex, carolMintJob: mintJob };
 }
 
-async function stage3_4_alice_send(client, seed, alice, bob, host, assetIdHex, aliceMintCoinId) {
+async function stage3_4_alice_send(client, seed, alice, bob, host, assetIdHex, aliceMintCoinId, eurAssetIdHex) {
   const pub = publisherPubkeyHex();
   if (!pub) {
     fail(3, 'PUBLISHER_KEY required to assert fee-less case (c) with publisher_pubkey');
@@ -977,8 +977,18 @@ async function stage3_4_alice_send(client, seed, alice, bob, host, assetIdHex, a
   pass(3, `Bob receipt discovered coin_id=${bobReceipt.coin_id.slice(0, 16)}…`);
 
   const balances = await pullBalances(client, alice);
-  assertBalancesExact(4, balances, { [assetIdHex]: ALICE_AFTER_SEND });
-  pass(4, `Alice balance USD-Demo == ${ALICE_AFTER_SEND} after send of ${SEND_AMOUNT}`);
+  const expectedAfterSend = { [assetIdHex]: ALICE_AFTER_SEND };
+  if (typeof eurAssetIdHex === 'string' && eurAssetIdHex.length > 0) {
+    expectedAfterSend[eurAssetIdHex] = EUR_DEMO.amount;
+  }
+  assertBalancesExact(4, balances, expectedAfterSend);
+  pass(
+    4,
+    `Alice balances after fee-less send of ${SEND_AMOUNT}: USD-Demo == ${ALICE_AFTER_SEND}` +
+      (typeof eurAssetIdHex === 'string' && eurAssetIdHex.length > 0
+        ? `, EUR-Demo == ${EUR_DEMO.amount} (untouched)`
+        : ''),
+  );
 
   return {
     assetIdHex,
@@ -1112,12 +1122,74 @@ async function stage7_reorg() {
 }
 
 async function stage8_recovery() {
-  fail(
-    8,
-    'TODO: Recovery control (Requirement 6) — destroy Bob node state; restore from seed + ' +
-      'regtest chain + replicated blobs; balance and coin set equal pre-destruction. ' +
-      'Needs: durable blob replication (k=3), volume wipe + restore procedure.',
-  );
+  try {
+    const seed = seedFromMnemonicV1(MNEMONIC);
+    const bob = buildAccount(seed, 1);
+
+    const node1Client = new ZkCoinsV1Client({
+      apiUrl: API_URL,
+      network: 'regtest',
+      requestTimeoutMs: 120_000,
+    });
+    const node2Client = new ZkCoinsV1Client({
+      apiUrl: API_URL_2,
+      network: 'regtest',
+      requestTimeoutMs: 120_000,
+    });
+
+    // Precondition: Bob on node1 must already hold SEND_AMOUNT (stages 1–5).
+    const node1Balances = await pullBalances(node1Client, bob);
+    let assetIdHex = null;
+    let node1Amount;
+    for (const [aid, amount] of node1Balances) {
+      if (amount === SEND_AMOUNT) {
+        assetIdHex = aid;
+        node1Amount = amount;
+        break;
+      }
+    }
+    if (node1Amount !== SEND_AMOUNT || assetIdHex === null) {
+      const actual =
+        node1Balances.size === 0
+          ? 'none'
+          : [...node1Balances.entries()]
+              .map(([k, v]) => `${k.slice(0, 16)}…=${v}`)
+              .join(', ');
+      fail(8, `node1 Bob balance precondition failed: expected ${SEND_AMOUNT}, got ${actual}`);
+    }
+
+    // Entrust Bob's operational bundle onto node2 so §4.5 recovery has a subject
+    // to scan under. Host must match ZKCOINS_PUBLIC_HOST_2 (api2/node2 chan_bind).
+    await entrustBundle(bob, '127.0.0.1:8081', API_URL_2);
+
+    // Poll node2 until Bob's recovered balance matches node1 (or budget expires).
+    const deadline = Date.now() + 180_000;
+    let last;
+    while (Date.now() < deadline) {
+      try {
+        const node2Balances = await pullBalances(node2Client, bob);
+        last = node2Balances.get(assetIdHex);
+        if (last === SEND_AMOUNT) {
+          pass(
+            8,
+            'recovery (Req 6): node2 reconstructed Bob from seed+chain+replicated blobs — 250000 == node1',
+          );
+          return;
+        }
+      } catch (e) {
+        // Expected transient: while the §4.5 recovery campaign is still running,
+        // node2 returns HTTP 500 "no indexed AccountState for subject" (fail-closed
+        // backend — it never invents empty state). Tolerate it and keep polling
+        // until the campaign installs Bob's head or the deadline elapses; only a
+        // missing balance AFTER the deadline is a real failure.
+        last = `pending (${(e && e.message ? e.message : String(e)).slice(0, 80)})`;
+      }
+      await sleep(3000);
+    }
+    fail(8, `recovery did not restore Bob: got ${last ?? 'none'}`);
+  } catch (err) {
+    fail(8, err.message);
+  }
 }
 
 async function stage9_portability() {
@@ -1454,6 +1526,7 @@ async function main() {
             host,
             ctx.assetIdHex,
             aliceMintCoinId,
+            ctx.eurAssetIdHex,
           )),
         };
         break;

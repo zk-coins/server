@@ -119,19 +119,19 @@ pub(crate) fn encode_v1_live_digest(c: &[u8; 32], c_balance: &[u8; 32]) -> Vec<u
 ///   [`load_balance_verifier_cache_checked`](zkcoins_prover::verifier_cache::load_balance_verifier_cache_checked)
 ///   (cryptographic verification — no trust placed in the cache file's
 ///   self-reported digest field alone).
-/// * `pin_c`, by contrast, is taken on faith *inside this helper*: `C` is
-///   **not** built here. The §3.6 pins are installed once, early, in
-///   `main.rs` (before `EngineAdapter::load_or_create_from_env` and before
-///   the primary/secondary role branch), so the `ProverBridge` identity gate
-///   is armed for the whole process from that point on. `C` itself is
-///   pin-checked the first time it is actually built — whichever of these
-///   happens first: (a) the ledger-load `last_proof` bind path
-///   (`ProverBridge::bind_loaded_prev_proof` / `bind_prev_proof_identity`,
-///   reached from `EngineAdapter::load_or_create_from_env` via
-///   `node/src/v1/db_v1.rs`) if the loaded account row has a persisted
-///   `last_proof`, or (b) the first `prove_transition` /
-///   `verify_transition` call via `ProverBridge::ensure_proving_identity` /
-///   `require_live_identity`.
+/// * `pin_c` is **not** built inside this helper. On a secondary boot the full
+///   `C` verifier data is loaded from the shared cache
+///   (`load_compliance_verifier_cache_checked` — digest recomputed AND the whole
+///   `VerifierCircuitData` blob authenticated by SHA-256 against the §3.6 pin)
+///   and installed via `ProverBridge::mark_compliance_verifier_from_cache`
+///   **before** `EngineAdapter::load_or_create_from_env` runs. So neither the
+///   ledger-load `last_proof` bind path (`bind_loaded_prev_proof` /
+///   `bind_prev_proof_identity`) nor any later `verify_transition` ever rebuilds
+///   `C`: the cache-verified verifier serves verification directly. The §3.6
+///   pins themselves are installed once, early, in `main.rs` before the role
+///   branch, arming the `ProverBridge` identity gate for the whole process.
+///   (A secondary never proves; if it ever did, `compliance_circuit` would build
+///   `C`'s prover data lazily at that point — this cache covers verification only.)
 ///
 /// This is a deliberately separate path from [`resolve_v1_live_digest`]
 /// (primary boot), which forces a live build of both circuits.
@@ -453,7 +453,8 @@ pub fn v1_canary_for_heal(adapter: &EngineAdapter) -> CanaryOutcome {
     if slow_canary_env_enabled() {
         info!(
             "v1.1 self-heal: ZKCOINS_V1_SLOW_CANARY=1 — running verify_transition \
-             canary (compliance circuit build may take minutes on cold start)"
+             canary (uses the cache-loaded C verifier on a secondary; on a primary/single \
+             node it builds the compliance circuit on first use — may take minutes on cold start)"
         );
         slow_canary_verify_transition(adapter)
     } else {

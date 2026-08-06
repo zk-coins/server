@@ -1351,7 +1351,9 @@ async fn stage_sdr_phase_a_after_mesh(
     use crate::v1::db_self_delivery_index::{
         insert_and_mirror_self_delivery, SelfDeliveryIndexRow,
     };
-    use crate::v1::delivery::{build_coin_delivery, external_delivery_coins};
+    use crate::v1::delivery::{
+        build_coin_delivery, external_delivery_coins, upload_built_coin_blob,
+    };
     use crate::v1::outbox_material::{SdrPhaseAMaterial, SdrPhaseAOutputRef};
     use crate::v1::sdr::{output_ref_from_built, stage_phase_a};
     use shared::spec_v1::note_encryption::xonly_pubkey;
@@ -1538,6 +1540,14 @@ async fn stage_sdr_phase_a_after_mesh(
                     rng.as_mut(),
                 )?
             };
+            upload_built_coin_blob(
+                &built,
+                &bundle.op,
+                deps.max_blob_bytes,
+                deps.now,
+                deps.auth_expiration,
+            )
+            .await?;
             let coin_id = digest_to_bytes(&coin.identifier);
             let row = SelfDeliveryIndexRow {
                 record_id: decrypt_record_id(&snap.owner, &coin_id, &built.blob_id),

@@ -757,14 +757,14 @@ fn assert_outer_tags_are_exactly_delivery_scan(
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoinDeliveryReport {}
 
-/// Upload ZBE blob to every holder, then publish gift-wrap to every relay.
-pub(crate) async fn publish_built_delivery(
+/// Upload a built coin's ZBE blob to every holder.
+pub(crate) async fn upload_built_coin_blob(
     built: &BuiltCoinDelivery,
     op_sk: &[u8; 32],
     max_blob_bytes: u64,
     now: u64,
     auth_expiration: u64,
-) -> Result<CoinDeliveryReport, DeliveryError> {
+) -> Result<(), DeliveryError> {
     let client = BlossomClient::new(max_blob_bytes).map_err(|e| DeliveryError::Blossom {
         holder: String::new(),
         error: e,
@@ -794,6 +794,19 @@ pub(crate) async fn publish_built_delivery(
                 error: e,
             })?;
     }
+
+    Ok(())
+}
+
+/// Upload ZBE blob to every holder, then publish gift-wrap to every relay.
+pub(crate) async fn publish_built_delivery(
+    built: &BuiltCoinDelivery,
+    op_sk: &[u8; 32],
+    max_blob_bytes: u64,
+    now: u64,
+    auth_expiration: u64,
+) -> Result<CoinDeliveryReport, DeliveryError> {
+    upload_built_coin_blob(built, op_sk, max_blob_bytes, now, auth_expiration).await?;
 
     let pool = RelayPool::new(built.recipient_relays.clone())
         .map_err(|e| DeliveryError::Relay(e.to_string()))?;

@@ -114,6 +114,8 @@ export ZKCOINS_V1_REVEAL_OUTPUT_SATS="1000"
 export ZKCOINS_FEATURES="wallet,explorer"
 # Host-side wallets dial http://127.0.0.1:8080 → chan_bind host "127.0.0.1:8080".
 export ZKCOINS_PUBLIC_HOST="127.0.0.1:8080"
+# node2 client-facing host for OwnershipProof chan_bind (api2/node2 only); api1/node1 keep ZKCOINS_PUBLIC_HOST — one host string per node.
+export ZKCOINS_PUBLIC_HOST_2="127.0.0.1:8081"
 export ZKCOINS_BLOSSOM_MAX_BLOB_BYTES="1048576"
 # Alice (account'=0), Bob (account'=1), and Carol (account'=2) op_pubkey,
 # derived from the journey's fixed V.2-ext test mnemonic via

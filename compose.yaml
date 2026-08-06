@@ -456,7 +456,10 @@ services:
 
       # Optional: comma-separated hosts for attest channel binding
       # (node/src/v1/attest.rs public_hosts_from_env — empty is OK, fails loud on use).
-      ZKCOINS_PUBLIC_HOST: ${ZKCOINS_PUBLIC_HOST:-}
+      ZKCOINS_PUBLIC_HOST: ${ZKCOINS_PUBLIC_HOST_2:-}
+      ZKCOINS_V1_RECOVERY: "1"
+      ZKCOINS_V1_RECOVERY_PAGE_LIMIT: "500"
+      ZKCOINS_V1_RECOVERY_EARLIEST: "0"
 
       # GetInfo / ChainIdentity operational pins (node/src/kernel/chain.rs +
       # runtime::require_chain_identity_ops_from_env). No defaults — missing
@@ -555,7 +558,7 @@ services:
       # chan_bind from host "127.0.0.1:8080" (sdk/src/v1/ownership.ts
       # canonicalHostFromApiUrl) — set that exact string when using
       # bootstrap/pull/attest/grants from the host.
-      ZKCOINS_PUBLIC_HOST: ${ZKCOINS_PUBLIC_HOST:-}
+      ZKCOINS_PUBLIC_HOST: ${ZKCOINS_PUBLIC_HOST_2:-}
 
       # --- Blossom (§7.4) — store set ⇒ companions Pflicht ---
       # Store path matches the volume mount. Absent store would leave

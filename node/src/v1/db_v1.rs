@@ -236,7 +236,7 @@ impl EngineSnapshot {
 }
 
 impl AccountSnapshot {
-    fn into_record(self) -> Result<AccountRecord> {
+    pub(crate) fn into_record(self) -> Result<AccountRecord> {
         use std::collections::{BTreeMap, BTreeSet};
 
         let mut spendable: BTreeMap<[u8; 32], TrackedCoin> = BTreeMap::new();

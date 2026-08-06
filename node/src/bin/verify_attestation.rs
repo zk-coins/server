@@ -155,10 +155,19 @@ fn run(args: CliArgs) -> Result<(), String> {
     let cache_dir = std::env::var("ZKCOINS_VERIFIER_CACHE_DIR")
         .map_err(|_| "ZKCOINS_VERIFIER_CACHE_DIR must be set".to_string())?;
     let pinned = pins.network_params.circuit_digest_c_balance();
+    let pinned_blob_hash =
+        zkcoins_prover::verifier_cache::balance_verifier_blob_hash_for_network(pins.network)
+            .map_err(|e| {
+                format!(
+                    "full-VerifierCircuitData blob-hash pin for C_balance on this network is not \
+                     generated yet: {e:#}"
+                )
+            })?;
     let verifier = zkcoins_prover::verifier_cache::load_balance_verifier_cache_checked(
         pins.network,
         std::path::Path::new(&cache_dir),
         &pinned,
+        &pinned_blob_hash,
     )
     .map_err(|e| format!("load_balance_verifier_cache_checked failed: {e:#}"))?;
     verify_balance_attestation(&decoded, &scanner, tip_height, &verifier)

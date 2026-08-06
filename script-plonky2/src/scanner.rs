@@ -1225,7 +1225,11 @@ pub(crate) fn may_contain_zkcoins_envelope(input: &TxIn) -> bool {
 /// 2. `inclusion_height - anchor.height > MAX_ANCHOR_GAP`;
 /// 3. `anchor.block_hash != ancestor_hash_at_anchor` (not an ancestor of the
 ///    inclusion block).
-pub(crate) fn evaluate_anchor_bound(
+///
+/// Also called cross-crate by the node's §4.5 SDR replay for check (vi), so
+/// that path reuses this exact §3.5 gap-bound predicate rather than
+/// re-deriving the arithmetic.
+pub fn evaluate_anchor_bound(
     anchor: &BlockAnchor,
     inclusion_height: u64,
     ancestor_hash_at_anchor: [u8; 32],
