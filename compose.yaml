@@ -238,6 +238,7 @@ services:
       PROOFS_DIR: /data/proofs
       ZKCOINS_VERIFIER_CACHE_DIR: /data/verifier_cache
       ZKCOINS_PROVER_LEASE_PATH: /data/verifier_cache/prover.lease
+      ZKCOINS_PROVER_IDLE_TTL_SECS: "180"
       # Verifier-cache role: primary builds circuits and WRITES the shared cache
       # that node2 (secondary) loads (node/src/v1/mode.rs verifier_cache_role_from_env).
       # Unset also resolves to Primary — explicit here for clarity across two nodes.
@@ -490,6 +491,7 @@ services:
       PROOFS_DIR: /data/proofs
       ZKCOINS_VERIFIER_CACHE_DIR: /data/verifier_cache
       ZKCOINS_PROVER_LEASE_PATH: /data/verifier_cache/prover.lease
+      ZKCOINS_PROVER_IDLE_TTL_SECS: "180"
       # Verifier-cache role: secondary LOADS the shared cache written by node1
       # (node/src/v1/mode.rs verifier_cache_role_from_env; main.rs Secondary).
       ZKCOINS_VERIFIER_CACHE_ROLE: secondary
