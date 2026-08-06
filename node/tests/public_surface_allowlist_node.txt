@@ -121,6 +121,7 @@ node::runtime::RestNodeConfig::v1_readiness
 node::runtime::V1Readiness
 node::runtime::V1Readiness::finality_ok
 node::runtime::V1Readiness::scan_caught_up
+node::runtime::boot_requires_prover_lease
 node::runtime::require_chain_identity_ops_from_env
 node::runtime::start_rest_node
 node::self_heal

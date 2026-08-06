@@ -25,6 +25,8 @@
 //!     circuit `C` common data + cyclic-tail bind; `bind_loaded_prev_proof`
 //!     is the durable-account bincode path and cannot accept §1.7.9 wire.
 //!     Full `verify_transition` remains a separate call.
+//!   - [`prover_bridge::validate_prover_lease_path_at_boot`] — boot-time
+//!     validation of the host-wide proving-lease path for `node/src/main.rs`.
 //! - [`prover_bridge::test_signing`] — `TestSignature`, `deterministic_secret`,
 //!   `normalized_key`, `sign_transition`: **required by `probe_r2`** for
 //!   host-valid clause-10 fixtures (not a production wallet API).
@@ -74,6 +76,7 @@ pub mod circuit_identity;
 pub mod half_agg;
 pub(crate) mod inscription;
 pub mod prover_bridge;
+mod prover_lease;
 pub mod publisher;
 pub mod scanner;
 pub mod state_engine;

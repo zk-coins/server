@@ -13,6 +13,9 @@ num = "0.4"
 serde = { workspace = true }
 sha2 = { workspace = true }
 bitcoin = { workspace = true }
+# Cross-process file locking for the host-wide proving lease; uses the same
+# `fs2::FileExt::try_lock_exclusive` pattern as `node/src/test_db.rs`.
+fs2 = "0.4"
 # Must share the workspace `bitcoin` 0.32.x line — bitcoincore-rpc 0.19
 # depends on bitcoin ^0.32.0 and Cargo unifies to a single 0.32.x instance.
 bitcoincore-rpc = "0.19.0"

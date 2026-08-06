@@ -19,7 +19,7 @@
 //! cannot serve proofs under matching env pins.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{bail, ensure, Context, Result};
 use num::BigUint;
@@ -546,24 +546,42 @@ fn compliance_verifier_slot(network: Network) -> &'static OnceLock<VerifierCircu
     }
 }
 
-/// Outcome of a circuit cache slot: the built circuit, or a permanent refusal
-/// if construction-time pin check failed (or digests could not be determined).
+/// State of a circuit cache slot: a transient build marker, the completed
+/// circuit, or a cached construction-time identity refusal.
 ///
-/// `Ready` holds a [`Box`] so the multi-megabyte circuit body never crosses a
-/// thread join / `OnceLock::get_or_init` boundary as a by-value stack object
+/// `Ready` holds an [`Arc`] so the multi-megabyte circuit body never crosses a
+/// thread join / cache boundary as a by-value stack object
 /// (the test-runner default stack is ~2 MiB; returning `SkeletonCircuit` by
 /// value there aborts with stack overflow before the 64 MiB build worker
-/// finishes transferring the result).
+/// finishes transferring the result). Reference counting also lets the idle
+/// reaper inspect real residency while any caller keeps its own circuit
+/// reference alive until completion. `Building` blocks lease release without
+/// retaining a circuit and is reset by [`BuildingSlotGuard`] on unwind.
 enum CircuitSlot<T> {
-    Ready(Box<T>),
+    Building,
+    Ready(Arc<T>),
     Refused(String),
 }
 
-/// Cached production prover/verifier for one compile-time network.
+/// Result of atomically inspecting a circuit slot and, when it is empty,
+/// reserving it for the caller's build. In particular, a `Ready` result lets
+/// dependency-heavy builders return before acquiring or reconstructing any
+/// dependency that the completed circuit does not retain.
+enum CircuitSlotClaim<T: 'static, D> {
+    Ready(Arc<T>),
+    Refused(String),
+    Building,
+    Claimed {
+        building: BuildingSlotGuard<T>,
+        dependency: D,
+    },
+}
+
+/// Lazily resident production prover/verifier for one compile-time network.
 ///
-/// `C` and `C_balance` are each built at most once per network per process.
-/// When pins are installed, construction digests the just-built circuit and
-/// refuses on pin mismatch (§1.7.9).
+/// `C` and `C_balance` are reference-counted and evicted after the proving
+/// lease's idle TTL. When pins are installed, every fresh construction digests
+/// the just-built circuit and refuses on pin mismatch (§1.7.9).
 #[derive(Clone, Copy, Debug)]
 pub struct ProverBridge {
     network: Network,
@@ -571,7 +589,8 @@ pub struct ProverBridge {
 
 impl ProverBridge {
     /// Select a network. The compliance / balance circuits are built on first
-    /// use (prove, verify, digest, or gate-count) and then cached process-wide.
+    /// use (prove, verify, digest, or gate-count) and kept process-wide until
+    /// the proving-lease idle reaper evicts the resident cache references.
     ///
     /// Construction itself is cheap so persistence / adapter tests can hold a
     /// bridge handle without paying the multi-minute circuit build. The §1.7.9
@@ -846,7 +865,8 @@ impl ProverBridge {
                 .with_context(|| format!("received coin {index} creating proof is unacceptable"))?;
         }
         let expected = validate_transition(witness, self.network)?;
-        let partial = assemble_transition_witness(circuit, witness, &circuit.data.verifier_only)?;
+        let partial =
+            assemble_transition_witness(&circuit, witness, &circuit.data.verifier_only)?;
         let proof = circuit
             .data
             .prove(partial)
@@ -1029,7 +1049,7 @@ impl ProverBridge {
             .context("attestation embeds an unacceptable compliance proof")?;
         validate_attestation(witness)?;
         let circuit = balance_circuit(self.network)?;
-        let partial = assemble_attestation_witness(circuit, witness, self.network)?;
+        let partial = assemble_attestation_witness(&circuit, witness, self.network)?;
         let proof = circuit
             .data
             .prove(partial)
@@ -1064,91 +1084,392 @@ impl ProverBridge {
     }
 }
 
-/// Build `C` once per network. When pins are installed, the digest of the
-/// circuit that was **just built** is compared to the pin immediately —
-/// that is the §1.7.9 check (not an embedded text file, not the pins
-/// compared to themselves).
-pub(crate) fn compliance_circuit(network: Network) -> Result<&'static SkeletonCircuit> {
-    static MAINNET: OnceLock<CircuitSlot<SkeletonCircuit>> = OnceLock::new();
-    static TESTNET: OnceLock<CircuitSlot<SkeletonCircuit>> = OnceLock::new();
-    static REGTEST: OnceLock<CircuitSlot<SkeletonCircuit>> = OnceLock::new();
-    let cache = match network {
+fn compliance_circuit_slot(
+    network: Network,
+) -> &'static Mutex<Option<CircuitSlot<SkeletonCircuit>>> {
+    static MAINNET: Mutex<Option<CircuitSlot<SkeletonCircuit>>> = Mutex::new(None);
+    static TESTNET: Mutex<Option<CircuitSlot<SkeletonCircuit>>> = Mutex::new(None);
+    static REGTEST: Mutex<Option<CircuitSlot<SkeletonCircuit>>> = Mutex::new(None);
+    match network {
         Network::Mainnet => &MAINNET,
         Network::Testnet => &TESTNET,
         Network::Regtest => &REGTEST,
-    };
-    let slot = cache.get_or_init(|| {
-        // Build + pin-check on a large stack; only `Box` / `Refused` crosses
-        // back to the caller (test-runner stack is too small for by-value
-        // `SkeletonCircuit` — see `CircuitSlot` docs).
-        std::thread::Builder::new()
-            .name("zkcoins-compliance-cache".to_owned())
-            .stack_size(64 * 1024 * 1024)
-            .spawn(move || {
-                let circuit =
-                    build_skeleton_circuit(CircuitConfig::standard_recursion_zk_config(), network);
-                let built = host::digest_to_bytes(&circuit.data.verifier_only.circuit_digest);
-                if let Some(pins) = pins_slot(network).get() {
-                    if let Err(e) = crate::circuit_identity::require_one_live_digest_matches_pin(
-                        "C", &built, &pins.c, network,
-                    ) {
-                        return CircuitSlot::Refused(e);
-                    }
-                }
-                c_verified_flag(network).store(true, Ordering::Release);
-                CircuitSlot::Ready(Box::new(circuit))
-            })
-            .expect("compliance cache worker must spawn")
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    });
-    match slot {
-        CircuitSlot::Ready(c) => Ok(c.as_ref()),
-        CircuitSlot::Refused(e) => Err(anyhow::anyhow!(e.clone())),
     }
 }
 
-/// Build `C_balance` once per network (depends on `C`). Same construction-
-/// time pin check as [`compliance_circuit`].
-pub(crate) fn balance_circuit(network: Network) -> Result<&'static BalanceCircuit> {
-    static MAINNET: OnceLock<CircuitSlot<BalanceCircuit>> = OnceLock::new();
-    static TESTNET: OnceLock<CircuitSlot<BalanceCircuit>> = OnceLock::new();
-    static REGTEST: OnceLock<CircuitSlot<BalanceCircuit>> = OnceLock::new();
-    let cache = match network {
+fn balance_circuit_slot(network: Network) -> &'static Mutex<Option<CircuitSlot<BalanceCircuit>>> {
+    static MAINNET: Mutex<Option<CircuitSlot<BalanceCircuit>>> = Mutex::new(None);
+    static TESTNET: Mutex<Option<CircuitSlot<BalanceCircuit>>> = Mutex::new(None);
+    static REGTEST: Mutex<Option<CircuitSlot<BalanceCircuit>>> = Mutex::new(None);
+    match network {
         Network::Mainnet => &MAINNET,
         Network::Testnet => &TESTNET,
         Network::Regtest => &REGTEST,
+    }
+}
+
+fn lock_circuit_slot<T>(
+    slot: &Mutex<Option<CircuitSlot<T>>>,
+) -> std::sync::MutexGuard<'_, Option<CircuitSlot<T>>> {
+    // Slot guards never span circuit construction or thread join, so a panic
+    // cannot leave a partially-written circuit in the protected value.
+    // Recovering poison therefore preserves the last complete state and avoids
+    // cascading a build-worker panic into the independent reaper thread.
+    slot.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Inspect a slot and install `Building` as one atomic operation. `on_claim`
+/// runs under the slot lock immediately before publication of that marker, so
+/// generation-local verification state cannot lag behind a visible build.
+/// Only the thread that claims an empty slot runs `prepare_dependency`, after
+/// dropping the slot lock and under a [`BuildingSlotGuard`].
+fn claim_circuit_build<T: 'static, D>(
+    slot: &'static Mutex<Option<CircuitSlot<T>>>,
+    on_claim: impl FnOnce(),
+    prepare_dependency: impl FnOnce() -> D,
+) -> CircuitSlotClaim<T, D> {
+    let mut cache = lock_circuit_slot(slot);
+    match cache.as_ref() {
+        Some(CircuitSlot::Ready(circuit)) => {
+            return CircuitSlotClaim::Ready(Arc::clone(circuit));
+        }
+        Some(CircuitSlot::Refused(error)) => {
+            return CircuitSlotClaim::Refused(error.clone());
+        }
+        Some(CircuitSlot::Building) => return CircuitSlotClaim::Building,
+        None => {
+            on_claim();
+            *cache = Some(CircuitSlot::Building);
+        }
+    }
+    drop(cache);
+
+    let building = BuildingSlotGuard::new(slot);
+    let dependency = prepare_dependency();
+    CircuitSlotClaim::Claimed {
+        building,
+        dependency,
+    }
+}
+
+/// Panic guard for the transient `Building` marker.
+///
+/// A worker panic is deliberately resumed on the caller, but it must not make
+/// every later caller wait forever. Unless the completed slot replaces the
+/// marker and disarms this guard, unwinding restores the slot to `None`.
+struct BuildingSlotGuard<T: 'static> {
+    slot: &'static Mutex<Option<CircuitSlot<T>>>,
+    armed: bool,
+}
+
+impl<T: 'static> BuildingSlotGuard<T> {
+    fn new(slot: &'static Mutex<Option<CircuitSlot<T>>>) -> Self {
+        Self { slot, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<T: 'static> Drop for BuildingSlotGuard<T> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut slot = lock_circuit_slot(self.slot);
+        if matches!(slot.as_ref(), Some(CircuitSlot::Building)) {
+            *slot = None;
+        }
+    }
+}
+
+/// Evict one cache-owned circuit only when no external [`Arc`] still uses it.
+/// `Refused` contains no circuit memory and therefore never pins the host lease.
+fn try_evict_slot<T>(slot: &Mutex<Option<CircuitSlot<T>>>) -> bool {
+    let mut slot = lock_circuit_slot(slot);
+    match slot.as_ref() {
+        None | Some(CircuitSlot::Refused(_)) => true,
+        Some(CircuitSlot::Building) => false,
+        Some(CircuitSlot::Ready(circuit)) if Arc::strong_count(circuit) == 1 => {
+            *slot = None;
+            true
+        }
+        Some(CircuitSlot::Ready(_)) => false,
+    }
+}
+
+/// Build or clone the resident `C` for one network. When pins are installed,
+/// every fresh build immediately compares the just-built digest to its pin —
+/// the §1.7.9 check, not an embedded text file or pins compared to themselves.
+pub(crate) fn compliance_circuit(network: Network) -> Result<Arc<SkeletonCircuit>> {
+    let slot = compliance_circuit_slot(network);
+    loop {
+        let mut cache = lock_circuit_slot(slot);
+        match cache.as_ref() {
+            Some(CircuitSlot::Ready(circuit)) => {
+                let circuit = Arc::clone(circuit);
+                drop(cache);
+                crate::prover_lease::note_active();
+                return Ok(circuit);
+            }
+            Some(CircuitSlot::Refused(error)) => {
+                let error = error.clone();
+                drop(cache);
+                return Err(anyhow::anyhow!(error));
+            }
+            Some(CircuitSlot::Building) => {
+                // A short poll keeps the state machine simple while ensuring
+                // no waiter retains the slot lock during the expensive build.
+                drop(cache);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            None => {
+                // A prior resident generation may have set this flag. Every
+                // fresh generation must earn it again via its own pin check.
+                c_verified_flag(network).store(false, Ordering::Release);
+                *cache = Some(CircuitSlot::Building);
+                drop(cache);
+                break;
+            }
+        }
+    }
+
+    let mut building = BuildingSlotGuard::new(slot);
+    crate::prover_lease::acquire_host_lease()?;
+    // This is intentionally before spawn/join: if the worker panics, the RAII
+    // guard clears `Building` and an already-running reaper can release flock.
+    crate::prover_lease::ensure_reaper_started()?;
+
+    // Build + pin-check on a large stack; only the completed circuit or a
+    // refusal string crosses back to the caller (the test-runner stack is too
+    // small for by-value `SkeletonCircuit`; see `CircuitSlot` docs).
+    let built = std::thread::Builder::new()
+        .name("zkcoins-compliance-cache".to_owned())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let circuit =
+                build_skeleton_circuit(CircuitConfig::standard_recursion_zk_config(), network);
+            let digest = host::digest_to_bytes(&circuit.data.verifier_only.circuit_digest);
+            if let Some(pins) = pins_slot(network).get() {
+                crate::circuit_identity::require_one_live_digest_matches_pin(
+                    "C", &digest, &pins.c, network,
+                )?;
+            }
+            c_verified_flag(network).store(true, Ordering::Release);
+            Ok::<_, String>(circuit)
+        })
+        .context("spawn compliance cache worker")?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+    let mut cache = lock_circuit_slot(slot);
+    let result = match built {
+        Ok(circuit) => {
+            let circuit = Arc::new(circuit);
+            *cache = Some(CircuitSlot::Ready(Arc::clone(&circuit)));
+            Ok(circuit)
+        }
+        Err(error) => {
+            *cache = Some(CircuitSlot::Refused(error.clone()));
+            Err(anyhow::anyhow!(error))
+        }
     };
-    // C must exist first (and have passed its pin check when pins are set).
-    let compliance = compliance_circuit(network)?;
-    let slot = cache.get_or_init(|| {
-        std::thread::Builder::new()
-            .name("zkcoins-balance-cache".to_owned())
-            .stack_size(64 * 1024 * 1024)
-            .spawn(move || {
-                // `compliance` is `'static`; re-borrow for the balance builder.
-                let circuit = build_c_balance_circuit(compliance, network);
-                let built = host::digest_to_bytes(&circuit.data.verifier_only.circuit_digest);
-                if let Some(pins) = pins_slot(network).get() {
-                    if let Err(e) = crate::circuit_identity::require_one_live_digest_matches_pin(
-                        "C_balance",
-                        &built,
-                        &pins.c_balance,
-                        network,
-                    ) {
-                        return CircuitSlot::Refused(e);
-                    }
-                }
-                balance_verified_flag(network).store(true, Ordering::Release);
-                CircuitSlot::Ready(Box::new(circuit))
-            })
-            .expect("balance cache worker must spawn")
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    });
-    match slot {
-        CircuitSlot::Ready(c) => Ok(c.as_ref()),
-        CircuitSlot::Refused(e) => Err(anyhow::anyhow!(e.clone())),
+    building.disarm();
+    drop(cache);
+    crate::prover_lease::note_active();
+    result
+}
+
+/// Build or clone the resident `C_balance` for one network. A ready balance
+/// circuit does not retain `C`, so its slot is checked before `C` is requested;
+/// only a newly claimed balance build keeps `C` resident for construction and
+/// the construction-time pin check shared with [`compliance_circuit`].
+pub(crate) fn balance_circuit(network: Network) -> Result<Arc<BalanceCircuit>> {
+    let slot = balance_circuit_slot(network);
+    let (mut building, compliance) = loop {
+        match claim_circuit_build(
+            slot,
+            || {
+                balance_verified_flag(network).store(false, Ordering::Release);
+            },
+            || {
+                crate::prover_lease::acquire_host_lease()?;
+                crate::prover_lease::ensure_reaper_started()?;
+                // `C_balance` copies only C's common/verifier data during
+                // construction and retains no C reference. This dependency
+                // preparation runs only for the claimed build, so a ready
+                // balance hit neither reconstructs C nor marks C active.
+                compliance_circuit(network)
+            },
+        ) {
+            CircuitSlotClaim::Ready(circuit) => {
+                crate::prover_lease::note_active();
+                return Ok(circuit);
+            }
+            CircuitSlotClaim::Refused(error) => return Err(anyhow::anyhow!(error)),
+            CircuitSlotClaim::Building => {
+                // A short poll keeps the state machine simple while ensuring
+                // no waiter retains the slot lock during the expensive build.
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            CircuitSlotClaim::Claimed {
+                building,
+                dependency,
+            } => {
+                let compliance = dependency?;
+                break (building, compliance);
+            }
+        }
+    };
+
+    let built = std::thread::Builder::new()
+        .name("zkcoins-balance-cache".to_owned())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let circuit = build_c_balance_circuit(&compliance, network);
+            let digest = host::digest_to_bytes(&circuit.data.verifier_only.circuit_digest);
+            if let Some(pins) = pins_slot(network).get() {
+                crate::circuit_identity::require_one_live_digest_matches_pin(
+                    "C_balance",
+                    &digest,
+                    &pins.c_balance,
+                    network,
+                )?;
+            }
+            balance_verified_flag(network).store(true, Ordering::Release);
+            Ok::<_, String>(circuit)
+        })
+        .context("spawn balance cache worker")?
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+    let mut cache = lock_circuit_slot(slot);
+    let result = match built {
+        Ok(circuit) => {
+            let circuit = Arc::new(circuit);
+            *cache = Some(CircuitSlot::Ready(Arc::clone(&circuit)));
+            Ok(circuit)
+        }
+        Err(error) => {
+            *cache = Some(CircuitSlot::Refused(error.clone()));
+            Err(anyhow::anyhow!(error))
+        }
+    };
+    building.disarm();
+    drop(cache);
+    crate::prover_lease::note_active();
+    result
+}
+
+/// Evict every cache-owned circuit whose slot is its only remaining [`Arc`].
+/// Returns true only when all six slots are empty in the lease sense.
+pub(crate) fn try_evict_all_unreferenced() -> bool {
+    let mut all_empty = true;
+    // Inspect every slot even after one blocks release: other unreferenced
+    // circuits should still be reclaimed during this pass.
+    for network in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+        all_empty &= try_evict_slot(balance_circuit_slot(network));
+        all_empty &= try_evict_slot(compliance_circuit_slot(network));
+    }
+    all_empty
+}
+
+/// Validate that the mandatory host-wide proving-lease file can be opened or
+/// created at boot. The exclusive flock itself is acquired by the first build.
+pub fn validate_prover_lease_path_at_boot() -> Result<()> {
+    crate::prover_lease::ensure_lease_path_ready()
+}
+
+#[cfg(test)]
+mod prover_lease_tests {
+    use super::{claim_circuit_build, try_evict_slot, CircuitSlot, CircuitSlotClaim};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn ready_balance_slot_does_not_enter_dependency_build_branch() {
+        // `BalanceCircuit` cannot be constructed cheaply in a unit test. This
+        // stand-in exercises the same generic slot decision used before the
+        // production `compliance_circuit` call; only `Claimed` may enter that
+        // dependency-build branch.
+        let slot: &'static Mutex<Option<CircuitSlot<u8>>> = Box::leak(Box::new(Mutex::new(
+            Some(CircuitSlot::Ready(Arc::new(7_u8))),
+        )));
+        let compliance_builds = AtomicUsize::new(0);
+
+        let circuit = match claim_circuit_build(
+            slot,
+            || {},
+            || {
+                compliance_builds.fetch_add(1, Ordering::Relaxed);
+            },
+        ) {
+            CircuitSlotClaim::Ready(circuit) => circuit,
+            CircuitSlotClaim::Claimed { .. } => {
+                panic!("ready balance slot must not claim a build")
+            }
+            CircuitSlotClaim::Building => panic!("ready balance slot reported Building"),
+            CircuitSlotClaim::Refused(error) => panic!("ready balance slot refused: {error}"),
+        };
+
+        assert_eq!(*circuit, 7);
+        assert_eq!(compliance_builds.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn sole_cache_reference_is_evicted_and_empty() {
+        let slot = Mutex::new(Some(CircuitSlot::Ready(Arc::new(7_u8))));
+
+        assert!(try_evict_slot(&slot));
+        assert!(slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+    }
+
+    #[test]
+    fn external_reference_blocks_release_until_dropped() {
+        let resident = Arc::new(7_u8);
+        let external = Arc::clone(&resident);
+        let slot = Mutex::new(Some(CircuitSlot::Ready(resident)));
+
+        assert!(
+            !try_evict_slot(&slot),
+            "the reaper must retain flock while an external circuit Arc lives"
+        );
+        drop(external);
+        assert!(try_evict_slot(&slot));
+        assert!(slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
+    }
+
+    #[test]
+    fn nonresident_states_are_empty_but_building_blocks_release() {
+        let none = Mutex::<Option<CircuitSlot<u8>>>::new(None);
+        let refused = Mutex::new(Some(CircuitSlot::<u8>::Refused("pin mismatch".to_owned())));
+        let building = Mutex::new(Some(CircuitSlot::<u8>::Building));
+
+        assert!(try_evict_slot(&none));
+        assert!(try_evict_slot(&refused));
+        assert!(!try_evict_slot(&building));
+    }
+
+    #[test]
+    fn building_guard_restores_slot_after_unwind_path() {
+        let slot: &'static Mutex<Option<CircuitSlot<u8>>> =
+            Box::leak(Box::new(Mutex::new(Some(CircuitSlot::Building))));
+        {
+            let _building = super::BuildingSlotGuard::new(slot);
+        }
+
+        assert!(slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none());
     }
 }
 

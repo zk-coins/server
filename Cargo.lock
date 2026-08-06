@@ -5630,6 +5630,7 @@ dependencies = [
  "bincode",
  "bitcoin",
  "bitcoincore-rpc",
+ "fs2",
  "num",
  "plonky2",
  "serde",

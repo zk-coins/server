@@ -163,6 +163,7 @@ zkcoins_prover_plonky2::prover_bridge::test_signing::TestSignature::transition
 zkcoins_prover_plonky2::prover_bridge::test_signing::deterministic_secret
 zkcoins_prover_plonky2::prover_bridge::test_signing::normalized_key
 zkcoins_prover_plonky2::prover_bridge::test_signing::sign_transition
+zkcoins_prover_plonky2::prover_bridge::validate_prover_lease_path_at_boot
 zkcoins_prover_plonky2::publisher
 zkcoins_prover_plonky2::publisher::BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN
 zkcoins_prover_plonky2::publisher::BatchMember

@@ -85,6 +85,22 @@ pub fn require_chain_identity_ops_from_env() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Whether this boot can build a circuit and therefore must validate the
+/// mandatory host-wide proving-lease path before expensive work.
+///
+/// Primary verifier-cache boot always self-heals live digests by constructing
+/// both circuits, even when the advertised kernel parts omit `prover`.
+pub fn boot_requires_prover_lease() -> Result<bool, String> {
+    let ops =
+        crate::kernel::chain::chain_identity_ops_from_env().map_err(|e| e.to_string())?;
+    let verifier_cache_role =
+        crate::v1::verifier_cache_role_from_env().map_err(|e| e.to_string())?;
+    Ok(ops
+        .kernel_parts
+        .contains(&crate::kernel::chain::KernelPart::Prover)
+        || verifier_cache_role == crate::v1::VerifierCacheRole::Primary)
+}
+
 /// Bind REST + job dispatcher + kernel gRPC, sharing one job store and notify map.
 ///
 /// The normative error table and the closed §7.5 / §7.8 wire vocabularies

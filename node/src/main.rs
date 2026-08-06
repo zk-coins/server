@@ -22,7 +22,8 @@ use node::account_node;
 use node::db;
 use node::kernel_rpc;
 use node::runtime::{
-    require_chain_identity_ops_from_env, start_rest_node, RestNodeConfig, V1Readiness,
+    boot_requires_prover_lease, require_chain_identity_ops_from_env, start_rest_node,
+    RestNodeConfig, V1Readiness,
 };
 use node::state::State;
 use node::username;
@@ -105,6 +106,11 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     require_chain_identity_ops_from_env().unwrap_or_else(|e| {
         panic!("{e}");
     });
+    if boot_requires_prover_lease().unwrap_or_else(|e| panic!("{e}")) {
+        zkcoins_prover::prover_bridge::validate_prover_lease_path_at_boot().expect(
+            "ZKCOINS_PROVER_LEASE_PATH must name an openable host-wide lease file for a prove-capable boot",
+        );
+    }
 
     // Open the Postgres pool and run pending migrations BEFORE any
     // state load — `connect_and_migrate` is idempotent (sqlx tracks
