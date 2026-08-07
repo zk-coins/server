@@ -546,6 +546,7 @@ pub fn verify_balance_attestation(
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

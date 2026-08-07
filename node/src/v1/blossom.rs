@@ -676,6 +676,7 @@ fn parse_hex32_lower(s: &str) -> Option<[u8; 32]> {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

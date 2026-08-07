@@ -2663,6 +2663,7 @@ pub mod test_fixtures {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

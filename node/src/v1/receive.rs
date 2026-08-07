@@ -1378,6 +1378,7 @@ fn summarize_published(batch: &PublishedBatch) -> PublishedBatchSummary {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

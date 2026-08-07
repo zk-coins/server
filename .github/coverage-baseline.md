@@ -192,14 +192,28 @@ Wave-4 unit gains: `v1/attest.rs` 82 → **88.01%**, `v1/nostr/profile.rs` 83 �
 adversarial-review pass, all error-branch assertions pinned to the exact variant/message), `v1/recovery.rs`
 §4.5 +11 error-branch tests.
 
-**⚠️ Measurement caveat — inline test modules deflate the number.** `--ignore-filename-regex` excludes
-only separate `*_tests.rs` files, not inline `#[cfg(test)] mod tests` blocks. Files with large inline test
-modules (recovery.rs, sdr.rs, signature.rs) count their test code as instrumented lines, and test code is
-never fully covered, so the per-file % understates production coverage (recovery.rs reads 59.98% with
-~2.7k of its ~3.5k instrumented lines being the test module). To measure honest **production** coverage,
-either move inline tests to `*_tests.rs` siblings (repo pattern, e.g. self_heal_tests.rs) or annotate the
-inline `mod tests` with `#[cfg_attr(coverage_nightly, coverage(off))]`. Deferred pending a methodology
-decision — the combined figures above are consistent across waves (trend valid) but conservative.
+**Methodology fix applied (2026-08-07): inline test modules excluded from coverage.** All 46 inline
+`#[cfg(test)] mod tests` blocks in node-src now carry `#[cfg_attr(coverage_nightly, coverage(off))]`
+(same mechanism the shared/script/program crates already use). This measures honest **production**
+coverage. Counter-intuitively this *lowered* the reported number: the inline test modules were ~95%
+covered (tests run their own code) and were inflating the figure, not deflating it.
+
+**Honest production node-src line coverage (2026-08-07, test modules excluded):**
+
+| Source | Coverage |
+|---|---|
+| Unit tests only | 68.81% |
+| Journey/integration only | 40.33% |
+| **Combined (unit ∪ integration)** | **78.63%** (24257 / 30848) |
+
+The earlier 85.35% figure counted test code and was inflated. Production coverage is 78.63% combined.
+The remaining ~21% is dominated by **integration-only** production code (Scanner/bitcoind RPC, the async
+job dispatcher, the Blossom/Nostr network path, the C-prover) with no test hook — e.g. `recovery.rs`
+production is 35.5%, `signature.rs` 52.5%, the rest being Scanner/network/prover paths. Their *correctness*
+is covered by the green journey + the reorg matrix (§3.9) + the fail-closed gates; their *lines* are only
+reachable via the live stack. Path to higher honest production coverage: (1) the remaining unit-testable
+pure/DB branches; (2) live-stack fault injection for the integration error branches; (3) documented
+`coverage(off)` for the provably-only-live defensive arms (never over-excluding unit-reachable code).
 
 ¹ integration-only measured against the *union* instrumented-line base (larger denominator than
 Update 9's integ-only-base 47.8%); the combined figure is the honest, comparable metric.

@@ -361,6 +361,7 @@ pub(crate) fn decrypt(conversation_key: &[u8; 32], payload: &str) -> Result<Stri
 // Tests — one named test per official vector group
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

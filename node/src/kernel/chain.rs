@@ -1421,6 +1421,7 @@ pub(crate) fn chain_view_from_accumulator_with_catalog(
 // Tests — NAV root, Path-B presence, bounds, closed sets, GetInfo
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -577,6 +577,7 @@ pub(crate) fn unwrap_gift(wrap: &Event, recipient_sk: &[u8; 32]) -> Result<Unwra
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

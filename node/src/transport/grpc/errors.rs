@@ -102,6 +102,7 @@ fn grpc_code(code: GrpcStatusCode) -> Code {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

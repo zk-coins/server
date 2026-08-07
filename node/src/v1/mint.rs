@@ -111,6 +111,7 @@ fn engine_begin_mint(engine: &StateEngine, req: MintRequest) -> Result<PendingTr
     engine.begin_mint(req)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

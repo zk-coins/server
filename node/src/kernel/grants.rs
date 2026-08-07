@@ -373,6 +373,7 @@ pub(crate) fn require_ownership_capability(
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

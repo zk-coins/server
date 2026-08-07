@@ -404,6 +404,7 @@ fn chan_bind_allowed(chan_bind: &ChanBind, allowed: &[[u8; 32]]) -> bool {
     allowed.iter().any(|b| b == &chan_bind.0)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

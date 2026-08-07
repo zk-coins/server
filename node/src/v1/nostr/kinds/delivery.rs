@@ -334,6 +334,7 @@ pub(crate) fn delivery_rumor(
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1030,6 +1030,7 @@ pub(crate) async fn resolve_profile_by_op_pubkey(
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

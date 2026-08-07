@@ -1115,6 +1115,7 @@ pub(crate) async fn poll_incoming_deliveries(
 // Tests — pure steps only (no real Plonky2 proof)
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

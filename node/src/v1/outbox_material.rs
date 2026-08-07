@@ -386,6 +386,7 @@ fn parse_hex_vec(s: &str, field: &str) -> Result<Vec<u8>> {
     hex::decode(s).with_context(|| format!("{field}: hex decode"))
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

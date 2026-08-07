@@ -426,6 +426,7 @@ pub(crate) fn revoke_operational_bundle(
     Ok(RevokeResult { revoked })
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

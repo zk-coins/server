@@ -699,6 +699,7 @@ pub(crate) fn domain_from_parts(
     DomainKernel::from_parts(job_store, notify_map, pending_sign_map, challenges)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

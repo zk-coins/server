@@ -792,6 +792,7 @@ pub(crate) async fn publish_sdr_outbox_row(
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -519,6 +519,7 @@ fn _force_uses() {
     let _ = std::any::type_name::<Arc<ProofStore>>();
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -315,6 +315,7 @@ fn lookup_session(
         .map_err(super::session::SessionError::into_kernel_error)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

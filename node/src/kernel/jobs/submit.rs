@@ -672,6 +672,7 @@ pub(crate) mod fixtures {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::fixtures::*;

@@ -213,6 +213,7 @@ pub(crate) fn open_attest_balance_challenge(
     challenges.issue(ChallengeAction::AttestBalance, subject, now)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

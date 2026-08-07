@@ -2718,6 +2718,7 @@ async fn wait_for_active_bundles(
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

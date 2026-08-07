@@ -242,6 +242,7 @@ fn exact32(bytes: &[u8], field: &str) -> Result<[u8; 32]> {
     Ok(arr)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

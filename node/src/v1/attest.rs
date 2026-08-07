@@ -1362,6 +1362,7 @@ pub(crate) fn public_hosts_from_env() -> Vec<String> {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

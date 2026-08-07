@@ -420,6 +420,7 @@ fn map_profile_check(index: usize, e: ProfileCheckError) -> KernelError {
     )
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

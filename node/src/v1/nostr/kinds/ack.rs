@@ -219,6 +219,7 @@ pub(crate) fn ack_rumor(author_pubkey: [u8; 32], created_at: u64, content: &AckC
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

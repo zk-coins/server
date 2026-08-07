@@ -980,6 +980,7 @@ pub(crate) fn validate_closed_sets() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

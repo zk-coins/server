@@ -291,6 +291,7 @@ pub(crate) fn assert_receive_provenance_is_creating_proof(
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

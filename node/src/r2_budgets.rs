@@ -333,6 +333,7 @@ pub fn budgets_for_mode(mode: ProverMode) -> Result<R2BudgetSet, BudgetUnavailab
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;

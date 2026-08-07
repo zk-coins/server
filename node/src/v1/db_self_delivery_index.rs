@@ -269,6 +269,7 @@ fn exact32(bytes: &[u8], field: &str) -> Result<[u8; 32]> {
         .with_context(|| format!("v1_self_delivery_index.{field} must be 32 bytes"))
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
