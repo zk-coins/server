@@ -180,13 +180,26 @@ the journey, so it was counted as uncovered. The **integration-coverage pipeline
 - Reproduce: bring the dev stack (`zkcoins-local`) down first (port 18443), `source` env.local.sh,
   `export COMPOSE_PROJECT_NAME=zkcoins-local-coverage`, `brew install lcov`, then run the script.
 
-**Measured node-src line coverage (updated 2026-08-07, wave 3):**
+**Measured node-src line coverage (updated 2026-08-07, wave 4):**
 
 | Source | Coverage |
 |---|---|
-| Unit tests only | 78.48% |
-| Journey/integration only | 24.59%¹ |
-| **Combined (unit ∪ integration)** | **84.68%** (42835 / 50583) |
+| Unit tests only | 79.51% |
+| Journey/integration only | 23.97%¹ |
+| **Combined (unit ∪ integration)** | **85.35%** (44294 / 51894) |
+
+Wave-4 unit gains: `v1/attest.rs` 82 → **88.01%**, `v1/nostr/profile.rs` 83 → **89.51%** (each with an
+adversarial-review pass, all error-branch assertions pinned to the exact variant/message), `v1/recovery.rs`
+§4.5 +11 error-branch tests.
+
+**⚠️ Measurement caveat — inline test modules deflate the number.** `--ignore-filename-regex` excludes
+only separate `*_tests.rs` files, not inline `#[cfg(test)] mod tests` blocks. Files with large inline test
+modules (recovery.rs, sdr.rs, signature.rs) count their test code as instrumented lines, and test code is
+never fully covered, so the per-file % understates production coverage (recovery.rs reads 59.98% with
+~2.7k of its ~3.5k instrumented lines being the test module). To measure honest **production** coverage,
+either move inline tests to `*_tests.rs` siblings (repo pattern, e.g. self_heal_tests.rs) or annotate the
+inline `mod tests` with `#[cfg_attr(coverage_nightly, coverage(off))]`. Deferred pending a methodology
+decision — the combined figures above are consistent across waves (trend valid) but conservative.
 
 ¹ integration-only measured against the *union* instrumented-line base (larger denominator than
 Update 9's integ-only-base 47.8%); the combined figure is the honest, comparable metric.
