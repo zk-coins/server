@@ -105,7 +105,7 @@ pub(crate) fn inscription_txs(
 
     let network = config.network();
 
-    println!("Publisher address: {}", publisher_address);
+    tracing::info!("Publisher address: {}", publisher_address);
 
     let amount: u64 = outpoints_with_sats.iter().map(|(_, sats)| sats).sum();
 
@@ -332,7 +332,7 @@ fn build_reveal_only_inner(
         Amount::from_sat(commit_output_value - reveal_fee);
 
     // Mine the reveal transaction to have a txid starting with our marker
-    println!(
+    tracing::info!(
         "Mining reveal transaction to start with {}...",
         INSCRIPTION_MARKER_PREFIX
     );
@@ -376,17 +376,17 @@ fn build_reveal_only_inner(
         let txid_bytes = txid.as_byte_array();
 
         if txid_bytes.starts_with(&target_prefix) {
-            println!("Found matching txid: {} with nSequence: {}", txid, nonce);
+            tracing::info!("Found matching txid: {} with nSequence: {}", txid, nonce);
             found_nonce = Some(nonce);
             break;
         }
 
         if nonce % 10000 == 0 {
-            println!("Tried {} nonces...", nonce);
+            tracing::info!("Tried {} nonces...", nonce);
         }
 
         if nonce == MAX_MINING_ATTEMPTS - 1 {
-            println!("WARNING: Reached maximum attempts without finding a match");
+            tracing::warn!("WARNING: Reached maximum attempts without finding a match");
         }
     }
 
@@ -410,7 +410,7 @@ async fn broadcast_raw_tx(
 ) -> Result<Txid, Box<dyn std::error::Error + Send + Sync>> {
     client.broadcast(tx).await?;
     let txid = tx.compute_txid();
-    println!("{label} transaction broadcast successfully: {txid}");
+    tracing::info!("{label} transaction broadcast successfully: {txid}");
     Ok(txid)
 }
 
@@ -475,15 +475,15 @@ pub(crate) async fn create_and_broadcast_inscription(
     let (public_key, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
     let network = config.network();
     let publisher_address = Address::p2tr(&secp256k1, public_key, None, network);
-    println!("Publisher address: {}", publisher_address);
+    tracing::info!("Publisher address: {}", publisher_address);
 
     // Fetch UTXOs
-    println!("Fetching UTXOs...");
+    tracing::info!("Fetching UTXOs...");
     let outpoints_with_sats =
         get_publisher_utxo(&publisher_address, config, Some(MIN_INSCRIPTION_AMOUNT)).await?;
 
     if outpoints_with_sats.is_empty() {
-        eprintln!(
+        tracing::error!(
             "ERROR: No UTXOs found for publisher address {}. Fund it to continue.",
             publisher_address
         );
@@ -494,7 +494,7 @@ pub(crate) async fn create_and_broadcast_inscription(
 
     // Log found UTXOs
     for (outpoint, sats) in &outpoints_with_sats {
-        println!(
+        tracing::info!(
             "Found UTXO: {}:{} with value {} sats",
             outpoint.txid, outpoint.vout, sats
         );
@@ -512,8 +512,8 @@ pub(crate) async fn create_and_broadcast_inscription(
     // Print transaction IDs
     let commit_txid = commit_tx.compute_txid();
     let reveal_txid = reveal_tx.compute_txid();
-    println!("\nCommit TX ID: {}", commit_txid);
-    println!("Reveal TX ID: {}", reveal_txid);
+    tracing::info!("\nCommit TX ID: {}", commit_txid);
+    tracing::info!("Reveal TX ID: {}", reveal_txid);
 
     // Persist the (commit, reveal) pair BEFORE attempting any
     // broadcast. Crash-recovery (Phase B) hinges on the row being on
@@ -540,7 +540,7 @@ pub(crate) async fn create_and_broadcast_inscription(
         .await
         {
             Ok(true) => {
-                println!(
+                tracing::info!(
                     "Persisted pending_inscriptions row (constructed) for commit={}",
                     commit_txid
                 );
@@ -552,13 +552,13 @@ pub(crate) async fn create_and_broadcast_inscription(
                 // the next boot; in the meantime we still want to try
                 // broadcasting now in case the operator hasn't
                 // restarted yet.
-                println!(
+                tracing::info!(
                     "pending_inscriptions row for commit={} already exists; proceeding with broadcast",
                     commit_txid
                 );
             }
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "Failed to persist pending_inscriptions row for {}: {}",
                     commit_txid, e
                 );
@@ -582,7 +582,7 @@ pub(crate) async fn create_and_broadcast_inscription(
             };
             tokio::spawn(async move {
                 if let Err(e) = db::insert_tx_mining_log(&pool, &mining_entry).await {
-                    eprintln!("Failed to persist tx_mining_log: {}", e);
+                    tracing::warn!("Failed to persist tx_mining_log: {}", e);
                 }
             });
         }
@@ -591,13 +591,13 @@ pub(crate) async fn create_and_broadcast_inscription(
     // Broadcast the transactions
     match broadcast_inscription_txs_with_persistence(config, &commit_tx, &reveal_tx, pool).await {
         Ok((commit_txid, reveal_txid)) => {
-            println!("Successfully broadcast transactions:");
-            println!("Commit TXID: {}", commit_txid);
-            println!("Reveal TXID: {}", reveal_txid);
+            tracing::info!("Successfully broadcast transactions:");
+            tracing::info!("Commit TXID: {}", commit_txid);
+            tracing::info!("Reveal TXID: {}", reveal_txid);
             Ok((commit_txid, reveal_txid))
         }
         Err(e) => {
-            println!("Failed to broadcast transactions: {}", e);
+            tracing::error!("Failed to broadcast transactions: {}", e);
             // Record the error chain on the row without changing the
             // status discriminator: the broadcast may have advanced
             // the state machine to `commit_broadcast` (commit landed
@@ -617,7 +617,7 @@ pub(crate) async fn create_and_broadcast_inscription(
                     db::update_pending_failure_reason(pool, commit_txid.as_byte_array(), &reason)
                         .await
                 {
-                    eprintln!(
+                    tracing::warn!(
                         "Failed to persist failure_reason for {}: {}",
                         commit_txid, persist_err
                     );
@@ -705,7 +705,7 @@ async fn advance_pending_status(pool: Option<&PgPool>, commit_txid_bytes: &[u8],
         return;
     };
     if let Err(e) = db::update_pending_status(pool, commit_txid_bytes, status).await {
-        eprintln!(
+        tracing::warn!(
             "Failed to advance pending_inscriptions row {} to {}: {}",
             hex::encode(commit_txid_bytes),
             status,
@@ -746,17 +746,17 @@ pub(crate) async fn resume_pending_inscriptions(
 
     let rows = db::load_pending_in_progress(pool).await?;
     if rows.is_empty() {
-        println!("resume_pending_inscriptions: no pending rows");
+        tracing::info!("resume_pending_inscriptions: no pending rows");
         return Ok(());
     }
-    println!(
+    tracing::info!(
         "resume_pending_inscriptions: resuming {} pending row(s)",
         rows.len()
     );
 
     for row in rows {
         if let Err(e) = resume_single_row(pool, config, &row).await {
-            eprintln!(
+            tracing::error!(
                 "resume_pending_inscriptions: row id={} commit_txid={} status={} failed: {}",
                 row.id,
                 hex::encode(&row.commit_txid),
@@ -797,7 +797,7 @@ async fn resume_single_row(
 
     match row.status.as_str() {
         db::PENDING_STATUS_CONSTRUCTED => {
-            println!(
+            tracing::info!(
                 "resume: row id={} status=constructed → re-broadcasting commit {}",
                 row.id, commit_txid
             );
@@ -813,7 +813,7 @@ async fn resume_single_row(
                 Err(e) if is_inputs_missingorspent_error(e.as_ref()) => {
                     // The commit already landed on a previous attempt.
                     // Advance and fall through to the reveal step.
-                    println!(
+                    tracing::info!(
                         "resume: commit {} already on chain (bad-txns-inputs-missingorspent), advancing",
                         commit_txid
                     );
@@ -829,14 +829,14 @@ async fn resume_single_row(
             broadcast_reveal_and_complete(pool, &client, &row.commit_txid, &reveal_tx).await?;
         }
         db::PENDING_STATUS_COMMIT_BROADCAST => {
-            println!(
+            tracing::info!(
                 "resume: row id={} status=commit_broadcast → broadcasting reveal for {}",
                 row.id, commit_txid
             );
             broadcast_reveal_and_complete(pool, &client, &row.commit_txid, &reveal_tx).await?;
         }
         db::PENDING_STATUS_REVEAL_BROADCAST => {
-            println!(
+            tracing::info!(
                 "resume: row id={} status=reveal_broadcast → re-broadcasting reveal for {} (idempotent)",
                 row.id, commit_txid
             );
@@ -846,7 +846,7 @@ async fn resume_single_row(
             match client.broadcast(&reveal_tx).await {
                 Ok(()) => {}
                 Err(e) if is_inputs_missingorspent_error(e.as_ref()) => {
-                    println!(
+                    tracing::info!(
                         "resume: reveal for {} already on chain (txn-already-known)",
                         commit_txid
                     );
@@ -864,7 +864,7 @@ async fn resume_single_row(
             // Forward-compatible: an unknown status (e.g. a future
             // `failed` value) is skipped instead of crashing the
             // bootstrap.
-            println!(
+            tracing::info!(
                 "resume: row id={} commit_txid={} has unknown status {:?}; skipping",
                 row.id,
                 hex::encode(&row.commit_txid),
@@ -895,7 +895,7 @@ async fn broadcast_reveal_and_complete(
         Ok(()) => {}
         Err(e) if is_inputs_missingorspent_error(e.as_ref()) => {
             // Reveal already on chain — proceed to advance the row.
-            println!(
+            tracing::info!(
                 "resume: reveal {} already on chain (txn-already-known)",
                 reveal_tx.compute_txid()
             );

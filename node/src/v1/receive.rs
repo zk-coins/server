@@ -684,7 +684,7 @@ fn broadcast_commit_idempotent(
         Ok(txid) => Ok(txid),
         Err(err) if is_rebroadcast_already_done(&err) => {
             let txid = prepared.commit_txid();
-            eprintln!(
+            tracing::info!(
                 "v1 publish: commit {txid} already known/mempool/spent — treating rebroadcast as success"
             );
             Ok(txid)
@@ -702,7 +702,7 @@ fn broadcast_reveal_idempotent(
         Ok(txid) => Ok(txid),
         Err(err) if is_rebroadcast_already_done(&err) => {
             let txid = prepared.reveal_txid();
-            eprintln!(
+            tracing::info!(
                 "v1 publish: reveal {txid} already known/mempool/spent — treating rebroadcast as success"
             );
             Ok(txid)

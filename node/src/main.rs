@@ -122,7 +122,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             .await
             .expect("connect and migrate database"),
     );
-    println!("Connected to Postgres state-layer");
+    tracing::info!("Connected to Postgres state-layer");
 
     // Cutover Stage 3 — **atomic default switch**.
     //
@@ -155,7 +155,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     v1::enforce_stack_scan_mode(&pool, ScanStackMode::V1)
         .await
         .expect("v1 stack separation gate");
-    println!(
+    tracing::info!(
         "Stage 3 v1 stack: AggregateStateNullifierV3 publisher + NfLog scanner; \
          prove path = StateEngine / ProverBridge (legacy Prover::new is not on \
          the binary path)"
@@ -276,7 +276,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             .await
             .expect("v1 EngineAdapter bootstrap"),
     );
-    println!(
+    tracing::info!(
         "v1 EngineAdapter ready (network={:?}, activation_height={})",
         v1_adapter.network(),
         v1_adapter.activation_height()
@@ -290,12 +290,12 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             .await
             .expect("load state from Postgres"),
     ));
-    println!("Loaded State from Postgres (residual SMT/MMR tables; v1 uses NfLog)");
+    tracing::info!("Loaded State from Postgres (residual SMT/MMR tables; v1 uses NfLog)");
 
     let account_node = account_node::AccountNode::load_ledger_from_pg(Arc::clone(&state), &pool)
         .await
         .expect("load account node ledger from Postgres (no legacy Prover)");
-    println!("Loaded AccountNode ledger (no Prover::new)");
+    tracing::info!("Loaded AccountNode ledger (no Prover::new)");
 
     // Self-heal: digest = tagged §1.7.1 `C || C_balance` of the circuits
     // just built through ProverBridge; canary = v1 structural / slow path.
@@ -328,7 +328,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 std::path::Path::new(&verifier_cache_dir),
             )
             .expect("write C verifier cache to ZKCOINS_VERIFIER_CACHE_DIR");
-            println!(
+            tracing::info!(
                 "v1 self-heal: live digest = tagged C||C_balance from the circuits \
                  just built through ProverBridge (matched §3.6 pins at construction; \
                  set ZKCOINS_V1_SLOW_CANARY=1 for verify_transition canary)"
@@ -345,7 +345,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
                 &pins.network_params.circuit_digest_c(),
                 &balance_digest,
             );
-            println!(
+            tracing::info!(
                 "v1 self-heal: secondary boot — live digest = tagged C||C_balance from \
                  cache-verified C_balance (recomputed digest matched §3.6 pin) and pin C. \
                  Both circuit-identity gates (C and C_balance) were already marked ready \
@@ -363,7 +363,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         })
         .await
         .expect("v1 circuit-digest self-heal");
-    println!("Circuit-digest self-heal: {:?}", heal_decision);
+    tracing::warn!("Circuit-digest self-heal: {:?}", heal_decision);
 
     // On a reset the in-memory ledger + engine were rehydrated from
     // pre-reset rows; reload empty genesis and re-init the engine.
@@ -387,7 +387,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             .reinit_after_self_heal_reset()
             .await
             .expect("reinit v1 engine after self-heal reset");
-        println!(
+        tracing::info!(
             "Re-inited v1 EngineAdapter + AccountNode ledger to empty genesis after self-heal reset"
         );
         account_node
@@ -400,7 +400,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let username_store = username::UsernameStore::load_from_pg(&pool)
         .await
         .expect("load username store from Postgres");
-    println!("Loaded UsernameStore from Postgres");
+    tracing::info!("Loaded UsernameStore from Postgres");
 
     // Spawn the account_node as a separate task. A bootstrap error
     // here (Postgres unreachable, listener bind failure) used to be
@@ -453,7 +453,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         })
         .await
         {
-            eprintln!("Account node error: {}", e);
+            tracing::error!("Account node error: {}", e);
             std::process::exit(1);
         }
     });
@@ -504,9 +504,9 @@ async fn boot_resume_pending_publishes(
     match v1_publisher_env_from_env(network) {
         Ok(env) => match connect_v1_publisher(env) {
             Ok(publisher) => match resume_all_pending_publishes(adapter, &publisher).await {
-                Ok(0) => println!("v1.1 resume_all_pending_publishes: nothing pending"),
+                Ok(0) => tracing::info!("v1.1 resume_all_pending_publishes: nothing pending"),
                 Ok(n) => {
-                    println!("v1.1 resume_all_pending_publishes: completed {n} pending publish(es)")
+                    tracing::info!("v1.1 resume_all_pending_publishes: completed {n} pending publish(es)")
                 }
                 Err(e) => {
                     return Err(format!(
@@ -537,7 +537,7 @@ async fn boot_resume_pending_publishes(
                     )
                     .into());
                 }
-                eprintln!(
+                tracing::warn!(
                     "v1.1 publisher connect failed (no pending publishes; continuing boot): {e:#}"
                 );
             }
@@ -563,7 +563,7 @@ async fn boot_resume_pending_publishes(
                 )
                 .into());
             }
-            eprintln!(
+            tracing::warn!(
                 "v1.1 publisher env incomplete (no pending publishes; continuing boot): {e:#}"
             );
         }
@@ -590,7 +590,7 @@ async fn run_pending_publish_resumer(
         let open = match node::v1::db_v1::list_resumable_pending_publishes(adapter.pool()).await {
             Ok(rows) => rows.len(),
             Err(list_err) => {
-                eprintln!(
+                tracing::warn!(
                     "v1.1 pending-publish resumer: open rows not determinable \
                      ({list_err:#}) — not treating as empty; will retry next interval"
                 );
@@ -604,7 +604,7 @@ async fn run_pending_publish_resumer(
         let env = match v1_publisher_env_from_env(network) {
             Ok(env) => env,
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "v1.1 pending-publish resumer: {open} open row(s); publisher \
                      env incomplete ({e:#}) — will retry next interval"
                 );
@@ -614,7 +614,7 @@ async fn run_pending_publish_resumer(
         let publisher = match connect_v1_publisher(env) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "v1.1 pending-publish resumer: {open} open row(s); publisher \
                      connect failed ({e:#}) — will retry next interval"
                 );
@@ -629,16 +629,16 @@ async fn run_pending_publish_resumer(
                 // Listed open rows, then none completed: another writer may
                 // have advanced them between list and resume, or statuses
                 // moved to non-resumable. Log the earlier open count.
-                println!(
+                tracing::info!(
                     "v1.1 pending-publish resumer: saw {open} open row(s); \
                      resume pass completed 0 (rows may have advanced concurrently)"
                 );
             }
-            Ok(n) => println!(
+            Ok(n) => tracing::info!(
                 "v1.1 pending-publish resumer: completed {n} of {open} open pending publish(es)"
             ),
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "v1.1 pending-publish resumer: failed with {open} open row(s) \
                      still pending ({e:#}) — will retry next interval; rows left as-is"
                 );
@@ -697,7 +697,7 @@ async fn run_v1_scan_loop(
         expected_params_identifier: pins.expected_params_identifier,
     };
 
-    println!(
+    tracing::info!(
         "v1.1 scanner: connecting bitcoind RPC for AggregateStateNullifierV3 / NfLog \
          (network={:?}, activation_height={})",
         pins.network, pins.activation_height
@@ -904,7 +904,7 @@ async fn run_v1_scan_loop(
             };
 
             if !tip_stable {
-                println!(
+                tracing::warn!(
                     "v1.1 boot tip: scan tip height={} hash={} moved during \
                      reconciliation — discarding observation and retrying \
                      (bound recon+scan window closed, not narrowed)",
@@ -922,7 +922,7 @@ async fn run_v1_scan_loop(
                 } => {
                     // Transient: RPC behind. Stay unready, leave finality_ok
                     // alone, never assume canonical or divergent.
-                    println!(
+                    tracing::warn!(
                         "v1.1 boot tip: incomplete live view at height \
                          {queried_height} — {detail}; staying unready and retrying"
                     );
@@ -930,7 +930,7 @@ async fn run_v1_scan_loop(
                     continue;
                 }
                 TipReconcileOutcome::Ready(PersistedTipReconciliation::Fresh) => {
-                    println!(
+                    tracing::info!(
                         "v1.1 boot tip: fresh engine (no persisted tip); applying \
                          first scan observation (tip={tip_height})"
                     );
@@ -941,7 +941,7 @@ async fn run_v1_scan_loop(
                 }) => {
                     let mirror = adapter.with_engine(|e| e.nflog_mirror());
                     folded_keys = folded_keys_from_nflog_mirror(&mirror);
-                    println!(
+                    tracing::info!(
                         "v1.1 boot tip: still canonical at height={} hash={} \
                          (seeded {} folded keys; bound to scan tip={tip_height})",
                         ph,
@@ -957,7 +957,7 @@ async fn run_v1_scan_loop(
                     persisted_hash,
                 }) => {
                     force_full_replace = true;
-                    println!(
+                    tracing::warn!(
                         "v1.1 boot tip: shallow offline reorg depth={} (persisted \
                          height={} hash={} → common ancestor height={} hash={}); \
                          full-replace NfLog from this scan's survivors (bound \
@@ -1006,7 +1006,7 @@ async fn run_v1_scan_loop(
                     nf.pk,
                 ));
             }
-            println!(
+            tracing::info!(
                 "v1.1 scanner full-replace applied: tip={} hash={} appended={} dup_ignored={}",
                 tip_height, tip.1, stats.appended, stats.duplicate_ignored
             );
@@ -1043,7 +1043,7 @@ async fn run_v1_scan_loop(
                     ));
                 }
                 if stats.appended > 0 || stats.duplicate_ignored > 0 {
-                    println!(
+                    tracing::info!(
                         "v1.1 scanner folded: tip={} appended={} dup_ignored={} below_act={}",
                         tip_height, stats.appended, stats.duplicate_ignored, stats.below_activation
                     );
@@ -1063,7 +1063,7 @@ async fn run_v1_scan_loop(
                 .await
                 .map_err(|e| format!("v1.1 SDR Phase B finalise failed: {e:#}"))?;
             if n > 0 {
-                println!("v1.1 scanner: SDR Phase B finalised {n} SelfDeliveryRecord(s)");
+                tracing::info!("v1.1 scanner: SDR Phase B finalised {n} SelfDeliveryRecord(s)");
             }
         }
 
@@ -1074,7 +1074,7 @@ async fn run_v1_scan_loop(
         if let Some(flag) = &scan_caught_up {
             if !flag.load(Ordering::SeqCst) {
                 flag.store(true, Ordering::SeqCst);
-                println!("v1.1 scanner: catch-up complete; readiness may pass v1_scan gate");
+                tracing::info!("v1.1 scanner: catch-up complete; readiness may pass v1_scan gate");
             }
         }
 

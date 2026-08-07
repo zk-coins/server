@@ -151,7 +151,7 @@ pub(crate) fn verify_mint_signature_pub(request: &MintRequest) -> Result<(), &'s
 /// This prevents cascade failures where one panic takes down all handlers.
 pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
-        eprintln!("WARNING: Recovering from poisoned mutex");
+        tracing::warn!("WARNING: Recovering from poisoned mutex");
         poisoned.into_inner()
     })
 }
@@ -3389,7 +3389,7 @@ pub(crate) async fn claim_username_handler(
         let pool = state.pool.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::db::insert_username_claim_log(&pool, &entry).await {
-                eprintln!("Failed to persist username_claim_log: {}", e);
+                tracing::warn!("Failed to persist username_claim_log: {}", e);
             }
         });
     };
@@ -3416,7 +3416,7 @@ pub(crate) async fn claim_username_handler(
         match crate::db::claim_username(&state.pool, &normalized_username, &addr_bytes).await {
             Ok(b) => b,
             Err(db_err) => {
-                eprintln!("Failed to persist username claim: {}", db_err);
+                tracing::error!("Failed to persist username claim: {}", db_err);
                 log_claim(false, Some(&format!("db error: {}", db_err)));
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,

@@ -124,7 +124,7 @@ pub async fn connect_and_migrate(url: &str) -> Result<PgPool, sqlx::Error> {
         match try_connect_and_migrate(url).await {
             Ok(pool) => return Ok(pool),
             Err(e) if is_transient_connect_error(&e) => {
-                eprintln!(
+                tracing::warn!(
                     "connect_and_migrate attempt {attempt}/{CONNECT_AND_MIGRATE_MAX_ATTEMPTS} \
                      hit transient error, retrying: {e}"
                 );

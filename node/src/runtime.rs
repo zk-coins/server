@@ -889,12 +889,12 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     // hatch is the PR #106 CLI recovery tool, and a transient
     // Esplora outage on boot must not crash-loop the container.
     if matches!(process_stack_mode(), Some(ScanStackMode::V1)) {
-        println!(
+        tracing::info!(
             "resume_pending_inscriptions: skipped (process claimed v1.1 scan stack; \
              legacy Commitment recovery is forbidden)"
         );
     } else if let Err(e) = resume_pending_inscriptions(&pool, &NETWORK_CONFIG).await {
-        eprintln!(
+        tracing::warn!(
             "Failed to resume pending inscriptions on bootstrap (continuing anyway): {}",
             e
         );
@@ -915,7 +915,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     // the `list_interrupted_for_resume` doc-comment for the
     // partitioning rationale.
     if let Err(e) = boot_resume_jobs(&job_store, &job_notify_map, &job_tx).await {
-        eprintln!("Job-API boot-time resume failed (continuing anyway): {}", e);
+        tracing::warn!("Job-API boot-time resume failed (continuing anyway): {}", e);
     }
 
     // Spawn the dispatcher. Owns the `mpsc::Receiver` half of the
@@ -1137,7 +1137,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                             // Loud but non-fatal: main's boot_resume still
                             // walks PG; the process queue can re-fill on
                             // new accepts. Never invent an empty success.
-                            eprintln!(
+                            tracing::warn!(
                                 "§7.6 hand-off queue seed from pending publishes failed: {e} \
                                  — continuing; drain will only see new accepts until re-seed"
                             );
@@ -1145,7 +1145,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "§7.6 hand-off queue: list_resumable_pending_publishes failed \
                          ({e:#}) — not treating as empty; drain starts without hydrate"
                     );
@@ -1226,7 +1226,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             )
             .await
             {
-                eprintln!("Kernel gRPC error: {}", e);
+                tracing::error!("Kernel gRPC error: {}", e);
                 std::process::exit(1);
             }
         });
@@ -1257,11 +1257,11 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             })),
         };
         if let Err(e) = crate::db::insert_boot_log(&pool, &boot_entry).await {
-            eprintln!("Failed to persist boot_log startup event: {}", e);
+            tracing::warn!("Failed to persist boot_log startup event: {}", e);
         }
     }
 
-    println!("REST API started at {}", socket_addr);
+    tracing::info!("REST API started at {}", socket_addr);
     let listener = TcpListener::bind(socket_addr).await?;
     tracing::info!("Listener bound on {socket_addr}; API is reachable");
 
@@ -1444,7 +1444,7 @@ async fn run_handoff_drain_loop(domain: crate::kernel::KernelService) {
         let open = match domain.handoff_queue().list_resumable() {
             Ok(rows) => rows.len(),
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "§7.6 hand-off drain: list_resumable failed ({e}) — \
                      not treating as empty; will retry next interval"
                 );
@@ -1456,7 +1456,7 @@ async fn run_handoff_drain_loop(domain: crate::kernel::KernelService) {
         }
 
         let Some(network) = domain.publish_network() else {
-            eprintln!(
+            tracing::warn!(
                 "§7.6 hand-off drain: {open} open row(s) but no network pin on \
                  KernelService — cannot half-aggregate; will retry next interval"
             );
@@ -1479,7 +1479,7 @@ async fn run_handoff_drain_loop(domain: crate::kernel::KernelService) {
             Err(e) => {
                 // Named boundary: publisher env incomplete. Retry — do not
                 // terminal-fail members for a config blip during boot race.
-                eprintln!(
+                tracing::warn!(
                     "§7.6 hand-off drain: {open} open row(s); publisher env \
                      incomplete ({e:#}) — bitcoind inscription path not ready; \
                      will retry next interval (members left at members_ready)"
@@ -1490,7 +1490,7 @@ async fn run_handoff_drain_loop(domain: crate::kernel::KernelService) {
         let publisher = match connect_v1_publisher(env) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "§7.6 hand-off drain: {open} open row(s); publisher connect \
                      failed ({e:#}) — bitcoind inscription path unavailable; \
                      will retry next interval (members left at members_ready)"
@@ -1539,7 +1539,7 @@ async fn run_handoff_drain_loop(domain: crate::kernel::KernelService) {
                             // Loud: process queue is already RevealBroadcast;
                             // PG lag means resume might try again (idempotent
                             // rebroadcast on the self-publish path).
-                            eprintln!(
+                            tracing::warn!(
                                 "§7.6 hand-off drain: PG mirror to reveal_broadcast \
                                  failed for pk={}: {e:#}",
                                 hex::encode(pk)
@@ -1554,13 +1554,13 @@ async fn run_handoff_drain_loop(domain: crate::kernel::KernelService) {
                 // that remain `members_ready` are retried by the pending-
                 // publish resumer or re-seeded on restart (process Failed
                 // is not silently cleared).
-                eprintln!(
+                tracing::error!(
                     "§7.6 hand-off drain: inscription terminal with {open} open \
                      row(s) attempted — {term}"
                 );
             }
             Err(join_err) => {
-                eprintln!(
+                tracing::warn!(
                     "§7.6 hand-off drain: spawn_blocking join failed ({join_err}) \
                      — will retry next interval"
                 );
@@ -1580,7 +1580,7 @@ async fn rearm_and_enqueue_v1_finalise(
         .send(crate::job_dispatcher::JobEnvelope { public_id })
         .await
     {
-        eprintln!(
+        tracing::warn!(
             "boot_resume_jobs: enqueue signed broadcasting {public_id} failed: {e} (continuing)"
         );
     } else {
@@ -1814,7 +1814,7 @@ pub(crate) async fn boot_resume_jobs(
             let release_result = match job_store.release_stale_finalise_claim(job.public_id).await {
                 Ok(r) => Ok(r),
                 Err(e) => {
-                    eprintln!(
+                    tracing::warn!(
                         "boot_resume_jobs: release_stale_finalise_claim({}) failed: {} \
                          (row left untouched for retry; fail closed)",
                         job.public_id, e
@@ -1837,7 +1837,7 @@ pub(crate) async fn boot_resume_jobs(
                         Ok(None)
                     }
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "boot_resume_jobs: load({}) after release_stale failed: {} \
                              (row left untouched for retry; fail closed)",
                             job.public_id, e
@@ -1918,7 +1918,7 @@ pub(crate) async fn boot_resume_jobs(
                 );
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "boot_resume_jobs: fail_if_status({}) failed: {} (continuing)",
                     job.public_id, e
                 );
@@ -1951,7 +1951,7 @@ pub(crate) async fn boot_resume_jobs(
                         );
                     }
                     Err(e) => {
-                        eprintln!(
+                        tracing::warn!(
                             "boot_resume_jobs: fail_if_status({}) failed: {} (continuing)",
                             job.public_id, e
                         );
@@ -1967,7 +1967,7 @@ pub(crate) async fn boot_resume_jobs(
                     })
                     .await
                 {
-                    eprintln!(
+                    tracing::warn!(
                         "boot_resume_jobs: enqueue({}) failed: {} (continuing)",
                         job.public_id, e
                     );

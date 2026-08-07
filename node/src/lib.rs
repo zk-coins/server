@@ -280,7 +280,7 @@ where
     // Read `ws_url` from the struct (sole store of ESPLORA_WS_URL after
     // build) so the field is not a write-only residual after the legacy
     // scanner deletion.
-    println!(
+    tracing::info!(
         "Network config: {} ({}) ws={}",
         cfg.network_name,
         cfg.url,
@@ -315,7 +315,7 @@ lazy_static! {
                  `dev.zkcoins.app` on DEV) — see #95 for the cross-network rationale. \
                  An empty or whitespace-only value is treated as unset (fail-closed).",
             );
-        println!("Username domain: {}", domain);
+        tracing::info!("Username domain: {}", domain);
         domain
     };
 

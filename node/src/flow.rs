@@ -265,7 +265,7 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
             commit_txid.to_byte_array()
         }
         Err(err) => {
-            eprintln!("Error broadcasting mint inscription: {}", err);
+            tracing::error!("Error broadcasting mint inscription: {}", err);
             return Err(FlowError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Failed to broadcast mint inscription on-chain",
@@ -285,7 +285,7 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
     let (new_root, smt_bytes, mmr_bytes, root_index_entry) = match state_advance_outcome {
         Ok(snapshot) => snapshot,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "mint_commit_flow: in-process state.update failed: {} (broadcast already landed; scanner-replay will reconcile)",
                 e
             );
@@ -305,7 +305,7 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
     )
     .await
     {
-        eprintln!(
+        tracing::error!(
             "mint_commit_flow: atomic persist + mark-complete failed: {} (scanner-replay will heal)",
             e
         );
@@ -314,7 +314,7 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
             "mint broadcast landed on chain but durable state advance failed; scanner will reconcile",
         ));
     }
-    println!(
+    tracing::info!(
         "mint_commit_flow: state.update persisted + row marked complete. New MMR root: {}",
         hex::encode(digest_to_bytes(&new_root))
     );
@@ -335,7 +335,7 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
         if let Err(e) =
             db::upsert_account_with_source(&state.pool, &key_bytes, &bytes, "mint").await
         {
-            eprintln!("Failed to upsert minted creator account: {}", e);
+            tracing::error!("Failed to upsert minted creator account: {}", e);
         }
     }
 
@@ -349,7 +349,7 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
     )
     .await
     {
-        eprintln!("Failed to register asset creator: {}", e);
+        tracing::error!("Failed to register asset creator: {}", e);
     }
 
     let hashes = mint_proof_commit_hashes(&staged.proof);
@@ -467,7 +467,7 @@ pub(crate) async fn commit_flow(state: &AppState, request: CommitRequest) -> Flo
     )
     .await
     {
-        eprintln!("Error broadcasting commit inscription: {}", err);
+        tracing::error!("Error broadcasting commit inscription: {}", err);
         return Err(FlowError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "Failed to broadcast commitment inscription on-chain",
@@ -485,7 +485,7 @@ pub(crate) async fn commit_flow(state: &AppState, request: CommitRequest) -> Flo
     let snapshot: Option<Vec<u8>> = {
         let mut guard = lock_or_recover(&state.account_node);
         if let Err(e) = guard.receive_coin(updated_proof) {
-            eprintln!("Failed to receive coin after commit: {}", e);
+            tracing::error!("Failed to receive coin after commit: {}", e);
         }
         guard
             .get_account(&recipient, &asset_id)
@@ -496,7 +496,7 @@ pub(crate) async fn commit_flow(state: &AppState, request: CommitRequest) -> Flo
         if let Err(e) =
             db::upsert_account_with_source(&state.pool, &key_bytes, &bytes, "receive").await
         {
-            eprintln!("Failed to upsert account after commit: {}", e);
+            tracing::error!("Failed to upsert account after commit: {}", e);
         }
     }
 

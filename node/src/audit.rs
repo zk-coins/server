@@ -82,7 +82,7 @@ async fn buffer_body(body: Body) -> Bytes {
     match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            eprintln!("audit: body collect failed: {}", e);
+            tracing::error!("audit: body collect failed: {}", e);
             Bytes::new()
         }
     }
@@ -177,7 +177,7 @@ pub(crate) async fn audit_log_middleware(
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn persist_audit_entry(pool: std::sync::Arc<sqlx::PgPool>, entry: db::RequestLogEntry) {
     if let Err(e) = db::insert_request_log(&pool, &entry).await {
-        eprintln!("audit: insert_request_log failed: {}", e);
+        tracing::error!("audit: insert_request_log failed: {}", e);
     }
 }
 
