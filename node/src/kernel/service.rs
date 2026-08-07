@@ -883,3 +883,129 @@ impl KernelService {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::kernel::{
+        chain::{
+            InscriptionCursor, InscriptionLimit, KernelNetwork, ListInscriptions,
+            NullifierPathRequest,
+        },
+        error::KernelErrorCode,
+        types::XOnlyKey,
+    };
+
+    fn dead_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(50))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/postgres")
+            .expect("connect_lazy never fails")
+    }
+
+    fn service() -> KernelService {
+        KernelService::from_store(Arc::new(JobStore::new(dead_pool())))
+    }
+
+    fn assert_internal_error<T>(result: KernelResult<T>, expected_message: &str) {
+        let err = match result {
+            Ok(_) => panic!("expected fail-closed internal error"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err.code, KernelErrorCode::InternalError));
+        assert_eq!(err.public_message, expected_message);
+    }
+
+    #[tokio::test]
+    async fn from_store_exposes_default_in_memory_dependencies_and_no_chain() {
+        let service = service();
+
+        let handoff_queue = Arc::clone(service.handoff_queue());
+        assert!(Arc::ptr_eq(&handoff_queue, service.handoff_queue()));
+        assert_eq!(service.publish_network(), None);
+        assert!(service.chain_engine().is_none());
+
+        let delivery_targets = Arc::clone(service.delivery_targets());
+        assert!(Arc::ptr_eq(
+            &delivery_targets,
+            service.delivery_targets()
+        ));
+
+        let private_record_index = Arc::clone(service.private_record_index());
+        assert!(Arc::ptr_eq(
+            &private_record_index,
+            service.private_record_index()
+        ));
+
+        let receipt_hub = Arc::clone(service.receipt_hub());
+        assert!(Arc::ptr_eq(&receipt_hub, service.receipt_hub()));
+
+        let manifest_store = Arc::clone(service.manifest_store());
+        assert!(Arc::ptr_eq(&manifest_store, service.manifest_store()));
+    }
+
+    #[tokio::test]
+    async fn builder_chain_installs_every_supplied_dependency_and_value() {
+        let mut service = service().with_publish_batch_eta_secs(Some(17));
+        assert_eq!(service.publish_batch_eta_secs, Some(17));
+
+        service = service.with_chain(ChainHandle {
+            network: Some(KernelNetwork::Regtest),
+            ..Default::default()
+        });
+        assert_eq!(service.publish_network(), Some(KernelNetwork::Regtest));
+
+        let bundles = BundleStore::shared();
+        service = service.with_bundle_store(Arc::clone(&bundles));
+        assert!(Arc::ptr_eq(&service.bundles, &bundles));
+
+        let delivery_targets = crate::v1::DeliveryTargetStore::shared();
+        service = service.with_delivery_targets(Arc::clone(&delivery_targets));
+        assert!(Arc::ptr_eq(service.delivery_targets(), &delivery_targets));
+
+        let manifests = ManifestStore::shared();
+        service = service.with_manifest_store(Arc::clone(&manifests));
+        assert!(Arc::ptr_eq(service.manifest_store(), &manifests));
+
+        let private_index = InMemoryPrivateIndex::shared();
+        service = service.with_private_index(Arc::clone(&private_index));
+        assert!(Arc::ptr_eq(service.private_record_index(), &private_index));
+
+        let receipt_hub = ReceiptHub::shared();
+        service = service.with_receipt_hub(Arc::clone(&receipt_hub));
+        assert!(Arc::ptr_eq(service.receipt_hub(), &receipt_hub));
+    }
+
+    #[tokio::test]
+    async fn chain_requirements_fail_closed_without_a_chain() {
+        let service = service();
+
+        assert_internal_error(service.require_identity(), "Chain identity unavailable");
+        assert_internal_error(service.require_chain_view(), "Chain view unavailable");
+    }
+
+    #[tokio::test]
+    async fn chainless_read_procedures_fail_closed_with_stable_public_errors() {
+        let service = service();
+
+        assert_internal_error(service.get_info(), "Chain identity unavailable");
+        assert_internal_error(service.get_accumulator(), "Chain view unavailable");
+        assert_internal_error(
+            service.get_nullifier_path(NullifierPathRequest {
+                pubkey: XOnlyKey([0u8; 32]),
+            }),
+            "Chain view unavailable",
+        );
+        assert_internal_error(
+            service.list_inscriptions(ListInscriptions {
+                from: InscriptionCursor::origin(),
+                limit: InscriptionLimit::new(1).expect("limit"),
+            }),
+            "Chain view unavailable",
+        );
+    }
+}
