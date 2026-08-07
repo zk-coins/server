@@ -225,6 +225,23 @@ bug fixed: `validate_send_request` reported "Missing signature" for an absent ti
 router.rs contract), `kernel/service.rs` 38 → **51.79%** (chain-less getters/builders/fail-closed reads;
 async/DB paths deferred), `self_heal_tests.rs` (+2 error-branch tests).
 
+**Latest measurement (2026-08-07, node HEAD `efb2781`, fault-injection journey stages):**
+
+| Source | Coverage |
+|---|---|
+| Unit tests only | 69.0% (21226/30770) |
+| Journey/integration only | 42.5% (11073/26024) |
+| **Combined (unit ∪ integration, node-only, official lcov merge)** | **77.5%** (23833/30770) |
+
+Progress vs. the prior measurement: integration-only 40.3% → 42.5% — the newly covered
+bitcoind/postgres fault-recovery paths from journey stages `fault-bitcoind` and
+`fault-postgres` (gated behind `ZKCOINS_JOURNEY_FAULTS=1`). 1721 unit tests green; journey
+stages 1–9 plus both fault stages green.
+
+Methodology note: only the **lines** figure above is meaningful. The lcov `functions` merge
+figure is an artifact — it adds together the denominators of two distinct binaries (the
+host unit-test binary and the Linux integration binary), which do not share a function set.
+
 **The path to 100% is four layers** (largest combined-uncovered blocks first):
 1. **Unit-testable pure logic** (sequential codex lanes; parallel lanes collide via the nested
    `node/node/src` path): `signature.rs` 79% (BIP-340 pure), `kernel/service.rs` 67%, `v1/attest.rs`

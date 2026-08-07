@@ -203,11 +203,28 @@ log "exporting integration LCOV with Docker /app paths mapped to this checkout"
   || die "llvm-cov integration export failed"
 [[ -s "${INTEGRATION_LCOV}" ]] || die "integration.lcov is empty"
 
+# llvm-cov's -path-equivalence maps source lookup only; it does NOT rewrite the SF: lines
+# in the lcov output, which keep the Docker /app paths. Rewrite them to this checkout so the
+# node-only extract + lcov merge below match the host-path unit.lcov.
+sed -i '' "s|^SF:/app/|SF:${REPO_ROOT}/|" "${INTEGRATION_LCOV}" \
+  || die "failed to normalize integration.lcov /app paths to the host checkout"
+grep -Fq "SF:${REPO_ROOT}/node/" "${INTEGRATION_LCOV}" \
+  || die "integration.lcov still lacks host node-crate paths after normalization"
+
 UNIT_LCOV="${ZKCOINS_UNIT_LCOV:-${RUN_DIR}/unit.lcov}"
 REUSE_UNIT_LCOV="${ZKCOINS_REUSE_UNIT_LCOV:-0}"
 case "${REUSE_UNIT_LCOV}" in
   0)
     log "running the unit-test coverage suite (same scope as the CI baseline)"
+    # The unit suite is hermetic and asserts against the CI test env, NOT the live-stack
+    # env.local.sh the caller sourced for the journey. Notably router_tests.rs derives the
+    # mocked publisher address from PUBLISHER_KEY=0000...0001; the live PUBLISHER_KEY breaks it.
+    # Source of truth: .github/workflows/ci.yaml (Tests + Coverage Gate job env).
+    export IS_MAINNET="false"
+    export ESPLORA_URL="http://127.0.0.1:1/api"
+    export ESPLORA_WS_URL="ws://127.0.0.1:1/api/v1/ws"
+    export USERNAME_DOMAIN="test.zkcoins.local"
+    export PUBLISHER_KEY="0000000000000000000000000000000000000000000000000000000000000001"
     RUSTFLAGS="--cfg coverage_nightly" cargo llvm-cov nextest \
       --release \
       -p node \
