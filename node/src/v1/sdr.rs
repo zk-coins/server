@@ -796,9 +796,13 @@ pub(crate) async fn publish_sdr_outbox_row(
 mod tests {
     use super::*;
     use crate::test_db::setup_pool;
-    use crate::v1::db_outbox::{self, OutboxKind, OutboxStatus};
+    use crate::v1::db_outbox::{self, OutboxKind, OutboxRow, OutboxStatus};
     use crate::v1::db_sdr;
-    use crate::v1::outbox_material::{SdrOutboxMaterial, SdrPhaseAMaterial};
+    use crate::v1::outbox_material::{
+        SdrOutboxMaterial, SdrPhaseAMaterial, SdrPhaseAOutputRef,
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Deterministic RNG for tests.
     struct StepRng(u8);
@@ -1050,6 +1054,111 @@ mod tests {
         }
     }
 
+    fn valid_snapshot(r: [u8; 32]) -> Option<(SpendClassification, LookupResult, Option<u64>)> {
+        Some((
+            SpendClassification::ValidFirstSpend,
+            LookupResult::Present {
+                pos: 0,
+                r,
+                inclusion_proof: vec![],
+            },
+            Some(100),
+        ))
+    }
+
+    async fn finalize_material_for_build(
+        pool: &PgPool,
+        material: &SdrPhaseAMaterial,
+    ) -> Result<bool> {
+        let mtp = FixedInclusionMtp {
+            block_hash: [0xBB; 32],
+            occurred_at: 1_700_000_000,
+        };
+        let mut rng = StepRng(1);
+        try_finalize_one_from_snapshot(
+            pool,
+            1,
+            material,
+            valid_snapshot([0x44; 32]),
+            &mtp,
+            &mut rng,
+        )
+        .await
+    }
+
+    fn sample_sdr_outbox_material() -> SdrOutboxMaterial {
+        let zbe = b"valid-zbe-ciphertext";
+        SdrOutboxMaterial {
+            v: 1,
+            zbe_ciphertext_hex: hex::encode(zbe),
+            blob_id_hex: hex::encode(super::super::blossom::blob_id_of(zbe)),
+            detect_tag_hex: hex::encode([0x11; 32]),
+            epk_hex: hex::encode([0x22; 32]),
+            k_tx_hex: hex::encode([0x33; 32]),
+            recipient_ivpk_hex: hex::encode(
+                xonly_pubkey(&[0x02; 32]).expect("fixture recipient IVPK"),
+            ),
+            recipient_op_pk_hex: hex::encode(
+                xonly_pubkey(&[0x03; 32]).expect("fixture recipient op key"),
+            ),
+            recipient_relays: vec!["ws://127.0.0.1:1/".into()],
+            blob_holders: vec!["http://127.0.0.1:1".into()],
+            max_blob_bytes: 1_048_576,
+            send_counter: 7,
+            record_kind: 0x02,
+        }
+    }
+
+    fn outbox_row(kind: OutboxKind, status: OutboxStatus, material: Vec<u8>) -> OutboxRow {
+        OutboxRow {
+            outbox_id: [0xA0; 32],
+            kind,
+            subject: [0xA1; 32],
+            transition_pk: [0xA2; 32],
+            coin_id: [0; 32],
+            status,
+            material,
+            blob_id: None,
+            detect_tag: None,
+            epk: None,
+            k_tx: None,
+            ack_nonce: None,
+            event_id: None,
+            zbe_ciphertext: None,
+            out_ciphertext: None,
+            recipient_op_pk: None,
+            attempt_n: 0,
+            fail_reason: None,
+        }
+    }
+
+    fn publish_rng() -> std::sync::Mutex<Box<dyn SecureRandom + Send>> {
+        std::sync::Mutex::new(Box::new(StepRng(1)))
+    }
+
+    async fn mount_successful_blossom(server: &MockServer, material: &SdrOutboxMaterial) {
+        Mock::given(method("PUT"))
+            .and(path("/blossom/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "blob_id": material.blob_id_hex.clone(),
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn publish_material_error(material: Vec<u8>) -> DeliveryError {
+        let scope = setup_pool().await;
+        publish_sdr_outbox_row(
+            &scope.pool,
+            &outbox_row(OutboxKind::SelfDelivery, OutboxStatus::Pending, material),
+            &[0x01; 32],
+            1_700_000_000,
+            &publish_rng(),
+        )
+        .await
+        .expect_err("fixture is expected to fail closed")
+    }
+
     #[tokio::test]
     async fn first_occurrence_completed_inserts_sdr_outbox() {
         let scope = setup_pool().await;
@@ -1215,6 +1324,874 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(open.len(), 1);
+    }
+
+    #[test]
+    fn output_ref_from_built_encodes_every_field() {
+        let holders = vec!["https://holder.example".to_string()];
+        let got = output_ref_from_built(
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 32],
+            &[0x44, 0x55],
+            &holders,
+        )
+        .expect("complete output ref");
+
+        assert_eq!(got.coin_id_hex, hex::encode([0x11; 32]));
+        assert_eq!(got.blob_id_hex, hex::encode([0x22; 32]));
+        assert_eq!(got.epk_hex, hex::encode([0x33; 32]));
+        assert_eq!(got.out_ciphertext_hex, "4455");
+        assert_eq!(got.holders, holders);
+    }
+
+    #[test]
+    fn output_ref_from_built_rejects_empty_holders() {
+        let err = output_ref_from_built([1; 32], [2; 32], [3; 32], b"ciphertext", &[])
+            .expect_err("holders are required");
+        assert!(err.to_string().contains("empty holders"), "{err:#}");
+    }
+
+    #[test]
+    fn output_ref_from_built_rejects_empty_ciphertext() {
+        let err = output_ref_from_built(
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            &[],
+            &["https://holder.example".into()],
+        )
+        .expect_err("ciphertext is required");
+        assert!(
+            err.to_string().contains("empty out_ciphertext"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_hex32_field_accepts_exactly_32_bytes() {
+        assert_eq!(
+            parse_hex32_field(&hex::encode([0xAB; 32]), "field").expect("32-byte hex"),
+            [0xAB; 32]
+        );
+    }
+
+    #[test]
+    fn parse_hex32_field_rejects_empty_input_as_wrong_length() {
+        let err = parse_hex32_field("", "field").expect_err("empty is not a zero digest");
+        assert!(
+            err.to_string().contains("expected 32 bytes, got 0"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_hex32_field_rejects_non_lowercase_hex() {
+        let err = parse_hex32_field(&"AA".repeat(32), "field")
+            .expect_err("uppercase hex is non-canonical");
+        assert!(err.to_string().contains("non-lowercase-hex"), "{err:#}");
+    }
+
+    #[test]
+    fn parse_hex32_field_rejects_31_bytes() {
+        let err = parse_hex32_field(&hex::encode([0xAB; 31]), "field")
+            .expect_err("31 bytes is not a digest");
+        assert!(
+            err.to_string().contains("expected 32 bytes, got 31"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_hex_vec_accepts_empty_input() {
+        assert_eq!(parse_hex_vec("", "field").expect("empty vector"), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn parse_hex_vec_rejects_odd_length_hex() {
+        let err = parse_hex_vec("abc", "field").expect_err("odd hex length");
+        assert!(err.to_string().contains("hex decode"), "{err:#}");
+    }
+
+    #[test]
+    fn parse_hex_vec_rejects_non_lowercase_hex() {
+        let err = parse_hex_vec("aB", "field").expect_err("mixed-case hex");
+        assert!(err.to_string().contains("non-lowercase-hex"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn stage_phase_a_roundtrips_complete_material() {
+        let scope = setup_pool().await;
+        let pk = [0x31; 32];
+        let material = sample_phase_a(pk);
+
+        stage_phase_a(&scope.pool, &material)
+            .await
+            .expect("complete Phase A stages");
+
+        let row = db_sdr::get_phase_a(&scope.pool, &pk)
+            .await
+            .expect("query staged Phase A")
+            .expect("staged row");
+        assert_eq!(row.transition_pk, pk);
+        assert_eq!(row.subject, [0x11; 32]);
+        assert_eq!(row.status, db_sdr::SdrPhaseAStatus::AwaitingFirstOccurrence);
+        assert_eq!(row.material, material);
+    }
+
+    #[tokio::test]
+    async fn stage_phase_a_names_incomplete_material() {
+        let scope = setup_pool().await;
+        let mut material = sample_phase_a([0x32; 32]);
+        material.record_kind = 0;
+
+        let err = stage_phase_a(&scope.pool, &material)
+            .await
+            .expect_err("invalid record kind must not stage");
+        match err {
+            DeliveryError::Relay(message) => {
+                assert!(message.contains("SDR Phase A incomplete"), "{message}");
+                assert!(message.contains("record_kind 0x00"), "{message}");
+            }
+            other => panic!("expected Relay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_phase_a_rejects_non_hex_transition_pk() {
+        let scope = setup_pool().await;
+        let mut material = sample_phase_a([0x33; 32]);
+        material.transition_pk_hex = "zz".into();
+
+        let err = stage_phase_a(&scope.pool, &material)
+            .await
+            .expect_err("transition key must be canonical hex");
+        match err {
+            DeliveryError::Relay(message) => {
+                assert!(message.contains("transition_pk"), "{message}");
+                assert!(message.contains("non-lowercase-hex"), "{message}");
+            }
+            other => panic!("expected Relay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_phase_a_rejects_non_hex_subject() {
+        let scope = setup_pool().await;
+        let mut material = sample_phase_a([0x34; 32]);
+        material.subject_hex = "zz".into();
+
+        let err = stage_phase_a(&scope.pool, &material)
+            .await
+            .expect_err("subject must be canonical hex");
+        match err {
+            DeliveryError::Relay(message) => {
+                assert!(message.contains("subject"), "{message}");
+                assert!(message.contains("non-lowercase-hex"), "{message}");
+            }
+            other => panic!("expected Relay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_without_classification_fails_named() {
+        let scope = setup_pool().await;
+        let material = sample_phase_a([0x41; 32]);
+        let mtp = FixedInclusionMtp {
+            block_hash: [0; 32],
+            occurred_at: 1,
+        };
+        let mut rng = StepRng(1);
+
+        let err = try_finalize_one_from_snapshot(
+            &scope.pool,
+            1,
+            &material,
+            None,
+            &mtp,
+            &mut rng,
+        )
+        .await
+        .expect_err("missing classification must fail closed");
+        assert!(
+            err.to_string()
+                .contains("Phase A own_nullifier hex incomplete"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_classification_leaves_phase_a_open() {
+        let scope = setup_pool().await;
+        let material = sample_phase_a([0x42; 32]);
+        let mtp = FixedInclusionMtp {
+            block_hash: [0; 32],
+            occurred_at: 1,
+        };
+        let mut rng = StepRng(1);
+
+        let got = try_finalize_one_from_snapshot(
+            &scope.pool,
+            1,
+            &material,
+            Some((SpendClassification::Pending, LookupResult::Absent, None)),
+            &mtp,
+            &mut rng,
+        )
+        .await
+        .expect("pending is a wait condition");
+        assert!(!got);
+    }
+
+    #[tokio::test]
+    async fn rejected_double_spend_fails_named() {
+        let scope = setup_pool().await;
+        let material = sample_phase_a([0x43; 32]);
+        let mtp = FixedInclusionMtp {
+            block_hash: [0; 32],
+            occurred_at: 1,
+        };
+        let mut rng = StepRng(1);
+
+        let err = try_finalize_one_from_snapshot(
+            &scope.pool,
+            1,
+            &material,
+            Some((
+                SpendClassification::RejectedDoubleSpend,
+                LookupResult::Absent,
+                None,
+            )),
+            &mtp,
+            &mut rng,
+        )
+        .await
+        .expect_err("first-occurrence loser must fail");
+        assert!(
+            err.to_string()
+                .contains("first-occurrence loser (double-spend)"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_r_mismatch_fails_named() {
+        let scope = setup_pool().await;
+        let material = sample_phase_a([0x44; 32]);
+        let mtp = FixedInclusionMtp {
+            block_hash: [0; 32],
+            occurred_at: 1,
+        };
+        let mut rng = StepRng(1);
+
+        let err = try_finalize_one_from_snapshot(
+            &scope.pool,
+            1,
+            &material,
+            valid_snapshot([0x45; 32]),
+            &mtp,
+            &mut rng,
+        )
+        .await
+        .expect_err("snapshot R must match staged R");
+        assert!(err.to_string().contains("R mismatches"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_missing_mirror_position_fails_named() {
+        let scope = setup_pool().await;
+        let material = sample_phase_a([0x45; 32]);
+        let mtp = FixedInclusionMtp {
+            block_hash: [0; 32],
+            occurred_at: 1,
+        };
+        let mut rng = StepRng(1);
+        let classify = Some((
+            SpendClassification::ValidFirstSpend,
+            LookupResult::Present {
+                pos: 7,
+                r: [0x44; 32],
+                inclusion_proof: vec![],
+            },
+            None,
+        ));
+
+        let err = try_finalize_one_from_snapshot(
+            &scope.pool,
+            8,
+            &material,
+            classify,
+            &mtp,
+            &mut rng,
+        )
+        .await
+        .expect_err("mirror position is required");
+        assert!(
+            err.to_string().contains("NfLog mirror missing position 7"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_lookup_waits_without_finalising() {
+        let scope = setup_pool().await;
+        let material = sample_phase_a([0x46; 32]);
+        let mtp = FixedInclusionMtp {
+            block_hash: [0; 32],
+            occurred_at: 1,
+        };
+        let mut rng = StepRng(1);
+
+        let got = try_finalize_one_from_snapshot(
+            &scope.pool,
+            1,
+            &material,
+            Some((
+                SpendClassification::ValidFirstSpend,
+                LookupResult::Absent,
+                None,
+            )),
+            &mtp,
+            &mut rng,
+        )
+        .await
+        .expect("absent lookup is a wait condition");
+        assert!(!got);
+    }
+
+    #[tokio::test]
+    async fn snapshot_inclusion_height_above_u32_fails_with_context() {
+        let scope = setup_pool().await;
+        let material = sample_phase_a([0x47; 32]);
+        let height = u64::from(u32::MAX) + 1;
+        let mtp = FixedInclusionMtp {
+            block_hash: [0; 32],
+            occurred_at: 1,
+        };
+        let mut rng = StepRng(1);
+        let classify = Some((
+            SpendClassification::ValidFirstSpend,
+            LookupResult::Present {
+                pos: 0,
+                r: [0x44; 32],
+                inclusion_proof: vec![],
+            },
+            Some(height),
+        ));
+
+        let err = try_finalize_one_from_snapshot(
+            &scope.pool,
+            1,
+            &material,
+            classify,
+            &mtp,
+            &mut rng,
+        )
+        .await
+        .expect_err("BlockAnchor height is u32");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!(
+                "resolve inclusion block + MTP at height {height}"
+            )),
+            "{message}"
+        );
+        assert!(message.contains("does not fit u32"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn build_record_rejects_non_hex_prev_state_head() {
+        let scope = setup_pool().await;
+        let mut material = sample_phase_a([0x51; 32]);
+        material.prev_state_head_hex = "zz".into();
+
+        let err = finalize_material_for_build(&scope.pool, &material)
+            .await
+            .expect_err("previous state head must be canonical hex");
+        let message = format!("{err:#}");
+        assert!(message.contains("prev_state_head"), "{message}");
+        assert!(message.contains("non-lowercase-hex"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn build_record_rejects_invalid_account_state() {
+        let scope = setup_pool().await;
+        let mut material = sample_phase_a([0x52; 32]);
+        material.account_state_hex = "aabb".into();
+
+        let err = finalize_material_for_build(&scope.pool, &material)
+            .await
+            .expect_err("account state wire bytes must parse");
+        assert!(format!("{err:#}").contains("account_state"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn empty_recursive_proof_is_rejected_by_phase_a_gate() {
+        let scope = setup_pool().await;
+        let mut material = sample_phase_a([0x53; 32]);
+        material.recursive_proof_hex.clear();
+
+        let err = finalize_material_for_build(&scope.pool, &material)
+            .await
+            .expect_err("recursive proof is required");
+        let message = format!("{err:#}");
+        assert!(message.contains("Phase A material incomplete"), "{message}");
+        assert!(message.contains("required hex field empty"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn build_record_rejects_invalid_proof_data() {
+        let scope = setup_pool().await;
+        let mut material = sample_phase_a([0x54; 32]);
+        material.proof_data_hex = "aabb".into();
+
+        let err = finalize_material_for_build(&scope.pool, &material)
+            .await
+            .expect_err("proof data wire bytes must parse");
+        assert!(format!("{err:#}").contains("proof_data"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn build_record_rejects_non_hex_spent_coin_id() {
+        let scope = setup_pool().await;
+        let mut material = sample_phase_a([0x55; 32]);
+        material.spent_or_folded_coin_ids_hex = vec!["zz".into()];
+
+        let err = finalize_material_for_build(&scope.pool, &material)
+            .await
+            .expect_err("spent coin IDs must be canonical hex");
+        let message = format!("{err:#}");
+        assert!(message.contains("spent_or_folded_coin_ids[0]"), "{message}");
+        assert!(message.contains("non-lowercase-hex"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn build_record_rejects_non_hex_output_coin_id() {
+        let scope = setup_pool().await;
+        let mut material = sample_phase_a([0x56; 32]);
+        material.output_refs = vec![SdrPhaseAOutputRef {
+            coin_id_hex: "zz".into(),
+            blob_id_hex: hex::encode([2; 32]),
+            epk_hex: hex::encode([3; 32]),
+            out_ciphertext_hex: hex::encode(b"ciphertext"),
+            holders: vec!["https://holder.example".into()],
+        }];
+
+        let err = finalize_material_for_build(&scope.pool, &material)
+            .await
+            .expect_err("output coin IDs must be canonical hex");
+        let message = format!("{err:#}");
+        assert!(message.contains("output_refs[0].coin_id"), "{message}");
+        assert!(message.contains("non-lowercase-hex"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn empty_output_holders_are_rejected_by_phase_a_gate() {
+        let scope = setup_pool().await;
+        let mut material = sample_phase_a([0x57; 32]);
+        material.output_refs = vec![SdrPhaseAOutputRef {
+            coin_id_hex: hex::encode([1; 32]),
+            blob_id_hex: hex::encode([2; 32]),
+            epk_hex: hex::encode([3; 32]),
+            out_ciphertext_hex: hex::encode(b"ciphertext"),
+            holders: vec![],
+        }];
+
+        let err = finalize_material_for_build(&scope.pool, &material)
+            .await
+            .expect_err("output holders are required");
+        let message = format!("{err:#}");
+        assert!(message.contains("output_refs[0] incomplete"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn empty_self_blob_holders_are_rejected_by_phase_a_gate() {
+        let scope = setup_pool().await;
+        let mut material = sample_phase_a([0x58; 32]);
+        material.blob_holders.clear();
+
+        let err = finalize_material_for_build(&scope.pool, &material)
+            .await
+            .expect_err("self blob holders are required");
+        let message = format!("{err:#}");
+        assert!(message.contains("empty blob_holders"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn invalid_record_kind_is_rejected_by_phase_a_gate() {
+        let scope = setup_pool().await;
+        let mut material = sample_phase_a([0x59; 32]);
+        material.record_kind = 0x09;
+
+        let err = finalize_material_for_build(&scope.pool, &material)
+            .await
+            .expect_err("record kind must be mint/send/receive");
+        assert!(format!("{err:#}").contains("record_kind 0x09"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn finalize_due_phase_b_empty_queue_returns_zero() {
+        let scope = setup_pool().await;
+        use crate::v1::separation::{claim_stack_scan_mode, set_process_stack_mode, ScanStackMode};
+
+        set_process_stack_mode(ScanStackMode::V1);
+        // Exclusive DB marker before any v1 write — load_or_create persists an empty
+        // genesis snapshot and refuses without this claim.
+        claim_stack_scan_mode(&scope.pool, ScanStackMode::V1)
+            .await
+            .expect("claim stack_scan_mode v1");
+        let adapter = EngineAdapter::load_or_create(scope.pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("empty regtest engine");
+        let mtp = FixedInclusionMtp {
+            block_hash: [0x61; 32],
+            occurred_at: 1_700_000_000,
+        };
+        let mut rng = StepRng(1);
+
+        let count = finalize_due_phase_b_with_mtp(&adapter, &mtp, &mut rng)
+            .await
+            .expect("empty queue is not an error");
+        assert_eq!(count, 0);
+        assert!(
+            db_sdr::list_awaiting_first_occurrence(&scope.pool)
+                .await
+                .expect("query open Phase A")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_due_phase_b_marks_unparseable_nullifier_failed() {
+        let scope = setup_pool().await;
+        use crate::v1::separation::{claim_stack_scan_mode, set_process_stack_mode, ScanStackMode};
+
+        set_process_stack_mode(ScanStackMode::V1);
+        // Exclusive DB marker before any v1 write — load_or_create persists an empty
+        // genesis snapshot and refuses without this claim.
+        claim_stack_scan_mode(&scope.pool, ScanStackMode::V1)
+            .await
+            .expect("claim stack_scan_mode v1");
+        let pk = [0x62; 32];
+        let mut material = sample_phase_a(pk);
+        material.own_nullifier_r_hex = "zz".into();
+        db_sdr::insert_phase_a(&scope.pool, &pk, &[0x11; 32], &material)
+            .await
+            .expect("non-empty corrupt hex passes completeness staging");
+        let adapter = EngineAdapter::load_or_create(scope.pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("empty regtest engine");
+        let mtp = FixedInclusionMtp {
+            block_hash: [0x63; 32],
+            occurred_at: 1_700_000_000,
+        };
+        let mut rng = StepRng(1);
+
+        let count = finalize_due_phase_b_with_mtp(&adapter, &mtp, &mut rng)
+            .await
+            .expect("per-row corruption is recorded, not returned as loop failure");
+        assert_eq!(count, 0);
+
+        let row = db_sdr::get_phase_a(&scope.pool, &pk)
+            .await
+            .expect("query failed Phase A")
+            .expect("failed row remains durable");
+        assert_eq!(row.status, db_sdr::SdrPhaseAStatus::Failed);
+        let reason = row.fail_reason.expect("failure reason is durable");
+        assert!(reason.contains("SDR Phase B finalise failed"), "{reason}");
+        assert!(reason.contains("own_nullifier.r"), "{reason}");
+        assert!(reason.contains("non-lowercase-hex"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_rejects_non_self_delivery_kind() {
+        let scope = setup_pool().await;
+        let row = outbox_row(OutboxKind::ExternalCoin, OutboxStatus::Pending, vec![]);
+
+        let err = publish_sdr_outbox_row(
+            &scope.pool,
+            &row,
+            &[0x01; 32],
+            1_700_000_000,
+            &publish_rng(),
+        )
+        .await
+        .expect_err("external row must not enter SDR publisher");
+        assert_eq!(
+            err,
+            DeliveryError::Relay("publish_sdr_outbox_row: kind is not self_delivery".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_rejects_both_terminal_statuses() {
+        let scope = setup_pool().await;
+        for status in [OutboxStatus::Completed, OutboxStatus::Failed] {
+            let row = outbox_row(OutboxKind::SelfDelivery, status, vec![]);
+            let err = publish_sdr_outbox_row(
+                &scope.pool,
+                &row,
+                &[0x01; 32],
+                1_700_000_000,
+                &publish_rng(),
+            )
+            .await
+            .expect_err("terminal SDR rows are never republished");
+            assert_eq!(
+                err,
+                DeliveryError::Relay("refuse publish of terminal SDR outbox row".into()),
+                "status={status:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_names_material_decode_failure() {
+        let err = publish_material_error(b"not-json".to_vec()).await;
+        match err {
+            DeliveryError::Relay(message) => {
+                assert!(message.contains("SDR outbox material decode"), "{message}");
+                assert!(message.contains("decode SdrOutboxMaterial JSON"), "{message}");
+            }
+            other => panic!("expected Relay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_rejects_non_hex_zbe_ciphertext() {
+        let mut material = sample_sdr_outbox_material();
+        material.zbe_ciphertext_hex = "zz".into();
+        let err = publish_material_error(material.encode().expect("encode fixture")).await;
+        assert_eq!(
+            err,
+            DeliveryError::Relay("zbe_ciphertext: non-lowercase-hex".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_rejects_short_blob_id() {
+        let mut material = sample_sdr_outbox_material();
+        material.blob_id_hex = "aa".into();
+        let err = publish_material_error(material.encode().expect("encode fixture")).await;
+        assert_eq!(
+            err,
+            DeliveryError::Relay("blob_id: expected 32 bytes, got 1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_rejects_short_detect_tag() {
+        let mut material = sample_sdr_outbox_material();
+        material.detect_tag_hex = "aa".into();
+        let err = publish_material_error(material.encode().expect("encode fixture")).await;
+        assert_eq!(
+            err,
+            DeliveryError::Relay("detect_tag: expected 32 bytes, got 1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_rejects_short_epk() {
+        let mut material = sample_sdr_outbox_material();
+        material.epk_hex = "aa".into();
+        let err = publish_material_error(material.encode().expect("encode fixture")).await;
+        assert_eq!(
+            err,
+            DeliveryError::Relay("epk: expected 32 bytes, got 1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_rejects_short_k_tx() {
+        let mut material = sample_sdr_outbox_material();
+        material.k_tx_hex = "aa".into();
+        let err = publish_material_error(material.encode().expect("encode fixture")).await;
+        assert_eq!(
+            err,
+            DeliveryError::Relay("k_tx: expected 32 bytes, got 1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_rejects_short_recipient_ivpk() {
+        let mut material = sample_sdr_outbox_material();
+        material.recipient_ivpk_hex = "aa".into();
+        let err = publish_material_error(material.encode().expect("encode fixture")).await;
+        assert_eq!(
+            err,
+            DeliveryError::Relay("recipient_ivpk: expected 32 bytes, got 1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_rejects_short_recipient_op_pk() {
+        let mut material = sample_sdr_outbox_material();
+        material.recipient_op_pk_hex = "aa".into();
+        let err = publish_material_error(material.encode().expect("encode fixture")).await;
+        assert_eq!(
+            err,
+            DeliveryError::Relay("recipient_op_pk: expected 32 bytes, got 1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_decode_gate_rejects_empty_recipient_relays() {
+        let mut material = sample_sdr_outbox_material();
+        material.recipient_relays.clear();
+        let bytes = serde_json::to_vec(&material).expect("raw corrupt fixture JSON");
+
+        let err = publish_material_error(bytes).await;
+        match err {
+            DeliveryError::Relay(message) => {
+                assert!(message.contains("SDR outbox material decode"), "{message}");
+                assert!(message.contains("incomplete after decode"), "{message}");
+            }
+            other => panic!("expected Relay decode refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_decode_gate_rejects_empty_blob_holders() {
+        let mut material = sample_sdr_outbox_material();
+        material.blob_holders.clear();
+        let bytes = serde_json::to_vec(&material).expect("raw corrupt fixture JSON");
+
+        let err = publish_material_error(bytes).await;
+        match err {
+            DeliveryError::Relay(message) => {
+                assert!(message.contains("SDR outbox material decode"), "{message}");
+                assert!(message.contains("incomplete after decode"), "{message}");
+            }
+            other => panic!("expected Relay decode refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_rejects_content_address_mismatch() {
+        let mut material = sample_sdr_outbox_material();
+        material.blob_id_hex = hex::encode([0xFF; 32]);
+
+        let err = publish_material_error(material.encode().expect("encode fixture")).await;
+        assert_eq!(
+            err,
+            DeliveryError::Relay(
+                "SDR material: zbe_ciphertext does not content-address to blob_id".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_decode_gate_rejects_invalid_record_kind() {
+        let mut material = sample_sdr_outbox_material();
+        material.record_kind = 0x09;
+        let bytes = serde_json::to_vec(&material).expect("raw corrupt fixture JSON");
+
+        let err = publish_material_error(bytes).await;
+        match err {
+            DeliveryError::Relay(message) => {
+                assert!(message.contains("SDR outbox material decode"), "{message}");
+                assert!(message.contains("record_kind 0x09"), "{message}");
+                assert!(message.contains("not mint/send/receive"), "{message}");
+            }
+            other => panic!("expected Relay decode refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_surfaces_blossom_holder_failure() {
+        let scope = setup_pool().await;
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/blossom/upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let mut material = sample_sdr_outbox_material();
+        material.blob_holders = vec![server.uri()];
+        let row = outbox_row(
+            OutboxKind::SelfDelivery,
+            OutboxStatus::Pending,
+            material.encode().expect("encode fixture"),
+        );
+
+        let err = publish_sdr_outbox_row(
+            &scope.pool,
+            &row,
+            &[0x01; 32],
+            1_700_000_000,
+            &publish_rng(),
+        )
+        .await
+        .expect_err("HTTP 500 must identify its holder");
+        match err {
+            DeliveryError::Blossom { holder, .. } => assert_eq!(holder, server.uri()),
+            other => panic!("expected Blossom, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_rejects_non_websocket_relay_after_upload() {
+        let scope = setup_pool().await;
+        let server = MockServer::start().await;
+        let mut material = sample_sdr_outbox_material();
+        material.blob_holders = vec![server.uri()];
+        material.recipient_relays = vec!["https://example.com".into()];
+        mount_successful_blossom(&server, &material).await;
+        let row = outbox_row(
+            OutboxKind::SelfDelivery,
+            OutboxStatus::Pending,
+            material.encode().expect("encode fixture"),
+        );
+
+        let err = publish_sdr_outbox_row(
+            &scope.pool,
+            &row,
+            &[0x01; 32],
+            1_700_000_000,
+            &publish_rng(),
+        )
+        .await
+        .expect_err("HTTP relay URL must be refused");
+        match err {
+            DeliveryError::Relay(message) => {
+                assert!(message.contains("invalid relay URL"), "{message}");
+                assert!(message.contains("https://example.com"), "{message}");
+            }
+            other => panic!("expected Relay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_sdr_reports_when_no_relay_accepts() {
+        let scope = setup_pool().await;
+        let server = MockServer::start().await;
+        let mut material = sample_sdr_outbox_material();
+        material.blob_holders = vec![server.uri()];
+        material.recipient_relays = vec!["ws://127.0.0.1:1/".into()];
+        mount_successful_blossom(&server, &material).await;
+        let row = outbox_row(
+            OutboxKind::SelfDelivery,
+            OutboxStatus::Pending,
+            material.encode().expect("encode fixture"),
+        );
+
+        let err = publish_sdr_outbox_row(
+            &scope.pool,
+            &row,
+            &[0x01; 32],
+            1_700_000_000,
+            &publish_rng(),
+        )
+        .await
+        .expect_err("unreachable relay cannot accept the gift wrap");
+        match err {
+            DeliveryError::NoRelayAccepted { results } => {
+                assert!(!results.is_empty(), "one relay outcome is required");
+                assert!(results.iter().all(|result| !result.accepted));
+                assert_eq!(results[0].relay_url, "ws://127.0.0.1:1/");
+            }
+            other => panic!("expected NoRelayAccepted, got {other:?}"),
+        }
     }
 
     #[test]
