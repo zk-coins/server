@@ -115,6 +115,8 @@ export COMPOSE_FILE="${MERGED_COMPOSE}"
 # and node2 setup from the canonical stack launcher. Its second --build is a
 # cache hit for the images explicitly built above.
 STACK_MAY_EXIST=1
+log "wiping stale volumes for a clean coverage run (stale account state otherwise fails stage 2 with KeyBindingRefusalError)"
+docker compose -f "${MERGED_COMPOSE}" down -v --remove-orphans || die "volume wipe before coverage run failed"
 log "starting the coverage stack through deploy/local-e2e/up.sh"
 bash "${SCRIPT_DIR}/up.sh" \
   || die "coverage stack startup failed"
