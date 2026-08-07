@@ -2724,8 +2724,47 @@ mod tests {
     use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashMap};
+    use std::ffi::OsString;
     use std::sync::{Arc, Mutex};
     use zkcoins_program::circuit::compliance::Network;
+
+    /// Process environment is shared by the whole test binary. Every recovery-env
+    /// mutation is serialized and restored by `RecoveryEnvRestore::drop`, including
+    /// when an assertion unwinds.
+    static RECOVERY_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RecoveryEnvRestore {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl RecoveryEnvRestore {
+        fn clear() -> Self {
+            let names = [
+                RECOVERY_ENV,
+                RECOVERY_PAGE_LIMIT_ENV,
+                RECOVERY_EARLIEST_ENV,
+            ];
+            let saved = names
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect();
+            for name in names {
+                std::env::remove_var(name);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for RecoveryEnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Fixtures
@@ -2743,6 +2782,13 @@ mod tests {
             }
             seed = Sha256::digest(&seed).to_vec();
         }
+    }
+
+    fn fixture_xonly(label: &[u8]) -> [u8; 32] {
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&fixture_sk(label)).expect("fixture secret key");
+        let keypair = Keypair::from_secret_key(&secp, &secret);
+        keypair.x_only_public_key().0.serialize()
     }
 
     fn signed_gift_wrap(sk: &[u8; 32], created_at: u64, content: &str) -> Event {
@@ -2955,12 +3001,136 @@ mod tests {
 
     #[test]
     fn recovery_env_off_when_unset_or_not_one() {
-        // Pure predicate: only exact "1" is on. We cannot mutate process env
-        // safely under parallel tests; exercise the parser shape via the
-        // public enable check documentation contract.
-        assert_eq!(RECOVERY_ENV, "ZKCOINS_V1_RECOVERY");
-        assert_eq!(RECOVERY_PAGE_LIMIT_ENV, "ZKCOINS_V1_RECOVERY_PAGE_LIMIT");
-        assert_eq!(RECOVERY_EARLIEST_ENV, "ZKCOINS_V1_RECOVERY_EARLIEST");
+        let _lock = RECOVERY_ENV_TEST_LOCK
+            .lock()
+            .expect("lock recovery env tests");
+        let _restore = RecoveryEnvRestore::clear();
+
+        assert_eq!(recovery_campaign_config_from_env(), Ok(None));
+
+        std::env::set_var(RECOVERY_ENV, "true");
+        assert_eq!(recovery_campaign_config_from_env(), Ok(None));
+    }
+
+    #[test]
+    fn recovery_env_rejects_missing_invalid_and_zero_page_limit() {
+        let _lock = RECOVERY_ENV_TEST_LOCK
+            .lock()
+            .expect("lock recovery env tests");
+        let _restore = RecoveryEnvRestore::clear();
+        std::env::set_var(RECOVERY_ENV, "1");
+
+        assert_eq!(
+            recovery_campaign_config_from_env(),
+            Err(format!(
+                "{RECOVERY_ENV}=1 requires {RECOVERY_PAGE_LIMIT_ENV} (positive integer page size L) \
+                 — refusing silent default L"
+            ))
+        );
+
+        std::env::set_var(RECOVERY_PAGE_LIMIT_ENV, "not-a-number");
+        assert_eq!(
+            recovery_campaign_config_from_env(),
+            Err(format!(
+                "{RECOVERY_PAGE_LIMIT_ENV}=\"not-a-number\" is not a non-negative integer"
+            ))
+        );
+
+        std::env::set_var(RECOVERY_PAGE_LIMIT_ENV, "0");
+        assert_eq!(
+            recovery_campaign_config_from_env(),
+            Err(format!(
+                "{RECOVERY_PAGE_LIMIT_ENV}=0 is invalid — page limit must be positive (no default L)"
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_env_rejects_non_utf8_page_limit() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _lock = RECOVERY_ENV_TEST_LOCK
+            .lock()
+            .expect("lock recovery env tests");
+        let _restore = RecoveryEnvRestore::clear();
+        std::env::set_var(RECOVERY_ENV, "1");
+        std::env::set_var(
+            RECOVERY_PAGE_LIMIT_ENV,
+            OsString::from_vec(vec![0xff, 0xfe]),
+        );
+
+        assert_eq!(
+            recovery_campaign_config_from_env(),
+            Err(format!("{RECOVERY_PAGE_LIMIT_ENV} is not valid UTF-8"))
+        );
+    }
+
+    #[test]
+    fn recovery_env_rejects_missing_or_invalid_earliest_timestamp() {
+        let _lock = RECOVERY_ENV_TEST_LOCK
+            .lock()
+            .expect("lock recovery env tests");
+        let _restore = RecoveryEnvRestore::clear();
+        std::env::set_var(RECOVERY_ENV, "1");
+        std::env::set_var(RECOVERY_PAGE_LIMIT_ENV, "25");
+
+        assert_eq!(
+            recovery_campaign_config_from_env(),
+            Err(format!(
+                "{RECOVERY_ENV}=1 requires {RECOVERY_EARLIEST_ENV} (unix seconds; wallet earliest \
+                 account timestamp after dense enumeration) — refusing silent start-at-zero"
+            ))
+        );
+
+        std::env::set_var(RECOVERY_EARLIEST_ENV, "-1");
+        assert_eq!(
+            recovery_campaign_config_from_env(),
+            Err(format!(
+                "{RECOVERY_EARLIEST_ENV}=\"-1\" is not a non-negative integer"
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_env_rejects_non_utf8_earliest_timestamp() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _lock = RECOVERY_ENV_TEST_LOCK
+            .lock()
+            .expect("lock recovery env tests");
+        let _restore = RecoveryEnvRestore::clear();
+        std::env::set_var(RECOVERY_ENV, "1");
+        std::env::set_var(RECOVERY_PAGE_LIMIT_ENV, "25");
+        std::env::set_var(
+            RECOVERY_EARLIEST_ENV,
+            OsString::from_vec(vec![0xff, 0xfe]),
+        );
+
+        assert_eq!(
+            recovery_campaign_config_from_env(),
+            Err(format!("{RECOVERY_EARLIEST_ENV} is not valid UTF-8"))
+        );
+    }
+
+    #[test]
+    fn recovery_env_returns_valid_campaign_config() {
+        let _lock = RECOVERY_ENV_TEST_LOCK
+            .lock()
+            .expect("lock recovery env tests");
+        let _restore = RecoveryEnvRestore::clear();
+        std::env::set_var(RECOVERY_ENV, "1");
+        std::env::set_var(RECOVERY_PAGE_LIMIT_ENV, "25");
+        std::env::set_var(RECOVERY_EARLIEST_ENV, "1700000000");
+
+        assert_eq!(
+            recovery_campaign_config_from_env(),
+            Ok(Some(RecoveryCampaignConfig {
+                page_limit: 25,
+                earliest_account_timestamp: 1_700_000_000,
+            }))
+        );
     }
 
     #[test]
@@ -3006,6 +3176,41 @@ mod tests {
             msg.contains("BOOTSTRAP_MANIFEST") || msg.contains("BootstrapManifest"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn already_recovered_subjects_only_returns_active_subjects_present_in_index() {
+        let recovered_subject = SubjectAddress([0x31; 32]);
+        let missing_subject = SubjectAddress([0x32; 32]);
+        let bundle = OperationalBundle {
+            ivk: [0x11; 32],
+            ovk: [0x12; 32],
+            op: [0x13; 32],
+            nk: [0x14; 32],
+            op_secret: [0x15; 32],
+        };
+        let index = InMemoryPrivateIndex::new();
+        index
+            .insert_account(
+                recovered_subject,
+                crate::kernel::access::AccountStateView {
+                    account_state: vec![0x01],
+                    state_head: crate::kernel::types::Digest32([0x21; 32]),
+                    head_record_id: None,
+                    send_counter: 7,
+                    current_pubkey: [0x22; 32],
+                    last_nullifier_pk: None,
+                    last_nullifier_r: None,
+                },
+            )
+            .expect("register recovered subject fixture");
+
+        let active = vec![(recovered_subject, bundle), (missing_subject, bundle)];
+        let recovered = already_recovered_subjects(&index, &active);
+        assert_eq!(recovered, HashSet::from([recovered_subject.0]));
+        assert!(!recovered.contains(&missing_subject.0));
+
+        assert!(already_recovered_subjects(&index, &[]).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -3131,6 +3336,51 @@ mod tests {
                 Ok(RelayQueryPage { events, truncated })
             })
         }
+    }
+
+    struct FixedErrorRelaySource {
+        error: RecoveryError,
+        queried_urls: Vec<String>,
+    }
+
+    impl RecoveryRelaySource for FixedErrorRelaySource {
+        fn query(
+            &mut self,
+            relay_url: &str,
+            _filter: &Filter,
+        ) -> Pin<Box<dyn Future<Output = Result<RelayQueryPage, RecoveryError>> + Send + '_>>
+        {
+            self.queried_urls.push(relay_url.to_string());
+            let error = self.error.clone();
+            Box::pin(async move { Err(error) })
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_timestamp_propagates_non_relay_error_without_trying_next_url() {
+        let mut source = FixedErrorRelaySource {
+            error: RecoveryError::WallClockUnavailable,
+            queried_urls: Vec::new(),
+        };
+        let relay_urls = vec!["ws://first.test".into(), "ws://second.test".into()];
+        let mut seen = HashSet::new();
+        let mut events = Vec::new();
+
+        let err = drain_timestamp(&mut source, &relay_urls, 123, &mut seen, &mut events)
+            .await
+            .expect_err("non-Relay source error must escape the drain");
+
+        match err {
+            DrainFailure::Error(error) => {
+                assert_eq!(error, RecoveryError::WallClockUnavailable)
+            }
+            DrainFailure::Incomplete { .. } => {
+                panic!("non-Relay error must not be converted to an incomplete drain")
+            }
+        }
+        assert_eq!(source.queried_urls, vec!["ws://first.test"]);
+        assert!(seen.is_empty());
+        assert!(events.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -3769,6 +4019,190 @@ mod tests {
     }
 
     #[test]
+    fn verify_fold_static_bindings_rejects_epk_mismatch() {
+        let subject = [0x86u8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/fold-epk-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/fold-epk-pk");
+        let account = sample_account_state_for(subject, nk, pk, 1);
+        let accepted_record = sample_sdr_record(1, host::ZERO_HASH, account, pk, 100);
+        let cp = host::CoinProof {
+            coin: host::Coin {
+                identifier: host::ZERO_HASH,
+                recipient: Address(subject),
+                amount: 1,
+                asset_id: host::ZERO_HASH,
+            },
+            proof: vec![],
+            inclusion_proof: vec![],
+            creating_prev_ash: host::ZERO_HASH,
+            creating_nullifier: accepted_record.own_nullifier,
+            nav_opening: host::NavOpening {
+                size: 0,
+                mth: host::ZERO_HASH,
+                nav_rand: [0u8; 32],
+            },
+            asset_terms: None,
+            epk: [0x61; 32],
+            ciphertext: vec![],
+            detect_tag: host::ZERO_HASH,
+        };
+        let oref = host::OutputRef {
+            coin_id: digest_to_bytes(&cp.coin.identifier),
+            blob_id: [0u8; 32],
+            epk: [0x62; 32],
+            out_ciphertext: vec![],
+            blob_locators: host::BlobLocatorSet {
+                holders: vec!["https://x.test".into()],
+            },
+        };
+
+        let err = verify_fold_static_bindings(&cp, &oref, &accepted_record)
+            .expect_err("CoinProof epk must bind to OutputRef epk");
+        match err {
+            SdrDiscardReason::FoldEpkMismatch { detail } => {
+                assert!(detail.contains("CoinProof epk"), "{detail}");
+                assert!(detail.contains("OutputRef epk"), "{detail}");
+            }
+            other => panic!("expected FoldEpkMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_fold_static_bindings_rejects_creating_nullifier_mismatch() {
+        let subject = [0x87u8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/fold-nullifier-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/fold-nullifier-pk");
+        let account = sample_account_state_for(subject, nk, pk, 1);
+        let accepted_record = sample_sdr_record(1, host::ZERO_HASH, account, pk, 100);
+        let epk = [0x63; 32];
+        let mut creating_nullifier = accepted_record.own_nullifier;
+        creating_nullifier.r_create = [0x64; 32];
+        let cp = host::CoinProof {
+            coin: host::Coin {
+                identifier: host::ZERO_HASH,
+                recipient: Address(subject),
+                amount: 1,
+                asset_id: host::ZERO_HASH,
+            },
+            proof: vec![],
+            inclusion_proof: vec![],
+            creating_prev_ash: host::ZERO_HASH,
+            creating_nullifier,
+            nav_opening: host::NavOpening {
+                size: 0,
+                mth: host::ZERO_HASH,
+                nav_rand: [0u8; 32],
+            },
+            asset_terms: None,
+            epk,
+            ciphertext: vec![],
+            detect_tag: host::ZERO_HASH,
+        };
+        let oref = host::OutputRef {
+            coin_id: digest_to_bytes(&cp.coin.identifier),
+            blob_id: [0u8; 32],
+            epk,
+            out_ciphertext: vec![],
+            blob_locators: host::BlobLocatorSet {
+                holders: vec!["https://x.test".into()],
+            },
+        };
+
+        let err = verify_fold_static_bindings(&cp, &oref, &accepted_record)
+            .expect_err("CoinProof creating nullifier must bind to accepted SDR");
+        assert_eq!(
+            err,
+            SdrDiscardReason::FoldCreatingTransitionMismatch {
+                detail: "CoinProof creating_nullifier != accepted SDR own_nullifier".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_output_ref_fails_locally_for_invalid_utf8_and_empty_holders() {
+        let scope = crate::test_db::setup_pool().await;
+        let subject = [0x88u8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/stage-output-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/stage-output-pk");
+        let account = sample_account_state_for(subject, nk, pk, 1);
+        let accepted_record = sample_sdr_record(1, host::ZERO_HASH, account, pk, 100);
+        let bridge = ProverBridge::new(Network::Regtest);
+        let ovk = fixture_sk(b"zkCoins/v1/test-vector/recovery/stage-output-ovk");
+        let epk = fixture_xonly(b"zkCoins/v1/test-vector/recovery/stage-output-epk");
+        let stores = FoldOutputRefStores { pool: &scope.pool };
+        let secrets = FoldOutputRefSecrets {
+            subject: &subject,
+            ovk: &ovk,
+        };
+
+        let invalid_utf8 = host::OutputRef {
+            coin_id: [0x73; 32],
+            blob_id: [0x74; 32],
+            epk,
+            out_ciphertext: vec![0xff, 0xfe],
+            blob_locators: host::BlobLocatorSet {
+                holders: vec!["https://must-not-be-contacted.test".into()],
+            },
+        };
+        let err = stage_output_ref_inner(
+            stores,
+            &bridge,
+            secrets,
+            &accepted_record,
+            TransitionKind::Send,
+            &invalid_utf8,
+            1024,
+            |_| -> Result<(), IncomingError> {
+                panic!("verification must not run after invalid out_ciphertext UTF-8")
+            },
+        )
+        .await
+        .expect_err("invalid out_ciphertext UTF-8 must fail before fetch");
+        match err {
+            SdrDiscardReason::ZbeOpenFailed { detail } => {
+                assert!(detail.contains("out_ciphertext is not UTF-8"), "{detail}");
+            }
+            other => panic!("expected ZbeOpenFailed, got {other:?}"),
+        }
+
+        let k_tx = [0x75; 32];
+        let out_ciphertext = crate::v1::delivery::out_ciphertext_for_output_ref(
+            &ovk,
+            &epk,
+            &k_tx,
+            &[0x76; 32],
+        )
+        .expect("construct valid OVK recovery envelope");
+        let no_holders = host::OutputRef {
+            coin_id: [0x77; 32],
+            blob_id: [0x78; 32],
+            epk,
+            out_ciphertext,
+            blob_locators: host::BlobLocatorSet { holders: vec![] },
+        };
+        let err = stage_output_ref_inner(
+            stores,
+            &bridge,
+            secrets,
+            &accepted_record,
+            TransitionKind::Send,
+            &no_holders,
+            1024,
+            |_| -> Result<(), IncomingError> {
+                panic!("verification must not run when the holder list is empty")
+            },
+        )
+        .await
+        .expect_err("empty holder list must fail without a network request");
+        assert_eq!(
+            err,
+            SdrDiscardReason::FetchFailed {
+                detail: "blob holders empty (no default store)".into(),
+            }
+        );
+    }
+
+    #[test]
     fn same_ash_divergent_records_are_retained_with_deterministic_winner() {
         let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/same-ash-nk");
         let pk0 = fixture_sk(b"zkCoins/v1/test-vector/recovery/same-ash-pk0");
@@ -4098,6 +4532,224 @@ mod tests {
             matches!(err, SdrDiscardReason::ProofVerifyFailed { .. }),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_head_install_handles_existing_accounts_and_index_read_failure() {
+        use crate::v1::separation::{
+            claim_stack_scan_mode, set_process_stack_mode, ScanStackMode,
+        };
+
+        let scope = crate::test_db::setup_pool().await;
+        set_process_stack_mode(ScanStackMode::V1);
+        claim_stack_scan_mode(&scope.pool, ScanStackMode::V1)
+            .await
+            .expect("claim v1 stack mode for EngineAdapter fixture");
+        let pool = Arc::new(scope.pool.clone());
+        let adapter = Arc::new(
+            EngineAdapter::load_or_create(pool.as_ref().clone(), Network::Regtest, 0)
+                .await
+                .expect("create recovery test adapter"),
+        );
+        let bridge = ProverBridge::new(Network::Regtest);
+
+        let no_op_subject = [0x91; 32];
+        let no_op_nk = [0x92; 32];
+        let no_op_pk = [0x93; 32];
+        let no_op_owner = Address(no_op_subject);
+        let no_op_record = crate::v1::db_v1::AccountSnapshot {
+            owner: no_op_owner,
+            state: sample_account_state_for(no_op_subject, no_op_nk, no_op_pk, 5),
+            nk: no_op_nk,
+            op_secret: Some(OpSecret::new([0x94; 32])),
+            genesis_pubkey: no_op_pk,
+            spendable: vec![],
+            spent_ids: vec![],
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        }
+        .into_record()
+        .expect("construct existing no-op account");
+
+        let behind_subject = [0xa1; 32];
+        let behind_nk = [0xa2; 32];
+        let behind_pk = [0xa3; 32];
+        let behind_owner = Address(behind_subject);
+        let behind_record = crate::v1::db_v1::AccountSnapshot {
+            owner: behind_owner,
+            state: sample_account_state_for(behind_subject, behind_nk, behind_pk, 1),
+            nk: behind_nk,
+            op_secret: Some(OpSecret::new([0xa4; 32])),
+            genesis_pubkey: behind_pk,
+            spendable: vec![],
+            spent_ids: vec![],
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        }
+        .into_record()
+        .expect("construct existing behind account");
+
+        adapter
+            .with_engine_mut(|engine| {
+                engine
+                    .insert_account(no_op_owner, no_op_record)
+                    .expect("seed no-op account");
+                engine
+                    .insert_account(behind_owner, behind_record)
+                    .expect("seed behind account");
+            })
+            .expect("seed adapter accounts under v1 process claim");
+
+        let make_deps = |seed_relays: Vec<String>| RecoveryCampaignDeps {
+            seed_relays,
+            bundles: BundleStore::shared(),
+            adapter: Arc::clone(&adapter),
+            pool: Arc::clone(&pool),
+            index: InMemoryPrivateIndex::shared(),
+            receipts: ReceiptHub::shared(),
+            max_blob_bytes: 1024,
+            expected_network: "regtest".into(),
+        };
+        let bundle = OperationalBundle {
+            ivk: [0xb1; 32],
+            ovk: [0xb2; 32],
+            op: [0xb3; 32],
+            nk: [0xb4; 32],
+            op_secret: [0xb5; 32],
+        };
+
+        let no_seed_err = run_recovery_campaign(
+            RecoveryCampaignConfig {
+                page_limit: 10,
+                earliest_account_timestamp: 1,
+            },
+            make_deps(vec![]),
+        )
+        .await
+        .expect_err("empty seed relays must fail before bundle, DB, or network access");
+        assert_eq!(no_seed_err, RecoveryError::NoSeedRelays);
+
+        let no_op_state = sample_account_state_for(no_op_subject, no_op_nk, no_op_pk, 4);
+        let no_op_sdr = sample_sdr_record(4, host::ZERO_HASH, no_op_state, no_op_pk, 100);
+        let no_op_accepted = vec![AcceptedSdr {
+            blob_id: [0xc1; 32],
+            account_state_ash: digest_to_bytes(
+                &account_state_hash(&no_op_sdr.account_state).expect("no-op head ash"),
+            ),
+            record: no_op_sdr,
+        }];
+        let deps = make_deps(vec!["ws://unused.test".into()]);
+        install_and_persist_recovered_head(
+            &deps,
+            &bridge,
+            no_op_subject,
+            &bundle,
+            &no_op_accepted,
+        )
+        .await
+        .expect("an engine account ahead of the recovered head is an idempotent no-op");
+        assert_eq!(
+            adapter.with_engine(|engine| {
+                engine
+                    .account(&no_op_owner)
+                    .expect("no-op account remains installed")
+                    .state
+                    .send_counter
+            }),
+            5
+        );
+
+        let behind_head_state =
+            sample_account_state_for(behind_subject, behind_nk, behind_pk, 2);
+        let behind_head = sample_sdr_record(
+            2,
+            host::ZERO_HASH,
+            behind_head_state,
+            behind_pk,
+            100,
+        );
+        let behind_accepted = vec![AcceptedSdr {
+            blob_id: [0xc2; 32],
+            account_state_ash: digest_to_bytes(
+                &account_state_hash(&behind_head.account_state).expect("behind head ash"),
+            ),
+            record: behind_head,
+        }];
+        let err = install_and_persist_recovered_head(
+            &deps,
+            &bridge,
+            behind_subject,
+            &bundle,
+            &behind_accepted,
+        )
+        .await
+        .expect_err("an older installed account must fail closed instead of being overwritten");
+        assert_eq!(
+            err,
+            SdrDiscardReason::HeadReconstructionFailed {
+                detail: "engine already holds account at send_counter 1, behind the \
+                         reconstructed head 2 — no in-place account update path exists; refusing \
+                         to overwrite (nothing was changed)"
+                    .into(),
+            }
+        );
+        assert_eq!(
+            adapter.with_engine(|engine| {
+                engine
+                    .account(&behind_owner)
+                    .expect("behind account remains installed")
+                    .state
+                    .send_counter
+            }),
+            1
+        );
+
+        sqlx::query("DROP TABLE v1_self_delivery_index CASCADE")
+            .execute(pool.as_ref())
+            .await
+            .expect("drop self-delivery index table for SQL failure fixture");
+
+        let missing_subject = [0xd1; 32];
+        let missing_nk = [0xd2; 32];
+        let missing_pk = [0xd3; 32];
+        assert!(adapter
+            .with_engine(|engine| engine.account(&Address(missing_subject)).is_none()));
+        let missing_state =
+            sample_account_state_for(missing_subject, missing_nk, missing_pk, 1);
+        let missing_head =
+            sample_sdr_record(1, host::ZERO_HASH, missing_state, missing_pk, 100);
+        let missing_accepted = vec![AcceptedSdr {
+            blob_id: [0xd4; 32],
+            account_state_ash: digest_to_bytes(
+                &account_state_hash(&missing_head.account_state).expect("missing head ash"),
+            ),
+            record: missing_head,
+        }];
+        let err = install_and_persist_recovered_head(
+            &deps,
+            &bridge,
+            missing_subject,
+            &bundle,
+            &missing_accepted,
+        )
+        .await
+        .expect_err("missing SQL table must map to IndexLookupFailed before reconstruction");
+        match err {
+            SdrDiscardReason::IndexLookupFailed { detail } => {
+                assert!(
+                    detail.starts_with("list self-delivery rows for head install:"),
+                    "{detail}"
+                );
+                assert!(detail.contains("v1_self_delivery_index"), "{detail}");
+            }
+            other => panic!("expected IndexLookupFailed, got {other:?}"),
+        }
+        assert!(adapter
+            .with_engine(|engine| engine.account(&Address(missing_subject)).is_none()));
     }
 
     // -----------------------------------------------------------------------
