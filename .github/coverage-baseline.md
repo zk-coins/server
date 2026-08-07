@@ -180,19 +180,23 @@ the journey, so it was counted as uncovered. The **integration-coverage pipeline
 - Reproduce: bring the dev stack (`zkcoins-local`) down first (port 18443), `source` env.local.sh,
   `export COMPOSE_PROJECT_NAME=zkcoins-local-coverage`, `brew install lcov`, then run the script.
 
-**Measured node-src line coverage (updated 2026-08-07, wave 2):**
+**Measured node-src line coverage (updated 2026-08-07, wave 3):**
 
 | Source | Coverage |
 |---|---|
-| Unit tests only | 77.53% |
-| Journey/integration only | 25.26%¹ |
-| **Combined (unit ∪ integration)** | **84.18%** (41456 / 49249) |
+| Unit tests only | 78.48% |
+| Journey/integration only | 24.59%¹ |
+| **Combined (unit ∪ integration)** | **84.68%** (42835 / 50583) |
 
 ¹ integration-only measured against the *union* instrumented-line base (larger denominator than
 Update 9's integ-only-base 47.8%); the combined figure is the honest, comparable metric.
 
-Wave-2 unit gains (committed to node #231): `v1/sdr.rs` 50.2 → **93.09%** (+49 tests, all Phase-A/B
-finalise + publish-outbox fail-closed branches), `v1/db_decrypt_index.rs` 20.5 → **99.79%** (+12 tests).
+Wave-2 unit gains: `v1/sdr.rs` 50.2 → **93.09%** (+49 tests), `v1/db_decrypt_index.rs` 20.5 → **99.79%** (+12).
+Wave-3 unit gains (each behind an adversarial codex-reviewer pass): `v1/signature.rs` 60.1 → **74.85%**
+(6 review-found error-branch gaps closed), `flow.rs` 18 → **65.33%** (admit-validators + a real production
+bug fixed: `validate_send_request` reported "Missing signature" for an absent timestamp, against the
+router.rs contract), `kernel/service.rs` 38 → **51.79%** (chain-less getters/builders/fail-closed reads;
+async/DB paths deferred), `self_heal_tests.rs` (+2 error-branch tests).
 
 **The path to 100% is four layers** (largest combined-uncovered blocks first):
 1. **Unit-testable pure logic** (sequential codex lanes; parallel lanes collide via the nested
