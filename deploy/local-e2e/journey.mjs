@@ -1649,6 +1649,67 @@ async function pollFaultReadiness(url, expectReady, timeoutMs, intervalMs) {
   return { matched: false, last };
 }
 
+/**
+ * Wait until a compose service reports Docker Health=healthy (via
+ * `docker compose up -d --wait`). Fail-loud on non-zero exit (timeout /
+ * unhealthy) through dockerCompose → fail().
+ */
+function waitComposeHealthy(service, timeoutS, stage) {
+  log(`waiting for compose service '${service}' healthy (timeout ${timeoutS}s)…`);
+  dockerCompose(
+    ['up', '-d', '--wait', '--wait-timeout', String(timeoutS), service],
+    stage,
+  );
+}
+
+/**
+ * Poll a plain-text HTTP liveness route until status 200 and body === expectBody.
+ * Fail-loud via fail(stage, …) on timeout. Not for JSON readiness shapes.
+ */
+async function pollHttpBody(url, expectBody, timeoutMs, intervalMs, stage, name) {
+  const deadline = Date.now() + timeoutMs;
+  let last = 'not polled';
+  log(`waiting for HTTP ${name} at ${url} (timeout ${timeoutMs}ms)…`);
+
+  while (Date.now() < deadline) {
+    try {
+      const res = await httpJson('GET', url);
+      last = `HTTP ${res.status} ${JSON.stringify(res.text)}`;
+      if (res.status === 200 && (res.text || '').trim() === expectBody) {
+        return;
+      }
+    } catch (e) {
+      last = `pending (${e.message})`;
+    }
+    await sleep(intervalMs);
+  }
+
+  fail(
+    stage,
+    `timeout after ${timeoutMs}ms waiting for ${name} (${url}) expect body ${JSON.stringify(expectBody)}; last observed: ${last}`,
+  );
+}
+
+/**
+ * Post-restart stack wait matching up.sh (node Docker health → node /health →
+ * api Docker health → api /health). Circuit rebuild may take many minutes.
+ */
+async function waitNodeStackPostRestart(
+  stage,
+  nodeService,
+  nodeHealthUrl,
+  apiService,
+  apiHealthUrl,
+) {
+  log(
+    `post-restart wait for ${nodeService}/${apiService} (circuit rebuild may take many minutes)…`,
+  );
+  waitComposeHealthy(nodeService, 1200, stage);
+  await pollHttpBody(nodeHealthUrl, 'ok', 120_000, 2_000, stage, `${nodeService} /health`);
+  waitComposeHealthy(apiService, 300, stage);
+  await pollHttpBody(apiHealthUrl, 'ok', 120_000, 2_000, stage, `${apiService} /health`);
+}
+
 async function faultStageBitcoind() {
   const stage = 'fault-bitcoind';
   log('stopping bitcoind and waiting for node1 to fail closed');
@@ -1662,14 +1723,32 @@ async function faultStageBitcoind() {
   );
 
   log('restoring bitcoind and restarting both affected nodes');
-  dockerCompose(['start', 'bitcoind'], stage);
+  // Start + wait dependency healthy before node restart (up.sh wait_healthy 120s).
+  waitComposeHealthy('bitcoind', 120, stage);
   dockerCompose(['restart', 'node'], stage);
   dockerCompose(['restart', 'node2'], stage);
 
+  // up.sh post-restart sequence for both node/api pairs (shared bitcoind).
+  await waitNodeStackPostRestart(
+    stage,
+    'node',
+    'http://127.0.0.1:4242/health',
+    'api',
+    `${API_URL}/health`,
+  );
+  await waitNodeStackPostRestart(
+    stage,
+    NODE2_SERVICE,
+    'http://127.0.0.1:4243/health',
+    'api2',
+    `${API_URL_2}/health`,
+  );
+
+  const recoveryTimeoutMs = 1_200_000;
   const recovery = await pollFaultReadiness(
     `${API_URL}/health/ready`,
     true,
-    180_000,
+    recoveryTimeoutMs,
     3_000,
   );
 
@@ -1682,7 +1761,7 @@ async function faultStageBitcoind() {
   if (!recovery.matched) {
     fail(
       stage,
-      `node1 did not become ready within 180000ms after bitcoind recovery; last observed: ${recovery.last}`,
+      `node1 did not become ready within ${recoveryTimeoutMs}ms after bitcoind recovery; last observed: ${recovery.last}`,
     );
   }
 
@@ -1702,13 +1781,25 @@ async function faultStagePostgres() {
   );
 
   log('restoring postgres and restarting node1');
-  dockerCompose(['start', 'postgres'], stage);
+  // Start + wait dependency healthy before node restart (up.sh wait_healthy 120s).
+  // postgres only — node2 uses postgres2 and is unaffected by this fault.
+  waitComposeHealthy('postgres', 120, stage);
   dockerCompose(['restart', 'node'], stage);
 
+  // up.sh post-restart sequence for node/api only (node1-scoped fault).
+  await waitNodeStackPostRestart(
+    stage,
+    'node',
+    'http://127.0.0.1:4242/health',
+    'api',
+    `${API_URL}/health`,
+  );
+
+  const recoveryTimeoutMs = 1_200_000;
   const recovery = await pollFaultReadiness(
     `${API_URL}/health/ready`,
     true,
-    180_000,
+    recoveryTimeoutMs,
     3_000,
   );
 
@@ -1721,7 +1812,7 @@ async function faultStagePostgres() {
   if (!recovery.matched) {
     fail(
       stage,
-      `node1 did not become ready within 180000ms after postgres recovery; last observed: ${recovery.last}`,
+      `node1 did not become ready within ${recoveryTimeoutMs}ms after postgres recovery; last observed: ${recovery.last}`,
     );
   }
 
