@@ -1133,6 +1133,292 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Check 2: closed content / zkcoins shape
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_zkcoins_object_rejects_non_object_content() {
+        let err = parse_zkcoins_object(&json!([1, 2, 3]), "regtest")
+            .expect_err("content root must be an object");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check2InvalidContentJson {
+                reason: "content is not a JSON object",
+            }
+        );
+    }
+
+    #[test]
+    fn parse_zkcoins_object_rejects_missing_zkcoins_key() {
+        let err = parse_zkcoins_object(&json!({"name": "Alice"}), "regtest")
+            .expect_err("zkcoins key must be present");
+        assert_eq!(err, ProfileCheckError::Check2MissingZkcoins);
+    }
+
+    #[test]
+    fn parse_zkcoins_object_rejects_non_object_zkcoins() {
+        let err = parse_zkcoins_object(&json!({"zkcoins": "not an object"}), "regtest")
+            .expect_err("zkcoins must be an object");
+        assert_eq!(err, ProfileCheckError::Check2ZkcoinsNotObject);
+    }
+
+    #[test]
+    fn parse_zkcoins_object_rejects_each_missing_required_field() {
+        let acct = sample_account("missing-fields");
+        let (zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+
+        for field in ZKCOINS_FIELDS {
+            let mut missing = zk.clone();
+            let removed = missing
+                .as_object_mut()
+                .expect("fixture zkcoins is an object")
+                .remove(field);
+            assert!(removed.is_some(), "fixture must contain {field}");
+
+            let err = parse_zkcoins_object(&json!({"zkcoins": missing}), "regtest")
+                .expect_err("required field removal must fail");
+            assert_eq!(
+                err,
+                ProfileCheckError::Check2MissingField { field },
+                "wrong error for missing field {field}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Check 2: field validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_zkcoins_object_rejects_numeric_version_two() {
+        let acct = sample_account("version-two");
+        let (mut zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        zk["version"] = json!(2);
+
+        let err = parse_zkcoins_object(&json!({"zkcoins": zk}), "regtest")
+            .expect_err("version 2 must fail");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check2Version {
+                got: "2".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_zkcoins_object_rejects_string_version_one() {
+        let acct = sample_account("version-string");
+        let (mut zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        zk["version"] = json!("1");
+
+        let err = parse_zkcoins_object(&json!({"zkcoins": zk}), "regtest")
+            .expect_err("string version must fail");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check2Version {
+                got: "\"1\"".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_zkcoins_object_rejects_unknown_network_even_when_expected() {
+        let acct = sample_account("closed-network");
+        let (mut zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        zk["network"] = json!("unknown");
+
+        let err = parse_zkcoins_object(&json!({"zkcoins": zk}), "unknown")
+            .expect_err("network labels are a closed set");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check2Network {
+                expected: "unknown".to_string(),
+                got: "unknown".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_zkcoins_object_rejects_wrong_hex_width_with_field_name() {
+        let acct = sample_account("hex-width");
+        let (mut zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        zk["pk0"] = json!("a".repeat(63));
+
+        let err = parse_zkcoins_object(&json!({"zkcoins": zk}), "regtest")
+            .expect_err("pk0 width must be exact");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check2InvalidHex {
+                field: "pk0",
+                reason: "wrong hex width",
+            }
+        );
+    }
+
+    #[test]
+    fn parse_zkcoins_object_rejects_uppercase_hex_with_field_name() {
+        let acct = sample_account("hex-uppercase");
+        let (mut zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        zk["nk_commit"] = json!("A".repeat(64));
+
+        let err = parse_zkcoins_object(&json!({"zkcoins": zk}), "regtest")
+            .expect_err("nk_commit must use lowercase hex");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check2InvalidHex {
+                field: "nk_commit",
+                reason: "must be lowercase hex",
+            }
+        );
+    }
+
+    #[test]
+    fn parse_zkcoins_object_rejects_invalid_bech32m_address() {
+        let acct = sample_account("invalid-address");
+        let (mut zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        zk["address"] = json!("not-an-address");
+
+        let err = parse_zkcoins_object(&json!({"zkcoins": zk}), "regtest")
+            .expect_err("address must be valid Bech32m");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check2InvalidAddress {
+                reason: "bech32m decode error: parse failed".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_zkcoins_object_rejects_non_array_relays() {
+        let acct = sample_account("relays-not-array");
+        let (mut zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        zk["relays"] = json!("wss://relay.example.com");
+
+        let err = parse_zkcoins_object(&json!({"zkcoins": zk}), "regtest")
+            .expect_err("relays must be an array");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check2InvalidRelays {
+                reason: "relays is not an array",
+            }
+        );
+    }
+
+    #[test]
+    fn parse_zkcoins_object_rejects_empty_relays() {
+        let acct = sample_account("relays-empty");
+        let (mut zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        zk["relays"] = json!([]);
+
+        let err = parse_zkcoins_object(&json!({"zkcoins": zk}), "regtest")
+            .expect_err("relays must be non-empty");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check2InvalidRelays {
+                reason: "relays must be non-empty",
+            }
+        );
+    }
+
+    #[test]
+    fn parse_zkcoins_object_rejects_non_string_relay_entry() {
+        let acct = sample_account("relay-not-string");
+        let (mut zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        zk["relays"] = json!([123]);
+
+        let err = parse_zkcoins_object(&json!({"zkcoins": zk}), "regtest")
+            .expect_err("relay entries must be strings");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check2InvalidRelays {
+                reason: "relay entry is not a string",
+            }
+        );
+    }
+
+    #[test]
+    fn parse_zkcoins_object_rejects_non_websocket_relay_url() {
+        let acct = sample_account("relay-url");
+        let (mut zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        zk["relays"] = json!(["http://bad"]);
+
+        let err = parse_zkcoins_object(&json!({"zkcoins": zk}), "regtest")
+            .expect_err("relay URL must use WebSocket transport");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check2InvalidRelayUrl {
+                url: "http://bad".to_string(),
+            }
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Check 4: foreign ivpk attack
     // -----------------------------------------------------------------------
 
@@ -1222,6 +1508,17 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn check_1_rejects_wrong_event_kind() {
+        let acct = sample_account("wrong-kind");
+        let event = Event::sign(&acct.op_sk, 1, 1, vec![], "{}".to_string())
+            .expect("sign kind-1 event");
+
+        let err = verify_payment_profile(&event, &acct.op_pk, "regtest", None)
+            .expect_err("kind 1 must fail profile check 1");
+        assert_eq!(err, ProfileCheckError::Check1WrongKind { kind: 1 });
+    }
+
+    #[test]
     fn check_1_rejects_author_mismatch() {
         let acct = sample_account("auth");
         let (zk, _, _) = build_zkcoins_json(
@@ -1245,6 +1542,56 @@ mod tests {
             }
             other => panic!("expected Check1AuthorMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_1_rejects_content_mutated_after_signing_as_id_mismatch() {
+        let acct = sample_account("mutated-content");
+        let (zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        let mut event = sign_kind0(&acct.op_sk, 1, "alice@example.com", &zk);
+        let signed_id = event.id;
+        event.content.push(' ');
+
+        let err = verify_payment_profile(&event, &acct.op_pk, "regtest", None)
+            .expect_err("mutated signed content must fail NIP-01 verification");
+        match err {
+            ProfileCheckError::Check1BadSignature(EventError::IdMismatch {
+                claimed,
+                computed,
+            }) => {
+                assert_eq!(claimed, signed_id);
+                assert_ne!(computed, claimed);
+            }
+            other => panic!("expected Check1BadSignature(IdMismatch), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_2_rejects_non_json_event_content() {
+        let acct = sample_account("non-json-content");
+        let event = Event::sign(
+            &acct.op_sk,
+            1,
+            KIND_METADATA,
+            vec![],
+            "not json {".to_string(),
+        )
+        .expect("sign kind-0 with non-JSON content");
+
+        let err = verify_payment_profile(&event, &acct.op_pk, "regtest", None)
+            .expect_err("non-JSON event content must fail check 2");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check2InvalidContentJson {
+                reason: "content is not JSON",
+            }
+        );
     }
 
     #[test]
@@ -1330,6 +1677,32 @@ mod tests {
     }
 
     #[test]
+    fn check_4_rejects_invalid_xonly_pk0_after_consistent_address_check() {
+        let acct = sample_account("invalid-pk0");
+        let (mut zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        let invalid_pk0 = [0u8; 32];
+        let consistent_address = address_from_parts(&invalid_pk0, &acct.nk_commit);
+        zk["pk0"] = json!(hex::encode(invalid_pk0));
+        zk["address"] = json!(Address(consistent_address).to_bech32m());
+        let event = sign_kind0(&acct.op_sk, 1, "alice@example.com", &zk);
+
+        let err = verify_payment_profile(&event, &acct.op_pk, "regtest", None)
+            .expect_err("invalid x-only pk0 must fail check 4");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check4Malformed {
+                reason: "invalid x-only public key",
+            }
+        );
+    }
+
+    #[test]
     fn name_checklist_requires_reverse_nip05_and_name_sig() {
         let acct = sample_account("name");
         let (zk, _, _) = build_zkcoins_json(
@@ -1372,6 +1745,33 @@ mod tests {
     }
 
     #[test]
+    fn check_5_rejects_invalid_name_message_syntax() {
+        let acct = sample_account("invalid-name-message");
+        let (zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        let event = sign_kind0(&acct.op_sk, 1, "invalid", &zk);
+
+        let err = verify_payment_profile(
+            &event,
+            &acct.op_pk,
+            "regtest",
+            Some("invalid"),
+        )
+        .expect_err("name without @ must fail name-message construction");
+        assert_eq!(
+            err,
+            ProfileCheckError::Check5NameMessage {
+                reason: "identifier missing '@' separator (§4.3)".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn name_sig_failure_is_check_5() {
         let acct = sample_account("namesig");
         let (mut zk, _, _) = build_zkcoins_json(
@@ -1397,6 +1797,49 @@ mod tests {
     // -----------------------------------------------------------------------
     // Newest valid kind-0 / lying relay
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn newest_valid_kind0_reports_no_kind0_event_for_empty_input() {
+        let acct = sample_account("no-kind0");
+        let err = select_newest_valid_payment_profile(
+            &[],
+            &acct.op_pk,
+            "regtest",
+            None,
+        )
+        .expect_err("empty input has no kind-0 candidate");
+        assert_eq!(err, ProfileResolveError::NoKind0Event);
+    }
+
+    #[test]
+    fn newest_valid_kind0_reports_last_concrete_profile_error() {
+        let acct = sample_account("no-valid-profile");
+        let (zk, _, _) = build_zkcoins_json(
+            &acct,
+            "regtest",
+            &["wss://relay.example.com"],
+            &acct.ivpk,
+            None,
+        );
+        let event = sign_kind0(&acct.op_sk, 1, "alice@example.com", &zk);
+
+        let err = select_newest_valid_payment_profile(
+            &[event],
+            &acct.op_pk,
+            "mainnet",
+            None,
+        )
+        .expect_err("wrong-network candidate must not resolve");
+        assert_eq!(
+            err,
+            ProfileResolveError::NoValidPaymentProfile {
+                last: ProfileCheckError::Check2Network {
+                    expected: "mainnet".to_string(),
+                    got: "regtest".to_string(),
+                },
+            }
+        );
+    }
 
     #[test]
     fn newest_valid_kind0_ignores_unverified_and_picks_by_created_at() {
@@ -1542,6 +1985,82 @@ mod tests {
         let acct = sample_account("inv");
         let inv = sample_invoice(&acct);
         verify_invoice(&inv).expect("honest invoice");
+    }
+
+    #[test]
+    fn invoice_rejects_empty_relays() {
+        let acct = sample_account("inv-empty-relays");
+        let mut inv = sample_invoice(&acct);
+        inv.relays.clear();
+
+        let err = verify_invoice(&inv).expect_err("invoice relays must be non-empty");
+        assert_eq!(
+            err,
+            InvoiceCheckError::InvalidRelays {
+                reason: "relays must be non-empty",
+            }
+        );
+    }
+
+    #[test]
+    fn invoice_rejects_non_websocket_relay_url() {
+        let acct = sample_account("inv-relay-url");
+        let mut inv = sample_invoice(&acct);
+        inv.relays = vec!["http://bad".to_string()];
+
+        let err =
+            verify_invoice(&inv).expect_err("invoice relay URL must use WebSocket transport");
+        assert_eq!(
+            err,
+            InvoiceCheckError::InvalidRelayUrl {
+                url: "http://bad".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn invoice_check_ii_rejects_invalid_xonly_pk0_after_consistent_address_check() {
+        let acct = sample_account("inv-invalid-pk0");
+        let mut inv = sample_invoice(&acct);
+        inv.pk0 = [0u8; 32];
+        inv.recipient = address_from_parts(&inv.pk0, &inv.nk_commit);
+
+        let err =
+            verify_invoice(&inv).expect_err("invalid x-only pk0 must fail check (ii)");
+        assert_eq!(
+            err,
+            InvoiceCheckError::Check2Malformed {
+                reason: "invalid x-only public key",
+            }
+        );
+    }
+
+    #[test]
+    fn invoice_check_iii_rejects_invalid_xonly_op_pubkey() {
+        let acct = sample_account("inv-invalid-op");
+        let mut inv = sample_invoice(&acct);
+        inv.op_pubkey = [0u8; 32];
+        let msg = invoice_message(InvoiceMessageParts {
+            amount: inv.amount,
+            recipient: &inv.recipient,
+            pk0: &inv.pk0,
+            nk_commit: &inv.nk_commit,
+            asset_id: &inv.asset_id,
+            memo: inv.memo.as_deref(),
+            ivpk: &inv.ivpk,
+            op_pubkey: &inv.op_pubkey,
+            relays: &inv.relays,
+        });
+        inv.addr_sig = sign_bip340(&acct.sk0, &msg).expect("re-sign check (ii) message");
+
+        let err =
+            verify_invoice(&inv).expect_err("invalid x-only op_pubkey must fail check (iii)");
+        assert_eq!(
+            err,
+            InvoiceCheckError::Check3Malformed {
+                reason: "invalid x-only public key",
+            }
+        );
     }
 
     #[test]
