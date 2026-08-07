@@ -2604,4 +2604,620 @@ mod tests {
             .collect();
         assert!(hosts.is_empty());
     }
+
+    fn minimally_well_formed_attest_request() -> AttestBalanceRequest {
+        let subject = Address([0xA5u8; 32]).to_bech32m();
+        AttestBalanceRequest {
+            subject: subject.clone(),
+            asset_id: hex::encode([0u8; 32]),
+            nav_ceiling: None,
+            size_ceiling: None,
+            challenge: AttestChallengeNonce {
+                nonce: hex::encode([0u8; 32]),
+            },
+            ownership_proof: OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject,
+                public_key: hex::encode([0u8; 32]),
+                nk_commit: hex::encode([0u8; 32]),
+                signature: hex::encode([0u8; 64]),
+            },
+        }
+    }
+
+    fn signed_attest_request(
+        store: &AttestChallengeMap,
+        host_name: &str,
+        now: u64,
+        nk_byte: u8,
+    ) -> AttestBalanceRequest {
+        let (sk, pk0) = sample_sk_pk();
+        let nk_commit = host::nk_commit(&[nk_byte; 32]);
+        let nk_commit_bytes = digest_to_bytes(&nk_commit);
+        let subject_bytes = host::address(&pk0, nk_commit);
+        let subject = Address(subject_bytes).to_bech32m();
+        let asset_id = [0x22u8; 32];
+        let (nonce, expiry) =
+            issue_attest_challenge(store, &subject, now).expect("issue challenge fixture");
+        let request_hash = attest_request_hash(
+            &subject_bytes,
+            &asset_id,
+            &ceiling_encoding(None, None).expect("omitted ceiling fixture"),
+        );
+        let challenge = attest_challenge_message(
+            &nonce,
+            &chan_bind_for_host(host_name),
+            &subject_bytes,
+            expiry,
+            &request_hash,
+        );
+
+        AttestBalanceRequest {
+            subject: subject.clone(),
+            asset_id: hex::encode(asset_id),
+            nav_ceiling: None,
+            size_ceiling: None,
+            challenge: AttestChallengeNonce {
+                nonce: hex::encode(nonce),
+            },
+            ownership_proof: OwnershipProofJson {
+                proof_type: "ownership".into(),
+                subject,
+                public_key: hex::encode(pk0),
+                nk_commit: hex::encode(nk_commit_bytes),
+                signature: hex::encode(sign_chal(&sk, &challenge)),
+            },
+        }
+    }
+
+    /// Strict 32-byte hex parsing reports the actual short wire length.
+    #[test]
+    fn parse_hex32_rejects_wrong_length_with_exact_diagnostic() {
+        let err = parse_hex32("abc", "fixture32").expect_err("three chars cannot encode 32 bytes");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "fixture32: expected 64 lowercase hex chars, got 3".to_string()
+            )
+        );
+    }
+
+    /// Strict 64-byte hex parsing reports the actual short wire length.
+    #[test]
+    fn parse_hex64_rejects_wrong_length_with_exact_diagnostic() {
+        let err = parse_hex64("00", "fixture64").expect_err("two chars cannot encode 64 bytes");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "fixture64: expected 128 lowercase hex chars, got 2".to_string()
+            )
+        );
+    }
+
+    /// Uppercase remains invalid even when the encoded length is exact.
+    #[test]
+    fn parse_hex32_rejects_uppercase_at_exact_length() {
+        let uppercase = "A0".repeat(32);
+        let err = parse_hex32(&uppercase, "fixture32")
+            .expect_err("uppercase hex must not be silently case-folded");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "fixture32: must be lowercase hex (no 0x, no uppercase)".to_string()
+            )
+        );
+    }
+
+    /// A length-preserving `0x` prefix reaches the character-class gate.
+    #[test]
+    fn parse_hex32_rejects_zero_x_prefix_at_exact_total_length() {
+        let prefixed = format!("0x{}", "00".repeat(31));
+        assert_eq!(prefixed.len(), 64, "fixture must bypass length rejection");
+        let err = parse_hex32(&prefixed, "fixture32")
+            .expect_err("0x prefixes are not part of canonical wire hex");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "fixture32: must be lowercase hex (no 0x, no uppercase)".to_string()
+            )
+        );
+    }
+
+    /// Truncated attestations cannot expose a network binding field.
+    #[test]
+    fn network_id_decode_rejects_truncated_attestation() {
+        let err = network_id_from_attestation_bytes(&[])
+            .expect_err("empty bytes cannot contain the fixed network_id field");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "BalanceAttestationV1 too short to contain network_id".to_string()
+            )
+        );
+    }
+
+    /// The REST authoriser preserves strict `nav_ceiling` hex errors.
+    #[test]
+    fn authorise_rejects_invalid_nav_ceiling_hex() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let mut req = minimally_well_formed_attest_request();
+        req.nav_ceiling = Some("g".repeat(64));
+        req.size_ceiling = Some(U64Decimal(1));
+
+        let err = authorise_attest_balance(&store, &["node.example.com".into()], &req, 1)
+            .expect_err("invalid nav_ceiling must fail before authentication");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "nav_ceiling: must be lowercase hex (no 0x, no uppercase)".to_string()
+            )
+        );
+    }
+
+    /// The REST entry point enforces paired ceiling presence.
+    #[test]
+    fn authorise_propagates_mismatched_ceiling_presence() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let mut req = minimally_well_formed_attest_request();
+        req.nav_ceiling = Some(hex::encode([0x11u8; 32]));
+
+        let err = authorise_attest_balance(&store, &["node.example.com".into()], &req, 1)
+            .expect_err("half-present ceiling must be malformed");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "nav_ceiling and size_ceiling must both be present or both omitted (§7.5)"
+                    .to_string()
+            )
+        );
+    }
+
+    /// Subject Bech32m decoding is a named malformed-request boundary.
+    #[test]
+    fn authorise_rejects_invalid_subject_bech32m() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let mut req = minimally_well_formed_attest_request();
+        req.subject = "not-a-valid-zk-address".into();
+
+        let err = authorise_attest_balance(&store, &["node.example.com".into()], &req, 1)
+            .expect_err("invalid subject must not reach capability checks");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "subject: invalid zk Bech32m address: bech32m decode error: parse failed"
+                    .to_string()
+            )
+        );
+    }
+
+    /// Asset identifiers use the same strict lowercase fixed-width hex gate.
+    #[test]
+    fn authorise_rejects_invalid_asset_id_hex() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let mut req = minimally_well_formed_attest_request();
+        req.asset_id = "g".repeat(64);
+
+        let err = authorise_attest_balance(&store, &["node.example.com".into()], &req, 1)
+            .expect_err("invalid asset_id must be malformed");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "asset_id: must be lowercase hex (no 0x, no uppercase)".to_string()
+            )
+        );
+    }
+
+    /// Challenge nonces reject non-hex input before store redemption.
+    #[test]
+    fn authorise_rejects_invalid_challenge_nonce_hex() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let mut req = minimally_well_formed_attest_request();
+        req.challenge.nonce = "g".repeat(64);
+
+        let err = authorise_attest_balance(&store, &["node.example.com".into()], &req, 1)
+            .expect_err("invalid nonce must be malformed");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "challenge.nonce: must be lowercase hex (no 0x, no uppercase)".to_string()
+            )
+        );
+    }
+
+    /// Unknown capability tags are unauthorized, not malformed or expired.
+    #[test]
+    fn authorise_rejects_unknown_capability_type() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let mut req = minimally_well_formed_attest_request();
+        req.ownership_proof.proof_type = "bogus".into();
+
+        let err = authorise_attest_balance(&store, &["node.example.com".into()], &req, 1)
+            .expect_err("open-ended capability tags must fail closed");
+        assert_eq!(
+            err,
+            AttestError::Unauthorized(
+                "unknown capability type \"bogus\"; only OwnershipProof authorises attest"
+                    .to_string()
+            )
+        );
+        assert_eq!(err.http_status_and_code(), (401, "unauthorized"));
+    }
+
+    /// The proof's subject must be byte-identical to the requested address.
+    #[test]
+    fn authorise_rejects_ownership_subject_mismatch() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let mut req = minimally_well_formed_attest_request();
+        req.ownership_proof.subject = Address([0xB6u8; 32]).to_bech32m();
+
+        let err = authorise_attest_balance(&store, &["node.example.com".into()], &req, 1)
+            .expect_err("proof subject must match request subject");
+        assert_eq!(
+            err,
+            AttestError::Unauthorized(
+                "ownership_proof.subject does not match request subject".to_string()
+            )
+        );
+    }
+
+    /// Ownership public keys are strict 32-byte lowercase hex.
+    #[test]
+    fn authorise_rejects_invalid_ownership_public_key_hex() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let mut req = minimally_well_formed_attest_request();
+        req.ownership_proof.public_key = "g".repeat(64);
+
+        let err = authorise_attest_balance(&store, &["node.example.com".into()], &req, 1)
+            .expect_err("invalid ownership public key must be malformed");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "ownership_proof.public_key: must be lowercase hex (no 0x, no uppercase)"
+                    .to_string()
+            )
+        );
+    }
+
+    /// Ownership nullifier-key commitments are strict 32-byte lowercase hex.
+    #[test]
+    fn authorise_rejects_invalid_ownership_nk_commit_hex() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let mut req = minimally_well_formed_attest_request();
+        req.ownership_proof.nk_commit = "g".repeat(64);
+
+        let err = authorise_attest_balance(&store, &["node.example.com".into()], &req, 1)
+            .expect_err("invalid nk_commit must be malformed");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "ownership_proof.nk_commit: must be lowercase hex (no 0x, no uppercase)"
+                    .to_string()
+            )
+        );
+    }
+
+    /// Ownership signatures must carry exactly 64 bytes.
+    #[test]
+    fn authorise_rejects_wrong_length_ownership_signature() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let mut req = minimally_well_formed_attest_request();
+        req.ownership_proof.signature = "00".into();
+
+        let err = authorise_attest_balance(&store, &["node.example.com".into()], &req, 1)
+            .expect_err("short ownership signature must be malformed");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "ownership_proof.signature: expected 128 lowercase hex chars, got 2".to_string()
+            )
+        );
+    }
+
+    /// Goldilocks digest limbs must be canonical before address binding.
+    #[test]
+    fn authorise_rejects_noncanonical_nk_commit_digest() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let mut req = minimally_well_formed_attest_request();
+        req.ownership_proof.nk_commit = hex::encode([0xFFu8; 32]);
+
+        let err = authorise_attest_balance(&store, &["node.example.com".into()], &req, 1)
+            .expect_err("non-canonical digest limbs must not be reduced");
+        assert_eq!(
+            err,
+            AttestError::Malformed(
+                "ownership_proof.nk_commit: non-canonical digest: non-canonical digest limb 0: \
+                 0xffffffffffffffff >= p (GoldilocksField::ORDER)"
+                    .to_string()
+            )
+        );
+    }
+
+    /// A syntactically valid subject still has to equal H(Pk0 || nk_commit).
+    #[test]
+    fn authorise_rejects_address_binding_mismatch() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let mut req = minimally_well_formed_attest_request();
+        let (_, pk0) = sample_sk_pk();
+        let nk_commit = host::nk_commit(&[0x11u8; 32]);
+        let arbitrary_subject = Address([0xA5u8; 32]);
+        assert_ne!(
+            host::address(&pk0, nk_commit),
+            arbitrary_subject.0,
+            "fixture must exercise the address-binding mismatch"
+        );
+        req.subject = arbitrary_subject.to_bech32m();
+        req.ownership_proof.subject = req.subject.clone();
+        req.ownership_proof.public_key = hex::encode(pk0);
+        req.ownership_proof.nk_commit = hex::encode(digest_to_bytes(&nk_commit));
+
+        let err = authorise_attest_balance(&store, &["node.example.com".into()], &req, 1)
+            .expect_err("proof keys must bind to the claimed subject");
+        assert_eq!(
+            err,
+            AttestError::Unauthorized(
+                "H(Pk0 ‖ nk_commit) does not equal subject address".to_string()
+            )
+        );
+    }
+
+    /// Missing authoritative hosts is an internal configuration failure.
+    #[test]
+    fn authorise_rejects_empty_public_hosts_before_nonce_redeem() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let host_name = "node.example.com";
+        let now = 1_700_000_100u64;
+        let req = signed_attest_request(&store, host_name, now, 0x11);
+
+        let err = authorise_attest_balance(&store, &[], &req, now)
+            .expect_err("chan_bind cannot be authorized without configured hosts");
+        assert_eq!(
+            err,
+            AttestError::Internal(
+                "no authoritative public hosts configured for chan_bind (ZKCOINS_PUBLIC_HOST)"
+                    .to_string()
+            )
+        );
+
+        authorise_attest_balance(&store, &[host_name.into()], &req, now)
+            .expect("configuration failure must not redeem the nonce");
+    }
+
+    /// A nonce issued to another valid subject cannot cross the subject gate.
+    #[test]
+    fn authorise_rejects_challenge_subject_mismatch() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let host_name = "node.example.com";
+        let now = 1_700_000_200u64;
+        let req_a = signed_attest_request(&store, host_name, now, 0x11);
+        let mut req_b = signed_attest_request(&store, host_name, now, 0x12);
+        assert_ne!(req_a.subject, req_b.subject, "fixtures need distinct subjects");
+        req_b.challenge.nonce = req_a.challenge.nonce;
+
+        let err = authorise_attest_balance(&store, &[host_name.into()], &req_b, now)
+            .expect_err("a challenge is bound to its issued subject");
+        assert_eq!(
+            err,
+            AttestError::Unauthorized(
+                "challenge was issued for a different subject".to_string()
+            )
+        );
+    }
+
+    /// Issued challenges expire strictly after the pinned TTL.
+    #[test]
+    fn authorise_rejects_expired_challenge_nonce() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let host_name = "node.example.com";
+        let issued_at = 1_700_000_300u64;
+        let req = signed_attest_request(&store, host_name, issued_at, 0x11);
+
+        let err = authorise_attest_balance(
+            &store,
+            &[host_name.into()],
+            &req,
+            issued_at + CHALLENGE_TTL_SECS + 1,
+        )
+        .expect_err("challenge older than TTL must expire");
+        assert_eq!(
+            err,
+            AttestError::ChallengeExpired("challenge nonce expired".to_string())
+        );
+    }
+
+    /// A corrupted Schnorr signature reaches and fails the verification gate.
+    #[test]
+    fn authorise_rejects_invalid_ownership_signature() {
+        let store: AttestChallengeMap = ChallengeStore::shared();
+        let host_name = "node.example.com";
+        let now = 1_700_000_400u64;
+        let mut req = signed_attest_request(&store, host_name, now, 0x11);
+        let mut signature =
+            hex::decode(&req.ownership_proof.signature).expect("fixture signature hex");
+        signature[0] ^= 0x01;
+        req.ownership_proof.signature = hex::encode(signature);
+
+        let err = authorise_attest_balance(&store, &[host_name.into()], &req, now)
+            .expect_err("corrupted ownership signature must not authorize");
+        assert_eq!(
+            err,
+            AttestError::Unauthorized(
+                "OwnershipProof signature invalid or chan_bind mismatch".to_string()
+            )
+        );
+    }
+
+    /// An independently folded, six-confirmation-final first spend is completed.
+    #[test]
+    fn independent_completed_anchor_accepts_final_first_occurrence() {
+        use shared::spec_v1::{ChainPosition, FoldOutcome, NfLogAccumulator};
+
+        let mut accumulator = NfLogAccumulator::new(0);
+        let pk = [0x11u8; 32];
+        let r = [0x22u8; 32];
+        let outcome = accumulator
+            .fold(
+                ChainPosition {
+                    height: 10,
+                    tx_index: 0,
+                    vin_index: 0,
+                    member_index: 0,
+                },
+                pk,
+                r,
+            )
+            .expect("ordered fold");
+        assert_eq!(outcome, FoldOutcome::Appended(0));
+
+        let pos = require_completed_anchor_independent(pk, r, &accumulator, 15)
+            .expect("height 10 has six confirmations at tip 15");
+        assert_eq!(pos, 0);
+    }
+
+    /// The losing R for a duplicate Pk is not a completed first occurrence.
+    #[test]
+    fn independent_completed_anchor_rejects_double_spend_loser() {
+        use shared::spec_v1::{ChainPosition, FoldOutcome, NfLogAccumulator};
+
+        let mut accumulator = NfLogAccumulator::new(0);
+        let pk = [0x11u8; 32];
+        let winner_r = [0x22u8; 32];
+        let loser_r = [0x33u8; 32];
+        assert_eq!(
+            accumulator
+                .fold(
+                    ChainPosition {
+                        height: 10,
+                        tx_index: 0,
+                        vin_index: 0,
+                        member_index: 0,
+                    },
+                    pk,
+                    winner_r,
+                )
+                .expect("winner fold"),
+            FoldOutcome::Appended(0)
+        );
+        assert_eq!(
+            accumulator
+                .fold(
+                    ChainPosition {
+                        height: 11,
+                        tx_index: 0,
+                        vin_index: 0,
+                        member_index: 0,
+                    },
+                    pk,
+                    loser_r,
+                )
+                .expect("ordered loser fold"),
+            FoldOutcome::DuplicateIgnored
+        );
+        assert_eq!(
+            accumulator.classify(pk, winner_r),
+            SpendClassification::ValidFirstSpend
+        );
+        assert_eq!(
+            accumulator.classify(pk, loser_r),
+            SpendClassification::RejectedDoubleSpend
+        );
+
+        let err = require_completed_anchor_independent(pk, loser_r, &accumulator, 15)
+            .expect_err("double-spend loser cannot be a completed anchor");
+        assert_eq!(
+            err,
+            AttestError::ProvingFailed(
+                "anchor (pk, r) is not the first occurrence on the independent scan's NfLog \
+                 (classification=RejectedDoubleSpend); state is not completed"
+                    .to_string()
+            )
+        );
+    }
+
+    /// A first occurrence outside the independent final prefix is pending.
+    #[test]
+    fn independent_completed_anchor_rejects_not_yet_final_position() {
+        use shared::spec_v1::{ChainPosition, FoldOutcome, NfLogAccumulator};
+
+        let mut accumulator = NfLogAccumulator::new(0);
+        let pk = [0x11u8; 32];
+        let r = [0x22u8; 32];
+        assert_eq!(
+            accumulator
+                .fold(
+                    ChainPosition {
+                        height: 10,
+                        tx_index: 0,
+                        vin_index: 0,
+                        member_index: 0,
+                    },
+                    pk,
+                    r,
+                )
+                .expect("ordered fold"),
+            FoldOutcome::Appended(0)
+        );
+        assert_eq!(accumulator.size_final(14), 0, "only five confirmations");
+
+        let err = require_completed_anchor_independent(pk, r, &accumulator, 14)
+            .expect_err("position outside size_final must not be completed");
+        assert_eq!(
+            err,
+            AttestError::ProvingFailed(
+                "anchor nullifier position 0 is not inside independently-scanned size_final 0 \
+                 (not >=6-confirmation-final; state is not completed)"
+                    .to_string()
+            )
+        );
+    }
+
+    /// A catalog row at the right locator but with the wrong member is a
+    /// hard producer-state inconsistency, never a pending-publish fallback.
+    #[tokio::test]
+    async fn anchor_locator_rejects_catalog_member_mismatch() {
+        use super::super::db_v1::CatalogInscription;
+
+        let fold_height = 100u64;
+        let (_scope, adapter, _owner, _asset_id, _pending_txid, _inclusion_hash) =
+            seeded_attest_adapter_cfg_full(
+                fold_height,
+                105,
+                Some(0),
+                true,
+                /* seed_pending_publish */ false,
+                /* seed_catalog */ false,
+            )
+            .await;
+        adapter
+            .append_catalog(&[CatalogInscription {
+                height: fold_height,
+                tx_index: 0,
+                vin_index: 0,
+                reveal_txid: [0x77u8; 32],
+                format: 0x00,
+                members: vec![(0, [0x99u8; 32], [0x88u8; 32])],
+                block_anchor_hash: [0u8; 32],
+                block_anchor_height: 0,
+            }])
+            .expect("append deliberately inconsistent catalog member");
+
+        let err = resolve_anchor_locator(
+            &adapter,
+            &[0x11u8; 32],
+            &[0x22u8; 32],
+            fold_height,
+            0,
+            0,
+            0,
+        )
+        .await
+        .expect_err("catalog member must equal the NfLog-disclosed pair");
+        assert_eq!(
+            err,
+            AttestError::Internal(
+                "catalog members[member_index=0] at height=100 tx_index=0 vin_index=0 does not \
+                 equal disclosed (pk, r) — NfLog/catalog state inconsistency"
+                    .to_string()
+            )
+        );
+    }
 }
