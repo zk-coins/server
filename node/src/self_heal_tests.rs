@@ -1558,7 +1558,7 @@ async fn heal_propagates_db_error() {
     );
 }
 
-// The two tests below cover the `?` error-propagation arms of the
+// The tests below cover the `?` error-propagation arms of the
 // `db::*` calls INSIDE `heal_circuit_digest` (the digest load succeeds, a
 // LATER call fails). Each manipulates the schema after the digest load so
 // the targeted inner query errors on a live connection — the only way to
@@ -1627,6 +1627,67 @@ async fn heal_propagates_error_from_reset_tx() {
     assert!(
         matches!(err, sqlx::Error::Database(_)),
         "unexpected: {:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn heal_v1_propagates_error_from_reset_tx() {
+    // Detector 1 trips the v1 reset branch. Drop the epoch metadata only
+    // after both the v1 capability claim and old-digest store have used it,
+    // so `bump_derived_state_epoch_in_tx` fails inside
+    // `reset_v1_proof_dependent_state_tx` and its dedicated `?` propagates.
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    claim_stack_scan_mode(&pool, ScanStackMode::V1)
+        .await
+        .expect("claim v1 for reset-error test");
+    set_process_stack_mode(ScanStackMode::V1);
+
+    let old = crate::v1::encode_v1_live_digest(&[0x01; 32], &[0x02; 32]);
+    let new = crate::v1::encode_v1_live_digest(&[0x03; 32], &[0x04; 32]);
+    db::store_circuit_digest(&pool, &old)
+        .await
+        .expect("store old v1 digest");
+    sqlx::query("DROP TABLE derived_state_epoch_meta CASCADE")
+        .execute(&pool)
+        .await
+        .expect("drop derived_state_epoch_meta");
+
+    let err = heal_circuit_digest(&pool, &new, "/tmp/whatever", &canary_must_not_run)
+        .await
+        .expect_err("heal must propagate the v1 reset-tx error");
+    assert!(
+        matches!(&err, sqlx::Error::Database(_)),
+        "unexpected: {:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn heal_legacy_reset_refuses_missing_stack_mode_marker() {
+    // Leave both the process mode and DB capability marker unclaimed. A
+    // digest mismatch selects the legacy fallback, whose first transaction
+    // operation must fail closed at the capability gate before any reset
+    // write or proof-store cleanup can occur.
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    db::store_circuit_digest(&pool, b"OLD")
+        .await
+        .expect("store old digest without claiming stack mode");
+
+    let err = heal_circuit_digest(&pool, b"NEW", "/tmp/whatever", &canary_must_not_run)
+        .await
+        .expect_err("heal must propagate the missing stack-mode capability error");
+    assert!(
+        matches!(&err, sqlx::Error::Protocol(_)),
+        "missing capability marker must map to Protocol, got {:?}",
+        err
+    );
+    assert!(
+        err.to_string()
+            .contains("stack_scan_mode marker is missing"),
+        "unexpected capability-gate error: {}",
         err
     );
 }
