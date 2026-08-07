@@ -180,17 +180,32 @@ the journey, so it was counted as uncovered. The **integration-coverage pipeline
 - Reproduce: bring the dev stack (`zkcoins-local`) down first (port 18443), `source` env.local.sh,
   `export COMPOSE_PROJECT_NAME=zkcoins-local-coverage`, `brew install lcov`, then run the script.
 
-**Measured node-src line coverage (2026-08-07):**
+**Measured node-src line coverage (updated 2026-08-07, wave 2):**
 
 | Source | Coverage |
 |---|---|
-| Unit tests only | 76.3% |
-| Journey/integration only | 47.8% |
-| **Combined (unit ∪ integration)** | **83.09%** (40379 / 48595) |
+| Unit tests only | 77.53% |
+| Journey/integration only | 25.26%¹ |
+| **Combined (unit ∪ integration)** | **84.18%** (41456 / 49249) |
 
-The remaining gap to 100% is (a) error/fault branches in the integration code that the happy-path
-journey does not hit (need fault-injection integration tests — regtest bitcoind/DB made to fail), and
-(b) more unit-testable files (raise sequentially with codex lanes; parallel lanes collide via the
-nested `node/node/src` path). Known-flaky in the unit re-run: `router::tests::health_publisher_*`
-(esplora-dependent) — reuse a pre-generated `unit.lcov` via `ZKCOINS_REUSE_UNIT_LCOV=1` for a
-self-contained pipeline run.
+¹ integration-only measured against the *union* instrumented-line base (larger denominator than
+Update 9's integ-only-base 47.8%); the combined figure is the honest, comparable metric.
+
+Wave-2 unit gains (committed to node #231): `v1/sdr.rs` 50.2 → **93.09%** (+49 tests, all Phase-A/B
+finalise + publish-outbox fail-closed branches), `v1/db_decrypt_index.rs` 20.5 → **99.79%** (+12 tests).
+
+**The path to 100% is four layers** (largest combined-uncovered blocks first):
+1. **Unit-testable pure logic** (sequential codex lanes; parallel lanes collide via the nested
+   `node/node/src` path): `signature.rs` 79% (BIP-340 pure), `kernel/service.rs` 67%, `v1/attest.rs`
+   82%, `v1/nostr/profile.rs` 83%, `self_heal.rs`, `reconstitute.rs`.
+2. **Fault-injection integration tests** for the integration-dominated files the happy-path journey
+   only partially hits: `job_dispatcher.rs` 57%, `v1/recovery.rs` 70%, `v1/receive.rs` 73%,
+   `runtime.rs` 65%, `v1/incoming.rs` 67% (make regtest bitcoind / the DB fail on purpose).
+3. **Journey extension** for paths neither unit nor journey reaches today: `flow.rs` **18%**,
+   `v1/attest_verify.rs` **39%** (Scanner-backed `verify_balance_attestation` — the journey has no
+   attest-verify leg).
+4. **Documented `coverage(off)`** for provably-unreachable defensive code (same mechanism as the
+   `shared` crate — never over-excluding covered lines).
+
+Known-flaky historically: `router::tests::health_publisher_*` (esplora-dependent) — this wave's
+1606-test run passed all 1606 (14 skipped), flaky tests included.
