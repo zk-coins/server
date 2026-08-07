@@ -108,10 +108,16 @@ pub(crate) fn validate_mint_request(req: &MintRequest) -> Result<MintIdentity, F
 pub(crate) fn validate_send_request(
     req: &SendCoinRequest,
 ) -> Result<([u8; 32], [u8; 32]), FlowError> {
-    if req.signature.is_none() || req.timestamp.is_none() {
+    if req.signature.is_none() {
         return Err(FlowError::new(
             StatusCode::UNAUTHORIZED,
             "Missing signature",
+        ));
+    }
+    if req.timestamp.is_none() {
+        return Err(FlowError::new(
+            StatusCode::UNAUTHORIZED,
+            "Missing timestamp",
         ));
     }
     let timestamp = req
@@ -511,4 +517,568 @@ pub(crate) async fn commit_flow(state: &AppState, request: CommitRequest) -> Flo
 #[allow(dead_code)]
 fn _force_uses() {
     let _ = std::any::type_name::<Arc<ProofStore>>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::secp256k1::{Keypair, Message, PublicKey, Secp256k1, SecretKey};
+    use sha2::{Digest, Sha256};
+
+    const TIMESTAMP_ERROR: &str = "Request timestamp too old or in the future";
+    const SIGNATURE_ERROR: &str = "Signature verification failed";
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_secs()
+    }
+
+    fn public_key(secp: &Secp256k1<bitcoin::secp256k1::All>, byte: u8) -> PublicKey {
+        let secret_key = SecretKey::from_slice(&[byte; 32]).expect("valid deterministic key");
+        PublicKey::from_secret_key(secp, &secret_key)
+    }
+
+    fn signed_mint_request(
+        name: &str,
+        decimals: u8,
+        amount: u64,
+        timestamp: u64,
+    ) -> MintRequest {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[7u8; 32]).expect("valid creator key");
+        let creator_pubkey = PublicKey::from_secret_key(&secp, &secret_key);
+
+        let mut hasher = Sha256::new();
+        hasher.update(creator_pubkey.serialize());
+        hasher.update(name.as_bytes());
+        hasher.update([decimals]);
+        hasher.update(amount.to_le_bytes());
+        hasher.update(timestamp.to_le_bytes());
+        let message = Message::from_digest(hasher.finalize().into());
+        let keypair = Keypair::from_secret_key(&secp, &secret_key);
+        let signature = secp.sign_schnorr(&message, &keypair);
+
+        MintRequest {
+            creator_pubkey,
+            next_public_key: public_key(&secp, 8),
+            name: name.to_string(),
+            decimals,
+            amount,
+            signature: hex::encode(signature.serialize()),
+            timestamp,
+        }
+    }
+
+    fn signed_send_request(
+        account_address: &str,
+        recipient: &str,
+        amount: u64,
+        timestamp: u64,
+    ) -> SendCoinRequest {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[11u8; 32]).expect("valid sender key");
+        let sender_public_key = PublicKey::from_secret_key(&secp, &secret_key);
+
+        let mut hasher = Sha256::new();
+        hasher.update(account_address.as_bytes());
+        hasher.update(recipient.as_bytes());
+        hasher.update(amount.to_le_bytes());
+        hasher.update(timestamp.to_le_bytes());
+        let message = Message::from_digest(hasher.finalize().into());
+        let keypair = Keypair::from_secret_key(&secp, &secret_key);
+        let signature = secp.sign_schnorr(&message, &keypair);
+
+        SendCoinRequest {
+            account_address: account_address.to_string(),
+            recipient: recipient.to_string(),
+            amount,
+            public_key: sender_public_key,
+            next_public_key: public_key(&secp, 12),
+            prev_commitment_pubkey: None,
+            signature: Some(hex::encode(signature.serialize())),
+            timestamp: Some(timestamp),
+            asset_id: None,
+        }
+    }
+
+    fn expect_flow_error<T>(result: Result<T, FlowError>, status: StatusCode, message: &str) {
+        let error = match result {
+            Ok(_) => panic!("request unexpectedly passed validation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, status);
+        assert_eq!(error.message, message);
+    }
+
+    #[test]
+    fn validate_mint_rejects_timestamp_outside_window() {
+        let request = signed_mint_request("TestToken", 8, 50_000, 0);
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            TIMESTAMP_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_invalid_signature() {
+        let mut request = signed_mint_request("TestToken", 8, 50_000, now_secs());
+        request.amount += 1;
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_returns_derived_identity() {
+        let request = signed_mint_request("TestToken", 8, 50_000, now_secs());
+        let creator_pubkey_bytes = request.creator_pubkey.serialize();
+        let expected_owner = zkcoins_program::hash::sha256_to_digest(&creator_pubkey_bytes);
+        let name_hash = zkcoins_program::types::calculate_name_hash(&request.name);
+        let expected_asset_id = zkcoins_program::types::calculate_asset_id(
+            &creator_pubkey_bytes,
+            &name_hash,
+            request.decimals,
+        );
+
+        let identity = validate_mint_request(&request).expect("valid mint request");
+
+        assert_eq!(identity.owner, expected_owner);
+        assert_eq!(identity.asset_id, expected_asset_id);
+    }
+
+    #[test]
+    fn validate_send_rejects_missing_signature() {
+        let mut request = signed_send_request(
+            &hex::encode([1u8; 32]),
+            &hex::encode([2u8; 32]),
+            100,
+            now_secs(),
+        );
+        request.signature = None;
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            "Missing signature",
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_missing_timestamp() {
+        let mut request = signed_send_request(
+            &hex::encode([1u8; 32]),
+            &hex::encode([2u8; 32]),
+            100,
+            now_secs(),
+        );
+        request.timestamp = None;
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            "Missing timestamp",
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_timestamp_outside_window() {
+        let request = signed_send_request(
+            &hex::encode([1u8; 32]),
+            &hex::encode([2u8; 32]),
+            100,
+            0,
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            TIMESTAMP_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_invalid_signature() {
+        let mut request = signed_send_request(
+            &hex::encode([1u8; 32]),
+            &hex::encode([2u8; 32]),
+            100,
+            now_secs(),
+        );
+        request.amount += 1;
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_invalid_account_address_hex() {
+        let request = signed_send_request(
+            "not-hex",
+            &hex::encode([2u8; 32]),
+            100,
+            now_secs(),
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "account_address is not valid hex",
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_invalid_recipient_hex() {
+        let request = signed_send_request(
+            &hex::encode([1u8; 32]),
+            "not-hex",
+            100,
+            now_secs(),
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "recipient is not valid hex",
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_tampered_account_address() {
+        let timestamp = now_secs();
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let mut request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+        request.account_address = hex::encode([0x33_u8; 32]);
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_tampered_recipient() {
+        let timestamp = now_secs();
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let mut request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+        request.recipient = hex::encode([0x33_u8; 32]);
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_tampered_timestamp() {
+        let timestamp = now_secs();
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let mut request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+        request.timestamp = Some(timestamp.saturating_add(1));
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_tampered_creator_pubkey() {
+        let timestamp = now_secs();
+        let mut request = signed_mint_request("tampered-key".into(), 8, 42, timestamp);
+        let secp = Secp256k1::new();
+        let mut replacement = public_key(&secp, 43);
+        if replacement == request.creator_pubkey {
+            replacement = public_key(&secp, 44);
+        }
+        request.creator_pubkey = replacement;
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_tampered_name() {
+        let timestamp = now_secs();
+        let mut request = signed_mint_request("original-name".into(), 8, 42, timestamp);
+        request.name = "tampered-name".to_string();
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_tampered_decimals() {
+        let timestamp = now_secs();
+        let mut request = signed_mint_request("tampered-decimals".into(), 8, 42, timestamp);
+        request.decimals = 9;
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_tampered_timestamp() {
+        let timestamp = now_secs();
+        let mut request = signed_mint_request("tampered-timestamp".into(), 8, 42, timestamp);
+        request.timestamp = timestamp.saturating_add(1);
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_invalid_hex_signature() {
+        let timestamp = now_secs();
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let mut request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+        request.signature = Some("zz-not-hex".to_string());
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_invalid_hex_signature() {
+        let timestamp = now_secs();
+        let mut request =
+            signed_mint_request("invalid-hex-signature".into(), 8, 42, timestamp);
+        request.signature = "zz-not-hex".to_string();
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_wrong_length_signature() {
+        let timestamp = now_secs();
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let mut request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+        request.signature = Some(hex::encode([0_u8; 32]));
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_wrong_length_signature() {
+        let timestamp = now_secs();
+        let mut request =
+            signed_mint_request("wrong-length-signature".into(), 8, 42, timestamp);
+        request.signature = hex::encode([0_u8; 32]);
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_future_timestamp_outside_window() {
+        let timestamp = now_secs().saturating_add(400);
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            TIMESTAMP_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_future_timestamp_outside_window() {
+        let timestamp = now_secs().saturating_add(400);
+        let request = signed_mint_request("future-timestamp".into(), 8, 42, timestamp);
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            TIMESTAMP_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_accepts_timestamp_at_exact_skew_boundary() {
+        let now = now_secs();
+        let timestamp = now.saturating_add(crate::router::MAX_TIMESTAMP_SKEW_SECS);
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+
+        assert!(validate_send_request(&request).is_ok());
+    }
+
+    #[test]
+    fn validate_send_rejects_timestamp_one_second_past_skew_boundary() {
+        let now = now_secs();
+        let timestamp = now.saturating_sub(
+            crate::router::MAX_TIMESTAMP_SKEW_SECS.saturating_add(1),
+        );
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            TIMESTAMP_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_accepts_timestamp_at_exact_skew_boundary() {
+        let now = now_secs();
+        let timestamp = now.saturating_add(crate::router::MAX_TIMESTAMP_SKEW_SECS);
+        let request = signed_mint_request("exact-skew-boundary".into(), 8, 42, timestamp);
+
+        assert!(validate_mint_request(&request).is_ok());
+    }
+
+    #[test]
+    fn validate_mint_rejects_timestamp_one_second_past_skew_boundary() {
+        let now = now_secs();
+        let timestamp = now.saturating_sub(
+            crate::router::MAX_TIMESTAMP_SKEW_SECS.saturating_add(1),
+        );
+        let request = signed_mint_request("past-skew-boundary".into(), 8, 42, timestamp);
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            TIMESTAMP_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_recipient_with_wrong_byte_length() {
+        let timestamp = now_secs();
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 31]);
+        let request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "address must be 32 bytes (64 hex chars)",
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_address_with_wrong_byte_length() {
+        let request = signed_send_request(
+            &hex::encode([1u8; 31]),
+            &hex::encode([2u8; 32]),
+            100,
+            now_secs(),
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "address must be 32 bytes (64 hex chars)",
+        );
+    }
+
+    #[test]
+    fn validate_send_returns_decoded_addresses() {
+        let account_address = format!("0x{}", hex::encode([1u8; 32]));
+        let recipient = format!("0x{}", hex::encode([2u8; 32]));
+        let request = signed_send_request(
+            &account_address,
+            &recipient,
+            100,
+            now_secs(),
+        );
+
+        let (from, to) = validate_send_request(&request).expect("valid send request");
+
+        assert_eq!(from, [1u8; 32]);
+        assert_eq!(to, [2u8; 32]);
+    }
 }
