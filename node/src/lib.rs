@@ -301,10 +301,20 @@ lazy_static! {
     /// (`dev.zkcoins.app`, `zkcoins.app`) — the client needs the
     /// stage's external hostname, not the chain identifier.
     pub(crate) static ref USERNAME_DOMAIN: String = {
-        let domain = std::env::var("USERNAME_DOMAIN").expect(
-            "USERNAME_DOMAIN env var must be set (e.g. `zkcoins.app` on PRD, \
-             `dev.zkcoins.app` on DEV) — see #95 for the cross-network rationale",
-        );
+        // `.filter(|v| !v.trim().is_empty())` treats an empty/whitespace-only
+        // value (e.g. `USERNAME_DOMAIN=` in a compose file) as unset, same
+        // fail-closed contract as `IS_MAINNET`/`ESPLORA_URL` in
+        // `build_network_config_from_env`'s `env_or_unset` — otherwise a
+        // set-but-empty var would silently bypass `expect` and leave
+        // `USERNAME_DOMAIN = ""`.
+        let domain = std::env::var("USERNAME_DOMAIN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .expect(
+                "USERNAME_DOMAIN env var must be set (e.g. `zkcoins.app` on PRD, \
+                 `dev.zkcoins.app` on DEV) — see #95 for the cross-network rationale. \
+                 An empty or whitespace-only value is treated as unset (fail-closed).",
+            );
         println!("Username domain: {}", domain);
         domain
     };
@@ -344,10 +354,18 @@ lazy_static! {
     /// (`connect_and_migrate`). Other binaries read `DATABASE_URL` from
     /// the environment themselves.
     pub static ref DATABASE_URL: String = {
-        std::env::var("DATABASE_URL").expect(
-            "DATABASE_URL env var must be set (e.g. \
-             postgresql://zkcoins:<pw>@postgres:5432/zkcoins)",
-        )
+        // Empty/whitespace-only is treated as unset (fail-closed), same
+        // contract as `USERNAME_DOMAIN` above and `IS_MAINNET`/`ESPLORA_URL`
+        // in `build_network_config_from_env` — a `DATABASE_URL=` line in a
+        // compose file must panic loudly, not resolve to `""`.
+        std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .expect(
+                "DATABASE_URL env var must be set (e.g. \
+                 postgresql://zkcoins:<pw>@postgres:5432/zkcoins). An empty or \
+                 whitespace-only value is treated as unset (fail-closed).",
+            )
     };
 }
 

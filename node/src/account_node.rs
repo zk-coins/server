@@ -184,10 +184,6 @@ pub(crate) struct OwnedAsset {
 }
 
 impl AccountNode {
-    /// Get the keypair to the pubkey this account commited to (which is derived key num_pubkeys -
-    /// 1)
-    // TODO: Move to client.
-    ///
     /// Test-only after PR-A3 — the production bootstrap rehydrates the
     /// node from Postgres via `load_from_pg`, never `new`. Kept
     /// because every test in `account_node_tests.rs`,
@@ -221,8 +217,6 @@ impl AccountNode {
 
     /// Balance of the `(owner, asset_id)` account. Per Model B, balance
     /// is always scoped to a single asset.
-    // TODO: User needs to provide a signature and the salt and the secret information for the
-    // address to authenticate.
     pub(crate) fn get_account_balance(
         &self,
         account_address: &Address,

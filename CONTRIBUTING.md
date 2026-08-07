@@ -248,9 +248,49 @@ not an unacknowledged tip poll.
 
 The node targets a single **Mac Studio M3 Ultra** (96 GB unified RAM): all
 on-box compute (P/E cores, Apple GPU via Metal, Neural Engine, AMX), **no
-external GPU/CUDA, no cloud proving services**. Performance budget: warm proof
-≤ 5 s (target ≤ 1 s), cold-start ≤ 30 s, memory peak < 64 GB. If a design
-overshoots the budget, the design changes — we do not add external hardware.
+external GPU/CUDA, no cloud proving services**. If a design overshoots the
+budget, the design changes — we do not add external hardware.
+
+The v1 circuit `C` (BIP-340 + S2C verified in-circuit) is, by design, a
+~90–100 GiB build/prove memory peak — this is the deliberate v1 hardware
+reality on the 96 GB target, not a regression against a legacy cap. The
+closest real measurement on file, [`docs/build-report.md`](./docs/build-report.md)
+(a 128 GB Apple M5 Max, not the M3 Ultra target — not a cross-host capacity
+claim), puts circuit-build peak RSS at 88.3 GiB and the full
+circuit-test-suite peak at 92.5 GiB, in the same ~90 GiB band.
+
+The old `<64 GB` / `≤ 5 s` warm / `≤ 30 s` cold-start budget below was the
+ROADMAP step-9 target for the legacy Poseidon-only circuit
+(`LEGACY_BUDGET_PEAK_RSS_KB` = 64 GiB, `LEGACY_BUDGET_WARM_PROVE_MS` = 5 000,
+`LEGACY_BUDGET_COLD_START_MS` = 30 000 in `node/src/r2_budgets.rs`). Applying
+those numbers to a healthy v1 prove produces false reds — the failure mode
+`r2_budgets.rs` exists to prevent. There is no equivalent fixed v1 cap in
+this document: `budgets_for_mode` under `ProverMode::V1` derives
+warm-prove / cold-start / peak-RSS budgets from stored measurement samples
+(`derive_budget_from_samples`, `V1_CALIBRATION`, `V1_WARM_SAMPLES_MS` /
+`V1_COLD_SAMPLES_MS` / `V1_RSS_SAMPLES_KB`) with a `MIN_SAMPLES_FOR_BUDGET`
+floor and a `BUDGET_HEADROOM_PERCENT` (25 %) headroom over the observed max,
+and refuses loudly (`BudgetUnavailable`) rather than silently falling back
+to the legacy numbers while the sample arrays are empty.
+
+A ~90–100 GiB peak fits the 96 GB target host only because at most one full
+`C` residency is ever resident host-wide, via three mechanisms:
+
+- **Secondary-verifier cache** — `ZKCOINS_VERIFIER_CACHE_ROLE` (default
+  `primary`) decides which process builds `C_balance` and writes the shared
+  verifier cache vs. which process only loads it. `secondary` never builds
+  `C_balance` itself (it still lazily builds the much smaller `C` circuit on
+  first prove). See `VerifierCacheRole` / `verifier_cache_role_from_env`
+  (`node/src/v1/mode.rs`) and `script-plonky2/src/verifier_cache.rs`.
+- **Host-wide proving lease** — `script-plonky2/src/prover_lease.rs`
+  serialises the memory-heavy prover across processes with an flock-backed
+  lease file: acquisition precedes every fresh circuit build, so two `C`
+  builds are never resident on the same host at once.
+- **Drop-when-idle** — `C` / `C_balance` circuit slots are reference-counted
+  and evicted, once no caller still holds a reference and the proving
+  lease's idle TTL has elapsed, by the idle reaper (`try_evict_slot` /
+  `try_evict_all_unreferenced`, `script-plonky2/src/prover_bridge.rs`), so
+  an idle process does not pin the peak in memory indefinitely.
 
 ## Project structure
 
@@ -321,23 +361,37 @@ Do **not** use a minimal `export … && cargo run -p node` snippet as the
 supported operator path — it will panic on missing pins/manifest. Use
 `deploy/local-e2e/` (or an equivalent full env from `docs/local-stack.md`).
 
-### Mainnet function restriction (SDR Phase B)
+### Bitcoind-finality function restriction (SDR Phase B)
 
 Stage-3 SDR Phase B seals `SelfDeliveryRecordV1` only when first-occurrence
-inclusion + BIP-113 MTP are available. Until bitcoind supplies that path, the
-node uses a **named provisional** stand-in (`tip_hash` + wall-clock) that is
-**fail-closed on mainnet**:
+inclusion + BIP-113 MTP are available. The production path,
+`finalize_due_phase_b_adapter`, uses `BitcoindInclusionMtp` **uniformly on
+every network** (mainnet, testnet, regtest) — there is no per-network branch
+and no wall-clock/tip-hash stand-in in the reachable path:
 
-- **Regtest / testnet:** provisional Inclusion/MTP may finalise Phase A → seal
-  → `self_delivery` outbox.
-- **Mainnet:** `finalize_due_phase_b_adapter` refuses provisional seal
-  (`PROVISIONAL_MTP_MAINNET_REFUSED`), returns `Ok(0)`, leaves Phase-A rows in
-  `awaiting_first_occurrence` (does **not** `mark_failed`). Operators will see
-  open Phase-A rows and error logs until real MTP is wired — this is intentional,
-  not a silent success.
+- `BitcoindInclusionMtp` resolves the nullifier's first-occurrence height via
+  `getblockhash` / `getblockheader`, requires `header.height` to match the
+  looked-up height, requires at least `FINALITY_CONFIRMATIONS` (6, §3.9)
+  confirmations, and requires a present BIP-113 `mediantime`. Any RPC error,
+  height mismatch, insufficient confirmations, or missing `mediantime` is
+  itself fail-closed (`bail!`) — it never falls back to tip/wall-clock.
+- In `finalize_due_phase_b_with_mtp`, a `BitcoindInclusionMtp` failure for a
+  given Phase-A row is caught, logged, and turned into a named
+  `db_sdr::mark_failed(pool, transition_pk, reason)` — no silent skip. A row
+  whose NfLog classification is still `Pending` (not yet a first-occurrence
+  winner) instead returns `Ok(false)` and stays in `awaiting_first_occurrence`
+  for the next scan cycle; that is the normal "not yet due" case, not a
+  failure.
 
-See `node/src/v1/sdr.rs` (`provisional_inclusion_mtp_for_network`,
-`finalize_due_phase_b_adapter`).
+`provisional_inclusion_mtp_for_network` (the old `PROVISIONAL_MTP_MAINNET_REFUSED`
+/ tip-hash-plus-wall-clock stand-in, with its "leaves Phase-A rows open,
+does **not** `mark_failed`" mainnet-refusal semantics) still exists in
+`node/src/v1/sdr.rs` but has no caller outside its own unit tests — it is
+**not** on the production `finalize_due_phase_b_adapter` path described
+above.
+
+See `node/src/v1/sdr.rs` (`BitcoindInclusionMtp`,
+`finalize_due_phase_b_adapter`, `finalize_due_phase_b_with_mtp`).
 
 ## Docker
 

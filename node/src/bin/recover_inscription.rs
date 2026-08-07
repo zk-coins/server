@@ -25,8 +25,11 @@
 //! Required env vars:
 //!   - `PUBLISHER_KEY` — 32-byte hex secp256k1 secret, must match the
 //!     key that signed the commit.
-//!   - `IS_MAINNET` — `"true"` for `Network::Bitcoin`, anything else
-//!     resolves to `Network::Signet` (Mutinynet).
+//!   - `IS_MAINNET` — exactly `"true"` (`Network::Bitcoin`) or `"false"`
+//!     (`Network::Signet`, Mutinynet); unset or any other value panics
+//!     the binary (`resolve_network_from_env`, no "anything else falls
+//!     back to Signet" default — a typo must not silently target the
+//!     wrong chain during recovery).
 //!
 //! Optional env vars:
 //!   - `NETWORK_NAME` — log-only label.
