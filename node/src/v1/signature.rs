@@ -2671,11 +2671,14 @@ mod tests {
         account_state_hash, address, asset_id_v1, coin_identifier, coinhist_empty_root,
         coinhist_root_after_first_insert, digest_to_bytes, hash_proof_data, merkle_root, name_hash,
         nav_commitment, nflog_empty, nflog_root, nk_commit, npk_commit, serialize_proof_data,
-        AccountState, Address, CoinHistState, Nav, ProofData, TreeKind, GENESIS_TAG, ZERO_HASH,
+        AccountState, Address, Coin, CoinHistState, CoinHistTree, Nav, ProofData, TreeKind,
+        GENESIS_TAG, ZERO_HASH,
     };
-    use std::collections::BTreeMap;
-    use zkcoins_prover::prover_bridge::{NavOpening, TransitionMode, TransitionWitness};
-    use zkcoins_prover::state_engine::{OpSecret, PendingTransition};
+    use std::collections::{BTreeMap, BTreeSet};
+    use zkcoins_prover::prover_bridge::{
+        NavOpening, NullifierOpening, TransitionMode, TransitionWitness,
+    };
+    use zkcoins_prover::state_engine::{AccountRecord, OpSecret, PendingTransition};
 
     use crate::v1::separation::{set_process_stack_mode, ScanStackMode};
 
@@ -2863,6 +2866,1028 @@ mod tests {
             // constant stands in so the skeleton type is constructible.
             op_secret: OpSecret::new([0u8; 32]),
         }
+    }
+
+    fn signed_mainnet_entry() -> PendingSignEntry {
+        let (mut entry, submission) = test_fixtures::v5_mainnet_entry_and_submission();
+        let accepted = accept_wallet_transition_signature(
+            V1ShadowMode::On,
+            entry.network,
+            &entry.pending,
+            &submission,
+        )
+        .expect("V.5 mainnet fixture must verify");
+        entry
+            .install_signature(accepted)
+            .expect("accepted signature must install");
+        entry
+    }
+
+    struct UnusedDeliveryPort;
+
+    impl crate::v1::delivery::OutgoingDeliveryPort for UnusedDeliveryPort {
+        fn deliver_outgoing(
+            &self,
+            _request: crate::v1::delivery::TransitionDeliveryRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::v1::delivery::TransitionDeliveryReport,
+                            crate::v1::delivery::DeliveryError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Ok(crate::v1::delivery::TransitionDeliveryReport::default()) })
+        }
+    }
+
+    fn delivery_snapshot(output_coins: Vec<Coin>) -> DeliverySnapshot {
+        DeliverySnapshot {
+            owner: [0x11; 32],
+            output_coins,
+            creating_prev_ash: ZERO_HASH,
+            nav_size: 0,
+            nav_mth: ZERO_HASH,
+            nav_rand: [0x22; 32],
+            pk_create: [0x33; 32],
+            r_create: [0x44; 32],
+            r_prime_create: [0x55; 32],
+            record_kind: 0x02,
+            spent_or_folded_coin_ids: Vec::new(),
+            entry_send_counter: 7,
+            proof_data_bytes: [0x66; 192],
+        }
+    }
+
+    fn external_coin(recipient: [u8; 32]) -> Coin {
+        Coin {
+            identifier: ZERO_HASH,
+            recipient: Address(recipient),
+            amount: 25,
+            asset_id: ZERO_HASH,
+        }
+    }
+
+    #[test]
+    fn strict_hex_helpers_accept_lowercase_and_name_every_encoding_failure() {
+        assert_eq!(parse_hex_exact::<2>("00af", "sample").unwrap(), [0x00, 0xaf]);
+        assert_eq!(hex_lower(&[0x00, 0xaf, 0x10]), "00af10");
+
+        for (raw, expected_message) in [
+            (
+                "0x00",
+                "sample must be bare lowercase hex (exactly 4 chars); 0x/0X prefix is not accepted",
+            ),
+            (
+                "0X00",
+                "sample must be bare lowercase hex (exactly 4 chars); 0x/0X prefix is not accepted",
+            ),
+            (
+                "000",
+                "sample hex length 3 != 4 (no silent pad/truncate)",
+            ),
+            (
+                "00af10",
+                "sample hex length 6 != 4 (no silent pad/truncate)",
+            ),
+            (
+                "00AF",
+                "sample is not lowercase hex (no silent case-fold)",
+            ),
+            (
+                "0aB0",
+                "sample is not lowercase hex (no silent case-fold)",
+            ),
+            (
+                "0a 0",
+                "sample is not lowercase hex (no silent case-fold)",
+            ),
+        ] {
+            let err = parse_hex_exact::<2>(raw, "sample").expect_err(raw);
+            assert_eq!(err.check, SignatureCheck::Encoding, "raw={raw}");
+            assert_eq!(err.message, expected_message, "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn network_labels_round_trip_all_networks_and_reject_unknown() {
+        for (network, label) in [
+            (Network::Mainnet, "mainnet"),
+            (Network::Testnet, "testnet"),
+            (Network::Regtest, "regtest"),
+        ] {
+            assert_eq!(network_label(network), label);
+            assert_eq!(parse_network_label(label), Some(network));
+        }
+        assert_eq!(parse_network_label("Mainnet"), None);
+        assert_eq!(parse_network_label("signet"), None);
+        assert_eq!(parse_network_label(""), None);
+    }
+
+    #[test]
+    fn strip_pending_sign_removes_each_key_and_refuses_non_objects() {
+        for key in [FINALISATION_BODY_KEY, PENDING_SIGN_BODY_KEY, "sign"] {
+            let mut body =
+                serde_json::json!({ (key): { "kept_secret": true }, "kind": "send" });
+            assert!(strip_pending_sign_from_body(&mut body), "key={key}");
+            assert!(body.get(key).is_none(), "key={key}, body={body}");
+            assert_eq!(body["kind"], "send");
+        }
+
+        let mut combined = serde_json::json!({
+            FINALISATION_BODY_KEY: {},
+            PENDING_SIGN_BODY_KEY: {},
+            "sign": {},
+            "kind": "mint",
+        });
+        assert!(strip_pending_sign_from_body(&mut combined));
+        assert_eq!(combined, serde_json::json!({ "kind": "mint" }));
+        assert!(!strip_pending_sign_from_body(&mut combined));
+
+        for mut body in [serde_json::Value::Null, serde_json::json!(["finalisation"])] {
+            let before = body.clone();
+            assert!(!strip_pending_sign_from_body(&mut body));
+            assert_eq!(body, before);
+        }
+    }
+
+    #[test]
+    fn stage_pending_sign_round_trips_map_and_invalid_json_fails_closed() {
+        let map: PendingSignMap = Arc::new(DashMap::new());
+        let job_id = Uuid::new_v4();
+        let (entry, _) = test_fixtures::v5_mainnet_entry_and_submission();
+        let expected_hash = entry.pending.proof_data_hash;
+
+        let durable = stage_pending_sign(&map, job_id, entry);
+        let staged = map.get(&job_id).expect("stage must insert the live entry");
+        assert_eq!(staged.network, Network::Mainnet);
+        assert_eq!(staged.pending.proof_data_hash, expected_hash);
+        drop(staged);
+
+        let body = serde_json::json!({ FINALISATION_BODY_KEY: durable });
+        let rehydrated = rehydrate_pending_sign(&body)
+            .expect("durable envelope must decode")
+            .expect("finalisation key must produce an entry");
+        assert_eq!(rehydrated.pending.proof_data_hash, expected_hash);
+        assert_eq!(rehydrated.network, Network::Mainnet);
+
+        assert!(rehydrate_pending_sign(&serde_json::json!({ "kind": "send" }))
+            .expect("absence is not malformed")
+            .is_none());
+
+        let malformed = serde_json::json!({ FINALISATION_BODY_KEY: 17 });
+        let err = rehydrate_pending_sign(&malformed).expect_err("non-object envelope must fail");
+        assert_eq!(err.check, SignatureCheck::PendingEnvelope);
+        assert!(
+            err.message
+                .starts_with("persisted finalisation is not a valid envelope:"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn stage_pending_sign_panics_before_inserting_an_incomplete_capability() {
+        let map: PendingSignMap = Arc::new(DashMap::new());
+        let job_id = Uuid::new_v4();
+        let (mut entry, _) = test_fixtures::v5_mainnet_entry_and_submission();
+        entry.completion_result = Some(serde_json::json!({}));
+        entry.completion_status = None;
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stage_pending_sign(&map, job_id, entry)
+        }))
+        .expect_err("an incomplete completion pair must panic while staging");
+        let message = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .expect("stage panic must carry a string payload");
+        assert!(
+            message.contains("FinalisationCapability always bincode-encodes"),
+            "panic={message}"
+        );
+        assert!(
+            !map.contains_key(&job_id),
+            "the map must remain empty because insertion follows durable encoding"
+        );
+    }
+
+    #[test]
+    fn durable_signature_attach_requires_capability_and_survives_rehydrate() {
+        let signed = signed_mainnet_entry();
+        let signature = signed.signature.clone().expect("helper installs signature");
+
+        let err = durable_finalisation_with_signature(&serde_json::json!({}), &signature)
+            .expect_err("missing durable capability must fail closed");
+        assert_eq!(err.check, SignatureCheck::PendingEnvelope);
+        assert_eq!(
+            err.message,
+            "no durable finalisation capability on job row to attach signature"
+        );
+
+        let (unsigned, _) = test_fixtures::v5_mainnet_entry_and_submission();
+        let persist = DurableFinalisationPersist::from_entry(&unsigned).expect("encode unsigned");
+        let body = serde_json::json!({
+            FINALISATION_BODY_KEY: serde_json::to_value(persist).expect("persist JSON")
+        });
+        let mut wrong_signature = signature.clone();
+        wrong_signature.pk_i[0] ^= 0xff;
+        let err = durable_finalisation_with_signature(&body, &wrong_signature)
+            .expect_err("durable attach must enforce the pending current_pubkey");
+        assert_eq!(err.check, SignatureCheck::PkMatch);
+        assert_eq!(
+            err.message,
+            "install_signature: pk_i does not match pending current_pubkey"
+        );
+
+        let updated = durable_finalisation_with_signature(&body, &signature)
+            .expect("valid durable capability accepts matching signature");
+        let updated_body = serde_json::json!({ FINALISATION_BODY_KEY: updated });
+        let rehydrated = rehydrate_pending_sign(&updated_body)
+            .expect("updated durable envelope decodes")
+            .expect("updated envelope is present");
+        let rehydrated_signature = rehydrated
+            .signature
+            .as_ref()
+            .expect("attached signature survives durable encode/decode");
+        assert_eq!(rehydrated_signature.pk_i, signature.pk_i);
+        assert_eq!(rehydrated_signature.signature, signature.signature);
+        assert_eq!(rehydrated_signature.r_prime, signature.r_prime);
+        ensure_finalise_ready(&rehydrated).expect("attached signature is finalise-ready");
+    }
+
+    #[test]
+    fn readiness_guards_name_every_incomplete_completion_state() {
+        let (unsigned, _) = test_fixtures::v5_mainnet_entry_and_submission();
+        assert_eq!(
+            ensure_finalise_ready(&unsigned).unwrap_err(),
+            "finalise readiness: durable capability has no installed signature \
+             (wallet /sign has not accepted authorisation)"
+        );
+        assert_eq!(
+            ensure_completion_ready(&unsigned).unwrap_err(),
+            "finalise readiness: durable capability has no installed signature \
+             (wallet /sign has not accepted authorisation)"
+        );
+
+        let signed = signed_mainnet_entry();
+        assert_eq!(
+            ensure_completion_ready(&signed).unwrap_err(),
+            "completion readiness: missing completion_result and completion_status \
+             (prove+apply has not recorded the §7.5 surface; resume cannot publish \
+             or complete without re-running finalise)"
+        );
+
+        let mut result_without_status = signed.clone();
+        result_without_status.completion_result = Some(serde_json::json!({}));
+        assert_eq!(
+            ensure_completion_ready(&result_without_status).unwrap_err(),
+            "completion readiness: completion_result present without completion_status \
+             (incomplete capability field set)"
+        );
+
+        let mut status_without_result = signed.clone();
+        status_without_result.completion_status = Some(200);
+        assert_eq!(
+            ensure_completion_ready(&status_without_result).unwrap_err(),
+            "completion readiness: completion_status present without completion_result \
+             (incomplete capability field set)"
+        );
+
+        let mut non_object = signed.clone();
+        non_object.completion_result = Some(serde_json::json!(["not", "an", "object"]));
+        non_object.completion_status = Some(200);
+        assert_eq!(
+            ensure_completion_ready(&non_object).unwrap_err(),
+            "completion readiness: completion_result must be a JSON object"
+        );
+
+        let mut wrong_status = signed.clone();
+        wrong_status.completion_result = Some(serde_json::json!({}));
+        wrong_status.completion_status = Some(201);
+        assert_eq!(
+            ensure_completion_ready(&wrong_status).unwrap_err(),
+            "completion readiness: completion_status must be 200; got 201"
+        );
+
+        let publisher = [0xabu8; 32];
+        let mut missing_publisher = signed.clone().with_publisher_pubkey(Some(publisher));
+        missing_publisher.completion_result = Some(serde_json::json!({}));
+        missing_publisher.completion_status = Some(200);
+        assert_eq!(
+            ensure_completion_ready(&missing_publisher).unwrap_err(),
+            "completion readiness: staged publisher_pubkey present but completion_result omits publisher_pubkey"
+        );
+
+        let mut mismatched_publisher = missing_publisher.clone();
+        mismatched_publisher.completion_result = Some(serde_json::json!({
+            "publisher_pubkey": "cd".repeat(32),
+        }));
+        assert_eq!(
+            ensure_completion_ready(&mismatched_publisher).unwrap_err(),
+            format!(
+                "completion readiness: completion_result.publisher_pubkey {} does not match staged publisher_pubkey {}",
+                "cd".repeat(32),
+                "ab".repeat(32)
+            )
+        );
+
+        let mut ready = missing_publisher;
+        ready.completion_result = Some(serde_json::json!({
+            "publisher_pubkey": "ab".repeat(32),
+        }));
+        ensure_completion_ready(&ready).expect("matching complete surface must be ready");
+    }
+
+    #[test]
+    fn completion_install_and_persist_refuse_invalid_field_pairs() {
+        let (mut entry, _) = test_fixtures::v5_mainnet_entry_and_submission();
+        let before_result = entry.completion_result.clone();
+        let before_status = entry.completion_status;
+        assert_eq!(
+            entry.install_completion(serde_json::json!("not-object"), 200),
+            Err("install_completion: result must be a JSON object (§7.5 job result)".to_string())
+        );
+        assert_eq!(entry.completion_result, before_result);
+        assert_eq!(entry.completion_status, before_status);
+
+        let before_result = entry.completion_result.clone();
+        let before_status = entry.completion_status;
+        assert_eq!(
+            entry.install_completion(serde_json::json!({}), 202),
+            Err("install_completion: success path requires HTTP 200; got 202".to_string())
+        );
+        assert_eq!(entry.completion_result, before_result);
+        assert_eq!(entry.completion_status, before_status);
+
+        entry.completion_result = Some(serde_json::json!({}));
+        assert_eq!(
+            DurableFinalisationPersist::from_entry(&entry).unwrap_err(),
+            "DurableFinalisationPersist: completion_result and completion_status must both be set or both be absent (incomplete capability)"
+        );
+        entry.completion_result = None;
+        entry.completion_status = Some(200);
+        assert_eq!(
+            DurableFinalisationPersist::from_entry(&entry).unwrap_err(),
+            "DurableFinalisationPersist: completion_result and completion_status must both be set or both be absent (incomplete capability)"
+        );
+        entry.completion_status = Some(200);
+        entry.completion_result = Some(serde_json::json!(false));
+        assert_eq!(
+            DurableFinalisationPersist::from_entry(&entry).unwrap_err(),
+            "DurableFinalisationPersist: completion_result must be a JSON object"
+        );
+        entry.completion_result = Some(serde_json::json!({}));
+        entry.completion_status = Some(500);
+        assert_eq!(
+            DurableFinalisationPersist::from_entry(&entry).unwrap_err(),
+            "DurableFinalisationPersist: completion_status must be 200; got 500"
+        );
+    }
+
+    #[test]
+    fn durable_publisher_pubkey_round_trips_as_lowercase_hex_json() {
+        let (mut entry, _) = test_fixtures::v5_mainnet_entry_and_submission();
+        let publisher_pubkey = [0xab; 32];
+        let expected_hex = "ab".repeat(32);
+        entry.publisher_pubkey = Some(publisher_pubkey);
+
+        let persist =
+            DurableFinalisationPersist::from_entry(&entry).expect("publisher key must encode");
+        assert_eq!(expected_hex.len(), 64);
+        assert_eq!(
+            persist.publisher_pubkey.as_deref(),
+            Some(expected_hex.as_str())
+        );
+        let json = serde_json::to_value(&persist).expect("durable envelope must serialize");
+        assert_eq!(
+            json.get("publisher_pubkey"),
+            Some(&serde_json::Value::String(expected_hex))
+        );
+
+        let restored = persist.into_entry().expect("publisher key must decode");
+        assert_eq!(restored.publisher_pubkey, Some(publisher_pubkey));
+    }
+
+    #[test]
+    fn durable_envelope_rejects_invalid_network_capability_publisher_and_completion() {
+        let (entry, _) = test_fixtures::v5_mainnet_entry_and_submission();
+        let valid = DurableFinalisationPersist::from_entry(&entry).expect("valid fixture persist");
+        let reject = |persist: DurableFinalisationPersist, needle: &str| {
+            let err = persist.into_entry().expect_err(needle);
+            assert_eq!(err.check, SignatureCheck::PendingEnvelope, "err={err}");
+            assert!(err.message.contains(needle), "needle={needle}, err={err}");
+        };
+
+        let mut bad = valid.clone();
+        bad.network = "signet".to_string();
+        reject(bad, "not a known label");
+
+        let mut bad = valid.clone();
+        bad.capability_bincode_hex.clear();
+        reject(bad, "missing/empty");
+
+        let mut bad = valid.clone();
+        bad.capability_bincode_hex = "AA".to_string();
+        reject(bad, "even-length lowercase hex");
+
+        let mut bad = valid.clone();
+        bad.capability_bincode_hex = "0".to_string();
+        reject(bad, "even-length lowercase hex");
+
+        let mut bad = valid.clone();
+        bad.capability_bincode_hex = "00".to_string();
+        reject(bad, "durable decode");
+
+        let mut bad = valid.clone();
+        bad.publisher_pubkey = Some("AB".repeat(32));
+        reject(bad, "64 lowercase hex chars");
+
+        let mut bad = valid.clone();
+        bad.completion_result = Some(serde_json::json!([]));
+        bad.completion_status = Some(200);
+        reject(bad, "completion_result must be a JSON object");
+
+        let mut bad = valid.clone();
+        bad.completion_result = Some(serde_json::json!({}));
+        bad.completion_status = Some(204);
+        reject(bad, "completion_status must be 200; got 204");
+
+        let mut bad = valid.clone();
+        bad.completion_result = Some(serde_json::json!({}));
+        bad.completion_status = None;
+        reject(bad, "completion_result without completion_status");
+
+        let mut bad = valid;
+        bad.completion_result = None;
+        bad.completion_status = Some(200);
+        reject(bad, "completion_status without completion_result");
+    }
+
+    #[test]
+    fn sign_rejection_maps_every_signature_check_to_closed_status_and_code() {
+        for (check, expected) in [
+            (SignatureCheck::Encoding, (400, "malformed_request")),
+            (SignatureCheck::ShadowFlag, (404, "feature_disabled")),
+            (SignatureCheck::S2cOpening, (409, "stale_message")),
+            (SignatureCheck::Bip340, (409, "invalid_signature")),
+            (SignatureCheck::PkMatch, (409, "invalid_signature")),
+            (
+                SignatureCheck::PendingEnvelope,
+                (409, "invalid_signature"),
+            ),
+            (SignatureCheck::LegacyCommitment, (409, "wrong_phase")),
+        ] {
+            let err = TransitionSignatureError::new(check, "specific rejection");
+            assert_eq!(sign_rejection(&err), expected, "check={check:?}");
+            assert!(
+                is_closed_outward_error_code(expected.1),
+                "sign route emitted non-closed code for {check:?}"
+            );
+            assert!(err.to_string().contains("specific rejection"));
+        }
+    }
+
+    #[test]
+    fn stored_failure_classification_covers_closed_unknown_and_legacy_shapes() {
+        use crate::job_store::JobStatus;
+
+        for (message, code) in [
+            ("UNKNOWN_PUBLISHER at profile lookup", "unknown_publisher"),
+            ("coin is INVALID_INPUT_COIN", "invalid_input_coin"),
+            ("wallet has insufficient_balance", "insufficient_balance"),
+            ("request bounds_exceeded", "bounds_exceeded"),
+            ("wrong circuit_digest pin", "circuit_digest_mismatch"),
+            ("internal_error: invariant", "internal_error"),
+            ("no finalise driver installed", "internal_error"),
+            ("dispatcher disappeared", "internal_error"),
+            ("not_waiting for signature", "internal_error"),
+            ("ordinary prover failure", "proving_failed"),
+        ] {
+            assert_eq!(classify_stored_failure(message, JobStatus::Failed), code);
+        }
+        assert_eq!(
+            classify_stored_failure("insufficient_balance", JobStatus::Cancelled),
+            "internal_error",
+            "cancelled status takes precedence over message substrings"
+        );
+
+        let closed_without_message = decode_job_error(
+            Some(r#"{"error":"invalid_signature"}"#),
+            JobStatus::Failed,
+        );
+        assert_eq!(closed_without_message["error"], "invalid_signature");
+        assert_eq!(closed_without_message["message"], "");
+
+        let invented = decode_job_error(
+            Some(r#"{"error":"moon_error","message":"diagnostic"}"#),
+            JobStatus::Failed,
+        );
+        assert_eq!(invented["error"], "proving_failed");
+        assert_eq!(invented["message"], "diagnostic");
+
+        let cancelled_invented = decode_job_error(
+            Some(r#"{"error":"moon_error","message":"cancelled diagnostic"}"#),
+            JobStatus::Cancelled,
+        );
+        assert_eq!(cancelled_invented["error"], "internal_error");
+        assert_eq!(cancelled_invented["message"], "cancelled diagnostic");
+
+        let legacy = decode_job_error(
+            Some("legacy unknown_publisher lookup failed"),
+            JobStatus::Failed,
+        );
+        assert_eq!(legacy["error"], "unknown_publisher");
+        assert_eq!(legacy["message"], "legacy unknown_publisher lookup failed");
+
+        let absent_failed = decode_job_error(None, JobStatus::Failed);
+        assert_eq!(
+            absent_failed,
+            serde_json::json!({ "error": "proving_failed", "message": "job failed" })
+        );
+        let absent_cancelled = decode_job_error(None, JobStatus::Cancelled);
+        assert_eq!(
+            absent_cancelled,
+            serde_json::json!({ "error": "internal_error", "message": "cancelled" })
+        );
+    }
+
+    #[test]
+    fn generic_anyhow_error_defaults_to_proving_failed_and_unknown_http_code_is_none() {
+        use crate::job_store::JobStatus;
+
+        let err = anyhow::anyhow!("opaque host failure").context("outer context");
+        assert_eq!(machine_code_from_engine_error(&err), None);
+        let encoded = encode_job_error_from_anyhow(&err);
+        let decoded = decode_job_error(Some(&encoded), JobStatus::Failed);
+        assert_eq!(decoded["error"], "proving_failed");
+        assert!(
+            decoded["message"]
+                .as_str()
+                .expect("encoded message string")
+                .contains("outer context")
+        );
+        assert_eq!(http_status_for_machine_code("malformed_request"), Some(400));
+        assert_eq!(http_status_for_machine_code("invalid_signature"), Some(409));
+        assert_eq!(http_status_for_machine_code("definitely_not_closed"), None);
+        assert!(!is_closed_outward_error_code("definitely_not_closed"));
+    }
+
+    #[test]
+    fn pending_registry_take_is_single_use_and_job_scoped() {
+        let map: PendingSignMap = Arc::new(DashMap::new());
+        let job_id = Uuid::new_v4();
+        let other_job_id = Uuid::new_v4();
+        let (entry, _) = test_fixtures::v5_mainnet_entry_and_submission();
+        let expected_hash = entry.pending.proof_data_hash;
+
+        register_live_pending_after_begin(&map, job_id, entry);
+        assert!(
+            take_live_pending_after_begin(&map, other_job_id).is_none(),
+            "a different job must not consume the registered entry"
+        );
+        let taken = take_live_pending_after_begin(&map, job_id)
+            .expect("the registered job consumes its entry once");
+        assert_eq!(taken.pending.proof_data_hash, expected_hash);
+        assert!(take_live_pending_after_begin(&map, job_id).is_none());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn account_state_view_maps_record_bytes_hash_counter_and_optional_nullifier() {
+        let owner = Address([0x71; 32]);
+        let coinhist = CoinHistTree::new();
+        let state = AccountState::new(
+            owner,
+            ZERO_HASH,
+            BTreeMap::new(),
+            [0x72; 32],
+            9,
+            coinhist.root(),
+        )
+        .expect("valid account state");
+        let expected_bytes = shared::spec_v1::serialize::serialize_account_state(&state)
+            .expect("account state serializes");
+        let expected_head = digest_to_bytes(
+            &account_state_hash(&state).expect("account state hash is defined"),
+        );
+        let mut record = AccountRecord {
+            state,
+            coinhist,
+            nk: [0x73; 32],
+            op_secret: Some(OpSecret::new([0x74; 32])),
+            genesis_pubkey: [0x75; 32],
+            spendable: BTreeMap::new(),
+            spent_ids: BTreeSet::new(),
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: Some(NullifierOpening {
+                public_key: [0x76; 32],
+                signature_r: [0x77; 32],
+                r_prime: [0x78; 32],
+            }),
+            last_nullifier_pos: Some(3),
+        };
+
+        let view = account_state_view_from_record(&record).expect("pure record mapping");
+        assert_eq!(view.account_state, expected_bytes);
+        assert_eq!(view.state_head.0, expected_head);
+        assert_eq!(view.head_record_id, None);
+        assert_eq!(view.send_counter, 9);
+        assert_eq!(view.current_pubkey, [0x72; 32]);
+        assert_eq!(view.last_nullifier_pk, Some([0x76; 32]));
+        assert_eq!(view.last_nullifier_r, Some([0x77; 32]));
+
+        record.last_nullifier = None;
+        let without_nullifier =
+            account_state_view_from_record(&record).expect("None nullifier maps without invention");
+        assert_eq!(without_nullifier.last_nullifier_pk, None);
+        assert_eq!(without_nullifier.last_nullifier_r, None);
+    }
+
+    #[test]
+    fn outgoing_materials_fail_closed_for_proof_target_and_relay_then_build() {
+        use crate::v1::delivery::{DeliveryError, DeliveryTarget, DeliveryTargetStore};
+        use crate::v1::nostr::nip59::SecureRandom;
+
+        let port = UnusedDeliveryPort;
+        let bundles = crate::kernel::bootstrap::BundleStore::new();
+        let targets = DeliveryTargetStore::new();
+        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> = std::sync::Mutex::new(Box::new(
+            crate::v1::nostr::nip59::OsSecureRandom,
+        ));
+        let deps = FinaliseDeliveryDeps {
+            port: &port,
+            bundles: &bundles,
+            targets: &targets,
+            blob_holders: vec!["https://holder.example".to_string()],
+            max_blob_bytes: 1_000_000,
+            now: 100,
+            expected_network: "regtest",
+            self_relays: vec!["wss://self.example".to_string()],
+            rng: &rng,
+        };
+
+        let no_external = delivery_snapshot(vec![external_coin([0x11; 32])]);
+        assert!(
+            build_outgoing_coin_materials(&no_external, &[], &deps)
+                .expect("self-output requires no mesh proof")
+                .is_empty()
+        );
+
+        let recipient = [0x91; 32];
+        let external = delivery_snapshot(vec![external_coin(recipient)]);
+        let err = build_outgoing_coin_materials(&external, &[], &deps)
+            .expect_err("external delivery without proof must fail");
+        assert_eq!(
+            err,
+            DeliveryError::ProofBytes(
+                "creating transition proof_bytes empty — refuse mesh delivery without a proof"
+                    .to_string()
+            )
+        );
+
+        let err = build_outgoing_coin_materials(&external, &[0xde, 0xad], &deps)
+            .expect_err("missing verified target must fail");
+        assert_eq!(
+            err,
+            DeliveryError::RecipientIvpkUnavailable { recipient }
+        );
+
+        targets.insert(
+            recipient,
+            DeliveryTarget {
+                ivpk: [0x92; 32],
+                op_pk: [0x93; 32],
+                relays: Vec::new(),
+                blob_stores: Vec::new(),
+                expires_at: 101,
+            },
+        );
+        let err = build_outgoing_coin_materials(&external, &[0xde, 0xad], &deps)
+            .expect_err("empty recipient relay set must fail");
+        assert_eq!(err, DeliveryError::RecipientRelaysEmpty { recipient });
+
+        targets.insert(
+            recipient,
+            DeliveryTarget {
+                ivpk: [0x92; 32],
+                op_pk: [0x93; 32],
+                relays: vec!["wss://recipient.example".to_string()],
+                blob_stores: Vec::new(),
+                expires_at: 101,
+            },
+        );
+        let materials = build_outgoing_coin_materials(&external, &[0xde, 0xad], &deps)
+            .expect("complete delivery material builds");
+        assert_eq!(materials.len(), 1);
+        assert_eq!(materials[0].coin.recipient.0, recipient);
+        assert_eq!(materials[0].leaf_index, 0);
+        assert_eq!(materials[0].proof_bytes, vec![0xde, 0xad]);
+        assert_eq!(materials[0].recipient_ivpk, [0x92; 32]);
+        assert_eq!(
+            materials[0].recipient_relays,
+            vec!["wss://recipient.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn outgoing_materials_preserve_original_indices_order_and_every_shared_field() {
+        use crate::v1::delivery::{DeliveryTarget, DeliveryTargetStore};
+        use crate::v1::nostr::nip59::SecureRandom;
+
+        let port = UnusedDeliveryPort;
+        let bundles = crate::kernel::bootstrap::BundleStore::new();
+        let targets = DeliveryTargetStore::new();
+        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> = std::sync::Mutex::new(Box::new(
+            crate::v1::nostr::nip59::OsSecureRandom,
+        ));
+        let deps = FinaliseDeliveryDeps {
+            port: &port,
+            bundles: &bundles,
+            targets: &targets,
+            blob_holders: vec!["https://holder.example".to_string()],
+            max_blob_bytes: 1_000_000,
+            now: 100,
+            expected_network: "regtest",
+            self_relays: vec!["wss://self.example".to_string()],
+            rng: &rng,
+        };
+
+        let recipient_a = [0xb1; 32];
+        let recipient_b = [0xc1; 32];
+        let owner = [0x11; 32];
+        let mut coin_a = external_coin(recipient_a);
+        coin_a.amount = 11;
+        coin_a.identifier =
+            coin_identifier(ZERO_HASH, &recipient_a, ZERO_HASH, coin_a.amount, 0);
+        let mut self_coin = external_coin(owner);
+        self_coin.amount = 22;
+        self_coin.identifier =
+            coin_identifier(ZERO_HASH, &owner, ZERO_HASH, self_coin.amount, 1);
+        let mut coin_b = external_coin(recipient_b);
+        coin_b.amount = 33;
+        coin_b.identifier =
+            coin_identifier(ZERO_HASH, &recipient_b, ZERO_HASH, coin_b.amount, 2);
+
+        targets.insert(
+            recipient_a,
+            DeliveryTarget {
+                ivpk: [0xb2; 32],
+                op_pk: [0xb3; 32],
+                relays: vec!["wss://recipient-a.example".to_string()],
+                blob_stores: Vec::new(),
+                expires_at: 101,
+            },
+        );
+        targets.insert(
+            recipient_b,
+            DeliveryTarget {
+                ivpk: [0xc2; 32],
+                op_pk: [0xc3; 32],
+                relays: vec![
+                    "wss://recipient-b-1.example".to_string(),
+                    "wss://recipient-b-2.example".to_string(),
+                ],
+                blob_stores: Vec::new(),
+                expires_at: 101,
+            },
+        );
+
+        let all_output_ids = vec![coin_a.identifier, self_coin.identifier, coin_b.identifier];
+        let snap = delivery_snapshot(vec![coin_a.clone(), self_coin, coin_b.clone()]);
+        let proof_bytes = [0xd1, 0xd2, 0xd3];
+        let materials = build_outgoing_coin_materials(&snap, &proof_bytes, &deps)
+            .expect("both external outputs must build in original output order");
+
+        assert_eq!(materials.len(), 2);
+        assert_eq!(
+            materials
+                .iter()
+                .map(|material| material.coin.recipient.0)
+                .collect::<Vec<_>>(),
+            vec![recipient_a, recipient_b]
+        );
+        assert!(
+            materials
+                .iter()
+                .all(|material| material.coin.recipient.0 != snap.owner),
+            "self-output must not produce outgoing material"
+        );
+
+        let expected = [
+            (
+                &coin_a,
+                0_u32,
+                [0xb2; 32],
+                [0xb3; 32],
+                vec!["wss://recipient-a.example".to_string()],
+            ),
+            (
+                &coin_b,
+                2_u32,
+                [0xc2; 32],
+                [0xc3; 32],
+                vec![
+                    "wss://recipient-b-1.example".to_string(),
+                    "wss://recipient-b-2.example".to_string(),
+                ],
+            ),
+        ];
+        for (material, (expected_coin, leaf_index, ivpk, op_pk, relays)) in
+            materials.iter().zip(expected)
+        {
+            assert_eq!(&material.coin, expected_coin);
+            assert_eq!(material.leaf_index, leaf_index);
+            assert_eq!(material.all_output_ids, all_output_ids);
+            assert_eq!(material.proof_bytes, proof_bytes.to_vec());
+            assert_eq!(material.creating_prev_ash, snap.creating_prev_ash);
+            assert_eq!(material.creating_nullifier.pk_create, snap.pk_create);
+            assert_eq!(material.creating_nullifier.r_create, snap.r_create);
+            assert_eq!(
+                material.creating_nullifier.r_prime_create,
+                snap.r_prime_create
+            );
+            assert_eq!(material.nav_opening.size, snap.nav_size);
+            assert_eq!(material.nav_opening.mth, snap.nav_mth);
+            assert_eq!(material.nav_opening.nav_rand, snap.nav_rand);
+            assert_eq!(material.asset_terms, None);
+            assert_eq!(material.recipient_ivpk, ivpk);
+            assert_eq!(material.recipient_op_pk, op_pk);
+            assert_eq!(material.recipient_relays, relays);
+        }
+    }
+
+    #[test]
+    fn external_outbox_wrapper_propagates_delivery_matrix_and_round_trips_every_field() {
+        use crate::v1::delivery::{DeliveryError, DeliveryTarget, DeliveryTargetStore};
+        use crate::v1::nostr::nip59::SecureRandom;
+
+        let port = UnusedDeliveryPort;
+        let bundles = crate::kernel::bootstrap::BundleStore::new();
+        let targets = DeliveryTargetStore::new();
+        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> = std::sync::Mutex::new(Box::new(
+            crate::v1::nostr::nip59::OsSecureRandom,
+        ));
+        let deps = FinaliseDeliveryDeps {
+            port: &port,
+            bundles: &bundles,
+            targets: &targets,
+            blob_holders: vec!["https://holder.example".to_string()],
+            max_blob_bytes: 1_000_000,
+            now: 100,
+            expected_network: "regtest",
+            self_relays: vec!["wss://self.example".to_string()],
+            rng: &rng,
+        };
+
+        let recipient = [0xd1; 32];
+        let external = delivery_snapshot(vec![external_coin(recipient)]);
+        let err = build_external_outbox_inserts(&external, &[], &deps)
+            .expect_err("the wrapper must propagate empty proof bytes");
+        assert_eq!(
+            err,
+            DeliveryError::ProofBytes(
+                "creating transition proof_bytes empty — refuse mesh delivery without a proof"
+                    .to_string()
+            )
+        );
+
+        targets.insert(
+            recipient,
+            DeliveryTarget {
+                ivpk: [0xd2; 32],
+                op_pk: [0xd3; 32],
+                relays: vec!["wss://expired.example".to_string()],
+                blob_stores: Vec::new(),
+                expires_at: 100,
+            },
+        );
+        let err = build_external_outbox_inserts(&external, &[0xca, 0xfe], &deps)
+            .expect_err("the wrapper must reject an expired target");
+        assert_eq!(
+            err,
+            DeliveryError::RecipientTargetExpired {
+                recipient,
+                expired_at: 100,
+                now: 100,
+            }
+        );
+
+        targets.insert(
+            recipient,
+            DeliveryTarget {
+                ivpk: [0xd2; 32],
+                op_pk: [0xd3; 32],
+                relays: Vec::new(),
+                blob_stores: Vec::new(),
+                expires_at: 101,
+            },
+        );
+        let err = build_external_outbox_inserts(&external, &[0xca, 0xfe], &deps)
+            .expect_err("the wrapper must reject an empty recipient relay set");
+        assert_eq!(err, DeliveryError::RecipientRelaysEmpty { recipient });
+
+        let recipient_relays = vec![
+            "wss://recipient-1.example".to_string(),
+            "wss://recipient-2.example".to_string(),
+        ];
+        targets.insert(
+            recipient,
+            DeliveryTarget {
+                ivpk: [0xd2; 32],
+                op_pk: [0xd3; 32],
+                relays: recipient_relays.clone(),
+                blob_stores: Vec::new(),
+                expires_at: 101,
+            },
+        );
+        let proof_bytes = [0xca, 0xfe];
+        let inserts = build_external_outbox_inserts(&external, &proof_bytes, &deps)
+            .expect("complete wrapper inputs must build an outbox insert");
+        assert_eq!(inserts.len(), 1);
+
+        let encoded = crate::v1::outbox_material::ExternalOutboxMaterial::decode(
+            &inserts[0].material,
+        )
+        .expect("outbox material must decode");
+        let outgoing = encoded
+            .to_outgoing()
+            .expect("decoded outbox material must rebuild outgoing material");
+        assert_eq!(outgoing.coin, external.output_coins[0]);
+        assert_eq!(outgoing.leaf_index, 0);
+        assert_eq!(
+            outgoing.all_output_ids,
+            vec![external.output_coins[0].identifier]
+        );
+        assert_eq!(outgoing.proof_bytes, proof_bytes.to_vec());
+        assert_eq!(outgoing.creating_prev_ash, external.creating_prev_ash);
+        assert_eq!(outgoing.creating_nullifier.pk_create, external.pk_create);
+        assert_eq!(outgoing.creating_nullifier.r_create, external.r_create);
+        assert_eq!(
+            outgoing.creating_nullifier.r_prime_create,
+            external.r_prime_create
+        );
+        assert_eq!(outgoing.nav_opening.size, external.nav_size);
+        assert_eq!(outgoing.nav_opening.mth, external.nav_mth);
+        assert_eq!(outgoing.nav_opening.nav_rand, external.nav_rand);
+        assert_eq!(outgoing.recipient_ivpk, [0xd2; 32]);
+        assert_eq!(outgoing.recipient_op_pk, [0xd3; 32]);
+        assert_eq!(outgoing.recipient_relays, recipient_relays);
+    }
+
+    #[test]
+    fn external_outbox_inserts_are_empty_without_external_coins_and_encode_material() {
+        use crate::v1::delivery::{DeliveryTarget, DeliveryTargetStore};
+        use crate::v1::nostr::nip59::SecureRandom;
+
+        let port = UnusedDeliveryPort;
+        let bundles = crate::kernel::bootstrap::BundleStore::new();
+        let targets = DeliveryTargetStore::new();
+        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> = std::sync::Mutex::new(Box::new(
+            crate::v1::nostr::nip59::OsSecureRandom,
+        ));
+        let deps = FinaliseDeliveryDeps {
+            port: &port,
+            bundles: &bundles,
+            targets: &targets,
+            blob_holders: vec!["https://holder.example".to_string()],
+            max_blob_bytes: 1_000_000,
+            now: 100,
+            expected_network: "regtest",
+            self_relays: vec!["wss://self.example".to_string()],
+            rng: &rng,
+        };
+
+        let no_external = delivery_snapshot(Vec::new());
+        assert!(
+            build_external_outbox_inserts(&no_external, &[], &deps)
+                .expect("no external coins means no outbox inserts")
+                .is_empty()
+        );
+
+        let recipient = [0xa1; 32];
+        targets.insert(
+            recipient,
+            DeliveryTarget {
+                ivpk: [0xa2; 32],
+                op_pk: [0xa3; 32],
+                relays: vec!["wss://recipient.example".to_string()],
+                blob_stores: Vec::new(),
+                expires_at: 101,
+            },
+        );
+        let external = delivery_snapshot(vec![external_coin(recipient)]);
+        let inserts = build_external_outbox_inserts(&external, &[0xca, 0xfe], &deps)
+            .expect("complete external material encodes into an outbox row");
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].subject, external.owner);
+        assert_eq!(inserts[0].transition_pk, external.pk_create);
+        assert_eq!(inserts[0].coin_id, digest_to_bytes(&ZERO_HASH));
+        assert!(!inserts[0].material.is_empty());
     }
 
     #[test]
@@ -3067,6 +4092,7 @@ mod tests {
         );
 
         set_process_stack_mode(ScanStackMode::Legacy);
+        assert!(!v1_sign_route_active());
         assert!(
             refuse_legacy_commitment_under_v1().is_ok(),
             "legacy claim must allow ash‖ocr Commitment"
@@ -3093,6 +4119,7 @@ mod tests {
     #[test]
     fn wired_path_rejects_legacy_commitment_under_v1_and_accepts_v1_signature() {
         set_process_stack_mode(ScanStackMode::V1);
+        assert!(v1_sign_route_active());
         let legacy_err =
             refuse_legacy_commitment_under_v1().expect_err("v1.1 claim must refuse legacy");
         assert_eq!(
@@ -3138,7 +4165,10 @@ mod tests {
             commitment.verify(),
             "legacy Commitment::verify must still accept ash‖ocr under flag-off"
         );
-        assert!(ensure_v1_signature_path(V1ShadowMode::Off).is_err());
+        let err = ensure_v1_signature_path(V1ShadowMode::Off)
+            .expect_err("flag off must name the refused signature path");
+        assert_eq!(err.check, SignatureCheck::ShadowFlag);
+        assert!(err.message.contains("ZKCOINS_V1_SHADOW is off"));
         assert!(ensure_v1_signature_path(V1ShadowMode::On).is_ok());
         assert!(refuse_legacy_commitment_under_v1().is_ok());
     }
@@ -3491,15 +4521,31 @@ mod tests {
 
         // Malformed (uppercase) → Err, never silent None.
         let body = serde_json::json!({"publisher_pubkey": "AB".repeat(32)});
-        assert!(publisher_pubkey_from_request_body(&body).is_err());
+        assert_eq!(
+            publisher_pubkey_from_request_body(&body).unwrap_err(),
+            "publisher_pubkey must be exactly 64 lowercase hex characters; got len=64"
+        );
 
         // Malformed (wrong length) → Err.
         let body = serde_json::json!({"publisher_pubkey": "aa".repeat(16)});
-        assert!(publisher_pubkey_from_request_body(&body).is_err());
+        assert_eq!(
+            publisher_pubkey_from_request_body(&body).unwrap_err(),
+            "publisher_pubkey must be exactly 64 lowercase hex characters; got len=32"
+        );
+
+        // A prefix padded back to width still fails the lowercase alphabet check.
+        let body = serde_json::json!({"publisher_pubkey": format!("0x{}", "aa".repeat(31))});
+        assert_eq!(
+            publisher_pubkey_from_request_body(&body).unwrap_err(),
+            "publisher_pubkey must be exactly 64 lowercase hex characters; got len=64"
+        );
 
         // Malformed (non-string) → Err.
         let body = serde_json::json!({"publisher_pubkey": 42});
-        assert!(publisher_pubkey_from_request_body(&body).is_err());
+        assert_eq!(
+            publisher_pubkey_from_request_body(&body).unwrap_err(),
+            "publisher_pubkey must be a lowercase hex string of exactly 64 characters"
+        );
     }
 
     #[test]
