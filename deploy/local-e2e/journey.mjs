@@ -145,7 +145,27 @@ async function httpJson(method, url, body, headers = {}) {
     init.headers['Content-Type'] = 'application/json';
     init.body = JSON.stringify(body);
   }
-  const res = await fetch(url, init);
+  // Bounded retry for transient connection failures only (thrown fetch).
+  // HTTP responses (incl. 4xx/5xx) are never retried. Max 3 attempts;
+  // backoff 500ms then 1500ms via sleep. Per-attempt AbortController 15s.
+  const maxAttempts = 3;
+  const backoffsMs = [500, 1500];
+  let res;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      res = await fetch(url, { ...init, signal: controller.signal });
+      break;
+    } catch (err) {
+      if (attempt === maxAttempts - 1) {
+        throw err;
+      }
+      await sleep(backoffsMs[attempt]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   const text = await res.text();
   let json = null;
   if (text.length > 0) {
