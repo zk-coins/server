@@ -128,6 +128,10 @@ NODE2_CID="$(docker compose -f "${MERGED_COMPOSE}" ps -q node2)"
 # and 4 intentionally share one implementation; journey.mjs suppresses the
 # duplicate call while retaining both stage assertions.
 log "running journey stages 1, 2, 2b, 3, 4, 5, 6, 7, 8, and 9"
+# Exercise live fail-closed dependency paths during the integration coverage journey.
+export ZKCOINS_JOURNEY_FAULTS=1
+# Exercise live fail-closed dependency paths during the integration coverage journey.
+export ZKCOINS_JOURNEY_FAULTS=1
 bash "${SCRIPT_DIR}/journey.sh" \
   --stage 1 \
   --stage 2 \

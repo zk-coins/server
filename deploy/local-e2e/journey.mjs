@@ -166,6 +166,21 @@ async function sleep(ms) {
 // bitcoind mining via compose
 // ---------------------------------------------------------------------------
 
+function dockerCompose(args, stage) {
+  const result = spawnSync(
+    'docker',
+    ['compose', '-f', COMPOSE_FILE, ...args],
+    { encoding: 'utf8' },
+  );
+  if (result.status !== 0) {
+    fail(
+      stage,
+      `docker compose ${args.join(' ')} failed: ${result.stderr || result.stdout || `exit ${result.status}`}`,
+    );
+  }
+  return result.stdout.trim();
+}
+
 function btcCli(args) {
   const r = spawnSync(
     'docker',
@@ -1589,6 +1604,115 @@ Stages 2b–11 are named and fail with TODO until their mechanics are operable.
   return out;
 }
 
+async function pollFaultReadiness(url, expectReady, timeoutMs, intervalMs) {
+  const deadline = Date.now() + timeoutMs;
+  let last = 'not polled';
+
+  while (Date.now() < deadline) {
+    try {
+      const response = await httpJson('GET', url);
+      last = `HTTP ${response.status} ${JSON.stringify(response.json)}`;
+      const ready = response.status === 200 && response.json?.ready === true;
+      if (ready === expectReady) {
+        return { matched: true, last };
+      }
+    } catch (e) {
+      last = `pending (${e.message})`;
+      if (!expectReady) {
+        return { matched: true, last };
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  return { matched: false, last };
+}
+
+async function faultStageBitcoind() {
+  const stage = 'fault-bitcoind';
+  log('stopping bitcoind and waiting for node1 to fail closed');
+  dockerCompose(['stop', 'bitcoind'], stage);
+
+  const fault = await pollFaultReadiness(
+    `${API_URL}/health/ready`,
+    false,
+    90_000,
+    2_000,
+  );
+
+  log('restoring bitcoind and restarting both affected nodes');
+  dockerCompose(['start', 'bitcoind'], stage);
+  dockerCompose(['restart', 'node'], stage);
+  dockerCompose(['restart', 'node2'], stage);
+
+  const recovery = await pollFaultReadiness(
+    `${API_URL}/health/ready`,
+    true,
+    180_000,
+    3_000,
+  );
+
+  if (!fault.matched) {
+    fail(
+      stage,
+      `bitcoind fault was not visible within 90000ms; last observed: ${fault.last}`,
+    );
+  }
+  if (!recovery.matched) {
+    fail(
+      stage,
+      `node1 did not become ready within 180000ms after bitcoind recovery; last observed: ${recovery.last}`,
+    );
+  }
+
+  pass(stage, 'bitcoind fault detected; bitcoind and both nodes restored, node1 ready');
+}
+
+async function faultStagePostgres() {
+  const stage = 'fault-postgres';
+  log('stopping node1 postgres and waiting for node1 to fail closed');
+  dockerCompose(['stop', 'postgres'], stage);
+
+  const fault = await pollFaultReadiness(
+    `${API_URL}/health/ready`,
+    false,
+    90_000,
+    2_000,
+  );
+
+  log('restoring postgres and restarting node1');
+  dockerCompose(['start', 'postgres'], stage);
+  dockerCompose(['restart', 'node'], stage);
+
+  const recovery = await pollFaultReadiness(
+    `${API_URL}/health/ready`,
+    true,
+    180_000,
+    3_000,
+  );
+
+  if (!fault.matched) {
+    fail(
+      stage,
+      `postgres fault was not visible within 90000ms; last observed: ${fault.last}`,
+    );
+  }
+  if (!recovery.matched) {
+    fail(
+      stage,
+      `node1 did not become ready within 180000ms after postgres recovery; last observed: ${recovery.last}`,
+    );
+  }
+
+  pass(stage, 'postgres fault detected; postgres and node1 restored and ready');
+}
+
+async function runFaultStages() {
+  await faultStageBitcoind();
+  await faultStagePostgres();
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.list) {
@@ -1733,6 +1857,10 @@ async function main() {
       default:
         fail('cli', `unknown stage ${s}; use --list`);
     }
+  }
+
+  if (process.env.ZKCOINS_JOURNEY_FAULTS === '1') {
+    await runFaultStages();
   }
 
   console.log('journey: all requested stages passed.');
