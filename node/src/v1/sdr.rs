@@ -598,6 +598,8 @@ pub(crate) async fn publish_sdr_outbox_row(
     operator_op_sk: &[u8; 32],
     now: u64,
     rng: &std::sync::Mutex<Box<dyn SecureRandom + Send>>,
+    manifest_blob_stores: &[String],
+    manifest_seed_relays: &[String],
 ) -> Result<(), DeliveryError> {
     use super::blossom::{BlossomClient, RetentionClass, UploadBinding};
     use super::db_outbox::{self, PublishArtefacts};
@@ -767,6 +769,17 @@ pub(crate) async fn publish_sdr_outbox_row(
                 .collect(),
         });
     }
+
+    super::delivery::publish_recovery_overlap(
+        manifest_blob_stores,
+        manifest_seed_relays,
+        &zbe,
+        &gift_wrap,
+        ack_nonce,
+        operator_op_sk,
+        mat.max_blob_bytes,
+    )
+    .await?;
 
     let artefacts = PublishArtefacts {
         blob_id,
@@ -1147,6 +1160,24 @@ mod tests {
             .await;
     }
 
+    async fn insert_sdr_publish_fixture(
+        pool: &sqlx::PgPool,
+        material: &SdrOutboxMaterial,
+    ) -> OutboxRow {
+        let outbox_id = crate::v1::delivery::insert_sdr_outbox_pending(
+            pool,
+            [0xA1; 32],
+            [0xA2; 32],
+            material,
+        )
+        .await
+        .expect("insert SDR overlap fixture");
+        db_outbox::get_by_id(pool, &outbox_id)
+            .await
+            .expect("load SDR overlap fixture")
+            .expect("inserted SDR overlap row")
+    }
+
     async fn publish_material_error(material: Vec<u8>) -> DeliveryError {
         let scope = setup_pool().await;
         publish_sdr_outbox_row(
@@ -1155,6 +1186,8 @@ mod tests {
             &[0x01; 32],
             1_700_000_000,
             &publish_rng(),
+            &[],
+            &[],
         )
         .await
         .expect_err("fixture is expected to fail closed")
@@ -1915,6 +1948,8 @@ mod tests {
             &[0x01; 32],
             1_700_000_000,
             &publish_rng(),
+            &[],
+            &[],
         )
         .await
         .expect_err("external row must not enter SDR publisher");
@@ -1935,6 +1970,8 @@ mod tests {
                 &[0x01; 32],
                 1_700_000_000,
                 &publish_rng(),
+                &[],
+                &[],
             )
             .await
             .expect_err("terminal SDR rows are never republished");
@@ -2121,6 +2158,8 @@ mod tests {
             &[0x01; 32],
             1_700_000_000,
             &publish_rng(),
+            &[],
+            &[],
         )
         .await
         .expect_err("HTTP 500 must identify its holder");
@@ -2150,6 +2189,8 @@ mod tests {
             &[0x01; 32],
             1_700_000_000,
             &publish_rng(),
+            &[],
+            &[],
         )
         .await
         .expect_err("HTTP relay URL must be refused");
@@ -2182,6 +2223,8 @@ mod tests {
             &[0x01; 32],
             1_700_000_000,
             &publish_rng(),
+            &[],
+            &[],
         )
         .await
         .expect_err("unreachable relay cannot accept the gift wrap");
@@ -2193,6 +2236,142 @@ mod tests {
             }
             other => panic!("expected NoRelayAccepted, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn overlap_sdr_reaches_recipient_and_manifest_on_both_planes() {
+        let scope = setup_pool().await;
+        let recipient_store = MockServer::start().await;
+        let manifest_store = MockServer::start().await;
+        let (recipient_relay, recipient_events) =
+            crate::v1::delivery::start_overlap_test_relay(true).await;
+        let (seed_relay, seed_events) =
+            crate::v1::delivery::start_overlap_test_relay(true).await;
+        let mut material = sample_sdr_outbox_material();
+        material.blob_holders = vec![recipient_store.uri()];
+        material.recipient_relays = vec![recipient_relay];
+        mount_successful_blossom(&recipient_store, &material).await;
+        mount_successful_blossom(&manifest_store, &material).await;
+        let row = insert_sdr_publish_fixture(&scope.pool, &material).await;
+
+        publish_sdr_outbox_row(
+            &scope.pool,
+            &row,
+            &[0x01; 32],
+            1_700_000_000,
+            &publish_rng(),
+            &[manifest_store.uri()],
+            &[seed_relay],
+        )
+        .await
+        .expect("SDR recipient and recovery overlap placement");
+
+        let published = db_outbox::get_by_id(&scope.pool, &row.outbox_id)
+            .await
+            .expect("reload published SDR")
+            .expect("published SDR row");
+        assert_eq!(published.status, OutboxStatus::Completed);
+        let event_id = published.event_id.expect("published SDR event id");
+        assert_eq!(
+            recipient_events.lock().expect("recipient events").as_slice(),
+            &[event_id]
+        );
+        assert_eq!(
+            seed_events.lock().expect("seed events").as_slice(),
+            &[event_id]
+        );
+        assert_eq!(
+            recipient_store
+                .received_requests()
+                .await
+                .expect("recipient Blossom requests")
+                .len(),
+            1
+        );
+        assert_eq!(
+            manifest_store
+                .received_requests()
+                .await
+                .expect("manifest Blossom requests")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn overlap_sdr_blob_failure_leaves_outbox_unpublished() {
+        let scope = setup_pool().await;
+        let recipient_store = MockServer::start().await;
+        let manifest_store = MockServer::start().await;
+        let (recipient_relay, _) =
+            crate::v1::delivery::start_overlap_test_relay(true).await;
+        let mut material = sample_sdr_outbox_material();
+        material.blob_holders = vec![recipient_store.uri()];
+        material.recipient_relays = vec![recipient_relay];
+        mount_successful_blossom(&recipient_store, &material).await;
+        Mock::given(method("PUT"))
+            .and(path("/blossom/upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&manifest_store)
+            .await;
+        let row = insert_sdr_publish_fixture(&scope.pool, &material).await;
+
+        let error = publish_sdr_outbox_row(
+            &scope.pool,
+            &row,
+            &[0x01; 32],
+            1_700_000_000,
+            &publish_rng(),
+            &[manifest_store.uri()],
+            &["ws://127.0.0.1:1/".into()],
+        )
+        .await
+        .expect_err("recipient placement alone must not satisfy SDR blob overlap");
+        assert!(matches!(error, DeliveryError::OverlapBlobStore { .. }));
+        let unchanged = db_outbox::get_by_id(&scope.pool, &row.outbox_id)
+            .await
+            .expect("reload failed SDR")
+            .expect("failed SDR row retained");
+        assert_eq!(unchanged.status, OutboxStatus::Pending);
+        assert_eq!(unchanged.attempt_n, 0);
+        assert!(unchanged.event_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn overlap_sdr_seed_rejection_leaves_outbox_unpublished() {
+        let scope = setup_pool().await;
+        let recipient_store = MockServer::start().await;
+        let manifest_store = MockServer::start().await;
+        let (recipient_relay, _) =
+            crate::v1::delivery::start_overlap_test_relay(true).await;
+        let (seed_relay, _) =
+            crate::v1::delivery::start_overlap_test_relay(false).await;
+        let mut material = sample_sdr_outbox_material();
+        material.blob_holders = vec![recipient_store.uri()];
+        material.recipient_relays = vec![recipient_relay];
+        mount_successful_blossom(&recipient_store, &material).await;
+        mount_successful_blossom(&manifest_store, &material).await;
+        let row = insert_sdr_publish_fixture(&scope.pool, &material).await;
+
+        let error = publish_sdr_outbox_row(
+            &scope.pool,
+            &row,
+            &[0x01; 32],
+            1_700_000_000,
+            &publish_rng(),
+            &[manifest_store.uri()],
+            &[seed_relay],
+        )
+        .await
+        .expect_err("recipient placement alone must not satisfy SDR relay overlap");
+        assert!(matches!(error, DeliveryError::OverlapSeedRelay { .. }));
+        let unchanged = db_outbox::get_by_id(&scope.pool, &row.outbox_id)
+            .await
+            .expect("reload failed SDR")
+            .expect("failed SDR row retained");
+        assert_eq!(unchanged.status, OutboxStatus::Pending);
+        assert_eq!(unchanged.attempt_n, 0);
+        assert!(unchanged.event_id.is_none());
     }
 
     #[test]

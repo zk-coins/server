@@ -269,6 +269,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             (*pool).clone(),
             Arc::clone(&shared_delivery_retention),
             Box::new(crate::v1::OsSecureRandom),
+            Arc::clone(&manifest_store),
         ));
     // Shared CSPRNG for finalise-time Phase-A change-coin builds and the
     // outbox drive path (process-local; never invent keys).
@@ -287,6 +288,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         let bundles = Arc::clone(&shared_bundle_store);
         let pg: sqlx::PgPool = (*pool).clone();
         let rng = Arc::clone(&shared_delivery_rng);
+        let outbox_manifest_store = Arc::clone(&manifest_store);
         let relay_url = crate::kernel::chain::chain_identity_ops_from_env()
             .ok()
             .map(|ops| ops.relay_url);
@@ -316,6 +318,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                     bundles.as_ref(),
                     retention.as_ref(),
                     rng.as_ref(),
+                    outbox_manifest_store.as_ref(),
                     now,
                 )
                 .await

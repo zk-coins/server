@@ -87,6 +87,7 @@ use super::nostr::profile::{
 };
 use super::nostr::relay::{Filter, RelayPool, RelayPublishResult};
 use super::outbox_material::ExternalOutboxMaterial;
+use crate::kernel::bootstrap::ManifestStore;
 use sqlx::PgPool;
 
 // ---------------------------------------------------------------------------
@@ -123,10 +124,17 @@ pub(crate) enum DeliveryError {
     BlossomAuthClockBeforeUnixEpoch,
     /// Blossom upload failed for one holder.
     Blossom { holder: String, error: BlossomError },
+    /// No verified-manifest Blossom store accepted the recovery overlap blob.
+    OverlapBlobStore {
+        attempted: usize,
+        results: Vec<BlossomOutcomeSummary>,
+    },
     /// Relay pool construction / empty list.
     Relay(String),
     /// Every relay rejected or was unreachable — nothing accepted the wrap.
     NoRelayAccepted { results: Vec<RelayOutcomeSummary> },
+    /// No verified-manifest seed relay accepted the recovery overlap wrap.
+    OverlapSeedRelay { results: Vec<RelayOutcomeSummary> },
     /// Wire framing / length error while building inclusion_proof.
     InclusionProof(String),
     /// Plonky2 proof serialisation failed.
@@ -153,6 +161,13 @@ pub(crate) enum DeliveryError {
 pub(crate) struct RelayOutcomeSummary {
     pub relay_url: String,
     pub accepted: bool,
+    pub detail: String,
+}
+
+/// Per-store failure detail for a recovery-overlap Blossom attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlossomOutcomeSummary {
+    pub holder: String,
     pub detail: String,
 }
 
@@ -193,6 +208,12 @@ impl fmt::Display for DeliveryError {
             DeliveryError::Blossom { holder, error } => {
                 write!(f, "Blossom upload to {holder}: {error}")
             }
+            DeliveryError::OverlapBlobStore { attempted, results } => write!(
+                f,
+                "no verified-manifest blob store accepted the recovery overlap blob \
+                 ({attempted} attempted, {} failures)",
+                results.len()
+            ),
             DeliveryError::Relay(msg) => write!(f, "relay pool: {msg}"),
             DeliveryError::NoRelayAccepted { results } => {
                 write!(
@@ -201,6 +222,12 @@ impl fmt::Display for DeliveryError {
                     results.len()
                 )
             }
+            DeliveryError::OverlapSeedRelay { results } => write!(
+                f,
+                "no verified-manifest seed relay accepted the recovery overlap gift-wrap \
+                 ({} outcomes)",
+                results.len()
+            ),
             DeliveryError::InclusionProof(msg) => write!(f, "inclusion_proof: {msg}"),
             DeliveryError::ProofBytes(msg) => write!(f, "proof bytes: {msg}"),
             DeliveryError::SdrOutputRef(msg) => write!(f, "SDR output_ref: {msg}"),
@@ -255,7 +282,9 @@ impl DeliveryError {
             // Process-local BundleStore may be refilled after restart/load.
             DeliveryError::OperationalBundleMissing { .. } => false,
             // Peer/network: all relays down or rejecting is usually temporary.
-            DeliveryError::NoRelayAccepted { .. } => false,
+            DeliveryError::NoRelayAccepted { .. }
+            | DeliveryError::OverlapBlobStore { .. }
+            | DeliveryError::OverlapSeedRelay { .. } => false,
             // DB / pool / mark_published wiring after a mesh attempt — retry.
             DeliveryError::Relay(_) => false,
             // Database/mirror availability may recover on finalise resume.
@@ -823,11 +852,195 @@ fn blossom_auth_timestamps_at(wall_clock: SystemTime) -> Result<(u64, u64), Deli
     Ok((created_at, expiration))
 }
 
+/// Place the recovery-discoverable copy on both verified-manifest planes.
+///
+/// Every manifest Blob store is attempted, even after one succeeds. This
+/// mirrors relay `publish_all`, preserves per-store diagnostics, and keeps a
+/// single slow/unhealthy store visible without making it a delivery failure
+/// once another verified-manifest store accepted the blob.
+pub(crate) async fn publish_recovery_overlap(
+    manifest_blob_stores: &[String],
+    manifest_seed_relays: &[String],
+    zbe_ciphertext: &[u8],
+    gift_wrap: &Event,
+    ack_nonce: [u8; 32],
+    op_sk: &[u8; 32],
+    max_blob_bytes: u64,
+) -> Result<(), DeliveryError> {
+    if manifest_blob_stores.is_empty() {
+        return Err(DeliveryError::OverlapBlobStore {
+            attempted: 0,
+            results: Vec::new(),
+        });
+    }
+
+    let client = BlossomClient::new(max_blob_bytes).map_err(|error| {
+        DeliveryError::OverlapBlobStore {
+            attempted: 0,
+            results: vec![BlossomOutcomeSummary {
+                holder: String::new(),
+                detail: error.to_string(),
+            }],
+        }
+    })?;
+    let binding = UploadBinding {
+        event_id: gift_wrap.id,
+        attempt_nonce: ack_nonce,
+        retention: RetentionClass::Indefinite,
+    };
+    let mut attempted = 0usize;
+    let mut accepted = 0usize;
+    let mut blob_results = Vec::new();
+    for holder in manifest_blob_stores {
+        attempted = attempted.saturating_add(1);
+        let timestamps = fresh_blossom_auth_timestamps();
+        let upload = match timestamps {
+            Ok((created_at, expiration)) => {
+                client
+                    .upload(
+                        holder,
+                        zbe_ciphertext,
+                        Some(&binding),
+                        op_sk,
+                        created_at,
+                        expiration,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        match upload {
+            Ok(()) => accepted = accepted.saturating_add(1),
+            Err(detail) => blob_results.push(BlossomOutcomeSummary {
+                holder: holder.clone(),
+                detail,
+            }),
+        }
+    }
+    if accepted == 0 {
+        return Err(DeliveryError::OverlapBlobStore {
+            attempted,
+            results: blob_results,
+        });
+    }
+
+    if manifest_seed_relays.is_empty() {
+        return Err(DeliveryError::OverlapSeedRelay {
+            results: Vec::new(),
+        });
+    }
+    let pool = RelayPool::new(manifest_seed_relays.to_vec()).map_err(|error| {
+        DeliveryError::OverlapSeedRelay {
+            results: manifest_seed_relays
+                .iter()
+                .map(|relay_url| RelayOutcomeSummary {
+                    relay_url: relay_url.clone(),
+                    accepted: false,
+                    detail: error.to_string(),
+                })
+                .collect(),
+        }
+    })?;
+    let relay_results = pool.publish_all(gift_wrap).await;
+    let any_accepted = relay_results
+        .iter()
+        .any(|result| matches!(result, RelayPublishResult::Accepted { .. }));
+    if !any_accepted {
+        return Err(DeliveryError::OverlapSeedRelay {
+            results: relay_outcome_summaries(&relay_results),
+        });
+    }
+
+    Ok(())
+}
+
+fn relay_outcome_summaries(results: &[RelayPublishResult]) -> Vec<RelayOutcomeSummary> {
+    results
+        .iter()
+        .map(|result| match result {
+            RelayPublishResult::Accepted { relay_url, message } => RelayOutcomeSummary {
+                relay_url: relay_url.clone(),
+                accepted: true,
+                detail: message.clone(),
+            },
+            RelayPublishResult::Rejected { relay_url, message } => RelayOutcomeSummary {
+                relay_url: relay_url.clone(),
+                accepted: false,
+                detail: message.clone(),
+            },
+            RelayPublishResult::Unreachable { relay_url, error } => RelayOutcomeSummary {
+                relay_url: relay_url.clone(),
+                accepted: false,
+                detail: error.to_string(),
+            },
+        })
+        .collect()
+}
+
+/// One-connection NIP-01 relay used by delivery/SDR overlap tests.
+#[cfg(test)]
+pub(crate) async fn start_overlap_test_relay(
+    accepted: bool,
+) -> (String, Arc<Mutex<Vec<[u8; 32]>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind overlap test relay");
+    let address = listener.local_addr().expect("overlap test relay address");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    tokio::spawn(async move {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (stream, _) = listener.accept().await.expect("accept relay client");
+        let mut websocket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("accept websocket handshake");
+        while let Some(frame) = websocket.next().await {
+            let Message::Text(text) = frame.expect("read relay frame") else {
+                continue;
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&text).expect("parse NIP-01 client frame");
+            if value.get(0).and_then(serde_json::Value::as_str) != Some("EVENT") {
+                continue;
+            }
+            let event_id_hex = value
+                .get(1)
+                .and_then(|event| event.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .expect("EVENT id");
+            let event_id: [u8; 32] = hex::decode(event_id_hex)
+                .expect("EVENT id hex")
+                .try_into()
+                .expect("EVENT id length");
+            captured.lock().expect("capture relay event").push(event_id);
+            let response = serde_json::json!([
+                "OK",
+                event_id_hex,
+                accepted,
+                if accepted { "stored" } else { "rejected by test relay" }
+            ])
+            .to_string();
+            websocket
+                .send(Message::Text(response))
+                .await
+                .expect("send relay OK");
+            break;
+        }
+    });
+    (format!("ws://{address}/"), events)
+}
+
 /// Upload ZBE blob to every holder, then publish gift-wrap to every relay.
 pub(crate) async fn publish_built_delivery(
     built: &BuiltCoinDelivery,
     op_sk: &[u8; 32],
     max_blob_bytes: u64,
+    manifest_blob_stores: &[String],
+    manifest_seed_relays: &[String],
 ) -> Result<CoinDeliveryReport, DeliveryError> {
     upload_built_coin_blob(built, op_sk, max_blob_bytes).await?;
 
@@ -861,6 +1074,17 @@ pub(crate) async fn publish_built_delivery(
             .collect();
         return Err(DeliveryError::NoRelayAccepted { results });
     }
+
+    publish_recovery_overlap(
+        manifest_blob_stores,
+        manifest_seed_relays,
+        &built.zbe_ciphertext,
+        &built.gift_wrap,
+        built.ack_nonce,
+        op_sk,
+        max_blob_bytes,
+    )
+    .await?;
 
     Ok(CoinDeliveryReport {})
 }
@@ -1038,6 +1262,8 @@ pub(crate) trait OutgoingDeliveryPort: Send + Sync {
 /// this port runs). The port drives pending / due rows to mesh publish.
 pub(crate) struct MeshDeliveryPort {
     pub pool: PgPool,
+    /// Process-local holder of the boot-verified §4.3 manifest.
+    pub manifest_store: Arc<ManifestStore>,
     /// Optional process-local mirror for unit tests of ACK unwrap without SQL.
     pub retention: Arc<PendingDeliveryStore>,
     /// Secure random — production uses [`super::nostr::nip59::OsSecureRandom`].
@@ -1050,9 +1276,11 @@ impl MeshDeliveryPort {
         pool: PgPool,
         retention: Arc<PendingDeliveryStore>,
         rng: Box<dyn SecureRandom + Send>,
+        manifest_store: Arc<ManifestStore>,
     ) -> Self {
         Self {
             pool,
+            manifest_store,
             retention,
             rng: Arc::new(Mutex::new(rng)),
         }
@@ -1079,6 +1307,8 @@ impl OutgoingDeliveryPort for MeshDeliveryPort {
                 return Err(DeliveryError::BlobHoldersEmpty);
             }
 
+            let (manifest_blob_stores, manifest_seed_relays) =
+                manifest_overlap_targets(self.manifest_store.as_ref());
             let mut report = TransitionDeliveryReport { delivered: 0 };
 
             for material in &request.coins {
@@ -1129,6 +1359,8 @@ impl OutgoingDeliveryPort for MeshDeliveryPort {
                     &request.operator,
                     self.retention.as_ref(),
                     self.rng.as_ref(),
+                    manifest_blob_stores,
+                    manifest_seed_relays,
                 )
                 .await?;
 
@@ -1153,6 +1385,8 @@ pub(crate) async fn publish_outbox_row(
     operator: &DeliveryOperatorContext,
     retention: &PendingDeliveryStore,
     rng: &Mutex<Box<dyn SecureRandom + Send>>,
+    manifest_blob_stores: &[String],
+    manifest_seed_relays: &[String],
 ) -> Result<CoinDeliveryReport, DeliveryError> {
     if row.status.is_terminal() {
         return Err(DeliveryError::Relay(
@@ -1176,6 +1410,8 @@ pub(crate) async fn publish_outbox_row(
         &built,
         &operator.op_sk,
         operator.max_blob_bytes,
+        manifest_blob_stores,
+        manifest_seed_relays,
     )
     .await?;
 
@@ -1224,8 +1460,11 @@ pub(crate) async fn drive_due_outbox_entries(
     bundles: &crate::kernel::bootstrap::BundleStore,
     retention: &PendingDeliveryStore,
     rng: &Mutex<Box<dyn SecureRandom + Send>>,
+    manifest_store: &ManifestStore,
     now: u64,
 ) -> Result<usize, DeliveryError> {
+    let (manifest_blob_stores, manifest_seed_relays) =
+        manifest_overlap_targets(manifest_store);
     let due = db_outbox::list_due(pool)
         .await
         .map_err(|e| DeliveryError::Relay(format!("list_due: {e:#}")))?;
@@ -1251,6 +1490,8 @@ pub(crate) async fn drive_due_outbox_entries(
                     &bundle.op,
                     now,
                     rng,
+                    manifest_blob_stores,
+                    manifest_seed_relays,
                 )
                 .await
                 {
@@ -1303,7 +1544,18 @@ pub(crate) async fn drive_due_outbox_entries(
                     max_blob_bytes: mat.max_blob_bytes,
                     now,
                 };
-                match publish_outbox_row(pool, &row, &outgoing, &operator, retention, rng).await {
+                match publish_outbox_row(
+                    pool,
+                    &row,
+                    &outgoing,
+                    &operator,
+                    retention,
+                    rng,
+                    manifest_blob_stores,
+                    manifest_seed_relays,
+                )
+                .await
+                {
                     Ok(_) => {
                         driven = driven.saturating_add(1);
                     }
@@ -1322,6 +1574,16 @@ pub(crate) async fn drive_due_outbox_entries(
         }
     }
     Ok(driven)
+}
+
+/// Resolve only boot-verified overlap targets. An empty store deliberately
+/// becomes two empty slices; the shared publisher turns that into the named,
+/// transient fail-closed overlap error instead of treating it as an opt-out.
+fn manifest_overlap_targets(manifest_store: &ManifestStore) -> (&[String], &[String]) {
+    match manifest_store.get() {
+        Some(manifest) => (manifest.blob_stores(), manifest.seed_relays()),
+        None => (&[], &[]),
+    }
 }
 
 /// Persist terminal outbox failure (named reason). Logs hard if the write
@@ -1931,6 +2193,8 @@ pub(crate) fn creating_nullifier_from_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_db::setup_pool;
+    use crate::v1::db_outbox::OutboxStatus;
     use crate::v1::nostr::kinds::ack::sign_ack;
     use crate::v1::nostr::kinds::delivery::encode_delivery_payload;
     use crate::v1::nostr::nip59::OsSecureRandom;
@@ -2027,9 +2291,62 @@ mod tests {
         }
     }
 
+    fn build_overlap_fixture(
+        recipient_holder: String,
+        recipient_relay: String,
+    ) -> (BuiltCoinDelivery, [u8; 32]) {
+        let (op_sk, _) = fixture_sk(b"zkCoins/v1/test/delivery/overlap-op");
+        let (ovk, _) = fixture_sk(b"zkCoins/v1/test/delivery/overlap-ovk");
+        let (_, recipient_ivpk) = fixture_sk(b"zkCoins/v1/test/delivery/overlap-ivk");
+        let (_, recipient_op_pk) = fixture_sk(b"zkCoins/v1/test/delivery/overlap-recipient-op");
+        let mut material = sample_material(recipient_ivpk, recipient_op_pk);
+        material.recipient_relays = vec![recipient_relay];
+        let mut rng = ChainRng::new(b"zkCoins/v1/test/delivery/overlap-rng");
+        let built = build_coin_delivery(
+            &material,
+            &op_sk,
+            &ovk,
+            &[recipient_holder],
+            1_700_000_000,
+            &mut rng,
+        )
+        .expect("build overlap fixture");
+        (built, op_sk)
+    }
+
+    async fn mount_overlap_blossom(
+        server: &MockServer,
+        blob_id: [u8; 32],
+        status: u16,
+    ) {
+        let response = if status == 200 {
+            ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                "blob_id": hex::encode(blob_id),
+            }))
+        } else {
+            ResponseTemplate::new(status)
+        };
+        Mock::given(method("PUT"))
+            .and(path("/blossom/upload"))
+            .respond_with(response)
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
     struct CapturingBlossomUpload {
         auth: Arc<Mutex<Option<String>>>,
         blob_id_hex: String,
+    }
+
+    struct SuccessfulBlossomUpload;
+
+    impl Respond for SuccessfulBlossomUpload {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "blob_id": hex::encode(blob_id_of(&request.body)),
+            }))
+        }
     }
 
     impl Respond for CapturingBlossomUpload {
@@ -2130,6 +2447,267 @@ mod tests {
             created_at.saturating_add(super::super::blossom::AUTH_REPLAY_WINDOW_SECS),
             "expiration must be derived from the same fresh upload timestamp"
         );
+    }
+
+    #[tokio::test]
+    async fn overlap_delivery_reaches_recipient_and_manifest_on_both_planes() {
+        let recipient_store = MockServer::start().await;
+        let unhealthy_manifest_store = MockServer::start().await;
+        let manifest_store = MockServer::start().await;
+        let (recipient_relay, recipient_events) = start_overlap_test_relay(true).await;
+        let (seed_relay, seed_events) = start_overlap_test_relay(true).await;
+        let (built, op_sk) =
+            build_overlap_fixture(recipient_store.uri(), recipient_relay);
+        mount_overlap_blossom(&recipient_store, built.blob_id, 200).await;
+        mount_overlap_blossom(&unhealthy_manifest_store, built.blob_id, 500).await;
+        mount_overlap_blossom(&manifest_store, built.blob_id, 200).await;
+
+        publish_built_delivery(
+            &built,
+            &op_sk,
+            1_048_576,
+            &[unhealthy_manifest_store.uri(), manifest_store.uri()],
+            &[seed_relay],
+        )
+        .await
+        .expect("recipient and recovery overlap placement");
+
+        assert_eq!(
+            recipient_events.lock().expect("recipient events").as_slice(),
+            &[built.gift_wrap.id]
+        );
+        assert_eq!(
+            seed_events.lock().expect("seed events").as_slice(),
+            &[built.gift_wrap.id]
+        );
+        assert_eq!(
+            recipient_store
+                .received_requests()
+                .await
+                .expect("recipient Blossom requests")
+                .len(),
+            1
+        );
+        assert_eq!(
+            unhealthy_manifest_store
+                .received_requests()
+                .await
+                .expect("unhealthy manifest Blossom requests")
+                .len(),
+            1,
+            "all manifest stores remain observable after one failure"
+        );
+        assert_eq!(
+            manifest_store
+                .received_requests()
+                .await
+                .expect("accepted manifest Blossom requests")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn overlap_delivery_fails_closed_when_all_manifest_blob_stores_fail() {
+        let recipient_store = MockServer::start().await;
+        let manifest_store = MockServer::start().await;
+        let (recipient_relay, _) = start_overlap_test_relay(true).await;
+        let (built, op_sk) =
+            build_overlap_fixture(recipient_store.uri(), recipient_relay);
+        mount_overlap_blossom(&recipient_store, built.blob_id, 200).await;
+        mount_overlap_blossom(&manifest_store, built.blob_id, 500).await;
+
+        let error = publish_built_delivery(
+            &built,
+            &op_sk,
+            1_048_576,
+            &[manifest_store.uri()],
+            &["ws://127.0.0.1:1/".into()],
+        )
+        .await
+        .expect_err("recipient placement alone must not satisfy blob overlap");
+        match error {
+            DeliveryError::OverlapBlobStore { attempted, results } => {
+                assert_eq!(attempted, 1);
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].holder, manifest_store.uri());
+            }
+            other => panic!("expected OverlapBlobStore, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn overlap_delivery_blob_failure_leaves_outbox_unpublished() {
+        let scope = setup_pool().await;
+        let recipient_store = MockServer::start().await;
+        let manifest_store = MockServer::start().await;
+        let (recipient_relay, _) = start_overlap_test_relay(true).await;
+        Mock::given(method("PUT"))
+            .and(path("/blossom/upload"))
+            .respond_with(SuccessfulBlossomUpload)
+            .mount(&recipient_store)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/blossom/upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&manifest_store)
+            .await;
+
+        let (op_sk, _) = fixture_sk(b"zkCoins/v1/test/delivery/outbox-overlap-op");
+        let (ovk, _) = fixture_sk(b"zkCoins/v1/test/delivery/outbox-overlap-ovk");
+        let (_, recipient_ivpk) =
+            fixture_sk(b"zkCoins/v1/test/delivery/outbox-overlap-ivk");
+        let (_, recipient_op_pk) =
+            fixture_sk(b"zkCoins/v1/test/delivery/outbox-overlap-recipient-op");
+        let mut material = sample_material(recipient_ivpk, recipient_op_pk);
+        material.recipient_relays = vec![recipient_relay];
+        let subject = [0x91; 32];
+        let coin_id = digest_to_bytes(&material.coin.identifier);
+        let transition_pk = material.creating_nullifier.pk_create;
+        db_outbox::insert_pending(
+            &scope.pool,
+            &[OutboxInsert {
+                kind: OutboxKind::ExternalCoin,
+                subject,
+                transition_pk,
+                coin_id,
+                material: vec![0x01],
+            }],
+        )
+        .await
+        .expect("insert external overlap fixture");
+        let outbox_id = db_outbox::outbox_id(
+            OutboxKind::ExternalCoin,
+            &subject,
+            &coin_id,
+            &transition_pk,
+        );
+        let row = db_outbox::get_by_id(&scope.pool, &outbox_id)
+            .await
+            .expect("load external overlap fixture")
+            .expect("inserted external overlap row");
+        let operator = DeliveryOperatorContext {
+            op_sk,
+            ovk,
+            blob_holders: vec![recipient_store.uri()],
+            max_blob_bytes: 1_048_576,
+            now: 1_700_000_000,
+        };
+        let retention = PendingDeliveryStore::new();
+        let rng: Mutex<Box<dyn SecureRandom + Send>> =
+            Mutex::new(Box::new(ChainRng::new(b"outbox-overlap-rng")));
+
+        let error = publish_outbox_row(
+            &scope.pool,
+            &row,
+            &material,
+            &operator,
+            &retention,
+            &rng,
+            &[manifest_store.uri()],
+            &["ws://127.0.0.1:1/".into()],
+        )
+        .await
+        .expect_err("overlap failure must precede mark_published");
+        assert!(matches!(error, DeliveryError::OverlapBlobStore { .. }));
+        let unchanged = db_outbox::get_by_id(&scope.pool, &outbox_id)
+            .await
+            .expect("reload failed external delivery")
+            .expect("failed external row retained");
+        assert_eq!(unchanged.status, OutboxStatus::Pending);
+        assert_eq!(unchanged.attempt_n, 0);
+        assert!(unchanged.event_id.is_none());
+        assert_eq!(retention.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn overlap_delivery_fails_closed_when_all_manifest_seed_relays_reject() {
+        let recipient_store = MockServer::start().await;
+        let manifest_store = MockServer::start().await;
+        let (recipient_relay, _) = start_overlap_test_relay(true).await;
+        let (seed_relay, _) = start_overlap_test_relay(false).await;
+        let (built, op_sk) =
+            build_overlap_fixture(recipient_store.uri(), recipient_relay);
+        mount_overlap_blossom(&recipient_store, built.blob_id, 200).await;
+        mount_overlap_blossom(&manifest_store, built.blob_id, 200).await;
+
+        let error = publish_built_delivery(
+            &built,
+            &op_sk,
+            1_048_576,
+            &[manifest_store.uri()],
+            &[seed_relay.clone()],
+        )
+        .await
+        .expect_err("recipient placement alone must not satisfy relay overlap");
+        match error {
+            DeliveryError::OverlapSeedRelay { results } => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].relay_url, seed_relay);
+                assert!(!results[0].accepted);
+            }
+            other => panic!("expected OverlapSeedRelay, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn overlap_delivery_without_loaded_manifest_fails_closed() {
+        let recipient_store = MockServer::start().await;
+        let (recipient_relay, _) = start_overlap_test_relay(true).await;
+        let (built, op_sk) =
+            build_overlap_fixture(recipient_store.uri(), recipient_relay);
+        mount_overlap_blossom(&recipient_store, built.blob_id, 200).await;
+
+        let error = publish_built_delivery(&built, &op_sk, 1_048_576, &[], &[])
+            .await
+            .expect_err("an unloaded manifest is not an overlap opt-out");
+        assert_eq!(
+            error,
+            DeliveryError::OverlapBlobStore {
+                attempted: 0,
+                results: Vec::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn overlap_delivery_without_manifest_seed_relays_fails_closed() {
+        let recipient_store = MockServer::start().await;
+        let manifest_store = MockServer::start().await;
+        let (recipient_relay, _) = start_overlap_test_relay(true).await;
+        let (built, op_sk) =
+            build_overlap_fixture(recipient_store.uri(), recipient_relay);
+        mount_overlap_blossom(&recipient_store, built.blob_id, 200).await;
+        mount_overlap_blossom(&manifest_store, built.blob_id, 200).await;
+
+        let error = publish_built_delivery(
+            &built,
+            &op_sk,
+            1_048_576,
+            &[manifest_store.uri()],
+            &[],
+        )
+        .await
+        .expect_err("a manifest without seed relays cannot satisfy event overlap");
+        assert_eq!(
+            error,
+            DeliveryError::OverlapSeedRelay {
+                results: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn overlap_failures_are_transient_for_outbox_retry() {
+        let blob = DeliveryError::OverlapBlobStore {
+            attempted: 0,
+            results: Vec::new(),
+        };
+        let relay = DeliveryError::OverlapSeedRelay {
+            results: Vec::new(),
+        };
+        assert!(!blob.is_terminal_outbox_failure());
+        assert!(!relay.is_terminal_outbox_failure());
     }
 
     #[test]
