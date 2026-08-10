@@ -112,6 +112,7 @@ async fn connect_and_migrate_creates_all_tables() {
     //   * After 0033 (v1 SDR Phase A): +1 table (`v1_sdr_phase_a`).
     //   * After 0036 (v1 self-delivery index): +1 table
     //     (`v1_self_delivery_index`).
+    //   * After 0037 (token provenance): +1 table (`token_provenance`).
     assert_eq!(
         names,
         vec![
@@ -141,6 +142,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "smt_state".to_string(),
             "stack_scan_mode".to_string(),
             "state_update_log".to_string(),
+            "token_provenance".to_string(),
             "tx_mining_log".to_string(),
             "username_claim_log".to_string(),
             "usernames".to_string(),

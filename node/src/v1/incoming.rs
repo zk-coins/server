@@ -53,9 +53,10 @@ use zkcoins_prover::state_engine::StateEngine;
 use super::adapter::EngineAdapter;
 use super::blossom::{blob_id_of, verify_content_address, BlossomClient, BlossomError};
 use super::db_decrypt_index::{
-    decrypt_record_id, get_by_blob_id, get_by_subject_coin, insert_verified_coin_proof, mark_acked,
-    to_indexed_record, DecryptIndexRow, DecryptVerificationStatus,
+    decrypt_record_id, get_by_blob_id, get_by_subject_coin, insert_verified_coin_proof_in_tx,
+    mark_acked, to_indexed_record, DecryptIndexRow, DecryptVerificationStatus,
 };
+use super::db_token_provenance::insert_token_provenance_in_tx;
 use super::nostr::event::Event;
 use super::nostr::kinds::ack::{ack_rumor, encode_ack_content, sign_ack, KIND_ACK};
 use super::nostr::kinds::delivery::{decode_delivery_payload, KIND_DELIVERY};
@@ -933,9 +934,8 @@ async fn process_delivery_candidate_inner(
         ack_nonce: payload.ack_nonce,
         occurred_at: 0,
     };
-    let sql_outcome = insert_verified_coin_proof(pool, &row)
-        .await
-        .map_err(|e| IncomingError::Persist(format!("{e:#}")))?;
+    let sql_outcome = persist_verified_coin_and_provenance(pool, &row, cp.asset_terms.as_ref())
+        .await?;
     let indexed = to_indexed_record(&row);
     let mem_outcome = index
         .insert_record(indexed)
@@ -989,6 +989,35 @@ async fn process_delivery_candidate_inner(
         replay,
         holder_attempts,
     })
+}
+
+/// Atomically persist the verified private CoinProof and any self-authenticated
+/// Class-B terms it carried (§4.6 / §4.8).
+///
+/// `None` is intentionally opaque and writes no provenance row. A conflicting
+/// existing provenance value aborts the whole transaction before ACK; it is
+/// never overwritten and the CoinProof row is not partially committed.
+async fn persist_verified_coin_and_provenance(
+    pool: &PgPool,
+    row: &DecryptIndexRow,
+    asset_terms: Option<&IssuanceTerms>,
+) -> Result<InsertRecordOutcome, IncomingError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| IncomingError::Persist(format!("store-and-ACK transaction begin: {e:#}")))?;
+    if let Some(terms) = asset_terms {
+        insert_token_provenance_in_tx(&mut tx, &row.asset_id, terms)
+            .await
+            .map_err(|e| IncomingError::Persist(format!("token provenance: {e:#}")))?;
+    }
+    let outcome = insert_verified_coin_proof_in_tx(&mut tx, row)
+        .await
+        .map_err(|e| IncomingError::Persist(format!("CoinProof index: {e:#}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| IncomingError::Persist(format!("store-and-ACK transaction commit: {e:#}")))?;
+    Ok(outcome)
 }
 
 /// Re-ACK a delivery attempt without re-crediting. Always echoes the
@@ -1119,7 +1148,9 @@ pub(crate) async fn poll_incoming_deliveries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_db::setup_pool;
     use shared::spec_v1::bundle::IssuanceTerms;
+    use shared::spec_v1::encoding::digest_to_bytes;
     use shared::spec_v1::hashes::name_hash;
     use shared::spec_v1::tags::GENESIS_TAG;
 
@@ -1251,5 +1282,84 @@ mod tests {
         assert_eq!(a, b);
         let c = decrypt_record_id(&[1u8; 32], &[2u8; 32], &[4u8; 32]);
         assert_ne!(a, c);
+    }
+
+    fn persistence_test_row(asset_id: [u8; 32], seed: u8) -> DecryptIndexRow {
+        let subject = [seed; 32];
+        let coin_id = [seed + 1; 32];
+        let blob_id = [seed + 2; 32];
+        DecryptIndexRow {
+            record_id: decrypt_record_id(&subject, &coin_id, &blob_id),
+            subject,
+            coin_id,
+            blob_id,
+            detect_tag: [seed + 3; 32],
+            canonical: vec![seed + 4],
+            asset_id,
+            verification_status: DecryptVerificationStatus::Verified,
+            delivery_event_id: [seed + 5; 32],
+            ack_nonce: [seed + 6; 32],
+            occurred_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_persist_with_no_asset_terms_keeps_coin_opaque() {
+        let scope = setup_pool().await;
+        let asset_id = [0x71; 32];
+        let row = persistence_test_row(asset_id, 0x10);
+
+        assert_eq!(
+            persist_verified_coin_and_provenance(&scope.pool, &row, None)
+                .await
+                .expect("persist opaque received CoinProof"),
+            InsertRecordOutcome::Inserted
+        );
+        assert!(get_by_blob_id(&scope.pool, &row.blob_id)
+            .await
+            .expect("load durable CoinProof")
+            .is_some());
+        assert_eq!(
+            super::super::db_token_provenance::get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("lookup absent provenance"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_persist_commits_verified_coin_and_terms_together() {
+        let scope = setup_pool().await;
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x31; 32],
+            decimals: 3,
+            issuance_version: 1,
+            name: b"atomic".to_vec(),
+            cap_total: None,
+            terms_salt: None,
+        };
+        let name_hash = name_hash(&terms.name).expect("test name");
+        let asset_id = digest_to_bytes(&asset_id_v1(
+            GENESIS_TAG,
+            &terms.creator_pubkey,
+            &name_hash,
+            terms.decimals,
+            terms.issuance_version,
+        ));
+        let row = persistence_test_row(asset_id, 0x20);
+
+        persist_verified_coin_and_provenance(&scope.pool, &row, Some(&terms))
+            .await
+            .expect("atomic received persist");
+        assert!(get_by_blob_id(&scope.pool, &row.blob_id)
+            .await
+            .expect("load durable CoinProof")
+            .is_some());
+        assert_eq!(
+            super::super::db_token_provenance::get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("load durable terms"),
+            Some(terms)
+        );
     }
 }

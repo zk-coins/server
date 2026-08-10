@@ -6,7 +6,8 @@
 //! (`get_info`, `get_accumulator`, `get_nullifier_path`, `list_inscriptions`).
 //! Block 7: `open_pull_challenge`, `pull`, `get_record`, `get_coin_proof`,
 //! `get_account_state`, `subscribe_receipts`. Block 8: `publish`,
-//! `entrust_operational_bundle`, `revoke_operational_bundle`.
+//! `entrust_operational_bundle`, `revoke_operational_bundle`. Block A adds the
+//! open, store-backed `get_token_provenance` read.
 //! `SubscribeReceipts` is the filtered push stream over the receipt hub;
 //! the receive path publishes after durable decrypt-index persist (§4.8 /
 //! §4.9). `ListInscriptions` reads the scanner-written inscription catalog
@@ -49,6 +50,7 @@ use crate::kernel::{
     SignTransition, TransitionCommand,
 };
 use crate::v1::{EngineAdapter, PendingSignMap};
+use shared::spec_v1::bundle::IssuanceTerms;
 use shared::spec_v1::Address;
 
 /// Optional live chain handle for the four Block-6 read procedures.
@@ -675,6 +677,29 @@ impl KernelService {
         request: SessionBoundRequest,
     ) -> KernelResult<AccountStateView> {
         access::get_account_state(self.access_deps(&[], now), request)
+    }
+
+    /// `GetTokenProvenance` — open Class-B lookup with no capability or
+    /// feature gate (§4.6 / §7.8).
+    pub(crate) async fn get_token_provenance(
+        &self,
+        asset_id: crate::kernel::types::Digest32,
+    ) -> KernelResult<IssuanceTerms> {
+        crate::v1::db_token_provenance::get_token_provenance(
+            self.job_store.pool(),
+            &asset_id.0,
+        )
+        .await
+        .map_err(|e| {
+            KernelError::with_internal(
+                KernelErrorCode::InternalError,
+                "Failed to load token provenance",
+                format!("asset_id={}: {e:#}", hex::encode(asset_id.0)),
+            )
+        })?
+        .ok_or_else(|| {
+            KernelError::new(KernelErrorCode::NotFound, "Token provenance not found")
+        })
     }
 
     /// `SubscribeReceipts` — server-stream of verified credits for the

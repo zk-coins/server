@@ -1518,6 +1518,177 @@ fn v1_error_body(code: &str, message: impl Into<String>) -> serde_json::Value {
     })
 }
 
+/// Strict §7.5 path value for the open token-provenance read.
+pub(crate) struct V1AssetId(pub [u8; 32]);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for V1AssetId
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let raw = match Path::<String>::from_request_parts(parts, state).await {
+            Ok(Path(raw)) => raw,
+            Err(err) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(v1_error_body(
+                        "malformed_request",
+                        format!("malformed asset_id path parameter: {err}"),
+                    )),
+                )
+                    .into_response());
+            }
+        };
+        let decoded = match hex::decode(&raw) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(v1_error_body(
+                        "malformed_request",
+                        "asset_id must be hexadecimal",
+                    )),
+                )
+                    .into_response());
+            }
+        };
+        let asset_id = match <[u8; 32]>::try_from(decoded.as_slice()) {
+            Ok(asset_id) => asset_id,
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(v1_error_body(
+                        "malformed_request",
+                        format!(
+                            "asset_id must decode to exactly 32 bytes; got {}",
+                            decoded.len()
+                        ),
+                    )),
+                )
+                    .into_response());
+            }
+        };
+        Ok(Self(asset_id))
+    }
+}
+
+/// Versioned §7.5 token-provenance JSON. `name` is hex of the raw bytes,
+/// never a UTF-8 JSON string.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
+pub(crate) struct TokenProvenanceResponse {
+    asset_id: String,
+    issuance_version: u8,
+    creator_pubkey: String,
+    name: String,
+    decimals: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cap_total: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terms_salt: Option<String>,
+}
+
+fn project_token_provenance(
+    asset_id: [u8; 32],
+    terms: shared::spec_v1::bundle::IssuanceTerms,
+) -> Result<TokenProvenanceResponse, KernelError> {
+    let (cap_total, terms_salt) = match terms.issuance_version {
+        1 => {
+            if terms.cap_total.is_some() || terms.terms_salt.is_some() {
+                return Err(KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Corrupt token provenance",
+                    "issuance_version=1 carries v2 fields",
+                ));
+            }
+            (None, None)
+        }
+        2 => {
+            let cap = terms.cap_total.ok_or_else(|| {
+                KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Corrupt token provenance",
+                    "issuance_version=2 is missing cap_total",
+                )
+            })?;
+            let salt = terms.terms_salt.ok_or_else(|| {
+                KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Corrupt token provenance",
+                    "issuance_version=2 is missing terms_salt",
+                )
+            })?;
+            (Some(cap.to_string()), Some(hex::encode(salt)))
+        }
+        other => {
+            return Err(KernelError::with_internal(
+                KernelErrorCode::InternalError,
+                "Corrupt token provenance",
+                format!("unsupported issuance_version {other}"),
+            ));
+        }
+    };
+    Ok(TokenProvenanceResponse {
+        asset_id: hex::encode(asset_id),
+        issuance_version: terms.issuance_version,
+        creator_pubkey: hex::encode(terms.creator_pubkey),
+        name: hex::encode(terms.name),
+        decimals: terms.decimals,
+        cap_total,
+        terms_salt,
+    })
+}
+
+fn token_provenance_error_response(err: KernelError) -> Response {
+    let desc = error_contract::describe(err.code);
+    let status = StatusCode::from_u16(desc.http_status)
+        .expect("error_contract http_status values are valid HTTP codes");
+    if let Some(ctx) = &err.internal_context {
+        tracing::error!("GetTokenProvenance internal error: {}", ctx.detail);
+    }
+    (
+        status,
+        Json(v1_error_body(desc.reason, err.public_message)),
+    )
+        .into_response()
+}
+
+/// `GET /v1/token/:asset_id/provenance` — open Class-B token terms (§7.5).
+/// No ownership/grant proof and no Cargo/runtime feature gate is consulted.
+#[utoipa::path(
+    get,
+    path = "/v1/token/{asset_id}/provenance",
+    tag = "Token",
+    params(("asset_id" = String, Path, description = "32-byte asset id as hex.")),
+    responses(
+        (status = 200, description = "Self-verifying retained IssuanceTerms.", body = TokenProvenanceResponse),
+        (status = 400, description = "`malformed_request` — invalid hex or width."),
+        (status = 404, description = "`not_found` — this node holds no terms."),
+        (status = 500, description = "`internal_error`."),
+    ),
+)]
+pub(crate) async fn get_token_provenance_v1_handler(
+    State(state): State<AppState>,
+    V1AssetId(asset_id): V1AssetId,
+) -> Response {
+    // The monolith calls the same transport-neutral kernel procedure that the
+    // gRPC adapter exposes as GetTokenProvenance; the API layer adds no gate.
+    let service = KernelService::from_store(Arc::clone(&state.job_store));
+    let terms = match service
+        .get_token_provenance(crate::kernel::types::Digest32(asset_id))
+        .await
+    {
+        Ok(terms) => terms,
+        Err(err) => return token_provenance_error_response(err),
+    };
+    match project_token_provenance(asset_id, terms) {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err(err) => token_provenance_error_response(err),
+    }
+}
+
 /// §7.5 path extractor for job UUIDs: malformed ids → `400 malformed_request`
 /// (Axum's default `Path<Uuid>` rejection is a framework 400/422 without the
 /// closed machine code).
@@ -3642,6 +3813,10 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/v1/jobs/:id/sign", post(jobs_sign_handler))
         .route("/v1/jobs/:id/stream", get(stream_job_v1_handler))
         .route("/v1/jobs/:id/cancel", post(jobs_cancel_v1_handler))
+        .route(
+            "/v1/token/:asset_id/provenance",
+            get(get_token_provenance_v1_handler),
+        )
         // §7.5 Gap G6 — balance attestation (flag-gated inside handlers).
         .route(
             "/v1/attest/balance/challenge",

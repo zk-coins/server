@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::kernel::access::{IndexedRecord, InsertRecordOutcome, RecordType};
 use crate::kernel::types::{Digest32, SubjectAddress};
@@ -71,6 +71,21 @@ pub(crate) async fn insert_verified_coin_proof(
     pool: &PgPool,
     row: &DecryptIndexRow,
 ) -> Result<InsertRecordOutcome> {
+    let mut tx = pool.begin().await.context("v1_decrypt_index begin")?;
+    let outcome = insert_verified_coin_proof_in_tx(&mut tx, row).await?;
+    tx.commit().await.context("v1_decrypt_index commit")?;
+    Ok(outcome)
+}
+
+/// Insert a verified CoinProof inside the caller's store-and-ACK transaction.
+///
+/// The incoming path pairs this with `token_provenance` so a crash or loud
+/// provenance conflict can never leave an ACK-eligible CoinProof without the
+/// `asset_terms` it carried.
+pub(crate) async fn insert_verified_coin_proof_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    row: &DecryptIndexRow,
+) -> Result<InsertRecordOutcome> {
     ensure_row_shape(row)?;
     let result = sqlx::query(
         "INSERT INTO v1_decrypt_index (\
@@ -90,7 +105,7 @@ pub(crate) async fn insert_verified_coin_proof(
     .bind(row.delivery_event_id.as_slice())
     .bind(row.ack_nonce.as_slice())
     .bind(i64::try_from(row.occurred_at).context("occurred_at fits i64")?)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .context("v1_decrypt_index insert")?;
 

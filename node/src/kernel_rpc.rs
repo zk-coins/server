@@ -12,7 +12,7 @@
 //! `ListInscriptions`, `OpenPullChallenge`, `Pull`, `GetRecord`,
 //! `GetCoinProof`, `GetAccountState`, `SubscribeReceipts`, `Publish`,
 //! `EntrustOperationalBundle`, `RevokeOperationalBundle`.
-//! **20 of 20** kernel procedures. `SubscribeReceipts` streams verified
+//! **21 of 21** kernel procedures. `SubscribeReceipts` streams verified
 //! credits from the receipt hub after the receive path's durable dual
 //! persist (§4.8 / §4.9); subject + scope come only from the server-side
 //! pull session. Wired procedures call the transport-neutral domain façade
@@ -31,11 +31,12 @@ use kernel_proto::kernel_server::{Kernel, KernelServer};
 use kernel_proto::{
     AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, Challenge,
     CoinProofBlob, CoinProofRequest, EntrustRequest, EntrustResult, GetAccumulatorRequest,
-    GetInfoRequest, GrantRequest, GrantResult, Info, Inscription, Job, JobEvent, JobHandle,
+    GetInfoRequest, GetTokenProvenanceRequest, GrantRequest, GrantResult, Info, Inscription, Job,
+    JobEvent, JobHandle,
     JobRequest, ListInscriptionsRequest, NullifierPath, NullifierPathRequest, PublishRequest,
     PublishResult, PullChallengeRequest, PullRequest, PullResult, Receipt, RecordBlob,
     RecordRequest, RevokeRequest, RevokeResult, SignRequest, SubscribeReceiptsRequest,
-    TransitionRequest,
+    TokenProvenance, TransitionRequest,
 };
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -53,11 +54,13 @@ use crate::transport::grpc::{
     account_state_to_proto, accumulator_tip_to_proto, coin_proof_blob_to_proto,
     entrust_result_to_proto, inscription_to_proto, job_event_to_proto, job_to_proto,
     kernel_error_to_status, kernel_info_to_proto, nullifier_path_to_proto, parse_attest_request,
-    parse_coin_proof_request, parse_entrust_request, parse_grant_request,
+    parse_coin_proof_request, parse_entrust_request, parse_get_token_provenance_request,
+    parse_grant_request,
     parse_list_inscriptions_request, parse_nullifier_path_request, parse_publish_request,
     parse_pull_request, parse_record_request, parse_revoke_request, parse_session_authority,
     parse_session_bound, parse_sign_request, parse_transition_request, publish_outcome_to_proto,
     pull_result_to_proto, receipt_to_proto, record_blob_to_proto, revoke_result_to_proto,
+    token_provenance_to_proto,
 };
 use crate::v1::PendingSignMap;
 use shared::spec_v1::Address;
@@ -560,6 +563,21 @@ impl Kernel for GrpcKernelService {
         Ok(Response::new(proto))
     }
 
+    async fn get_token_provenance(
+        &self,
+        request: Request<GetTokenProvenanceRequest>,
+    ) -> Result<Response<TokenProvenance>, Status> {
+        let asset_id = parse_get_token_provenance_request(request.into_inner())
+            .map_err(map_domain_err)?;
+        let terms = self
+            .domain
+            .get_token_provenance(asset_id)
+            .await
+            .map_err(map_domain_err)?;
+        let proto = token_provenance_to_proto(&terms).map_err(map_domain_err)?;
+        Ok(Response::new(proto))
+    }
+
     type SubscribeReceiptsStream = BoxStream<Receipt>;
 
     async fn subscribe_receipts(
@@ -766,6 +784,152 @@ mod tests {
     fn grpc_svc(domain: DomainKernel) -> GrpcKernelService {
         let (job_tx, _rx) = mpsc::channel::<JobEnvelope>(8);
         GrpcKernelService::new(domain, job_tx)
+    }
+
+    fn provenance_asset_id(terms: &shared::spec_v1::bundle::IssuanceTerms) -> [u8; 32] {
+        use shared::spec_v1::encoding::digest_to_bytes;
+        use shared::spec_v1::hashes::{asset_id_v1, asset_id_v2, name_hash};
+        use shared::spec_v1::tags::GENESIS_TAG;
+
+        let name_hash = name_hash(&terms.name).expect("valid test name");
+        let digest = match terms.issuance_version {
+            1 => asset_id_v1(
+                GENESIS_TAG,
+                &terms.creator_pubkey,
+                &name_hash,
+                terms.decimals,
+                1,
+            ),
+            2 => asset_id_v2(
+                GENESIS_TAG,
+                &terms.creator_pubkey,
+                &name_hash,
+                terms.decimals,
+                2,
+                terms.cap_total.expect("v2 cap"),
+                &terms.terms_salt.expect("v2 salt"),
+            ),
+            other => panic!("unsupported test issuance version {other}"),
+        };
+        digest_to_bytes(&digest)
+    }
+
+    #[tokio::test]
+    async fn get_token_provenance_returns_v1_and_v2_self_verifying_terms_without_gate() {
+        let (domain, scope) = test_domain().await;
+        let svc = grpc_svc(domain);
+        let cases = [
+            shared::spec_v1::bundle::IssuanceTerms {
+                creator_pubkey: [0x41; 32],
+                decimals: 2,
+                issuance_version: 1,
+                name: vec![0xff, 0x00, b'1'],
+                cap_total: None,
+                terms_salt: None,
+            },
+            shared::spec_v1::bundle::IssuanceTerms {
+                creator_pubkey: [0x42; 32],
+                decimals: 9,
+                issuance_version: 2,
+                name: b"grpc-v2".to_vec(),
+                cap_total: Some(u128::MAX - 11),
+                terms_salt: Some([0x43; 32]),
+            },
+        ];
+
+        for expected in cases {
+            let asset_id = provenance_asset_id(&expected);
+            crate::v1::db_token_provenance::insert_token_provenance(
+                &scope.pool,
+                &asset_id,
+                &expected,
+            )
+            .await
+            .expect("seed retained provenance");
+
+            // No V1 process claim or feature is enabled in this test. This read
+            // must nevertheless remain an ordinary successful RPC.
+            let response = svc
+                .get_token_provenance(Request::new(GetTokenProvenanceRequest {
+                    asset_id: asset_id.to_vec(),
+                }))
+                .await
+                .expect("open GetTokenProvenance")
+                .into_inner();
+            assert_eq!(response.issuance_version, u32::from(expected.issuance_version));
+            assert_eq!(response.creator_pubkey, expected.creator_pubkey);
+            assert_eq!(response.name, expected.name);
+            assert_eq!(response.decimals, u32::from(expected.decimals));
+
+            let returned = match response.issuance_version {
+                1 => {
+                    assert!(response.cap_total.is_empty());
+                    assert!(response.terms_salt.is_empty());
+                    shared::spec_v1::bundle::IssuanceTerms {
+                        creator_pubkey: response
+                            .creator_pubkey
+                            .as_slice()
+                            .try_into()
+                            .expect("32-byte creator"),
+                        decimals: u8::try_from(response.decimals).expect("u8 decimals"),
+                        issuance_version: 1,
+                        name: response.name,
+                        cap_total: None,
+                        terms_salt: None,
+                    }
+                }
+                2 => shared::spec_v1::bundle::IssuanceTerms {
+                    creator_pubkey: response
+                        .creator_pubkey
+                        .as_slice()
+                        .try_into()
+                        .expect("32-byte creator"),
+                    decimals: u8::try_from(response.decimals).expect("u8 decimals"),
+                    issuance_version: 2,
+                    name: response.name,
+                    cap_total: Some(response.cap_total.parse().expect("decimal u128 cap")),
+                    terms_salt: Some(
+                        response
+                            .terms_salt
+                            .as_slice()
+                            .try_into()
+                            .expect("32-byte terms salt"),
+                    ),
+                },
+                other => panic!("unexpected response issuance version {other}"),
+            };
+            assert_eq!(returned, expected);
+            assert_eq!(provenance_asset_id(&returned), asset_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_token_provenance_unknown_is_not_found_with_error_info() {
+        let (domain, _scope) = test_domain().await;
+        let status = grpc_svc(domain)
+            .get_token_provenance(Request::new(GetTokenProvenanceRequest {
+                asset_id: vec![0xee; 32],
+            }))
+            .await
+            .expect_err("unknown asset id must not succeed");
+        assert_eq!(status.code(), Code::NotFound);
+        assert_error_info(&status, "not_found", "404");
+    }
+
+    #[tokio::test]
+    async fn get_token_provenance_rejects_every_non_32_byte_asset_id() {
+        let (domain, _scope) = test_domain().await;
+        let svc = grpc_svc(domain);
+        for width in [0usize, 31, 33] {
+            let status = svc
+                .get_token_provenance(Request::new(GetTokenProvenanceRequest {
+                    asset_id: vec![0xaa; width],
+                }))
+                .await
+                .expect_err("wrong-width asset id must not succeed");
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert_error_info(&status, "malformed_request", "400");
+        }
     }
 
     #[test]

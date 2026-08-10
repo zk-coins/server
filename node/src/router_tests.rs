@@ -6373,6 +6373,292 @@ mod jobs_endpoint_tests {
     // (assert on KernelErrorCode + detail cause — no `should_panic`).
 
     // -----------------------------------------------------------------------
+    // §4.6 / §7.5 open token-provenance REST surface
+    // -----------------------------------------------------------------------
+
+    fn recompute_token_provenance_asset_id(
+        terms: &shared::spec_v1::bundle::IssuanceTerms,
+    ) -> [u8; 32] {
+        use shared::spec_v1::encoding::digest_to_bytes;
+        use shared::spec_v1::hashes::{asset_id_v1, asset_id_v2, name_hash};
+        use shared::spec_v1::tags::GENESIS_TAG;
+
+        let name_hash = name_hash(&terms.name).expect("valid test name");
+        let digest = match terms.issuance_version {
+            1 => asset_id_v1(
+                GENESIS_TAG,
+                &terms.creator_pubkey,
+                &name_hash,
+                terms.decimals,
+                terms.issuance_version,
+            ),
+            2 => asset_id_v2(
+                GENESIS_TAG,
+                &terms.creator_pubkey,
+                &name_hash,
+                terms.decimals,
+                terms.issuance_version,
+                terms.cap_total.expect("v2 cap"),
+                &terms.terms_salt.expect("v2 salt"),
+            ),
+            other => panic!("unsupported test issuance version {other}"),
+        };
+        digest_to_bytes(&digest)
+    }
+
+    #[tokio::test]
+    async fn token_provenance_v1_held_returns_schema() {
+        use shared::spec_v1::bundle::IssuanceTerms;
+        use shared::spec_v1::encoding::digest_to_bytes;
+        use shared::spec_v1::hashes::{asset_id_v1, name_hash};
+        use shared::spec_v1::tags::GENESIS_TAG;
+
+        let (state, pool, _scope) = jobs_test_state().await;
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x51u8; 32],
+            decimals: 3,
+            issuance_version: 1,
+            name: vec![0xff, 0x00, b'R', b'1'],
+            cap_total: None,
+            terms_salt: None,
+        };
+        let asset_id = recompute_token_provenance_asset_id(&terms);
+        crate::v1::db_token_provenance::insert_token_provenance(&pool, &asset_id, &terms)
+            .await
+            .expect("seed v1 retained provenance");
+
+        let req = Request::get(format!(
+            "/v1/token/{}/provenance",
+            hex::encode(asset_id)
+        ))
+        .body(Body::empty())
+        .unwrap();
+        let (status, _headers, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let v: serde_json::Value = serde_json::from_str(&body).expect("token provenance json");
+        assert_eq!(
+            v.as_object().expect("token provenance object").len(),
+            5,
+            "unexpected v1 response fields: {body}"
+        );
+        assert_eq!(v["asset_id"], hex::encode(asset_id));
+        assert_eq!(v["issuance_version"], 1);
+        assert_eq!(v["creator_pubkey"], hex::encode(terms.creator_pubkey));
+        assert_eq!(v["name"], hex::encode(&terms.name));
+        assert_eq!(v["decimals"], terms.decimals);
+        assert!(v.get("cap_total").is_none(), "v1 must omit cap_total: {body}");
+        assert!(v.get("terms_salt").is_none(), "v1 must omit terms_salt: {body}");
+
+        let returned_asset_id: [u8; 32] = hex::decode(
+            v["asset_id"]
+                .as_str()
+                .expect("response asset_id is a hex string"),
+        )
+        .expect("response asset_id is valid hex")
+        .try_into()
+        .expect("response asset_id is 32 bytes");
+        let response_name_hash = name_hash(&terms.name).expect("valid test name");
+        let recomputed = digest_to_bytes(&asset_id_v1(
+            GENESIS_TAG,
+            &terms.creator_pubkey,
+            &response_name_hash,
+            terms.decimals,
+            terms.issuance_version,
+        ));
+        assert_eq!(returned_asset_id, recomputed);
+    }
+
+    #[tokio::test]
+    async fn token_provenance_v2_held_returns_cap() {
+        use shared::spec_v1::bundle::IssuanceTerms;
+        use shared::spec_v1::encoding::digest_to_bytes;
+        use shared::spec_v1::hashes::{asset_id_v2, name_hash};
+        use shared::spec_v1::tags::GENESIS_TAG;
+
+        let (state, pool, _scope) = jobs_test_state().await;
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x52u8; 32],
+            decimals: 9,
+            issuance_version: 2,
+            name: b"router-v2".to_vec(),
+            cap_total: Some(u128::MAX - 17),
+            terms_salt: Some([0x53u8; 32]),
+        };
+        let asset_id = recompute_token_provenance_asset_id(&terms);
+        crate::v1::db_token_provenance::insert_token_provenance(&pool, &asset_id, &terms)
+            .await
+            .expect("seed v2 retained provenance");
+
+        let req = Request::get(format!(
+            "/v1/token/{}/provenance",
+            hex::encode(asset_id)
+        ))
+        .body(Body::empty())
+        .unwrap();
+        let (status, _headers, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let v: serde_json::Value = serde_json::from_str(&body).expect("token provenance json");
+        assert_eq!(
+            v.as_object().expect("token provenance object").len(),
+            7,
+            "unexpected v2 response fields: {body}"
+        );
+        assert_eq!(v["asset_id"], hex::encode(asset_id));
+        assert_eq!(v["issuance_version"], 2);
+        assert_eq!(v["creator_pubkey"], hex::encode(terms.creator_pubkey));
+        assert_eq!(v["name"], hex::encode(&terms.name));
+        assert_eq!(v["decimals"], terms.decimals);
+
+        let response_cap = v["cap_total"]
+            .as_str()
+            .expect("v2 cap_total is a decimal string");
+        assert_eq!(
+            response_cap.parse::<u128>().expect("v2 cap_total parses as u128"),
+            terms.cap_total.expect("v2 cap")
+        );
+        assert_eq!(
+            response_cap,
+            terms.cap_total.expect("v2 cap").to_string()
+        );
+        assert_eq!(
+            v["terms_salt"],
+            hex::encode(terms.terms_salt.expect("v2 salt"))
+        );
+        let response_salt: [u8; 32] = hex::decode(
+            v["terms_salt"]
+                .as_str()
+                .expect("v2 terms_salt is a hex string"),
+        )
+        .expect("v2 terms_salt is valid hex")
+        .try_into()
+        .expect("v2 terms_salt is 32 bytes");
+        assert_eq!(response_salt, terms.terms_salt.expect("v2 salt"));
+
+        let returned_asset_id: [u8; 32] = hex::decode(
+            v["asset_id"]
+                .as_str()
+                .expect("response asset_id is a hex string"),
+        )
+        .expect("response asset_id is valid hex")
+        .try_into()
+        .expect("response asset_id is 32 bytes");
+        let response_name_hash = name_hash(&terms.name).expect("valid test name");
+        let recomputed = digest_to_bytes(&asset_id_v2(
+            GENESIS_TAG,
+            &terms.creator_pubkey,
+            &response_name_hash,
+            terms.decimals,
+            terms.issuance_version,
+            terms.cap_total.expect("v2 cap"),
+            &terms.terms_salt.expect("v2 salt"),
+        ));
+        assert_eq!(returned_asset_id, recomputed);
+    }
+
+    #[tokio::test]
+    async fn token_provenance_unknown_returns_404() {
+        let (state, _pool, _scope) = jobs_test_state().await;
+        let asset_id = [0xeeu8; 32];
+        let req = Request::get(format!(
+            "/v1/token/{}/provenance",
+            hex::encode(asset_id)
+        ))
+        .body(Body::empty())
+        .unwrap();
+        let (status, _headers, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("not-found json");
+        assert_eq!(v["error"], "not_found");
+        assert!(v["message"].as_str().is_some(), "missing message: {body}");
+    }
+
+    #[tokio::test]
+    async fn token_provenance_malformed_asset_id_returns_400() {
+        let (state, _pool, _scope) = jobs_test_state().await;
+
+        for width in [31usize, 33] {
+            let req = Request::get(format!(
+                "/v1/token/{}/provenance",
+                "aa".repeat(width)
+            ))
+            .body(Body::empty())
+            .unwrap();
+            let (status, _headers, body) = run(state.clone(), req).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{width}-byte asset_id body: {body}"
+            );
+            let v: serde_json::Value =
+                serde_json::from_str(&body).expect("malformed-request json");
+            assert_eq!(v["error"], "malformed_request");
+            assert!(v["message"].as_str().is_some(), "missing message: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn token_provenance_not_feature_gated_serves_without_v1_claim() {
+        use shared::spec_v1::bundle::IssuanceTerms;
+
+        // Deliberately no `set_process_stack_mode` call and no `_stack_guard`:
+        // unlike sign/attest routes, open provenance must not consult a gate.
+        let (state, pool, _scope) = jobs_test_state().await;
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x61u8; 32],
+            decimals: 6,
+            issuance_version: 1,
+            name: b"ungated-router".to_vec(),
+            cap_total: None,
+            terms_salt: None,
+        };
+        let held_asset_id = recompute_token_provenance_asset_id(&terms);
+        crate::v1::db_token_provenance::insert_token_provenance(
+            &pool,
+            &held_asset_id,
+            &terms,
+        )
+        .await
+        .expect("seed ungated retained provenance");
+
+        let held_req = Request::get(format!(
+            "/v1/token/{}/provenance",
+            hex::encode(held_asset_id)
+        ))
+        .body(Body::empty())
+        .unwrap();
+        let (held_status, _headers, held_body) = run(state.clone(), held_req).await;
+        assert_eq!(held_status, StatusCode::OK, "body: {held_body}");
+        let held_json: serde_json::Value =
+            serde_json::from_str(&held_body).expect("held provenance json");
+        assert_eq!(held_json["asset_id"], hex::encode(held_asset_id));
+        assert!(
+            held_json.get("error").is_none(),
+            "ungated success returned an error: {held_body}"
+        );
+
+        let unknown_asset_id = [0xfdu8; 32];
+        assert_ne!(unknown_asset_id, held_asset_id, "fixed unknown id collision");
+        let unknown_req = Request::get(format!(
+            "/v1/token/{}/provenance",
+            hex::encode(unknown_asset_id)
+        ))
+        .body(Body::empty())
+        .unwrap();
+        let (unknown_status, _headers, unknown_body) = run(state, unknown_req).await;
+        assert_eq!(
+            unknown_status,
+            StatusCode::NOT_FOUND,
+            "body: {unknown_body}"
+        );
+        let unknown_json: serde_json::Value =
+            serde_json::from_str(&unknown_body).expect("unknown provenance json");
+        assert_eq!(unknown_json["error"], "not_found");
+        assert_ne!(unknown_json["error"], "feature_disabled");
+    }
+
+    // -----------------------------------------------------------------------
     // Gap G6 — §7.5 balance attestation surface
     // -----------------------------------------------------------------------
 

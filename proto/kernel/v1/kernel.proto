@@ -40,6 +40,7 @@ service Kernel {
   rpc RevokeOperationalBundle(RevokeRequest) returns (RevokeResult);
   rpc AttestBalance(AttestRequest) returns (JobHandle);
   rpc IssueViewGrant(GrantRequest) returns (GrantResult);
+  rpc GetTokenProvenance(GetTokenProvenanceRequest) returns (TokenProvenance);
 }
 
 message GetInfoRequest {}
@@ -332,3 +333,14 @@ message GrantRequest {
   bytes chan_bind = 6;                      // opaque 32B equality token (§5.1)
 }
 message GrantResult { string grant = 1; }
+message GetTokenProvenanceRequest { bytes asset_id = 1; }  // asset_id length MUST be exactly 32 (INVALID_ARGUMENT otherwise)
+message TokenProvenance {
+  // Returned only when the node holds captured IssuanceTerms for asset_id;
+  // otherwise NOT_FOUND (API maps to 404 not_found, §7.5).
+  uint32 issuance_version = 1;             // 1 | 2
+  bytes creator_pubkey = 2;                // 32B
+  bytes name = 3;                          // raw name bytes; H(name) binds into asset_id
+  uint32 decimals = 4;
+  string cap_total = 5;                    // decimal u128; set iff issuance_version == 2
+  bytes terms_salt = 6;                    // 32B; set iff issuance_version == 2
+}

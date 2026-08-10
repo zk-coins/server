@@ -41,6 +41,7 @@ use kernel_proto::{
     BootstrapManifest as ProtoBootstrapManifest, CoinProofBlob as ProtoCoinProofBlob,
     CoinProofRequest as ProtoCoinProofRequest, DeliveryCredential as ProtoDeliveryCredential,
     EntrustRequest as ProtoEntrustRequest, EntrustResult as ProtoEntrustResult,
+    GetTokenProvenanceRequest as ProtoGetTokenProvenanceRequest,
     GrantRequest as ProtoGrantRequest, Info as ProtoInfo, Invoice as ProtoInvoice,
     Issuance as ProtoIssuance, Job as ProtoJob, JobError as ProtoJobError,
     JobEvent as ProtoJobEvent, JobResult as ProtoJobResult, Kind0Event as ProtoKind0Event,
@@ -51,9 +52,67 @@ use kernel_proto::{
     RecordBlob as ProtoRecordBlob, RecordRef as ProtoRecordRef,
     RecordRequest as ProtoRecordRequest, RevokeRequest as ProtoRevokeRequest,
     RevokeResult as ProtoRevokeResult, Scope as ProtoScope, SignRequest as ProtoSignRequest,
-    TransitionRequest as ProtoTransitionRequest,
+    TokenProvenance as ProtoTokenProvenance, TransitionRequest as ProtoTransitionRequest,
 };
+use shared::spec_v1::bundle::IssuanceTerms;
 use shared::spec_v1::Address;
+
+/// Parse proto `GetTokenProvenanceRequest` (`asset_id` width = 32).
+pub(crate) fn parse_get_token_provenance_request(
+    req: ProtoGetTokenProvenanceRequest,
+) -> KernelResult<Digest32> {
+    parse_digest32(&req.asset_id, "asset_id")
+}
+
+/// Strictly project retained `IssuanceTerms` onto the versioned §7.8 message.
+pub(crate) fn token_provenance_to_proto(
+    terms: &IssuanceTerms,
+) -> KernelResult<ProtoTokenProvenance> {
+    let (cap_total, terms_salt) = match terms.issuance_version {
+        1 => {
+            if terms.cap_total.is_some() || terms.terms_salt.is_some() {
+                return Err(KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Corrupt token provenance",
+                    "issuance_version=1 carries v2 fields",
+                ));
+            }
+            (String::new(), Vec::new())
+        }
+        2 => {
+            let cap = terms.cap_total.ok_or_else(|| {
+                KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Corrupt token provenance",
+                    "issuance_version=2 is missing cap_total",
+                )
+            })?;
+            let salt = terms.terms_salt.ok_or_else(|| {
+                KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Corrupt token provenance",
+                    "issuance_version=2 is missing terms_salt",
+                )
+            })?;
+            (cap.to_string(), salt.to_vec())
+        }
+        other => {
+            return Err(KernelError::with_internal(
+                KernelErrorCode::InternalError,
+                "Corrupt token provenance",
+                format!("unsupported issuance_version {other}"),
+            ));
+        }
+    };
+    Ok(ProtoTokenProvenance {
+        issuance_version: u32::from(terms.issuance_version),
+        creator_pubkey: terms.creator_pubkey.to_vec(),
+        name: terms.name.clone(),
+        decimals: u32::from(terms.decimals),
+        cap_total,
+        terms_salt,
+    })
+}
 
 /// Parse proto `AttestRequest` into a domain [`AttestBalanceCommand`].
 ///

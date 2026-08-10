@@ -41,7 +41,7 @@
 //!   `GetNullifierPath` / `OpenPullChallenge` / `Pull` / `GetRecord` /
 //!   `GetCoinProof` / `GetAccountState` / `SubscribeReceipts` /
 //!   `ListInscriptions` / `Publish` / `EntrustOperationalBundle` /
-//!   `RevokeOperationalBundle` are wired (**20 of 20**). Receipts stream
+//!   `RevokeOperationalBundle` / `GetTokenProvenance` are wired (**21 of 21**). Receipts stream
 //!   from the shared hub after the receive path's durable dual persist.
 //! - [`state`] — binary `State::load_from_pg` (+ `LoadStateError`). The
 //!   type is public so the binary can hold `Arc<Mutex<State>>`. **Not**

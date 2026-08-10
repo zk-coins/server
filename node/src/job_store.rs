@@ -484,9 +484,10 @@ impl JobStore {
 
     /// Borrow the underlying pool — needed by callers that thread
     /// existing transactions (idempotent reply body lookups) through
-    /// the same connection.
-    #[cfg(test)]
-    pub fn pool(&self) -> &PgPool {
+    /// the same connection, and by the open token-provenance read
+    /// (§4.6 Class B) that the store-backed `KernelService` serves
+    /// without a chain engine.
+    pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
     }
 

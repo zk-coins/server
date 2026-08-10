@@ -92,6 +92,8 @@ pub(crate) mod db_outbox;
 pub(crate) mod db_sdr;
 /// Durable local self-delivery catalog (migration 0036), without invented ACK fields.
 pub(crate) mod db_self_delivery_index;
+/// Durable open Class-B `asset_id → IssuanceTerms` store (migration 0037).
+pub(crate) mod db_token_provenance;
 pub mod db_v1;
 /// §4.2 send-path delivery: finished transition → gift-wrapped kind-1059.
 /// Port pattern matches the nullifier publisher; kernel stays transport-free.

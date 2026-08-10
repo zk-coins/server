@@ -322,6 +322,31 @@ fn read_blob_locator_set(cur: &mut &[u8]) -> Result<BlobLocatorSet, SpecError> {
 // CoinProof
 // ---------------------------------------------------------------------------
 
+/// Canonical `IssuanceTerms` bytes used inside [`CoinProof`] (§1.5 / §7.1).
+///
+/// The token-provenance store persists this exact encoding rather than
+/// introducing a database-only serialization. Version/field-shape validation
+/// is identical to [`serialize_coin_proof`].
+pub fn serialize_issuance_terms(terms: &IssuanceTerms) -> Result<Vec<u8>, SpecError> {
+    let mut out = Vec::new();
+    write_issuance_terms(terms, &mut out)?;
+    Ok(out)
+}
+
+/// Inverse of [`serialize_issuance_terms`]. Rejects trailing bytes so a stored
+/// value has exactly one canonical interpretation.
+pub fn deserialize_issuance_terms(bytes: &[u8]) -> Result<IssuanceTerms, SpecError> {
+    let mut cur = bytes;
+    let terms = read_issuance_terms(&mut cur)?;
+    if !cur.is_empty() {
+        return Err(SpecError::BundleTrailingBytes {
+            context: "IssuanceTerms",
+            remaining: cur.len(),
+        });
+    }
+    Ok(terms)
+}
+
 /// `serialize(CoinProof)` — length-prefixed concatenation in §1.5 order.
 pub fn serialize_coin_proof(cp: &CoinProof) -> Result<Vec<u8>, SpecError> {
     if let Some(terms) = &cp.asset_terms {
@@ -1022,6 +1047,63 @@ mod tests {
         let cp = sample_coin_proof(Some(terms));
         let bytes = serialize_coin_proof(&cp).expect("ser");
         assert_eq!(deserialize_coin_proof(&bytes).expect("de"), cp);
+    }
+
+    #[test]
+    fn standalone_issuance_terms_codec_is_the_coinproof_codec_and_rejects_trailing_bytes() {
+        for terms in [
+            IssuanceTerms {
+                creator_pubkey: [0x01; 32],
+                decimals: 8,
+                issuance_version: 1,
+                name: vec![0xff, 0x00, b'Z'],
+                cap_total: None,
+                terms_salt: None,
+            },
+            IssuanceTerms {
+                creator_pubkey: [0x02; 32],
+                decimals: 2,
+                issuance_version: 2,
+                name: b"CAPPED".to_vec(),
+                cap_total: Some(u128::MAX),
+                terms_salt: Some([0x55; 32]),
+            },
+        ] {
+            let standalone = serialize_issuance_terms(&terms).expect("serialize terms");
+            assert_eq!(
+                deserialize_issuance_terms(&standalone).expect("deserialize terms"),
+                terms
+            );
+
+            let coinproof = serialize_coin_proof(&sample_coin_proof(Some(terms.clone())))
+                .expect("serialize containing CoinProof");
+            let terms_offset = COIN_WIRE_LEN
+                + 4
+                + sample_coin_proof(Some(terms.clone())).proof.len()
+                + 4
+                + sample_coin_proof(Some(terms.clone())).inclusion_proof.len()
+                + 32
+                + 96
+                + 72
+                + 1;
+            assert_eq!(
+                &coinproof[terms_offset..terms_offset + standalone.len()],
+                standalone.as_slice(),
+                "dedicated store bytes must be the exact CoinProof subencoding"
+            );
+
+            let mut trailing = standalone;
+            trailing.push(0xaa);
+            let err = deserialize_issuance_terms(&trailing)
+                .expect_err("trailing bytes must not acquire a second interpretation");
+            assert!(matches!(
+                err,
+                SpecError::BundleTrailingBytes {
+                    context: "IssuanceTerms",
+                    remaining: 1
+                }
+            ));
+        }
     }
 
     #[test]
