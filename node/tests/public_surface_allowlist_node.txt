@@ -251,6 +251,7 @@ node::v1::WalletSignSubmission::signature_r
 node::v1::WalletSignSubmission::signature_s
 node::v1::apply_canonical_survivors
 node::v1::apply_forward_scan
+node::v1::backfill_token_provenance_from_decrypt_index
 node::v1::begin_v1_mint
 node::v1::begin_v1_send
 node::v1::claim_process_stack_from_v1_shadow_env

@@ -428,6 +428,18 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                         );
                     }
                 };
+                let blob_stores = match manifest_store.get() {
+                    Some(v) if !v.blob_stores().is_empty() => v.blob_stores().to_vec(),
+                    _ => {
+                        anyhow::bail!(
+                            "{}=1 requires a verified BootstrapManifest with \
+                             non-empty blob_stores (set {} to a BMF1 artifact) \
+                             — refusing to invent blob store URLs",
+                            crate::v1::recovery::RECOVERY_ENV,
+                            crate::kernel::bootstrap::BOOTSTRAP_MANIFEST_PATH_ENV
+                        );
+                    }
+                };
                 let ops = crate::kernel::chain::chain_identity_ops_from_env().map_err(|e| {
                     anyhow::anyhow!(
                         "{}=1 requires chain identity ops (max_blob_bytes / network \
@@ -445,6 +457,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                     page_limit = recovery_config.page_limit,
                     earliest = recovery_config.earliest_account_timestamp,
                     seed_relays = seed_relays.len(),
+                    blob_stores = blob_stores.len(),
                     "§4.5 recovery campaign scheduled (background; will wait for \
                      entrusteed operational bundle before scanning)"
                 );
@@ -457,6 +470,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                         for attempt in 0..RECOVERY_CAMPAIGN_MAX_ATTEMPTS {
                             let deps = crate::v1::recovery::RecoveryCampaignDeps {
                                 seed_relays: seed_relays.clone(),
+                                blob_stores: blob_stores.clone(),
                                 bundles: Arc::clone(&bundles),
                                 adapter: Arc::clone(&engine),
                                 pool: Arc::clone(&pool),

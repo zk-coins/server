@@ -7,9 +7,12 @@
 
 use anyhow::{bail, Context, Result};
 use shared::spec_v1::bundle::{
-    deserialize_issuance_terms, serialize_issuance_terms, IssuanceTerms,
+    deserialize_coin_proof, deserialize_issuance_terms, serialize_issuance_terms, IssuanceTerms,
 };
+use shared::spec_v1::encoding::digest_to_bytes;
 use sqlx::{PgPool, Postgres, Transaction};
+
+use super::db_decrypt_index::list_all;
 
 /// Named outcome for an idempotent provenance write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +34,28 @@ pub(crate) async fn insert_token_provenance(
     let outcome = insert_token_provenance_in_tx(&mut tx, asset_id, terms).await?;
     tx.commit().await.context("token_provenance commit")?;
     Ok(outcome)
+}
+
+/// Populate provenance introduced after the durable decrypt index.
+///
+/// Corrupt historical CoinProof bytes fail boot loudly; rows without
+/// `asset_terms` intentionally have no provenance entry.
+pub async fn backfill_token_provenance_from_decrypt_index(pool: &PgPool) -> Result<usize> {
+    let rows = list_all(pool).await?;
+    let mut inserted = 0usize;
+    for row in rows {
+        let coin = deserialize_coin_proof(&row.canonical)
+            .context("token_provenance backfill deserialize v1_decrypt_index CoinProof")?;
+        if let Some(terms) = coin.asset_terms.as_ref() {
+            let asset_id = digest_to_bytes(&coin.coin.asset_id);
+            if insert_token_provenance(pool, &asset_id, terms).await?
+                == InsertTokenProvenanceOutcome::Inserted
+            {
+                inserted += 1;
+            }
+        }
+    }
+    Ok(inserted)
 }
 
 /// Insert inside the caller's store-and-ACK transaction.
@@ -104,9 +129,17 @@ pub(crate) async fn get_token_provenance(
 mod tests {
     use super::*;
     use crate::test_db::setup_pool;
+    use crate::v1::db_decrypt_index::{
+        decrypt_record_id, insert_verified_coin_proof, DecryptIndexRow,
+        DecryptVerificationStatus,
+    };
+    use shared::spec_v1::bundle::{
+        serialize_coin_proof, CoinProof, CreatingNullifier, NavOpening,
+    };
     use shared::spec_v1::encoding::digest_to_bytes;
     use shared::spec_v1::hashes::{asset_id_v1, asset_id_v2, name_hash};
     use shared::spec_v1::tags::GENESIS_TAG;
+    use shared::spec_v1::{self as host, Address, Coin};
 
     fn v1_terms() -> IssuanceTerms {
         IssuanceTerms {
@@ -152,6 +185,144 @@ mod tests {
             other => panic!("unsupported test issuance version {other}"),
         };
         digest_to_bytes(&digest)
+    }
+
+    fn coin_proof(asset_id: [u8; 32], asset_terms: Option<IssuanceTerms>) -> CoinProof {
+        CoinProof {
+            coin: Coin {
+                identifier: host::ZERO_HASH,
+                recipient: Address([0x44; 32]),
+                amount: 7,
+                asset_id: host::digest_from_bytes(&asset_id).expect("valid test asset digest"),
+            },
+            proof: vec![],
+            inclusion_proof: vec![],
+            creating_prev_ash: host::ZERO_HASH,
+            creating_nullifier: CreatingNullifier {
+                pk_create: [0x45; 32],
+                r_create: [0x46; 32],
+                r_prime_create: [0x47; 32],
+            },
+            nav_opening: NavOpening {
+                size: 0,
+                mth: host::ZERO_HASH,
+                nav_rand: [0x48; 32],
+            },
+            asset_terms,
+            epk: [0x49; 32],
+            ciphertext: vec![],
+            detect_tag: host::ZERO_HASH,
+        }
+    }
+
+    fn decrypt_index_row(seed: u8, asset_id: [u8; 32], canonical: Vec<u8>) -> DecryptIndexRow {
+        let subject = [seed; 32];
+        let coin_id = [seed + 1; 32];
+        let blob_id = [seed + 2; 32];
+        DecryptIndexRow {
+            record_id: decrypt_record_id(&subject, &coin_id, &blob_id),
+            subject,
+            coin_id,
+            blob_id,
+            detect_tag: [seed + 3; 32],
+            canonical,
+            asset_id,
+            verification_status: DecryptVerificationStatus::Verified,
+            delivery_event_id: [seed + 4; 32],
+            ack_nonce: [seed + 5; 32],
+            occurred_at: u64::from(seed),
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_restores_terms_and_is_idempotent() {
+        let scope = setup_pool().await;
+        let terms = v1_terms();
+        let asset_id = recompute_asset_id(&terms);
+        let canonical = serialize_coin_proof(&coin_proof(asset_id, Some(terms.clone())))
+            .expect("serialize historical CoinProof");
+        let row = decrypt_index_row(0x10, asset_id, canonical);
+        insert_verified_coin_proof(&scope.pool, &row)
+            .await
+            .expect("insert historical decrypt-index row");
+        assert_eq!(
+            get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("pre-backfill lookup"),
+            None
+        );
+
+        assert_eq!(
+            backfill_token_provenance_from_decrypt_index(&scope.pool)
+                .await
+                .expect("first provenance backfill"),
+            1
+        );
+        assert_eq!(
+            get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("post-backfill lookup"),
+            Some(terms)
+        );
+        assert_eq!(
+            backfill_token_provenance_from_decrypt_index(&scope.pool)
+                .await
+                .expect("idempotent provenance backfill"),
+            0
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM token_provenance")
+            .fetch_one(&scope.pool)
+            .await
+            .expect("count provenance rows after repeat backfill");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn backfill_skips_coin_proof_without_asset_terms() {
+        let scope = setup_pool().await;
+        let asset_id = recompute_asset_id(&v2_terms());
+        let canonical = serialize_coin_proof(&coin_proof(asset_id, None))
+            .expect("serialize CoinProof without terms");
+        let row = decrypt_index_row(0x20, asset_id, canonical);
+        insert_verified_coin_proof(&scope.pool, &row)
+            .await
+            .expect("insert decrypt-index row without terms");
+
+        assert_eq!(
+            backfill_token_provenance_from_decrypt_index(&scope.pool)
+                .await
+                .expect("backfill without terms"),
+            0
+        );
+        assert_eq!(
+            get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("lookup skipped provenance"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_fails_loud_on_corrupt_coin_proof() {
+        let scope = setup_pool().await;
+        let row = decrypt_index_row(0x30, [0; 32], vec![0xff]);
+        insert_verified_coin_proof(&scope.pool, &row)
+            .await
+            .expect("insert corrupt historical canonical bytes");
+
+        let err = backfill_token_provenance_from_decrypt_index(&scope.pool)
+            .await
+            .expect_err("corrupt historical CoinProof must fail backfill");
+        assert!(
+            err.to_string()
+                .contains("backfill deserialize v1_decrypt_index CoinProof"),
+            "{err:#}"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM token_provenance")
+            .fetch_one(&scope.pool)
+            .await
+            .expect("count provenance rows after failed backfill");
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]

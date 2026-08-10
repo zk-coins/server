@@ -123,6 +123,9 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             .expect("connect and migrate database"),
     );
     tracing::info!("Connected to Postgres state-layer");
+    node::v1::backfill_token_provenance_from_decrypt_index(&pool)
+        .await
+        .expect("backfill token provenance from v1 decrypt index");
 
     // Cutover Stage 3 — **atomic default switch**.
     //

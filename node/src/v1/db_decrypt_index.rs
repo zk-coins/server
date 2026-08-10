@@ -190,6 +190,19 @@ pub(crate) async fn list_by_subject(
     rows.into_iter().map(DecryptIndexSqlRow::into_row).collect()
 }
 
+/// All durable received-CoinProof rows, for one-time derived-table backfills.
+pub(crate) async fn list_all(pool: &PgPool) -> Result<Vec<DecryptIndexRow>> {
+    let rows: Vec<DecryptIndexSqlRow> = sqlx::query_as(
+        "SELECT record_id, subject, coin_id, blob_id, detect_tag, canonical, asset_id, \
+                verification_status, delivery_event_id, ack_nonce, occurred_at \
+         FROM v1_decrypt_index",
+    )
+    .fetch_all(pool)
+    .await
+    .context("v1_decrypt_index list_all")?;
+    rows.into_iter().map(DecryptIndexSqlRow::into_row).collect()
+}
+
 /// Map a durable row into the kernel [`IndexedRecord`] shape.
 pub(crate) fn to_indexed_record(row: &DecryptIndexRow) -> IndexedRecord {
     IndexedRecord {

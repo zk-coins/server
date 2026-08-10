@@ -1661,6 +1661,7 @@ async fn stage_output_ref_inner(
     transition_kind: TransitionKind,
     oref: &host::OutputRef,
     max_blob_bytes: u64,
+    blob_stores: &[String],
     verify: impl FnOnce(&CoinProof) -> Result<(), IncomingError>,
 ) -> Result<StagedFoldOutcome, SdrDiscardReason> {
     // 1. Recover K_tx from out_ciphertext under K_out (OVK path).
@@ -1696,8 +1697,9 @@ async fn stage_output_ref_inner(
     let client = BlossomClient::new(max_blob_bytes).map_err(|e| SdrDiscardReason::FetchFailed {
         detail: format!("BlossomClient: {e}"),
     })?;
+    let holders = recovery_blob_holders(&oref.blob_locators.holders, blob_stores);
     let (zbe_ciphertext, _attempts) =
-        fetch_blob_from_holders(&client, &oref.blob_id, &oref.blob_locators.holders)
+        fetch_blob_from_holders(&client, &oref.blob_id, &holders)
             .await
             .map_err(|e| SdrDiscardReason::FetchFailed {
                 detail: e.to_string(),
@@ -1800,6 +1802,7 @@ pub(crate) struct SdrGiftWrapCandidate {
 /// Dependencies for one background recovery campaign (runtime-owned handles).
 pub(crate) struct RecoveryCampaignDeps {
     pub seed_relays: Vec<String>,
+    pub blob_stores: Vec<String>,
     pub bundles: Arc<BundleStore>,
     pub adapter: Arc<EngineAdapter>,
     pub pool: Arc<PgPool>,
@@ -1807,6 +1810,18 @@ pub(crate) struct RecoveryCampaignDeps {
     pub receipts: Arc<ReceiptHub>,
     pub max_blob_bytes: u64,
     pub expected_network: String,
+}
+
+/// Receiver-advertised holders remain preferred; verified manifest stores are
+/// appended as recovery-only fallbacks without retrying duplicate URLs.
+fn recovery_blob_holders(advertised: &[String], blob_stores: &[String]) -> Vec<String> {
+    let mut holders = Vec::with_capacity(advertised.len() + blob_stores.len());
+    for holder in advertised.iter().chain(blob_stores) {
+        if !holders.contains(holder) {
+            holders.push(holder.clone());
+        }
+    }
+    holders
 }
 
 /// Wait for at least one entrusteed operational bundle, then run one recovery
@@ -2060,10 +2075,10 @@ pub(crate) async fn run_recovery_campaign(
                         continue;
                     }
                 };
+                let holders =
+                    recovery_blob_holders(&candidate.holders, &deps.blob_stores);
                 let zbe_ciphertext =
-                    match fetch_blob_from_holders(&client, &candidate.blob_id, &candidate.holders)
-                        .await
-                    {
+                    match fetch_blob_from_holders(&client, &candidate.blob_id, &holders).await {
                         Ok((body, _)) => body,
                         Err(e) => {
                             report.sdr_discards.push(SdrDiscard {
@@ -2429,6 +2444,7 @@ async fn stage_output_ref_via_adapter(
         transition_kind,
         oref,
         deps.max_blob_bytes,
+        deps.blob_stores.as_slice(),
         |cp| {
             deps.adapter.with_engine(|engine| {
                 verify_coin_proof_for_index(engine, bridge, cp, secrets.subject)
@@ -2724,9 +2740,13 @@ mod tests {
     use super::*;
     use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
     use sha2::{Digest, Sha256};
+    use shared::spec_v1::bundle::serialize_coin_proof;
+    use shared::spec_v1::note_encryption::zbe_seal;
     use std::collections::{BTreeMap, HashMap};
     use std::ffi::OsString;
     use std::sync::{Arc, Mutex};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
     use zkcoins_program::circuit::compliance::Network;
 
     /// Process environment is shared by the whole test binary. Every recovery-env
@@ -4120,6 +4140,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_fetch_falls_back_to_manifest_blob_store() {
+        let unavailable_holder = MockServer::start().await;
+        let server = MockServer::start().await;
+        let body = b"recovery-only-manifest-copy".to_vec();
+        let blob_id = super::super::blossom::blob_id_of(&body);
+        Mock::given(method("GET"))
+            .and(path(format!("/blossom/{}", hex::encode(blob_id))))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(body.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let advertised = vec![unavailable_holder.uri()];
+        let blob_stores = vec![server.uri()];
+        let holders = recovery_blob_holders(&advertised, &blob_stores);
+        let client = BlossomClient::new(1024).expect("construct Blossom client");
+        let (fetched, attempts) = fetch_blob_from_holders(&client, &blob_id, &holders)
+            .await
+            .expect("manifest blob store must recover the blob");
+
+        assert_eq!(fetched, body);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].holder, advertised[0]);
+        assert_eq!(attempts[1].holder, blob_stores[0]);
+    }
+
+    #[test]
+    fn recovery_blob_holders_preserve_preference_and_deduplicate() {
+        let advertised = vec![
+            "https://recipient-a.test".to_owned(),
+            "https://shared.test".to_owned(),
+            "https://recipient-a.test".to_owned(),
+        ];
+        let blob_stores = vec![
+            "https://shared.test".to_owned(),
+            "https://manifest-b.test".to_owned(),
+            "https://manifest-b.test".to_owned(),
+        ];
+
+        assert_eq!(
+            recovery_blob_holders(&advertised, &blob_stores),
+            vec![
+                "https://recipient-a.test".to_owned(),
+                "https://shared.test".to_owned(),
+                "https://manifest-b.test".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_output_ref_fetches_coin_only_from_manifest_blob_store() {
+        let scope = crate::test_db::setup_pool().await;
+        let subject = [0x88u8; 32];
+        let nk = fixture_sk(b"zkCoins/v1/test-vector/recovery/blob-store-stage-nk");
+        let pk = fixture_sk(b"zkCoins/v1/test-vector/recovery/blob-store-stage-pk");
+        let account = sample_account_state_for(subject, nk, pk, 1);
+        let accepted_record = sample_sdr_record(1, host::ZERO_HASH, account, pk, 100);
+        let bridge = ProverBridge::new(Network::Regtest);
+        let ovk = fixture_sk(b"zkCoins/v1/test-vector/recovery/blob-store-stage-ovk");
+        let epk = fixture_xonly(b"zkCoins/v1/test-vector/recovery/blob-store-stage-epk");
+        let k_tx = [0x75; 32];
+        let coin_proof = host::CoinProof {
+            coin: host::Coin {
+                identifier: host::ZERO_HASH,
+                recipient: Address([0x99; 32]),
+                amount: 1,
+                asset_id: host::ZERO_HASH,
+            },
+            proof: vec![],
+            inclusion_proof: vec![],
+            creating_prev_ash: host::ZERO_HASH,
+            creating_nullifier: accepted_record.own_nullifier,
+            nav_opening: host::NavOpening {
+                size: 0,
+                mth: host::ZERO_HASH,
+                nav_rand: [0; 32],
+            },
+            asset_terms: None,
+            epk,
+            ciphertext: vec![],
+            detect_tag: host::ZERO_HASH,
+        };
+        let plaintext = serialize_coin_proof(&coin_proof).expect("serialize CoinProof");
+        let (zbe_ciphertext, blob_id) = zbe_seal(&k_tx, &plaintext).expect("seal CoinProof");
+        let unavailable_holder = MockServer::start().await;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/blossom/{}", hex::encode(blob_id))))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(zbe_ciphertext),
+            )
+            .mount(&server)
+            .await;
+        let out_ciphertext = crate::v1::delivery::out_ciphertext_for_output_ref(
+            &ovk,
+            &epk,
+            &k_tx,
+            &[0x76; 32],
+        )
+        .expect("construct OVK recovery envelope");
+        let oref = host::OutputRef {
+            coin_id: digest_to_bytes(&coin_proof.coin.identifier),
+            blob_id,
+            epk,
+            out_ciphertext,
+            blob_locators: host::BlobLocatorSet {
+                holders: vec![unavailable_holder.uri()],
+            },
+        };
+        let blob_stores = vec![server.uri()];
+
+        let outcome = stage_output_ref_inner(
+            FoldOutputRefStores { pool: &scope.pool },
+            &bridge,
+            FoldOutputRefSecrets {
+                subject: &subject,
+                ovk: &ovk,
+            },
+            &accepted_record,
+            TransitionKind::Send,
+            &oref,
+            4096,
+            &blob_stores,
+            |_| -> Result<(), IncomingError> {
+                panic!("a CoinProof for another subject must not reach verification")
+            },
+        )
+        .await
+        .expect("manifest blob store must supply the staged CoinProof");
+        assert_eq!(outcome, StagedFoldOutcome::NotOurs);
+    }
+
+    #[tokio::test]
     async fn stage_output_ref_fails_locally_for_invalid_utf8_and_empty_holders() {
         let scope = crate::test_db::setup_pool().await;
         let subject = [0x88u8; 32];
@@ -4153,6 +4311,7 @@ mod tests {
             TransitionKind::Send,
             &invalid_utf8,
             1024,
+            &[],
             |_| -> Result<(), IncomingError> {
                 panic!("verification must not run after invalid out_ciphertext UTF-8")
             },
@@ -4189,6 +4348,7 @@ mod tests {
             TransitionKind::Send,
             &no_holders,
             1024,
+            &[],
             |_| -> Result<(), IncomingError> {
                 panic!("verification must not run when the holder list is empty")
             },
@@ -4607,6 +4767,7 @@ mod tests {
 
         let make_deps = |seed_relays: Vec<String>| RecoveryCampaignDeps {
             seed_relays,
+            blob_stores: Vec::new(),
             bundles: BundleStore::shared(),
             adapter: Arc::clone(&adapter),
             pool: Arc::clone(&pool),
