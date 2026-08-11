@@ -5636,6 +5636,7 @@ dependencies = [
  "serde",
  "sha2",
  "shared",
+ "tracing",
  "trybuild",
  "zkcoins-program-plonky2",
 ]

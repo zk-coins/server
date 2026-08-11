@@ -12,6 +12,7 @@ bincode = "1.3"
 num = "0.4"
 serde = { workspace = true }
 sha2 = { workspace = true }
+tracing = { workspace = true }
 bitcoin = { workspace = true }
 # Cross-process file locking for the host-wide proving lease; uses the same
 # `fs2::FileExt::try_lock_exclusive` pattern as `node/src/test_db.rs`.

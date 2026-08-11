@@ -853,7 +853,7 @@ impl Publisher {
         let commit_txid = self.broadcast_commit(&prepared)?;
         let reveal_txid = self.broadcast_reveal(&prepared)?;
 
-        eprintln!(
+        tracing::info!(
             "publisher: broadcast commit={commit_txid} ({} vB, fee {} sat) \
              reveal={reveal_txid} ({} vB, fee {} sat) fee_rate={} sat/vB members={member_count}",
             prepared.commit_vsize,
@@ -1165,9 +1165,10 @@ impl Publisher {
                 continue;
             }
             if let Err(err) = ensure_deterministic_funding(&entry.script_pub_key) {
-                eprintln!(
+                tracing::warn!(
                     "publisher: skipping ineligible UTXO {}:{} — {err}",
-                    entry.txid, entry.vout
+                    entry.txid,
+                    entry.vout
                 );
                 continue;
             }
@@ -1257,7 +1258,7 @@ impl Publisher {
                 .checked_sub(spent_core)
                 .context("with-change leftover underflow")?;
             if leftover < dust {
-                eprintln!(
+                tracing::info!(
                     "publisher: change {} sat is below dust limit {} sat under with-change fees; \
                      switching to no-change topology (round {round})",
                     leftover.to_sat(),
@@ -1297,9 +1298,9 @@ impl Publisher {
                     .context("with-change measured leftover underflow")?
                     < dust
             {
-                eprintln!(
+                tracing::info!(
                     "publisher: measured with-change fees leave residual below dust or shortfall \
-                     on round {round}; switching to no-change topology"
+                 on round {round}; switching to no-change topology"
                 );
                 with_change_viable = false;
                 break;

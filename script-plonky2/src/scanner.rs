@@ -1532,10 +1532,10 @@ impl Scanner {
 
             if outcome.finality_broken {
                 // Loud surface: finality assumption broken — caller must stop crediting.
-                eprintln!(
+                tracing::error!(
                     "zkCoins scanner: FINALITY BROKEN after reorg — \
-                     displaced_final_count={}, old_tip_height={old_tip_height}, \
-                     fork={fork_height:?}. Callers MUST stop crediting against the \
+             displaced_final_count={}, old_tip_height={old_tip_height}, \
+             fork={fork_height:?}. Callers MUST stop crediting against the \
                      broken state (§3.9).",
                     outcome.displaced_final_count
                 );

@@ -1436,10 +1436,9 @@ fn build_skeleton_circuit_inner(config: CircuitConfig, network: Network) -> Skel
         }
         candidate = data.common.clone();
     }
-    let (data, targets, gate_count, iterations) = converged.unwrap_or_else(|| {
+    let (data, targets, gate_count, _iterations) = converged.unwrap_or_else(|| {
         panic!("compliance CommonCircuitData fixed point did not converge in 16 iterations")
     });
-    eprintln!("compliance cyclic CommonCircuitData fixed point converged in {iterations} build(s)");
 
     let dummy = zk_safe_dummy_circuit(&data.common);
     let base_proof = build_base_proof(&dummy, &data.verifier_only);

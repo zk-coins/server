@@ -195,7 +195,10 @@ fn acquire_exclusive_with_timeout(file: &File, path: &Path, timeout_secs: u64) -
             }
             Err(error) => {
                 return Err(error).with_context(|| {
-                    format!("acquire exclusive host-wide proving lease {}", path.display())
+                    format!(
+                        "acquire exclusive host-wide proving lease {}",
+                        path.display()
+                    )
                 });
             }
         }
@@ -263,7 +266,7 @@ fn reaper_tick(idle_ttl_secs: u64, try_evict_all_unreferenced: impl FnOnce() -> 
             .copied()
             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("non-string panic payload");
-        eprintln!("zkcoins prover reaper tick panicked; continuing: {description}");
+        tracing::warn!("zkcoins prover reaper tick panicked; continuing: {description}");
     }
 }
 
