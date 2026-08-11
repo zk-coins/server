@@ -980,6 +980,7 @@ async fn process_mint(
         }
     };
 
+    let mint_name_bytes = issuance_name.clone().into_bytes();
     let mint_req = zkcoins_prover::state_engine::MintRequest {
         owner: shared::spec_v1::Address(subject.0),
         nk,
@@ -1042,6 +1043,73 @@ async fn process_mint(
             return Ok(());
         }
     };
+
+    let mint_terms_stage = async {
+        let ai = pending
+            .witness_wip
+            .asset_issuance
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "begin_v1_mint returned a transition without asset_issuance witness"
+                )
+            })?;
+        let issuance_terms = shared::spec_v1::bundle::IssuanceTerms {
+            creator_pubkey: ai.creator_pubkey,
+            decimals: ai.decimals,
+            issuance_version: ai.issuance_version,
+            name: mint_name_bytes,
+            cap_total: (ai.issuance_version == 2).then_some(ai.cap_total),
+            terms_salt: (ai.issuance_version == 2).then_some(ai.terms_salt),
+        };
+        crate::v1::db_mint_terms_staging::stage_mint_issuance_terms(
+            adapter.pool(),
+            &pending.witness_wip.prev_account_state.current_pubkey,
+            &issuance_terms,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("stage mint IssuanceTerms: {e:#}"))?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(e) = mint_terms_stage {
+        tracing::warn!(
+            "Job dispatcher: mint job {} IssuanceTerms staging failed: {:#}",
+            public_id,
+            e
+        );
+        // Cancel may have won while staging; do not overwrite cancelled.
+        if let Ok(Some(j)) = job_store.load(public_id).await {
+            if j.status == JobStatus::Cancelled {
+                cleanup_pending_sign(job_store, app_state, public_id).await;
+                notify_map.remove(&public_id);
+                return Ok(());
+            }
+        }
+        let message = fail_error_string(&format!("mint IssuanceTerms staging: {e:#}"));
+        // Allowed: proving → failed.
+        if !job_store
+            .fail(public_id, JobStatus::Proving, &message)
+            .await?
+        {
+            tracing::warn!("Job dispatcher: fail matched 0 rows; not publishing failed event");
+            cleanup_pending_sign(job_store, app_state, public_id).await;
+            notify_map.remove(&public_id);
+            return Ok(());
+        }
+        publish_phase(
+            notify_map,
+            public_id,
+            JobPhaseEvent {
+                status: JobStatus::Failed,
+                phase: "failed".to_string(),
+                proof_id: None,
+                result: None,
+                error: Some(message),
+            },
+        );
+        return Ok(());
+    }
 
     // Cancel may have won during the prove leg.
     if let Ok(Some(j)) = job_store.load(public_id).await {

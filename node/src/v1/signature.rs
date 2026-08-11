@@ -1065,7 +1065,8 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
                 .await
                 .map_err(|e| anyhow::anyhow!("load Phase A on crash-resume: {e:#}"))?;
             if already.is_none() {
-                let delivery_snapshot = DeliverySnapshot::from_pending(&pending, &signature)?;
+                let delivery_snapshot =
+                    DeliverySnapshot::from_pending(adapter.pool(), &pending, &signature).await?;
                 let tip_hash = adapter.tip_hash();
                 let tip_height = adapter.with_engine(|engine| engine.tip_height());
                 let tip_height_u32 = u32::try_from(tip_height).map_err(|_| {
@@ -1105,7 +1106,8 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     }
 
     // Capture delivery materials before prove moves `pending`.
-    let delivery_snapshot = DeliverySnapshot::from_pending(&pending, &signature)?;
+    let delivery_snapshot =
+        DeliverySnapshot::from_pending(adapter.pool(), &pending, &signature).await?;
 
     // §4.2 targets must be resolved **before** durable finalise. A missing
     // IVPK discovered only at mesh-build would leave the transition already
@@ -1380,6 +1382,10 @@ async fn stage_sdr_phase_a_after_mesh(
         return Err(crate::v1::delivery::DeliveryError::BlobHoldersEmpty);
     }
 
+    // Self-delivery bypasses receive verification, so retain issuer provenance
+    // here; the append-only insert is safe on every crash-resume re-entry.
+    insert_issuer_mint_provenance(adapter.pool(), snap).await?;
+
     let subject = SubjectAddress(snap.owner);
     let bundle = deps.bundles.get_active(&subject).ok_or(
         crate::v1::delivery::DeliveryError::OperationalBundleMissing {
@@ -1499,13 +1505,14 @@ async fn stage_sdr_phase_a_after_mesh(
     // Change / self-output coins: build local CoinProof envelopes for SDR
     // output_refs (no mesh publish) and durably index their canonical bodies
     // for immediate ownership/grant disclosure.
-    let change_coins: Vec<_> = snap
-        .output_coins
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.recipient.0 == snap.owner)
-        .collect();
-    if !change_coins.is_empty() {
+    let change_materials = build_self_delivery_coin_materials(
+        snap,
+        proof_bytes,
+        self_ivpk,
+        self_op_pk,
+        &deps.self_relays,
+    );
+    if !change_materials.is_empty() {
         let transition_kind = match snap.record_kind {
             0x01 => TransitionKind::Mint,
             0x02 => TransitionKind::Send,
@@ -1516,28 +1523,7 @@ async fn stage_sdr_phase_a_after_mesh(
                 ));
             }
         };
-        let all_output_ids: Vec<_> = snap.output_coins.iter().map(|c| c.identifier).collect();
-        let creating_nullifier = crate::v1::delivery::creating_nullifier_from_parts(
-            snap.pk_create,
-            snap.r_create,
-            snap.r_prime_create,
-        );
-        let nav_opening =
-            crate::v1::delivery::bundle_nav_opening(snap.nav_size, snap.nav_mth, snap.nav_rand);
-        for (leaf_index, coin) in change_coins {
-            let material = crate::v1::delivery::OutgoingCoinMaterial {
-                coin: coin.clone(),
-                leaf_index: leaf_index as u32,
-                all_output_ids: all_output_ids.clone(),
-                proof_bytes: proof_bytes.to_vec(),
-                creating_prev_ash: snap.creating_prev_ash,
-                creating_nullifier,
-                nav_opening,
-                asset_terms: None,
-                recipient_ivpk: self_ivpk,
-                recipient_op_pk: self_op_pk,
-                recipient_relays: deps.self_relays.clone(),
-            };
+        for material in change_materials {
             let built = {
                 let mut rng = deps
                     .rng
@@ -1553,7 +1539,7 @@ async fn stage_sdr_phase_a_after_mesh(
                 )?
             };
             upload_built_coin_blob(&built, &bundle.op, deps.max_blob_bytes).await?;
-            let coin_id = digest_to_bytes(&coin.identifier);
+            let coin_id = digest_to_bytes(&material.coin.identifier);
             let row = SelfDeliveryIndexRow {
                 record_id: decrypt_record_id(&snap.owner, &coin_id, &built.blob_id),
                 subject: snap.owner,
@@ -1561,7 +1547,7 @@ async fn stage_sdr_phase_a_after_mesh(
                 blob_id: built.blob_id,
                 detect_tag: built.keys.detect_tag,
                 canonical: built.canonical.clone(),
-                asset_id: digest_to_bytes(&coin.asset_id),
+                asset_id: digest_to_bytes(&material.coin.asset_id),
                 transition_kind,
                 occurred_at: 0,
             };
@@ -1621,6 +1607,67 @@ async fn stage_sdr_phase_a_after_mesh(
     Ok(())
 }
 
+async fn insert_issuer_mint_provenance(
+    pool: &sqlx::PgPool,
+    snap: &DeliverySnapshot,
+) -> Result<(), crate::v1::delivery::DeliveryError> {
+    let Some(terms) = snap.mint_asset_terms.as_ref() else {
+        return Ok(());
+    };
+    let asset_id = snap
+        .output_coins
+        .first()
+        .map(|coin| digest_to_bytes(&coin.asset_id))
+        .ok_or_else(|| {
+            crate::v1::delivery::DeliveryError::Relay(
+                "mint transition has no output coins to derive asset_id from".into(),
+            )
+        })?;
+    crate::v1::db_token_provenance::insert_token_provenance(pool, &asset_id, terms)
+        .await
+        .map_err(|e| {
+            crate::v1::delivery::DeliveryError::Relay(format!(
+                "issuer-side token provenance insert: {e:#}"
+            ))
+        })?;
+    Ok(())
+}
+
+fn build_self_delivery_coin_materials(
+    snap: &DeliverySnapshot,
+    proof_bytes: &[u8],
+    recipient_ivpk: [u8; 32],
+    recipient_op_pk: [u8; 32],
+    recipient_relays: &[String],
+) -> Vec<crate::v1::delivery::OutgoingCoinMaterial> {
+    use crate::v1::delivery::{
+        bundle_nav_opening, creating_nullifier_from_parts, OutgoingCoinMaterial,
+    };
+
+    let all_output_ids: Vec<_> = snap.output_coins.iter().map(|coin| coin.identifier).collect();
+    let creating_nullifier =
+        creating_nullifier_from_parts(snap.pk_create, snap.r_create, snap.r_prime_create);
+    let nav_opening = bundle_nav_opening(snap.nav_size, snap.nav_mth, snap.nav_rand);
+    snap.output_coins
+        .iter()
+        .enumerate()
+        .filter(|(_, coin)| coin.recipient.0 == snap.owner)
+        .map(|(leaf_index, coin)| OutgoingCoinMaterial {
+            coin: coin.clone(),
+            leaf_index: leaf_index as u32,
+            all_output_ids: all_output_ids.clone(),
+            proof_bytes: proof_bytes.to_vec(),
+            creating_prev_ash: snap.creating_prev_ash,
+            creating_nullifier,
+            nav_opening,
+            asset_terms: snap.mint_asset_terms.clone(),
+            recipient_ivpk,
+            recipient_op_pk,
+            recipient_relays: recipient_relays.to_vec(),
+        })
+        .collect()
+}
+
 /// Snapshot of delivery-relevant fields taken before prove moves `pending`.
 struct DeliverySnapshot {
     owner: [u8; 32],
@@ -1632,6 +1679,8 @@ struct DeliverySnapshot {
     pk_create: [u8; 32],
     r_create: [u8; 32],
     r_prime_create: [u8; 32],
+    /// Full raw terms staged only for mint transitions; absent on send/receive.
+    mint_asset_terms: Option<shared::spec_v1::bundle::IssuanceTerms>,
     /// SDR `RecordKind` wire byte (mint/send/receive).
     record_kind: u8,
     /// Input coin ids (spent / folded into the transition).
@@ -1643,7 +1692,8 @@ struct DeliverySnapshot {
 }
 
 impl DeliverySnapshot {
-    fn from_pending(
+    async fn from_pending(
+        pool: &sqlx::PgPool,
         pending: &PendingTransition,
         signature: &TransitionSignature,
     ) -> Result<Self, anyhow::Error> {
@@ -1661,6 +1711,31 @@ impl DeliverySnapshot {
             shared::spec_v1::bundle::RecordKind::Send => 0x02,
             shared::spec_v1::bundle::RecordKind::Receive => 0x03,
         };
+        let mint_asset_terms =
+            if record_kind == shared::spec_v1::bundle::RecordKind::Mint {
+                Some(
+                    crate::v1::db_mint_terms_staging::get_staged_mint_issuance_terms(
+                        pool,
+                        &signature.pk_i,
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "v1.1 finalise: load staged mint IssuanceTerms for pk_create/signature.pk_i {}: {e:#}",
+                            hex_lower(&signature.pk_i)
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "v1.1 finalise: mint transition is finalising without staged \
+                             IssuanceTerms for pk_create/signature.pk_i {}",
+                            hex_lower(&signature.pk_i)
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
         let spent_or_folded_coin_ids: Vec<[u8; 32]> = w
             .input_coins
             .iter()
@@ -1676,6 +1751,7 @@ impl DeliverySnapshot {
             pk_create: signature.pk_i,
             r_create: signature.signature_r(),
             r_prime_create: signature.r_prime,
+            mint_asset_terms,
             record_kind: record_kind_byte,
             spent_or_folded_coin_ids,
             entry_send_counter: w.prev_account_state.send_counter,
@@ -1744,7 +1820,7 @@ fn build_outgoing_coin_materials(
             creating_prev_ash: snap.creating_prev_ash,
             creating_nullifier,
             nav_opening,
-            asset_terms: None,
+            asset_terms: snap.mint_asset_terms.clone(),
             recipient_ivpk: target.ivpk,
             recipient_op_pk: target.op_pk,
             recipient_relays: target.relays,
@@ -2930,10 +3006,22 @@ mod tests {
             pk_create: [0x33; 32],
             r_create: [0x44; 32],
             r_prime_create: [0x55; 32],
+            mint_asset_terms: None,
             record_kind: 0x02,
             spent_or_folded_coin_ids: Vec::new(),
             entry_send_counter: 7,
             proof_data_bytes: [0x66; 192],
+        }
+    }
+
+    fn mint_terms() -> shared::spec_v1::bundle::IssuanceTerms {
+        shared::spec_v1::bundle::IssuanceTerms {
+            creator_pubkey: [0x71; 32],
+            decimals: 8,
+            issuance_version: 2,
+            name: b"Durable Mint".to_vec(),
+            cap_total: Some(1_000_000),
+            terms_salt: Some([0x72; 32]),
         }
     }
 
@@ -3734,6 +3822,119 @@ mod tests {
             assert_eq!(material.recipient_op_pk, op_pk);
             assert_eq!(material.recipient_relays, relays);
         }
+    }
+
+    #[test]
+    fn mint_outgoing_materials_carry_asset_terms_on_every_external_output() {
+        use crate::v1::delivery::{DeliveryTarget, DeliveryTargetStore};
+        use crate::v1::nostr::nip59::SecureRandom;
+
+        let port = UnusedDeliveryPort;
+        let bundles = crate::kernel::bootstrap::BundleStore::new();
+        let targets = DeliveryTargetStore::new();
+        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> = std::sync::Mutex::new(Box::new(
+            crate::v1::nostr::nip59::OsSecureRandom,
+        ));
+        let deps = FinaliseDeliveryDeps {
+            port: &port,
+            bundles: &bundles,
+            targets: &targets,
+            blob_holders: vec!["https://holder.example".to_string()],
+            max_blob_bytes: 1_000_000,
+            now: 100,
+            expected_network: "regtest",
+            self_relays: vec!["wss://self.example".to_string()],
+            rng: &rng,
+        };
+
+        let recipient_a = [0xd1; 32];
+        let recipient_b = [0xe1; 32];
+        for (recipient, ivpk, op_pk) in [
+            (recipient_a, [0xd2; 32], [0xd3; 32]),
+            (recipient_b, [0xe2; 32], [0xe3; 32]),
+        ] {
+            targets.insert(
+                recipient,
+                DeliveryTarget {
+                    ivpk,
+                    op_pk,
+                    relays: vec!["wss://recipient.example".to_string()],
+                    blob_stores: Vec::new(),
+                    expires_at: 101,
+                },
+            );
+        }
+
+        let expected_terms = mint_terms();
+        let mut snap = delivery_snapshot(vec![
+            external_coin(recipient_a),
+            external_coin(recipient_b),
+        ]);
+        snap.record_kind = 0x01;
+        snap.mint_asset_terms = Some(expected_terms.clone());
+
+        let materials = build_outgoing_coin_materials(&snap, &[0xaa], &deps)
+            .expect("mint external materials build");
+        assert_eq!(materials.len(), 2);
+        assert!(materials
+            .iter()
+            .all(|material| material.asset_terms == Some(expected_terms.clone())));
+    }
+
+    #[test]
+    fn mint_self_delivery_material_carries_asset_terms() {
+        let owner = [0x11; 32];
+        let mut self_coin = external_coin(owner);
+        self_coin.amount = 77;
+        let expected_terms = mint_terms();
+        let mut snap = delivery_snapshot(vec![
+            external_coin([0x91; 32]),
+            self_coin.clone(),
+        ]);
+        snap.record_kind = 0x01;
+        snap.mint_asset_terms = Some(expected_terms.clone());
+
+        let materials = build_self_delivery_coin_materials(
+            &snap,
+            &[0xfa, 0xfb],
+            [0xa1; 32],
+            [0xa2; 32],
+            &["wss://self.example".to_string()],
+        );
+        assert_eq!(materials.len(), 1);
+        let material = &materials[0];
+        assert_eq!(material.coin, self_coin);
+        assert_eq!(material.leaf_index, 1);
+        assert_eq!(material.asset_terms, Some(expected_terms));
+        assert_eq!(material.proof_bytes, vec![0xfa, 0xfb]);
+        assert_eq!(material.recipient_ivpk, [0xa1; 32]);
+        assert_eq!(material.recipient_op_pk, [0xa2; 32]);
+    }
+
+    #[tokio::test]
+    async fn issuer_mint_provenance_helper_persists_snapshot_terms() {
+        use crate::test_db::setup_pool;
+
+        let scope = setup_pool().await;
+        let expected_terms = mint_terms();
+        let coin = external_coin([0x81; 32]);
+        let asset_id = digest_to_bytes(&coin.asset_id);
+        let mut snap = delivery_snapshot(vec![coin]);
+        snap.record_kind = 0x01;
+        snap.mint_asset_terms = Some(expected_terms.clone());
+
+        insert_issuer_mint_provenance(&scope.pool, &snap)
+            .await
+            .expect("persist issuer-side mint provenance");
+        insert_issuer_mint_provenance(&scope.pool, &snap)
+            .await
+            .expect("repeat issuer-side mint provenance after crash-resume");
+        assert_eq!(
+            crate::v1::db_token_provenance::get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("read issuer-side mint provenance"),
+            Some(expected_terms)
+        );
     }
 
     #[test]

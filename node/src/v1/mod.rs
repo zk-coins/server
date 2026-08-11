@@ -86,6 +86,8 @@ pub mod attest_verify;
 pub(crate) mod blossom;
 /// Durable `v1_decrypt_index` (migration 0031) — SQL half of the private-record catalog.
 pub(crate) mod db_decrypt_index;
+/// Durable raw mint `IssuanceTerms` bridge (migration 0038), keyed by `pk_create`.
+pub(crate) mod db_mint_terms_staging;
 /// Durable `v1_delivery_outbox` (migration 0032) — mesh delivery state machine.
 pub(crate) mod db_outbox;
 /// Durable `v1_sdr_phase_a` (migration 0033) — §4.2 SDR Phase-A staging.

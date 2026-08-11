@@ -113,6 +113,10 @@ async fn connect_and_migrate_creates_all_tables() {
     //   * After 0036 (v1 self-delivery index): +1 table
     //     (`v1_self_delivery_index`).
     //   * After 0037 (token provenance): +1 table (`token_provenance`).
+    //   * After 0038 (v1 mint terms staging): +1 table
+    //     (`v1_mint_terms_staging`; the durable begin→finalise bridge for
+    //     the raw mint IssuanceTerms — sorts between `v1_inscriptions` and
+    //     `v1_nflog_entries`).
     assert_eq!(
         names,
         vec![
@@ -152,6 +156,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "v1_engine_meta".to_string(),
             "v1_inscription_members".to_string(),
             "v1_inscriptions".to_string(),
+            "v1_mint_terms_staging".to_string(),
             "v1_nflog_entries".to_string(),
             "v1_nullifier_index".to_string(),
             "v1_pending_publishes".to_string(),
