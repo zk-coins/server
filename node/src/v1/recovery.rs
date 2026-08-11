@@ -1813,8 +1813,11 @@ pub(crate) struct RecoveryCampaignDeps {
 }
 
 /// Receiver-advertised holders remain preferred; verified manifest stores are
-/// appended as recovery-only fallbacks without retrying duplicate URLs.
-fn recovery_blob_holders(advertised: &[String], blob_stores: &[String]) -> Vec<String> {
+/// appended as recovery-discoverable fallbacks without retrying duplicate URLs.
+pub(crate) fn recovery_blob_holders(
+    advertised: &[String],
+    blob_stores: &[String],
+) -> Vec<String> {
     let mut holders = Vec::with_capacity(advertised.len() + blob_stores.len());
     for holder in advertised.iter().chain(blob_stores) {
         if !holders.contains(holder) {
@@ -2001,6 +2004,7 @@ pub(crate) async fn run_recovery_campaign(
                 },
                 CandidateNetwork {
                     max_blob_bytes: deps.max_blob_bytes,
+                    manifest_blob_stores: &deps.blob_stores,
                     discovery_relays: &deps.seed_relays,
                     expected_network: &deps.expected_network,
                 },

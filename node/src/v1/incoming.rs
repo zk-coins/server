@@ -64,6 +64,7 @@ use super::nostr::nip59::{seal_and_wrap, unwrap_gift, SecureRandom, KIND_GIFT_WR
 use super::nostr::profile::resolve_profile_by_op_pubkey;
 use super::nostr::relay::{Filter, RelayPool};
 use super::receive::{extract_compliance_public_inputs, verify_output_inclusion};
+use super::recovery::recovery_blob_holders;
 use crate::kernel::access::{
     publish_credit_if_inserted, CreditReceipt, InMemoryPrivateIndex, InsertRecordOutcome,
     ReceiptHub, ReceiptState,
@@ -635,10 +636,11 @@ pub(crate) struct CandidateStores<'a> {
     pub receipts: &'a ReceiptHub,
 }
 
-/// Blob size bound, discovery relays (sender profile), closed network label.
+/// Blob size bound, recovery stores, discovery relays, closed network label.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CandidateNetwork<'a> {
     pub max_blob_bytes: u64,
+    pub manifest_blob_stores: &'a [String],
     pub discovery_relays: &'a [String],
     pub expected_network: &'a str,
 }
@@ -649,6 +651,7 @@ pub(crate) struct IncomingPoll<'a> {
     pub secrets: CandidateSecrets<'a>,
     pub stores: CandidateStores<'a>,
     pub max_blob_bytes: u64,
+    pub manifest_blob_stores: &'a [String],
     pub expected_network: &'a str,
     pub now: u64,
     pub rng: &'a mut dyn SecureRandom,
@@ -763,6 +766,7 @@ async fn process_delivery_candidate_inner(
     }: CandidateStores<'_>,
     CandidateNetwork {
         max_blob_bytes,
+        manifest_blob_stores,
         discovery_relays,
         expected_network,
     }: CandidateNetwork<'_>,
@@ -865,8 +869,9 @@ async fn process_delivery_candidate_inner(
     if let Some(first) = payload.holders.first() {
         let _ = client.probe(first, &payload.blob_id).await;
     }
+    let holders = recovery_blob_holders(&payload.holders, manifest_blob_stores);
     let (zbe_ciphertext, holder_attempts) =
-        fetch_blob_from_holders(&client, &payload.blob_id, &payload.holders).await?;
+        fetch_blob_from_holders(&client, &payload.blob_id, &holders).await?;
 
     // 4. K_tx + ZBE-Open.
     let k_tx = derive_note_key(&ss, &epk).map_err(IncomingError::DetectCrypto)?;
@@ -1091,6 +1096,7 @@ pub(crate) async fn poll_incoming_deliveries(
         secrets,
         stores,
         max_blob_bytes,
+        manifest_blob_stores,
         expected_network,
         now,
         rng,
@@ -1125,6 +1131,7 @@ pub(crate) async fn poll_incoming_deliveries(
                 stores,
                 CandidateNetwork {
                     max_blob_bytes,
+                    manifest_blob_stores,
                     discovery_relays: relays,
                     expected_network,
                 },

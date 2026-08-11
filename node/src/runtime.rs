@@ -587,6 +587,10 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         let receipt_hub = Arc::clone(&shared_receipt_hub);
         let pool = Arc::clone(&pool);
         let ops = crate::kernel::chain::chain_identity_ops_from_env().ok();
+        let manifest_blob_stores = manifest_store
+            .get()
+            .map(|manifest| manifest.blob_stores().to_vec())
+            .unwrap_or_default();
         let network_label = crate::v1::mode::network_label(engine.network()).to_string();
         tokio::spawn(async move {
             let Some(ops) = ops else {
@@ -627,6 +631,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                             receipts: receipt_hub.as_ref(),
                         },
                         max_blob_bytes: ops.max_blob_bytes,
+                        manifest_blob_stores: &manifest_blob_stores,
                         expected_network: &network_label,
                         now,
                         rng: &mut rng,

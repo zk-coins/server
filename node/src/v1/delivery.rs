@@ -2193,11 +2193,24 @@ pub(crate) fn creating_nullifier_from_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::access::{InMemoryPrivateIndex, ReceiptHub};
     use crate::test_db::setup_pool;
+    use crate::v1::adapter::EngineAdapter;
+    use crate::v1::db_decrypt_index::{
+        decrypt_record_id, insert_verified_coin_proof_in_tx, DecryptIndexRow,
+        DecryptVerificationStatus,
+    };
     use crate::v1::db_outbox::OutboxStatus;
+    use crate::v1::incoming::{
+        process_delivery_candidate, AckClock, CandidateNetwork, CandidateOutcome,
+        CandidateSecrets, CandidateStores, HolderOutcome,
+    };
     use crate::v1::nostr::kinds::ack::sign_ack;
     use crate::v1::nostr::kinds::delivery::encode_delivery_payload;
     use crate::v1::nostr::nip59::OsSecureRandom;
+    use crate::v1::nostr::profile::{
+        address_from_parts, profile_invoice_message, sign_bip340, KIND_METADATA,
+    };
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
     use serde_json::Value;
@@ -2207,6 +2220,7 @@ mod tests {
     use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+    use zkcoins_program::circuit::compliance::Network;
     use zkcoins_program::hash::ZERO_HASH;
 
     /// Deterministic CSPRNG for tests (not for production).
@@ -2312,6 +2326,65 @@ mod tests {
         )
         .expect("build overlap fixture");
         (built, op_sk)
+    }
+
+    async fn start_profile_discovery_relay(profile: Event) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind profile discovery relay");
+        let address = listener
+            .local_addr()
+            .expect("profile discovery relay address");
+        tokio::spawn(async move {
+            use futures_util::{SinkExt as _, StreamExt as _};
+            use tokio_tungstenite::tungstenite::Message;
+
+            let (stream, _) = listener.accept().await.expect("accept profile query");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept profile websocket handshake");
+            let request = websocket
+                .next()
+                .await
+                .expect("profile REQ frame")
+                .expect("read profile REQ frame");
+            let Message::Text(request) = request else {
+                panic!("profile relay expected text REQ");
+            };
+            let request: serde_json::Value =
+                serde_json::from_str(&request).expect("parse profile REQ");
+            assert_eq!(
+                request.get(0).and_then(serde_json::Value::as_str),
+                Some("REQ")
+            );
+            let subscription_id = request
+                .get(1)
+                .and_then(serde_json::Value::as_str)
+                .expect("profile subscription id")
+                .to_owned();
+            let profile_json = serde_json::json!({
+                "id": hex::encode(profile.id),
+                "pubkey": hex::encode(profile.pubkey),
+                "created_at": profile.created_at,
+                "kind": profile.kind,
+                "tags": profile.tags,
+                "content": profile.content,
+                "sig": hex::encode(profile.sig),
+            });
+            websocket
+                .send(Message::Text(
+                    serde_json::json!(["EVENT", &subscription_id, profile_json]).to_string(),
+                ))
+                .await
+                .expect("send sender profile");
+            websocket
+                .send(Message::Text(
+                    serde_json::json!(["EOSE", subscription_id]).to_string(),
+                ))
+                .await
+                .expect("send profile EOSE");
+        });
+        format!("ws://{address}/")
     }
 
     async fn mount_overlap_blossom(
@@ -2504,6 +2577,186 @@ mod tests {
                 .expect("accepted manifest Blossom requests")
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_coinproof_falls_back_to_manifest_blob_store() {
+        let unavailable_holder = MockServer::start().await;
+        let manifest_store = MockServer::start().await;
+        let (ack_relay, _) = start_overlap_test_relay(true).await;
+        let (sender_op, sender_op_pk) =
+            fixture_sk(b"zkCoins/v1/test/delivery/incoming-fallback-sender-op");
+        let (sender_pk0_sk, sender_pk0) =
+            fixture_sk(b"zkCoins/v1/test/delivery/incoming-fallback-sender-pk0");
+        let (_, sender_ivpk) =
+            fixture_sk(b"zkCoins/v1/test/delivery/incoming-fallback-sender-ivk");
+        let (recipient_ivk, recipient_ivpk) =
+            fixture_sk(b"zkCoins/v1/test/delivery/incoming-fallback-recipient-ivk");
+        let (recipient_op, recipient_op_pk) =
+            fixture_sk(b"zkCoins/v1/test/delivery/incoming-fallback-recipient-op");
+        let (ovk, _) = fixture_sk(b"zkCoins/v1/test/delivery/incoming-fallback-ovk");
+        let mut material = sample_material(recipient_ivpk, recipient_op_pk);
+        material.proof_bytes.clear();
+        let subject = material.coin.recipient.0;
+        let coin_id = digest_to_bytes(&material.coin.identifier);
+        let now = 1_700_000_000;
+        let mut build_rng = ChainRng::new(b"zkCoins/v1/test/delivery/incoming-fallback-build");
+        let built = build_coin_delivery(
+            &material,
+            &sender_op,
+            &ovk,
+            &[unavailable_holder.uri()],
+            now,
+            &mut build_rng,
+        )
+        .expect("build fallback delivery");
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/blossom/{}",
+                hex::encode(built.blob_id)
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(built.zbe_ciphertext.clone()),
+            )
+            .expect(1)
+            .mount(&manifest_store)
+            .await;
+
+        let nk_commit: [u8; 32] =
+            Sha256::digest(b"zkCoins/v1/test/delivery/incoming-fallback-nk").into();
+        let sender_address = address_from_parts(&sender_pk0, &nk_commit);
+        let sender_relays = vec![ack_relay];
+        let addr_sig = sign_bip340(
+            &sender_pk0_sk,
+            &profile_invoice_message(
+                &sender_address,
+                &sender_pk0,
+                &nk_commit,
+                &sender_ivpk,
+                &sender_op_pk,
+                &sender_relays,
+            ),
+        )
+        .expect("sign sender profile binding");
+        let profile = Event::sign(
+            &sender_op,
+            now,
+            KIND_METADATA,
+            vec![],
+            serde_json::json!({
+                "name": "Fallback Sender",
+                "zkcoins": {
+                    "version": 1,
+                    "network": "regtest",
+                    "address": Address(sender_address).to_bech32m(),
+                    "pk0": hex::encode(sender_pk0),
+                    "nk_commit": hex::encode(nk_commit),
+                    "ivpk": hex::encode(sender_ivpk),
+                    "relays": sender_relays,
+                    "addr_sig": hex::encode(addr_sig),
+                    "name_sig": hex::encode([0u8; 64]),
+                }
+            })
+            .to_string(),
+        )
+        .expect("sign sender profile event");
+        let discovery_relays = vec![start_profile_discovery_relay(profile).await];
+        let manifest_blob_stores = vec![manifest_store.uri()];
+
+        let scope = setup_pool().await;
+        {
+            // EngineAdapter::persist refuses to write v1 scan state without an
+            // exclusive stack claim (no silent claim-from-write); claim it for
+            // this fixture, exactly as the recovery-path adapter fixtures do.
+            use crate::v1::separation::{
+                claim_stack_scan_mode, set_process_stack_mode, ScanStackMode,
+            };
+            set_process_stack_mode(ScanStackMode::V1);
+            claim_stack_scan_mode(&scope.pool, ScanStackMode::V1)
+                .await
+                .expect("claim v1 stack mode for EngineAdapter fixture");
+        }
+        let stored_blob_id = [0xD1; 32];
+        assert_ne!(stored_blob_id, built.blob_id);
+        let stored_record_id = decrypt_record_id(&subject, &coin_id, &stored_blob_id);
+        let mut tx = scope.pool.begin().await.expect("begin replay seed tx");
+        insert_verified_coin_proof_in_tx(
+            &mut tx,
+            &DecryptIndexRow {
+                record_id: stored_record_id,
+                subject,
+                coin_id,
+                blob_id: stored_blob_id,
+                detect_tag: [0xD2; 32],
+                canonical: vec![0xD3],
+                asset_id: [0xD4; 32],
+                verification_status: DecryptVerificationStatus::Verified,
+                delivery_event_id: [0xD5; 32],
+                ack_nonce: [0xD6; 32],
+                occurred_at: now,
+            },
+        )
+        .await
+        .expect("insert coin-level replay row");
+        tx.commit().await.expect("commit replay seed tx");
+
+        let adapter = EngineAdapter::load_or_create(scope.pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("load test engine adapter");
+        let index = InMemoryPrivateIndex::new();
+        let receipts = ReceiptHub::new();
+        let mut ack_rng = ChainRng::new(b"zkCoins/v1/test/delivery/incoming-fallback-ack");
+        let outcome = process_delivery_candidate(
+            &built.gift_wrap,
+            CandidateSecrets {
+                subject: &subject,
+                ivk: &recipient_ivk,
+                op: &recipient_op,
+            },
+            CandidateStores {
+                adapter: &adapter,
+                pool: &scope.pool,
+                index: &index,
+                receipts: &receipts,
+            },
+            CandidateNetwork {
+                max_blob_bytes: 1_048_576,
+                manifest_blob_stores: &manifest_blob_stores,
+                discovery_relays: &discovery_relays,
+                expected_network: "regtest",
+            },
+            AckClock {
+                now,
+                rng: &mut ack_rng,
+            },
+        )
+        .await;
+
+        let CandidateOutcome::Accepted {
+            replay,
+            holder_attempts,
+            ..
+        } = outcome
+        else {
+            panic!("manifest fallback must accept replayed CoinProof: {outcome:?}");
+        };
+        assert!(replay);
+        assert_eq!(holder_attempts.len(), 2);
+        assert_eq!(holder_attempts[0].holder, unavailable_holder.uri());
+        assert!(matches!(
+            &holder_attempts[0].outcome,
+            HolderOutcome::FetchError { .. }
+        ));
+        assert_eq!(holder_attempts[1].holder, manifest_store.uri());
+        assert_eq!(
+            holder_attempts[1].outcome,
+            HolderOutcome::Ok {
+                body_len: built.zbe_ciphertext.len()
+            }
         );
     }
 
