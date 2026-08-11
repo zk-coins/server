@@ -907,8 +907,14 @@ where
         Err(term) => {
             let reason = term.to_string();
             for m in &members {
-                // Best-effort mark; surface the original terminal reason.
-                let _ = queue.mark_failed(&m.public_key, &reason);
+                if let Err(mark_err) = queue.mark_failed(&m.public_key, &reason) {
+                    tracing::warn!(
+                        public_key = %hex::encode(m.public_key.0),
+                        error = %mark_err,
+                        "publish: failed to mark queue member failed after terminal inscription error; \
+                         member may remain non-terminal"
+                    );
+                }
             }
             Err(term)
         }

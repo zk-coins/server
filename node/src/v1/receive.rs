@@ -495,9 +495,19 @@ pub(crate) async fn commit_proved_receive_with(
             Ok(a) => a,
             Err(err) => {
                 // Apply failed before the account insert; restore for safety.
-                let _ = adapter.restore_live(pre);
-                return Err(err)
-                    .context("v1.1 receive: apply_proved_transition failed — state restored");
+                match adapter.restore_live(pre) {
+                    Ok(()) => {
+                        return Err(err).context(
+                            "v1.1 receive: apply_proved_transition failed — state restored",
+                        );
+                    }
+                    Err(restore_err) => {
+                        return Err(err).context(format!(
+                            "v1.1 receive: apply_proved_transition failed; \
+                             engine restore also failed ({restore_err:#})"
+                        ));
+                    }
+                }
             }
         };
 

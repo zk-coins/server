@@ -67,7 +67,14 @@ pub(crate) fn check_timestamp_window(timestamp: u64) -> Result<(), &'static str>
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        // Unusable host clock (pre-epoch) must not silently pass a stale/replayed
+        // timestamp — fail closed.
+        .map_err(|_| "Server clock unavailable")?;
+    check_timestamp_window_at(now, timestamp)
+}
+
+/// Pure freshness check against a caller-supplied `now` (unit-testable).
+pub(crate) fn check_timestamp_window_at(now: u64, timestamp: u64) -> Result<(), &'static str> {
     if now.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS {
         return Err("Request timestamp too old or in the future");
     }
@@ -3870,3 +3877,46 @@ pub(crate) fn create_router(state: AppState) -> Router {
 #[cfg(test)]
 #[path = "router_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod check_timestamp_window_at_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_timestamp_is_ok() {
+        assert!(check_timestamp_window_at(1_000, 1_000).is_ok());
+    }
+
+    #[test]
+    fn exactly_at_positive_skew_bound_is_ok() {
+        let now = 1_000_000;
+        assert!(check_timestamp_window_at(now, now - MAX_TIMESTAMP_SKEW_SECS).is_ok());
+    }
+
+    #[test]
+    fn exactly_at_negative_skew_bound_is_ok() {
+        let now = 1_000_000;
+        assert!(check_timestamp_window_at(now, now + MAX_TIMESTAMP_SKEW_SECS).is_ok());
+    }
+
+    #[test]
+    fn one_second_beyond_positive_skew_bound_is_err() {
+        let now = 1_000_000;
+        assert!(check_timestamp_window_at(now, now - MAX_TIMESTAMP_SKEW_SECS - 1).is_err());
+    }
+
+    #[test]
+    fn one_second_beyond_negative_skew_bound_is_err() {
+        let now = 1_000_000;
+        assert!(check_timestamp_window_at(now, now + MAX_TIMESTAMP_SKEW_SECS + 1).is_err());
+    }
+
+    #[test]
+    fn near_zero_timestamp_against_realistic_now_is_err() {
+        // This is the fail-open case the router.rs change fixes: a near-zero
+        // (e.g. unset/default) timestamp must NOT pass as "fresh" just because
+        // an unusable clock previously produced now=0.
+        let realistic_now = 1_755_000_000; // a realistic recent unix timestamp
+        assert!(check_timestamp_window_at(realistic_now, 5).is_err());
+    }
+}

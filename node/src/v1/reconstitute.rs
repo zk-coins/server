@@ -214,7 +214,15 @@ pub(crate) async fn load_coin_proof_canonical(
                 });
             }
             // Re-mirror so subsequent folds hit the process index.
-            let _ = index.insert_record(crate::v1::db_decrypt_index::to_indexed_record(&row));
+            if let Err(mirror_err) =
+                index.insert_record(crate::v1::db_decrypt_index::to_indexed_record(&row))
+            {
+                tracing::warn!(
+                    coin_id = %hex::encode(coin_id),
+                    error = %mirror_err,
+                    "reconstitute: failed to re-mirror canonical CoinProof into process index (cache only)"
+                );
+            }
             Ok(row.canonical)
         }
         None => Err(ReconstituteError::UnknownCoinId { coin_id: *coin_id }),

@@ -2664,10 +2664,14 @@ async fn install_and_persist_recovered_head(
     })?;
 
     if let Err(e) = deps.adapter.persist().await {
-        let _ = deps.adapter.restore_live(pre);
-        return Err(SdrDiscardReason::HeadPersistFailed {
-            detail: format!("durable persist of recovered head failed (engine rolled back): {e:#}"),
-        });
+        let detail = match deps.adapter.restore_live(pre) {
+            Ok(()) => format!("durable persist of recovered head failed (engine rolled back): {e:#}"),
+            Err(restore_err) => format!(
+                "durable persist of recovered head failed AND engine restore failed \
+                 (memory/disk may diverge): persist={e:#}; restore={restore_err:#}"
+            ),
+        };
+        return Err(SdrDiscardReason::HeadPersistFailed { detail });
     }
 
     deps.index

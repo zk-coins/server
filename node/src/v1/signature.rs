@@ -1145,7 +1145,11 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     let applied = match adapter.with_engine_mut(|engine| engine.apply_proved_transition(proved)) {
         Ok(Ok(a)) => a,
         Ok(Err(e)) => {
-            let _ = adapter.restore_live(pre);
+            if let Err(restore_err) = adapter.restore_live(pre) {
+                return Err(e.context(format!(
+                    "apply_proved_transition failed; engine restore also failed ({restore_err:#})"
+                )));
+            }
             // Preserve typed engine causes through the host encode path.
             return Err(e.context("apply_proved_transition failed"));
         }
@@ -1158,13 +1162,23 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
 
     let (pk, r) = applied.nullifier();
     if signature.pk_i != pk {
-        let _ = adapter.restore_live(pre);
+        if let Err(restore_err) = adapter.restore_live(pre) {
+            return Err(anyhow::anyhow!(
+                "v1.1 finalise: signature.pk_i does not match applied nullifier Pk; \
+                 engine restore also failed ({restore_err:#})"
+            ));
+        }
         return Err(anyhow::anyhow!(
             "v1.1 finalise: signature.pk_i does not match applied nullifier Pk"
         ));
     }
     if signature.signature_r() != r {
-        let _ = adapter.restore_live(pre);
+        if let Err(restore_err) = adapter.restore_live(pre) {
+            return Err(anyhow::anyhow!(
+                "v1.1 finalise: signature R does not match applied nullifier R; \
+                 engine restore also failed ({restore_err:#})"
+            ));
+        }
         return Err(anyhow::anyhow!(
             "v1.1 finalise: signature R does not match applied nullifier R"
         ));
