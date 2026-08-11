@@ -47,7 +47,7 @@ impl Invoice {
     }
 }
 
-// TODO: Eventually move all of this to the client directly
+// Design note: this account representation may eventually live in the client.
 pub struct ClientAccount {
     pub address: Address,
     pub num_pubkeys: u32,

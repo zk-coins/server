@@ -398,41 +398,12 @@ impl AccountNode {
         self.accounts.insert(key, mutated_account);
     }
 
-    /// Run a synthetic discardable `prove_initial` to wake the Rayon
-    /// worker pool and warm the AOT-compiled Plonky2 evaluator caches.
+    /// Readiness hook for the v1 on-demand prover lifecycle.
     ///
-    /// Called from a background `spawn_blocking` task spawned by
-    /// `runtime::start_rest_node` AFTER `TcpListener::bind` so the
-    /// HTTP listener is already serving traffic while this runs.
-    /// `/health/ready` exposes a `prover` flag that flips to `ready`
-    /// the moment this call returns Ok; load balancers / Kuma can use
-    /// the readiness endpoint to gate traffic during a rolling deploy
-    /// without holding the API itself offline.
-    ///
-    /// Empirical evidence (DEV-host R2 probe, 2026-05-31):
-    /// - `circuit_build_wall_ms = 14214` — `Prover::new()` (paid in
-    ///   `load_from_pg` already, before this call).
-    /// - `prove_cold_wall_ms = 7012` — first prove call after build,
-    ///   which is what this method pays during background warmup.
-    /// - `prove_warm p50 = 4777` — every subsequent prove call,
-    ///   including the first user-facing request once the background
-    ///   task has reported `prover_warm = true`.
-    ///
-    /// A user-facing `/api/mint` or `/api/send` that lands BEFORE the
-    /// background warmup completes still serves correctly, but pays
-    /// the cold-prove tax (~7 s instead of ~5 s). The deferred cost is
-    /// amortised by every subsequent request.
-    ///
-    /// `prove_initial` against a fresh `AccountState` (zero balance,
-    /// dummy pubkey, `ZERO_HASH` history root) is the cheapest valid
-    /// codepath that exercises the full circuit + Rayon spinup; the
-    /// resulting proof is discarded. No state mutation, no on-chain
-    /// side-effect.
-    ///
-    /// The mirrored helper in `node/src/bin/probe_r2.rs` is the
-    /// reference implementation that produced the numbers above; keep
-    /// the witness shape (fresh `AccountState::new(_)` + `ZERO_HASH`) in
-    /// sync if either side changes.
+    /// In v1, Prover (C) is loaded on demand through the proving lease
+    /// and dropped once idle, so no prover warmup runs at boot. This
+    /// method is intentionally a no-op retained for the readiness path,
+    /// allowing `/health/ready` to observe the `prover` flag transition.
     pub(crate) fn warmup_prover(&self) -> anyhow::Result<()> {
         // Stage 3: legacy Prover deleted. v1 proves warm via ProverBridge.
         Ok(())

@@ -1282,36 +1282,28 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
     let listener = TcpListener::bind(socket_addr).await?;
     tracing::info!("Listener bound on {socket_addr}; API is reachable");
 
-    // Background-warmup. A fresh `Prover` carries a cold Rayon worker
-    // pool and uninitialised AOT-compiled Plonky2 evaluator caches;
-    // empirically (DEV-host R2 probe, 2026-05-31) the first
-    // `prove_initial` after `Prover::new()` takes ~7012 ms vs the
-    // steady-state p50 of ~4777 ms for every subsequent call.
+    // Background prover-readiness hook. In v1, Prover (C) is loaded on
+    // demand through the proving lease and dropped once idle, so there
+    // is no boot-time prover warmup or synthetic prove here.
     //
-    // The previous shape (PR #147, closed) paid that tax synchronously
-    // before binding the listener and pushed API offline time per
-    // deploy from ~14 s to ~21 s. This shape instead binds the
-    // listener FIRST (the API is reachable at ~0.1 s), then spawns
-    // `AccountNode::warmup_prover` in a `spawn_blocking` task so the
-    // tokio worker that runs `axum::serve` is not starved by the
-    // CPU-bound Plonky2 prove. While the task is running a user
-    // request still serves correctly — it just pays the ~7 s cold tax
-    // — and `/health/ready` returns 503 with `prover: warming` so an
-    // LB / Kuma can hold traffic on the previous-gen pod during a
-    // rolling deploy.
+    // The listener is bound first, then `AccountNode::warmup_prover`
+    // runs in a `spawn_blocking` task. The method is intentionally a
+    // no-op, retained so `/health/ready` can continue to expose the
+    // `prover` flag transition without implying that a prover was
+    // loaded or a proof generated during boot.
     //
     // Opt-out via `ZKCOINS_SKIP_BOOTSTRAP_WARMUP=1`: the smoke tests
     // in `runtime_tests.rs` set this so each `start_rest_node_*` test
-    // does not pay the ~7 s prove tax twice over. When set,
-    // `prover_warm` is flipped to `true` immediately so the readiness
-    // probe matches the production-ready shape.
+    // skips scheduling the readiness hook. When set, `prover_warm` is
+    // flipped to `true` immediately so the readiness probe matches the
+    // production-ready shape.
     let skip_warmup = std::env::var("ZKCOINS_SKIP_BOOTSTRAP_WARMUP")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let warmup_handle = if skip_warmup {
         tracing::info!(
-            "Bootstrap warmup skipped via ZKCOINS_SKIP_BOOTSTRAP_WARMUP; \
-             prover_warm = true (first user request will pay the ~7 s cold tax)"
+            "Prover readiness hook skipped via ZKCOINS_SKIP_BOOTSTRAP_WARMUP; \
+             prover_warm = true (v1 proving remains on-demand)"
         );
         prover_warm.store(true, Ordering::SeqCst);
         None
@@ -1320,17 +1312,11 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         let prover_warm_flag = Arc::clone(&prover_warm);
         let handle = tokio::task::spawn_blocking(move || {
             let warmup_t = std::time::Instant::now();
-            // Hold the sync `Mutex` only for the duration of the
-            // prove call. The scanner — spawned in parallel by
-            // `main.rs` — locks `state`, not `account_node`, so it
-            // does not contend with this guard. The only realistic
-            // contender is a user request that lands during the
-            // ~7 s warmup window; that request blocks on
-            // `account_node.lock()` for the remainder of the warmup
-            // (then runs warm), which is the accepted trade-off
-            // documented in the function comment. The block is
-            // shorter (and aborts cleanly on shutdown) than the
-            // previous synchronous-bootstrap shape.
+            // Hold the sync `Mutex` only while invoking the readiness
+            // hook. The hook is intentionally a no-op in v1: no prover
+            // is loaded and no proof is generated. The scanner —
+            // spawned in parallel by `main.rs` — locks `state`, not
+            // `account_node`, so it does not contend with this guard.
             let result = {
                 let guard = account_node_for_warmup
                     .lock()
@@ -1341,7 +1327,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                 Ok(()) => {
                     tracing::info!(
                         elapsed_ms = warmup_t.elapsed().as_millis() as u64,
-                        "Background warmup complete; prover ready"
+                        "Prover readiness hook complete (v1 proving is on-demand; no boot warmup)"
                     );
                     prover_warm_flag.store(true, Ordering::SeqCst);
                 }
@@ -1357,7 +1343,7 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
                 }
             }
         });
-        tracing::info!("Bootstrap warmup spawned in background; listener serving now");
+        tracing::info!("Prover readiness hook spawned in background; listener serving now");
         Some(handle)
     };
     // `warmup_handle` is intentionally not awaited: `axum::serve`

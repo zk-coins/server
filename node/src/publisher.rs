@@ -31,9 +31,9 @@ pub(crate) struct EsploraConfig {
     pub url: String,
     pub is_mainnet: bool,
     pub network_name: String,
-    /// Esplora WebSocket endpoint consumed by the block-tip scanner
-    /// (`scanner_ws::run_scanner_ws`). Sourced from the `ESPLORA_WS_URL`
-    /// env var via `lib::build_network_config_from_env`, which panics
+    /// Esplora WebSocket endpoint for the block-tip scanner. Sourced
+    /// from the `ESPLORA_WS_URL` env var via
+    /// `lib::build_network_config_from_env`, which panics
     /// if it is unset or empty — production callers always observe a
     /// `Some(...)` here. The `Option` shape is retained to keep this
     /// struct constructible from test fixtures that do not need a WS

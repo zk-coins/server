@@ -189,8 +189,8 @@ use std::str::FromStr;
 ///
 /// 1. A Mainnet deployment that forgot `ESPLORA_URL` / `ESPLORA_WS_URL`
 ///    would silently scan Mutinynet and answer `/api/info` as Mainnet —
-///    visible only as a 5 s HTTP-retry loop on `scanner_runtime` with a
-///    green `/health/ready` (zk-coins/node #84).
+///    visible only as a recurring 5 s HTTP-retry loop with a green
+///    `/health/ready` (zk-coins/node #84).
 /// 2. A Mutinynet deployment that left `ESPLORA_WS_URL` unset would
 ///    couple itself to the public `wss://mutinynet.com/api/v1/ws`
 ///    endpoint we do not operate — DEV's entire WS observability would
@@ -217,10 +217,9 @@ use std::str::FromStr;
 /// ## Single source of truth
 ///
 /// `NETWORK_CONFIG.url` and `NETWORK_CONFIG.ws_url` are the only
-/// places these endpoints are read. `scanner_ws::ScannerWsConfig` is
-/// constructed via `from_network_config(&EsploraConfig)`; the
-/// publisher consumes the same struct. There is no second `env::var`
-/// path that could fall back to a hardcoded chain URL.
+/// places these endpoints are read before being supplied to runtime
+/// consumers. There is no second `env::var` path that could fall back
+/// to a hardcoded chain URL.
 pub(crate) fn build_network_config_from_env<F>(env: F) -> EsploraConfig
 where
     F: Fn(&str) -> Option<String>,
