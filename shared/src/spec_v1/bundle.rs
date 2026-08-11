@@ -1,7 +1,7 @@
 //! Bundle wire codecs: `CoinProof`, `SelfDeliveryRecordV1`, `BlobLocatorSet` (§7.1).
 //!
 //! These layouts are the **content-addressed plaintexts** that ZBE encrypts
-//! ([§4.2.1](https://docs.zkcoins.app)): `blob_id = H(ZBE(serialize(bundle)))`.
+//! ([§4.2.1](https://docs.zkcoins.com)): `blob_id = H(ZBE(serialize(bundle)))`.
 //! The rules below fix **exactly one** byte string per value so two honest
 //! senders of the same bundle under the same key produce the same `blob_id`.
 //!

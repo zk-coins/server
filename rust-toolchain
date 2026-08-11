@@ -1,3 +1,5 @@
 [toolchain]
+# Dated pin: an unpinned channel broke CI repo-wide (stricter rustfmt, new lints).
+# `-D warnings` plus a moving channel means CI can go red without a code change.
 channel = "nightly-2026-06-18"
 components = ["llvm-tools", "rustc-dev", "rustfmt", "clippy"]

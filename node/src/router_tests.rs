@@ -7088,7 +7088,7 @@ mod jobs_endpoint_tests {
             concat!(
                 r#"{{"service":"zkcoins-node","version":"{}","network":"{}","endpoints":"#,
                 "{}",
-                r#","docs":"https://docs.zkcoins.app"}}"#,
+                r#","docs":"https://docs.zkcoins.com"}}"#,
             ),
             env!("CARGO_PKG_VERSION"),
             crate::NETWORK_CONFIG.network_name,
