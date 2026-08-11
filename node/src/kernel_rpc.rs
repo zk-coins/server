@@ -433,16 +433,21 @@ impl Kernel for GrpcKernelService {
         request: Request<SignRequest>,
     ) -> Result<Response<Job>, Status> {
         // API-edge feature gate (same surface as HTTP `feature_disabled`):
-        // not a KernelErrorCode. Refuse before domain so a legacy stack
-        // never sees a missing-staging `internal_error` for a surface that
-        // is simply off. Unimplemented + flag name distinguishes this from
-        // unwired procedures (`"<Name>: not yet implemented"`).
+        // not a KernelErrorCode with its own §7.5 machine_code — this
+        // condition is outside SignTransition's closed §7.8 per-procedure
+        // error-table row, so it maps through the table's own designated
+        // fallback: INTERNAL / internal_error / 500 (never UNIMPLEMENTED,
+        // which is not one of the eight admissible gRPC codes and carries
+        // no ErrorInfo). `KernelError::new` (no internal_context) so this
+        // expected, config-driven refusal never trips the internal-error
+        // log branch in `map_domain_err` — that log is for genuine bugs.
         if !crate::v1::v1_sign_route_active() {
-            return Err(Status::unimplemented(
+            return Err(map_domain_err(KernelError::new(
+                KernelErrorCode::InternalError,
                 "SignTransition: disabled — requires ZKCOINS_V1_SHADOW=1 / \
                  ScanStackMode::V1 (surface inactive in this configuration; \
                  not an unimplemented procedure)",
-            ));
+            )));
         }
         // Width / UUID checks at the transport edge (64 / 32 bytes).
         let req = parse_sign_request(request.into_inner()).map_err(map_domain_err)?;
@@ -1022,9 +1027,9 @@ mod tests {
     ///   `InvalidArgument` / auth errors — does **not** claim the happy path
     ///   works. Named as malformed-boundary checks below.
     ///
-    /// `SignTransition` feature-gate `Unimplemented` (V1 claim inactive) is
-    /// covered separately — that is an intentional edge gate, not an unmapped
-    /// procedure.
+    /// `SignTransition` feature-gate `Internal` with `ErrorInfo` (V1 claim
+    /// inactive) is covered separately — that is an intentional edge gate,
+    /// not an unmapped procedure.
     #[tokio::test]
     async fn all_kernel_procedures_are_transport_mapped_not_bare_unimplemented() {
         let (domain, _scope) = test_domain().await;
@@ -1443,11 +1448,11 @@ message GrantRequest {
     }
 
     /// Flag/claim off: SignTransition is refused at the gRPC edge with
-    /// `Unimplemented` naming `ZKCOINS_V1_SHADOW` — never a domain call
-    /// (no job mutation). Distinct from unwired procedures' "not yet
-    /// implemented" wording.
+    /// `Internal` plus `ErrorInfo`, naming `ZKCOINS_V1_SHADOW` — never a
+    /// domain call (no job mutation). Distinct from unwired procedures'
+    /// "not yet implemented" wording.
     #[tokio::test]
-    async fn sign_transition_flag_off_is_unimplemented_naming_flag_without_domain() {
+    async fn sign_transition_flag_off_is_internal_naming_flag_without_domain() {
         // Default process claim is unset → `v1_sign_route_active()` is false
         // (nextest process isolation; do not claim V1 in this test).
         let scope = setup_pool().await;
@@ -1503,10 +1508,11 @@ message GrantRequest {
 
         assert_eq!(
             err.code(),
-            Code::Unimplemented,
-            "disabled surface uses Unimplemented (not a domain KernelError); got {:?}",
+            Code::Internal,
+            "disabled surface uses Internal via a domain KernelError; got {:?}",
             err.code()
         );
+        assert_error_info(&err, "internal_error", "500");
         let msg = err.message();
         assert!(
             msg.contains("ZKCOINS_V1_SHADOW"),
