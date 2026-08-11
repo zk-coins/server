@@ -443,6 +443,57 @@ pub(crate) fn verify_asset_terms_self_auth(
 // Host verification of a decrypted CoinProof (§2.3.3 steps 2–6)
 // ---------------------------------------------------------------------------
 
+/// Classify + finality-gate the creating nullifier's first-occurrence entry on
+/// the receiver's own NfLog (§3.7 classify, §3.9 size_final). This is the
+/// store-and-ACK gate's finality check — mirrors the idiom already used at
+/// `receive.rs::verify_creating_first_occurrence` (`pos < receiver_nav.size`
+/// where `receiver_nav = size_final_nav(engine)`, i.e. `receiver_nav.size ==
+/// size_final`) and at `reconstitute.rs::live_nflog_paths` (`pos_create >=
+/// receiver_nav.size` => `CreatingNullifierNotCompleted`). Both of those are
+/// already correct; this function brings incoming.rs's store-and-ACK gate up
+/// to the same standard.
+fn verify_creating_nullifier_final(
+    engine: &StateEngine,
+    pk_create: [u8; 32],
+    r_create: [u8; 32],
+) -> Result<(), IncomingError> {
+    match engine.nflog().classify(pk_create, r_create) {
+        SpendClassification::ValidFirstSpend => {}
+        SpendClassification::RejectedDoubleSpend => {
+            return Err(IncomingError::Verification(
+                "creating Pk is present with a different R (double-spend loser)".into(),
+            ));
+        }
+        SpendClassification::Pending => {
+            return Err(IncomingError::Verification(
+                "creating nullifier is not a first-occurrence on receiver NfLog".into(),
+            ));
+        }
+    }
+    match engine.nflog().lookup(pk_create) {
+        LookupResult::Present { pos, r, .. } => {
+            if r != r_create {
+                return Err(IncomingError::Verification(
+                    "NfLog first-occurrence R mismatches creating_nullifier.R".into(),
+                ));
+            }
+            let size_final = engine.nflog().size_final(engine.tip_height());
+            if pos >= size_final {
+                return Err(IncomingError::Verification(format!(
+                    "creating nullifier position {pos} is not yet final (size_final \
+                     {size_final}); refusing credit until §3.9 finality (6 confirmations)"
+                )));
+            }
+        }
+        LookupResult::Absent => {
+            return Err(IncomingError::Verification(
+                "creating Pk vanished between classify and lookup".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Verify a decrypted bundle against the local engine + proof port.
 ///
 /// Does **not** run the receive transition (step 7) — that is a separate
@@ -531,36 +582,11 @@ pub(crate) fn verify_coin_proof_for_index(
         ))
     })?;
 
-    match engine.nflog().classify(
+    verify_creating_nullifier_final(
+        engine,
         cp.creating_nullifier.pk_create,
         cp.creating_nullifier.r_create,
-    ) {
-        SpendClassification::ValidFirstSpend => {}
-        SpendClassification::RejectedDoubleSpend => {
-            return Err(IncomingError::Verification(
-                "creating Pk is present with a different R (double-spend loser)".into(),
-            ));
-        }
-        SpendClassification::Pending => {
-            return Err(IncomingError::Verification(
-                "creating nullifier is not a first-occurrence on receiver NfLog".into(),
-            ));
-        }
-    }
-    match engine.nflog().lookup(cp.creating_nullifier.pk_create) {
-        LookupResult::Present { r, .. } => {
-            if r != cp.creating_nullifier.r_create {
-                return Err(IncomingError::Verification(
-                    "NfLog first-occurrence R mismatches creating_nullifier.R".into(),
-                ));
-            }
-        }
-        LookupResult::Absent => {
-            return Err(IncomingError::Verification(
-                "creating Pk vanished between classify and lookup".into(),
-            ));
-        }
-    }
+    )?;
 
     // Step 5 — local replay: already held coin is refused for a second credit
     // path; the durable index UNIQUE is the durable half of this check.
@@ -1154,6 +1180,127 @@ pub(crate) async fn poll_incoming_deliveries(
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use zkcoins_program::circuit::compliance::Network;
+
+    trait IntoFixtureEngine {
+        fn into_fixture_engine(self) -> StateEngine;
+    }
+
+    impl IntoFixtureEngine for StateEngine {
+        fn into_fixture_engine(self) -> StateEngine {
+            self
+        }
+    }
+
+    impl<E: std::fmt::Debug> IntoFixtureEngine for Result<StateEngine, E> {
+        fn into_fixture_engine(self) -> StateEngine {
+            match self {
+                Ok(engine) => engine,
+                Err(err) => panic!("failed to build StateEngine fixture: {err:?}"),
+            }
+        }
+    }
+
+    fn nullifier_entry(
+        pk: [u8; 32],
+        r: [u8; 32],
+    ) -> (host::ChainPosition, host::NfLogEntry) {
+        (
+            host::ChainPosition {
+                height: 0,
+                tx_index: 0,
+                vin_index: 0,
+                member_index: 0,
+            },
+            host::NfLogEntry { pk, r },
+        )
+    }
+
+    /// The store-and-ACK path deliberately implements DEFER, not a durable
+    /// `Pending` receipt: an error stores, ACKs, and credits nothing, while the
+    /// existing unconditional relay re-poll naturally retries the delivery.
+    #[test]
+    fn creating_nullifier_present_not_final_is_rejected() {
+        let pk = [0x11; 32];
+        let r = [0x22; 32];
+        let engine = StateEngine::from_persisted(
+            Network::Regtest,
+            0,
+            0,
+            0,
+            vec![nullifier_entry(pk, r)],
+            vec![],
+        )
+        .into_fixture_engine();
+
+        let err = verify_creating_nullifier_final(&engine, pk, r)
+            .expect_err("an unfinalized creating nullifier must be deferred");
+        let message = err.to_string();
+        assert!(message.contains("not yet final"));
+        assert!(!message.contains("double-spend"));
+        assert!(!message.contains("vanished"));
+    }
+
+    /// The same delivery accepted after finality demonstrates promotion by
+    /// natural re-drive, without introducing a durable `Pending` receipt.
+    #[test]
+    fn creating_nullifier_present_and_final_is_accepted() {
+        let pk = [0x11; 32];
+        let r = [0x22; 32];
+        let engine = StateEngine::from_persisted(
+            Network::Regtest,
+            0,
+            6,
+            0,
+            vec![nullifier_entry(pk, r)],
+            vec![],
+        )
+        .into_fixture_engine();
+
+        assert!(verify_creating_nullifier_final(&engine, pk, r).is_ok());
+    }
+
+    /// Together with the non-final and later-final tests, this proves that a
+    /// creating nullifier orphaned before finality never passes the gate: no
+    /// durable insert, ACK, or live `Completed` credit is reachable for it.
+    #[test]
+    fn orphaned_not_final_nullifier_never_yields_live_credit() {
+        let pk = [0x11; 32];
+        let r = [0x22; 32];
+        let engine = StateEngine::from_persisted(Network::Regtest, 0, 1, 0, vec![], vec![])
+            .into_fixture_engine();
+
+        let err = verify_creating_nullifier_final(&engine, pk, r)
+            .expect_err("an orphaned creating nullifier must remain deferred");
+        assert!(
+            err.to_string()
+                .contains("creating nullifier is not a first-occurrence on receiver NfLog")
+        );
+    }
+
+    #[test]
+    fn creating_nullifier_double_spend_loser_is_still_rejected() {
+        let pk = [0x11; 32];
+        let r_winner = [0x22; 32];
+        let r_loser = [0x33; 32];
+        let engine = StateEngine::from_persisted(
+            Network::Regtest,
+            0,
+            6,
+            0,
+            vec![nullifier_entry(pk, r_winner)],
+            vec![],
+        )
+        .into_fixture_engine();
+
+        let err = verify_creating_nullifier_final(&engine, pk, r_loser)
+            .expect_err("a double-spend loser must remain rejected");
+        assert!(err.to_string().contains(
+            "creating Pk is present with a different R (double-spend loser)"
+        ));
+    }
+
     use super::*;
     use crate::test_db::setup_pool;
     use shared::spec_v1::bundle::IssuanceTerms;
