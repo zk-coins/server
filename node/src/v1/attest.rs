@@ -2172,6 +2172,7 @@ mod tests {
         crate::db::insert_block_log(
             &pool,
             &crate::db::BlockLogEntry {
+                block_time: None,
                 block_hash: inclusion_hash.to_vec(),
                 block_height: Some(i64::try_from(fold_height).unwrap()),
                 inscription_count: 1,
@@ -2353,6 +2354,7 @@ mod tests {
         let blocks = [BlockScanResult {
             height: fold_height,
             block_hash: BlockHash::from_byte_array(inclusion_hash),
+            block_time: 1_700_000_000,
             inscriptions_seen: 0,
             rejected: vec![],
             admitted: vec![],

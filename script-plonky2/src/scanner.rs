@@ -327,6 +327,8 @@ pub struct ScannedInscription {
 pub struct BlockScanResult {
     pub height: u64,
     pub block_hash: BlockHash,
+    /// Block header nTime, the raw timestamp used by downstream BIP-113 MTP windows.
+    pub block_time: u32,
     /// Envelopes found before validation (successful `extract_payload_from_input`
     /// yielding `Some(_)`, plus extract `Err`s that looked like marker inputs).
     pub inscriptions_seen: usize,
@@ -1300,6 +1302,7 @@ struct CollectedBlockContents {
 struct CollectedBlock {
     height: u64,
     block_hash: BlockHash,
+    block_time: u32,
     verified: Vec<PublishedNullifier>,
     accepted: Vec<ScannedInscription>,
     rejected: Vec<RejectedInscription>,
@@ -1453,6 +1456,7 @@ impl Scanner {
                             collected.push(CollectedBlock {
                                 height: fetch.height,
                                 block_hash: fetch.block_hash,
+                                block_time: fetch.block.header.time,
                                 verified: contents.verified,
                                 accepted: contents.accepted,
                                 rejected: contents.rejected,
@@ -1522,6 +1526,7 @@ impl Scanner {
                 block_reports.push(BlockScanResult {
                     height: block.height,
                     block_hash: block.block_hash,
+                    block_time: block.block_time,
                     inscriptions_seen: block.inscriptions_seen,
                     rejected: block.rejected,
                     admitted,
@@ -1741,6 +1746,7 @@ impl Scanner {
         Ok(BlockScanResult {
             height,
             block_hash,
+            block_time: block.header.time,
             inscriptions_seen: contents.inscriptions_seen,
             rejected: contents.rejected,
             admitted,
