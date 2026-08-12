@@ -2443,6 +2443,101 @@ fn parse_hex32_field(hex_str: &str, field: &str) -> Result<[u8; 32], String> {
     Ok(arr)
 }
 
+/// Why receive auth-key resolution refused, with the §7.5 machine_code each
+/// maps to ([`ReceiveAuthError::code`]): the two `GenesisPubkey*` variants are
+/// client `genesis_pubkey` presence violations (`malformed_request`), the rest
+/// are node-side/state conditions (`internal_error`).
+#[derive(Debug)]
+enum ReceiveAuthError {
+    NoActiveBundle { subject: [u8; 32] },
+    EngineMissing,
+    NkMismatch,
+    OpSecretMismatch,
+    GenesisPubkeyForbidden,
+    GenesisPubkeyRequired,
+}
+
+impl std::fmt::Display for ReceiveAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoActiveBundle { subject } => write!(
+                f,
+                "receive: no active operational bundle for subject {} (§7.7)",
+                hex::encode(subject)
+            ),
+            Self::EngineMissing => write!(f, "receive: v1 EngineAdapter missing"),
+            Self::NkMismatch => write!(
+                f,
+                "receive: operational-bundle nk does not match registered account nk"
+            ),
+            Self::OpSecretMismatch => write!(
+                f,
+                "receive: operational-bundle op_secret does not match registered account"
+            ),
+            Self::GenesisPubkeyForbidden => write!(
+                f,
+                "receive: genesis_pubkey must be absent for a registered (non-genesis) account (§7.5)"
+            ),
+            Self::GenesisPubkeyRequired => write!(
+                f,
+                "receive: genesis_pubkey required for InitialProof (account's first transition) (§7.5)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReceiveAuthError {}
+
+impl ReceiveAuthError {
+    /// Stable machine-facing prefix for job error encoding (not parsed for
+    /// control flow — identity is the enum / full Display).
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::GenesisPubkeyForbidden | Self::GenesisPubkeyRequired => "malformed_request",
+            Self::NoActiveBundle { .. }
+            | Self::EngineMissing
+            | Self::NkMismatch
+            | Self::OpSecretMismatch => "internal_error",
+        }
+    }
+}
+
+#[cfg(test)]
+mod receive_auth_error_tests {
+    use super::ReceiveAuthError;
+
+    #[test]
+    fn receive_auth_error_codes_are_stable() {
+        assert_eq!(
+            ReceiveAuthError::NoActiveBundle { subject: [0u8; 32] }.code(),
+            "internal_error"
+        );
+        assert_eq!(ReceiveAuthError::EngineMissing.code(), "internal_error");
+        assert_eq!(ReceiveAuthError::NkMismatch.code(), "internal_error");
+        assert_eq!(ReceiveAuthError::OpSecretMismatch.code(), "internal_error");
+        assert_eq!(
+            ReceiveAuthError::GenesisPubkeyForbidden.code(),
+            "malformed_request"
+        );
+        assert_eq!(
+            ReceiveAuthError::GenesisPubkeyRequired.code(),
+            "malformed_request"
+        );
+    }
+
+    #[test]
+    fn genesis_pubkey_presence_errors_keep_exact_display_text() {
+        assert_eq!(
+            ReceiveAuthError::GenesisPubkeyForbidden.to_string(),
+            "receive: genesis_pubkey must be absent for a registered (non-genesis) account (§7.5)"
+        );
+        assert_eq!(
+            ReceiveAuthError::GenesisPubkeyRequired.to_string(),
+            "receive: genesis_pubkey required for InitialProof (account's first transition) (§7.5)"
+        );
+    }
+}
+
 /// Resolve `nk` / `op_secret` / `current_pubkey` for a receive begin.
 ///
 /// - Registered engine account → live rotated `current_pubkey`;
@@ -2458,41 +2553,31 @@ fn resolve_receive_auth_keys(
     app_state: &AppState,
     subject: &crate::kernel::types::SubjectAddress,
     genesis_pubkey: Option<[u8; 32]>,
-) -> Result<ReceiveAuthKeys, String> {
-    let bundle = app_state.bundles.get_active(subject).ok_or_else(|| {
-        format!(
-            "receive: no active operational bundle for subject {} (§7.7)",
-            hex::encode(subject.0)
-        )
-    })?;
+) -> Result<ReceiveAuthKeys, ReceiveAuthError> {
+    let bundle = app_state
+        .bundles
+        .get_active(subject)
+        .ok_or_else(|| ReceiveAuthError::NoActiveBundle { subject: subject.0 })?;
     let op_secret = zkcoins_prover::state_engine::OpSecret::new(bundle.op_secret);
     let owner = shared::spec_v1::Address(subject.0);
 
     let adapter = app_state
         .v1_engine
         .as_ref()
-        .ok_or_else(|| "receive: v1 EngineAdapter missing".to_string())?;
+        .ok_or(ReceiveAuthError::EngineMissing)?;
 
     adapter.with_engine(|engine| {
         if let Some(rec) = engine.account(&owner) {
             if rec.nk != bundle.nk {
-                return Err(
-                    "receive: operational-bundle nk does not match registered account nk".into(),
-                );
+                return Err(ReceiveAuthError::NkMismatch);
             }
             if let Some(stored) = rec.op_secret {
                 if stored != op_secret {
-                    return Err(
-                        "receive: operational-bundle op_secret does not match registered account"
-                            .into(),
-                    );
+                    return Err(ReceiveAuthError::OpSecretMismatch);
                 }
             }
             if genesis_pubkey.is_some() {
-                return Err(
-                    "receive: genesis_pubkey must be absent for a registered (non-genesis) account (§7.5)"
-                        .into(),
-                );
+                return Err(ReceiveAuthError::GenesisPubkeyForbidden);
             }
             return Ok((rec.nk, op_secret, rec.state.current_pubkey));
         }
@@ -2500,10 +2585,7 @@ fn resolve_receive_auth_keys(
         // inside begin_receive (state_engine.rs); a wrong value fails closed there.
         match genesis_pubkey {
             Some(pk) => Ok((bundle.nk, op_secret, pk)),
-            None => Err(
-                "receive: genesis_pubkey required for InitialProof (account's first transition) (§7.5)"
-                    .into(),
-            ),
+            None => Err(ReceiveAuthError::GenesisPubkeyRequired),
         }
     })
 }
@@ -2617,8 +2699,8 @@ async fn process_receive_initial(
                     app_state,
                     notify_map,
                     public_id,
-                    "internal_error",
-                    e,
+                    e.code(),
+                    e.to_string(),
                 )
                 .await;
             }
@@ -5262,6 +5344,515 @@ mod receive_job_path_and_decision_table_tests {
             err.contains("unknown coin") || err.contains("unknown_coin"),
             "must name unknown-coin cause; got {err}"
         );
+        drop(scope);
+    }
+
+    #[tokio::test]
+    async fn receive_genesis_pubkey_forbidden_on_registered_account_fails_malformed_request() {
+        use crate::kernel::access::{AccountStateView, InMemoryPrivateIndex};
+        use crate::kernel::bootstrap::{BundleStore, OperationalBundle};
+        use crate::kernel::types::{Digest32, SubjectAddress};
+        use crate::v1::separation::{claim_stack_scan_mode, set_process_stack_mode, ScanStackMode};
+        use shared::spec_v1::{self as host, AccountState};
+        use std::collections::{BTreeMap, BTreeSet};
+        use zkcoins_program::circuit::compliance::Network;
+        use zkcoins_prover::prover_bridge::test_signing::{deterministic_secret, normalized_key};
+        use zkcoins_prover::state_engine::{AccountRecord, OpSecret};
+
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = crate::test_db::setup_pool().await;
+        // Exclusive DB marker before any v1 write — load_or_create persists
+        // an empty genesis snapshot and refuses without this claim.
+        claim_stack_scan_mode(&scope.pool, ScanStackMode::V1)
+            .await
+            .expect("claim stack_scan_mode v1");
+        let store = JobStore::new(scope.pool.clone());
+
+        let nk = [4u8; 32];
+        let op_secret_bytes = [5u8; 32];
+        let (_sk0, _pt, pk0) = normalized_key(deterministic_secret(b"rx-forbidden-pk0"));
+        let subject = shared::spec_v1::address(&pk0, shared::spec_v1::nk_commit(&nk));
+        let fold_hex = "22".repeat(32);
+        let CreateResult::Fresh(job) = store
+            .create(
+                JobKind::Receive,
+                &subject,
+                Some("k-rx-genesis-forbidden"),
+                serde_json::json!({
+                    "kind": "receive",
+                    "subject": hex::encode(subject),
+                    "next_pubkey": hex::encode([0x11u8; 32]),
+                    "npk_rand": hex::encode([0x22u8; 32]),
+                    "fold_coin_ids": [fold_hex],
+                    "genesis_pubkey": hex::encode(pk0),
+                }),
+            )
+            .await
+            .expect("create")
+        else {
+            panic!("expected Fresh");
+        };
+        let job_id = job.public_id;
+
+        let pool = std::sync::Arc::new(scope.pool.clone());
+        let job_store = std::sync::Arc::new(store);
+        let adapter =
+            crate::v1::EngineAdapter::load_or_create((*pool).clone(), Network::Regtest, 0)
+                .await
+                .expect("adapter");
+
+        let owner = shared::spec_v1::Address(subject);
+        let account_state = AccountState::new(
+            owner,
+            shared::spec_v1::nk_commit(&nk),
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("construct empty AccountState fixture");
+        let record = AccountRecord {
+            state: account_state,
+            coinhist: host::CoinHistTree::new(),
+            nk,
+            op_secret: Some(OpSecret::new(op_secret_bytes)),
+            genesis_pubkey: pk0,
+            spendable: BTreeMap::new(),
+            spent_ids: BTreeSet::new(),
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+        adapter
+            .with_engine_mut(|engine| {
+                engine
+                    .insert_account(owner, record)
+                    .expect("insert_account fixture")
+            })
+            .expect("with_engine_mut");
+
+        let bundles = BundleStore::shared();
+        bundles.install_for_test(
+            &SubjectAddress(subject),
+            OperationalBundle {
+                ivk: [1; 32],
+                ovk: [2; 32],
+                op: [3; 32],
+                nk,
+                op_secret: op_secret_bytes,
+            },
+        );
+        let private_index = InMemoryPrivateIndex::shared();
+        private_index
+            .insert_account(
+                SubjectAddress(subject),
+                AccountStateView {
+                    account_state: vec![0u8; 140],
+                    state_head: Digest32([0; 32]),
+                    head_record_id: None,
+                    send_counter: 0,
+                    current_pubkey: pk0,
+                    last_nullifier_pk: None,
+                    last_nullifier_r: None,
+                },
+            )
+            .expect("insert account state fixture");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let proof_dir = tmp.path().to_str().expect("utf8").to_string();
+        std::mem::forget(tmp);
+        let state_arc = std::sync::Arc::new(std::sync::Mutex::new(crate::state::State::new()));
+        let app_state = crate::router::AppState {
+            account_node: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::account_node::AccountNode::new(state_arc),
+            )),
+            proof_store: std::sync::Arc::new(crate::router::ProofStore::new(&proof_dir)),
+            mint_store: std::sync::Arc::new(crate::router::MintStore::new()),
+            username_store: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::username::UsernameStore::new(),
+            )),
+            pool: std::sync::Arc::clone(&pool),
+            esplora_config: std::sync::Arc::new(crate::publisher::EsploraConfig {
+                url: "http://127.0.0.1:1".to_string(),
+                is_mainnet: false,
+                network_name: "Regtest".to_string(),
+                ws_url: None,
+            }),
+            prover_warm: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            prover_health: std::sync::Arc::new(crate::prover_health::ProverHealth::new()),
+            job_store: std::sync::Arc::clone(&job_store),
+            job_tx: tokio::sync::mpsc::channel::<JobEnvelope>(8).0,
+            job_notify_map: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_scan_caught_up: None,
+            v1_finality_ok: None,
+            pending_sign_map: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_finalise: None,
+            v1_live_pending_after_begin: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_pending_after_prove: None,
+            receive_creating_proof_loader: None,
+            v1_engine: Some(std::sync::Arc::new(adapter)),
+            private_index,
+            bundles,
+            attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
+            public_hosts: std::sync::Arc::new(vec!["node.test".to_string()]),
+        };
+
+        process_envelope_for_test(
+            job_store.as_ref(),
+            &app_state,
+            &app_state.job_notify_map,
+            Duration::from_millis(50),
+            JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("dispatcher returns Ok after terminal fail");
+
+        let after = job_store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(after.status, JobStatus::Failed);
+        let err = after.error.as_deref().expect("error");
+        assert!(
+            err.contains("malformed_request"),
+            "must preserve malformed-request code; got {err}"
+        );
+        assert!(
+            !err.contains("internal_error"),
+            "must not misclassify client input as internal_error; got {err}"
+        );
+        assert!(
+            err.contains("genesis_pubkey must be absent"),
+            "must preserve forbidden-genesis message; got {err}"
+        );
+        drop(scope);
+    }
+
+    #[tokio::test]
+    async fn receive_genesis_pubkey_required_on_fresh_account_fails_malformed_request() {
+        use crate::kernel::access::{AccountStateView, InMemoryPrivateIndex};
+        use crate::kernel::bootstrap::{BundleStore, OperationalBundle};
+        use crate::kernel::types::{Digest32, SubjectAddress};
+        use crate::v1::separation::{claim_stack_scan_mode, set_process_stack_mode, ScanStackMode};
+        use zkcoins_program::circuit::compliance::Network;
+        use zkcoins_prover::prover_bridge::test_signing::{deterministic_secret, normalized_key};
+
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = crate::test_db::setup_pool().await;
+        // Exclusive DB marker before any v1 write — load_or_create persists
+        // an empty genesis snapshot and refuses without this claim.
+        claim_stack_scan_mode(&scope.pool, ScanStackMode::V1)
+            .await
+            .expect("claim stack_scan_mode v1");
+        let store = JobStore::new(scope.pool.clone());
+
+        let nk = [4u8; 32];
+        let (_sk0, _pt, pk0) = normalized_key(deterministic_secret(b"rx-required-pk0"));
+        let subject = shared::spec_v1::address(&pk0, shared::spec_v1::nk_commit(&nk));
+        let fold_hex = "22".repeat(32);
+        let CreateResult::Fresh(job) = store
+            .create(
+                JobKind::Receive,
+                &subject,
+                Some("k-rx-genesis-required"),
+                serde_json::json!({
+                    "kind": "receive",
+                    "subject": hex::encode(subject),
+                    "next_pubkey": hex::encode([0x11u8; 32]),
+                    "npk_rand": hex::encode([0x22u8; 32]),
+                    "fold_coin_ids": [fold_hex],
+                }),
+            )
+            .await
+            .expect("create")
+        else {
+            panic!("expected Fresh");
+        };
+        let job_id = job.public_id;
+
+        let pool = std::sync::Arc::new(scope.pool.clone());
+        let job_store = std::sync::Arc::new(store);
+        let adapter =
+            crate::v1::EngineAdapter::load_or_create((*pool).clone(), Network::Regtest, 0)
+                .await
+                .expect("adapter");
+
+        let bundles = BundleStore::shared();
+        bundles.install_for_test(
+            &SubjectAddress(subject),
+            OperationalBundle {
+                ivk: [1; 32],
+                ovk: [2; 32],
+                op: [3; 32],
+                nk,
+                op_secret: [5; 32],
+            },
+        );
+        let private_index = InMemoryPrivateIndex::shared();
+        private_index
+            .insert_account(
+                SubjectAddress(subject),
+                AccountStateView {
+                    account_state: vec![0u8; 140],
+                    state_head: Digest32([0; 32]),
+                    head_record_id: None,
+                    send_counter: 0,
+                    current_pubkey: pk0,
+                    last_nullifier_pk: None,
+                    last_nullifier_r: None,
+                },
+            )
+            .expect("insert account state fixture");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let proof_dir = tmp.path().to_str().expect("utf8").to_string();
+        std::mem::forget(tmp);
+        let state_arc = std::sync::Arc::new(std::sync::Mutex::new(crate::state::State::new()));
+        let app_state = crate::router::AppState {
+            account_node: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::account_node::AccountNode::new(state_arc),
+            )),
+            proof_store: std::sync::Arc::new(crate::router::ProofStore::new(&proof_dir)),
+            mint_store: std::sync::Arc::new(crate::router::MintStore::new()),
+            username_store: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::username::UsernameStore::new(),
+            )),
+            pool: std::sync::Arc::clone(&pool),
+            esplora_config: std::sync::Arc::new(crate::publisher::EsploraConfig {
+                url: "http://127.0.0.1:1".to_string(),
+                is_mainnet: false,
+                network_name: "Regtest".to_string(),
+                ws_url: None,
+            }),
+            prover_warm: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            prover_health: std::sync::Arc::new(crate::prover_health::ProverHealth::new()),
+            job_store: std::sync::Arc::clone(&job_store),
+            job_tx: tokio::sync::mpsc::channel::<JobEnvelope>(8).0,
+            job_notify_map: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_scan_caught_up: None,
+            v1_finality_ok: None,
+            pending_sign_map: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_finalise: None,
+            v1_live_pending_after_begin: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_pending_after_prove: None,
+            receive_creating_proof_loader: None,
+            v1_engine: Some(std::sync::Arc::new(adapter)),
+            private_index,
+            bundles,
+            attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
+            public_hosts: std::sync::Arc::new(vec!["node.test".to_string()]),
+        };
+
+        process_envelope_for_test(
+            job_store.as_ref(),
+            &app_state,
+            &app_state.job_notify_map,
+            Duration::from_millis(50),
+            JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("dispatcher returns Ok after terminal fail");
+
+        let after = job_store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(after.status, JobStatus::Failed);
+        let err = after.error.as_deref().expect("error");
+        assert!(
+            err.contains("malformed_request"),
+            "must preserve malformed-request code; got {err}"
+        );
+        assert!(
+            !err.contains("internal_error"),
+            "must not misclassify client input as internal_error; got {err}"
+        );
+        assert!(
+            err.contains("genesis_pubkey required for InitialProof"),
+            "must preserve required-genesis message; got {err}"
+        );
+        drop(scope);
+    }
+
+    // Indirectly proves registered + no genesis_pubkey returns Ok from resolve_receive_auth_keys.
+    #[tokio::test]
+    async fn receive_registered_account_without_genesis_pubkey_passes_auth_resolution() {
+        use crate::kernel::access::{AccountStateView, InMemoryPrivateIndex};
+        use crate::kernel::bootstrap::{BundleStore, OperationalBundle};
+        use crate::kernel::types::{Digest32, SubjectAddress};
+        use crate::v1::separation::{claim_stack_scan_mode, set_process_stack_mode, ScanStackMode};
+        use shared::spec_v1::{self as host, AccountState};
+        use std::collections::{BTreeMap, BTreeSet};
+        use zkcoins_program::circuit::compliance::Network;
+        use zkcoins_prover::prover_bridge::test_signing::{deterministic_secret, normalized_key};
+        use zkcoins_prover::state_engine::{AccountRecord, OpSecret};
+
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = crate::test_db::setup_pool().await;
+        // Exclusive DB marker before any v1 write — load_or_create persists
+        // an empty genesis snapshot and refuses without this claim.
+        claim_stack_scan_mode(&scope.pool, ScanStackMode::V1)
+            .await
+            .expect("claim stack_scan_mode v1");
+        let store = JobStore::new(scope.pool.clone());
+
+        let nk = [4u8; 32];
+        let op_secret_bytes = [5u8; 32];
+        let (_sk0, _pt, pk0) = normalized_key(deterministic_secret(b"rx-registered-pk0"));
+        let subject = shared::spec_v1::address(&pk0, shared::spec_v1::nk_commit(&nk));
+        let fold_hex = "22".repeat(32);
+        let CreateResult::Fresh(job) = store
+            .create(
+                JobKind::Receive,
+                &subject,
+                Some("k-rx-registered-unknown"),
+                serde_json::json!({
+                    "kind": "receive",
+                    "subject": hex::encode(subject),
+                    "next_pubkey": hex::encode([0x11u8; 32]),
+                    "npk_rand": hex::encode([0x22u8; 32]),
+                    "fold_coin_ids": [fold_hex],
+                }),
+            )
+            .await
+            .expect("create")
+        else {
+            panic!("expected Fresh");
+        };
+        let job_id = job.public_id;
+
+        let pool = std::sync::Arc::new(scope.pool.clone());
+        let job_store = std::sync::Arc::new(store);
+        let adapter =
+            crate::v1::EngineAdapter::load_or_create((*pool).clone(), Network::Regtest, 0)
+                .await
+                .expect("adapter");
+
+        let owner = shared::spec_v1::Address(subject);
+        let account_state = AccountState::new(
+            owner,
+            shared::spec_v1::nk_commit(&nk),
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("construct empty AccountState fixture");
+        let record = AccountRecord {
+            state: account_state,
+            coinhist: host::CoinHistTree::new(),
+            nk,
+            op_secret: Some(OpSecret::new(op_secret_bytes)),
+            genesis_pubkey: pk0,
+            spendable: BTreeMap::new(),
+            spent_ids: BTreeSet::new(),
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+        adapter
+            .with_engine_mut(|engine| {
+                engine
+                    .insert_account(owner, record)
+                    .expect("insert_account fixture")
+            })
+            .expect("with_engine_mut");
+
+        let bundles = BundleStore::shared();
+        bundles.install_for_test(
+            &SubjectAddress(subject),
+            OperationalBundle {
+                ivk: [1; 32],
+                ovk: [2; 32],
+                op: [3; 32],
+                nk,
+                op_secret: op_secret_bytes,
+            },
+        );
+        let private_index = InMemoryPrivateIndex::shared();
+        private_index
+            .insert_account(
+                SubjectAddress(subject),
+                AccountStateView {
+                    account_state: vec![0u8; 140],
+                    state_head: Digest32([0; 32]),
+                    head_record_id: None,
+                    send_counter: 0,
+                    current_pubkey: pk0,
+                    last_nullifier_pk: None,
+                    last_nullifier_r: None,
+                },
+            )
+            .expect("insert account state fixture");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let proof_dir = tmp.path().to_str().expect("utf8").to_string();
+        std::mem::forget(tmp);
+        let state_arc = std::sync::Arc::new(std::sync::Mutex::new(crate::state::State::new()));
+        let app_state = crate::router::AppState {
+            account_node: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::account_node::AccountNode::new(state_arc),
+            )),
+            proof_store: std::sync::Arc::new(crate::router::ProofStore::new(&proof_dir)),
+            mint_store: std::sync::Arc::new(crate::router::MintStore::new()),
+            username_store: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::username::UsernameStore::new(),
+            )),
+            pool: std::sync::Arc::clone(&pool),
+            esplora_config: std::sync::Arc::new(crate::publisher::EsploraConfig {
+                url: "http://127.0.0.1:1".to_string(),
+                is_mainnet: false,
+                network_name: "Regtest".to_string(),
+                ws_url: None,
+            }),
+            prover_warm: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            prover_health: std::sync::Arc::new(crate::prover_health::ProverHealth::new()),
+            job_store: std::sync::Arc::clone(&job_store),
+            job_tx: tokio::sync::mpsc::channel::<JobEnvelope>(8).0,
+            job_notify_map: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_scan_caught_up: None,
+            v1_finality_ok: None,
+            pending_sign_map: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_finalise: None,
+            v1_live_pending_after_begin: std::sync::Arc::new(dashmap::DashMap::new()),
+            v1_pending_after_prove: None,
+            receive_creating_proof_loader: None,
+            v1_engine: Some(std::sync::Arc::new(adapter)),
+            private_index,
+            bundles,
+            attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
+            public_hosts: std::sync::Arc::new(vec!["node.test".to_string()]),
+        };
+
+        process_envelope_for_test(
+            job_store.as_ref(),
+            &app_state,
+            &app_state.job_notify_map,
+            Duration::from_millis(50),
+            JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("dispatcher returns Ok after terminal fail");
+
+        let after = job_store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(
+            after.status,
+            JobStatus::Failed,
+            "unknown coin must terminal-fail; got {:?}",
+            after.status
+        );
+        let err = after.error.as_deref().expect("error");
+        let parsed: serde_json::Value = serde_json::from_str(err).expect("job error is JSON");
+        assert_eq!(
+            parsed["error"].as_str(),
+            Some("unknown_coin"),
+            "downstream failure must carry the unknown_coin machine_code, not an auth-resolution code; got {err}"
+        );
+        assert!(
+            !err.contains("malformed_request"),
+            "auth resolution must not reject registered account without genesis_pubkey; got {err}"
+        );
+        assert!(
+            !err.contains("genesis_pubkey"),
+            "auth resolution must not be the failure cause; got {err}"
+        );
+        // Fresh + genesis_pubkey resolving Ok is covered by the pre-existing unknown-coin test.
         drop(scope);
     }
 
