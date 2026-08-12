@@ -96,7 +96,7 @@ pub(crate) enum IncomingError {
     },
     /// Delivery payload decode failed.
     Payload(String),
-    /// No holders in the payload (no default store).
+    /// No advertised or manifest blob holders configured (both merged sets are empty).
     HoldersEmpty,
     /// Every holder failed; last error named. Lying holders are listed.
     AllHoldersFailed { attempts: Vec<HolderAttempt> },
@@ -165,7 +165,9 @@ impl fmt::Display for IncomingError {
                 hex::encode(rumor_pubkey)
             ),
             IncomingError::Payload(msg) => write!(f, "delivery payload: {msg}"),
-            IncomingError::HoldersEmpty => write!(f, "blob holders empty (no default store)"),
+            IncomingError::HoldersEmpty => {
+                write!(f, "no advertised or manifest blob holders configured")
+            }
             IncomingError::AllHoldersFailed { attempts } => {
                 write!(f, "all {} holders failed:", attempts.len())?;
                 for a in attempts {
@@ -947,26 +949,49 @@ async fn process_delivery_candidate_inner(
     }
 
     let bridge = adapter.bridge();
-    adapter.with_engine(|engine| verify_coin_proof_for_index(engine, &bridge, &cp, subject))?;
 
-    // 6. Durable persist then process index — before any ACK.
-    let asset_id = digest_to_bytes(&cp.coin.asset_id);
-    let record_id = decrypt_record_id(subject, &coin_id, &payload.blob_id);
-    let row = DecryptIndexRow {
-        record_id,
-        subject: *subject,
-        coin_id,
-        blob_id: payload.blob_id,
-        detect_tag,
-        canonical: plaintext,
-        asset_id,
-        verification_status: DecryptVerificationStatus::Verified,
-        delivery_event_id: wrap.id,
-        ack_nonce: payload.ack_nonce,
-        occurred_at: 0,
+    // 6. Finality verification and durable persist share the scanner write
+    // gate. A reorg restore therefore cannot invalidate the creating
+    // nullifier between the live-engine check and the durable credit.
+    let (row, sql_outcome) = {
+        let _write_gate = adapter.lock_writes().await;
+        adapter
+            .with_engine(|engine| verify_coin_proof_for_index(engine, &bridge, &cp, subject))?;
+
+        let asset_id = digest_to_bytes(&cp.coin.asset_id);
+        let record_id = decrypt_record_id(subject, &coin_id, &payload.blob_id);
+        let row = DecryptIndexRow {
+            record_id,
+            subject: *subject,
+            coin_id,
+            blob_id: payload.blob_id,
+            detect_tag,
+            canonical: plaintext,
+            asset_id,
+            verification_status: DecryptVerificationStatus::Verified,
+            delivery_event_id: wrap.id,
+            ack_nonce: payload.ack_nonce,
+            occurred_at: 0,
+        };
+
+        // Re-check the cheap finality-only predicate immediately before the
+        // SQL insert while the same write gate is still held.
+        adapter.with_engine(|engine| {
+            verify_creating_nullifier_final(
+                engine,
+                cp.creating_nullifier.pk_create,
+                cp.creating_nullifier.r_create,
+            )
+        })?;
+        let sql_outcome =
+            persist_verified_coin_and_provenance(pool, &row, cp.asset_terms.as_ref()).await?;
+
+        // Durable credit is fixed. Release the gate before process-local and
+        // network work so the scanner can proceed.
+        (row, sql_outcome)
     };
-    let sql_outcome = persist_verified_coin_and_provenance(pool, &row, cp.asset_terms.as_ref())
-        .await?;
+    let asset_id = row.asset_id;
+    let record_id = row.record_id;
     let indexed = to_indexed_record(&row);
     let mem_outcome = index
         .insert_record(indexed)
@@ -1174,13 +1199,15 @@ pub(crate) async fn poll_incoming_deliveries(
 }
 
 // ---------------------------------------------------------------------------
-// Tests — pure steps only (no real Plonky2 proof)
+// Tests — pure steps plus an ignored real-proof pipeline fixture
 // ---------------------------------------------------------------------------
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+    use sha2::{Digest as _, Sha256};
     use zkcoins_program::circuit::compliance::Network;
 
     trait IntoFixtureEngine {
@@ -1215,6 +1242,56 @@ mod tests {
             },
             host::NfLogEntry { pk, r },
         )
+    }
+
+    /// Deterministic CSPRNG for delivery fixtures (never production use).
+    struct PipelineRng {
+        state: [u8; 32],
+        counter: u64,
+    }
+
+    impl PipelineRng {
+        fn new(seed: &[u8]) -> Self {
+            Self {
+                state: Sha256::digest(seed).into(),
+                counter: 0,
+            }
+        }
+    }
+
+    impl SecureRandom for PipelineRng {
+        fn fill_bytes(
+            &mut self,
+            dest: &mut [u8],
+        ) -> Result<(), crate::v1::nostr::nip59::Nip59Error> {
+            let mut filled = 0;
+            while filled < dest.len() {
+                let mut block = Vec::with_capacity(40);
+                block.extend_from_slice(&self.state);
+                block.extend_from_slice(&self.counter.to_be_bytes());
+                self.state = Sha256::digest(&block).into();
+                self.counter = self.counter.wrapping_add(1);
+                let take = (dest.len() - filled).min(self.state.len());
+                dest[filled..filled + take].copy_from_slice(&self.state[..take]);
+                filled += take;
+            }
+            Ok(())
+        }
+    }
+
+    fn pipeline_fixture_sk(label: &[u8]) -> ([u8; 32], [u8; 32]) {
+        let mut seed = Sha256::digest(label).to_vec();
+        let secp = Secp256k1::new();
+        loop {
+            let mut sk_bytes = [0u8; 32];
+            sk_bytes.copy_from_slice(&seed[..32]);
+            if let Ok(sk) = SecretKey::from_slice(&sk_bytes) {
+                let keypair = Keypair::from_secret_key(&secp, &sk);
+                let (xonly, _) = keypair.x_only_public_key();
+                return (sk_bytes, xonly.serialize());
+            }
+            seed = Sha256::digest(&seed).to_vec();
+        }
     }
 
     /// The store-and-ACK path deliberately implements DEFER, not a durable
@@ -1455,6 +1532,398 @@ mod tests {
             ack_nonce: [seed + 6; 32],
             occurred_at: 0,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "heavy: real Plonky2 prove; run with --ignored --release"]
+    async fn store_and_ack_finality_gate_blocks_credit_until_final() {
+        use crate::kernel::grants::{
+            GrantAssetScope, GrantScope, SCOPE_NOT_AFTER_UNBOUNDED,
+        };
+        use crate::v1::delivery::{
+            build_coin_delivery, bundle_nav_opening, creating_nullifier_from_parts,
+            OutgoingCoinMaterial,
+        };
+        use crate::v1::separation::{
+            claim_stack_scan_mode, set_process_stack_mode, ScanStackMode,
+        };
+        use futures_util::StreamExt as _;
+        use shared::spec_v1::datastructures::Address;
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zkcoins_prover::prover_bridge::test_signing::{
+            deterministic_secret, normalized_key, sign_transition,
+        };
+        use zkcoins_prover::state_engine::{
+            MintRequest, OpSecret, ScannedNullifier, SendRequest,
+        };
+
+        set_process_stack_mode(ScanStackMode::V1);
+        let scope = setup_pool().await;
+        claim_stack_scan_mode(&scope.pool, ScanStackMode::V1)
+            .await
+            .expect("claim v1 stack mode for incoming pipeline fixture");
+        let adapter = EngineAdapter::load_or_create(scope.pool.clone(), Network::Regtest, 0)
+            .await
+            .expect("load incoming pipeline engine adapter");
+
+        let alice_nk: [u8; 32] =
+            Sha256::digest(b"zkCoins/v1/incoming-finality/alice-nk").into();
+        let (alice_secret0, alice_public0, alice_pk0) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/incoming-finality/alice-sk0",
+        ));
+        let (_, _, alice_pk1) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/incoming-finality/alice-sk1",
+        ));
+        let alice_owner = Address(host::address(&alice_pk0, host::nk_commit(&alice_nk)));
+        let mint_name_hash =
+            host::name_hash(b"incoming finality asset").expect("mint name hash");
+        let mint_asset_id =
+            host::asset_id_v1(host::GENESIS_TAG, &alice_pk0, &mint_name_hash, 2, 1);
+        let mint_pending = adapter
+            .with_engine(|engine| {
+                engine.begin_mint(MintRequest {
+                    owner: alice_owner,
+                    nk: alice_nk,
+                    op_secret: OpSecret::new(
+                        Sha256::digest(b"zkCoins/v1/incoming-finality/alice-op-secret").into(),
+                    ),
+                    current_pubkey: alice_pk0,
+                    next_pubkey: alice_pk1,
+                    name: b"incoming finality asset".to_vec(),
+                    decimals: 2,
+                    amount: 100,
+                    issuance_version: 1,
+                    cap_total: 0,
+                    terms_salt: [0u8; 32],
+                    output_templates: vec![host::CoinTemplate {
+                        recipient: alice_owner,
+                        amount: 100,
+                        asset_id: mint_asset_id,
+                    }],
+                    npk_rand: [0x22; 32],
+                })
+            })
+            .expect("begin genuine mint");
+        let minted_coin_id = mint_pending
+            .witness_wip
+            .output_coins
+            .first()
+            .expect("mint output")
+            .identifier;
+        let mint_sig = sign_transition(
+            alice_secret0,
+            alice_public0,
+            &mint_pending.proof_data,
+            Network::Regtest,
+        );
+        let applied_mint = adapter
+            .with_engine_mut(|engine| {
+                engine
+                    .finalise(mint_pending, mint_sig.transition)
+                    .expect("prove and finalise mint")
+            })
+            .expect("apply mint");
+        adapter
+            .with_engine_mut(|engine| {
+                engine
+                    .append_nullifier(ScannedNullifier::from_survivor(
+                        &shared::spec_v1::PublishedNullifier {
+                            chain_pos: host::ChainPosition {
+                                height: 100,
+                                tx_index: 0,
+                                vin_index: 0,
+                                member_index: 0,
+                            },
+                            pk: applied_mint.nullifier().0,
+                            r: applied_mint.nullifier().1,
+                        },
+                    ))
+                    .expect("fold mint nullifier");
+                engine.set_tip_height(110);
+            })
+            .expect("prepare final mint anchor");
+
+        let (alice_secret1, alice_public1, alice_pk1_check) = normalized_key(
+            deterministic_secret(b"zkCoins/v1/incoming-finality/alice-sk1"),
+        );
+        assert_eq!(alice_pk1_check, alice_pk1);
+        let (_, _, alice_pk2) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/incoming-finality/alice-sk2",
+        ));
+        let bob_nk: [u8; 32] =
+            Sha256::digest(b"zkCoins/v1/incoming-finality/bob-nk").into();
+        let (_, _, bob_pk0) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/incoming-finality/bob-sk0",
+        ));
+        let bob_owner = Address(host::address(&bob_pk0, host::nk_commit(&bob_nk)));
+
+        let send_pending = adapter
+            .with_engine(|engine| {
+                engine.begin_send(SendRequest {
+                    owner: alice_owner,
+                    input_coin_ids: vec![minted_coin_id],
+                    output_templates: vec![host::CoinTemplate {
+                        recipient: bob_owner,
+                        amount: 30,
+                        asset_id: mint_asset_id,
+                    }],
+                    next_pubkey: alice_pk2,
+                    npk_rand: [0xA5; 32],
+                })
+            })
+            .expect("begin genuine send");
+        let bob_coin = send_pending
+            .witness_wip
+            .output_coins
+            .iter()
+            .find(|coin| coin.recipient == bob_owner)
+            .cloned()
+            .expect("Bob output coin");
+        let bob_coin_index = send_pending
+            .witness_wip
+            .output_coins
+            .iter()
+            .position(|coin| coin.recipient == bob_owner)
+            .expect("Bob output index") as u32;
+        let all_output_ids = send_pending
+            .witness_wip
+            .output_coins
+            .iter()
+            .map(|coin| coin.identifier)
+            .collect::<Vec<_>>();
+        let creating_prev_ash =
+            host::account_state_hash(&send_pending.witness_wip.prev_account_state)
+                .expect("send creating_prev_ash");
+        let send_nav_opening = send_pending.nav_opening;
+        let send_sig = sign_transition(
+            alice_secret1,
+            alice_public1,
+            &send_pending.proof_data,
+            Network::Regtest,
+        );
+        let send_r_prime = send_sig.transition.r_prime;
+        let applied_send = adapter
+            .with_engine_mut(|engine| {
+                engine
+                    .finalise(send_pending, send_sig.transition)
+                    .expect("prove and finalise send")
+            })
+            .expect("apply send");
+        let send_nullifier = applied_send.nullifier();
+        adapter
+            .with_engine_mut(|engine| {
+                let position = engine
+                    .append_nullifier(ScannedNullifier::from_survivor(
+                        &shared::spec_v1::PublishedNullifier {
+                            chain_pos: host::ChainPosition {
+                                height: 110,
+                                tx_index: 1,
+                                vin_index: 0,
+                                member_index: 0,
+                            },
+                            pk: send_nullifier.0,
+                            r: send_nullifier.1,
+                        },
+                    ))
+                    .expect("fold send nullifier");
+                assert_eq!(position, 1, "send must be the second NfLog entry");
+                engine.set_tip_height(114);
+                assert_eq!(engine.nflog().size_final(engine.tip_height()), 1);
+            })
+            .expect("prepare non-final send anchor");
+
+        let blob_store = MockServer::start().await;
+        let (sender_op, _) =
+            pipeline_fixture_sk(b"zkCoins/v1/incoming-finality/sender-op");
+        let (recipient_ivk, recipient_ivpk) =
+            pipeline_fixture_sk(b"zkCoins/v1/incoming-finality/recipient-ivk");
+        let (recipient_op, recipient_op_pk) =
+            pipeline_fixture_sk(b"zkCoins/v1/incoming-finality/recipient-op");
+        let (ovk, _) = pipeline_fixture_sk(b"zkCoins/v1/incoming-finality/ovk");
+        let expected_coin_id = digest_to_bytes(&bob_coin.identifier);
+        let expected_asset_id = digest_to_bytes(&bob_coin.asset_id);
+        let expected_amount = bob_coin.amount;
+        let material = OutgoingCoinMaterial {
+            coin: bob_coin,
+            leaf_index: bob_coin_index,
+            all_output_ids,
+            proof_bytes: applied_send.proved().proof.to_bytes(),
+            creating_prev_ash,
+            creating_nullifier: creating_nullifier_from_parts(
+                send_nullifier.0,
+                send_nullifier.1,
+                send_r_prime,
+            ),
+            nav_opening: bundle_nav_opening(
+                send_nav_opening.nav.size,
+                send_nav_opening.nav.mth,
+                send_nav_opening.nav_rand,
+            ),
+            asset_terms: None,
+            recipient_ivpk,
+            recipient_op_pk,
+            recipient_relays: vec!["ws://127.0.0.1:9/".into()],
+        };
+        let now = 1_700_000_000;
+        let mut build_rng =
+            PipelineRng::new(b"zkCoins/v1/incoming-finality/build-delivery");
+        let built = build_coin_delivery(
+            &material,
+            &sender_op,
+            &ovk,
+            &[blob_store.uri()],
+            now,
+            &mut build_rng,
+        )
+        .expect("build genuine incoming delivery");
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/blossom/{}",
+                hex::encode(built.blob_id)
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(built.zbe_ciphertext.clone()),
+            )
+            .expect(2)
+            .mount(&blob_store)
+            .await;
+
+        let index = InMemoryPrivateIndex::new();
+        let receipts = ReceiptHub::new();
+        let mut receipt_stream = receipts.subscribe(
+            SubjectAddress(bob_owner.0),
+            GrantScope {
+                assets: GrantAssetScope::All,
+                not_before: 0,
+                not_after: SCOPE_NOT_AFTER_UNBOUNDED,
+            },
+        );
+        let mut first_ack_rng =
+            PipelineRng::new(b"zkCoins/v1/incoming-finality/non-final-ack");
+        let first = process_delivery_candidate(
+            &built.gift_wrap,
+            CandidateSecrets {
+                subject: &bob_owner.0,
+                ivk: &recipient_ivk,
+                op: &recipient_op,
+            },
+            CandidateStores {
+                adapter: &adapter,
+                pool: &scope.pool,
+                index: &index,
+                receipts: &receipts,
+            },
+            CandidateNetwork {
+                max_blob_bytes: 1_048_576,
+                manifest_blob_stores: &[],
+                discovery_relays: &[],
+                expected_network: "regtest",
+            },
+            AckClock {
+                now,
+                rng: &mut first_ack_rng,
+            },
+        )
+        .await;
+        let CandidateOutcome::Rejected { error } = first else {
+            panic!("non-final delivery must be rejected by the real pipeline: {first:?}");
+        };
+        assert!(
+            error.to_string().contains("not yet final"),
+            "unexpected non-final rejection: {error}"
+        );
+        assert!(
+            get_by_blob_id(&scope.pool, &built.blob_id)
+                .await
+                .expect("query non-final durable row")
+                .is_none(),
+            "non-final delivery must not be persisted"
+        );
+        let idle = tokio::time::timeout(Duration::from_millis(30), receipt_stream.next()).await;
+        assert!(
+            idle.is_err(),
+            "non-final delivery must not publish a Completed receipt: {idle:?}"
+        );
+
+        adapter
+            .with_engine_mut(|engine| {
+                engine.set_tip_height(115);
+                assert_eq!(engine.nflog().size_final(engine.tip_height()), 2);
+            })
+            .expect("advance creating nullifier through finality");
+
+        // Holding the same gate as the scanner makes the production
+        // candidate wait before verification/persist. Removing the F2 gate
+        // would let this warmed second attempt complete and credit here.
+        let held_write_gate = adapter.lock_writes().await;
+        let mut final_ack_rng =
+            PipelineRng::new(b"zkCoins/v1/incoming-finality/final-ack");
+        let mut final_attempt = Box::pin(process_delivery_candidate(
+            &built.gift_wrap,
+            CandidateSecrets {
+                subject: &bob_owner.0,
+                ivk: &recipient_ivk,
+                op: &recipient_op,
+            },
+            CandidateStores {
+                adapter: &adapter,
+                pool: &scope.pool,
+                index: &index,
+                receipts: &receipts,
+            },
+            CandidateNetwork {
+                max_blob_bytes: 1_048_576,
+                manifest_blob_stores: &[],
+                discovery_relays: &[],
+                expected_network: "regtest",
+            },
+            AckClock {
+                now,
+                rng: &mut final_ack_rng,
+            },
+        ));
+        let blocked = tokio::time::timeout(Duration::from_secs(10), &mut final_attempt).await;
+        assert!(
+            blocked.is_err(),
+            "candidate bypassed the scanner write gate: {blocked:?}"
+        );
+        assert!(
+            get_by_blob_id(&scope.pool, &built.blob_id)
+                .await
+                .expect("query write-gated durable row")
+                .is_none(),
+            "write-gated candidate must not persist before the gate is released"
+        );
+        let idle = tokio::time::timeout(Duration::from_millis(30), receipt_stream.next()).await;
+        assert!(
+            idle.is_err(),
+            "write-gated candidate must not publish before durable persist: {idle:?}"
+        );
+        drop(held_write_gate);
+
+        // Empty discovery relays deliberately make the later ACK stage fail;
+        // durable insert and receipt publication precede that expected error.
+        let _final_outcome = final_attempt.await;
+        let stored = get_by_blob_id(&scope.pool, &built.blob_id)
+            .await
+            .expect("query final durable row")
+            .expect("final delivery must be durably inserted");
+        assert_eq!(stored.coin_id, expected_coin_id);
+        assert_eq!(stored.asset_id, expected_asset_id);
+        let receipt = tokio::time::timeout(Duration::from_secs(1), receipt_stream.next())
+            .await
+            .expect("final receipt timeout")
+            .expect("final receipt stream ended")
+            .expect("final receipt error");
+        assert_eq!(receipt.subject, SubjectAddress(bob_owner.0));
+        assert_eq!(receipt.coin_id, Digest32(expected_coin_id));
+        assert_eq!(receipt.asset_id, Digest32(expected_asset_id));
+        assert_eq!(receipt.amount, expected_amount);
+        assert_eq!(receipt.state, ReceiptState::Completed);
     }
 
     #[tokio::test]

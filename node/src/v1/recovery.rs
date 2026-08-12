@@ -4366,7 +4366,7 @@ mod tests {
         assert_eq!(
             err,
             SdrDiscardReason::FetchFailed {
-                detail: "blob holders empty (no default store)".into(),
+                detail: "no advertised or manifest blob holders configured".into(),
             }
         );
     }
