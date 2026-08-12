@@ -1614,6 +1614,7 @@ pub(crate) async fn insert_block_log(
          VALUES ($1, $2, NOW(), $3, $4, $5) \
          ON CONFLICT (block_hash) DO UPDATE SET \
            block_time = COALESCE(block_log.block_time, EXCLUDED.block_time), \
+           block_height = COALESCE(block_log.block_height, EXCLUDED.block_height), \
            processed_at = NOW()",
     )
     .bind(&entry.block_hash)
