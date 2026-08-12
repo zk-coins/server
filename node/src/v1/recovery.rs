@@ -275,8 +275,10 @@ pub(crate) enum SdrDiscardReason {
     NotFirstOccurrence { detail: String },
     /// Check (v): inclusion block height/hash does not match NfLog + block_log.
     InclusionBlockMismatch { detail: String },
-    /// Check (v): `occurred_at` is zero, the local BIP-113 MTP window is
-    /// incomplete, or the value differs from the re-derived MTP.
+    /// Check (v): `occurred_at` is zero, or differs from a successfully
+    /// re-derived BIP-113 MTP. A window that is not locally derivable uses the
+    /// documented presence-only fallback (accept on the other checks), not this
+    /// error.
     OccurredAtInvalid { detail: String },
     /// Check (v) ordering stage: `occurred_at` regressed vs a previously accepted record.
     OccurredAtNotMonotonic { detail: String },
