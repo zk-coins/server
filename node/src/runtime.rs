@@ -587,10 +587,17 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
         let receipt_hub = Arc::clone(&shared_receipt_hub);
         let pool = Arc::clone(&pool);
         let ops = crate::kernel::chain::chain_identity_ops_from_env().ok();
-        let manifest_blob_stores = manifest_store
-            .get()
-            .map(|manifest| manifest.blob_stores().to_vec())
-            .unwrap_or_default();
+        let manifest_blob_stores = match manifest_store.get() {
+            Some(v) if !v.blob_stores().is_empty() => v.blob_stores().to_vec(),
+            _ => {
+                anyhow::bail!(
+                    "incoming delivery scanner requires a verified BootstrapManifest with \
+                     non-empty blob_stores (set {} to a BMF1 artifact) \
+                     — refusing to invent blob store URLs",
+                    crate::kernel::bootstrap::BOOTSTRAP_MANIFEST_PATH_ENV
+                );
+            }
+        };
         let network_label = crate::v1::mode::network_label(engine.network()).to_string();
         tokio::spawn(async move {
             let Some(ops) = ops else {

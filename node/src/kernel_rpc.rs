@@ -1106,7 +1106,7 @@ mod tests {
             assert_eq!(err.code(), Code::InvalidArgument);
         }
         // Malformed-boundary under V1 claim: empty SignRequest → InvalidArgument
-        // (width/UUID), not the feature-gate Unimplemented path.
+        // (width/UUID), not the feature-gate Internal/ErrorInfo path.
         // Process claim is monotonic; nextest isolates per test.
         {
             crate::v1::set_process_stack_mode(crate::v1::ScanStackMode::V1);

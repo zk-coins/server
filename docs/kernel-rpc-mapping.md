@@ -14,13 +14,15 @@ Abhängigkeiten sind **nicht** `Status::unimplemented` (typisch
 `InvalidArgument` / `Internal`). Das ist **nicht** dasselbe wie
 „production happy-path complete“.
 
-**Feature-Gate (Ausnahme, kein Platzhalter):** `SignTransition` liefert bei
-**inaktivem** V1-Claim (`!v1_sign_route_active()`) absichtlich
-`Status::unimplemented` am gRPC-Rand **vor** dem Domain-Aufruf — mit
-Meldung zu `ZKCOINS_V1_SHADOW` / `ScanStackMode::V1`, **nicht** dem Text
-`not yet implemented` unverdrahteter Prozeduren. Bei aktivem V1-Claim ist
-der Pfad domain-mapped. Dieses Gate zählt als transport-mapped, nicht als
-unverdrahteter Stub.
+**Feature-Gate (Ausnahme, kein Platzhalter):** `SignTransition` lehnt bei
+**inaktivem** V1-Claim (`!v1_sign_route_active()`) absichtlich am gRPC-Rand
+**vor** dem Domain-Aufruf ab — als `Internal` mit `ErrorInfo`
+(`internal_error` / 500, der §7.8-Fallback für eine Bedingung ausserhalb der
+Prozedur-Fehlertabelle; **nie** `Unimplemented`, das keiner der acht
+zulässigen gRPC-Codes ist) — mit Meldung zu `ZKCOINS_V1_SHADOW` /
+`ScanStackMode::V1`, **nicht** dem Text `not yet implemented` unverdrahteter
+Prozeduren. Bei aktivem V1-Claim ist der Pfad domain-mapped. Dieses Gate
+zählt als transport-mapped, nicht als unverdrahteter Stub.
 
 „Nein“ / unmapped würde die **konkret fehlende** Voraussetzung für eine
 ehrliche Verdrahtung nennen (aktuell: kein Kernel-RPC nur als bare
@@ -75,7 +77,7 @@ Die REST-Keys `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delet
 | **Production happy-path complete** (persist + rehydrate + restart-tested content) | Teilmenge — siehe Zeilennotizen (`GetAccountState`-Index, process-local private records, …) | **nicht 20** |
 | gRPC bare-`Unimplemented` als einzige Fläche (kein Domain-Aufruf, Platzhalter) | — | **0** |
 
-**Kurzfassung:** Alle **20** Kernel-Prozeduren haben einen gRPC-Handler und Domain-Pfad (kein stummes Platzhalter-`Unimplemented`). Das ist **nicht** dasselbe wie „production-complete“: z. B. `GetAccountState` bleibt ohne rehydrierten Account-Index praktisch fail-closed, private records sind process-local bis SQL-Rehydrate, und einige Surfaces brauchen live Session/Engine. `ListInscriptions` liest den beim Falten geschriebenen Inschriften-Katalog. `SubscribeReceipts` streamt Credits vom `ReceiptHub` nach dual-Persist (`v1::incoming`). `OpenPullChallenge` deckt auch `entrust`/`revoke` ab. `SignTransition` hat ein **API-Rand-Feature-Gate** (`Unimplemented` nur bei inaktivem V1-Claim; mit aktivem Claim domain-mapped). Server-Boot nur über `start_rest_node` + shared Hub + pending-sign-Map + shared Receipt-Hub — kein stummer pool-only-Stream-Pfad.
+**Kurzfassung:** Alle **20** Kernel-Prozeduren haben einen gRPC-Handler und Domain-Pfad (kein stummes Platzhalter-`Unimplemented`). Das ist **nicht** dasselbe wie „production-complete“: z. B. `GetAccountState` bleibt ohne rehydrierten Account-Index praktisch fail-closed, private records sind process-local bis SQL-Rehydrate, und einige Surfaces brauchen live Session/Engine. `ListInscriptions` liest den beim Falten geschriebenen Inschriften-Katalog. `SubscribeReceipts` streamt Credits vom `ReceiptHub` nach dual-Persist (`v1::incoming`). `OpenPullChallenge` deckt auch `entrust`/`revoke` ab. `SignTransition` hat ein **API-Rand-Feature-Gate** (`Internal` mit `ErrorInfo` bei inaktivem V1-Claim; mit aktivem Claim domain-mapped). Server-Boot nur über `start_rest_node` + shared Hub + pending-sign-Map + shared Receipt-Hub — kein stummer pool-only-Stream-Pfad.
 
 ## API-lokale Endpunkte (explizit ohne Kernel)
 

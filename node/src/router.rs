@@ -67,9 +67,18 @@ pub(crate) fn check_timestamp_window(timestamp: u64) -> Result<(), &'static str>
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        // Unusable host clock (pre-epoch) must not silently pass a stale/replayed
-        // timestamp — fail closed.
-        .map_err(|_| "Server clock unavailable")?;
+        .map_err(|_| ());
+    check_timestamp_window_with_now(now, timestamp)
+}
+
+/// Freshness check against an injected wall-clock read (unit-testable).
+fn check_timestamp_window_with_now(
+    now: Result<u64, ()>,
+    timestamp: u64,
+) -> Result<(), &'static str> {
+    // Unusable host clock (pre-epoch) must not silently pass a stale/replayed
+    // timestamp — fail closed.
+    let now = now.map_err(|_| "Server clock unavailable")?;
     check_timestamp_window_at(now, timestamp)
 }
 
@@ -3881,6 +3890,14 @@ mod tests;
 #[cfg(test)]
 mod check_timestamp_window_at_tests {
     use super::*;
+
+    #[test]
+    fn unavailable_server_clock_fails_closed() {
+        assert_eq!(
+            check_timestamp_window_with_now(Err(()), 1_000),
+            Err("Server clock unavailable")
+        );
+    }
 
     #[test]
     fn fresh_timestamp_is_ok() {
