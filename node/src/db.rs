@@ -435,6 +435,42 @@ pub(crate) async fn load_block_time_at_height(
     }
 }
 
+/// Load the most recently processed block header timestamp at `height`
+/// inside an open transaction.
+pub(crate) async fn load_block_time_at_height_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    height: u64,
+) -> Result<Option<u64>, sqlx::Error> {
+    let height_i64 = i64::try_from(height).map_err(|_| {
+        sqlx::Error::Decode(format!("block height {height} does not fit i64").into())
+    })?;
+    let block_time: Option<Option<i64>> = sqlx::query_scalar(
+        r#"
+        SELECT block_time
+        FROM block_log
+        WHERE block_height = $1
+        ORDER BY processed_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(height_i64)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    match block_time.flatten() {
+        None => Ok(None),
+        Some(value) if value < 0 => Err(sqlx::Error::Decode(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("negative block_time {value} stored at height {height}"),
+            ),
+        ))),
+        Some(value) => u64::try_from(value)
+            .map(Some)
+            .map_err(|error| sqlx::Error::Decode(Box::new(error))),
+    }
+}
+
 /// Re-derive Bitcoin Core's median-time-past value at `inclusion_height`.
 ///
 /// Returns `None` unless every height in the BIP-113 window has a stored
@@ -448,6 +484,28 @@ pub(crate) async fn load_median_time_past(
 
     for height in first_height..=inclusion_height {
         let Some(block_time) = load_block_time_at_height(pool, height).await? else {
+            return Ok(None);
+        };
+        block_times.push(block_time);
+    }
+
+    block_times.sort_unstable();
+    Ok(Some(block_times[block_times.len() / 2]))
+}
+
+/// Re-derive Bitcoin Core's median-time-past value inside an open transaction.
+///
+/// Returns `None` unless every height in the BIP-113 window has a stored
+/// header timestamp in the transaction's snapshot.
+pub(crate) async fn load_median_time_past_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    inclusion_height: u64,
+) -> Result<Option<u64>, sqlx::Error> {
+    let first_height = inclusion_height.saturating_sub(10);
+    let mut block_times = Vec::with_capacity((inclusion_height - first_height + 1) as usize);
+
+    for height in first_height..=inclusion_height {
+        let Some(block_time) = load_block_time_at_height_in_tx(tx, height).await? else {
             return Ok(None);
         };
         block_times.push(block_time);
@@ -480,6 +538,41 @@ pub(crate) async fn load_block_hash_at_height(
     )
     .bind(height_i64)
     .fetch_optional(pool)
+    .await?;
+    match row {
+        None => Ok(None),
+        Some((bytes,)) => {
+            let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                sqlx::Error::Decode(
+                    format!(
+                        "block_log.block_hash has unexpected length {} (expected 32)",
+                        bytes.len()
+                    )
+                    .into(),
+                )
+            })?;
+            Ok(Some(arr))
+        }
+    }
+}
+
+/// Load the most recently processed block hash at `height` inside an open
+/// transaction.
+pub(crate) async fn load_block_hash_at_height_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    height: u64,
+) -> Result<Option<[u8; 32]>, sqlx::Error> {
+    let height_i64 = i64::try_from(height).map_err(|_| {
+        sqlx::Error::Decode(format!("block height {height} does not fit i64").into())
+    })?;
+    let row: Option<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT block_hash FROM block_log \
+         WHERE block_height = $1 \
+         ORDER BY processed_at DESC \
+         LIMIT 1",
+    )
+    .bind(height_i64)
+    .fetch_optional(&mut **tx)
     .await?;
     match row {
         None => Ok(None),
@@ -1499,17 +1592,18 @@ pub(crate) async fn insert_root_index(
     Ok(())
 }
 
-/// Append-only scanner observation: one row per confirmed block hash.
+/// Scanner observation log: one row per confirmed block hash.
 ///
 /// Production caller: [`crate::v1::record_scanned_block_hashes`] from the
 /// v1.1 scan loop (so below-tip §5.7 anchor locators can load inclusion
 /// hashes via [`load_block_hash_at_height`]). Also used by unit-test
 /// fixtures that seed a known height → hash binding.
 ///
-/// Insert (or no-op on UNIQUE conflict — replayed blocks land twice
-/// when the scanner restarts mid-stream). Marks `processed_at = NOW()`
-/// in the same statement so the row reflects "scanner saw + processed
-/// this block".
+/// Insert a new block observation or refresh an existing block hash when the
+/// scanner observes that physical block again. A conflict advances
+/// `processed_at` so a block returning to canonical status wins height-based
+/// latest-observation lookups, and backfills a missing `block_time` without
+/// overwriting an already-recorded header timestamp.
 pub(crate) async fn insert_block_log(
     pool: &PgPool,
     entry: &BlockLogEntry,
@@ -1518,7 +1612,9 @@ pub(crate) async fn insert_block_log(
         "INSERT INTO block_log \
          (block_hash, block_height, processed_at, inscription_count, processing_duration_us, block_time) \
          VALUES ($1, $2, NOW(), $3, $4, $5) \
-         ON CONFLICT (block_hash) DO NOTHING",
+         ON CONFLICT (block_hash) DO UPDATE SET \
+           block_time = COALESCE(block_log.block_time, EXCLUDED.block_time), \
+           processed_at = NOW()",
     )
     .bind(&entry.block_hash)
     .bind(entry.block_height)

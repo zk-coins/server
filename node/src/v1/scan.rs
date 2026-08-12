@@ -256,7 +256,8 @@ pub(crate) fn replace_engine_nflog_from_survivors(
 /// Durably record the block hash of every block the scanner observed this poll.
 ///
 /// Writes one `block_log` row per entry in `blocks` via
-/// [`crate::db::insert_block_log`] (`ON CONFLICT (block_hash) DO NOTHING`).
+/// [`crate::db::insert_block_log`], refreshing the observation time and
+/// backfilling a missing header timestamp when the block hash already exists.
 /// The live v1.1 scan loop calls this **unconditionally** after each
 /// successful `scan_to_tip` so below-tip §5.7 anchor locators can resolve
 /// inclusion hashes through [`crate::db::load_block_hash_at_height`].
@@ -264,7 +265,7 @@ pub(crate) fn replace_engine_nflog_from_survivors(
 /// block; this function performs no independent RPC lookup.
 ///
 /// Does not touch the in-memory engine or the durable inscription catalog —
-/// only the append-only block-observation audit log.
+/// only the block-observation audit log.
 pub async fn record_scanned_block_hashes(
     pool: &sqlx::PgPool,
     blocks: &[zkcoins_prover::scanner::BlockScanResult],

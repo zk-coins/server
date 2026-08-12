@@ -723,11 +723,27 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
             ),
         });
     }
-    let stored_inclusion_hash = crate::db::load_block_hash_at_height(pool, inclusion_height)
+    let mut tx = pool
+        .begin()
         .await
         .map_err(|e| SdrDiscardReason::InclusionBlockMismatch {
-            detail: format!("block_log lookup at inclusion height {inclusion_height}: {e}"),
+            detail: format!("begin block_log verification snapshot: {e}"),
         })?;
+    // REPEATABLE READ = snapshot isolation in Postgres: one MVCC snapshot for
+    // all block_log reads below. Must be the first statement after BEGIN.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| SdrDiscardReason::InclusionBlockMismatch {
+            detail: format!("set block_log verification snapshot to REPEATABLE READ: {e}"),
+        })?;
+
+    let stored_inclusion_hash =
+        crate::db::load_block_hash_at_height_in_tx(&mut tx, inclusion_height)
+            .await
+            .map_err(|e| SdrDiscardReason::InclusionBlockMismatch {
+                detail: format!("block_log lookup at inclusion height {inclusion_height}: {e}"),
+            })?;
     let Some(stored_inclusion_hash) = stored_inclusion_hash else {
         return Err(SdrDiscardReason::InclusionBlockMismatch {
             detail: format!(
@@ -749,7 +765,7 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
             detail: "occurred_at is zero; a valid sealed BIP-113 MTP is required".into(),
         });
     }
-    let mtp = crate::db::load_median_time_past(pool, inclusion_height)
+    let mtp = crate::db::load_median_time_past_in_tx(&mut tx, inclusion_height)
         .await
         .map_err(|e| SdrDiscardReason::OccurredAtInvalid {
             detail: format!(
@@ -757,21 +773,27 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
                  {inclusion_height}: {e}"
             ),
         })?;
-    let Some(mtp) = mtp else {
-        return Err(SdrDiscardReason::OccurredAtInvalid {
-            detail: format!(
-                "cannot re-derive BIP-113 MTP: missing block_time in the \
-                 [h-10..=h] window at height {inclusion_height}"
-            ),
-        });
-    };
-    if record.occurred_at != mtp {
-        return Err(SdrDiscardReason::OccurredAtInvalid {
-            detail: format!(
-                "occurred_at {} ≠ MTP(inclusion_block) {mtp} (BIP-113)",
-                record.occurred_at
-            ),
-        });
+    match mtp {
+        Some(mtp) => {
+            if record.occurred_at != mtp {
+                return Err(SdrDiscardReason::OccurredAtInvalid {
+                    detail: format!(
+                        "occurred_at {} ≠ MTP(inclusion_block) {mtp} (BIP-113)",
+                        record.occurred_at
+                    ),
+                });
+            }
+        }
+        // This is intentional graceful degradation to presence-only
+        // verification when local history is incomplete, not masking an error.
+        None => {
+            tracing::info!(
+                inclusion_height,
+                "SDR recovery: MTP window was not locally available at the inclusion height; \
+                 BIP-113 binding was not re-verified for this record; intentional \
+                 recovery-completeness fallback to presence-only verification"
+            );
+        }
     }
 
     // (vi) §3.5 anchor bound via the shared scanner predicate
@@ -779,15 +801,17 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
         block_hash: record.proof_block_anchor.block_hash,
         height: record.proof_block_anchor.height,
     };
-    let anchor_hash =
-        crate::db::load_block_hash_at_height(pool, u64::from(record.proof_block_anchor.height))
-            .await
-            .map_err(|e| SdrDiscardReason::AnchorBoundFailed {
-                detail: format!(
-                    "block_log lookup at proof_block_anchor height {}: {e}",
-                    record.proof_block_anchor.height
-                ),
-            })?;
+    let anchor_hash = crate::db::load_block_hash_at_height_in_tx(
+        &mut tx,
+        u64::from(record.proof_block_anchor.height),
+    )
+    .await
+    .map_err(|e| SdrDiscardReason::AnchorBoundFailed {
+        detail: format!(
+            "block_log lookup at proof_block_anchor height {}: {e}",
+            record.proof_block_anchor.height
+        ),
+    })?;
     let Some(anchor_hash) = anchor_hash else {
         return Err(SdrDiscardReason::AnchorBoundFailed {
             detail: format!(
@@ -798,6 +822,12 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
     };
     zkcoins_prover::scanner::evaluate_anchor_bound(&sp_anchor, inclusion_height, anchor_hash)
         .map_err(|detail| SdrDiscardReason::AnchorBoundFailed { detail })?;
+
+    tx.commit()
+        .await
+        .map_err(|e| SdrDiscardReason::InclusionBlockMismatch {
+            detail: format!("commit block_log verification snapshot: {e}"),
+        })?;
 
     Ok(())
 }
@@ -3986,7 +4016,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdr_missing_mtp_window_timestamp_is_discarded_fail_closed() {
+    async fn sdr_missing_mtp_window_is_accepted_via_presence_fallback() {
         let scope = crate::test_db::setup_pool().await;
         for height in 90_u64..=100 {
             // Height 95 is present but deliberately has SQL NULL block_time.
@@ -3999,14 +4029,42 @@ mod tests {
             )
             .await;
         }
+        insert_sdr_anchor_if_outside_window(&scope.pool, 100, 50).await;
         let record = sample_sdr_for_async_checks(100, 50, 95);
+
+        verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
+            .await
+            .expect("an incomplete MTP window must fall back to presence verification");
+    }
+
+    #[tokio::test]
+    async fn sdr_zero_occurred_at_is_discarded_when_mtp_window_unavailable() {
+        let scope = crate::test_db::setup_pool().await;
+        for height in 90_u64..=100 {
+            let block_time = (height != 95).then_some(height as i64);
+            insert_sdr_check_block(
+                &scope.pool,
+                height,
+                sdr_check_block_hash(height),
+                block_time,
+            )
+            .await;
+        }
+        assert_eq!(
+            crate::db::load_median_time_past(&scope.pool, 100)
+                .await
+                .unwrap(),
+            None,
+            "the fixture must have an unavailable MTP window"
+        );
+        let record = sample_sdr_for_async_checks(100, 50, 0);
 
         let err = verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
             .await
-            .expect_err("an incomplete MTP window must fail closed");
+            .expect_err("zero occurred_at must fail before the MTP fallback");
         match err {
             SdrDiscardReason::OccurredAtInvalid { detail } => {
-                assert!(detail.contains("cannot re-derive BIP-113 MTP"), "{detail}");
+                assert!(detail.contains("occurred_at is zero"), "{detail}");
             }
             other => panic!("expected OccurredAtInvalid, got {other:?}"),
         }
@@ -4042,33 +4100,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdr_reorged_ancestor_timestamp_invalidates_old_occurred_at() {
+    async fn sdr_a_b_a_reorg_restores_canonical_mtp_binding() {
         let scope = crate::test_db::setup_pool().await;
         insert_sdr_mtp_window(&scope.pool, 100, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]).await;
+        insert_sdr_anchor_if_outside_window(&scope.pool, 100, 50).await;
         let record = sample_sdr_for_async_checks(100, 50, 6);
 
-        // Simulate a rescanned canonical ancestor while retaining the same
-        // canonical inclusion block. Replacing height 95's time 6 with 1,000
-        // changes the median to 7 without triggering inclusion-hash mismatch.
+        // A is initially canonical at height 95, B replaces it, then the scanner
+        // re-observes A when the chain returns to the original physical block.
         insert_sdr_check_block(&scope.pool, 95, [0xEE; 32], Some(1_000)).await;
-        sqlx::query(
-            "UPDATE block_log SET processed_at = NOW() + INTERVAL '1 second' \
-             WHERE block_hash = $1",
+        insert_sdr_check_block(
+            &scope.pool,
+            95,
+            sdr_check_block_hash(95),
+            Some(6),
         )
-        .bind(vec![0xEEu8; 32])
-        .execute(&scope.pool)
-        .await
-        .unwrap();
+        .await;
 
-        let err = verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
+        assert_eq!(
+            crate::db::load_median_time_past(&scope.pool, 100)
+                .await
+                .unwrap(),
+            Some(6),
+            "the MTP window must select A's restored timestamp, not orphaned B's"
+        );
+        verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
             .await
-            .expect_err("the old pre-reorg MTP must be discarded");
-        match err {
-            SdrDiscardReason::OccurredAtInvalid { detail } => {
-                assert!(detail.contains("≠ MTP(inclusion_block) 7"), "{detail}");
-            }
-            other => panic!("expected OccurredAtInvalid, got {other:?}"),
-        }
+            .expect("occurred_at matching restored canonical A's MTP must pass");
     }
 
     /// Distinct, constructible account state for chain / ash fixtures.
