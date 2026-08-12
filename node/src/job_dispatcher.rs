@@ -2443,17 +2443,10 @@ fn parse_hex32_field(hex_str: &str, field: &str) -> Result<[u8; 32], String> {
     Ok(arr)
 }
 
-/// Resolve `nk` / `op_secret` / `current_pubkey` for a receive begin.
-///
-/// - Registered engine account → live rotated `current_pubkey`;
-///   `genesis_pubkey` MUST be absent (§7.5 presence rule) — refused if present.
-/// - Fresh account (InitialProof, no engine record yet) → the client-supplied
-///   `genesis_pubkey` (required). The engine's own `begin_receive` (in
-///   `script-plonky2/src/state_engine.rs`) independently re-checks
-///   `owner == H(current_pubkey ‖ nk_commit)` and fails closed on mismatch —
-///   this function does not duplicate that cryptographic check, it only
-///   resolves which value to hand the engine. Matches how
-///   `resolve_mint_auth_keys` uses `creator_pubkey`.
+/// Why receive auth-key resolution refused, with the §7.5 machine_code each
+/// maps to ([`ReceiveAuthError::code`]): the two `GenesisPubkey*` variants are
+/// client `genesis_pubkey` presence violations (`malformed_request`), the rest
+/// are node-side/state conditions (`internal_error`).
 #[derive(Debug)]
 enum ReceiveAuthError {
     NoActiveBundle { subject: [u8; 32] },
@@ -2545,16 +2538,26 @@ mod receive_auth_error_tests {
     }
 }
 
+/// Resolve `nk` / `op_secret` / `current_pubkey` for a receive begin.
+///
+/// - Registered engine account → live rotated `current_pubkey`;
+///   `genesis_pubkey` MUST be absent (§7.5 presence rule) — refused if present.
+/// - Fresh account (InitialProof, no engine record yet) → the client-supplied
+///   `genesis_pubkey` (required). The engine's own `begin_receive` (in
+///   `script-plonky2/src/state_engine.rs`) independently re-checks
+///   `owner == H(current_pubkey ‖ nk_commit)` and fails closed on mismatch —
+///   this function does not duplicate that cryptographic check, it only
+///   resolves which value to hand the engine. Matches how
+///   `resolve_mint_auth_keys` uses `creator_pubkey`.
 fn resolve_receive_auth_keys(
     app_state: &AppState,
     subject: &crate::kernel::types::SubjectAddress,
     genesis_pubkey: Option<[u8; 32]>,
 ) -> Result<ReceiveAuthKeys, ReceiveAuthError> {
-    let bundle = app_state.bundles.get_active(subject).ok_or_else(|| {
-        ReceiveAuthError::NoActiveBundle {
-            subject: subject.0,
-        }
-    })?;
+    let bundle = app_state
+        .bundles
+        .get_active(subject)
+        .ok_or_else(|| ReceiveAuthError::NoActiveBundle { subject: subject.0 })?;
     let op_secret = zkcoins_prover::state_engine::OpSecret::new(bundle.op_secret);
     let owner = shared::spec_v1::Address(subject.0);
 
@@ -5835,9 +5838,11 @@ mod receive_job_path_and_decision_table_tests {
             after.status
         );
         let err = after.error.as_deref().expect("error");
-        assert!(
-            err.contains("unknown coin") || err.contains("unknown_coin"),
-            "must name downstream unknown-coin cause; got {err}"
+        let parsed: serde_json::Value = serde_json::from_str(err).expect("job error is JSON");
+        assert_eq!(
+            parsed["error"].as_str(),
+            Some("unknown_coin"),
+            "downstream failure must carry the unknown_coin machine_code, not an auth-resolution code; got {err}"
         );
         assert!(
             !err.contains("malformed_request"),
