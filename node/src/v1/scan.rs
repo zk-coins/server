@@ -260,6 +260,8 @@ pub(crate) fn replace_engine_nflog_from_survivors(
 /// The live v1.1 scan loop calls this **unconditionally** after each
 /// successful `scan_to_tip` so below-tip §5.7 anchor locators can resolve
 /// inclusion hashes through [`crate::db::load_block_hash_at_height`].
+/// `block_time` is the header nTime carried from the scanner's already-fetched
+/// block; this function performs no independent RPC lookup.
 ///
 /// Does not touch the in-memory engine or the durable inscription catalog —
 /// only the append-only block-observation audit log.
@@ -281,6 +283,7 @@ pub async fn record_scanned_block_hashes(
             )
         })?;
         let entry = crate::db::BlockLogEntry {
+            block_time: Some(i64::from(block.block_time)),
             block_hash: block.block_hash.to_byte_array().to_vec(),
             block_height: Some(block_height),
             inscription_count,

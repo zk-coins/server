@@ -275,7 +275,8 @@ pub(crate) enum SdrDiscardReason {
     NotFirstOccurrence { detail: String },
     /// Check (v): inclusion block height/hash does not match NfLog + block_log.
     InclusionBlockMismatch { detail: String },
-    /// Check (v): `occurred_at` is zero (invalid; BIP-113 MTP not re-derived here).
+    /// Check (v): `occurred_at` is zero, the local BIP-113 MTP window is
+    /// incomplete, or the value differs from the re-derived MTP.
     OccurredAtInvalid { detail: String },
     /// Check (v) ordering stage: `occurred_at` regressed vs a previously accepted record.
     OccurredAtNotMonotonic { detail: String },
@@ -712,14 +713,8 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
     inclusion_height: u64,
     record: &host::SelfDeliveryRecordV1,
 ) -> Result<(), SdrDiscardReason> {
-    // (v) inclusion height/hash + occurred_at ≠ 0 (monotonicity is ordering-stage)
-    if record.occurred_at == 0 {
-        return Err(SdrDiscardReason::OccurredAtInvalid {
-            detail: "occurred_at is zero (refusing non-deterministic MTP re-derivation; \
-                     require a non-zero sealed value)"
-                .into(),
-        });
-    }
+    // (v) inclusion height/hash + occurred_at bound to locally re-derived BIP-113 MTP
+    // (monotonicity is ordering-stage).
     if u64::from(record.inclusion_block.height) != inclusion_height {
         return Err(SdrDiscardReason::InclusionBlockMismatch {
             detail: format!(
@@ -746,6 +741,35 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
                 "inclusion_block.block_hash {} ≠ block_log hash {} at height {inclusion_height}",
                 hex::encode(record.inclusion_block.block_hash),
                 hex::encode(stored_inclusion_hash)
+            ),
+        });
+    }
+    if record.occurred_at == 0 {
+        return Err(SdrDiscardReason::OccurredAtInvalid {
+            detail: "occurred_at is zero; a valid sealed BIP-113 MTP is required".into(),
+        });
+    }
+    let mtp = crate::db::load_median_time_past(pool, inclusion_height)
+        .await
+        .map_err(|e| SdrDiscardReason::OccurredAtInvalid {
+            detail: format!(
+                "block_log lookup for BIP-113 MTP window at inclusion height \
+                 {inclusion_height}: {e}"
+            ),
+        })?;
+    let Some(mtp) = mtp else {
+        return Err(SdrDiscardReason::OccurredAtInvalid {
+            detail: format!(
+                "cannot re-derive BIP-113 MTP: missing block_time in the \
+                 [h-10..=h] window at height {inclusion_height}"
+            ),
+        });
+    };
+    if record.occurred_at != mtp {
+        return Err(SdrDiscardReason::OccurredAtInvalid {
+            detail: format!(
+                "occurred_at {} ≠ MTP(inclusion_block) {mtp} (BIP-113)",
+                record.occurred_at
             ),
         });
     }
@@ -3832,6 +3856,221 @@ mod tests {
         }
     }
 
+    fn sdr_check_block_hash(height: u64) -> [u8; 32] {
+        [u8::try_from(height).unwrap().wrapping_add(1); 32]
+    }
+
+    async fn insert_sdr_check_block(
+        pool: &PgPool,
+        height: u64,
+        block_hash: [u8; 32],
+        block_time: Option<i64>,
+    ) {
+        crate::db::insert_block_log(
+            pool,
+            &crate::db::BlockLogEntry {
+                block_time,
+                block_hash: block_hash.to_vec(),
+                block_height: Some(i64::try_from(height).unwrap()),
+                inscription_count: 0,
+                processing_duration_us: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_sdr_mtp_window(pool: &PgPool, inclusion_height: u64, times: &[i64]) {
+        let first_height = inclusion_height.saturating_sub(10);
+        assert_eq!(times.len(), (inclusion_height - first_height + 1) as usize);
+        for (height, block_time) in (first_height..=inclusion_height).zip(times.iter().copied()) {
+            insert_sdr_check_block(
+                pool,
+                height,
+                sdr_check_block_hash(height),
+                Some(block_time),
+            )
+            .await;
+        }
+    }
+
+    fn sample_sdr_for_async_checks(
+        inclusion_height: u64,
+        anchor_height: u64,
+        occurred_at: u64,
+    ) -> host::SelfDeliveryRecordV1 {
+        let subject = [0x41; 32];
+        let nk = [0x42; 32];
+        let pk = [0x43; 32];
+        let account = sample_account_state_for(subject, nk, pk, 1);
+        let mut record = sample_sdr_record(1, host::ZERO_HASH, account, pk, occurred_at);
+        record.inclusion_block = host::BlockAnchor {
+            block_hash: sdr_check_block_hash(inclusion_height),
+            height: u32::try_from(inclusion_height).unwrap(),
+        };
+        record.proof_block_anchor = host::BlockAnchor {
+            block_hash: sdr_check_block_hash(anchor_height),
+            height: u32::try_from(anchor_height).unwrap(),
+        };
+        record
+    }
+
+    async fn insert_sdr_anchor_if_outside_window(
+        pool: &PgPool,
+        inclusion_height: u64,
+        anchor_height: u64,
+    ) {
+        if anchor_height < inclusion_height.saturating_sub(10) {
+            insert_sdr_check_block(
+                pool,
+                anchor_height,
+                sdr_check_block_hash(anchor_height),
+                None,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sdr_occurred_at_equal_to_locally_derived_mtp_is_accepted() {
+        let scope = crate::test_db::setup_pool().await;
+        let times = [11, 2, 9, 4, 8, 6, 7, 5, 3, 10, 1];
+        insert_sdr_mtp_window(&scope.pool, 100, &times).await;
+        insert_sdr_anchor_if_outside_window(&scope.pool, 100, 50).await;
+        let record = sample_sdr_for_async_checks(100, 50, 6);
+
+        verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
+            .await
+            .expect("occurred_at equal to the local BIP-113 MTP must pass");
+    }
+
+    #[tokio::test]
+    async fn sdr_nonzero_occurred_at_different_from_mtp_is_discarded() {
+        let scope = crate::test_db::setup_pool().await;
+        let times = [11, 2, 9, 4, 8, 6, 7, 5, 3, 10, 1];
+        insert_sdr_mtp_window(&scope.pool, 100, &times).await;
+        let record = sample_sdr_for_async_checks(100, 50, 7);
+
+        let err = verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
+            .await
+            .expect_err("non-MTP occurred_at must fail check (v)");
+        match err {
+            SdrDiscardReason::OccurredAtInvalid { detail } => {
+                assert!(detail.contains("≠ MTP(inclusion_block)"), "{detail}");
+            }
+            other => panic!("expected OccurredAtInvalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sdr_zero_occurred_at_short_circuit_is_preserved() {
+        let scope = crate::test_db::setup_pool().await;
+        insert_sdr_check_block(
+            &scope.pool,
+            100,
+            sdr_check_block_hash(100),
+            Some(1_700_000_000),
+        )
+        .await;
+        let record = sample_sdr_for_async_checks(100, 50, 0);
+
+        let err = verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
+            .await
+            .expect_err("zero occurred_at must fail check (v)");
+        match err {
+            SdrDiscardReason::OccurredAtInvalid { detail } => {
+                assert!(detail.contains("occurred_at is zero"), "{detail}");
+            }
+            other => panic!("expected OccurredAtInvalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sdr_missing_mtp_window_timestamp_is_discarded_fail_closed() {
+        let scope = crate::test_db::setup_pool().await;
+        for height in 90_u64..=100 {
+            // Height 95 is present but deliberately has SQL NULL block_time.
+            let block_time = (height != 95).then_some(height as i64);
+            insert_sdr_check_block(
+                &scope.pool,
+                height,
+                sdr_check_block_hash(height),
+                block_time,
+            )
+            .await;
+        }
+        let record = sample_sdr_for_async_checks(100, 50, 95);
+
+        let err = verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
+            .await
+            .expect_err("an incomplete MTP window must fail closed");
+        match err {
+            SdrDiscardReason::OccurredAtInvalid { detail } => {
+                assert!(detail.contains("cannot re-derive BIP-113 MTP"), "{detail}");
+            }
+            other => panic!("expected OccurredAtInvalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sdr_near_genesis_truncated_mtp_window_is_accepted() {
+        let scope = crate::test_db::setup_pool().await;
+        insert_sdr_mtp_window(&scope.pool, 3, &[40, 10, 30, 20]).await;
+        let record = sample_sdr_for_async_checks(3, 0, 30);
+
+        verify_sdr_record_checks_v_vi_async(&scope.pool, 3, &record)
+            .await
+            .expect("the four-block near-genesis MTP window must pass");
+    }
+
+    #[tokio::test]
+    async fn sdr_even_count_mtp_uses_upper_middle_element() {
+        let scope = crate::test_db::setup_pool().await;
+        insert_sdr_mtp_window(&scope.pool, 3, &[2_000, 1, 1_000, 2]).await;
+        assert_eq!(
+            crate::db::load_median_time_past(&scope.pool, 3)
+                .await
+                .unwrap(),
+            Some(1_000),
+            "Bitcoin Core selects sorted[len/2], not an average"
+        );
+        let record = sample_sdr_for_async_checks(3, 0, 1_000);
+
+        verify_sdr_record_checks_v_vi_async(&scope.pool, 3, &record)
+            .await
+            .expect("the exact upper-middle MTP must pass");
+    }
+
+    #[tokio::test]
+    async fn sdr_reorged_ancestor_timestamp_invalidates_old_occurred_at() {
+        let scope = crate::test_db::setup_pool().await;
+        insert_sdr_mtp_window(&scope.pool, 100, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]).await;
+        let record = sample_sdr_for_async_checks(100, 50, 6);
+
+        // Simulate a rescanned canonical ancestor while retaining the same
+        // canonical inclusion block. Replacing height 95's time 6 with 1,000
+        // changes the median to 7 without triggering inclusion-hash mismatch.
+        insert_sdr_check_block(&scope.pool, 95, [0xEE; 32], Some(1_000)).await;
+        sqlx::query(
+            "UPDATE block_log SET processed_at = NOW() + INTERVAL '1 second' \
+             WHERE block_hash = $1",
+        )
+        .bind(vec![0xEEu8; 32])
+        .execute(&scope.pool)
+        .await
+        .unwrap();
+
+        let err = verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
+            .await
+            .expect_err("the old pre-reorg MTP must be discarded");
+        match err {
+            SdrDiscardReason::OccurredAtInvalid { detail } => {
+                assert!(detail.contains("≠ MTP(inclusion_block) 7"), "{detail}");
+            }
+            other => panic!("expected OccurredAtInvalid, got {other:?}"),
+        }
+    }
+
     /// Distinct, constructible account state for chain / ash fixtures.
     fn sample_account_state_for(
         subject: [u8; 32],
@@ -5008,9 +5247,19 @@ mod tests {
         }
         engine.set_tip_height(inclusion_height + 10);
 
+        for height in inclusion_height - 10..inclusion_height {
+            insert_sdr_check_block(
+                pool,
+                height,
+                sdr_check_block_hash(height),
+                Some(1_700_000_000),
+            )
+            .await;
+        }
         crate::db::insert_block_log(
             pool,
             &crate::db::BlockLogEntry {
+                block_time: Some(1_700_000_000),
                 block_hash: inclusion_hash.to_vec(),
                 block_height: Some(inclusion_height as i64),
                 inscription_count: 0,
@@ -5022,6 +5271,7 @@ mod tests {
         crate::db::insert_block_log(
             pool,
             &crate::db::BlockLogEntry {
+                block_time: None,
                 block_hash: anchor_hash.to_vec(),
                 block_height: Some(anchor_height as i64),
                 inscription_count: 0,
@@ -5179,7 +5429,7 @@ mod tests {
 
         let scope = crate::test_db::setup_pool().await;
         let (mut record, engine, subject, nk) = build_real_mint_sdr_fixture(&scope.pool).await;
-        // (v) only: zero occurred_at is invalid (no MTP re-derivation).
+        // (v) only: zero occurred_at remains invalid before the MTP lookup.
         record.occurred_at = 0;
 
         let bridge = ProverBridge::new(Network::Regtest);

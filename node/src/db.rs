@@ -396,6 +396,67 @@ pub(crate) async fn load_mmr(pool: &PgPool) -> Result<Option<Vec<u8>>, sqlx::Err
     Ok(row.map(|(data,)| data))
 }
 
+/// Load the most recently processed block header timestamp at `height`.
+///
+/// A missing row and a row whose timestamp is SQL NULL both return `None`.
+/// Negative stored timestamps are rejected because Bitcoin header times are
+/// unsigned values.
+pub(crate) async fn load_block_time_at_height(
+    pool: &PgPool,
+    height: u64,
+) -> Result<Option<u64>, sqlx::Error> {
+    let height_i64 = i64::try_from(height).map_err(|_| {
+        sqlx::Error::Decode(format!("block height {height} does not fit i64").into())
+    })?;
+    let block_time: Option<Option<i64>> = sqlx::query_scalar(
+        r#"
+        SELECT block_time
+        FROM block_log
+        WHERE block_height = $1
+        ORDER BY processed_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(height_i64)
+    .fetch_optional(pool)
+    .await?;
+
+    match block_time.flatten() {
+        None => Ok(None),
+        Some(value) if value < 0 => Err(sqlx::Error::Decode(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("negative block_time {value} stored at height {height}"),
+            ),
+        ))),
+        Some(value) => u64::try_from(value)
+            .map(Some)
+            .map_err(|error| sqlx::Error::Decode(Box::new(error))),
+    }
+}
+
+/// Re-derive Bitcoin Core's median-time-past value at `inclusion_height`.
+///
+/// Returns `None` unless every height in the BIP-113 window has a stored
+/// header timestamp.
+pub(crate) async fn load_median_time_past(
+    pool: &PgPool,
+    inclusion_height: u64,
+) -> Result<Option<u64>, sqlx::Error> {
+    let first_height = inclusion_height.saturating_sub(10);
+    let mut block_times = Vec::with_capacity((inclusion_height - first_height + 1) as usize);
+
+    for height in first_height..=inclusion_height {
+        let Some(block_time) = load_block_time_at_height(pool, height).await? else {
+            return Ok(None);
+        };
+        block_times.push(block_time);
+    }
+
+    block_times.sort_unstable();
+    Ok(Some(block_times[block_times.len() / 2]))
+}
+
 /// Load the block hash for a scanned height from the durable `block_log`
 /// audit trail (most recent row at that height, if any).
 ///
@@ -1455,14 +1516,15 @@ pub(crate) async fn insert_block_log(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO block_log \
-         (block_hash, block_height, processed_at, inscription_count, processing_duration_us) \
-         VALUES ($1, $2, NOW(), $3, $4) \
+         (block_hash, block_height, processed_at, inscription_count, processing_duration_us, block_time) \
+         VALUES ($1, $2, NOW(), $3, $4, $5) \
          ON CONFLICT (block_hash) DO NOTHING",
     )
     .bind(&entry.block_hash)
     .bind(entry.block_height)
     .bind(entry.inscription_count)
     .bind(entry.processing_duration_us)
+    .bind(entry.block_time)
     .execute(pool)
     .await?;
     Ok(())
@@ -1471,11 +1533,12 @@ pub(crate) async fn insert_block_log(
 /// One `block_log` row written by the live scan loop (or a test fixture).
 #[derive(Debug, Clone)]
 pub(crate) struct BlockLogEntry {
+    /// The block's header nTime as a Unix timestamp, or `None` when the live
+    /// scan legitimately could not learn it. Never a synthetic zero.
+    pub block_time: Option<i64>,
     pub block_hash: Vec<u8>,
-    /// Block height as reported by Esplora's `get_block_status`. `None`
-    /// when the upstream did not return a height — the previous
-    /// sentinel `-1` was magic-value-driven, NULL is the type-safe
-    /// alternative (migration 0010 drops the NOT NULL).
+    /// Block height reported by the scanner. `None` when the scanner did not
+    /// return a height; migration 0010 permits SQL NULL for that case.
     pub block_height: Option<i64>,
     pub inscription_count: i32,
     pub processing_duration_us: Option<i64>,
