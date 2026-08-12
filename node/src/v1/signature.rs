@@ -4016,6 +4016,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn issuer_mint_provenance_helper_rejects_asset_id_mismatch() {
+        use crate::test_db::setup_pool;
+
+        let scope = setup_pool().await;
+        let expected_terms = mint_terms();
+        let nh = name_hash(&expected_terms.name).expect("mint terms name");
+        let computed_asset_id = asset_id_v2(
+            GENESIS_TAG,
+            &expected_terms.creator_pubkey,
+            &nh,
+            expected_terms.decimals,
+            2,
+            expected_terms.cap_total.expect("v2 mint terms cap_total"),
+            &expected_terms
+                .terms_salt
+                .expect("v2 mint terms terms_salt"),
+        );
+        let mismatched_asset_id = shared::spec_v1::digest_from_bytes(&[0x99; 32])
+            .expect("fixed mismatched asset_id digest");
+        assert_ne!(mismatched_asset_id, computed_asset_id);
+
+        let mut coin = external_coin([0x81; 32]);
+        coin.asset_id = mismatched_asset_id;
+        let asset_id = digest_to_bytes(&coin.asset_id);
+        let mut snap = delivery_snapshot(vec![coin]);
+        snap.record_kind = 0x01;
+        snap.mint_asset_terms = Some(expected_terms.clone());
+
+        let err = insert_issuer_mint_provenance(&scope.pool, &snap)
+            .await
+            .expect_err("issuer mint provenance must reject an asset_id mismatch");
+        assert_eq!(
+            err,
+            crate::v1::delivery::DeliveryError::Relay(
+                "issuer-side asset_terms self-auth failed: recomputed asset_id ≠ output coin asset_id"
+                    .into(),
+            )
+        );
+        assert_eq!(
+            crate::v1::db_token_provenance::get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("read rejected issuer-side mint provenance"),
+            None
+        );
+    }
+
     #[test]
     fn external_outbox_wrapper_propagates_delivery_matrix_and_round_trips_every_field() {
         use crate::v1::delivery::{DeliveryError, DeliveryTarget, DeliveryTargetStore};

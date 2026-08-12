@@ -22,17 +22,15 @@ use uuid::Uuid;
 pub(crate) async fn stage_mint_issuance_terms(
     pool: &PgPool,
     job_id: Uuid,
-    pk_create: &[u8; 32],
     terms: &IssuanceTerms,
 ) -> Result<()> {
     let canonical = serialize_issuance_terms(terms)
         .context("v1_mint_terms_staging serialize canonical IssuanceTerms")?;
     let result = sqlx::query(
-        "INSERT INTO v1_mint_terms_staging (job_id, pk_create, issuance_terms) \
-         VALUES ($1, $2, $3) ON CONFLICT (job_id) DO NOTHING",
+        "INSERT INTO v1_mint_terms_staging (job_id, issuance_terms) \
+         VALUES ($1, $2) ON CONFLICT (job_id) DO NOTHING",
     )
     .bind(job_id)
-    .bind(pk_create.as_slice())
     .bind(&canonical)
     .execute(pool)
     .await
@@ -109,10 +107,9 @@ mod tests {
     async fn staged_terms_round_trip() {
         let scope = setup_pool().await;
         let job_id = Uuid::from_bytes([0x41; 16]);
-        let pk_create = [0x21; 32];
         let terms = v1_terms();
 
-        stage_mint_issuance_terms(&scope.pool, job_id, &pk_create, &terms)
+        stage_mint_issuance_terms(&scope.pool, job_id, &terms)
             .await
             .expect("stage mint terms");
         assert_eq!(
@@ -139,13 +136,12 @@ mod tests {
     async fn identical_restaging_is_idempotent_and_non_destructive() {
         let scope = setup_pool().await;
         let job_id = Uuid::from_bytes([0x43; 16]);
-        let pk_create = [0x31; 32];
         let terms = v1_terms();
 
-        stage_mint_issuance_terms(&scope.pool, job_id, &pk_create, &terms)
+        stage_mint_issuance_terms(&scope.pool, job_id, &terms)
             .await
             .expect("first mint terms stage");
-        stage_mint_issuance_terms(&scope.pool, job_id, &pk_create, &terms)
+        stage_mint_issuance_terms(&scope.pool, job_id, &terms)
             .await
             .expect("idempotent mint terms restage");
         assert_eq!(
@@ -163,19 +159,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn distinct_job_ids_same_pk_create_read_back_own_terms() {
+    async fn distinct_job_ids_read_back_own_terms() {
         let scope = setup_pool().await;
         let job_id_a = Uuid::from_bytes([0x61; 16]);
         let job_id_b = Uuid::from_bytes([0x62; 16]);
-        let pk_create = [0x51; 32];
         let terms_a = v1_terms();
         let mut terms_b = v1_terms();
         terms_b.name = vec![b'd', b'i', b'f', b'f', b'e', b'r', b'e', b'n', b't'];
 
-        stage_mint_issuance_terms(&scope.pool, job_id_a, &pk_create, &terms_a)
+        stage_mint_issuance_terms(&scope.pool, job_id_a, &terms_a)
             .await
             .expect("stage first mint attempt terms");
-        stage_mint_issuance_terms(&scope.pool, job_id_b, &pk_create, &terms_b)
+        stage_mint_issuance_terms(&scope.pool, job_id_b, &terms_b)
             .await
             .expect("stage second mint attempt terms");
 
@@ -197,7 +192,6 @@ mod tests {
     async fn divergent_terms_same_attempt_key_is_hard_error() {
         let scope = setup_pool().await;
         let job_id = Uuid::from_bytes([0x72; 16]);
-        let pk_create = [0x71; 32];
         let original_terms = v1_terms();
         let mut divergent_terms = v1_terms();
         divergent_terms.name = vec![b'd', b'i', b'v', b'e', b'r', b'g', b'e', b'n', b't'];
@@ -205,7 +199,6 @@ mod tests {
         stage_mint_issuance_terms(
             &scope.pool,
             job_id,
-            &pk_create,
             &original_terms,
         )
         .await
@@ -213,7 +206,6 @@ mod tests {
         stage_mint_issuance_terms(
             &scope.pool,
             job_id,
-            &pk_create,
             &divergent_terms,
         )
         .await

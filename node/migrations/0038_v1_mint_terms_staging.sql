@@ -9,7 +9,6 @@
 
 CREATE TABLE v1_mint_terms_staging (
     job_id UUID PRIMARY KEY,
-    pk_create BYTEA NOT NULL CHECK (octet_length(pk_create) = 32),
     issuance_terms BYTEA NOT NULL CHECK (octet_length(issuance_terms) > 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
