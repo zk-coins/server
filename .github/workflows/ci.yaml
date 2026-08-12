@@ -1,24 +1,30 @@
 name: CI
 
 on:
+  # `workflow_dispatch` stays available: a run can still be started by
+  # hand from the Actions tab when a specific answer is wanted.
+  workflow_dispatch:
+
   # CI runs on every pull request regardless of target branch. This
   # makes the default safe for stacked PRs (PR-A → PR-B → PR-C where
   # each PR's base is the previous PR's branch) and any other workflow
   # that opens a PR against a non-`develop` branch — previously such
   # PRs were silently skipped because `branches: [develop]` filtered
   # them out, and the only fix was to hand-edit ci.yaml on each new
-  # feature stack. Letting every PR trigger CI is cheap (the heavy
-  # M3 Ultra jobs are still gated behind the `ci:full` label below)
-  # and matches what most repos default to.
+  # feature stack. Letting every PR trigger CI matches what most
+  # repos default to. The heavy M3 Ultra gate (`test-and-coverage`)
+  # now runs on every non-draft PR (CI endgame / G16 — see
+  # `.github/coverage-baseline.md`); drafts still skip via each
+  # job's `if:` guard.
   #
   # `push: develop` is intentionally absent. Every commit reaching
   # `develop` is already covered by the open Release PR (`Release:
   # develop -> main`, created by auto-release-pr.yaml) — that PR's
-  # `synchronize` event runs CI on the new HEAD, and because the
-  # Release PR carries the `ci:full` label the heavy gate runs too.
-  # Adding `on: push: branches: [develop]` would queue a second
-  # workflow instance on the same SHA, doubling self-hosted-runner
-  # load on a check the Release PR's `synchronize` already provides.
+  # `synchronize` event runs CI on the new HEAD, and the heavy gate
+  # runs because the Release PR is non-draft. Adding
+  # `on: push: branches: [develop]` would queue a second workflow
+  # instance on the same SHA, doubling self-hosted-runner load on a
+  # check the Release PR's `synchronize` already provides.
   # (Under the PR-number grouping in the concurrency block below the
   # two runs would land in DIFFERENT groups — push keyed by
   # `refs/heads/develop`, PR keyed by the Release PR's number — so
@@ -29,9 +35,9 @@ on:
   # `if:` guard on each job (saves self-hosted-runner time while
   # work is still in progress).
   #
-  # `labeled` / `unlabeled` are added so toggling the `ci:full` label
-  # triggers (or removes) the heavy self-hosted-runner gate on demand
-  # — see the `test-and-coverage` job below.
+  # `labeled` / `unlabeled` remain so label toggles re-fire the
+  # workflow (e.g. operational re-runs). The heavy gate no longer
+  # keys off `ci:full` (see `test-and-coverage` job `if:`).
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
@@ -49,10 +55,10 @@ concurrency:
   #
   # Label events (`labeled` / `unlabeled`) get their own isolated
   # group keyed by `run_id`, so toggling a label on a PR does NOT
-  # cancel an in-flight 60-90-min Heavy run on the same PR — most
-  # label toggles are unrelated (`bug`, `priority/*`, …) and killing
-  # the Heavy run for them would be a footgun. Trade-off: removing
-  # `ci:full` mid-run does NOT auto-stop a Heavy run that is already
+  # cancel an in-flight Heavy run on the same PR — most label
+  # toggles are unrelated (`bug`, `priority/*`, …) and killing the
+  # Heavy run for them would be a footgun. Trade-off: a label toggle
+  # mid-run does NOT auto-stop a Heavy run that is already
   # executing; cancel it manually with `gh run cancel` if you really
   # need to free an agent.
   group: >-
@@ -72,32 +78,32 @@ env:
 # Job topology — a two-tier test-gating model:
 #
 # * Tier 1 — `lint-and-build` — GitHub-hosted Linux, the DEFAULT.
-#   Runs on every non-draft PR and every push with no label required.
-#   Catches cross-platform compile bitrot and lint regressions
-#   cheaply. Runs in PARALLEL with the heavy gate below — it does not
-#   gate it via `needs:`. Each job carries its own draft/label `if:`
-#   guard, so a lint failure does not block the heavy gate from
-#   starting (deliberate: parallel feedback. Trade-off: on a lint
-#   failure the m3-ultra runner time is spent regardless).
+#   Runs on every non-draft PR and every push. Catches cross-platform
+#   compile bitrot and lint regressions cheaply. Runs in PARALLEL with
+#   the heavy gate below — it does not gate it via `needs:`. Each job
+#   carries its own draft `if:` guard, so a lint failure does not
+#   block the heavy gate from starting (deliberate: parallel
+#   feedback. Trade-off: on a lint failure the m3-ultra runner time
+#   is spent regardless).
 #
 # * Tier 2 — `test-and-coverage` — the authoritative test + coverage
-#   gate, opt-in via the `ci:full` label. Single heavy job (~60-90 min
-#   on the shared self-hosted M3 Ultra runner pool). It runs the FULL
-#   node + shared nextest suite under llvm-cov instrumentation: the Postgres
-#   `db_tests`, the Plonky2-heavy mint/send/receive prover flows, and
-#   the 100% line + function coverage gate, all in one binary run.
-#   Gated behind `ci:full` so we don't burn runner time on every
-#   speculative PR — apply the label when the PR is ready for the
-#   authoritative gate. Both auto-promote PRs (staging -> develop and
-#   develop -> main) get the label applied automatically by
-#   auto-release-pr-staging.yaml / auto-release-pr.yaml.
+#   gate. Runs on every non-draft PR (CI endgame / G16 expansion —
+#   previously label-gated behind `ci:full`; see
+#   `.github/coverage-baseline.md`). Single heavy job on the shared
+#   self-hosted M3 Ultra runner pool. It runs the FULL node + shared
+#   nextest suite under llvm-cov instrumentation: the Postgres
+#   `db_tests`, the Plonky2-heavy mint/send/receive prover flows, the
+#   measured coverage floor, plus the release-mode prover package and
+#   the four `#[ignore]` prove flows (Task #9), all in one job.
+#   Drafts still skip via the job `if:` (saves runner time while work
+#   is in progress).
 #
 # There is no third "subset" tier: a test either runs in the default
-# Lint & Build (compile/lint) or comes in with `ci:full` (the full
-# suite). The previous narrow per-area subset jobs (and their
-# per-area opt-in labels) were removed — the heavy gate is a strict
-# superset of everything they selected, so they added a maintenance
-# burden (filter drift) without extending coverage.
+# Lint & Build (compile/lint) or in the heavy gate (the full suite).
+# The previous narrow per-area subset jobs (and their per-area opt-in
+# labels) were removed — the heavy gate is a strict superset of
+# everything they selected, so they added a maintenance burden
+# (filter drift) without extending coverage.
 #
 #   Why test + coverage are merged into one job: the previous topology
 #   had a `node-tests` job and a separate `coverage` job, both
@@ -105,8 +111,8 @@ env:
 #   in `cargo llvm-cov nextest`). That doubled wall-clock and m3-ultra
 #   agent usage on every Release PR for no signal benefit — llvm-cov
 #   under nextest produces both test execution AND coverage data in a
-#   single binary run. Merging them keeps the 100% lines + functions
-#   gate intact (same ignore regex, same `not binary(api_remote)`
+#   single binary run. Merging them keeps the measured coverage floor
+#   intact (same ignore regex as baseline, same `not binary(api_remote)`
 #   exclusion) while running the heavy suite once per PR.
 #
 #   The documented hardware target is the M3 Ultra (CONTRIBUTING.md
@@ -121,9 +127,8 @@ jobs:
   lint-and-build:
     name: Lint & Build
     # Skip on draft PRs. The heavy `test-and-coverage` gate carries
-    # the same draft/push guard plus the `ci:full` label check on its
-    # own `if:`, so it runs in parallel with this job rather than
-    # gating behind it via `needs:`.
+    # the same draft/push guard on its own `if:`, so it runs in
+    # parallel with this job rather than gating behind it via `needs:`.
     if: github.event_name == 'push' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -131,11 +136,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.81.0
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.81.0"
-          components: rustfmt, clippy
+      # The repo pins its toolchain in `rust-toolchain` (a dated nightly, with
+      # `rustfmt` and `clippy` in `components`) and every other job uses it.
+      # This step used to install 1.81.0 explicitly and export
+      # `RUSTUP_TOOLCHAIN`, which overrides the file — so formatting and lints
+      # were checked on a toolchain seventeen releases older than the one that
+      # builds and tests the same tree. That is not a conservative choice, it
+      # is a different compiler: a clippy suggestion can name an API the build
+      # toolchain has and the lint toolchain does not, and a lint that only
+      # exists in one of them is either invisible or unfixable. Installing the
+      # pinned toolchain instead keeps a single pin with nothing to drift.
+      - name: Install the pinned toolchain (rust-toolchain)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -148,34 +164,49 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # kernel-proto/build.rs invokes `protoc` (via tonic-build / prost-build)
+      # to compile the kernel.v1 contract. ubuntu-latest ships no
+      # protobuf-compiler by default — without this step, fmt is fine but
+      # clippy/build fail with "Could not find `protoc`".
+      - name: Install protoc (kernel-proto build.rs)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Check formatting
         run: cargo fmt --all --check
 
+      # `--all-targets` on every clippy step: without it clippy lints the
+      # library targets only, so tests, benches and feature-gated fixture
+      # modules — several thousand lines that decide whether a green run
+      # means anything — were never linted at all. Two real lints were
+      # hiding in `shared/src/spec_v1/nflog_boundary.rs`, which is behind
+      # the `test-fixtures` feature and therefore invisible to a plain
+      # `-p shared` run.
       - name: Run clippy (node + shared, MVP feature set)
-        run: cargo clippy -p node -p shared -- -D warnings
+        run: cargo clippy -p node -p shared --all-targets -- -D warnings
 
       - name: Run clippy (node, all features)
-        run: cargo clippy -p node --all-features -- -D warnings
+        run: cargo clippy -p node --all-features --all-targets -- -D warnings
 
-      - name: Run clippy (program + prover libs)
-        run: cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --lib -- -D warnings
+      - name: Run clippy (program + prover)
+        run: cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --all-targets -- -D warnings
 
-      # Issue #84: the chain-tip wait path and the publisher's
-      # commit→reveal propagation wait must be event-driven (WS /
-      # ZMQ), not polled. The grep below fails the build if a
-      # `tokio::time::{sleep,sleep_until,interval}` or
-      # `std::thread::sleep` call sneaks back into the scanner /
-      # publisher modules without the documented opt-out marker. See
-      # CONTRIBUTING.md § "No polling — events only" for the per-line
-      # `scanner-polling-ok:` escape hatch and the rationale for each
-      # currently-grandfathered occurrence. The marker is a plain
-      # comment token (not an `#[allow(...)]` attribute) so future
-      # contributors cannot mistake it for a real lint suppression
-      # (issue #84 round-4 MINOR 4).
+      # Issue #84: chain-tip advance and publisher commit→reveal waits must
+      # be event-driven (bitcoind ZMQ / block signals), not silent polls.
+      # The deleted Esplora WS scanner modules are gone; the live hotpaths
+      # are the v1 bitcoind scan loop in `main.rs` and `publisher.rs`.
+      # The grep fails the build if a `tokio::time::{sleep,sleep_until,
+      # interval}` or `std::thread::sleep` call appears there without the
+      # same-line opt-out marker. See CONTRIBUTING.md § "No polling —
+      # events only" for `scanner-polling-ok:` and the rationale for each
+      # grandfathered occurrence. The marker is a plain comment token
+      # (not an `#[allow(...)]` attribute) so contributors cannot mistake
+      # it for a real lint suppression (issue #84 round-4 MINOR 4).
+      # Follow-up: replace main.rs scan_to_tip idle sleep with bitcoind
+      # block-signal subscription (event-driven tip advance).
       - name: Forbid polling patterns in scanner/publisher
         run: |
           set -e
-          FOUND=$(grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' node/src/scanner.rs node/src/scanner_runtime.rs node/src/scanner_ws.rs node/src/scanner_ws_parse.rs node/src/publisher.rs 2>/dev/null | grep -v 'scanner-polling-ok:' || true)
+          FOUND=$(grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' node/src/main.rs node/src/publisher.rs 2>/dev/null | grep -v 'scanner-polling-ok:' || true)
           if [ -n "$FOUND" ]; then
             echo "::error::Polling pattern (tokio::time::sleep|sleep_until|interval or std::thread::sleep) detected in event-driven hot paths. See issue #84."
             echo "$FOUND"
@@ -190,23 +221,29 @@ jobs:
         run: cargo build -p node --all-features
 
   test-and-coverage:
-    name: Tests + Coverage Gate (M3 Ultra, 100% lines + functions)
+    name: Tests + Coverage Gate (M3 Ultra, measured coverage floor)
     # Authoritative heavy gate: runs the full nextest suite under
     # llvm-cov instrumentation, producing both test execution AND
     # coverage data in a single binary run. Replaces the previous
     # `node-tests` + `coverage` pair (the two jobs ran the same
     # nextest suite — see the file header for the merge rationale).
+    # Floor values and ignore rules: `.github/coverage-baseline.md`.
     #
-    # Gated behind the `ci:full` label so we don't burn runner time
-    # on every speculative PR. Both auto-promote PRs get the label
-    # applied automatically: staging -> develop by
-    # auto-release-pr-staging.yaml and develop -> main by
-    # auto-release-pr.yaml.
-    if: >-
-      (github.event_name == 'push' || github.event.pull_request.draft == false)
-      && contains(github.event.pull_request.labels.*.name, 'ci:full')
+    # CI endgame / G16: runs on every non-draft PR (same draft/push
+    # guard as `lint-and-build`). Previously opt-in via the `ci:full`
+    # label; the baseline recorded that expansion for the un-pause
+    # step — the label is no longer required for this gate.
+    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    # The registered self-hosted M3 Ultra machines (dfx01, dfx01-2) advertise
+    # the `zkcoins-node` pool label, not `m3-ultra` — the old `m3-ultra`
+    # requirement matched no online runner, so this gate queued forever. Target
+    # the label the runners actually carry.
     runs-on: [self-hosted, zkcoins-node]
-    timeout-minutes: 120
+    # 180 min: llvm-cov nextest (~60-90 min) + release prover package
+    # + four `#[ignore]` prove flows (a representative multi-input
+    # send prove alone is ~290 s locally) + circuit-digest verify.
+    # Was 120 min when the job stopped at coverage + digests only.
+    timeout-minutes: 180
     env:
       # All three chain-shaping env vars are required by the node
       # bootstrap (see `lib::build_network_config_from_env`). CI uses
@@ -261,7 +298,7 @@ jobs:
       # `cargo llvm-cov`. cargo-llvm-cov does NOT auto-set this cfg —
       # without it every `coverage(off)` in the workspace is inert
       # and llvm-cov counts the excluded fns / lines as uncovered,
-      # which silently broke the 100%-line + 100%-function gate the
+      # which would drag the measured floor below its true value the
       # moment the first annotation landed in the `node` crate. Set
       # only on this job: the `lint-and-build` job runs stable
       # 1.81.0 and would reject `feature(coverage_attribute)`, so the
@@ -300,10 +337,15 @@ jobs:
       # already running with a different cap than the requested
       # SCCACHE_CACHE_SIZE, stop it so the next --start-server picks up
       # the new env value; the on-disk cache files survive the restart.
-      - name: Ensure sccache + cargo-nextest are installed
+      - name: Ensure sccache + cargo-nextest + protoc are installed
         run: |
           command -v sccache >/dev/null || brew install sccache
           command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          # kernel-proto/build.rs invokes protoc; the self-hosted runner has
+          # no protobuf-compiler unless we install it (idempotent, like the
+          # tools above). The ubuntu lint job installs it via apt separately.
+          command -v protoc >/dev/null || brew install protobuf
+          protoc --version
           if ! sccache --show-stats 2>/dev/null | grep -qE "Max cache size +50 GiB"; then
             sccache --stop-server >/dev/null 2>&1 || true
           fi
@@ -320,34 +362,25 @@ jobs:
 
       # `cargo llvm-cov nextest` is the nextest-aware coverage
       # subcommand: collects llvm-cov data while driving the suite
-      # through nextest, so the 100% line/function gate and the test
+      # through nextest, so the measured coverage floor and the test
       # execution share a single binary run. This is the merge of
       # the previous `node-tests` + `coverage` pair — the previous
       # `node-tests` job ran the same nextest invocation without the
       # `cargo llvm-cov` wrapper, which produced no extra signal.
       #
-      # `-p node -p shared --all-features` matches the previous
-      # `node-tests` test set exactly (the previous `coverage` job
-      # was scoped to `-p node` because the coverage GATE is only
-      # measured against the `node` crate; the merge keeps that gate
-      # scope while widening the EXECUTED set to `-p node -p shared`
-      # so the shared crate's `commitment::tests::*` keep running in
-      # the heavy gate — they were part of `node-tests` before).
-      # The `shared/src/commitment.rs` entry in --ignore-filename-regex
-      # keeps the coverage gate strictness identical to the previous
-      # `-p node`-scoped gate: the shared crate's source files are
-      # excluded from the 100% measurement, only the `node` crate is
-      # gated. `--all-features` likewise mirrors the previous
-      # `node-tests` invocation so opt-in feature-gated code paths
-      # still execute.
+      # Scope: `-p node -p shared --all-features`. Production modules
+      # (publisher, runtime, flow, job_dispatcher, scanners, shared)
+      # are measured. Legitimate ignores only: test infra + crate
+      # entrypoints + Plonky2 circuit packages. Floor integers and
+      # full justification: `.github/coverage-baseline.md`.
       #
       # The `api_remote` integration test (node/tests/api_remote.rs)
       # is excluded: it targets the live DEV node and belongs in
       # the post-deploy `api-e2e` job in deploy-dev.yaml, not the
-      # hermetic gate. The MVP coverage scope is measured by the
-      # rest of the suite, which covers the in-process axum handlers
-      # via oneshot().
-      - name: Run llvm-cov nextest (MVP scope, 100% line + function gate)
+      # hermetic gate. The coverage scope is measured by the rest of
+      # the suite, which covers the in-process axum handlers via
+      # oneshot().
+      - name: Run llvm-cov nextest (measured coverage floor)
         # `--test-threads=8` (issue #181 Opt A): the heavy gate is
         # the largest wall consumer on M3 Ultra (~60-90 min at
         # --test-threads=1). 8 outer threads × Rayon-pinned cores
@@ -356,29 +389,64 @@ jobs:
         # Per-test schema isolation (#182) + cross-process file lock
         # around the shared container (`test_db::init_shared_pg`)
         # make the suite parallel-safe under llvm-cov.
+        #
+        # Floor: integer under measured totals (77.28% lines /
+        # 77.82% functions). See `.github/coverage-baseline.md`.
         run: |
           cargo llvm-cov nextest --release -p node -p shared --all-features --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
-            --fail-under-lines 100 \
-            --fail-under-functions 100 \
+            --ignore-filename-regex '_tests\.rs$|test_db\.rs$|bin/.*\.rs$|main\.rs$|lib\.rs$|program-plonky2/|script-plonky2/' \
+            --fail-under-lines 77 \
+            --fail-under-functions 77 \
             --test-threads 8 \
             -E 'not binary(api_remote)'
+
+      # Task #9: release-mode prover package suite. These prove tests
+      # are multi-minute and never ran in any gate before; the M3 Ultra
+      # job is the right home (GitHub-hosted `lint-and-build` would
+      # time out). Local verification of a representative multi-input
+      # send prove in this package: ~290 s, green.
+      - name: Run zkcoins-prover-plonky2 release tests
+        run: cargo nextest run -p zkcoins-prover-plonky2 --release
+
+      # Task #9: four `#[ignore]` prove flows in node+shared that the
+      # default nextest (and the llvm-cov step above) never select.
+      # They exercise real sequential-history prove paths and a forged
+      # wrapper rejection — minutenlang, self-hosted only:
+      #   - begin_receive_initial_proof_uses_sequential_history_roots
+      #   - begin_send_multi_input_uses_sequential_history_roots
+      #   - verify_incoming_rejects_forged_wrapper_proof_data_before_verify
+      #   - prover_bridge_real_end_to_end
+      - name: Run ignored prove flows (node + shared)
+        run: >
+          cargo nextest run -p node -p shared --all-features --release
+          --run-ignored ignored-only
+
+      # §1.7.9 circuit-digest generator: builds real C / C_balance for every
+      # network and verifies the committed generated_circuit_digests.txt
+      # matches. Multi-minute; kept out of default cargo test via #[ignore],
+      # but a test that cannot run cannot fail — this heavy job is the one
+      # that actually runs it. Does NOT set REGEN_CIRCUIT_DIGESTS
+      # (verify-only; no file rewrite).
+      - name: Verify live circuit digests vs committed generated_circuit_digests.txt
+        run: |
+          cargo test -p zkcoins-prover-plonky2 --release --test generated_circuit_digests_test \
+            generate_circuit_digests -- --ignored --nocapture
 
       # On gate failure, re-format the existing llvm-cov data (no
       # re-run, no new test execution — `report` reads the on-disk
       # profraw / profdata produced by the previous step) and emit
       # the per-file "Uncovered Lines" block plus a json digest of
-      # files below 100% line / function. `--show-missing-lines` on
-      # the gate step sometimes elides this section depending on the
-      # llvm-cov build (observed empirically across this repo's
-      # llvm-cov upgrades), so this step makes the detail
-      # deterministic: whenever the gate fails, the operator sees
-      # which file/line/function is below 100% without having to
-      # reproduce locally.
+      # files still below 100% line / function (gap list; the gate
+      # itself fails under the measured floor — see baseline).
+      # `--show-missing-lines` on the gate step sometimes elides this
+      # section depending on the llvm-cov build, so this step makes
+      # the detail deterministic: whenever the gate fails, the
+      # operator sees which file/line/function is uncovered without
+      # having to reproduce locally.
       - name: Show missing coverage on gate failure
         if: failure()
         run: |
-          IGNORE='main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$'
+          IGNORE='_tests\.rs$|test_db\.rs$|bin/.*\.rs$|main\.rs$|lib\.rs$|program-plonky2/|script-plonky2/'
 
           echo "--- llvm-cov report: --show-missing-lines (text) ---"
           cargo llvm-cov report --release --show-missing-lines \
@@ -444,8 +512,7 @@ jobs:
   # timeout, OOM, runner crash — still fire the alert. `if: failure()`
   # evaluates against the whole `needs:` group: any listed job
   # transitioning to `failure` triggers it, while skipped jobs
-  # (`test-and-coverage` on a non-ci:full PR, or all jobs on a draft
-  # PR) and manual cancellation stay silent.
+  # (all jobs on a draft PR) and manual cancellation stay silent.
   notify-failure:
     name: Telegram alert on failure
     needs: [lint-and-build, test-and-coverage]

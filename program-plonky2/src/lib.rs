@@ -10,6 +10,12 @@
 //! circuit, and host-side prover wiring will land in follow-up commits.
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+// Exclude the whole circuit-program crate from coverage instrumentation (see
+// script-plonky2/src/lib.rs): justifiably excluded from the coverage floor, and
+// instrumenting the circuit math makes an instrumented node build too slow.
+#![cfg_attr(coverage_nightly, coverage(off))]
+
+extern crate alloc;
 
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::plonk::config::PoseidonGoldilocksConfig;
@@ -24,11 +30,16 @@ pub type C = PoseidonGoldilocksConfig;
 /// `standard_recursion_config`.
 pub const D: usize = 2;
 
+// `clippy::chunks_exact_to_as_chunks` does not exist on the pinned
+// nightly-2026-06-18; allowing an unknown lint fails under `-D warnings`.
+// Keep only lints that this toolchain knows.
+#[allow(clippy::needless_range_loop)]
 pub mod circuit;
 pub mod hash;
 pub mod inputs;
 pub mod merkle;
 pub mod types;
+pub mod u32_lib;
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]

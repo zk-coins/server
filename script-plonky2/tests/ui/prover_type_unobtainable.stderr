@@ -1,0 +1,5 @@
+error[E0425]: cannot find value `Prover` in crate `zkcoins_prover_plonky2`
+ --> tests/ui/prover_type_unobtainable.rs:5:37
+  |
+5 |     let _ = zkcoins_prover_plonky2::Prover;
+  |                                     ^^^^^^ not found in `zkcoins_prover_plonky2`

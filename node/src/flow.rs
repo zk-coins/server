@@ -2,46 +2,37 @@
 //! `mint_handler` / `send_coin_handler` / `commit_handler` route
 //! handlers in `router.rs`. The Job-API refactor (PR1) moved every
 //! synchronous route off the request thread and into a single-worker
-//! background dispatcher (`job_dispatcher.rs`); the dispatcher calls
-//! the [`mint_flow`], [`send_flow`], and [`commit_flow`] entrypoints
-//! below to drive a `Job` through the state machine.
-//!
-//! The flow bodies are bit-for-bit identical to the pre-refactor
-//! handler bodies — only the I/O surface changed (no `axum::extract`s,
-//! no `Json` response; plain `Result<serde_json::Value, FlowError>`
-//! shaped responses). Every concurrency / state-advance / persistence
-//! invariant the previous handlers maintained (zk-coins/node#89's
-//! prepare-then-commit ordering, the Phase-E atomic state advance,
-//! the `commit_mint_tx` per-account upsert bundle) stays in place.
+//! background dispatcher (`job_dispatcher.rs`). Legacy prove-leg entry
+//! points (`mint_flow` / `send_flow`) are gone — mint/send prove now
+//! runs through `begin_v1_mint` / `begin_v1_send`. This module retains
+//! admit-time validators plus residual commit legs
+//! ([`commit_flow`], [`mint_commit_flow`]).
 //!
 //! ## Coverage scope
 //!
 //! This file is excluded from the 100% line / function coverage gate
 //! via the CI `--ignore-filename-regex` flag (alongside `runtime.rs`,
 //! `publisher.rs`, etc.). Rationale: the flow bodies own the
-//! interaction between the prover (a heavy synchronous engine
-//! gated behind a `tokio::task::spawn_blocking`), the publisher
-//! (which makes outbound Bitcoin broadcasts) and the database — a
-//! surface that is already proven correct by the
-//! `mint_handler_*` / `send_*` / `commit_*` integration tests in
-//! `router_tests.rs` (now driven through the `/api/jobs/*` admit
-//! handlers + the dispatcher, end-to-end).
+//! interaction between the publisher (outbound Bitcoin broadcasts) and
+//! the database — a surface that is already proven correct by the
+//! `mint_*` / `send_*` / `commit_*` integration tests in
+//! `router_tests.rs` (driven through the `/api/jobs/*` admit handlers
+//! + the dispatcher, end-to-end).
 
 use crate::account_node::{AccountNode, CoinProof};
 use crate::db;
 use crate::publisher::create_and_broadcast_inscription;
 use crate::router::{
-    lock_or_recover, map_send_coins_error, AppState, CommitRequest, MintRequest, ProofStore,
-    SendCoinRequest,
+    lock_or_recover, AppState, CommitRequest, MintRequest, ProofStore, SendCoinRequest,
 };
 use crate::NETWORK_CONFIG;
 use axum::http::StatusCode;
 use bitcoin::secp256k1::schnorr::Signature as SchnorrSignature;
 use serde_json::json;
 use shared::commitment::Commitment;
-use shared::{Invoice, ProofData};
+use shared::ProofData;
 use std::sync::Arc;
-use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
+use zkcoins_program::hash::digest_to_bytes;
 
 /// Result of a flow: either a JSON body + 2xx status code, or a
 /// (status, error_string) tuple that the dispatcher persists into the
@@ -65,14 +56,6 @@ impl FlowError {
             message: msg.into(),
         }
     }
-}
-
-/// Map a `send_coins`-style `&'static str` error onto a [`FlowError`]
-/// preserving the same status-code ladder the legacy
-/// `map_send_coins_error` produced.
-pub(crate) fn flow_err_from_send_coins(err: &str) -> FlowError {
-    let (status, body) = map_send_coins_error(err);
-    FlowError::new(status, body)
 }
 
 /// The server-derived identity of a mint: the creator's owner address
@@ -109,43 +92,13 @@ pub(crate) fn validate_mint_request(req: &MintRequest) -> Result<MintIdentity, F
         ));
     }
     let creator_pubkey = req.creator_pubkey.serialize();
-    let owner = zkcoins_program::hash::hash_bytes(&creator_pubkey);
+    // owner = protocol address H(Pk₀) = SHA-256(creator_pubkey) (#226),
+    // consistent with the wallet/SDK address / username-claim / SMT.
+    let owner = zkcoins_program::hash::sha256_to_digest(&creator_pubkey);
     let name_hash = zkcoins_program::types::calculate_name_hash(&req.name);
     let asset_id =
         zkcoins_program::types::calculate_asset_id(&creator_pubkey, &name_hash, req.decimals);
     Ok(MintIdentity { owner, asset_id })
-}
-
-/// Resolve a caller-supplied `asset_id` hex string for a SEND.
-///
-/// There is no native / default asset (Model B): the field is REQUIRED.
-/// A missing, malformed, or wrong-length value is a hard `422` — never
-/// a silent fall-back, which would send the wrong asset under a `200`
-/// the caller cannot notice.
-fn parse_send_asset_id(
-    asset_id: Option<&str>,
-) -> Result<zkcoins_program::types::AssetId, FlowError> {
-    let hex_str = asset_id.ok_or_else(|| {
-        FlowError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "asset_id is required (no native asset)",
-        )
-    })?;
-    let raw = hex::decode(hex_str.trim_start_matches("0x")).map_err(|_| {
-        FlowError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "asset_id is not valid hex",
-        )
-    })?;
-    if raw.len() != 32 {
-        return Err(FlowError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "asset_id must be 32 bytes (64 hex chars)",
-        ));
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&raw);
-    Ok(digest_from_bytes(&arr))
 }
 
 /// Pre-flight validation of a `SendCoinRequest` body. The signature +
@@ -155,10 +108,16 @@ fn parse_send_asset_id(
 pub(crate) fn validate_send_request(
     req: &SendCoinRequest,
 ) -> Result<([u8; 32], [u8; 32]), FlowError> {
-    if req.signature.is_none() || req.timestamp.is_none() {
+    if req.signature.is_none() {
         return Err(FlowError::new(
             StatusCode::UNAUTHORIZED,
             "Missing signature",
+        ));
+    }
+    if req.timestamp.is_none() {
+        return Err(FlowError::new(
+            StatusCode::UNAUTHORIZED,
+            "Missing timestamp",
         ));
     }
     let timestamp = req
@@ -201,95 +160,6 @@ pub(crate) fn validate_send_request(
     Ok((from_b, to_b))
 }
 
-/// Drive the PROVE leg of a two-phase, creator-signed mint (phase 1).
-///
-/// Neutral, permissionless model: there is no central minting
-/// authority. The asset's creator signs the mint request; the node
-/// derives the owner (`H(creator_pubkey)`) and the asset_id, builds an
-/// issuer-mint proof on the creator's OWN `(owner, asset_id)` account
-/// that credits `amount` to the creator's own balance, and stages it.
-///
-/// This mirrors [`send_flow`]: the prove leg returns the
-/// `(proof_id, SendCommitHashes)` so the dispatcher can transition the
-/// job to `awaiting_signature` with the `account_state_hash` /
-/// `output_coins_root` hex on its result. The wallet signs those as a
-/// `Commitment` and POSTs them to `POST /api/jobs/:id/commit`; the
-/// broadcast + state-advance + apply leg lives in [`mint_commit_flow`].
-///
-/// The prove call is CPU-bound; it runs through `spawn_blocking` so the
-/// dispatcher's tokio worker is not blocked during the prove.
-pub(crate) async fn mint_flow(
-    state: &AppState,
-    request: MintRequest,
-) -> Result<(u64, SendCommitHashes), FlowError> {
-    // Re-validate (signature + timestamp). The admit handler already
-    // ran this, but the job may have been queued for a while;
-    // re-checking the timestamp here keeps the freshness window honest
-    // at prove time. `prepare_mint` re-derives owner/asset_id from the
-    // pubkey + name + decimals, so the derived identity is not needed
-    // here beyond the validation side-effect.
-    let identity = validate_mint_request(&request)?;
-    let creator_pubkey = request.creator_pubkey.serialize();
-    let next_public_key = request.next_public_key.serialize();
-    let name = request.name.clone();
-    let decimals = request.decimals;
-    let amount = request.amount;
-
-    // Off-circuit creator binding (MULTI_ASSET.md §5.3): reject a mint
-    // of an `asset_id` already claimed by a DIFFERENT creator before
-    // paying for the prove. A matching (or absent) creator passes.
-    if db::asset_creator_conflict(
-        &state.pool,
-        &digest_to_bytes(&identity.asset_id),
-        &creator_pubkey,
-    )
-    .await
-    .map_err(|e| {
-        FlowError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("asset_creator lookup failed: {}", e),
-        )
-    })? {
-        return Err(FlowError::new(
-            StatusCode::CONFLICT,
-            "asset_id is registered to a different creator",
-        ));
-    }
-
-    let account_node_clone = state.account_node.clone();
-    let prepared = tokio::task::spawn_blocking(
-        move || -> Result<crate::account_node::MintingPrepared, FlowError> {
-            let guard = lock_or_recover(&account_node_clone);
-            guard
-                .prepare_mint(&creator_pubkey, &name, decimals, amount, &next_public_key)
-                .map_err(flow_err_from_send_coins)
-        },
-    )
-    .await
-    .map_err(|e| {
-        FlowError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("spawn_blocking join error: {}", e),
-        )
-    })??;
-    tracing::info!("Mint prove: ok");
-
-    // Derive the commit hashes the wallet must sign, from the same
-    // public-input path the commit leg re-derives.
-    let commit_hashes = mint_proof_commit_hashes(&prepared.proof);
-
-    // Stage the mint for the wallet-signed commit leg.
-    let proof_id = state.mint_store.add(crate::router::StagedMint {
-        proof: prepared.proof,
-        owner: prepared.owner,
-        asset_id: prepared.asset_id,
-        mutated_account: prepared.mutated_account,
-        creator_pubkey: request.creator_pubkey,
-    });
-
-    Ok((proof_id, commit_hashes))
-}
-
 /// Extract the `account_state_hash` / `output_coins_root` a mint proof
 /// commits, as lowercase hex (the digests the wallet signs). Shares the
 /// `ProofData::from_field_elements` path with [`send_commit_hashes`].
@@ -320,6 +190,14 @@ pub(crate) fn mint_proof_commit_hashes(proof: &zkcoins_prover::Proof) -> SendCom
 /// H(victim_pk)` + a victim's asset_id (public values) and sign with
 /// their OWN key, forging inflation / theft of a foreign asset.
 pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -> FlowResult {
+    // Gap G4: under a v1.1 process claim the residual ash‖ocr Commitment
+    // path is refused. TransitionSignature authorisation goes through
+    // `POST /api/jobs/{id}/sign` → `v1::accept_wallet_transition_signature`
+    // against the staged pending transition.
+    if let Err(e) = crate::v1::refuse_legacy_commitment_under_v1() {
+        return Err(FlowError::new(StatusCode::CONFLICT, e.to_string()));
+    }
+
     let staged = match state.mint_store.take(request.proof_id) {
         Some(s) => s,
         None => {
@@ -387,7 +265,7 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
             commit_txid.to_byte_array()
         }
         Err(err) => {
-            eprintln!("Error broadcasting mint inscription: {}", err);
+            tracing::error!("Error broadcasting mint inscription: {}", err);
             return Err(FlowError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Failed to broadcast mint inscription on-chain",
@@ -407,7 +285,7 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
     let (new_root, smt_bytes, mmr_bytes, root_index_entry) = match state_advance_outcome {
         Ok(snapshot) => snapshot,
         Err(e) => {
-            eprintln!(
+            tracing::error!(
                 "mint_commit_flow: in-process state.update failed: {} (broadcast already landed; scanner-replay will reconcile)",
                 e
             );
@@ -427,7 +305,7 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
     )
     .await
     {
-        eprintln!(
+        tracing::error!(
             "mint_commit_flow: atomic persist + mark-complete failed: {} (scanner-replay will heal)",
             e
         );
@@ -436,7 +314,7 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
             "mint broadcast landed on chain but durable state advance failed; scanner will reconcile",
         ));
     }
-    println!(
+    tracing::info!(
         "mint_commit_flow: state.update persisted + row marked complete. New MMR root: {}",
         hex::encode(digest_to_bytes(&new_root))
     );
@@ -457,7 +335,7 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
         if let Err(e) =
             db::upsert_account_with_source(&state.pool, &key_bytes, &bytes, "mint").await
         {
-            eprintln!("Failed to upsert minted creator account: {}", e);
+            tracing::error!("Failed to upsert minted creator account: {}", e);
         }
     }
 
@@ -471,7 +349,7 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
     )
     .await
     {
-        eprintln!("Failed to register asset creator: {}", e);
+        tracing::error!("Failed to register asset creator: {}", e);
     }
 
     let hashes = mint_proof_commit_hashes(&staged.proof);
@@ -496,8 +374,9 @@ pub(crate) async fn mint_commit_flow(state: &AppState, request: CommitRequest) -
 /// / `output_coins_root` hex the `mint` and `commit` completed results
 /// already carry. The wallet signs `SHA256(serialize(ash) ‖ serialize(ocr))`
 /// over them (see CONTRIBUTING "Trust model"). Bit-identical to the
-/// extraction in [`mint_flow`] / [`commit_flow`] so the value the wallet
-/// signs matches what `commit_flow` re-derives from the same proof.
+/// extraction in [`mint_proof_commit_hashes`] / [`commit_flow`] so the
+/// value the wallet signs matches what `commit_flow` re-derives from
+/// the same proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SendCommitHashes {
     /// `account_state_hash`, 32-byte digest as 64 lowercase hex chars.
@@ -526,94 +405,23 @@ pub(crate) fn send_commit_hashes(proof: &CoinProof) -> SendCommitHashes {
     }
 }
 
-/// Drive a `send` job up to and including proof generation. Returns
-/// the persisted `proof_id` plus the [`SendCommitHashes`] the wallet
-/// must sign, so the dispatcher can transition the job to
-/// `awaiting_signature` with the `account_state_hash` /
-/// `output_coins_root` hex on its result and the wallet's
-/// `POST /api/jobs/:id/commit` can look the proof up.
-///
-/// The post-signature broadcast leg lives in [`commit_flow`] — the
-/// dispatcher invokes it after the wallet signals on the per-job
-/// `Notify` channel.
-pub(crate) async fn send_flow(
-    state: &AppState,
-    request: SendCoinRequest,
-) -> Result<(u64, SendCommitHashes), FlowError> {
-    let (from_address_bytes, to_address_bytes) = validate_send_request(&request)?;
-    let from_address = digest_from_bytes(&from_address_bytes);
-    let to_address = digest_from_bytes(&to_address_bytes);
-
-    let public_key = request.public_key;
-    let next_public_key = request.next_public_key;
-    let prev_commitment_pubkey = request.prev_commitment_pubkey;
-    let amount = request.amount;
-    let send_asset_id = parse_send_asset_id(request.asset_id.as_deref())?;
-
-    // The prove call is CPU-bound; push it through spawn_blocking so
-    // the dispatcher's tokio worker is not blocked during the prove.
-    let account_node_clone = state.account_node.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<(CoinProof, Vec<u8>), FlowError> {
-        let mut guard = lock_or_recover(&account_node_clone);
-        let res = guard.send_coins(
-            vec![Invoice::new(amount, to_address, send_asset_id)],
-            from_address,
-            public_key,
-            next_public_key,
-            prev_commitment_pubkey,
-        );
-        match res {
-            Ok(mut coin_proofs) => {
-                let snap = AccountNode::serialize_account(
-                    guard
-                        .get_account(&from_address, &send_asset_id)
-                        .expect("send_coins Ok implies the sender account is in memory"),
-                );
-                let proof = coin_proofs
-                    .pop()
-                    .expect("send_coins returns at least one coin_proof on Ok");
-                Ok((proof, snap))
-            }
-            Err(e) => {
-                let mapped = map_send_coins_error(e);
-                tracing::warn!("send_coins rejected: {} (status={})", e, mapped.0);
-                Err(FlowError::new(mapped.0, mapped.1))
-            }
-        }
-    })
-    .await
-    .map_err(|e| {
-        FlowError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("spawn_blocking join error: {}", e),
-        )
-    })??;
-
-    let (coin_proof, updated_account_bytes) = result;
-    // Derive the commit hashes BEFORE the proof is moved into the
-    // store, from the same public-input path `commit_flow` re-derives —
-    // so the hex the wallet signs matches what the broadcast leg later
-    // verifies the commitment against.
-    let commit_hashes = send_commit_hashes(&coin_proof);
-    let proof_id = state.proof_store.add_proof(coin_proof);
-
-    // The sender account is keyed by `(from_address, send_asset_id)`.
-    let key_bytes = crate::account_node::account_key_bytes(&from_address, &send_asset_id);
-    if let Err(e) =
-        db::upsert_account_with_source(&state.pool, &key_bytes, &updated_account_bytes, "send")
-            .await
-    {
-        eprintln!("Failed to upsert sender account after send: {}", e);
-    }
-    Ok((proof_id, commit_hashes))
-}
-
 /// Parse + verify a `CommitRequest` and then broadcast the commitment
 /// inscription on chain. Drives the second half of the `send` job
 /// lifecycle: the dispatcher invokes this when the wallet has
 /// signalled the `Notify` channel attached to a job that is currently
 /// `awaiting_signature`.
+///
+/// Under a v1.1 process claim this entry refuses loud — the residual
+/// ash‖ocr Commitment is the wrong signing protocol. The v1.1 path
+/// authorises via `POST /api/jobs/{id}/sign` →
+/// [`crate::v1::accept_wallet_transition_signature`] against the staged
+/// pending transition.
 pub(crate) async fn commit_flow(state: &AppState, request: CommitRequest) -> FlowResult {
+    // Gap G4: refuse legacy Commitment under ScanStackMode::V1.
+    if let Err(e) = crate::v1::refuse_legacy_commitment_under_v1() {
+        return Err(FlowError::new(StatusCode::CONFLICT, e.to_string()));
+    }
+
     let coin_proof = match state.proof_store.get_proof(request.proof_id) {
         Some(p) => p,
         None => {
@@ -659,7 +467,7 @@ pub(crate) async fn commit_flow(state: &AppState, request: CommitRequest) -> Flo
     )
     .await
     {
-        eprintln!("Error broadcasting commit inscription: {}", err);
+        tracing::error!("Error broadcasting commit inscription: {}", err);
         return Err(FlowError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "Failed to broadcast commitment inscription on-chain",
@@ -677,7 +485,7 @@ pub(crate) async fn commit_flow(state: &AppState, request: CommitRequest) -> Flo
     let snapshot: Option<Vec<u8>> = {
         let mut guard = lock_or_recover(&state.account_node);
         if let Err(e) = guard.receive_coin(updated_proof) {
-            eprintln!("Failed to receive coin after commit: {}", e);
+            tracing::error!("Failed to receive coin after commit: {}", e);
         }
         guard
             .get_account(&recipient, &asset_id)
@@ -688,7 +496,7 @@ pub(crate) async fn commit_flow(state: &AppState, request: CommitRequest) -> Flo
         if let Err(e) =
             db::upsert_account_with_source(&state.pool, &key_bytes, &bytes, "receive").await
         {
-            eprintln!("Failed to upsert account after commit: {}", e);
+            tracing::error!("Failed to upsert account after commit: {}", e);
         }
     }
 
@@ -709,4 +517,569 @@ pub(crate) async fn commit_flow(state: &AppState, request: CommitRequest) -> Flo
 #[allow(dead_code)]
 fn _force_uses() {
     let _ = std::any::type_name::<Arc<ProofStore>>();
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::secp256k1::{Keypair, Message, PublicKey, Secp256k1, SecretKey};
+    use sha2::{Digest, Sha256};
+
+    const TIMESTAMP_ERROR: &str = "Request timestamp too old or in the future";
+    const SIGNATURE_ERROR: &str = "Signature verification failed";
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_secs()
+    }
+
+    fn public_key(secp: &Secp256k1<bitcoin::secp256k1::All>, byte: u8) -> PublicKey {
+        let secret_key = SecretKey::from_slice(&[byte; 32]).expect("valid deterministic key");
+        PublicKey::from_secret_key(secp, &secret_key)
+    }
+
+    fn signed_mint_request(
+        name: &str,
+        decimals: u8,
+        amount: u64,
+        timestamp: u64,
+    ) -> MintRequest {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[7u8; 32]).expect("valid creator key");
+        let creator_pubkey = PublicKey::from_secret_key(&secp, &secret_key);
+
+        let mut hasher = Sha256::new();
+        hasher.update(creator_pubkey.serialize());
+        hasher.update(name.as_bytes());
+        hasher.update([decimals]);
+        hasher.update(amount.to_le_bytes());
+        hasher.update(timestamp.to_le_bytes());
+        let message = Message::from_digest(hasher.finalize().into());
+        let keypair = Keypair::from_secret_key(&secp, &secret_key);
+        let signature = secp.sign_schnorr(&message, &keypair);
+
+        MintRequest {
+            creator_pubkey,
+            next_public_key: public_key(&secp, 8),
+            name: name.to_string(),
+            decimals,
+            amount,
+            signature: hex::encode(signature.serialize()),
+            timestamp,
+        }
+    }
+
+    fn signed_send_request(
+        account_address: &str,
+        recipient: &str,
+        amount: u64,
+        timestamp: u64,
+    ) -> SendCoinRequest {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[11u8; 32]).expect("valid sender key");
+        let sender_public_key = PublicKey::from_secret_key(&secp, &secret_key);
+
+        let mut hasher = Sha256::new();
+        hasher.update(account_address.as_bytes());
+        hasher.update(recipient.as_bytes());
+        hasher.update(amount.to_le_bytes());
+        hasher.update(timestamp.to_le_bytes());
+        let message = Message::from_digest(hasher.finalize().into());
+        let keypair = Keypair::from_secret_key(&secp, &secret_key);
+        let signature = secp.sign_schnorr(&message, &keypair);
+
+        SendCoinRequest {
+            account_address: account_address.to_string(),
+            recipient: recipient.to_string(),
+            amount,
+            public_key: sender_public_key,
+            next_public_key: public_key(&secp, 12),
+            prev_commitment_pubkey: None,
+            signature: Some(hex::encode(signature.serialize())),
+            timestamp: Some(timestamp),
+            asset_id: None,
+        }
+    }
+
+    fn expect_flow_error<T>(result: Result<T, FlowError>, status: StatusCode, message: &str) {
+        let error = match result {
+            Ok(_) => panic!("request unexpectedly passed validation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, status);
+        assert_eq!(error.message, message);
+    }
+
+    #[test]
+    fn validate_mint_rejects_timestamp_outside_window() {
+        let request = signed_mint_request("TestToken", 8, 50_000, 0);
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            TIMESTAMP_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_invalid_signature() {
+        let mut request = signed_mint_request("TestToken", 8, 50_000, now_secs());
+        request.amount += 1;
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_returns_derived_identity() {
+        let request = signed_mint_request("TestToken", 8, 50_000, now_secs());
+        let creator_pubkey_bytes = request.creator_pubkey.serialize();
+        let expected_owner = zkcoins_program::hash::sha256_to_digest(&creator_pubkey_bytes);
+        let name_hash = zkcoins_program::types::calculate_name_hash(&request.name);
+        let expected_asset_id = zkcoins_program::types::calculate_asset_id(
+            &creator_pubkey_bytes,
+            &name_hash,
+            request.decimals,
+        );
+
+        let identity = validate_mint_request(&request).expect("valid mint request");
+
+        assert_eq!(identity.owner, expected_owner);
+        assert_eq!(identity.asset_id, expected_asset_id);
+    }
+
+    #[test]
+    fn validate_send_rejects_missing_signature() {
+        let mut request = signed_send_request(
+            &hex::encode([1u8; 32]),
+            &hex::encode([2u8; 32]),
+            100,
+            now_secs(),
+        );
+        request.signature = None;
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            "Missing signature",
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_missing_timestamp() {
+        let mut request = signed_send_request(
+            &hex::encode([1u8; 32]),
+            &hex::encode([2u8; 32]),
+            100,
+            now_secs(),
+        );
+        request.timestamp = None;
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            "Missing timestamp",
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_timestamp_outside_window() {
+        let request = signed_send_request(
+            &hex::encode([1u8; 32]),
+            &hex::encode([2u8; 32]),
+            100,
+            0,
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            TIMESTAMP_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_invalid_signature() {
+        let mut request = signed_send_request(
+            &hex::encode([1u8; 32]),
+            &hex::encode([2u8; 32]),
+            100,
+            now_secs(),
+        );
+        request.amount += 1;
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_invalid_account_address_hex() {
+        let request = signed_send_request(
+            "not-hex",
+            &hex::encode([2u8; 32]),
+            100,
+            now_secs(),
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "account_address is not valid hex",
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_invalid_recipient_hex() {
+        let request = signed_send_request(
+            &hex::encode([1u8; 32]),
+            "not-hex",
+            100,
+            now_secs(),
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "recipient is not valid hex",
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_tampered_account_address() {
+        let timestamp = now_secs();
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let mut request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+        request.account_address = hex::encode([0x33_u8; 32]);
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_tampered_recipient() {
+        let timestamp = now_secs();
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let mut request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+        request.recipient = hex::encode([0x33_u8; 32]);
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_tampered_timestamp() {
+        let timestamp = now_secs();
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let mut request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+        request.timestamp = Some(timestamp.saturating_add(1));
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_tampered_creator_pubkey() {
+        let timestamp = now_secs();
+        let mut request = signed_mint_request("tampered-key".into(), 8, 42, timestamp);
+        let secp = Secp256k1::new();
+        let mut replacement = public_key(&secp, 43);
+        if replacement == request.creator_pubkey {
+            replacement = public_key(&secp, 44);
+        }
+        request.creator_pubkey = replacement;
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_tampered_name() {
+        let timestamp = now_secs();
+        let mut request = signed_mint_request("original-name".into(), 8, 42, timestamp);
+        request.name = "tampered-name".to_string();
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_tampered_decimals() {
+        let timestamp = now_secs();
+        let mut request = signed_mint_request("tampered-decimals".into(), 8, 42, timestamp);
+        request.decimals = 9;
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_tampered_timestamp() {
+        let timestamp = now_secs();
+        let mut request = signed_mint_request("tampered-timestamp".into(), 8, 42, timestamp);
+        request.timestamp = timestamp.saturating_add(1);
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_invalid_hex_signature() {
+        let timestamp = now_secs();
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let mut request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+        request.signature = Some("zz-not-hex".to_string());
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_invalid_hex_signature() {
+        let timestamp = now_secs();
+        let mut request =
+            signed_mint_request("invalid-hex-signature".into(), 8, 42, timestamp);
+        request.signature = "zz-not-hex".to_string();
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_wrong_length_signature() {
+        let timestamp = now_secs();
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let mut request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+        request.signature = Some(hex::encode([0_u8; 32]));
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_wrong_length_signature() {
+        let timestamp = now_secs();
+        let mut request =
+            signed_mint_request("wrong-length-signature".into(), 8, 42, timestamp);
+        request.signature = hex::encode([0_u8; 32]);
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            SIGNATURE_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_future_timestamp_outside_window() {
+        let timestamp = now_secs().saturating_add(400);
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            TIMESTAMP_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_rejects_future_timestamp_outside_window() {
+        let timestamp = now_secs().saturating_add(400);
+        let request = signed_mint_request("future-timestamp".into(), 8, 42, timestamp);
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            TIMESTAMP_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_accepts_timestamp_at_exact_skew_boundary() {
+        let now = now_secs();
+        let timestamp = now.saturating_add(crate::router::MAX_TIMESTAMP_SKEW_SECS);
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+
+        assert!(validate_send_request(&request).is_ok());
+    }
+
+    #[test]
+    fn validate_send_rejects_timestamp_one_second_past_skew_boundary() {
+        let now = now_secs();
+        let timestamp = now.saturating_sub(
+            crate::router::MAX_TIMESTAMP_SKEW_SECS.saturating_add(1),
+        );
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 32]);
+        let request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNAUTHORIZED,
+            TIMESTAMP_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_mint_accepts_timestamp_at_exact_skew_boundary() {
+        let now = now_secs();
+        let timestamp = now.saturating_add(crate::router::MAX_TIMESTAMP_SKEW_SECS);
+        let request = signed_mint_request("exact-skew-boundary".into(), 8, 42, timestamp);
+
+        assert!(validate_mint_request(&request).is_ok());
+    }
+
+    #[test]
+    fn validate_mint_rejects_timestamp_one_second_past_skew_boundary() {
+        let now = now_secs();
+        let timestamp = now.saturating_sub(
+            crate::router::MAX_TIMESTAMP_SKEW_SECS.saturating_add(1),
+        );
+        let request = signed_mint_request("past-skew-boundary".into(), 8, 42, timestamp);
+
+        expect_flow_error(
+            validate_mint_request(&request),
+            StatusCode::UNAUTHORIZED,
+            TIMESTAMP_ERROR,
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_recipient_with_wrong_byte_length() {
+        let timestamp = now_secs();
+        let account_address = hex::encode([0x11_u8; 32]);
+        let recipient = hex::encode([0x22_u8; 31]);
+        let request = signed_send_request(
+            account_address.as_str().into(),
+            recipient.as_str().into(),
+            42,
+            timestamp,
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "address must be 32 bytes (64 hex chars)",
+        );
+    }
+
+    #[test]
+    fn validate_send_rejects_address_with_wrong_byte_length() {
+        let request = signed_send_request(
+            &hex::encode([1u8; 31]),
+            &hex::encode([2u8; 32]),
+            100,
+            now_secs(),
+        );
+
+        expect_flow_error(
+            validate_send_request(&request),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "address must be 32 bytes (64 hex chars)",
+        );
+    }
+
+    #[test]
+    fn validate_send_returns_decoded_addresses() {
+        let account_address = format!("0x{}", hex::encode([1u8; 32]));
+        let recipient = format!("0x{}", hex::encode([2u8; 32]));
+        let request = signed_send_request(
+            &account_address,
+            &recipient,
+            100,
+            now_secs(),
+        );
+
+        let (from, to) = validate_send_request(&request).expect("valid send request");
+
+        assert_eq!(from, [1u8; 32]);
+        assert_eq!(to, [2u8; 32]);
+    }
 }

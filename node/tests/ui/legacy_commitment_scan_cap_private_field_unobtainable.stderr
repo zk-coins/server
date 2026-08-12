@@ -1,0 +1,5 @@
+error[E0451]: field `_private` of struct `LegacyCommitmentScanCap` is private
+ --> tests/ui/legacy_commitment_scan_cap_private_field_unobtainable.rs:5:69
+  |
+5 |     let _ = node::legacy_commitment_scan::LegacyCommitmentScanCap { _private: () };
+  |                                                                     ^^^^^^^^ private field

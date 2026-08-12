@@ -152,6 +152,18 @@ async fn build_state_with_pool() -> (AppState, SchemaScope) {
         job_store: Arc::new(crate::job_store::JobStore::new((*pool_arc).clone())),
         job_tx: tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8).0,
         job_notify_map: Arc::new(dashmap::DashMap::new()),
+        v1_scan_caught_up: None,
+        v1_finality_ok: None,
+        pending_sign_map: Arc::new(dashmap::DashMap::new()),
+        v1_finalise: None,
+        v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
+        v1_pending_after_prove: None,
+        receive_creating_proof_loader: None,
+        v1_engine: None,
+        private_index: crate::kernel::access::InMemoryPrivateIndex::shared(),
+        bundles: crate::kernel::bootstrap::BundleStore::shared(),
+        attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
+        public_hosts: Arc::new(vec!["node.test".to_string()]),
     };
     // tempdir lives until the test ends (Drop on test exit).
     std::mem::forget(tmp);

@@ -1,0 +1,9 @@
+[package]
+name = "stack-policy"
+version.workspace = true
+edition.workspace = true
+description = "Process-wide scan-stack claim registry and legacy-publisher policy"
+publish = false
+
+[dependencies]
+# Zero production deps: process-local Mutex registry only.

@@ -1,0 +1,28 @@
+# generated_sig_agg_vectors.txt — V.5 signature + V.6 s_agg
+# Computed by script-plonky2 generate_sig_agg_vectors; never hand-edit.
+#
+# V.5 inputs (reference-implementation output; proposed for V.5 in PR #124 draft):
+#   sk/Pk = V.2-ext sk₀/Pk₀ (BIP-340-normalised d used for signing)
+#   H(ProofData@0) = V.4 pin from generated_poseidon_vectors.txt
+#   nonce rule = V.8 fixture rule (deterministic; not production-normative)
+#   networks = mainnet | testnet | regtest (V.5 does not pin a single m_state)
+#
+# V.6 inputs:
+#   member set = V.8 two-signer fixture (m = 2; V.6 layout reuses it)
+#   s_agg is independent of block_anchor (anchor is payload metadata only)
+#
+v2ext_pk0 = 0x7c9cdde9b8cb1e33a48a5c2b6ab1fa6fd753fa1762f56c0b3e8169e4f2d54630
+h_proof_data_0 = 0xdb8c60533ba19eba14958f6ce44fd8df2e784d17dac28d8532e66fa938308de4
+v5_r_prime_mainnet = 0xfafd5229e657311d934989a4bc8bdfc8f033b4d640d2eb27b9fdda316f5c9601
+v5_signature_mainnet = 0x7db327f8ff4bb148f051a038d370c4213149fe3affeff5b7fb7e9f8e3cc4438532168b5fca622ba2fad6d72ed201e71cef1003df880d345ddbe2b89f1ce3d4e5
+v5_r_prime_testnet = 0x8c5b9be1e267c2f40ead298fb6fd8f98c0bc3efb862fce6ef7fa98b5691b3c6e
+v5_signature_testnet = 0xc62142c2448e098e5f8f4ec306b8a922be44226ae754e7b515178485d2da2286c52881936dd64a1dc3b9756c4a7a033e76ca4ad778624acbf580c041be6f7bf0
+v5_r_prime_regtest = 0x7f415c530cd07713998ae0467e2c18fce210a7818ec7ad26a7b419009d6598f1
+v5_signature_regtest = 0x8945e81ed57b06222bd86b957f6800fc5569014b295c40c0b7a501787edca2c916b9c2f693f5e43c030bfc4fa0f210b9e96d45b06e943e652c8edb3b4a06d7fc
+v6_s_agg = 0xcfb0c36a8399589b5580ba41cafaf66b7d707443a202e4113f3635872ca58b78
+v8_pk_1 = 0xe7f2a98e7b45e9424e3e0cb1d937a1698ebd339c6d8344906db979642cf20474
+v8_r_1 = 0xc41ff1a78f2006e5f5aa800efa84b2d2046d108dfa968909974ec37fcb87f6c4
+v8_s_1 = 0x748ae8e2fded9df9830cbaa8893484e753fdfd141cccc8b35a27ab5a870a83d2
+v8_pk_2 = 0x21799353e64a65ee4b1f414998c44878c56270cf8a81046cb3636e5ec31a3341
+v8_r_2 = 0xbd22b77069c75431ee3676bea7324a59e9b6466a62a9a3021f831e6ccf5d3220
+v8_s_2 = 0xcaa0374d3cf77e1874298c98d3d3fe8b416f89d51823d6909c3e1cdbf91d3002

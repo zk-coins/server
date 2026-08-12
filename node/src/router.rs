@@ -1,38 +1,51 @@
 use axum::{
+    async_trait,
     body::Bytes,
-    extract::{Json, Path, State},
-    http::{header, HeaderMap, Method, StatusCode},
+    extract::{
+        rejection::{JsonRejection, PathRejection},
+        FromRequest, FromRequestParts, Json, Path, State,
+    },
+    http::{header, request::Parts, HeaderMap, Method, Request, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{get, post},
     Router,
 };
 use bitcoin::secp256k1::{self as secp, schnorr::Signature as SchnorrSignature, Message};
 use futures_util::stream::Stream;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use utoipa::ToSchema;
 use uuid::Uuid;
-use zkcoins_program::hash::{digest_from_bytes, digest_to_bytes};
+#[cfg(feature = "username-claim")]
+use zkcoins_program::hash::digest_from_bytes;
+use zkcoins_program::hash::digest_to_bytes;
 use zkcoins_prover::Proof;
 
 use crate::account_node::{AccountNode, CoinProof};
-use crate::db;
 use crate::db::InscriptionSummary;
 use crate::flow;
-use crate::job_dispatcher::{JobEnvelope, JobNotifier, JobNotifyMap, JobPhaseEvent};
-use crate::job_store::{CreateResult, Job, JobKind, JobStatus, JobStore};
+use crate::job_dispatcher::{JobEnvelope, JobNotifyMap, JobPhaseEvent};
+use crate::job_store::{CreateResult, JobKind, JobStatus, JobStore};
+use crate::kernel::{
+    CancelPolicy, JobEvent, JobId, JobRequest, JobState, KernelError, KernelErrorCode,
+    KernelService,
+};
 use crate::publisher::EsploraConfig;
+use crate::transport::error_contract;
 use crate::username::UsernameStore;
 use crate::{NETWORK_CONFIG, USERNAME_DOMAIN};
 
@@ -54,7 +67,23 @@ pub(crate) fn check_timestamp_window(timestamp: u64) -> Result<(), &'static str>
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_err(|_| ());
+    check_timestamp_window_with_now(now, timestamp)
+}
+
+/// Freshness check against an injected wall-clock read (unit-testable).
+fn check_timestamp_window_with_now(
+    now: Result<u64, ()>,
+    timestamp: u64,
+) -> Result<(), &'static str> {
+    // Unusable host clock (pre-epoch) must not silently pass a stale/replayed
+    // timestamp — fail closed.
+    let now = now.map_err(|_| "Server clock unavailable")?;
+    check_timestamp_window_at(now, timestamp)
+}
+
+/// Pure freshness check against a caller-supplied `now` (unit-testable).
+pub(crate) fn check_timestamp_window_at(now: u64, timestamp: u64) -> Result<(), &'static str> {
     if now.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS {
         return Err("Request timestamp too old or in the future");
     }
@@ -138,14 +167,14 @@ pub(crate) fn verify_mint_signature_pub(request: &MintRequest) -> Result<(), &'s
 /// This prevents cascade failures where one panic takes down all handlers.
 pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
-        eprintln!("WARNING: Recovering from poisoned mutex");
+        tracing::warn!("WARNING: Recovering from poisoned mutex");
         poisoned.into_inner()
     })
 }
 
 // Define a struct for our application state
 #[derive(Clone)]
-pub struct AppState {
+pub(crate) struct AppState {
     pub(crate) account_node: Arc<Mutex<AccountNode>>,
     pub(crate) proof_store: Arc<ProofStore>,
     /// In-memory staged-mint store for the two-phase, creator-signed
@@ -214,15 +243,116 @@ pub struct AppState {
     /// stay lock-free on the typical access pattern (one wallet per
     /// job + at most a handful of SSE streams).
     ///
-    /// See [`JobNotifier`] for the two coordination primitives the
-    /// dispatcher and the SSE handler share via this map; see
+    /// See [`crate::job_dispatcher::JobNotifier`] for the two coordination
+    /// primitives the dispatcher and the SSE handler share via this map; see
     /// [`stream_job_handler`] for the subscriber-side wiring.
     pub(crate) job_notify_map: JobNotifyMap,
+    /// When `Some`, the v1.1 NfLog scanner has completed at least one
+    /// successful catch-up apply. Under `ZKCOINS_V1_SHADOW=1` readiness
+    /// requires this flag so the node does not report ready while its
+    /// v1.1 view is still empty / behind tip. `None` = legacy stack
+    /// (readiness does not wait on NfLog catch-up).
+    pub(crate) v1_scan_caught_up: Option<Arc<AtomicBool>>,
+    /// When `Some`, set to `false` if the scanner reports
+    /// `ReorgOutcome::finality_broken`. Readiness then fails with
+    /// `"deep_reorg"` and callers must stop crediting. `None` = legacy.
+    pub(crate) v1_finality_ok: Option<Arc<AtomicBool>>,
+    /// Staged v1.1 [`PendingSignEntry`](crate::v1::PendingSignEntry)
+    /// material keyed by job id. Populated when a job reaches
+    /// `awaiting_signature` under a v1.1 claim; consumed by
+    /// [`jobs_sign_handler`] and the dispatcher finalise path. Empty /
+    /// unused under the legacy stack. Restart-safe: also persisted under
+    /// In-memory staging of the durable finalisation capability; also
+    /// persisted under `request_body.finalisation` and rehydrated on boot.
+    pub(crate) pending_sign_map: crate::v1::PendingSignMap,
+    /// Optional v1.1 finalise driver. Under a v1.1 claim an accepted
+    /// `/sign` **must** go through this (install signature → prove
+    /// outside the engine lock → apply with live re-validation, or a
+    /// test double) rather than completing the job with the signature
+    /// material alone. `None` under the legacy stack; under v1.1 a
+    /// missing driver fails the job loud.
+    pub(crate) v1_finalise: Option<V1FinaliseHook>,
+    /// Production registry of live [`PendingSignEntry`] values produced
+    /// by `StateEngine::begin_*`. Keyed by job id; the dispatcher takes
+    /// the entry once when entering `awaiting_signature` and stages it
+    /// via [`crate::v1::stage_pending_sign`]. Empty under the legacy
+    /// stack. Writers: [`crate::v1::register_live_pending_after_begin`].
+    pub(crate) v1_live_pending_after_begin: crate::v1::PendingSignMap,
+    /// Test-only extra source of a live pending after the prove leg
+    /// (fixtures without a multi-minute prove). Production never
+    /// installs this — the live path is
+    /// [`Self::v1_live_pending_after_begin`] alone. Kept behind
+    /// `cfg(test)` so it cannot be mistaken for a production resolver
+    /// input (Defect 4).
+    #[cfg(test)]
+    pub(crate) v1_pending_after_prove: Option<V1PendingAfterProveHook>,
+    /// Test-only creating-proof loader for receive reconstitution (host
+    /// hollow fixtures). Production always uses
+    /// [`zkcoins_prover::prover_bridge::ProverBridge::load_transition_proof_bytes`].
+    #[cfg(test)]
+    pub(crate) receive_creating_proof_loader: Option<ReceiveCreatingProofLoader>,
+    /// Shared v1.1 engine for Gap-G6 balance attestation (and later
+    /// Stage-3 prove paths). `None` under the legacy stack.
+    pub(crate) v1_engine: Option<Arc<crate::v1::EngineAdapter>>,
+    /// Process mirror of durable `v1_decrypt_index` — receive fold loads
+    /// CoinProofs from here (SQL fall-through in the reconstitutor).
+    pub(crate) private_index: Arc<crate::kernel::access::InMemoryPrivateIndex>,
+    /// Process-local operational-bundle store (`nk` / `op_secret` for begin).
+    pub(crate) bundles: Arc<crate::kernel::bootstrap::BundleStore>,
+    /// Single-use `AttestBalanceChallenge` store (§7.5 / §5.1).
+    pub(crate) attest_challenges: crate::v1::AttestChallengeMap,
+    /// Authoritative hostnames for `chan_bind` (§5.1). From
+    /// `ZKCOINS_PUBLIC_HOST`. Empty → attest auth fails loud (no silent
+    /// localhost default).
+    pub(crate) public_hosts: Arc<Vec<String>>,
 }
+
+/// Hook the dispatcher invokes after a verified `/sign` to drive
+/// prove → apply → **durable** engine + `v1_pending_publishes` stage.
+///
+/// The third argument is the exclusive-claim [`crate::job_store::FinaliseFence`]
+/// for this acquisition epoch. Production
+/// [`crate::v1::finalise_accepted_prove_persist_and_stage`] commits the engine
+/// snapshot and `members_ready` only while that fence + lease still hold —
+/// the same predicate as job-row host-edge writes. A fence that stops at the
+/// job-row boundary is decoration; the engine write is the one that matters.
+///
+/// Production wires this via the shared [`crate::v1::EngineAdapter`] (async:
+/// multi-minute prove on a blocking pool, then atomic fenced persist). Tests
+/// inject a spy that records the call without running the multi-minute prove.
+pub(crate) type V1FinaliseHook = Arc<
+    dyn Fn(
+            zkcoins_prover::state_engine::PendingTransition,
+            zkcoins_prover::prover_bridge::TransitionSignature,
+            crate::job_store::FinaliseFence,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::v1::FinaliseOutcome, anyhow::Error>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+/// Test-only hook the dispatcher may consult after the prove leg under a
+/// v1.1 claim. Production uses only
+/// [`AppState::v1_live_pending_after_begin`]. Behind `cfg(test)` so it is
+/// not compiled into the production binary (Defect 4).
+#[cfg(test)]
+pub(crate) type V1PendingAfterProveHook =
+    Arc<dyn Fn(uuid::Uuid) -> Option<crate::v1::PendingSignEntry> + Send + Sync>;
+
+/// Test-only creating-proof loader for receive reconstitution — see the
+/// field doc on [`AppState::receive_creating_proof_loader`]. Same
+/// `#[cfg(test)]` discipline as the hooks above (Defect 4).
+#[cfg(test)]
+pub(crate) type ReceiveCreatingProofLoader = Arc<
+    dyn Fn(&[u8]) -> Result<zkcoins_prover::prover_bridge::ComplianceProof, String> + Send + Sync,
+>;
 
 // Response types for our API
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct BalanceResponse {
+pub(crate) struct BalanceResponse {
     balance: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
@@ -253,24 +383,17 @@ pub struct BalanceResponse {
 
 #[cfg(any(feature = "address-list", feature = "lnurl"))]
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct AddressesResponse {
+pub(crate) struct AddressesResponse {
     addresses: Vec<String>,
 }
 
-// ----- /api/history (issue #153) ------------------------------------------
+// ----- /api/history (Stage 3 closed — 410 only) ---------------------------
+// Legacy list/detail helpers (`list_account_history`, `history_row_to_item`,
+// balance/direction decoders, `TxDetail`, …) deleted in Stage 4. Handlers
+// below stay as loud 410 Gone; OpenAPI documents that shape only.
 
-/// Default page size when `/api/history?limit` is omitted.
-pub(crate) const HISTORY_DEFAULT_LIMIT: i64 = 50;
-/// Hard cap on `/api/history?limit`. Anything outside `[1, MAX]` is a
-/// 400 — clamping silently was rejected as a footgun (callers that pass
-/// `limit=1000` should learn about the cap, not get an unexplained 200
-/// with 200 rows).
-pub(crate) const HISTORY_MAX_LIMIT: i64 = 200;
-
-/// `?address=&limit=&offset=` query for `GET /api/history`. All three
-/// are parsed via the typed `Query` extractor so axum surfaces a 400 on
-/// a non-integer `limit` / `offset` without the handler having to
-/// re-parse.
+/// `?address=&limit=&offset=` still accepted so clients get 410, not a
+/// framework 400 from an unknown query extractor — values are ignored.
 #[derive(Deserialize)]
 pub(crate) struct HistoryQuery {
     pub address: Option<String>,
@@ -278,383 +401,14 @@ pub(crate) struct HistoryQuery {
     pub offset: Option<i64>,
 }
 
-/// One entry in the `/api/history` response. Field names match the
-/// issue #153 contract verbatim; `null`-able fields use `Option<T>`
-/// with `serialize_with = Some` so the wire shape stays
-/// `"field": null` rather than the field being elided.
-///
-/// Memo / counterparty / block_height stay `null` today: the current
-/// schema does not store the recipient address per-mutation
-/// (`account_history` is keyed on the address that changed, not the
-/// counterparty), no memo column exists, and `triggering_commit_txid`
-/// is unset by every Rust caller — see [`db::AccountHistoryRow::commit_txid`]
-/// for the GUC-plumbing story.
+/// Error envelope retained for OpenAPI of the closed history routes.
 #[derive(Serialize, ToSchema)]
-pub struct HistoryItem {
-    /// Server-internal monotonic id. Always set — sourced from
-    /// `account_history.id`.
-    pub id: i64,
-    /// Bitcoin txid (lower-case hex, 64 chars) of the commit inscription
-    /// for this state change, once the publisher has broadcast it.
-    /// `null` while no commit_txid is linked to the row.
-    pub txid: Option<String>,
-    /// Unix epoch in seconds of the state change.
-    pub timestamp: i64,
-    /// `"send"`, `"receive"`, or `"mint"`. `scanner` / `recovery`
-    /// `account_history` rows are filtered out before the handler maps
-    /// to this enum.
-    pub direction: &'static str,
-    /// Absolute balance delta in sats (`|new_balance − prev_balance|`).
-    /// For a `receive` / `mint` this is the amount credited; for a
-    /// `send` this is the amount debited.
-    pub amount: u64,
-    /// Counterparty address (lower-case hex, 64 chars). Always `null`
-    /// in the current schema — see the type-level doc-comment.
-    pub counterparty: Option<String>,
-    /// `"pending"`, `"confirmed"`, or `"failed"`. Every persisted
-    /// `account_history` row reflects a state mutation that committed
-    /// in Postgres, so the default is `"confirmed"`; the alternative
-    /// values surface once the `pending_inscriptions` join lights up.
-    pub status: &'static str,
-    /// Bitcoin block height that contains the commit inscription, or
-    /// `null` while the scanner has not integrated it (and while the
-    /// `commit_txid` link is missing).
-    pub block_height: Option<i64>,
-    /// Free-text memo attached to the operation. Always `null` — no
-    /// memo column exists in the current schema.
-    pub memo: Option<String>,
-}
-
-/// Paginated wrapper around [`HistoryItem`]. `total` is the unfiltered
-/// count for the queried address (not the count of returned `items`)
-/// so the caller can drive pagination without a separate query.
-#[derive(Serialize, ToSchema)]
-pub struct HistoryResponse {
-    pub items: Vec<HistoryItem>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// JSON envelope returned by the validation-failure branches of
-/// `get_history_handler`. Distinct from the existing `SendCoinResponse`
-/// shape because `/api/history` is a read endpoint with no `success` /
-/// `proof_id` machinery — a flat `{ "error": "..." }` is the contract
-/// the issue documents.
-#[derive(Serialize, ToSchema)]
-pub struct HistoryErrorResponse {
+pub(crate) struct HistoryErrorResponse {
     pub error: &'static str,
 }
 
-/// Per-transaction detail returned by `GET /api/history/{id}`.
-///
-/// Extends the [`HistoryItem`] list shape with everything else the node
-/// can derive for one `account_history` row **without a schema change**:
-/// the decoded account-state snapshot the mutation produced (usable
-/// balance before/after, the post-mutation send counter and commitment
-/// public key), the verifier circuit digest every proof on this node is
-/// checked against, and the on-chain commit output value when a
-/// publisher inscription exists. Fields the current schema cannot
-/// populate stay `null` — the same honesty contract as [`HistoryItem`]
-/// (`txid` / `block_height` / `commit_output_value` light up only once
-/// the publisher threads `triggering_commit_txid`).
-#[derive(Serialize, ToSchema)]
-pub struct TxDetail {
-    // --- identity / core (mirrors HistoryItem) ---
-    /// Server-internal monotonic id (`account_history.id`).
-    pub id: i64,
-    /// The queried address, echoed as lower-case hex (32 bytes, no `0x`).
-    pub address: String,
-    /// Commit-inscription txid (lower-case hex), or `null` while unlinked.
-    pub txid: Option<String>,
-    /// Unix epoch in seconds of the state change.
-    pub timestamp: i64,
-    /// `"send"`, `"receive"`, or `"mint"`.
-    pub direction: &'static str,
-    /// Absolute balance delta in sats (`|balance_after − balance_before|`).
-    pub amount: u64,
-    /// Counterparty address — always `null` in the current schema.
-    pub counterparty: Option<String>,
-    /// `"pending"`, `"confirmed"`, or `"failed"`.
-    pub status: &'static str,
-    /// Bitcoin block height of the commit, or `null` while unconfirmed.
-    pub block_height: Option<i64>,
-    /// Free-text memo — always `null` (no memo column exists).
-    pub memo: Option<String>,
-    // --- decoded account-state snapshot for this mutation ---
-    /// Usable balance (settled + queued) AFTER this mutation, in sats.
-    pub balance_after: u64,
-    /// Usable balance BEFORE this mutation; `null` for the first row of
-    /// an address (no prior state to decode).
-    pub balance_before: Option<u64>,
-    /// The account's own-send counter after this mutation — the wallet's
-    /// authoritative BIP-32 child index (see `BalanceResponse.num_sends`).
-    pub num_sends_after: u32,
-    /// The account's commitment public key after this mutation
-    /// (compressed secp256k1, 33-byte lower-case hex); `null` before the
-    /// account has ever sent (genesis / mint-only state).
-    pub commitment_public_key: Option<String>,
-    // --- proof / verification ---
-    /// The verifier circuit digest (lower-case hex) every proof on this
-    /// node is checked against — the proof-system identity. `null` only
-    /// before the node has stored its digest (pre-first-proof boot).
-    pub circuit_digest: Option<String>,
-    // --- on-chain ---
-    /// Value (sats) locked in the commit inscription's output, when a
-    /// publisher inscription row exists for this mutation; `null`
-    /// otherwise (e.g. a faucet mint before broadcast).
-    pub commit_output_value: Option<i64>,
-}
-
-/// Decode the 64-char (or 64 char + 0x prefix) hex `address` argument
-/// into the raw 32-byte form `account_history.address` is keyed on.
-/// Reuses the exact decode + length rules `get_balance_handler` applies
-/// — `Err` on non-hex characters or a length that does not unpack to
-/// 32 bytes.
-pub(crate) fn decode_history_address(raw: &str) -> Result<[u8; 32], &'static str> {
-    let bytes = hex::decode(raw.trim_start_matches("0x")).map_err(|_| "Invalid address hex")?;
-    if bytes.len() != 32 {
-        return Err("Address must be 32 bytes (64 hex chars)");
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-/// Map an `account_history.source` string into the user-facing
-/// `direction` enum. Returns `None` for the `scanner` and `recovery`
-/// sources, which are internal mutations the user did not initiate and
-/// the handler filters out before serialising.
-pub(crate) fn map_history_direction(source: &str) -> Option<&'static str> {
-    match source {
-        "mint" => Some("mint"),
-        "send" => Some("send"),
-        "receive" => Some("receive"),
-        // `scanner` and `recovery` are internal replays / operator-only
-        // mutations. Surface a `None` so the handler skips them.
-        _ => None,
-    }
-}
-
-/// Recover the usable balance out of a bincode-serialised
-/// [`crate::account_node::Account`] blob. Returns `None` if the bytes
-/// fail to round-trip — defensive, the handler treats a decode failure
-/// as a missing prior balance (so the delta collapses to the absolute
-/// new balance instead of producing a fabricated number).
-///
-/// Mirrors [`crate::account_node::Account::get_balance`]: the settled
-/// `balance` field plus pending receives sitting in `coin_queue`.
-/// Mints and receives push the credited coin into `coin_queue` without
-/// touching `balance` until a subsequent send drains the queue into
-/// `coin_history`; reading only `a.balance` here would report `0` for
-/// the very transactions the history endpoint is meant to surface (the
-/// E2E suite catches this as `amount = 0` on first mint).
-///
-/// `saturating_add` is used because the two summands come out of an
-/// untrusted on-disk blob; in practice overflow is impossible (per-coin
-/// amounts and `Account.balance` are both bounded by the minting
-/// account's supply), but capping at `u64::MAX` is preferable to a
-/// panic on a corrupted row.
-pub(crate) fn balance_from_account_blob(blob: &[u8]) -> Option<u64> {
-    let a = bincode::deserialize::<crate::account_node::Account>(blob).ok()?;
-    let queued: u64 = a
-        .coin_queue
-        .iter()
-        .fold(0u64, |acc, cp| acc.saturating_add(cp.coin.amount));
-    Some(a.balance.saturating_add(queued))
-}
-
-/// Typed mirror of the `pending_inscriptions.status` CHECK constraint
-/// (migration 0003: `constructed`, `commit_broadcast`, `reveal_broadcast`,
-/// `complete`, `failed`). Parsed via [`PendingInscriptionStatus::from_db_str`]
-/// so the `match` in [`history_row_to_item`] can be exhaustive and a
-/// future schema state addition forces compile-time attention — a plain
-/// `match row.pending_status.as_deref()` on a `String` can't enforce
-/// that.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PendingInscriptionStatus {
-    Constructed,
-    CommitBroadcast,
-    RevealBroadcast,
-    Complete,
-    Failed,
-}
-
-impl PendingInscriptionStatus {
-    /// Map a raw `pending_inscriptions.status` string to the enum.
-    /// Returns `None` for an unrecognised value — Postgres's CHECK
-    /// constraint prevents that in practice, but if it ever leaks the
-    /// handler degrades to `pending` rather than crash.
-    pub(crate) fn from_db_str(s: &str) -> Option<Self> {
-        match s {
-            "constructed" => Some(Self::Constructed),
-            "commit_broadcast" => Some(Self::CommitBroadcast),
-            "reveal_broadcast" => Some(Self::RevealBroadcast),
-            "complete" => Some(Self::Complete),
-            "failed" => Some(Self::Failed),
-            _ => None,
-        }
-    }
-}
-
-/// Convert one [`db::AccountHistoryRow`] into a wire [`HistoryItem`].
-/// Returns `None` if the row's source is internal (`scanner` /
-/// `recovery`), if the `new_data` blob fails to decode, or if a
-/// non-null `prev_data` blob fails to decode (treating that as zero
-/// would fabricate a full-balance delta — see the inner `match` for
-/// the warn log).
-pub(crate) fn history_row_to_item(row: &crate::db::AccountHistoryRow) -> Option<HistoryItem> {
-    let direction = map_history_direction(&row.source)?;
-    let new_balance = balance_from_account_blob(&row.new_data)?;
-    // `prev_data` is `None` on the first INSERT for an address — treat
-    // that as a from-zero delta so the very first mint / receive
-    // surfaces the full credit instead of disappearing. A `Some(blob)`
-    // that fails to decode is *not* the same as `None`: silently
-    // collapsing to zero would fabricate the full new balance as the
-    // delta. Drop the row instead and log a warn so an operator can
-    // notice the schema drift.
-    let prev_balance = match row.prev_data.as_deref() {
-        None => 0,
-        Some(blob) => match balance_from_account_blob(blob) {
-            Some(b) => b,
-            None => {
-                let blob_len = blob.len();
-                tracing::warn!(
-                    "history_row_to_item: row id={} address has un-decodable prev_data blob (len={}); dropping row to avoid fabricating a full-balance delta",
-                    row.id,
-                    blob_len,
-                );
-                return None;
-            }
-        },
-    };
-    // Absolute delta — sends are debits (prev > new), mints / receives
-    // are credits (new > prev). The `direction` field already encodes
-    // the sign for the caller.
-    let amount = new_balance.max(prev_balance) - new_balance.min(prev_balance);
-
-    // Wire status derived from `pending_inscriptions.status` (the
-    // authoritative state machine) joined to `observed_inscriptions`
-    // for the post-broadcast on-chain confirmation. A DB-committed
-    // `account_history` row only proves a server-side state change —
-    // *not* an on-chain confirmation — so the default before any
-    // matching inscription row exists is `pending`, not `confirmed`.
-    //
-    // The inner `match pending` is exhaustive over the
-    // [`PendingInscriptionStatus`] enum (which mirrors migration 0003's
-    // CHECK constraint). A future state added to the enum will fail to
-    // compile here — no silent `_ => "pending"` catch-all.
-    //
-    // The unknown-string case is handled separately via
-    // `from_db_str` returning `None`: Postgres's CHECK constraint
-    // already prevents that, but if it ever leaks we warn and degrade
-    // to `pending` rather than crash.
-    let pending_enum = row
-        .pending_status
-        .as_deref()
-        .map(|s| (s, PendingInscriptionStatus::from_db_str(s)));
-    let status = match pending_enum {
-        Some((_, Some(p))) => match p {
-            PendingInscriptionStatus::Complete => "confirmed",
-            PendingInscriptionStatus::Failed => "failed",
-            PendingInscriptionStatus::Constructed
-            | PendingInscriptionStatus::CommitBroadcast
-            | PendingInscriptionStatus::RevealBroadcast => "pending",
-        },
-        Some((raw, None)) => {
-            tracing::warn!(
-                "history_row_to_item: unknown pending_inscriptions.status={:?} (id={}); defaulting to pending",
-                raw,
-                row.id,
-            );
-            "pending"
-        }
-        // No pending_inscriptions row but the scanner has observed the
-        // inscription on-chain — it's confirmed even though we lost the
-        // pending row (the resumer prunes `complete` rows after a
-        // safe-depth threshold).
-        None if row.block_height.is_some() => "confirmed",
-        // Neither pending nor observed — the on-chain side is not yet
-        // known to us; the DB write alone does not warrant `confirmed`.
-        None => "pending",
-    };
-
-    Some(HistoryItem {
-        id: row.id,
-        txid: row.commit_txid.as_deref().map(hex::encode),
-        timestamp: row.timestamp_secs,
-        direction,
-        amount,
-        // TODO(zk-coins/node#160): capture `counterparty_address` per
-        // `account_history` row (schema change) so this stops being
-        // unconditionally null.
-        counterparty: None,
-        status,
-        block_height: row.block_height,
-        memo: None,
-    })
-}
-
-/// Decode the post-mutation `num_sends` + `commitment_public_key` out of
-/// an `accounts.data` bincode blob, for the transaction-detail endpoint.
-/// Returns `None` on a decode failure (the caller maps that to a 500 — a
-/// corrupt blob is a server fault, not a user error). Mirrors
-/// [`balance_from_account_blob`], which handles the balance half.
-pub(crate) fn account_meta_from_blob(blob: &[u8]) -> Option<(u32, Option<String>)> {
-    let a = bincode::deserialize::<crate::account_node::Account>(blob).ok()?;
-    // `commitment_public_key` is a secp256k1 `PublicKey`; serialize to its
-    // 33-byte compressed form before hex-encoding (matches the wire form
-    // the wallet derives and sends in `prev_commitment_pubkey`).
-    let cpk = a
-        .commitment_public_key
-        .as_ref()
-        .map(|pk| hex::encode(pk.serialize()));
-    Some((a.num_sends, cpk))
-}
-
-/// Build a [`TxDetail`] from one history row + the node's circuit digest.
-///
-/// Reuses [`history_row_to_item`] for the shared list fields
-/// (direction / amount / status / txid …) so the two endpoints can never
-/// disagree on the core shape, then layers on the decoded account-state
-/// snapshot. Returns `None` when the row's source is internal or any
-/// state blob fails to decode — both map to a 500 at the call site (the
-/// db query already filtered to user-facing sources, so in practice only
-/// a corrupt blob reaches the `None` arm).
-pub(crate) fn tx_detail_from_row(
-    row: &crate::db::AccountHistoryRow,
-    address_hex: String,
-    circuit_digest: Option<Vec<u8>>,
-) -> Option<TxDetail> {
-    let item = history_row_to_item(row)?;
-    let balance_after = balance_from_account_blob(&row.new_data)?;
-    let balance_before = match row.prev_data.as_deref() {
-        None => None,
-        Some(blob) => Some(balance_from_account_blob(blob)?),
-    };
-    let (num_sends_after, commitment_public_key) = account_meta_from_blob(&row.new_data)?;
-    Some(TxDetail {
-        id: item.id,
-        address: address_hex,
-        txid: item.txid,
-        timestamp: item.timestamp,
-        direction: item.direction,
-        amount: item.amount,
-        counterparty: item.counterparty,
-        status: item.status,
-        block_height: item.block_height,
-        memo: item.memo,
-        balance_after,
-        balance_before,
-        num_sends_after,
-        commitment_public_key,
-        circuit_digest: circuit_digest.map(hex::encode),
-        commit_output_value: row.commit_output_value,
-    })
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
-pub struct SendCoinRequest {
+pub(crate) struct SendCoinRequest {
     /// Sender account address (`0x`-prefixed 32-byte hex).
     pub(crate) account_address: String,
     /// Recipient identifier — `0x`-prefixed 32-byte hex address or a
@@ -694,7 +448,7 @@ pub struct SendCoinRequest {
 /// BIP-340 Schnorr signature over the mint fields, verified against
 /// `creator_pubkey` (see [`verify_mint_signature_pub`]).
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
-pub struct MintRequest {
+pub(crate) struct MintRequest {
     /// Compressed secp256k1 public key (33 bytes) of the asset creator,
     /// hex-encoded. The owner is `H(creator_pubkey)` and the asset_id
     /// is `calculate_asset_id(creator_pubkey, H(name), decimals)`.
@@ -729,41 +483,24 @@ pub struct MintRequest {
 // authenticated push endpoint. Mark `dead_code` to silence the lint.
 #[allow(dead_code)]
 #[derive(Deserialize)]
-pub struct ReceiveCoinRequest {
+pub(crate) struct ReceiveCoinRequest {
     coin_proof: Proof,
 }
 
 /// Persistent proof store — survives node restarts.
 /// Each proof is stored as an individual file: /data/proofs/{id}.bin
+///
+/// Write path (`add_proof` / `next_id`) removed with the legacy send prove
+/// leg; residual callers only read (`get_proof`) or plant test fixtures.
 pub(crate) struct ProofStore {
     dir: String,
-    next_id: AtomicU64,
 }
 
 impl ProofStore {
     pub(crate) fn new(dir: &str) -> Self {
         std::fs::create_dir_all(dir).ok();
-        // Scan existing files to find the highest ID
-        let max_id = std::fs::read_dir(dir)
-            .ok()
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| {
-                        e.file_name()
-                            .to_str()?
-                            .strip_suffix(".bin")?
-                            .parse::<u64>()
-                            .ok()
-                    })
-                    .max()
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
-
         ProofStore {
             dir: dir.to_string(),
-            next_id: AtomicU64::new(max_id + 1),
         }
     }
 
@@ -776,77 +513,34 @@ impl ProofStore {
         Some(base.join(format!("{}.bin", id)))
     }
 
-    // Vestigial: `add_proof` is only reachable from the now-removed
-    // synchronous `/api/send` handler. The Job-API replacement
-    // (`jobs_send_handler` → `dispatcher::process_send_job`) hands
-    // the resulting `CoinProof` directly to the wallet via the
-    // `proof_id` field on the job row and never writes to the file
-    // store. Kept on disk so a wallet that still posts to
-    // `/api/receive` with an old `proof_id` hits the legacy path
-    // (which now never produces one). Marked `coverage(off)` because
-    // an honest test would have to construct a `CoinProof` through
-    // the Plonky2 prover, which is a >40-s job for a handler that
-    // will be removed in the follow-up wallet-migration PR.
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    pub(crate) fn add_proof(&self, proof_with_commitment: CoinProof) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let path = self
-            .proof_path(id)
-            .expect("proof store directory exists (created in ProofStore::new)");
-        let bytes =
-            bincode::serialize(&proof_with_commitment).expect("CoinProof is always serializable");
-        Self::persist_proof_bytes(&path, &bytes, id);
-        id
-    }
-
-    /// Best-effort persist: write `bytes` to `path` atomically, log the
-    /// I/O error if the write fails. Extracted so the error arm can be
-    /// exercised directly without having to construct a real `CoinProof`
-    /// (which requires the Plonky2 prover to run).
-    ///
-    /// "Atomic" here means write-to-temp + rename. `File::create` +
-    /// `sync_all` flushes the data file before the rename, and the
-    /// final rename is a single inode swap from the OS's perspective,
-    /// so a crash between the two never leaves a half-written
-    /// `{id}.bin` for `get_proof` to find. Inlined (rather than calling
-    /// a shared `atomic_write` helper) because the only remaining
-    /// user after PR-A3 is this proof store — `accounts.bin`,
-    /// `usernames.bin`, and `minting_num_pubkeys.bin` all moved to
-    /// Postgres.
-    fn persist_proof_bytes(path: &std::path::Path, bytes: &[u8], id: u64) {
-        let path_str = path.to_str().unwrap_or("");
-        let tmp_path = format!("{}.tmp", path_str);
-        let result: std::io::Result<()> = (|| {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&tmp_path, path_str)?;
-            Ok(())
-        })();
-        if let Err(e) = result {
-            eprintln!("Failed to persist proof {}: {}", id, e);
-        }
-    }
-
-    // Vestigial pair to `add_proof`; the only call site
-    // (`get_proof_handler`) is reached via the legacy `/api/proof/:id`
-    // endpoint kept on disk for wallet-transition compatibility.
-    // See `add_proof` for the deprecation rationale and the
-    // coverage-off reason.
+    // Residual read path for `flow::commit_flow` (legacy ash‖ocr commit)
+    // and the 410-Gone `/api/proof/:id` handler. Marked `coverage(off)`
+    // because an honest production write would require a CoinProof from
+    // the deleted legacy prove leg; tests plant bytes via
+    // `plant_raw_for_test`.
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn get_proof(&self, id: u64) -> Option<CoinProof> {
         let path = self.proof_path(id)?;
         let bytes = std::fs::read(&path).ok()?;
         bincode::deserialize(&bytes).ok()
     }
+
+    /// Test-only: plant opaque bytes under `{id}.bin` so closed-handler
+    /// tests can prove the HTTP path never returns store contents.
+    #[cfg(test)]
+    pub(crate) fn plant_raw_for_test(&self, id: u64, bytes: &[u8]) {
+        let path = self
+            .proof_path(id)
+            .expect("proof store directory exists (created in ProofStore::new)");
+        std::fs::write(&path, bytes).expect("plant proof bytes for test");
+    }
 }
 
 /// A staged issuer-mint awaiting the creator's signature (phase 1 → 2
-/// of the two-phase mint). Built by `flow::mint_flow`'s prove leg and
-/// consumed by `flow::mint_commit_flow` once the wallet returns a
-/// signed `Commitment`. Carries everything the commit leg needs to run
-/// the off-circuit creator binding and apply the balance increase.
+/// of the residual two-phase mint). Consumed by `flow::mint_commit_flow`
+/// once the wallet returns a signed `Commitment`. Carries everything the
+/// commit leg needs to run the off-circuit creator binding and apply the
+/// balance increase.
 pub(crate) struct StagedMint {
     /// The issuer-mint proof (no out-coins; increases the creator's own
     /// balance). The wallet signs its `account_state_hash ||
@@ -871,8 +565,12 @@ pub(crate) struct StagedMint {
 /// the prove and commit legs drops the staged mint; the wallet's job
 /// then times out at `awaiting_signature` and the creator re-submits
 /// (same boot-resume semantics as a send).
+/// Staged-mint map for residual legacy `mint_commit_flow`. Stage 3 deleted
+/// the prove-side `add` path; the map stays so a commit against an unknown
+/// `proof_id` still returns 404 rather than a type-level hole.
 #[derive(Default)]
 pub(crate) struct MintStore {
+    #[cfg(test)]
     next_id: AtomicU64,
     staged: Mutex<HashMap<u64, StagedMint>>,
 }
@@ -880,14 +578,14 @@ pub(crate) struct MintStore {
 impl MintStore {
     pub(crate) fn new() -> Self {
         MintStore {
-            // Start at 1 so a `proof_id` of 0 is never a valid staged
-            // mint (mirrors `ProofStore`'s 1-based ids).
+            #[cfg(test)]
             next_id: AtomicU64::new(1),
             staged: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Stage a mint, returning its `proof_id`.
+    /// Stage a mint, returning its `proof_id` (test / residual legacy only).
+    #[cfg(test)]
     pub(crate) fn add(&self, staged: StagedMint) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         lock_or_recover(&self.staged).insert(id, staged);
@@ -901,7 +599,7 @@ impl MintStore {
 }
 
 #[derive(Serialize, Deserialize, Default, ToSchema)]
-pub struct SendCoinResponse {
+pub(crate) struct SendCoinResponse {
     pub(crate) success: bool,
     /// Structured error message on failure. `None` on success. Mirrors
     /// the body string returned alongside a 4xx/5xx status code, so
@@ -916,91 +614,6 @@ pub struct SendCoinResponse {
     pub(crate) account_state_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) output_coins_root: Option<String>,
-}
-
-/// Map a `send_coins` error string to an HTTP status code plus a
-/// client-safe body message.
-///
-/// Threat model (memory `feedback_threat_model_over_checklist`):
-///
-/// - **422 UNPROCESSABLE_ENTITY** — the request is well-formed but the
-///   witness is invalid (insufficient balance, in-coin not in source's
-///   output_coins_root, source commitment not in history MMR, etc.).
-///   The defense-in-depth shim added in PR #26 (Stage 5d-next-5
-///   Phase 2b) produces two of these strings in microseconds before
-///   the minute-scale prove cost is paid; surfacing the specific
-///   string lets clients distinguish "fix your inclusion proof" from
-///   "fix your account selection".
-/// - **404 NOT_FOUND** — sender address is not known to the node.
-/// - **500 INTERNAL_SERVER_ERROR** — the prover failed. Body collapses
-///   to a generic `"prove failed"` to avoid leaking prover-internal
-///   state to the caller. The full error string is logged via
-///   `eprintln!` in the handler.
-///
-/// The historical 400 `"prev_commitment_pubkey required for account
-/// update"` is unreachable as of the
-/// [`Account::commitment_public_key`] refactor: the server reads the
-/// previous commitment pubkey from its own state instead of trusting
-/// the caller. The match arm is therefore gone.
-pub(crate) fn map_send_coins_error(err: &str) -> (StatusCode, &'static str) {
-    match err {
-        "Unknown account address" => (StatusCode::NOT_FOUND, "Unknown account address"),
-        "Insufficient funds" => (StatusCode::UNPROCESSABLE_ENTITY, "Insufficient funds"),
-        // `get_merkle_proofs` failures — reachable from `send_coins`
-        // via the `prev_commitment_pubkey` path. The client supplied
-        // the wrong public key, or the previous proof references a
-        // history root the node hasn't seen yet (stale snapshot).
-        // Both are caller-fixable, hence 422 rather than 500.
-        "Unable to get merkle proofs for provided public key" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Unable to get merkle proofs for provided public key",
-        ),
-        "Unable to get mmr inclusion proof for the previous root" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Unable to get mmr inclusion proof for the previous root",
-        ),
-        // Truncated proof public-inputs vector — the proof stored on
-        // the account is corrupt or was produced by an incompatible
-        // build of the prover. Not caller-fixable; surfaces as 500.
-        "Proof public_inputs too short" => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Proof public_inputs too short",
-        ),
-        "In-coin not present in source's output_coins_root" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "In-coin not present in source's output_coins_root",
-        ),
-        "Source commitment not present in history MMR" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Source commitment not present in history MMR",
-        ),
-        "Coin is missing commitment" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Coin is missing commitment",
-        ),
-        "Should provide an inclusion proof" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Should provide an inclusion proof",
-        ),
-        "Coin should not exist in coin history tree" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Coin should not exist in coin history tree",
-        ),
-        "Coin should not exist in tree yet" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Coin should not exist in tree yet",
-        ),
-        "Too many in-coins for one transition" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Too many in-coins for one transition",
-        ),
-        "Too many out-coins for one transition" => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Too many out-coins for one transition",
-        ),
-        s if s.ends_with("failed") => (StatusCode::INTERNAL_SERVER_ERROR, "prove failed"),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
-    }
 }
 
 /// Build a `SendCoinResponse` for a request-level failure (hex
@@ -1023,7 +636,7 @@ pub(crate) fn handler_error_response(
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
-pub struct CommitRequest {
+pub(crate) struct CommitRequest {
     pub(crate) proof_id: u64,
     /// Hex-encoded compressed public key (33 bytes) that signed the commitment.
     #[schema(value_type = String)]
@@ -1045,13 +658,13 @@ pub struct CommitRequest {
 /// foot-gun of matching the free-text string.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum BitcoinNetwork {
+pub(crate) enum BitcoinNetwork {
     Mainnet,
     Mutinynet,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct InfoResponse {
+pub(crate) struct InfoResponse {
     /// Human-readable network label (e.g. `"Mainnet"` / `"Mutinynet"`),
     /// sourced from `NETWORK_CONFIG.network_name`. Operator-overridable
     /// and intended for display only — clients gate behaviour on
@@ -1092,7 +705,7 @@ pub struct Capabilities {
 
 #[cfg(feature = "username-claim")]
 #[derive(Deserialize, ToSchema)]
-pub struct ClaimUsernameRequest {
+pub(crate) struct ClaimUsernameRequest {
     username: String,
     address: String,
     #[schema(value_type = String)]
@@ -1102,14 +715,14 @@ pub struct ClaimUsernameRequest {
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct UsernameResponse {
+pub(crate) struct UsernameResponse {
     username: String,
     address: String,
 }
 
 #[cfg(feature = "lnurl")]
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct LnurlpResponse {
+pub(crate) struct LnurlpResponse {
     tag: String,
     callback: String,
     #[serde(rename = "minSendable")]
@@ -1120,7 +733,7 @@ pub struct LnurlpResponse {
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct LnurlErrorResponse {
+pub(crate) struct LnurlErrorResponse {
     status: String,
     reason: String,
 }
@@ -1145,68 +758,24 @@ pub(crate) async fn get_balance_handler(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let err_422 = || {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(BalanceResponse {
-                balance: 0,
-                username: None,
-                num_sends: 0,
-            }),
-        )
-    };
-
-    // `address` (required) + `asset_id` (required under the multi-asset
-    // model — balance is per-(owner, asset_id); the list endpoint
-    // `GET /api/balance/:address` aggregates across assets).
-    let Some(address_hex) = params.get("address") else {
-        return err_422();
-    };
-    let address = match parse_hex_digest(address_hex) {
-        Some(a) => a,
-        None => return err_422(),
-    };
-    let Some(asset_hex) = params.get("asset_id") else {
-        return err_422();
-    };
-    let asset_id = match parse_hex_digest(asset_hex) {
-        Some(a) => a,
-        None => return err_422(),
-    };
-
-    let account_node = lock_or_recover(&state.account_node);
-    let username = {
-        let username_store = lock_or_recover(&state.username_store);
-        username_store.get_username(&address).map(String::from)
-    };
-    let num_sends = account_node
-        .get_account(&address, &asset_id)
-        .map(|a| a.num_sends)
-        .unwrap_or(0);
-    let balance = account_node
-        .get_account_balance(&address, &asset_id)
-        .unwrap_or(0);
+    // Stage 3 Runde 5 (R2): legacy single-asset balance read is closed.
+    // Spec `read.account` (capability-bound ownership / view-grant) is the
+    // replacement surface (`/v1/attest/balance` and later account-state
+    // pull). Never return 200 with zeroed or partial ledger fields — that
+    // would mask the protocol error.
+    let _ = params;
+    let _ = &state;
     (
-        StatusCode::OK,
-        Json(BalanceResponse {
-            balance,
-            username,
-            num_sends,
-        }),
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/balance is removed (Stage 3): legacy AccountNode ledger read is not capability-bound; use the v1 attest / read.account surface"
+        })),
     )
-}
-
-/// Parse a `0x`-optional 32-byte hex string into a Poseidon
-/// [`HashDigest`]. Returns `None` on bad hex or wrong length.
-pub(crate) fn parse_hex_digest(s: &str) -> Option<zkcoins_program::hash::HashDigest> {
-    let raw = hex::decode(s.trim_start_matches("0x")).ok()?;
-    let arr: [u8; 32] = raw.as_slice().try_into().ok()?;
-    Some(digest_from_bytes(&arr))
 }
 
 /// One asset entry in the [`OwnerBalanceResponse`] list.
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct AssetBalance {
+pub(crate) struct AssetBalance {
     /// Asset identifier, 32-byte digest as 64 lowercase hex chars.
     pub asset_id: String,
     /// Human-facing asset name, if the node learned it at mint time.
@@ -1223,7 +792,7 @@ pub struct AssetBalance {
 
 /// Aggregated per-asset balance list for `GET /api/balance/:address`.
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct OwnerBalanceResponse {
+pub(crate) struct OwnerBalanceResponse {
     /// Owner address echoed back, 64 lowercase hex chars.
     pub address: String,
     /// Username bound to the owner, if any.
@@ -1249,52 +818,20 @@ pub struct OwnerBalanceResponse {
             body = OwnerBalanceResponse),
     ),
 )]
-/// `GET /api/balance/:address` — list every asset the owner holds with
-/// its per-asset balance, num_sends, and (where known) display
-/// metadata. The multi-asset replacement for the single-balance
-/// `GET /api/balance?address=` query.
+/// `GET /api/balance/:address` — formerly listed every asset the owner
+/// holds. Stage 3 Runde 5 (R2): closed; same capability-bound
+/// `read.account` replacement as [`get_balance_handler`].
 pub(crate) async fn get_owner_balance_handler(
     State(state): State<AppState>,
     Path(address_hex): Path<String>,
 ) -> impl IntoResponse {
-    let empty = |code: StatusCode, address: String| {
-        (
-            code,
-            Json(OwnerBalanceResponse {
-                address,
-                username: None,
-                assets: vec![],
-            }),
-        )
-    };
-    let address = match parse_hex_digest(&address_hex) {
-        Some(a) => a,
-        None => return empty(StatusCode::UNPROCESSABLE_ENTITY, address_hex),
-    };
-
-    let account_node = lock_or_recover(&state.account_node);
-    let username = {
-        let username_store = lock_or_recover(&state.username_store);
-        username_store.get_username(&address).map(String::from)
-    };
-    let assets = account_node
-        .assets_for_owner(&address)
-        .into_iter()
-        .map(|a| AssetBalance {
-            asset_id: hex::encode(digest_to_bytes(&a.asset_id)),
-            name: a.name,
-            decimals: a.decimals,
-            balance: a.balance,
-            num_sends: a.num_sends,
-        })
-        .collect();
+    let _ = address_hex;
+    let _ = &state;
     (
-        StatusCode::OK,
-        Json(OwnerBalanceResponse {
-            address: hex::encode(digest_to_bytes(&address)),
-            username,
-            assets,
-        }),
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/balance/:address is removed (Stage 3): legacy multi-asset AccountNode ledger read is not capability-bound; use the v1 attest / read.account surface"
+        })),
     )
 }
 
@@ -1302,267 +839,57 @@ pub(crate) async fn get_owner_balance_handler(
     get,
     path = "/api/history",
     tag = "Accounts",
-    params(
-        ("address" = String, Query,
-            description = "Account address (32-byte hex, with or without `0x` prefix)."),
-        ("limit" = Option<i64>, Query,
-            description = "Page size in `[1, 200]`. Defaults to 50."),
-        ("offset" = Option<i64>, Query,
-            description = "Non-negative pagination offset. Defaults to 0."),
-    ),
     responses(
-        (status = 200, description = "Paginated newest-first history page.",
-            body = HistoryResponse),
-        (status = 422, description = "Missing/malformed `address`, `limit` outside `[1, 200]`, \
-            or negative `offset`.",
-            body = HistoryErrorResponse),
-        (status = 500, description = "Database error while reading history.",
+        (status = 410, description = "Closed (Stage 3): unauthenticated legacy account history removed.",
             body = HistoryErrorResponse),
     ),
 )]
-/// `GET /api/history?address=<hex>&limit=<n>&offset=<n>` — paginated
-/// per-address transaction history. Implements issue #153.
+/// `GET /api/history` — **closed (Stage 3 Runde 6)**.
 ///
-/// Sort order is fixed `ORDER BY changed_at DESC` (newest first); the
-/// matching test in `router_tests.rs` pins this so a future caller
-/// cannot silently flip the order.
-///
-/// Validation contract (all return HTTP 422 with a
-/// [`HistoryErrorResponse`] — mirrors the `/api/balance` shape so the
-/// whole read surface uses the same status for malformed input):
-///   * `address` missing.
-///   * `address` not valid 32-byte hex.
-///   * `limit` outside `[1, 200]` (the issue's max=200 rule). `limit=0`
-///     is rejected because a successful response with zero items would
-///     be indistinguishable from "no rows", masking the misuse.
-///   * `offset` negative.
-///
-/// A successful response with `offset >= total` returns
-/// `items: [], total: N` so the caller can detect end-of-list without
-/// a second round-trip.
-///
-/// Persistence: pure read from `account_history` (joined with
-/// `observed_inscriptions` + `pending_inscriptions` for the future
-/// txid/block_height/status link — see [`db::AccountHistoryRow`] for
-/// the today-vs-tomorrow story). No new schema work.
+/// Previously paginated decoded legacy `account_history` snapshots
+/// (amount, balance deltas, …) for any address. Address knowledge is
+/// not `read.account` (spec §6.4 / §7.5). Loud HTTP 410; never 200 with
+/// rows and never a 422 validation path that re-probes the store.
 pub(crate) async fn get_history_handler(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<HistoryQuery>,
 ) -> impl IntoResponse {
-    // Resolve defaults first so the rest of the validation block can
-    // assume concrete values. `Option::get().copied().unwrap_or(...)`
-    // would also work but the field is already an `Option<i64>` from
-    // the typed extractor — `unwrap_or` is the same shape.
-    let limit = query.limit.unwrap_or(HISTORY_DEFAULT_LIMIT);
-    let offset = query.offset.unwrap_or(0);
-
-    // --- validation ---
-    let address_hex = match query.address.as_deref() {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(HistoryErrorResponse {
-                    error: "Missing required `address` query parameter",
-                }),
-            )
-                .into_response();
-        }
-    };
-    let address_bytes = match decode_history_address(address_hex) {
-        Ok(b) => b,
-        Err(msg) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(HistoryErrorResponse { error: msg }),
-            )
-                .into_response();
-        }
-    };
-    if !(1..=HISTORY_MAX_LIMIT).contains(&limit) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(HistoryErrorResponse {
-                error: "limit must be in [1, 200]",
-            }),
-        )
-            .into_response();
-    }
-    if offset < 0 {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(HistoryErrorResponse {
-                error: "offset must be non-negative",
-            }),
-        )
-            .into_response();
-    }
-
-    // --- DB read ---
-    // Single round-trip: page rows + filtered total in one query so the
-    // handler carries a single DB error branch.
-    let (rows, total) =
-        match db::list_account_history(&state.pool, &address_bytes, limit, offset).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("get_history_handler: list query failed: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(HistoryErrorResponse {
-                        error: "Database error while reading history",
-                    }),
-                )
-                    .into_response();
-            }
-        };
-
-    // Defense-in-depth safety net: the SQL already filters to
-    // mint/send/receive, so `filter_map` should never actually drop a
-    // row in normal operation. If it does, that's a schema drift bug —
-    // the post-fetch filter prevents a junk row from reaching the wire
-    // until someone fixes the SQL.
-    let items: Vec<HistoryItem> = rows.iter().filter_map(history_row_to_item).collect();
-
+    // Touch fields so Deserialize stays intentional; values ignored (410).
+    let _ = (state, &query.address, query.limit, query.offset);
     (
-        StatusCode::OK,
-        Json(HistoryResponse {
-            items,
-            total,
-            limit,
-            offset,
-        }),
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/history is removed (Stage 3): unauthenticated legacy account history is closed; use capability-bound v1 read.account"
+        })),
     )
-        .into_response()
 }
 
 #[utoipa::path(
     get,
     path = "/api/history/{id}",
     tag = "Accounts",
-    params(
-        ("id" = i64, Path,
-            description = "Server-internal `account_history.id` of the row (from a `HistoryItem.id`)."),
-        ("address" = String, Query,
-            description = "Account address (32-byte hex, with or without `0x` prefix) the row must belong to."),
-    ),
     responses(
-        (status = 200, description = "Full per-transaction detail.", body = TxDetail),
-        (status = 404, description = "No user-facing row with that id for the address.",
-            body = HistoryErrorResponse),
-        (status = 422, description = "Missing/malformed `address` or non-integer `id`.",
-            body = HistoryErrorResponse),
-        (status = 500, description = "Database error / undecodable state blob.",
+        (status = 410, description = "Closed (Stage 3): unauthenticated legacy account history detail removed.",
             body = HistoryErrorResponse),
     ),
 )]
-/// `GET /api/history/{id}?address=<hex>` — full detail for one
-/// transaction (one `account_history` row), scoped to `address`.
+/// `GET /api/history/{id}` — **closed (Stage 3 Runde 6)**.
 ///
-/// The list endpoint (`GET /api/history`) returns the lean per-row
-/// shape; this returns [`TxDetail`] — the same core fields plus the
-/// decoded account-state snapshot (balance before/after, post-mutation
-/// `num_sends` + commitment pubkey), the verifier circuit digest, and
-/// the on-chain commit output value when present.
-///
-/// Scoping: the row must both have `id` AND belong to `address`, and its
-/// source must be user-facing (`mint`/`send`/`receive`). A mismatch (or
-/// an internal `scanner`/`recovery` row) returns 404 — a caller cannot
-/// read another address's rows or the node's internal mutations by
-/// guessing ids.
-///
-/// Validation: missing/malformed `address` → 422; a non-integer `id` →
-/// 422 (parsed from the path as a string so the contract matches the
-/// list endpoint's 422-on-bad-input rather than axum's default 400).
+/// Previously returned decoded legacy snapshots (`balance_before/after`,
+/// `num_sends_after`, `commitment_public_key`, …) without ownership proof
+/// or view grant. Loud HTTP 410.
 pub(crate) async fn get_history_item_handler(
     State(state): State<AppState>,
     Path(id_raw): Path<String>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    // --- validation: address (required) ---
-    let address_hex = match params.get("address") {
-        Some(s) if !s.is_empty() => s.as_str(),
-        _ => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(HistoryErrorResponse {
-                    error: "Missing required `address` query parameter",
-                }),
-            )
-                .into_response();
-        }
-    };
-    let address_bytes = match decode_history_address(address_hex) {
-        Ok(b) => b,
-        Err(msg) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(HistoryErrorResponse { error: msg }),
-            )
-                .into_response();
-        }
-    };
-    // --- validation: id (positive integer) ---
-    let id = match id_raw.parse::<i64>() {
-        Ok(n) if n > 0 => n,
-        _ => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(HistoryErrorResponse {
-                    error: "id must be a positive integer",
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    // --- DB read: the scoped row ---
-    let row = match db::get_account_history_item(&state.pool, &address_bytes, id).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(HistoryErrorResponse {
-                    error: "Transaction not found",
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::warn!("get_history_item_handler: row query failed: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(HistoryErrorResponse {
-                    error: "Database error while reading transaction",
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    // The verifier circuit digest is node-global (single row). A read
-    // failure degrades the field to `null` rather than failing the whole
-    // detail — it is metadata, not the row itself.
-    let circuit_digest = db::load_circuit_digest(&state.pool).await.ok().flatten();
-
-    // Echo the normalised (lower-case, no `0x`) address so the wire form
-    // is canonical regardless of how the caller spelled it.
-    let address_norm = hex::encode(address_bytes);
-    match tx_detail_from_row(&row, address_norm, circuit_digest) {
-        Some(detail) => (StatusCode::OK, Json(detail)).into_response(),
-        None => {
-            tracing::warn!(
-                "get_history_item_handler: row {} for address could not be decoded",
-                id
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(HistoryErrorResponse {
-                    error: "Database error while reading transaction",
-                }),
-            )
-                .into_response()
-        }
-    }
+    let _ = (state, id_raw, params);
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/history/:id is removed (Stage 3): unauthenticated legacy account history detail is closed; use capability-bound v1 read.account"
+        })),
+    )
 }
 
 #[utoipa::path(
@@ -1577,18 +904,15 @@ pub(crate) async fn get_history_item_handler(
 )]
 #[cfg(feature = "address-list")]
 pub(crate) async fn get_address_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let account_node = lock_or_recover(&state.account_node);
-
-    // Convert addresses to hex strings
-    let hex_addresses: Vec<String> = account_node
-        .get_addresses()
-        .iter()
-        .map(|addr| format!("0x{}", hex::encode(digest_to_bytes(addr))))
-        .collect();
-
-    Json(AddressesResponse {
-        addresses: hex_addresses,
-    })
+    // Stage 3 Runde 6 (C): listing every rehydrated legacy address is
+    // unauthenticated account enumeration — not `read.account`. Loud 410.
+    let _ = state;
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/address is removed (Stage 3): unauthenticated legacy address list is closed; use capability-bound v1 read.account"
+        })),
+    )
 }
 
 // Vestigial: the wallet's pre-Job-API flow was send-then-receive,
@@ -1623,51 +947,20 @@ pub(crate) async fn get_address_handler(State(state): State<AppState>) -> impl I
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn receive_coin_handler(
     State(state): State<AppState>,
-    body: Bytes, // Accept raw binary data instead of multipart
+    body: Bytes,
 ) -> impl IntoResponse {
-    // Try to deserialize the binary data as a CoinProof
-    let coin_proof = match bincode::deserialize::<CoinProof>(&body) {
-        Ok(cp) => cp,
-        Err(e) => {
-            // Caller submitted a malformed binary body. The handler
-            // returns a default `SendCoinResponse { success: false }`
-            // (currently a 200 with `success=false`, behaviourally a
-            // client-input rejection); log at `info` so the CI E2E
-            // negative-path tests hitting `/api/receive` with bad
-            // bytes do not surface as `detected_level=error` lines.
-            tracing::info!("Failed to deserialize proof with commitment: {}", e);
-            return Json(SendCoinResponse::default());
-        }
-    };
-    let recipient = coin_proof.coin.recipient;
-    let asset_id = coin_proof.coin.asset_id;
-    // Snapshot the recipient's mutated account inside the (sync) lock
-    // scope so the post-receive Postgres upsert runs without holding
-    // the guard across an `.await` point.
-    let snapshot: Option<Vec<u8>> = {
-        let mut account_node = lock_or_recover(&state.account_node);
-        match account_node.receive_coin(coin_proof) {
-            Ok(_) => account_node
-                .get_account(&recipient, &asset_id)
-                .map(AccountNode::serialize_account),
-            Err(_) => None,
-        }
-    };
-    match snapshot {
-        Some(bytes) => {
-            let addr_bytes = crate::account_node::account_key_bytes(&recipient, &asset_id);
-            if let Err(e) =
-                db::upsert_account_with_source(&state.pool, &addr_bytes, &bytes, "receive").await
-            {
-                eprintln!("Failed to upsert recipient account after receive: {}", e);
-            }
-            Json(SendCoinResponse {
-                success: true,
-                ..Default::default()
-            })
-        }
-        None => Json(SendCoinResponse::default()),
-    }
+    // Stage 3 Runde 4 (B6): legacy `/api/receive` must never mutate durable
+    // state. Prefer explicit, loud refusal over silent 200+success:false.
+    // Route kept so wallets get a clear protocol error (not a bare 404).
+    let _ = body;
+    let _ = &state;
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "success": false,
+            "error": "POST /api/receive is removed (Stage 3): legacy CoinProof receive no longer mutates account state; use the v1 receive transition path"
+        })),
+    )
 }
 
 // Vestigial: paired with `receive_coin_handler` above. See its
@@ -1676,9 +969,9 @@ pub(crate) async fn receive_coin_handler(
 // not-found arm (404) is still covered by
 // `get_proof_handler_returns_404_for_unknown_id` so we keep the
 // behavioural test green; only the file-found branch is excluded
-// from coverage because the prover round-trip needed to populate
-// `next_id` and the on-disk `.bin` is the same prohibitive cost as
-// the receive happy path.
+// from coverage because constructing a real `CoinProof` for the
+// on-disk `.bin` is the same prohibitive cost as the receive happy
+// path (tests plant opaque bytes via `plant_raw_for_test`).
 #[utoipa::path(
     get,
     path = "/api/proof/{id}",
@@ -1698,30 +991,19 @@ pub(crate) async fn get_proof_handler(
     State(state): State<AppState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
-    match state.proof_store.get_proof(id) {
-        Some(proof_with_commitment) => {
-            // Serialize the proof and commitment together to binary
-            let binary_data = bincode::serialize(&proof_with_commitment).unwrap_or_default();
-
-            // Set appropriate headers for binary download
-            let mut headers = header::HeaderMap::new();
-            headers.insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static("application/octet-stream"),
-            );
-            headers.insert(
-                header::CONTENT_DISPOSITION,
-                header::HeaderValue::from_static("attachment; filename=\"coin_proof.bin\""),
-            );
-
-            (StatusCode::OK, headers, Bytes::from(binary_data))
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            header::HeaderMap::new(),
-            Bytes::new(),
-        ),
-    }
+    // Stage 3 Runde 5 (R2): legacy `/api/proof/:id` handed out a full
+    // bincode `CoinProof` — including the cleartext `Coin` — with no
+    // capability check. That contradicts capability-bound `read.proof` /
+    // `read.account` (spec §6.4). Loud 410; never 200 with empty/partial
+    // binary and never a 404 that still probes the store.
+    let _ = id;
+    let _ = &state;
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/proof/:id is removed (Stage 3): unauthenticated CoinProof download (cleartext Coin) is closed; use capability-bound v1 read.proof / read.account"
+        })),
+    )
 }
 
 // ===========================================================================
@@ -1770,13 +1052,13 @@ fn read_idempotency_key(
 /// `SendCoinResponse` so a wallet client can branch on the shape
 /// (`{error: "..."}` vs. the legacy `{success: false, error: "..."}`).
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct JobErrorResponse {
+pub(crate) struct JobErrorResponse {
     pub(crate) error: String,
 }
 
 /// Body returned by the admit handlers on a fresh enqueue.
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct JobAcceptedResponse {
+pub(crate) struct JobAcceptedResponse {
     #[schema(value_type = String, example = "00000000-0000-0000-0000-000000000000")]
     pub(crate) job_id: Uuid,
     pub(crate) status: &'static str,
@@ -1785,7 +1067,7 @@ pub struct JobAcceptedResponse {
 /// Body returned by `GET /api/jobs/:id`. Optional fields are emitted
 /// only when populated so the wire shape mirrors the row state.
 #[derive(Serialize, Deserialize, ToSchema)]
-pub struct JobStatusResponse {
+pub(crate) struct JobStatusResponse {
     #[schema(value_type = String, example = "00000000-0000-0000-0000-000000000000")]
     pub(crate) job_id: Uuid,
     pub(crate) kind: String,
@@ -1918,9 +1200,12 @@ pub(crate) async fn jobs_send_handler(
 }
 
 /// Shared admit-then-enqueue glue used by `jobs_mint_handler` and
-/// `jobs_send_handler`. Hides the `(create → idempotent-replay
-/// branch → enqueue)` sequence from the kind-specific handler so the
-/// two route handlers stay short and obviously equivalent.
+/// `jobs_send_handler`. Domain admission lives in
+/// [`crate::kernel::jobs::admit_job`] (body-aware idempotency +
+/// dispatcher handoff). This function only projects the HTTP envelope
+/// so well-formed mint/send responses stay byte-equal to the pre-split
+/// surface; the sole deliberate delta is `409` on
+/// `idempotency_conflict` (§7.5).
 async fn admit_and_enqueue(
     state: &AppState,
     kind: JobKind,
@@ -1928,14 +1213,42 @@ async fn admit_and_enqueue(
     idem_key: &str,
     request_body: serde_json::Value,
 ) -> axum::response::Response {
-    let create_result = match state
-        .job_store
-        .create(kind, account, Some(idem_key), request_body)
-        .await
+    use crate::kernel::jobs::submit::{admit_job, AdmitError, AdmitJobDeps, AdmitOutcome};
+
+    let outcome = match admit_job(
+        AdmitJobDeps {
+            store: state.job_store.as_ref(),
+            job_tx: &state.job_tx,
+        },
+        kind,
+        account,
+        idem_key,
+        request_body,
+    )
+    .await
     {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("JobStore::create failed: {}", e);
+        Ok(o) => o,
+        Err(AdmitError::DispatcherUnavailable) => {
+            // Preserve the pre-split 503 when the admit channel is down.
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(JobErrorResponse {
+                    error: "Dispatcher unavailable".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Err(AdmitError::Domain(e)) if e.code == KernelErrorCode::IdempotencyConflict => {
+            return (
+                StatusCode::CONFLICT,
+                Json(JobErrorResponse {
+                    error: "idempotency_conflict".to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Err(AdmitError::Domain(e)) => {
+            tracing::error!("admit_job failed: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(JobErrorResponse {
@@ -1946,77 +1259,95 @@ async fn admit_and_enqueue(
         }
     };
 
-    let (job, fresh) = match create_result {
-        CreateResult::Fresh(j) => (j, true),
-        CreateResult::IdempotentReplay(j) => (j, false),
-    };
-
-    if !fresh {
-        // Replay: if the original job already completed, surface the
-        // cached body + status verbatim. Otherwise return the
-        // current snapshot so the wallet sees the same job_id.
-        if job.status == JobStatus::Completed {
-            let status_code = StatusCode::from_u16(job.response_status.unwrap_or(200) as u16)
-                .unwrap_or(StatusCode::OK);
-            // `JobStore::complete` always sets `response_body` on the row before
-            // flipping the status to `Completed`; the matching INSERT in
-            // `complete()` is non-nullable on the value side. A `None` here
-            // would mean the row was hand-edited or the schema invariant
-            // broke — the `.expect()` surfaces that immediately instead of
-            // hiding behind a defensive empty-object fallback (which would
-            // also cost the 100% line-coverage gate a never-reached closure).
-            let body = job
-                .response_body
-                .clone()
-                .expect("response_body is set on every Completed job by JobStore::complete");
-            return (status_code, Json(body)).into_response();
+    match outcome {
+        AdmitOutcome::Replay(job) => {
+            // Replay: if the original job already completed, surface the
+            // cached body + status verbatim. Otherwise return the
+            // current snapshot so the wallet sees the same job_id.
+            if job.status == JobStatus::Completed {
+                // `JobStore::complete` always writes both `response_status` and
+                // `response_body` before flipping the row to `Completed`. A
+                // missing or non-HTTP status is corruption / hand-edit — never
+                // invent 200 OK (absence must not mean success).
+                let Some(raw_status) = job.response_status else {
+                    tracing::error!(
+                        job_id = %job.public_id,
+                        "completed job missing response_status on idempotent replay"
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(JobErrorResponse {
+                            error: "internal_error".to_string(),
+                        }),
+                    )
+                        .into_response();
+                };
+                let status_u16 = match u16::try_from(raw_status) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::error!(
+                            job_id = %job.public_id,
+                            response_status = raw_status,
+                            "completed job has non-u16 response_status on idempotent replay"
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(JobErrorResponse {
+                                error: "internal_error".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                };
+                let status_code = match StatusCode::from_u16(status_u16) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        tracing::error!(
+                            job_id = %job.public_id,
+                            response_status = status_u16,
+                            "completed job has invalid HTTP response_status on idempotent replay"
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(JobErrorResponse {
+                                error: "internal_error".to_string(),
+                            }),
+                        )
+                            .into_response();
+                    }
+                };
+                // Same invariant as response_status: `complete()` always sets
+                // the body. A `None` here is corruption — surface immediately.
+                let body = job
+                    .response_body
+                    .clone()
+                    .expect("response_body is set on every Completed job by JobStore::complete");
+                return (status_code, Json(body)).into_response();
+            }
+            (
+                StatusCode::ACCEPTED,
+                [(header::LOCATION, format!("/api/jobs/{}", job.public_id))],
+                Json(JobAcceptedResponse {
+                    job_id: job.public_id,
+                    status: job.status.as_str(),
+                }),
+            )
+                .into_response()
         }
-        return (
-            StatusCode::ACCEPTED,
-            [(header::LOCATION, format!("/api/jobs/{}", job.public_id))],
-            Json(JobAcceptedResponse {
-                job_id: job.public_id,
-                status: job.status.as_str(),
-            }),
-        )
-            .into_response();
+        AdmitOutcome::Fresh(job) => {
+            // Fresh: dispatcher already notified inside admit_job.
+            (
+                StatusCode::ACCEPTED,
+                [(header::LOCATION, format!("/api/jobs/{}", job.public_id))],
+                Json(JobAcceptedResponse {
+                    job_id: job.public_id,
+                    status: job.status.as_str(),
+                }),
+            )
+                .into_response()
+        }
     }
-
-    if let Err(e) = state
-        .job_tx
-        .send(JobEnvelope {
-            public_id: job.public_id,
-        })
-        .await
-    {
-        tracing::error!("Job dispatcher channel send failed: {}", e);
-        // The row exists but the dispatcher cannot be reached —
-        // mark the job failed so the wallet observes a terminal
-        // status on its next poll. Best-effort; the dispatcher
-        // would only be down on a shutdown / catastrophic
-        // panic-recovery scenario.
-        let _ = state
-            .job_store
-            .fail(job.public_id, "dispatcher unavailable")
-            .await;
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(JobErrorResponse {
-                error: "Dispatcher unavailable".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    (
-        StatusCode::ACCEPTED,
-        [(header::LOCATION, format!("/api/jobs/{}", job.public_id))],
-        Json(JobAcceptedResponse {
-            job_id: job.public_id,
-            status: job.status.as_str(),
-        }),
-    )
-        .into_response()
+    .into_response()
 }
 
 /// `GET /api/jobs/:id` — poll handler. Returns the current row
@@ -2043,63 +1374,73 @@ pub(crate) async fn get_job_handler(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> axum::response::Response {
-    let job = match state.job_store.load(id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(JobErrorResponse {
-                    error: "Job not found".to_string(),
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!("JobStore::load failed: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(JobErrorResponse {
-                    error: "Failed to load job".to_string(),
-                }),
-            )
-                .into_response();
-        }
+    let service = KernelService::from_store(Arc::clone(&state.job_store));
+    let job = match service.get_job(JobRequest { id: JobId(id) }).await {
+        Ok(j) => j,
+        Err(e) => return legacy_get_job_error(e),
     };
 
-    let response = JobStatusResponse {
-        job_id: job.public_id,
-        kind: job.kind.as_str().to_string(),
-        status: job.status.as_str().to_string(),
-        phase: job.phase.clone(),
-        progress: job.progress,
-        proof_id: if job.status == JobStatus::AwaitingSignature {
-            job.proof_id
-        } else {
-            None
-        },
-        // `awaiting_signature` carries the ash/ocr hex the wallet must
-        // sign (persisted in `response_body` by
-        // `JobStore::set_awaiting_signature`); `completed` carries the
-        // cached terminal body. Both live in `response_body`, so the
-        // same field surfaces on either status.
-        result: if job.status == JobStatus::Completed || job.status == JobStatus::AwaitingSignature
-        {
-            job.response_body.clone()
-        } else {
-            None
-        },
-        error: if job.status == JobStatus::Failed {
-            job.error.clone()
-        } else {
-            None
-        },
-    };
+    let response = project_job_legacy(&job);
 
-    if job.status.is_terminal() {
+    if job.state.is_terminal() {
         (StatusCode::OK, Json(response)).into_response()
     } else {
         (StatusCode::OK, [(header::RETRY_AFTER, "2")], Json(response)).into_response()
     }
+}
+
+/// Legacy `/api/jobs/:id` JSON projection from a typed domain job.
+///
+/// Field names, optionality, and wire status vocabulary match the pre-split
+/// handler for every well-formed state.
+fn project_job_legacy(job: &crate::kernel::Job) -> JobStatusResponse {
+    let status = job.normative_status();
+    let (proof_id, result, error) = match &job.state {
+        // `awaiting_signature` carries the ash/ocr (or v1 surface) the
+        // wallet must sign; `completed` carries the cached terminal body.
+        JobState::AwaitingSignature { payload, proof_id } => {
+            (*proof_id, Some(payload.0.clone()), None)
+        }
+        JobState::Completed { result } => (None, Some(result.0.clone()), None),
+        JobState::Failed { error } => (None, None, error.clone()),
+        // Legacy never projected `error` for cancelled; keep that shape.
+        JobState::Accepted
+        | JobState::Proving
+        | JobState::Publishing
+        | JobState::Cancelled { .. } => (None, None, None),
+    };
+
+    JobStatusResponse {
+        job_id: job.id.as_uuid(),
+        kind: job.kind.as_str().to_string(),
+        status: status.as_legacy_str().to_string(),
+        phase: job.phase.clone(),
+        progress: job.progress,
+        proof_id,
+        result,
+        error,
+    }
+}
+
+/// Map a domain error onto the legacy jobs error envelope.
+///
+/// Legacy bodies use free-text `error` strings (not §7.5 machine codes).
+fn legacy_get_job_error(err: KernelError) -> axum::response::Response {
+    let desc = error_contract::describe(err.code);
+    let status = StatusCode::from_u16(desc.http_status)
+        .expect("error_contract http_status values are valid HTTP codes");
+    if err.code == KernelErrorCode::InternalError {
+        if let Some(ctx) = &err.internal_context {
+            tracing::error!("GetJob internal_error: {}", ctx.detail);
+        }
+    }
+    (
+        status,
+        Json(JobErrorResponse {
+            error: err.public_message,
+        }),
+    )
+        .into_response()
 }
 
 /// `POST /api/jobs/:id/commit` — attach the wallet-signed
@@ -2135,99 +1476,46 @@ pub(crate) async fn jobs_commit_handler(
     Path(id): Path<Uuid>,
     Json(commit_request): Json<CommitRequest>,
 ) -> axum::response::Response {
-    let job = match state.job_store.load(id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(JobErrorResponse {
-                    error: "Job not found".to_string(),
-                }),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!("JobStore::load failed: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(JobErrorResponse {
-                    error: "Failed to load job".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    if job.status != JobStatus::AwaitingSignature {
-        return (
-            StatusCode::CONFLICT,
-            Json(JobErrorResponse {
-                error: format!(
-                    "Job is in status `{}`, not `awaiting_signature`",
-                    job.status.as_str()
-                ),
-            }),
-        )
-            .into_response();
-    }
-
-    // Merge the commit payload into the existing request_body so
-    // the dispatcher can pull both halves out on wake. Persist via
-    // a direct SQL write — we cannot expose every field through a
-    // narrower JobStore method without burning a per-field
-    // helper for each commit-leg shape.
-    let mut merged = job.request_body.clone();
-    // `CommitMintTxRequest` derives `Serialize` over fixed primitives;
-    // see `jobs_mint_handler` above for the dead-arm rationale.
+    // Quarantined legacy ash‖ocr path — not normative SignTransition.
+    // `CommitRequest` derives `Serialize` over fixed primitives.
     let commit_value = serde_json::to_value(&commit_request)
-        .expect("CommitMintTxRequest with derived Serialize always encodes");
-    // `request_body` is always a JSON object: the admit handlers
-    // (`jobs_mint_handler`, `jobs_send_handler`) only ever insert a
-    // value produced by `serde_json::to_value(&MintRequest|SendCoinRequest)`,
-    // both of which derive `Serialize` over fixed-field structs that
-    // serialise as `{...}`. Collapsing the previous `if let
-    // Some(obj) = ... else { merged = json!({"commit": ...}) }` into a
-    // single `.expect` keeps the 100%-line/function coverage gate
-    // honest without weakening the contract — an unexpected
-    // non-object would surface here as a panic at the call site,
-    // exactly like every other defensive `.expect` in this file.
-    let obj = merged
-        .as_object_mut()
-        .expect("jobs.request_body is always a JSON object (admit handlers enforce)");
-    obj.insert("commit".to_string(), commit_value);
-
-    if let Err(e) =
-        sqlx::query("UPDATE jobs SET request_body = $1, updated_at = NOW() WHERE public_id = $2")
-            .bind(&merged)
-            .bind(id)
-            .execute(state.job_store.pool())
-            .await
+        .expect("CommitRequest with derived Serialize always encodes");
+    match crate::application::legacy_jobs::commit_legacy(
+        state.job_store.as_ref(),
+        &state.job_notify_map,
+        id,
+        commit_value,
+    )
+    .await
     {
-        tracing::error!("Failed to merge commit payload into job row: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(crate::application::legacy_jobs::LegacyCommitAccepted) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "broadcasting"})),
+        )
+            .into_response(),
+        Err(crate::application::legacy_jobs::LegacyCommitError::RefusedUnderV1 { message }) => (
+            StatusCode::CONFLICT,
+            Json(JobErrorResponse { error: message }),
+        )
+            .into_response(),
+        Err(crate::application::legacy_jobs::LegacyCommitError::NotFound) => (
+            StatusCode::NOT_FOUND,
             Json(JobErrorResponse {
-                error: "Failed to persist commit payload".to_string(),
+                error: "Job not found".to_string(),
             }),
         )
-            .into_response();
-    }
-
-    // Wake the dispatcher's `wait_for_commit` task. If no entry
-    // exists in the notify_map the dispatcher already gave up
-    // (e.g. timed out and removed the entry); surface 409 so the
-    // wallet does not silently spin.
-    let notifier = state.job_notify_map.get(&id).map(|e| e.value().clone());
-    match notifier {
-        Some(n) => {
-            n.commit_wake.notify_one();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "broadcasting"})),
-            )
-                .into_response()
-        }
-        None => (
+            .into_response(),
+        Err(crate::application::legacy_jobs::LegacyCommitError::Conflict { message }) => (
+            StatusCode::CONFLICT,
+            Json(JobErrorResponse { error: message }),
+        )
+            .into_response(),
+        Err(crate::application::legacy_jobs::LegacyCommitError::Internal { message }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(JobErrorResponse { error: message }),
+        )
+            .into_response(),
+        Err(crate::application::legacy_jobs::LegacyCommitError::NoDispatcherWaiting) => (
             StatusCode::CONFLICT,
             Json(JobErrorResponse {
                 error: "Job is no longer waiting for a signature".to_string(),
@@ -2235,6 +1523,705 @@ pub(crate) async fn jobs_commit_handler(
         )
             .into_response(),
     }
+}
+
+/// §7.5 outward error body: `{ "error": <machine_code>, "message": <human> }`.
+/// No invented fields (`check`, free-form strings outside the enumeration).
+fn v1_error_body(code: &str, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "error": code,
+        "message": message.into(),
+    })
+}
+
+/// Strict §7.5 path value for the open token-provenance read.
+pub(crate) struct V1AssetId(pub [u8; 32]);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for V1AssetId
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let raw = match Path::<String>::from_request_parts(parts, state).await {
+            Ok(Path(raw)) => raw,
+            Err(err) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(v1_error_body(
+                        "malformed_request",
+                        format!("malformed asset_id path parameter: {err}"),
+                    )),
+                )
+                    .into_response());
+            }
+        };
+        let decoded = match hex::decode(&raw) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(v1_error_body(
+                        "malformed_request",
+                        "asset_id must be hexadecimal",
+                    )),
+                )
+                    .into_response());
+            }
+        };
+        let asset_id = match <[u8; 32]>::try_from(decoded.as_slice()) {
+            Ok(asset_id) => asset_id,
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(v1_error_body(
+                        "malformed_request",
+                        format!(
+                            "asset_id must decode to exactly 32 bytes; got {}",
+                            decoded.len()
+                        ),
+                    )),
+                )
+                    .into_response());
+            }
+        };
+        Ok(Self(asset_id))
+    }
+}
+
+/// Versioned §7.5 token-provenance JSON. `name` is hex of the raw bytes,
+/// never a UTF-8 JSON string.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
+pub(crate) struct TokenProvenanceResponse {
+    asset_id: String,
+    issuance_version: u8,
+    creator_pubkey: String,
+    name: String,
+    decimals: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cap_total: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terms_salt: Option<String>,
+}
+
+fn project_token_provenance(
+    asset_id: [u8; 32],
+    terms: shared::spec_v1::bundle::IssuanceTerms,
+) -> Result<TokenProvenanceResponse, KernelError> {
+    let (cap_total, terms_salt) = match terms.issuance_version {
+        1 => {
+            if terms.cap_total.is_some() || terms.terms_salt.is_some() {
+                return Err(KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Corrupt token provenance",
+                    "issuance_version=1 carries v2 fields",
+                ));
+            }
+            (None, None)
+        }
+        2 => {
+            let cap = terms.cap_total.ok_or_else(|| {
+                KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Corrupt token provenance",
+                    "issuance_version=2 is missing cap_total",
+                )
+            })?;
+            let salt = terms.terms_salt.ok_or_else(|| {
+                KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Corrupt token provenance",
+                    "issuance_version=2 is missing terms_salt",
+                )
+            })?;
+            (Some(cap.to_string()), Some(hex::encode(salt)))
+        }
+        other => {
+            return Err(KernelError::with_internal(
+                KernelErrorCode::InternalError,
+                "Corrupt token provenance",
+                format!("unsupported issuance_version {other}"),
+            ));
+        }
+    };
+    Ok(TokenProvenanceResponse {
+        asset_id: hex::encode(asset_id),
+        issuance_version: terms.issuance_version,
+        creator_pubkey: hex::encode(terms.creator_pubkey),
+        name: hex::encode(terms.name),
+        decimals: terms.decimals,
+        cap_total,
+        terms_salt,
+    })
+}
+
+fn token_provenance_error_response(err: KernelError) -> Response {
+    let desc = error_contract::describe(err.code);
+    let status = StatusCode::from_u16(desc.http_status)
+        .expect("error_contract http_status values are valid HTTP codes");
+    if let Some(ctx) = &err.internal_context {
+        tracing::error!("GetTokenProvenance internal error: {}", ctx.detail);
+    }
+    (
+        status,
+        Json(v1_error_body(desc.reason, err.public_message)),
+    )
+        .into_response()
+}
+
+/// `GET /v1/token/:asset_id/provenance` — open Class-B token terms (§7.5).
+/// No ownership/grant proof and no Cargo/runtime feature gate is consulted.
+#[utoipa::path(
+    get,
+    path = "/v1/token/{asset_id}/provenance",
+    tag = "Token",
+    params(("asset_id" = String, Path, description = "32-byte asset id as hex.")),
+    responses(
+        (status = 200, description = "Self-verifying retained IssuanceTerms.", body = TokenProvenanceResponse),
+        (status = 400, description = "`malformed_request` — invalid hex or width."),
+        (status = 404, description = "`not_found` — this node holds no terms."),
+        (status = 500, description = "`internal_error`."),
+    ),
+)]
+pub(crate) async fn get_token_provenance_v1_handler(
+    State(state): State<AppState>,
+    V1AssetId(asset_id): V1AssetId,
+) -> Response {
+    // The monolith calls the same transport-neutral kernel procedure that the
+    // gRPC adapter exposes as GetTokenProvenance; the API layer adds no gate.
+    let service = KernelService::from_store(Arc::clone(&state.job_store));
+    let terms = match service
+        .get_token_provenance(crate::kernel::types::Digest32(asset_id))
+        .await
+    {
+        Ok(terms) => terms,
+        Err(err) => return token_provenance_error_response(err),
+    };
+    match project_token_provenance(asset_id, terms) {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err(err) => token_provenance_error_response(err),
+    }
+}
+
+/// §7.5 path extractor for job UUIDs: malformed ids → `400 malformed_request`
+/// (Axum's default `Path<Uuid>` rejection is a framework 400/422 without the
+/// closed machine code).
+pub(crate) struct V1JobId(pub Uuid);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for V1JobId
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Path::<Uuid>::from_request_parts(parts, state).await {
+            Ok(Path(id)) => Ok(V1JobId(id)),
+            Err(PathRejection::FailedToDeserializePathParams(err)) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(v1_error_body(
+                    "malformed_request",
+                    format!("job_id is not a valid UUID: {err}"),
+                )),
+            )
+                .into_response()),
+            Err(err) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(v1_error_body(
+                    "malformed_request",
+                    format!("malformed job_id path parameter: {err}"),
+                )),
+            )
+                .into_response()),
+        }
+    }
+}
+
+/// §7.5 JSON body extractor: missing / malformed / wrong-type JSON →
+/// `400 malformed_request` (Axum's default is 422 with a framework body).
+pub(crate) struct V1Json<T>(pub T);
+
+#[async_trait]
+impl<S, T> FromRequest<S> for V1Json<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(
+        req: Request<axum::body::Body>,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(V1Json(value)),
+            Err(err) => {
+                let message = match &err {
+                    JsonRejection::MissingJsonContentType(_) => {
+                        "Content-Type must be application/json".to_string()
+                    }
+                    JsonRejection::JsonDataError(e) => {
+                        format!("request body is not a well-formed JSON value of the expected type: {e}")
+                    }
+                    JsonRejection::JsonSyntaxError(e) => {
+                        format!("request body is not valid JSON: {e}")
+                    }
+                    JsonRejection::BytesRejection(e) => {
+                        format!("failed to read request body: {e}")
+                    }
+                    _ => format!("malformed request body: {err}"),
+                };
+                Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(v1_error_body("malformed_request", message)),
+                )
+                    .into_response())
+            }
+        }
+    }
+}
+
+/// `POST /v1/jobs/:id/sign` — §7.5 wallet transition signature (normative path).
+///
+/// Active only under a v1.1 process claim (`ScanStackMode::V1`). The body is
+/// decoded as [`crate::v1::WalletSignSubmissionWire`] then strictly converted
+/// to [`crate::v1::WalletSignSubmission`] so encoding failures surface as the
+/// closed §7.5 code `malformed_request` (HTTP 400), not a generic JSON error
+/// and never an invented `encoding` code.
+///
+/// Verification uses [`crate::v1::accept_wallet_transition_signature`] against
+/// the staged [`crate::v1::PendingSignEntry`] for this job — provenance is the
+/// pending transition alone. On accept the verified signature is persisted and
+/// the dispatcher is woken to drive `StateEngine::finalise` (not a bare
+/// status flip).
+///
+/// With the flag off this route refuses at `feature_disabled` / ShadowFlag;
+/// the legacy [`jobs_commit_handler`] path is untouched.
+#[utoipa::path(
+    post,
+    path = "/v1/jobs/{job_id}/sign",
+    tag = "Jobs",
+    params(
+        ("job_id" = String, Path, description = "Job UUID returned by the matching admit handler."),
+    ),
+    responses(
+        (status = 200, description = "Signature verified; dispatcher woken to finalise."),
+        (status = 400, description = "`malformed_request` — non-canonical hex / wrong width.",
+            body = JobErrorResponse),
+        (status = 404, description = "`job_not_found`.",
+            body = JobErrorResponse),
+        (status = 409, description = "`wrong_phase` / `stale_message` / `invalid_signature`.",
+            body = JobErrorResponse),
+        (status = 500, description = "`internal_error` while attaching the signature payload.",
+            body = JobErrorResponse),
+    ),
+)]
+pub(crate) async fn jobs_sign_handler(
+    State(state): State<AppState>,
+    V1JobId(id): V1JobId,
+    V1Json(wire): V1Json<crate::v1::WalletSignSubmissionWire>,
+) -> axum::response::Response {
+    // Flag gate: refuse the v1.1 path when the process is not on the v1.1 claim.
+    // Legacy `/commit` remains the only active authorisation surface.
+    // §7.5: this is a disabled surface (`feature_disabled`), not a job
+    // phase mismatch (`wrong_phase`). API-layer only — not a kernel code.
+    if !crate::v1::v1_sign_route_active() {
+        let err = crate::v1::TransitionSignatureError {
+            check: crate::v1::SignatureCheck::ShadowFlag,
+            message: "POST /v1/jobs/{id}/sign requires ZKCOINS_V1_SHADOW=1 / \
+                      ScanStackMode::V1; legacy ash‖ocr uses POST /api/jobs/{id}/commit"
+                .to_string(),
+        };
+        let (status, code) = crate::v1::sign_rejection(&err);
+        return (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::NOT_FOUND),
+            Json(v1_error_body(code, err.message)),
+        )
+            .into_response();
+    }
+
+    // Boundary: documented encoding is what we enforce. §7.5 closed code.
+    let submission = match crate::v1::WalletSignSubmission::try_from(&wire) {
+        Ok(s) => s,
+        Err(err) => {
+            let (status, code) = crate::v1::sign_rejection(&err);
+            return (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                Json(v1_error_body(code, err.message)),
+            )
+                .into_response();
+        }
+    };
+
+    let service = KernelService::from_parts(
+        Arc::clone(&state.job_store),
+        Arc::clone(&state.job_notify_map),
+        Arc::clone(&state.pending_sign_map),
+        Arc::clone(&state.attest_challenges),
+    );
+    match service
+        .sign_transition(crate::kernel::SignTransition {
+            id: JobId(id),
+            submission,
+        })
+        .await
+    {
+        Ok(_job) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "signature_accepted",
+                "job_id": id,
+            })),
+        )
+            .into_response(),
+        Err(e) => v1_sign_error(e),
+    }
+}
+
+/// Map a domain `SignTransition` error onto the §7.5 `{error, message}` body.
+fn v1_sign_error(err: KernelError) -> axum::response::Response {
+    let desc = error_contract::describe(err.code);
+    // `error_contract::describe` only emits real HTTP statuses; a failure
+    // here is a programming error in the table, not a request-shape issue.
+    let status = StatusCode::from_u16(desc.http_status)
+        .expect("error_contract http_status is a valid HTTP status code");
+    if err.code == KernelErrorCode::InternalError {
+        if let Some(ctx) = &err.internal_context {
+            tracing::error!("SignTransition internal_error: {}", ctx.detail);
+        } else {
+            tracing::error!("SignTransition internal_error: {}", err.public_message);
+        }
+    }
+    (status, Json(v1_error_body(desc.reason, err.public_message))).into_response()
+}
+
+/// `progress` as a float in `[0, 1]` (§7.5). The store keeps 0–100.
+fn v1_progress_wire(progress: i16) -> f64 {
+    (progress as f64 / 100.0).clamp(0.0, 1.0)
+}
+
+// ---------------------------------------------------------------------------
+// §7.5 Gap G6 — balance attestation
+// ---------------------------------------------------------------------------
+
+/// Map an [`crate::v1::AttestError`] to the §7.5 error body + HTTP status.
+fn attest_error_response(err: crate::v1::AttestError) -> axum::response::Response {
+    let (status, code) = err.http_status_and_code();
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(v1_error_body(code, err.message())),
+    )
+        .into_response()
+}
+
+/// FromRequestParts gate for the Gap-G6 attest surface.
+///
+/// Runs **before** any `FromRequest` body extractor ([`V1Json`]), so a
+/// malformed body against a disabled feature still yields
+/// `feature_disabled` rather than `malformed_request`.
+pub(crate) struct RequireAttestRoute;
+
+#[async_trait]
+impl<S> FromRequestParts<S> for RequireAttestRoute
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(_parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        if !crate::v1::v1_attest_route_active() {
+            return Err(attest_error_response(
+                crate::v1::AttestError::FeatureDisabled,
+            ));
+        }
+        Ok(RequireAttestRoute)
+    }
+}
+
+/// `POST /v1/attest/balance/challenge` — §7.5 action-bound challenge.
+///
+/// Body: `{ subject: <zk-address> }`  
+/// Returns: `{ nonce: <hex32>, expiry: <decimal-string u64>, domain: "zkCoins/v1/AttestBalanceChallenge" }`
+///
+/// `expiry` is a §7.1 decimal **string** (never a JSON number). Body
+/// decode uses [`V1Json`] so malformed JSON is `400 malformed_request`
+/// **only when the flag is on** — [`RequireAttestRoute`] checks the
+/// flag before body extraction.
+pub(crate) async fn attest_balance_challenge_handler(
+    State(state): State<AppState>,
+    _active: RequireAttestRoute,
+    V1Json(body): V1Json<crate::v1::AttestChallengeRequest>,
+) -> axum::response::Response {
+    let now = match crate::v1::unix_now() {
+        Ok(n) => n,
+        Err(e) => {
+            return attest_error_response(crate::v1::AttestError::Internal(e.to_string()));
+        }
+    };
+    match crate::v1::issue_attest_challenge(&state.attest_challenges, &body.subject, now) {
+        Ok((nonce, expiry)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "nonce": hex::encode(nonce),
+                "expiry": crate::v1::U64Decimal::format(expiry),
+                "domain": crate::v1::ATTEST_BALANCE_CHALLENGE_DOMAIN,
+            })),
+        )
+            .into_response(),
+        Err(e) => attest_error_response(e),
+    }
+}
+
+/// `POST /v1/attest/balance` — §7.5 OwnershipProof-gated admit.
+///
+/// Returns `202 { job_id }` on success. Auth failures use the closed
+/// codes `unauthorized` / `challenge_expired` / `malformed_request`.
+/// Body decode uses [`V1Json`] so missing/malformed JSON is the closed
+/// `400 malformed_request` (not Axum's 422 rejection) **only when the
+/// flag is on** — [`RequireAttestRoute`] checks the flag first.
+pub(crate) async fn attest_balance_handler(
+    State(state): State<AppState>,
+    _active: RequireAttestRoute,
+    V1Json(body): V1Json<crate::v1::AttestBalanceRequest>,
+) -> axum::response::Response {
+    let now = match crate::v1::unix_now() {
+        Ok(n) => n,
+        Err(e) => {
+            return attest_error_response(crate::v1::AttestError::Internal(e.to_string()));
+        }
+    };
+    let authorised = match crate::v1::authorise_attest_balance(
+        &state.attest_challenges,
+        state.public_hosts.as_slice(),
+        &body,
+        now,
+    ) {
+        Ok(b) => b,
+        Err(e) => return attest_error_response(e),
+    };
+
+    // Engine must be present under a v1.1 claim (wired at boot).
+    if state.v1_engine.is_none() {
+        return attest_error_response(crate::v1::AttestError::Internal(
+            "v1 EngineAdapter not available for attestation".into(),
+        ));
+    }
+
+    let request_value = match serde_json::to_value(&authorised) {
+        Ok(v) => v,
+        Err(e) => {
+            return attest_error_response(crate::v1::AttestError::Internal(format!(
+                "encode AttestJobBody: {e}"
+            )));
+        }
+    };
+
+    let create_result = match state
+        .job_store
+        .create(
+            JobKind::AttestBalance,
+            &authorised.subject,
+            None,
+            request_value,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("JobStore::create (attest_balance) failed: {}", e);
+            return attest_error_response(crate::v1::AttestError::Internal(
+                "Failed to admit attestation job".into(),
+            ));
+        }
+    };
+
+    let job = match create_result {
+        CreateResult::Fresh(j) | CreateResult::IdempotentReplay(j) => j,
+        CreateResult::IdempotencyConflict => {
+            // Attest admits without an Idempotency-Key, so the conflict
+            // arm is unreachable for this path.
+            return attest_error_response(crate::v1::AttestError::Internal(
+                "unexpected idempotency_conflict on attest admit".into(),
+            ));
+        }
+    };
+
+    // Enqueue for the dispatcher (same channel as mint/send).
+    if let Err(e) = state
+        .job_tx
+        .send(crate::job_dispatcher::JobEnvelope {
+            public_id: job.public_id,
+        })
+        .await
+    {
+        tracing::error!("attest job enqueue failed: {}", e);
+        // Allowed: queued → failed. CAS miss → log, no invented success.
+        let err_body =
+            crate::v1::encode_job_error("internal_error", format!("enqueue failed: {e}"));
+        match state
+            .job_store
+            .fail(
+                job.public_id,
+                crate::job_store::JobStatus::Queued,
+                &err_body,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "attest enqueue-fail: fail(queued) matched 0 rows for job {} \
+                     (concurrent advance); not inventing success",
+                    job.public_id
+                );
+            }
+            Err(store_err) => {
+                tracing::error!(
+                    "attest enqueue-fail: fail(queued) store error for job {}: {}",
+                    job.public_id,
+                    store_err
+                );
+            }
+        }
+        return attest_error_response(crate::v1::AttestError::Internal(
+            "Failed to enqueue attestation job".into(),
+        ));
+    }
+
+    // §7.5: `202 { job_id }` — no status field on this admit response.
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "job_id": job.public_id.to_string(),
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /v1/jobs/:id` — §7.5 poll envelope.
+///
+/// - `status` is the closed §7.5 set (`accepted` / `publishing` aliases).
+/// - `phase` is optional and **absent** in terminal states.
+/// - `progress` is a float in `[0, 1]`.
+/// - While `awaiting_signature`, the six ProofData digests + handshake
+///   fields are under the top-level `awaiting_signature` key (not `result`).
+/// - `result` is present only once `status == completed`.
+/// - `error` is `{ error, message }` once failed/cancelled.
+#[utoipa::path(
+    get,
+    path = "/v1/jobs/{job_id}",
+    tag = "Jobs",
+    params(
+        ("job_id" = String, Path, description = "Job UUID."),
+    ),
+    responses(
+        (status = 200, description = "Current job state (§7.5 envelope)."),
+        (status = 404, description = "`job_not_found`."),
+        (status = 500, description = "`internal_error`."),
+    ),
+)]
+pub(crate) async fn get_job_v1_handler(
+    State(state): State<AppState>,
+    V1JobId(id): V1JobId,
+) -> axum::response::Response {
+    let service = KernelService::from_store(Arc::clone(&state.job_store));
+    let job = match service.get_job(JobRequest { id: JobId(id) }).await {
+        Ok(j) => j,
+        Err(e) => return v1_get_job_error(e),
+    };
+
+    let body = project_job_v1(&job);
+
+    if job.state.is_terminal() {
+        (StatusCode::OK, Json(body)).into_response()
+    } else {
+        // §7.5: Retry-After; RECOMMENDED 0 while awaiting_signature.
+        let retry = if matches!(job.state, JobState::AwaitingSignature { .. }) {
+            "0"
+        } else {
+            "2"
+        };
+        (StatusCode::OK, [(header::RETRY_AFTER, retry)], Json(body)).into_response()
+    }
+}
+
+/// §7.5 `/v1/jobs/:id` JSON projection from a typed domain job.
+///
+/// Distinct from the legacy projection: status aliases, float progress,
+/// `awaiting_signature` key (not `result`), structured terminal errors.
+/// Well-formed states stay field-equal to the pre-split handler.
+fn project_job_v1(job: &crate::kernel::Job) -> serde_json::Value {
+    let status_wire = job.normative_status().as_v1_str();
+    let mut body = serde_json::json!({
+        "job_id": job.id.as_uuid(),
+        "kind": job.kind.as_str(),
+        "status": status_wire,
+        "progress": v1_progress_wire(job.progress),
+    });
+    let obj = body.as_object_mut().expect("object");
+
+    // phase: optional diagnostic; absent in terminal states (§7.5).
+    if !job.state.is_terminal() {
+        let phase = job.phase.as_str();
+        if !phase.is_empty()
+            && phase
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            && phase.len() <= 64
+        {
+            obj.insert(
+                "phase".to_string(),
+                serde_json::Value::String(phase.to_string()),
+            );
+        }
+    }
+
+    match &job.state {
+        // Payload presence is enforced by `project_job_row` (fail-closed).
+        // Backend-Korrektheit ist fail-closed: lieber ein Fehler als ein
+        // Wert, der Vollständigkeit vortäuscht — genau dieses Muster
+        // (halbe Antwort, die wie Erfolg aussieht) ist der Grund für den
+        // Kernel-Schnitt.
+        JobState::AwaitingSignature { payload, .. } => {
+            obj.insert("awaiting_signature".to_string(), payload.0.clone());
+        }
+        JobState::Completed { result } => {
+            obj.insert("result".to_string(), result.0.clone());
+        }
+        JobState::Failed { error } => {
+            // §7.5: always present on failed/cancelled; machine codes from
+            // the closed enumeration (never invent, never omit).
+            obj.insert(
+                "error".to_string(),
+                crate::v1::decode_job_error(error.as_deref(), JobStatus::Failed),
+            );
+        }
+        JobState::Cancelled { error } => {
+            obj.insert(
+                "error".to_string(),
+                crate::v1::decode_job_error(error.as_deref(), JobStatus::Cancelled),
+            );
+        }
+        JobState::Accepted | JobState::Proving | JobState::Publishing => {}
+    }
+
+    body
+}
+
+/// Map a domain error onto the §7.5 v1 error envelope via the shared contract.
+fn v1_get_job_error(err: KernelError) -> axum::response::Response {
+    let desc = error_contract::describe(err.code);
+    let status = StatusCode::from_u16(desc.http_status)
+        .expect("error_contract http_status values are valid HTTP codes");
+    if err.code == KernelErrorCode::InternalError {
+        if let Some(ctx) = &err.internal_context {
+            tracing::error!("GetJob internal_error: {}", ctx.detail);
+        }
+    }
+    (status, Json(v1_error_body(desc.reason, err.public_message))).into_response()
 }
 
 /// `POST /api/jobs/:id/cancel` — cancel a still-queued job. Only
@@ -2263,8 +2250,16 @@ pub(crate) async fn jobs_cancel_handler(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> axum::response::Response {
-    match state.job_store.cancel(id).await {
-        Ok(true) => {
+    // Legacy policy: only `queued`. Domain distinguishes not-found from
+    // wrong-phase; this adapter maps **both** to 409 free-text so the
+    // pre-split wire contract (and `jobs_cancel_unknown_returns_409`)
+    // stays byte-stable.
+    let service = KernelService::from_store(Arc::clone(&state.job_store));
+    match service
+        .cancel_job(JobRequest { id: JobId(id) }, CancelPolicy::LegacyQueuedOnly)
+        .await
+    {
+        Ok(_job) => {
             // Publish the terminal `cancelled` event to any attached
             // SSE listener BEFORE the dispatcher's notify-map entry
             // drops (it won't drop until the next admit, but the
@@ -2290,15 +2285,48 @@ pub(crate) async fn jobs_cancel_handler(
             )
                 .into_response()
         }
-        Ok(false) => (
+        Err(e) => legacy_cancel_error(e),
+    }
+}
+
+/// Map domain cancel errors onto the legacy jobs cancel envelope.
+///
+/// Legacy folds `job_not_found` and `wrong_phase` into a single 409 with
+/// free-text `"Job is not in a cancellable state"`.
+fn legacy_cancel_error(err: KernelError) -> axum::response::Response {
+    match err.code {
+        KernelErrorCode::JobNotFound | KernelErrorCode::WrongPhase => (
             StatusCode::CONFLICT,
             Json(JobErrorResponse {
                 error: "Job is not in a cancellable state".to_string(),
             }),
         )
             .into_response(),
-        Err(e) => {
-            tracing::error!("JobStore::cancel failed: {}", e);
+        KernelErrorCode::InternalError => {
+            // Wire contract: legacy cancel always said "Failed to cancel job"
+            // for any store failure. Domain may be more precise (e.g. load
+            // failed before cancel was attempted) — keep that in logs only.
+            if let Some(ctx) = &err.internal_context {
+                tracing::error!("CancelJob (legacy) internal_error: {}", ctx.detail);
+            } else {
+                tracing::error!("CancelJob (legacy) internal_error: {}", err.public_message);
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(JobErrorResponse {
+                    error: "Failed to cancel job".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        other => {
+            // CancelJob's closed error set is only the three above plus
+            // malformed/rate_limited (handled at the extractor). Anything
+            // else is a programming error — fail closed as 500.
+            tracing::error!(
+                "CancelJob (legacy) unexpected domain code {}",
+                other.reason()
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(JobErrorResponse {
@@ -2308,6 +2336,197 @@ pub(crate) async fn jobs_cancel_handler(
                 .into_response()
         }
     }
+}
+
+/// `POST /v1/jobs/:id/cancel` — §7.5 normative cancel route.
+///
+/// Cancels a **not-yet-published** job (`queued` | `proving` |
+/// `awaiting_signature`). Once the nullifier is broadcast
+/// (`broadcasting` / completed), cancel is refused as `wrong_phase`.
+/// Outward errors use the closed §7.5 `{error, message}` body.
+///
+/// Spec foundation: §7.5 `POST /v1/jobs/<job_id>/cancel` — "cancels a
+/// not-yet-published job"; §7.8 `CancelJob` — same; wire table maps
+/// `wrong_phase` when the job is past the accepting status. The
+/// implementation set is exactly the statuses **before** `publishing`
+/// (`accepted`/`queued`, `proving`, `awaiting_signature`).
+pub(crate) async fn jobs_cancel_v1_handler(
+    State(state): State<AppState>,
+    V1JobId(id): V1JobId,
+) -> axum::response::Response {
+    let service = KernelService::from_store(Arc::clone(&state.job_store));
+    match service
+        .cancel_job(JobRequest { id: JobId(id) }, CancelPolicy::NotYetPublished)
+        .await
+    {
+        Ok(_job) => {
+            // Envelope strip is atomic with the status flip in
+            // `cancel_not_yet_published`. Drop in-memory staging only.
+            state.pending_sign_map.remove(&id);
+            state.v1_live_pending_after_begin.remove(&id);
+            let err_body = crate::v1::encode_job_error("internal_error", "cancelled");
+            crate::job_dispatcher::publish_phase(
+                &state.job_notify_map,
+                id,
+                JobPhaseEvent {
+                    status: JobStatus::Cancelled,
+                    phase: "cancelled".to_string(),
+                    proof_id: None,
+                    result: None,
+                    error: Some(err_body),
+                },
+            );
+            // Wake a parked awaiting_signature dispatcher so it observes
+            // the terminal status instead of waiting for timeout.
+            if let Some(notifier) = state.job_notify_map.get(&id).map(|e| e.value().clone()) {
+                let _ = notifier.try_claim_timeout();
+                notifier.commit_wake.notify_one();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "cancelled", "job_id": id})),
+            )
+                .into_response()
+        }
+        Err(e) => v1_cancel_error(e),
+    }
+}
+
+fn v1_cancel_error(err: KernelError) -> axum::response::Response {
+    let desc = error_contract::describe(err.code);
+    let status = StatusCode::from_u16(desc.http_status)
+        .expect("error_contract http_status values are valid HTTP codes");
+    if err.code == KernelErrorCode::InternalError {
+        if let Some(ctx) = &err.internal_context {
+            tracing::error!("CancelJob (v1) internal_error: {}", ctx.detail);
+        }
+    }
+    (status, Json(v1_error_body(desc.reason, err.public_message))).into_response()
+}
+
+/// `GET /v1/jobs/:id/stream` — §7.5 normative SSE route.
+///
+/// Emits `event: phase` for non-terminal updates, `event: complete` for a
+/// successful terminal job, and `event: error` for `failed` / `cancelled`
+/// with a closed enumeration `error` object. Unknown ids and DB failures
+/// return the closed §7.5 error body (never a bare framework status).
+///
+/// Domain source: [`KernelService::stream_job`]. Heartbeat is HTTP-only.
+pub(crate) async fn stream_job_v1_handler(
+    V1JobId(id): V1JobId,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use futures_util::StreamExt;
+
+    let service = KernelService::from_parts(
+        Arc::clone(&state.job_store),
+        Arc::clone(&state.job_notify_map),
+        Arc::clone(&state.pending_sign_map),
+        Arc::clone(&state.attest_challenges),
+    );
+    let domain_stream = match service.stream_job(JobRequest { id: JobId(id) }).await {
+        Ok(s) => s,
+        Err(e) => return v1_stream_open_error(e),
+    };
+
+    let stream = async_stream::stream! {
+        let mut domain_stream = domain_stream;
+        while let Some(item) = domain_stream.next().await {
+            match item {
+                Ok(ev) => {
+                    let terminal = ev.job.state.is_terminal();
+                    yield Ok::<Event, Infallible>(sse_event_from_job_event_v1(&ev));
+                    if terminal {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    // Mid-stream domain failure: log and close (no half-frame).
+                    if let Some(ctx) = &e.internal_context {
+                        tracing::error!("StreamJob (v1) mid-stream error: {}", ctx.detail);
+                    } else {
+                        tracing::error!("StreamJob (v1) mid-stream error: {}", e);
+                    }
+                    return;
+                }
+            }
+        }
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(SSE_HEARTBEAT_INTERVAL))
+        .into_response()
+}
+
+fn v1_stream_open_error(err: KernelError) -> axum::response::Response {
+    let desc = error_contract::describe(err.code);
+    let status = StatusCode::from_u16(desc.http_status)
+        .expect("error_contract http_status values are valid HTTP codes");
+    if err.code == KernelErrorCode::InternalError {
+        if let Some(ctx) = &err.internal_context {
+            tracing::error!("StreamJob (v1) open internal_error: {}", ctx.detail);
+        }
+    }
+    (status, Json(v1_error_body(desc.reason, err.public_message))).into_response()
+}
+
+/// §7.5 SSE frame from a domain [`JobEvent`].
+pub(crate) fn sse_event_from_job_event_v1(event: &JobEvent) -> Event {
+    let job = &event.job;
+    let status_wire = job.normative_status().as_v1_str();
+    let event_name = event.kind.as_v1_str();
+    let payload = match &job.state {
+        JobState::Completed { result } => serde_json::json!({
+            "job_id": job.id.as_uuid(),
+            "kind": job.kind.as_str(),
+            "status": status_wire,
+            "result": result.0.clone(),
+        }),
+        JobState::Failed { error } => serde_json::json!({
+            "job_id": job.id.as_uuid(),
+            "status": status_wire,
+            "error": crate::v1::decode_job_error(error.as_deref(), JobStatus::Failed),
+        }),
+        JobState::Cancelled { error } => serde_json::json!({
+            "job_id": job.id.as_uuid(),
+            "status": status_wire,
+            "error": crate::v1::decode_job_error(error.as_deref(), JobStatus::Cancelled),
+        }),
+        JobState::AwaitingSignature { payload, .. } => {
+            let mut data = serde_json::json!({
+                "status": status_wire,
+                "progress": v1_progress_wire(job.progress),
+            });
+            // Presence enforced by projection — insert, do not `if let Some`.
+            data.as_object_mut()
+                .expect("object")
+                .insert("awaiting_signature".to_string(), payload.0.clone());
+            if !job.phase.is_empty() {
+                data.as_object_mut().expect("object").insert(
+                    "phase".to_string(),
+                    serde_json::Value::String(job.phase.clone()),
+                );
+            }
+            data
+        }
+        JobState::Accepted | JobState::Proving | JobState::Publishing => {
+            let mut data = serde_json::json!({
+                "status": status_wire,
+                "progress": v1_progress_wire(job.progress),
+            });
+            if !job.phase.is_empty() {
+                data.as_object_mut().expect("object").insert(
+                    "phase".to_string(),
+                    serde_json::Value::String(job.phase.clone()),
+                );
+            }
+            data
+        }
+    };
+    Event::default()
+        .event(event_name)
+        .json_data(payload)
+        .expect("Event::json_data cannot fail for a freshly built serde_json::Value")
 }
 
 // =======================================================================
@@ -2323,85 +2542,113 @@ pub(crate) async fn jobs_cancel_handler(
 // subscribes, forwards events as SSE frames, and closes on the
 // first terminal event.
 
-/// SSE event-builder helper: emit the current job snapshot as the
-/// first frame of a freshly-opened stream. Mirrors the wire-shape the
-/// `GET /api/jobs/:id` handler returns so the SSE consumer's parse
-/// path is identical to the existing poll parse path.
+/// Explicit JSON encoding of an optional integer field: `null` means
+/// "not present" on the legacy wire (a statement, not a mask).
+fn option_i64_json(value: Option<i64>) -> serde_json::Value {
+    match value {
+        Some(v) => serde_json::Value::from(v),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Explicit JSON encoding of an optional free-text error on the legacy wire.
+fn option_string_json(value: Option<&str>) -> serde_json::Value {
+    match value {
+        Some(s) => serde_json::Value::String(s.to_string()),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Legacy SSE frame from a domain [`JobEvent`].
 ///
-/// Pure (no I/O, no async) so the function-level coverage gate can hit
-/// every arm — split into a free function rather than baked into the
-/// stream future so the test suite can drive each branch directly.
-pub(crate) fn initial_event_from_job(job: &Job) -> Event {
-    let payload = serde_json::json!({
-        "status": job.status.as_str(),
-        "phase": job.phase,
-        "proof_id": if job.status == JobStatus::AwaitingSignature {
-            job.proof_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
-        } else {
-            serde_json::Value::Null
-        },
-        "result": if job.status == JobStatus::Completed
-            || job.status == JobStatus::AwaitingSignature
-        {
-            // `awaiting_signature` carries the ash/ocr hex the wallet
-            // signs; `completed` carries the terminal body. Both are in
-            // `response_body`, so the SSE initial frame mirrors the GET
-            // snapshot for either status.
-            job.response_body.clone().unwrap_or(serde_json::Value::Null)
-        } else {
-            serde_json::Value::Null
-        },
-        "error": if job.status == JobStatus::Failed {
-            job.error.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
-        } else {
-            serde_json::Value::Null
-        },
-    });
-    let event_name = if job.status.is_terminal() {
-        "complete"
-    } else {
-        "phase"
+/// Field set matches the pre-split `/api/jobs/:id/stream` wire for every
+/// well-formed state. Required payloads are already enforced by projection.
+pub(crate) fn sse_event_from_job_event_legacy(event: &JobEvent) -> Event {
+    let job = &event.job;
+    let status = job.normative_status().as_legacy_str();
+    let (proof_id, result, error) = match &job.state {
+        JobState::AwaitingSignature { payload, proof_id } => (
+            option_i64_json(*proof_id),
+            payload.0.clone(),
+            serde_json::Value::Null,
+        ),
+        JobState::Completed { result } => (
+            serde_json::Value::Null,
+            result.0.clone(),
+            serde_json::Value::Null,
+        ),
+        JobState::Failed { error } => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            option_string_json(error.as_deref()),
+        ),
+        // Legacy initial frames never projected `error` for cancelled.
+        // Mid-stream cancel events historically also left error null
+        // when the phase event carried none — cancelled with a free-text
+        // error is still projected as null on the initial path; for
+        // mid-stream phase conversion we keep the same status gate so
+        // wire stays equal to the legacy snapshot projection.
+        JobState::Accepted
+        | JobState::Proving
+        | JobState::Publishing
+        | JobState::Cancelled { .. } => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ),
     };
-    // `Event::json_data` only returns `Err` when its argument has a
-    // custom `Serialize` impl that itself errs (and even then only
-    // when the resulting bytes are not valid UTF-8 — which JSON's
-    // ASCII-superset output can't violate). The `payload` here is a
-    // `serde_json::Value` built inline above with no custom impls,
-    // so the error arm is structurally unreachable. `.expect()`
-    // documents the invariant inline — a failure here would mean
-    // axum/serde-json changed semantics, not a runtime data shape.
+    let payload = serde_json::json!({
+        "status": status,
+        "phase": job.phase,
+        "proof_id": proof_id,
+        "result": result,
+        "error": error,
+    });
+    let event_name = event.kind.as_legacy_str();
     Event::default()
         .event(event_name)
         .json_data(payload)
         .expect("Event::json_data cannot fail for a freshly built serde_json::Value")
 }
 
-/// SSE event-builder helper: translate a dispatcher-published
-/// [`JobPhaseEvent`] into an SSE frame. Terminal statuses emit
-/// `event: complete`; everything else emits `event: phase`.
-///
-/// Mirrors `initial_event_from_job` shape so the wallet's
-/// `EventSource.addEventListener('phase' | 'complete', …)` parse path
-/// handles both the initial frame and subsequent updates uniformly.
-pub(crate) fn event_from_phase(event: &JobPhaseEvent) -> Event {
-    let payload = serde_json::json!({
-        "status": event.status.as_str(),
-        "phase": event.phase,
-        "proof_id": event.proof_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
-        "result": event.result.clone().unwrap_or(serde_json::Value::Null),
-        "error": event.error.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
-    });
-    let event_name = if event.status.is_terminal() {
-        "complete"
-    } else {
-        "phase"
+/// Mid-stream legacy frame: unlike the initial snapshot, historical
+/// phase frames surface whatever the phase event carried (proof_id /
+/// result / error) without status-gating error to Failed only.
+/// Domain projection has already fail-closed required payloads.
+pub(crate) fn sse_event_from_job_event_legacy_phase(event: &JobEvent) -> Event {
+    let job = &event.job;
+    let status = job.normative_status().as_legacy_str();
+    let (proof_id, result, error) = match &job.state {
+        JobState::AwaitingSignature { payload, proof_id } => (
+            option_i64_json(*proof_id),
+            payload.0.clone(),
+            serde_json::Value::Null,
+        ),
+        JobState::Completed { result } => (
+            serde_json::Value::Null,
+            result.0.clone(),
+            serde_json::Value::Null,
+        ),
+        JobState::Failed { error } | JobState::Cancelled { error } => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            option_string_json(error.as_deref()),
+        ),
+        JobState::Accepted | JobState::Proving | JobState::Publishing => (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ),
     };
-    // Same invariant as `initial_event_from_job`: `payload` is a
-    // freshly built `serde_json::Value` with no custom Serialize
-    // impls, so `Event::json_data` is structurally infallible. See
-    // the longer note in `initial_event_from_job` above.
+    let payload = serde_json::json!({
+        "status": status,
+        "phase": job.phase,
+        "proof_id": proof_id,
+        "result": result,
+        "error": error,
+    });
     Event::default()
-        .event(event_name)
+        .event(event.kind.as_legacy_str())
         .json_data(payload)
         .expect("Event::json_data cannot fail for a freshly built serde_json::Value")
 }
@@ -2471,92 +2718,73 @@ pub(crate) async fn stream_job_handler(
     Path(id): Path<Uuid>,
     State(state): State<AppState>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-    // 1. Load the row up-front so a 404 surfaces with the standard
-    //    JSON shape (not as an immediately-closed SSE stream — the
-    //    wallet's polling fallback expects a non-stream error
-    //    response for unknown IDs).
-    let job = match state.job_store.load(id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => return Err(StatusCode::NOT_FOUND),
+    use futures_util::StreamExt;
+
+    // Domain StreamJob: load + project snapshot, then phase changes.
+    // 404 / 500 surface as plain status codes (legacy contract — no JSON body).
+    let service = KernelService::from_parts(
+        Arc::clone(&state.job_store),
+        Arc::clone(&state.job_notify_map),
+        Arc::clone(&state.pending_sign_map),
+        Arc::clone(&state.attest_challenges),
+    );
+    let domain_stream = match service.stream_job(JobRequest { id: JobId(id) }).await {
+        Ok(s) => s,
         Err(e) => {
-            tracing::error!("JobStore::load failed in stream handler: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err(legacy_stream_open_status(e));
         }
     };
 
-    // 2. Subscribe to the per-job broadcast channel BEFORE sending
-    //    the initial event so any event that lands between "build
-    //    initial" and "spawn stream loop" lands in the receiver
-    //    queue. The `or_insert_with` arm handles the (uncommon) case
-    //    where the dispatcher has not yet created the notifier
-    //    (e.g. the row is still `queued` waiting to be picked up).
-    //
-    //    Cleanup race: the dispatcher's terminal-publish path runs
-    //    `notify_map.remove(id)` AFTER pushing the final event onto
-    //    the broadcast channel. A fresh subscriber that opens between
-    //    publish and remove would `or_insert_with` a brand-new
-    //    notifier, replacing the just-dropped one. That is safe
-    //    because the initial-state read above already reflects the
-    //    terminal row (the dispatcher persisted before publishing),
-    //    so `initial_event_from_job` emits the `complete` / `fail`
-    //    frame and the stream returns end-of-stream on the next poll
-    //    without ever depending on the now-orphaned subscriber.
-    let notifier = state
-        .job_notify_map
-        .entry(id)
-        .or_insert_with(|| Arc::new(JobNotifier::new()))
-        .clone();
-    let rx = notifier.phase_tx.subscribe();
-
-    let stream = build_phase_stream(job, rx);
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_HEARTBEAT_INTERVAL)))
-}
-
-/// Build the long-lived SSE stream that fans out phase events to the
-/// wallet.
-///
-/// Coverage: the per-event loop is driven by tokio time + the
-/// broadcast channel, neither of which the deterministic test harness
-/// can exhaustively cover without a real wall-clock advance. The
-/// initial-state emission and the terminal-job-early-close path stay
-/// pure (covered by [`initial_event_from_job`]); the loop itself is
-/// annotated `coverage(off)` so the 100% line/function gate doesn't
-/// trip on the inner `tokio::select!` arms. Same shape as
-/// `scanner_ws::run_subscription_loop` — see CI workflow's
-/// `--ignore-filename-regex` and the `coverage_nightly` cfg in
-/// `Cargo.toml` for the project-wide pattern.
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn build_phase_stream(
-    job: Job,
-    mut rx: tokio::sync::broadcast::Receiver<JobPhaseEvent>,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    async_stream::stream! {
-        // 1. Initial event with the current state. If terminal,
-        //    close immediately — the wallet only needs the snapshot.
-        let initial = initial_event_from_job(&job);
-        let is_terminal = job.status.is_terminal();
-        yield Ok(initial);
-        if is_terminal {
-            return;
-        }
-
-        // 2. Forward every event published by the dispatcher. Close
-        //    the stream on the first terminal event so the wallet's
-        //    EventSource fires its `complete`-listener and detaches.
-        //    `Lagged` is treated the same as channel-closed — the
-        //    fallback polling path will surface the eventual terminal
-        //    state, so the stream does not need to recover.
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let is_terminal = event.status.is_terminal();
-                    yield Ok(event_from_phase(&event));
-                    if is_terminal {
+    // Snapshot uses status-gated error projection; subsequent frames use
+    // the historical phase-event shape (error field also on cancelled).
+    let stream = async_stream::stream! {
+        let mut domain_stream = domain_stream;
+        let mut first = true;
+        while let Some(item) = domain_stream.next().await {
+            match item {
+                Ok(ev) => {
+                    let terminal = ev.job.state.is_terminal();
+                    let frame = if first {
+                        first = false;
+                        sse_event_from_job_event_legacy(&ev)
+                    } else {
+                        sse_event_from_job_event_legacy_phase(&ev)
+                    };
+                    yield Ok::<Event, Infallible>(frame);
+                    if terminal {
                         return;
                     }
                 }
-                Err(_) => return,
+                Err(e) => {
+                    if let Some(ctx) = &e.internal_context {
+                        tracing::error!("StreamJob (legacy) mid-stream error: {}", ctx.detail);
+                    } else {
+                        tracing::error!("StreamJob (legacy) mid-stream error: {}", e);
+                    }
+                    return;
+                }
             }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_HEARTBEAT_INTERVAL)))
+}
+
+fn legacy_stream_open_status(err: KernelError) -> StatusCode {
+    match err.code {
+        KernelErrorCode::JobNotFound => StatusCode::NOT_FOUND,
+        KernelErrorCode::InternalError => {
+            if let Some(ctx) = &err.internal_context {
+                tracing::error!("StreamJob (legacy) open internal_error: {}", ctx.detail);
+            }
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        other => {
+            tracing::error!(
+                "StreamJob (legacy) unexpected open error {}",
+                other.reason()
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
@@ -2586,58 +2814,26 @@ fn job_flow_error(e: flow::FlowError) -> (StatusCode, Json<JobErrorResponse>) {
         (status = 500, description = "Database error.", body = SendCoinResponse),
     ),
 )]
-/// `GET /api/inscriptions/:txid` — operator/forensics lookup of a single
-/// inscription by its commit txid. Surfaces the columns that answer
-/// "what kind of operation was this, and where is it in the publish
-/// pipeline" without exposing the raw commit/reveal/commitment blobs
-/// (those are crash-recovery state, not user-facing).
+/// `GET /api/inscriptions/:txid` — **closed (Stage 3 Runde 6)**.
 ///
-/// Returns 404 when no row exists — the inscription either never went
-/// through this node (e.g. external recovery via `recover_inscription`
-/// CLI) or the txid is unknown.
+/// Previously returned legacy `pending_inscriptions` summary (kind,
+/// status, txids, amount, failure, timestamps) without capability.
+/// **Decision:** 410 Gone rather than rebind to `v1_pending_publishes`.
+/// V1 publish rows are operator crash-recovery state for AggregateState
+/// NullifierV3, not a public account-read surface; capability-bound
+/// `read.account` / job status cover wallet needs. Loud protocol error.
 pub(crate) async fn get_inscription_handler(
     State(state): State<AppState>,
     Path(txid_hex): Path<String>,
 ) -> axum::response::Response {
-    // Bitcoin convention: display txids are big-endian, but the
-    // `pending_inscriptions.commit_txid` column stores raw little-endian
-    // bytes (matching `bitcoin::Txid::as_byte_array()` semantics — see
-    // `publisher.rs` write site). Reverse on parse so a caller can pass
-    // the same hex an explorer shows.
-    let mut bytes = match hex::decode(txid_hex.trim()) {
-        Ok(b) if b.len() == 32 => b,
-        Ok(_) => {
-            return handler_error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "txid must be 32 bytes (64 hex chars)",
-            )
-            .into_response();
-        }
-        Err(_) => {
-            return handler_error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "txid is not valid hex",
-            )
-            .into_response();
-        }
-    };
-    bytes.reverse();
-
-    match crate::db::get_inscription_summary_by_commit_txid(&state.pool, &bytes).await {
-        Ok(Some(summary)) => (StatusCode::OK, Json(summary)).into_response(),
-        Ok(None) => {
-            handler_error_response(StatusCode::NOT_FOUND, "No inscription found for this txid")
-                .into_response()
-        }
-        Err(e) => {
-            eprintln!("get_inscription_handler: db error: {}", e);
-            handler_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database error while looking up inscription",
-            )
-            .into_response()
-        }
-    }
+    let _ = (state, txid_hex);
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "error": "GET /api/inscriptions/:txid is removed (Stage 3): unauthenticated legacy pending_inscriptions lookup is closed; use capability-bound v1 surfaces"
+        })),
+    )
+        .into_response()
 }
 
 // ---- Admin: R2 probe history --------------------------------------------
@@ -2712,8 +2908,9 @@ async fn r2_probe_history_handler(
 
 /// JSON body returned by `GET /health/ready`. `failures` is empty on a
 /// fully ready node; each failing dependency contributes one stable
-/// short tag (`"db"`, `"esplora"`, `"prover"`) so a Kuma monitor parses
-/// the cause without having to scrape the status code in isolation.
+/// short tag (`"db"`, `"esplora"`, `"prover"`, and under the v1.1 stack
+/// `"v1_scan"` / `"deep_reorg"`) so a Kuma monitor parses the cause
+/// without having to scrape the status code in isolation.
 ///
 /// `prover` is the background-warmup tag (see `AppState::prover_warm`):
 /// while the bootstrap warmup task is still running, the readiness
@@ -2721,7 +2918,7 @@ async fn r2_probe_history_handler(
 /// 503 so a load balancer keeps holding traffic on the previous-gen
 /// pod. `/health` (liveness) is unaffected.
 #[derive(Serialize, ToSchema)]
-pub struct ReadyResponse {
+pub(crate) struct ReadyResponse {
     ready: bool,
     failures: Vec<&'static str>,
     /// Lifecycle tag. `"starting"` while any failure is present,
@@ -2812,6 +3009,20 @@ pub(crate) async fn ready_handler(State(state): State<AppState>) -> impl IntoRes
         failures.push("prover");
     }
 
+    // v1.1 stack readiness: when the process claimed NfLog, do not report
+    // ready until the scanner has caught up at least once, and fail hard
+    // if finality was broken by a deep reorg (§3.9 contract).
+    if let Some(caught_up) = &state.v1_scan_caught_up {
+        if !caught_up.load(Ordering::SeqCst) {
+            failures.push("v1_scan");
+        }
+    }
+    if let Some(finality_ok) = &state.v1_finality_ok {
+        if !finality_ok.load(Ordering::SeqCst) {
+            failures.push("deep_reorg");
+        }
+    }
+
     let ready = failures.is_empty();
     let status = if ready {
         StatusCode::OK
@@ -2843,8 +3054,7 @@ pub(crate) async fn ready_handler(State(state): State<AppState>) -> impl IntoRes
 async fn check_esplora(
     config: &EsploraConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use esplora_client::{r#async::DefaultSleeper, AsyncClient, Builder};
-    let client = AsyncClient::<DefaultSleeper>::from_builder(Builder::new(&config.url))?;
+    let client = crate::esplora_bound::EsploraReadClient::connect(&config.url)?;
     client.get_height().await?;
     Ok(())
 }
@@ -2855,7 +3065,7 @@ async fn check_esplora(
 /// Esplora directly. `address` is the publisher's Taproot bech32 — log-
 /// only, NOT a secret (the matching key lives in `PUBLISHER_KEY`).
 #[derive(Serialize, ToSchema)]
-pub struct PublisherHealthResponse {
+pub(crate) struct PublisherHealthResponse {
     address: String,
     utxo_count: u64,
     total_sats: u64,
@@ -2868,7 +3078,7 @@ pub struct PublisherHealthResponse {
 /// HTTP status separately. `address` is echoed back so the failure
 /// log still identifies which wallet the operator should top up.
 #[derive(Serialize, ToSchema)]
-pub struct PublisherHealthErrorResponse {
+pub(crate) struct PublisherHealthErrorResponse {
     error: &'static str,
     detail: String,
     address: String,
@@ -2991,7 +3201,7 @@ pub(crate) async fn info_handler() -> impl IntoResponse {
 }
 
 #[derive(Serialize, ToSchema)]
-pub struct RootResponse {
+pub(crate) struct RootResponse {
     service: &'static str,
     version: &'static str,
     network: String,
@@ -3005,8 +3215,19 @@ pub struct RootResponse {
 /// from the default build. Meta routes (`/openapi.json`, `/docs`,
 /// `/docs/{file}`) and admin endpoints (`/api/admin/*`) are also
 /// omitted — the OpenAPI spec is the canonical map for those.
-#[derive(Serialize, ToSchema)]
-pub struct RootEndpoints {
+///
+/// This type is the **single source of truth** for the pre-G6 / flag-off
+/// closed endpoint set. It is registered in OpenAPI as a component
+/// schema, so its field list must stay free of Gap-G6 attestation keys
+/// (`skip_serializing_if` only hides runtime values, not schema
+/// properties). Flag-on `GET /` serialises a separate ordered type
+/// ([`RootEndpointsWithAttest`]); attest keys never appear here.
+///
+/// Serde field order **is** the wire order: never round-trip this type
+/// through `serde_json::Value` (without `preserve_order`, `Value::Object`
+/// is a sorted map and reorders keys).
+#[derive(Serialize, ToSchema, Clone, Copy)]
+pub(crate) struct RootEndpoints {
     info: &'static str,
     balance: &'static str,
     history: &'static str,
@@ -3016,6 +3237,7 @@ pub struct RootEndpoints {
     get_job: &'static str,
     stream_job: &'static str,
     commit: &'static str,
+    sign: &'static str,
     cancel: &'static str,
     proof: &'static str,
     inscription: &'static str,
@@ -3025,6 +3247,100 @@ pub struct RootEndpoints {
     health_publisher: &'static str,
     openapi: &'static str,
     docs: &'static str,
+}
+
+/// Flag-on endpoint map: pre-G6 closed set plus §7.5 attest keys inserted
+/// after `username_resolve`. Not an OpenAPI component — schema stays on
+/// [`RootEndpoints`]. Serialised in declaration order (same rule as
+/// [`RootEndpoints`]: never via sorted `Value`).
+#[derive(Serialize, Clone, Copy)]
+struct RootEndpointsWithAttest {
+    info: &'static str,
+    balance: &'static str,
+    history: &'static str,
+    receive: &'static str,
+    admit_mint: &'static str,
+    admit_send: &'static str,
+    get_job: &'static str,
+    stream_job: &'static str,
+    commit: &'static str,
+    sign: &'static str,
+    cancel: &'static str,
+    proof: &'static str,
+    inscription: &'static str,
+    username_resolve: &'static str,
+    attest_balance_challenge: &'static str,
+    attest_balance: &'static str,
+    health: &'static str,
+    health_ready: &'static str,
+    health_publisher: &'static str,
+    openapi: &'static str,
+    docs: &'static str,
+}
+
+/// Flag-on outer envelope — same field order as [`RootResponse`].
+#[derive(Serialize)]
+struct RootResponseWithAttest {
+    service: &'static str,
+    version: &'static str,
+    network: String,
+    endpoints: RootEndpointsWithAttest,
+    docs: &'static str,
+}
+
+/// Canonical always-on endpoint map (pre-G6 / flag-off). Derived from
+/// [`RootEndpoints`] so the handler, the OpenAPI component, and the
+/// byte-identity tests share one type — not a hand-written second list.
+pub(crate) fn root_endpoints_always_on() -> RootEndpoints {
+    RootEndpoints {
+        info: "GET  /api/info",
+        balance: "GET  /api/balance?address={hex}",
+        history: "GET  /api/history?address={hex}&limit={n}&offset={n}",
+        receive: "POST /api/receive",
+        admit_mint: "POST /api/jobs/mint",
+        admit_send: "POST /api/jobs/send",
+        get_job: "GET  /api/jobs/{job_id}",
+        stream_job: "GET  /api/jobs/{job_id}/stream",
+        commit: "POST /api/jobs/{job_id}/commit",
+        sign: "POST /v1/jobs/{job_id}/sign",
+        cancel: "POST /api/jobs/{job_id}/cancel",
+        proof: "GET  /api/proof/{id}",
+        inscription: "GET  /api/inscriptions/{txid}",
+        username_resolve: "GET  /api/username/resolve/{username}",
+        health: "GET  /health",
+        health_ready: "GET  /health/ready",
+        health_publisher: "GET  /health/publisher",
+        openapi: "GET  /openapi.json",
+        docs: "GET  /docs",
+    }
+}
+
+/// Additive §7.5 extension of [`root_endpoints_always_on`].
+fn root_endpoints_with_attest() -> RootEndpointsWithAttest {
+    let b = root_endpoints_always_on();
+    RootEndpointsWithAttest {
+        info: b.info,
+        balance: b.balance,
+        history: b.history,
+        receive: b.receive,
+        admit_mint: b.admit_mint,
+        admit_send: b.admit_send,
+        get_job: b.get_job,
+        stream_job: b.stream_job,
+        commit: b.commit,
+        sign: b.sign,
+        cancel: b.cancel,
+        proof: b.proof,
+        inscription: b.inscription,
+        username_resolve: b.username_resolve,
+        attest_balance_challenge: "POST /v1/attest/balance/challenge",
+        attest_balance: "POST /v1/attest/balance",
+        health: b.health,
+        health_ready: b.health_ready,
+        health_publisher: b.health_publisher,
+        openapi: b.openapi,
+        docs: b.docs,
+    }
 }
 
 #[utoipa::path(
@@ -3042,33 +3358,32 @@ pub struct RootEndpoints {
 /// the package version, the connected network, and pointers to the real
 /// endpoints. Cheaper than serving a static landing page and still answers the
 /// "is this the right host?" question without surfacing a bare 404.
-pub(crate) async fn root_handler() -> impl IntoResponse {
-    Json(RootResponse {
-        service: "zkcoins-node",
-        version: env!("CARGO_PKG_VERSION"),
-        network: NETWORK_CONFIG.network_name.clone(),
-        endpoints: RootEndpoints {
-            info: "GET  /api/info",
-            balance: "GET  /api/balance?address={hex}",
-            history: "GET  /api/history?address={hex}&limit={n}&offset={n}",
-            receive: "POST /api/receive",
-            admit_mint: "POST /api/jobs/mint",
-            admit_send: "POST /api/jobs/send",
-            get_job: "GET  /api/jobs/{job_id}",
-            stream_job: "GET  /api/jobs/{job_id}/stream",
-            commit: "POST /api/jobs/{job_id}/commit",
-            cancel: "POST /api/jobs/{job_id}/cancel",
-            proof: "GET  /api/proof/{id}",
-            inscription: "GET  /api/inscriptions/{txid}",
-            username_resolve: "GET  /api/username/resolve/{username}",
-            health: "GET  /health",
-            health_ready: "GET  /health/ready",
-            health_publisher: "GET  /health/publisher",
-            openapi: "GET  /openapi.json",
-            docs: "GET  /docs",
-        },
-        docs: "https://docs.zkcoins.com",
-    })
+pub(crate) async fn root_handler() -> axum::response::Response {
+    // Serialise ordered structs directly. Do **not** build via
+    // `serde_json::json!` / `Value`: without `preserve_order`, object keys
+    // are sorted and flag-off bytes diverge from the pre-G6 golden
+    // (`service`/`version` first → alphabetical `docs`/`endpoints` first).
+    // Attest keys live only on `RootEndpointsWithAttest` so the OpenAPI
+    // `RootEndpoints` component schema stays pre-G6.
+    if crate::v1::v1_attest_route_active() {
+        Json(RootResponseWithAttest {
+            service: "zkcoins-node",
+            version: env!("CARGO_PKG_VERSION"),
+            network: NETWORK_CONFIG.network_name.clone(),
+            endpoints: root_endpoints_with_attest(),
+            docs: "https://docs.zkcoins.com",
+        })
+        .into_response()
+    } else {
+        Json(RootResponse {
+            service: "zkcoins-node",
+            version: env!("CARGO_PKG_VERSION"),
+            network: NETWORK_CONFIG.network_name.clone(),
+            endpoints: root_endpoints_always_on(),
+            docs: "https://docs.zkcoins.com",
+        })
+        .into_response()
+    }
 }
 
 // --- Username & LNURL handlers ---
@@ -3261,7 +3576,7 @@ pub(crate) async fn claim_username_handler(
         let pool = state.pool.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::db::insert_username_claim_log(&pool, &entry).await {
-                eprintln!("Failed to persist username_claim_log: {}", e);
+                tracing::warn!("Failed to persist username_claim_log: {}", e);
             }
         });
     };
@@ -3288,7 +3603,7 @@ pub(crate) async fn claim_username_handler(
         match crate::db::claim_username(&state.pool, &normalized_username, &addr_bytes).await {
             Ok(b) => b,
             Err(db_err) => {
-                eprintln!("Failed to persist username claim: {}", db_err);
+                tracing::error!("Failed to persist username claim: {}", db_err);
                 log_claim(false, Some(&format!("db error: {}", db_err)));
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -3328,29 +3643,21 @@ pub(crate) async fn claim_username_handler(
         .into_response()
 }
 
-/// Resolve an identifier to an address. Checks the username store first,
-/// then falls back to hex-prefix matching against known account addresses.
-/// Used by the always-on username handlers and the gated LNURL handlers.
+/// Resolve an identifier to an address via the **username store only**.
+///
+/// Stage 3 Runde 6 (C): the hex-prefix scan over `get_addresses()` is
+/// removed — address knowledge / prefix matching is not a
+/// `read.account` capability and leaked full rehydrated legacy addresses.
+/// Username and LNURL resolve exclusively against claimed names.
 fn resolve_identifier(
     state: &AppState,
     identifier: &str,
 ) -> Option<(zkcoins_program::hash::HashDigest, String)> {
     let normalized = identifier.to_lowercase();
-
-    // 1. Check custom username
     let username_store = lock_or_recover(&state.username_store);
-    if let Some(address) = username_store.resolve(&normalized) {
-        return Some((address, normalized));
-    }
-    drop(username_store);
-
-    // 2. Check hex prefix against known addresses
-    let account_node = lock_or_recover(&state.account_node);
-    account_node
-        .get_addresses()
-        .into_iter()
-        .find(|addr| hex::encode(digest_to_bytes(addr)).starts_with(&normalized))
-        .map(|addr| (addr, normalized))
+    username_store
+        .resolve(&normalized)
+        .map(|address| (address, normalized))
 }
 
 #[utoipa::path(
@@ -3515,6 +3822,23 @@ pub(crate) fn create_router(state: AppState) -> Router {
         .route("/api/jobs/:id", get(get_job_handler))
         .route("/api/jobs/:id/stream", get(stream_job_handler))
         .route("/api/jobs/:id/commit", post(jobs_commit_handler))
+        // §7.5 normative surface (v1.1 claim). Legacy `/api/jobs/*` stays
+        // as-is; the v1.1 sign + poll + stream + cancel envelopes live
+        // under `/v1/` (never a bare framework 404 for a normative path).
+        .route("/v1/jobs/:id", get(get_job_v1_handler))
+        .route("/v1/jobs/:id/sign", post(jobs_sign_handler))
+        .route("/v1/jobs/:id/stream", get(stream_job_v1_handler))
+        .route("/v1/jobs/:id/cancel", post(jobs_cancel_v1_handler))
+        .route(
+            "/v1/token/:asset_id/provenance",
+            get(get_token_provenance_v1_handler),
+        )
+        // §7.5 Gap G6 — balance attestation (flag-gated inside handlers).
+        .route(
+            "/v1/attest/balance/challenge",
+            post(attest_balance_challenge_handler),
+        )
+        .route("/v1/attest/balance", post(attest_balance_handler))
         .route("/api/jobs/:id/cancel", post(jobs_cancel_handler))
         .route("/api/inscriptions/:txid", get(get_inscription_handler))
         .route(
@@ -3524,7 +3848,10 @@ pub(crate) fn create_router(state: AppState) -> Router {
         // Operator-facing R2 probe trend (see `r2_probe_history_handler`
         // doc-comment). Grouped under `/api/admin/` so it is visibly
         // separate from the user-facing surface.
-        .route("/api/admin/r2-probe/history", get(r2_probe_history_handler));
+        .route("/api/admin/r2-probe/history", get(r2_probe_history_handler))
+        .route("/openapi.json", get(crate::openapi::openapi_json_handler))
+        .route("/docs", get(crate::openapi::docs_handler))
+        .route("/docs/:file", get(crate::openapi::swagger_asset_handler));
 
     // Gated routes — only compiled in when their Cargo feature is enabled.
     // With a feature off, the handler does not exist in the binary and the
@@ -3559,3 +3886,54 @@ pub(crate) fn create_router(state: AppState) -> Router {
 #[cfg(test)]
 #[path = "router_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod check_timestamp_window_at_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_server_clock_fails_closed() {
+        assert_eq!(
+            check_timestamp_window_with_now(Err(()), 1_000),
+            Err("Server clock unavailable")
+        );
+    }
+
+    #[test]
+    fn fresh_timestamp_is_ok() {
+        assert!(check_timestamp_window_at(1_000, 1_000).is_ok());
+    }
+
+    #[test]
+    fn exactly_at_positive_skew_bound_is_ok() {
+        let now = 1_000_000;
+        assert!(check_timestamp_window_at(now, now - MAX_TIMESTAMP_SKEW_SECS).is_ok());
+    }
+
+    #[test]
+    fn exactly_at_negative_skew_bound_is_ok() {
+        let now = 1_000_000;
+        assert!(check_timestamp_window_at(now, now + MAX_TIMESTAMP_SKEW_SECS).is_ok());
+    }
+
+    #[test]
+    fn one_second_beyond_positive_skew_bound_is_err() {
+        let now = 1_000_000;
+        assert!(check_timestamp_window_at(now, now - MAX_TIMESTAMP_SKEW_SECS - 1).is_err());
+    }
+
+    #[test]
+    fn one_second_beyond_negative_skew_bound_is_err() {
+        let now = 1_000_000;
+        assert!(check_timestamp_window_at(now, now + MAX_TIMESTAMP_SKEW_SECS + 1).is_err());
+    }
+
+    #[test]
+    fn near_zero_timestamp_against_realistic_now_is_err() {
+        // This is the fail-open case the router.rs change fixes: a near-zero
+        // (e.g. unset/default) timestamp must NOT pass as "fresh" just because
+        // an unusable clock previously produced now=0.
+        let realistic_now = 1_755_000_000; // a realistic recent unix timestamp
+        assert!(check_timestamp_window_at(realistic_now, 5).is_err());
+    }
+}

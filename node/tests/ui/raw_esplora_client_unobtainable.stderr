@@ -1,0 +1,22 @@
+error[E0433]: cannot find `esplora_client` in the crate root
+ --> tests/ui/raw_esplora_client_unobtainable.rs:8:15
+  |
+8 |     let _ = ::esplora_client::Builder::new("http://127.0.0.1");
+  |               ^^^^^^^^^^^^^^ could not find `esplora_client` in the list of imported crates
+  |
+help: consider importing one of these structs
+  |
+6 + use std::thread::Builder;
+  |
+6 + use bitcoin::script::Builder;
+  |
+6 + use reqwest::retry::Builder;
+  |
+6 + use tempfile::Builder;
+  |
+  = and 3 other candidates
+help: if you import `Builder`, refer to it directly
+  |
+8 -     let _ = ::esplora_client::Builder::new("http://127.0.0.1");
+8 +     let _ = Builder::new("http://127.0.0.1");
+  |

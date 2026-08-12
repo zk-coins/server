@@ -121,7 +121,7 @@ pub enum ResetDecision {
 /// live circuit; it is only consulted on the no-persisted-digest branch
 /// (when a digest IS persisted, detector 1 is authoritative and far
 /// cheaper). No circuit build, no I/O — exhaustively unit-testable.
-pub fn reset_decision(
+pub(crate) fn reset_decision(
     persisted: Option<&[u8]>,
     live: &[u8],
     canary: CanaryOutcome,
@@ -149,7 +149,7 @@ pub fn reset_decision(
 /// error is returned so the caller can decide — `heal_circuit_digest`
 /// logs and continues, because a stale proof file with a fresh DB is
 /// inert (no row points at it) and must not crash-loop the container.
-pub fn reset_proof_store_dir(proofs_dir: &str) -> std::io::Result<()> {
+pub(crate) fn reset_proof_store_dir(proofs_dir: &str) -> std::io::Result<()> {
     let path = Path::new(proofs_dir);
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
@@ -225,9 +225,61 @@ pub async fn heal_circuit_digest(
                 "Circuit changed since the persisted state was written — persisted \
                  proofs are incompatible with the current circuit. Resetting \
                  proof-dependent state to genesis (self-heal) so the node serves \
-                 cleanly."
+                 cleanly. This DESTROYS proof-dependent state (see follow-up \
+                 lines for the exact wipe set) and is irreversible without \
+                 re-funding / re-minting."
             );
-            db::reset_proof_dependent_state_tx(pool, live_digest).await?;
+            // Under exclusive v1.1:
+            //   * Do NOT wipe SMT/MMR/root-index/latest_block — structures the
+            //     v1.1 stack does not use (and that the full legacy wipe would
+            //     require a legacy marker to touch).
+            //   * DO wipe all v1 proof-dependent tables (NfLog, accounts,
+            //     last_proof/openings, pending publishes) plus leftover
+            //     legacy `accounts`, fail non-terminal jobs (strip durable
+            //     finalisation / completion_result), and store the live
+            //     binary digest (`encode_v1_live_digest(C, C_balance)` from
+            //     the embed). A digest-only update left stale
+            //     ComplianceProofs in place; the next AccountUpdate would
+            //     fail to recurse.
+            // Legacy (or unclaimed) path keeps the full proof-dependent wipe.
+            match crate::v1::process_stack_mode() {
+                Some(crate::v1::ScanStackMode::V1) => {
+                    warn!(
+                        "Self-heal reset (v1.1) will DESTROY: \
+                         v1_delivery_outbox / v1_sdr_phase_a \
+                         (outstanding mesh deliveries + replica receipts); \
+                         v1_pending_publishes (stale nullifier publish recovery); \
+                         v1_spendable_coins / v1_spent_coins (CoinHist leaves); \
+                         v1_accounts (multi-asset state + last_proof / openings); \
+                         v1_nullifier_index / v1_nflog_entries (NfLog); \
+                         v1_engine_meta (tip / network pin); \
+                         leftover legacy accounts rows; \
+                         on-disk PROOFS_DIR proof-store files; \
+                         and every non-terminal jobs row (queued/proving/\
+                         awaiting_signature/broadcasting) is marked failed with \
+                         durable finalisation + completion_result stripped so a \
+                         wiped transition cannot later report completed. \
+                         Leaving smt_state / mmr_state / mmr_root_index / \
+                         latest_block untouched (v1.1 does not use them). \
+                         Storing the live binary circuit digest."
+                    );
+                    db::reset_v1_proof_dependent_state_tx(pool, live_digest).await?;
+                }
+                _ => {
+                    warn!(
+                        "Self-heal reset (legacy) will DESTROY: \
+                         accounts (proof-bearing account blobs); \
+                         smt_state / mmr_state / mmr_root_index / latest_block \
+                         (global scan state); \
+                         on-disk PROOFS_DIR proof-store files; \
+                         and every non-terminal jobs row is marked failed with \
+                         the self-heal reset generation bumped so a concurrent \
+                         writer cannot resurrect or complete wiped work. \
+                         Storing the live circuit digest."
+                    );
+                    db::reset_proof_dependent_state_tx(pool, live_digest).await?;
+                }
+            }
             if let Err(e) = reset_proof_store_dir(proofs_dir) {
                 warn!(
                     "Self-heal: failed to drop proof-store dir {} (continuing — no \

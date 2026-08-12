@@ -1,0 +1,604 @@
+# Local developer stack for the zkCoins node (Stage-3 binary) + public API.
+#
+# Services are derived from the node/api bootstrap code, not from guesswork:
+#   - postgres:17  — state layer (node/src/test_db.rs with_tag("17"), README)
+#   - bitcoind     — regtest RPC for Stage-3 NfLog scan + AggregateStateNullifierV3
+#                    publish (node/src/v1/scan.rs, node/src/v1/publish.rs)
+#   - nostr-relay  — NIP-01 WebSocket relay (node/src/v1/nostr/relay.rs;
+#                    testcontainers pin scsibug/nostr-rs-relay:0.8.13)
+#   - node         — Dockerfile + 0.0.0.0:4242 REST + KERNEL_GRPC_ADDR gRPC
+#   - api          — sibling zk-coins/api Dockerfile; REST §7.5 over kernel gRPC
+#
+# NOT a compose service (see docs/local-stack.md):
+#   - electrs / Esplora — still required by residual NETWORK_CONFIG +
+#                    /health/ready (lib.rs build_network_config_from_env,
+#                    router.rs check_esplora); not in this file
+#   - wallet / SDK — signing and operational-bundle material stay off-compose
+#
+# No restart:always — a boot failure must stay visible.
+# No invented PUBLISHER_KEY / chain pins — compose fails at parse if missing.
+# No IS_MAINNET=true.
+# No latest-tag images.
+
+name: zkcoins-local
+
+services:
+  postgres:
+    # Version pin: testcontainers and README use postgres:17
+    # (node/src/test_db.rs:348 `.with_tag("17")`, README.md local Postgres).
+    image: postgres:17
+    environment:
+      POSTGRES_USER: zkcoins
+      # Local-only DB password for the compose network (not a crypto key).
+      # Documented in docs/local-stack.md. Do not reuse outside this stack.
+      POSTGRES_PASSWORD: localdev
+      POSTGRES_DB: zkcoins
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # Real Postgres readiness — not a always-true probe.
+      test: ["CMD-SHELL", "pg_isready -U zkcoins -d zkcoins"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  bitcoind:
+    # Image pin: repo (CI, docs, tests) does not name a bitcoind version.
+    # Chosen: bitcoin/bitcoin:31.1 — multi-platform Debian image from the
+    # willcl-ark/bitcoin-core-docker line on Docker Hub (not `latest`),
+    # carrying Bitcoin Core 31.1 release binaries. Compatible with this
+    # tree's bitcoincore-rpc 0.19 client (node/Cargo.toml, script-plonky2).
+    # Regtest only — never mainnet.
+    image: bitcoin/bitcoin:31.1
+    command:
+      - -printtoconsole
+      - -regtest=1
+      - -server=1
+      - -txindex=1
+      - -rest=1
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -fallbackfee=0.0002
+    ports:
+      # Regtest JSON-RPC/REST (docs for bitcoin/bitcoin image; tests use :18443).
+      - "18443:18443"
+    volumes:
+      # Default datadir of the image: /home/bitcoin/.bitcoin
+      # Cookie (regtest): /home/bitcoin/.bitcoin/regtest/.cookie
+      - bitcoind_data:/home/bitcoin/.bitcoin
+    healthcheck:
+      # Cookie auth + RPC: bitcoin-cli reads the cookie from the datadir.
+      # Fails until bitcoind has written regtest/.cookie and answers RPC.
+      test:
+        [
+          "CMD",
+          "bitcoin-cli",
+          "-regtest",
+          "-datadir=/home/bitcoin/.bitcoin",
+          "getblockchaininfo",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  nostr-relay:
+    # Image pin: scsibug/nostr-rs-relay:0.8.13 — same tag as the
+    # testcontainers integration tests in node/src/v1/nostr/relay.rs
+    # (RELAY_IMAGE / RELAY_TAG). Starts with the image default config
+    # (listen 0.0.0.0:8080, on-disk SQLite). Not `latest`.
+    # WebSocket NIP-01 endpoint: ws://nostr-relay:8080/ (compose DNS).
+    # Host publish is 18080 (not 8080): host 8080 is the api REST surface
+    # below — both containers listen on 8080 internally, but only one
+    # process can bind a given host port.
+    image: scsibug/nostr-rs-relay:0.8.13
+    ports:
+      - "18080:8080"
+    volumes:
+      - nostr_relay_data:/usr/src/app/db
+    healthcheck:
+      # TCP readiness on the relay listen port — the image has bash;
+      # fails until the process accepts connections on 8080.
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bitcoind:
+        condition: service_healthy
+    ports:
+      # Listener address is hard-coded: node/src/main.rs ACCOUNT_NODE_ADDR
+      # "0.0.0.0:4242"; Dockerfile EXPOSE 4242.
+      - "4242:4242"
+      # Kernel gRPC (KERNEL_GRPC_ADDR). Host-side zk-coins/api dials this.
+      - "50051:50051"
+    volumes:
+      - node_data:/data
+      # Stage-3 scanner + publisher cookie auth (v1/scan.rs, v1/publish.rs).
+      # Same volume as bitcoind; cookie path matches regtest datadir layout.
+      - type: volume
+        source: bitcoind_data
+        target: /run/bitcoind-data
+        read_only: true
+      # Signed §4.3 BootstrapManifest (BMF1). Host path is operator-supplied
+      # (produce with `gen_bootstrap_manifest` — see docs/local-stack.md).
+      # No silent default artifact; compose fails at parse if the host path
+      # env is unset. Container path is fixed so the node env pin is stable.
+      - type: bind
+        source: ${ZKCOINS_V1_BOOTSTRAP_MANIFEST_HOST_PATH:?set ZKCOINS_V1_BOOTSTRAP_MANIFEST_HOST_PATH to the host path of a signed BMF1 artifact}
+        target: /run/bootstrap/manifest.bmf1
+        read_only: true
+      # Shared verifier cache: node1 (primary) writes; node2 (secondary) loads.
+      - verifier_cache_shared:/data/verifier_cache
+    environment:
+      # --- Postgres (internal compose network; matches postgres service) ---
+      # Panic site if unset outside compose: node/src/lib.rs DATABASE_URL lazy_static.
+      DATABASE_URL: postgresql://zkcoins:localdev@postgres:5432/zkcoins
+
+      # --- Chain label for residual EsploraConfig (NOT mainnet) ---
+      # Panic: node/src/lib.rs build_network_config_from_env IS_MAINNET.
+      # Only exact "true" | "false". Local stack is never mainnet.
+      IS_MAINNET: "false"
+      NETWORK_NAME: regtest
+
+      # Still required at REST bootstrap even though Stage-3 NfLog scan is
+      # bitcoind RPC (main.rs run_v1_scan_loop). NETWORK_CONFIG panics without
+      # them (lib.rs); /health/ready pings ESPLORA_URL (router.rs ready_handler).
+      ESPLORA_URL: ${ESPLORA_URL:?set ESPLORA_URL to a live Esplora HTTP base URL}
+      ESPLORA_WS_URL: ${ESPLORA_WS_URL:?set ESPLORA_WS_URL to a live Esplora WebSocket URL}
+
+      # --- Publisher key (crypto secret — never invent a default) ---
+      # Panic: node/src/lib.rs PUBLISHER_KEY lazy_static.
+      # Quoted: the `: ` inside the :? message is a YAML mapping separator in an
+      # unquoted scalar — without the quotes `docker compose config` rejects the
+      # whole file, which is why this stack had never been validated.
+      PUBLISHER_KEY: "${PUBLISHER_KEY:?set PUBLISHER_KEY — generate with `openssl rand -hex 32`}"
+
+      # --- Username domain returned by /api/info ---
+      # Panic: node/src/lib.rs USERNAME_DOMAIN lazy_static.
+      USERNAME_DOMAIN: ${USERNAME_DOMAIN:?set USERNAME_DOMAIN e.g. local.zkcoins.test}
+
+      # --- Stage 3 exclusive stack (binary refuses Off) ---
+      # Panic: node/src/main.rs match shadow_mode V1ShadowMode::Off.
+      ZKCOINS_V1_SHADOW: "1"
+
+      # §3.6 boot pins — missing any → V1_BOOT_CONFIG_ERROR
+      # (node/src/v1/mode.rs v1_boot_pins_from_env).
+      # Regtest activation_height is pinned at 0 (mode.rs validate_v1_boot_pins).
+      ZKCOINS_NETWORK: regtest
+      ZKCOINS_ACTIVATION_HEIGHT: "0"
+      ZKCOINS_CIRCUIT_DIGEST_C: ${ZKCOINS_CIRCUIT_DIGEST_C:?set ZKCOINS_CIRCUIT_DIGEST_C (64 lowercase hex; see docs/local-stack.md)}
+      ZKCOINS_CIRCUIT_DIGEST_C_BALANCE: ${ZKCOINS_CIRCUIT_DIGEST_C_BALANCE:?set ZKCOINS_CIRCUIT_DIGEST_C_BALANCE (64 lowercase hex; see docs/local-stack.md)}
+      ZKCOINS_BOOTSTRAP_PUBKEY: ${ZKCOINS_BOOTSTRAP_PUBKEY:?set ZKCOINS_BOOTSTRAP_PUBKEY (64 lowercase hex x-only)}
+      ZKCOINS_EXPECTED_PARAMS_IDENTIFIER: ${ZKCOINS_EXPECTED_PARAMS_IDENTIFIER:?set ZKCOINS_EXPECTED_PARAMS_IDENTIFIER (SHA-256 of canonical network-params; see docs/local-stack.md)}
+
+      # Stage-3 scanner + publisher: bitcoind RPC only
+      # (node/src/v1/scan.rs v1_bitcoind_rpc_from_env;
+      #  node/src/v1/publish.rs v1_publisher_env_from_env).
+      # Production names (not the live-test ZKCOINS_REGTEST_* aliases):
+      #   URL form matches tests: http://host:18443 (no /wallet/… suffix)
+      #   cookie: path to .cookie file
+      #   wallet: loaded bitcoind wallet name
+      # Compose-internal service DNS — not host.docker.internal.
+      ZKCOINS_V1_BITCOIND_RPC_URL: http://bitcoind:18443
+      ZKCOINS_V1_BITCOIND_COOKIE_PATH: /run/bitcoind-data/regtest/.cookie
+
+      # Publisher wallet + fee + reveal — required for a mint that reaches
+      # completed (finalise handoff runs construct/broadcast; boot also
+      # aborts if pending rows exist without these — main.rs).
+      # Wallet must already exist and be funded before publish (docs).
+      ZKCOINS_V1_BITCOIND_WALLET: ${ZKCOINS_V1_BITCOIND_WALLET:?set ZKCOINS_V1_BITCOIND_WALLET to a loaded bitcoind wallet name}
+      ZKCOINS_V1_FEE_RATE_SAT_PER_VB: ${ZKCOINS_V1_FEE_RATE_SAT_PER_VB:?set ZKCOINS_V1_FEE_RATE_SAT_PER_VB integer > 0}
+      ZKCOINS_V1_REVEAL_OUTPUT_SATS: ${ZKCOINS_V1_REVEAL_OUTPUT_SATS:?set ZKCOINS_V1_REVEAL_OUTPUT_SATS integer > 0}
+
+      # Optional: comma-separated hosts for attest channel binding
+      # (node/src/v1/attest.rs public_hosts_from_env — empty is OK, fails loud on use).
+      ZKCOINS_PUBLIC_HOST: ${ZKCOINS_PUBLIC_HOST:-}
+
+      # GetInfo / ChainIdentity operational pins (node/src/kernel/chain.rs +
+      # runtime::require_chain_identity_ops_from_env). No defaults — missing
+      # aborts at parse or binary edge. Complete ChainIdentity also needs a
+      # verified §4.3 BootstrapManifest (BMF1) under the path below — produce
+      # it with `gen_bootstrap_manifest` (docs/local-stack.md).
+      ZKCOINS_RELAY_URL: ${ZKCOINS_RELAY_URL:?set ZKCOINS_RELAY_URL (operator-chosen Nostr relay URL for this node)}
+      ZKCOINS_BLOSSOM_URL: ${ZKCOINS_BLOSSOM_URL:?set ZKCOINS_BLOSSOM_URL (operator-chosen Blossom base URL for this node)}
+      ZKCOINS_MAX_BLOB_BYTES: ${ZKCOINS_MAX_BLOB_BYTES:?set ZKCOINS_MAX_BLOB_BYTES integer > 0}
+      ZKCOINS_KERNEL_PARTS: ${ZKCOINS_KERNEL_PARTS:?set ZKCOINS_KERNEL_PARTS e.g. scanner,prover,publisher}
+
+      # §7.6 AcceptFeeLess batch interval (seconds). Required when
+      # kernel_parts includes publisher — no invented default
+      # (runtime.rs ZKCOINS_PUBLISH_BATCH_ETA_SECS; missing eta with
+      # publisher role → internal_error on Publish).
+      ZKCOINS_PUBLISH_BATCH_ETA_SECS: ${ZKCOINS_PUBLISH_BATCH_ETA_SECS:?set ZKCOINS_PUBLISH_BATCH_ETA_SECS to a non-negative integer batch interval in seconds}
+
+      # §4.3 / §7.7 BMF1 path inside the container (bind-mounted above).
+      # Fixed path — host location is ZKCOINS_V1_BOOTSTRAP_MANIFEST_HOST_PATH.
+      # Artifact must verify under ZKCOINS_BOOTSTRAP_PUBKEY or boot aborts.
+      ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH: /run/bootstrap/manifest.bmf1
+
+      # Kernel gRPC bind (node/src/kernel_rpc.rs KERNEL_GRPC_ADDR — no default).
+      # Must be 0.0.0.0 so the host-side api can reach it via published 50051.
+      KERNEL_GRPC_ADDR: ${KERNEL_GRPC_ADDR:?set KERNEL_GRPC_ADDR e.g. 0.0.0.0:50051}
+
+      PROOFS_DIR: /data/proofs
+      ZKCOINS_VERIFIER_CACHE_DIR: /data/verifier_cache
+      ZKCOINS_PROVER_LEASE_PATH: /data/verifier_cache/prover.lease
+      ZKCOINS_PROVER_IDLE_TTL_SECS: "180"
+      # Verifier-cache role: primary builds circuits and WRITES the shared cache
+      # that node2 (secondary) loads (node/src/v1/mode.rs verifier_cache_role_from_env).
+      # Unset also resolves to Primary — explicit here for clarity across two nodes.
+      ZKCOINS_VERIFIER_CACHE_ROLE: primary
+      RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      # Liveness only: GET /health returns "ok" once the TCP listener is bound
+      # (node/src/router.rs health_handler). Does not mask dependency failure —
+      # /health/ready is the readiness probe (db + esplora + prover + v1_scan).
+      # /health is served only after §1.7.9 circuits (C + C_balance) stand —
+      # cold construction is multi-minute, not a hung process. start_period must
+      # cover that window so failed probes do not burn retries into unhealthy.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4242/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # 20 min: cold Plonky2 circuit construction before /health is bound.
+      # Aligns with deploy/local-e2e/up.sh node wait (1200s). Not a hang budget.
+      start_period: 1200s
+
+  api:
+    # Build context is the sibling checkout of zk-coins/api next to this
+    # node worktree: …/zk-coins/api when this file lives in …/zk-coins/node
+    # (compose path ../api). That layout is an operator assumption, not a
+    # monorepo guarantee. If the api repo is elsewhere, point
+    # build.context at that path (or build/tag an image yourself and
+    # replace this block with `image:`) — there is no fallback context
+    # and no pre-built registry pin in this stack.
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+    # depends_on — only what the api process actually dials:
+    #   node (YES): ZKCOINS_KERNEL_ADDR → kernel gRPC (api/src/config.rs,
+    #     api/src/main.rs connect_lazy, api/src/kernel/client.rs). Every
+    #     non-local REST surface is a kernel RPC pass-through.
+    #   postgres (NO): api holds no value-bearing DB and has no DATABASE_URL
+    #     (api/src/config.rs closed env set). Postgres is node-only.
+    #   bitcoind (NO): api never speaks Bitcoin RPC; scan/publish stay in
+    #     the kernel (node/src/v1/scan.rs, node/src/v1/publish.rs).
+    #   nostr-relay (NO): NIP-01 transport and delivery live in the node
+    #     path, not in the api process (api only proxies kernel RPCs;
+    #     local-stack.md: node client not yet wired into send/receive).
+    depends_on:
+      node:
+        condition: service_healthy
+    ports:
+      # Operator bind: ZKCOINS_BIND_ADDR (api/src/config.rs + main.rs).
+      # Local-stack convention inside the container: 0.0.0.0:8080
+      # (Dockerfile EXPOSE 8080) — not a binary default.
+      - "8080:8080"
+    volumes:
+      # §7.4 content-addressed Blossom store (api/src/config.rs
+      # ZKCOINS_BLOSSOM_STORE; api/src/blossom/store.rs BlobStore::open).
+      - api_blossom_data:/data/blossom
+    environment:
+      # --- Pflicht (api/src/config.rs Config::from_env) — no defaults ---
+      ZKCOINS_BIND_ADDR: "0.0.0.0:8080"
+      # Compose DNS → node KERNEL_GRPC_ADDR (published host 50051).
+      ZKCOINS_KERNEL_ADDR: "http://node:50051"
+      # Variable required; unknown token is a start error. Full pass needs
+      # at least wallet,explorer (docs/local-stack.md). Empty string =
+      # all features off is allowed by the binary but rejected here by
+      # ${…:?} so an operator must name the set explicitly.
+      ZKCOINS_FEATURES: ${ZKCOINS_FEATURES:?set ZKCOINS_FEATURES e.g. wallet,explorer}
+      # Variable required; empty string allowed (OwnershipProof / session
+      # surfaces fail loud — mint/sign/nullifier do not need it).
+      # For host-side wallets dialing http://127.0.0.1:8080 the SDK derives
+      # chan_bind from host "127.0.0.1:8080" (sdk/src/v1/ownership.ts
+      # canonicalHostFromApiUrl) — set that exact string when using
+      # bootstrap/pull/attest/grants from the host.
+      ZKCOINS_PUBLIC_HOST: ${ZKCOINS_PUBLIC_HOST:-}
+
+      # --- Blossom (§7.4) — store set ⇒ companions Pflicht ---
+      # Store path matches the volume mount. Absent store would leave
+      # blossom routes unmounted; this stack mounts the store so delivery
+      # blobs have a local holder.
+      ZKCOINS_BLOSSOM_STORE: /data/blossom
+      ZKCOINS_BLOSSOM_MAX_BLOB_BYTES: ${ZKCOINS_BLOSSOM_MAX_BLOB_BYTES:?set ZKCOINS_BLOSSOM_MAX_BLOB_BYTES integer > 0}
+      # Variable required when store is set; empty string allowed
+      # (surface up, every upload 403 — api/src/config.rs).
+      ZKCOINS_BLOSSOM_ALLOWED_OPS: ${ZKCOINS_BLOSSOM_ALLOWED_OPS:-}
+
+      RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      # Liveness only: GET /health → body "ok" once the TCP listener is
+      # bound (api/src/routes.rs health). Do **not** probe /health/ready
+      # here: that path is a GetInfo projection (api/src/info.rs
+      # health_ready) and depends on kernel ChainIdentity (verified BMF1 +
+      # ops pins). A depends_on on ready would park the stack on kernel
+      # identity issues without proving the REST listener is up.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  postgres2:
+    # Version pin: testcontainers and README use postgres:17
+    # (node/src/test_db.rs:348 `.with_tag("17")`, README.md local Postgres).
+    image: postgres:17
+    environment:
+      POSTGRES_USER: zkcoins
+      # Local-only DB password for the compose network (not a crypto key).
+      # Documented in docs/local-stack.md. Do not reuse outside this stack.
+      POSTGRES_PASSWORD: localdev
+      POSTGRES_DB: zkcoins
+    volumes:
+      - postgres2_data:/var/lib/postgresql/data
+    healthcheck:
+      # Real Postgres readiness — not a always-true probe.
+      test: ["CMD-SHELL", "pg_isready -U zkcoins -d zkcoins"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  node2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres2:
+        condition: service_healthy
+      bitcoind:
+        condition: service_healthy
+      node:
+        condition: service_healthy
+    ports:
+      # Listener address is hard-coded: node/src/main.rs ACCOUNT_NODE_ADDR
+      # "0.0.0.0:4242"; Dockerfile EXPOSE 4242. Host 4243 avoids node1 collision.
+      - "4243:4242"
+      # Kernel gRPC (KERNEL_GRPC_ADDR). Host 50052 avoids node1's 50051.
+      - "50052:50051"
+    volumes:
+      - node2_data:/data
+      # Stage-3 scanner + publisher cookie auth (v1/scan.rs, v1/publish.rs).
+      # Same volume as bitcoind; cookie path matches regtest datadir layout.
+      - type: volume
+        source: bitcoind_data
+        target: /run/bitcoind-data
+        read_only: true
+      # Signed §4.3 BootstrapManifest (BMF1). Host path is operator-supplied
+      # (produce with `gen_bootstrap_manifest` — see docs/local-stack.md).
+      # No silent default artifact; compose fails at parse if the host path
+      # env is unset. Container path is fixed so the node env pin is stable.
+      # Same BMF1 as node1 (same network, same bootstrap trust anchor).
+      - type: bind
+        source: ${ZKCOINS_V1_BOOTSTRAP_MANIFEST_HOST_PATH:?set ZKCOINS_V1_BOOTSTRAP_MANIFEST_HOST_PATH to the host path of a signed BMF1 artifact}
+        target: /run/bootstrap/manifest.bmf1
+        read_only: true
+      # Shared verifier cache written by node1 (primary); secondary only reads
+      # (node/src/main.rs VerifierCacheRole::Secondary → load_balance_verifier_cache_checked).
+      - type: volume
+        source: verifier_cache_shared
+        target: /data/verifier_cache
+        read_only: true
+    environment:
+      # --- Postgres (internal compose network; matches postgres2 service) ---
+      # Panic site if unset outside compose: node/src/lib.rs DATABASE_URL lazy_static.
+      DATABASE_URL: postgresql://zkcoins:localdev@postgres2:5432/zkcoins
+
+      # --- Chain label for residual EsploraConfig (NOT mainnet) ---
+      # Panic: node/src/lib.rs build_network_config_from_env IS_MAINNET.
+      # Only exact "true" | "false". Local stack is never mainnet.
+      IS_MAINNET: "false"
+      NETWORK_NAME: regtest
+
+      # Still required at REST bootstrap even though Stage-3 NfLog scan is
+      # bitcoind RPC (main.rs run_v1_scan_loop). NETWORK_CONFIG panics without
+      # them (lib.rs); /health/ready pings ESPLORA_URL (router.rs ready_handler).
+      ESPLORA_URL: ${ESPLORA_URL:?set ESPLORA_URL to a live Esplora HTTP base URL}
+      ESPLORA_WS_URL: ${ESPLORA_WS_URL:?set ESPLORA_WS_URL to a live Esplora WebSocket URL}
+
+      # --- Publisher key (crypto secret — never invent a default) ---
+      # Panic: node/src/lib.rs PUBLISHER_KEY lazy_static.
+      # Quoted: the `: ` inside the :? message is a YAML mapping separator in an
+      # unquoted scalar — without the quotes `docker compose config` rejects the
+      # whole file, which is why this stack had never been validated.
+      PUBLISHER_KEY: "${PUBLISHER_KEY_2:?set PUBLISHER_KEY_2 — a second openssl rand -hex 32 for node2's identity, distinct from PUBLISHER_KEY}"
+
+      # --- Username domain returned by /api/info ---
+      # Panic: node/src/lib.rs USERNAME_DOMAIN lazy_static.
+      USERNAME_DOMAIN: ${USERNAME_DOMAIN:?set USERNAME_DOMAIN e.g. local.zkcoins.test}
+
+      # --- Stage 3 exclusive stack (binary refuses Off) ---
+      # Panic: node/src/main.rs match shadow_mode V1ShadowMode::Off.
+      ZKCOINS_V1_SHADOW: "1"
+
+      # §3.6 boot pins — missing any → V1_BOOT_CONFIG_ERROR
+      # (node/src/v1/mode.rs v1_boot_pins_from_env).
+      # Regtest activation_height is pinned at 0 (mode.rs validate_v1_boot_pins).
+      ZKCOINS_NETWORK: regtest
+      ZKCOINS_ACTIVATION_HEIGHT: "0"
+      ZKCOINS_CIRCUIT_DIGEST_C: ${ZKCOINS_CIRCUIT_DIGEST_C:?set ZKCOINS_CIRCUIT_DIGEST_C (64 lowercase hex; see docs/local-stack.md)}
+      ZKCOINS_CIRCUIT_DIGEST_C_BALANCE: ${ZKCOINS_CIRCUIT_DIGEST_C_BALANCE:?set ZKCOINS_CIRCUIT_DIGEST_C_BALANCE (64 lowercase hex; see docs/local-stack.md)}
+      ZKCOINS_BOOTSTRAP_PUBKEY: ${ZKCOINS_BOOTSTRAP_PUBKEY:?set ZKCOINS_BOOTSTRAP_PUBKEY (64 lowercase hex x-only)}
+      ZKCOINS_EXPECTED_PARAMS_IDENTIFIER: ${ZKCOINS_EXPECTED_PARAMS_IDENTIFIER:?set ZKCOINS_EXPECTED_PARAMS_IDENTIFIER (SHA-256 of canonical network-params; see docs/local-stack.md)}
+
+      # Stage-3 scanner + publisher: bitcoind RPC only
+      # (node/src/v1/scan.rs v1_bitcoind_rpc_from_env;
+      #  node/src/v1/publish.rs v1_publisher_env_from_env).
+      # Production names (not the live-test ZKCOINS_REGTEST_* aliases):
+      #   URL form matches tests: http://host:18443 (no /wallet/… suffix)
+      #   cookie: path to .cookie file
+      #   wallet: loaded bitcoind wallet name
+      # Compose-internal service DNS — not host.docker.internal.
+      ZKCOINS_V1_BITCOIND_RPC_URL: http://bitcoind:18443
+      ZKCOINS_V1_BITCOIND_COOKIE_PATH: /run/bitcoind-data/regtest/.cookie
+
+      # Publisher wallet + fee + reveal — required for a mint that reaches
+      # completed (finalise handoff runs construct/broadcast; boot also
+      # aborts if pending rows exist without these — main.rs).
+      # Wallet must already exist and be funded before publish (docs).
+      ZKCOINS_V1_BITCOIND_WALLET: ${ZKCOINS_V1_BITCOIND_WALLET_2:?set ZKCOINS_V1_BITCOIND_WALLET_2 to a loaded bitcoind wallet name for node2, e.g. zkcoins2}
+      ZKCOINS_V1_FEE_RATE_SAT_PER_VB: ${ZKCOINS_V1_FEE_RATE_SAT_PER_VB:?set ZKCOINS_V1_FEE_RATE_SAT_PER_VB integer > 0}
+      ZKCOINS_V1_REVEAL_OUTPUT_SATS: ${ZKCOINS_V1_REVEAL_OUTPUT_SATS:?set ZKCOINS_V1_REVEAL_OUTPUT_SATS integer > 0}
+
+      # Optional: comma-separated hosts for attest channel binding
+      # (node/src/v1/attest.rs public_hosts_from_env — empty is OK, fails loud on use).
+      ZKCOINS_PUBLIC_HOST: ${ZKCOINS_PUBLIC_HOST_2:-}
+      ZKCOINS_V1_RECOVERY: "1"
+      ZKCOINS_V1_RECOVERY_PAGE_LIMIT: "500"
+      ZKCOINS_V1_RECOVERY_EARLIEST: "0"
+
+      # GetInfo / ChainIdentity operational pins (node/src/kernel/chain.rs +
+      # runtime::require_chain_identity_ops_from_env). No defaults — missing
+      # aborts at parse or binary edge. Complete ChainIdentity also needs a
+      # verified §4.3 BootstrapManifest (BMF1) under the path below — produce
+      # it with `gen_bootstrap_manifest` (docs/local-stack.md).
+      ZKCOINS_RELAY_URL: ${ZKCOINS_RELAY_URL:?set ZKCOINS_RELAY_URL (operator-chosen Nostr relay URL for this node)}
+      ZKCOINS_BLOSSOM_URL: ${ZKCOINS_BLOSSOM_URL_2:?set ZKCOINS_BLOSSOM_URL_2 (operator-chosen Blossom base URL for node2, e.g. http://api2:8080/)}
+      ZKCOINS_MAX_BLOB_BYTES: ${ZKCOINS_MAX_BLOB_BYTES:?set ZKCOINS_MAX_BLOB_BYTES integer > 0}
+      ZKCOINS_KERNEL_PARTS: ${ZKCOINS_KERNEL_PARTS:?set ZKCOINS_KERNEL_PARTS e.g. scanner,prover,publisher}
+
+      # §7.6 AcceptFeeLess batch interval (seconds). Required when
+      # kernel_parts includes publisher — no invented default
+      # (runtime.rs ZKCOINS_PUBLISH_BATCH_ETA_SECS; missing eta with
+      # publisher role → internal_error on Publish).
+      ZKCOINS_PUBLISH_BATCH_ETA_SECS: ${ZKCOINS_PUBLISH_BATCH_ETA_SECS:?set ZKCOINS_PUBLISH_BATCH_ETA_SECS to a non-negative integer batch interval in seconds}
+
+      # §4.3 / §7.7 BMF1 path inside the container (bind-mounted above).
+      # Fixed path — host location is ZKCOINS_V1_BOOTSTRAP_MANIFEST_HOST_PATH.
+      # Artifact must verify under ZKCOINS_BOOTSTRAP_PUBKEY or boot aborts.
+      ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH: /run/bootstrap/manifest.bmf1
+
+      # Kernel gRPC bind (node/src/kernel_rpc.rs KERNEL_GRPC_ADDR — no default).
+      # Must be 0.0.0.0 so the host-side api can reach it via published 50052.
+      KERNEL_GRPC_ADDR: ${KERNEL_GRPC_ADDR:?set KERNEL_GRPC_ADDR e.g. 0.0.0.0:50051}
+
+      PROOFS_DIR: /data/proofs
+      ZKCOINS_VERIFIER_CACHE_DIR: /data/verifier_cache
+      ZKCOINS_PROVER_LEASE_PATH: /data/verifier_cache/prover.lease
+      ZKCOINS_PROVER_IDLE_TTL_SECS: "180"
+      # Verifier-cache role: secondary LOADS the shared cache written by node1
+      # (node/src/v1/mode.rs verifier_cache_role_from_env; main.rs Secondary).
+      ZKCOINS_VERIFIER_CACHE_ROLE: secondary
+      RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      # Liveness only: GET /health returns "ok" once the TCP listener is bound
+      # (node/src/router.rs health_handler). Does not mask dependency failure —
+      # /health/ready is the readiness probe (db + esplora + prover + v1_scan).
+      # /health is served only after §1.7.9 circuits (C + C_balance) stand —
+      # cold construction is multi-minute, not a hung process. start_period must
+      # cover that window so failed probes do not burn retries into unhealthy.
+      # Container-internal port remains 4242 (host mapping is 4243).
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4242/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # 20 min: cold Plonky2 circuit construction before /health is bound.
+      # Aligns with deploy/local-e2e/up.sh node wait (1200s). Not a hang budget.
+      start_period: 1200s
+
+  api2:
+    # Build context is the sibling checkout of zk-coins/api next to this
+    # node worktree: …/zk-coins/api when this file lives in …/zk-coins/node
+    # (compose path ../api). That layout is an operator assumption, not a
+    # monorepo guarantee. If the api repo is elsewhere, point
+    # build.context at that path (or build/tag an image yourself and
+    # replace this block with `image:`) — there is no fallback context
+    # and no pre-built registry pin in this stack.
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+    # depends_on — only what the api process actually dials:
+    #   node2 (YES): ZKCOINS_KERNEL_ADDR → kernel gRPC (api/src/config.rs,
+    #     api/src/main.rs connect_lazy, api/src/kernel/client.rs). Every
+    #     non-local REST surface is a kernel RPC pass-through.
+    #   postgres (NO): api holds no value-bearing DB and has no DATABASE_URL
+    #     (api/src/config.rs closed env set). Postgres is node-only.
+    #   bitcoind (NO): api never speaks Bitcoin RPC; scan/publish stay in
+    #     the kernel (node/src/v1/scan.rs, node/src/v1/publish.rs).
+    #   nostr-relay (NO): NIP-01 transport and delivery live in the node
+    #     path, not in the api process (api only proxies kernel RPCs;
+    #     local-stack.md: node client not yet wired into send/receive).
+    depends_on:
+      node2:
+        condition: service_healthy
+    ports:
+      # Operator bind: ZKCOINS_BIND_ADDR (api/src/config.rs + main.rs).
+      # Local-stack convention inside the container: 0.0.0.0:8080
+      # (Dockerfile EXPOSE 8080) — not a binary default. Host 8081 avoids api.
+      - "8081:8080"
+    volumes:
+      # §7.4 content-addressed Blossom store (api/src/config.rs
+      # ZKCOINS_BLOSSOM_STORE; api/src/blossom/store.rs BlobStore::open).
+      - api2_blossom_data:/data/blossom
+    environment:
+      # --- Pflicht (api/src/config.rs Config::from_env) — no defaults ---
+      ZKCOINS_BIND_ADDR: "0.0.0.0:8080"
+      # Compose DNS → node2 KERNEL_GRPC_ADDR (container-internal 50051).
+      ZKCOINS_KERNEL_ADDR: "http://node2:50051"
+      # Variable required; unknown token is a start error. Full pass needs
+      # at least wallet,explorer (docs/local-stack.md). Empty string =
+      # all features off is allowed by the binary but rejected here by
+      # ${…:?} so an operator must name the set explicitly.
+      ZKCOINS_FEATURES: ${ZKCOINS_FEATURES:?set ZKCOINS_FEATURES e.g. wallet,explorer}
+      # Variable required; empty string allowed (OwnershipProof / session
+      # surfaces fail loud — mint/sign/nullifier do not need it).
+      # For host-side wallets dialing http://127.0.0.1:8080 the SDK derives
+      # chan_bind from host "127.0.0.1:8080" (sdk/src/v1/ownership.ts
+      # canonicalHostFromApiUrl) — set that exact string when using
+      # bootstrap/pull/attest/grants from the host.
+      ZKCOINS_PUBLIC_HOST: ${ZKCOINS_PUBLIC_HOST_2:-}
+
+      # --- Blossom (§7.4) — store set ⇒ companions Pflicht ---
+      # Store path matches the volume mount. Absent store would leave
+      # blossom routes unmounted; this stack mounts the store so delivery
+      # blobs have a local holder.
+      ZKCOINS_BLOSSOM_STORE: /data/blossom
+      ZKCOINS_BLOSSOM_MAX_BLOB_BYTES: ${ZKCOINS_BLOSSOM_MAX_BLOB_BYTES:?set ZKCOINS_BLOSSOM_MAX_BLOB_BYTES integer > 0}
+      # Variable required when store is set; empty string allowed
+      # (surface up, every upload 403 — api/src/config.rs).
+      ZKCOINS_BLOSSOM_ALLOWED_OPS: ${ZKCOINS_BLOSSOM_ALLOWED_OPS:-}
+
+      RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      # Liveness only: GET /health → body "ok" once the TCP listener is
+      # bound (api/src/routes.rs health). Do **not** probe /health/ready
+      # here: that path is a GetInfo projection (api/src/info.rs
+      # health_ready) and depends on kernel ChainIdentity (verified BMF1 +
+      # ops pins). A depends_on on ready would park the stack on kernel
+      # identity issues without proving the REST listener is up.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  postgres_data:
+  node_data:
+  bitcoind_data:
+  nostr_relay_data:
+  api_blossom_data:
+  node2_data:
+  postgres2_data:
+  api2_blossom_data:
+  # Host-global shared lease/cache volume. Create once before `up` with:
+  # `docker volume create zkcoins_verifier_cache_shared`.
+  verifier_cache_shared:
+    external: true
+    name: zkcoins_verifier_cache_shared

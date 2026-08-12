@@ -1,0 +1,19 @@
+error[E0425]: cannot find function `clear_process_stack_mode_for_test` in module `node::v1`
+  --> tests/ui/clear_process_stack_mode_unobtainable.rs:14:15
+   |
+14 |     node::v1::clear_process_stack_mode_for_test();
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `node::v1`
+
+error[E0425]: cannot find function `clear_process_stack_mode_for_test` in crate `stack_policy`
+  --> tests/ui/clear_process_stack_mode_unobtainable.rs:17:19
+   |
+17 |     stack_policy::clear_process_stack_mode_for_test();
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `stack_policy`
+   |
+note: found an item that was configured out
+  --> $WORKSPACE/stack-policy/src/lib.rs
+   |
+   | #[cfg(test)]
+   |       ---- the item is gated here
+   | pub fn clear_process_stack_mode_for_test() {
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

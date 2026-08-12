@@ -1,0 +1,7 @@
+error[E0560]: struct `ReceiveRequest` has no field named `nav_rand`
+  --> tests/ui/receive_request_nav_rand_unobtainable.rs:18:9
+   |
+18 |         nav_rand: [0u8; 32],
+   |         ^^^^^^^^ `ReceiveRequest` does not have this field
+   |
+   = note: all struct fields are already assigned

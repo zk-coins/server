@@ -1,6 +1,7 @@
 use super::*;
 use crate::db::{insert_root_index, load_root_indices, persist_state_tx};
 use crate::test_db::setup_pool;
+use crate::v1::{claim_stack_scan_mode, ScanStackMode};
 use bitcoin::bip32::{ChildNumber, Xpub};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
@@ -9,6 +10,12 @@ use shared::SECP256K1;
 use std::str::FromStr;
 use zkcoins_program::circuit::main::MMR_PROOF_PATH_LEN;
 use zkcoins_program::hash::{digest_from_bytes, hash_concat};
+
+async fn claim_legacy_stack(pool: &sqlx::PgPool) {
+    claim_stack_scan_mode(pool, ScanStackMode::Legacy)
+        .await
+        .expect("claim legacy stack for test");
+}
 
 const HASH_SIZE: usize = 32;
 
@@ -91,6 +98,7 @@ async fn test_persist_and_load_state_roundtrip() {
     // BEGIN/COMMIT in Postgres (issue #11 fix).
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
 
     // Create and populate a state
     let mut original_state = State::new();
@@ -230,6 +238,7 @@ async fn test_serialize_for_persist_roundtrip() {
 
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let (smt_bytes, mmr_bytes) = state.serialize_for_persist().unwrap();
     persist_state_tx(&pool, &smt_bytes, &mmr_bytes, &[0u8; 32], None)
         .await
@@ -467,6 +476,7 @@ async fn test_get_commitment_proof_returns_err_when_smt_has_key_but_mmr_empty() 
     // MMR directly, then reloading.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
 
     let mut populated = State::new();
     let commitment = create_test_commitment(
@@ -495,6 +505,9 @@ async fn test_get_commitment_proof_returns_err_when_smt_has_key_but_mmr_empty() 
 /// `mmr_root_index` in one transaction). Mirrors the production
 /// scanner-callback shape after the Phase-C atomicity fix.
 async fn populate_state_with_persistence(pool: &PgPool, count: usize) -> State {
+    // Callers that share a pool may already have claimed; claim is
+    // idempotent for the same mode.
+    claim_legacy_stack(pool).await;
     let mut state = State::new();
     for i in 0..count {
         let key_hex = format!("{:064x}", i + 1);
@@ -582,6 +595,7 @@ async fn test_get_mmr_inclusion_proof_after_restart_succeeds() {
     // (matches what a Plonky2 proof commits as `commitment_history_root`).
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
 
     // Capture each pre-update `prev_mmr_root` during the populate run.
     let mut prev_roots: Vec<HashDigest> = Vec::new();
@@ -740,6 +754,7 @@ async fn test_insert_root_index_is_idempotent_on_conflict() {
     // same `prev_mmr_root` must not error and must not duplicate.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let prev = digest_from_bytes(&[1u8; 32]);
     let smt = digest_from_bytes(&[2u8; 32]);
     insert_root_index(&pool, &prev, &smt, 0)

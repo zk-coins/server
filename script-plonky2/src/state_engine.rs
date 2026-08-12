@@ -1,0 +1,6353 @@
+//! In-memory zkCoins state-transition engine (P1-E.2).
+//!
+//! Wires host state primitives (`AccountState`, per-account `CoinHistTree`,
+//! global `NfLogAccumulator`) to the P1-E.1 [`ProverBridge`] and drives the
+//! §2.3 two-phase lifecycle (`request` → `awaiting_signature` → `finalise`)
+//! for mint / send / receive.
+//!
+//! # Scope / non-scope
+//!
+//! - Purely in-memory: no DB, no I/O, no REST (those are P1-G).
+//! - Fail-loud: every invalid state returns `Err`; checks are never skipped.
+//! - **Receive path assumption:** [`StateEngine::begin_receive`] admits an
+//!   already-verified received coin. The caller's node is responsible for
+//!   decrypting the `CoinProof` bundle and re-verifying the creating proof /
+//!   Bitcoin first-occurrence scan **before** calling `begin_receive`. Bundle
+//!   decrypt and Bitcoin scan belong to P1-G.
+//! - **Incoming-transition host checks:** [`StateEngine::verify_incoming_transition`]
+//!   runs bridge verify + cyclic-tail pin and the canonical-NAV / `size_final`
+//!   precondition (D.5 Caveat A). The Bitcoin first-occurrence anchor check for
+//!   a foreign `(Pk, R)` needs the chain scanner and is **out of scope here**
+//!   (P1-G).
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use anyhow::{bail, ensure, Context, Result};
+use shared::spec_v1::{
+    self as host, AccountState, Address, ChainPosition, Coin, CoinHistTree, CoinTemplate,
+    FoldOutcome, HashDigest, LookupResult, Nav, NfLogAccumulator, NfLogEntry, ProofData,
+    PublishedNullifier, TreeKind,
+};
+use zkcoins_program_plonky2::circuit::compliance::{
+    Network, MAX_ACCOUNT_ASSETS, MAX_RX_COINS, MAX_TX_INPUTS, MAX_TX_OUTPUTS,
+};
+
+use crate::prover_bridge::{
+    AssetIssuance, ComplianceProof, InputAuthorization, NavOpening, NullifierOpening,
+    PredecessorNullifier, ProvedTransition, ProverBridge, ReceivedAuthorization, TransitionMode,
+    TransitionSignature, TransitionWitness,
+};
+
+// ---------------------------------------------------------------------------
+// Scanner-only NfLog append capability
+// ---------------------------------------------------------------------------
+
+/// Capability token proving a nullifier was observed on the scan path.
+///
+/// Fields are private. The sole production constructor is
+/// [`ScannedNullifier::from_survivor`], which takes a
+/// [`PublishedNullifier`] emitted by the scanner (or by the node-side
+/// fold of scanner survivors). A free-floating [`ChainPosition`] cannot
+/// reach [`StateEngine::append_nullifier`] — possession of this type is
+/// the proof the position came through the scan path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScannedNullifier {
+    chain_pos: ChainPosition,
+    pk: [u8; 32],
+    r: [u8; 32],
+}
+
+impl ScannedNullifier {
+    /// Mint a scan-path capability from a survivor observed on chain.
+    ///
+    /// This is the only production constructor. Callers outside the scan
+    /// fold must not invent positions; they hold a survivor the scanner
+    /// (or `members_to_published` of a scanned inscription) produced.
+    pub fn from_survivor(nf: &PublishedNullifier) -> Self {
+        Self {
+            chain_pos: nf.chain_pos,
+            pk: nf.pk,
+            r: nf.r,
+        }
+    }
+
+    pub fn chain_pos(self) -> ChainPosition {
+        self.chain_pos
+    }
+
+    pub fn pk(self) -> [u8; 32] {
+        self.pk
+    }
+
+    pub fn r(self) -> [u8; 32] {
+        self.r
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dependency-not-final (typed cause for §7.5 `dependency_not_final`)
+// ---------------------------------------------------------------------------
+
+/// Why a transition cannot yet bind its predecessor nullifier.
+///
+/// Returned as the **cause** of an `anyhow::Error` from
+/// [`StateEngine::account_transition_context`] (via `begin_*`). The human
+/// [`Display`] text is diagnostic only — outward classification must
+/// downcast this type, not parse the message.
+///
+/// Spec §7.5 maps both variants to machine code `dependency_not_final`
+/// (HTTP 409): the wallet waits for finality / inclusion and resubmits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyNotFinal {
+    /// Account `last_nullifier` is absent from the canonical NfLog
+    /// (applied receive not yet scan-folded, or never published).
+    PredecessorAbsentFromCanonicalNfLog,
+    /// Predecessor is on the NfLog but its position is not covered by
+    /// `size_final` at the current tip (not yet 6-confirmation-final).
+    PredecessorPositionNotCoveredBySizeFinal { position: u64, size_final: u64 },
+}
+
+impl std::fmt::Display for DependencyNotFinal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PredecessorAbsentFromCanonicalNfLog => write!(
+                f,
+                "predecessor nullifier is not in the canonical NfLog \
+                 (awaiting on-chain inclusion / scan-fold); refusing AccountUpdateProof"
+            ),
+            Self::PredecessorPositionNotCoveredBySizeFinal {
+                position,
+                size_final,
+            } => write!(
+                f,
+                "predecessor nullifier position {position} is not covered by size_final nav.size {size_final}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DependencyNotFinal {}
+
+// ---------------------------------------------------------------------------
+// Request types (wallet → engine)
+// ---------------------------------------------------------------------------
+
+/// §2.3.1 mint / issuance intent.
+#[derive(Clone, Debug)]
+pub struct MintRequest {
+    pub owner: Address,
+    /// Operational nullifier key (node operational bundle).
+    pub nk: [u8; 32],
+    /// Nav-rand secret (A/4'; operational bundle). Keys deterministic `nav_rand`.
+    /// Debug-redacted via [`OpSecret`]; never caller-supplied as `nav_rand`.
+    pub op_secret: OpSecret,
+    /// Consumed spend key `Pkᵢ` (`Pk₀` for a genesis mint).
+    pub current_pubkey: [u8; 32],
+    /// Rotated spend key `Pkᵢ₊₁` folded into `new_account_state`.
+    pub next_pubkey: [u8; 32],
+    /// Human-readable asset name (hashed; never on-chain).
+    pub name: Vec<u8>,
+    pub decimals: u8,
+    pub amount: u128,
+    /// Token standard: `1` (default / uncapped) or `2` (capped).
+    pub issuance_version: u8,
+    /// Token-standard-2 supply cap; must be `0` for standard 1.
+    pub cap_total: u128,
+    /// Token-standard-2 terms salt; all-zero for standard 1.
+    pub terms_salt: [u8; 32],
+    /// Mint-output recipients (§6.5). Symmetric to `SendRequest::output_templates`,
+    /// but a mint has no inputs, so there is no separate change computation: the
+    /// amounts of every entry (which must all carry this mint's derived `asset_id`
+    /// — conservation forbids any other asset in a mint's outputs) MUST sum to
+    /// exactly `amount`. Token-standard-1 conventionally carries one self-addressed
+    /// entry (today's implicit behaviour, now explicit). Token-standard-2 REQUIRES
+    /// at least one entry and forbids every entry from being self-addressed — the
+    /// circuit (`enforce_mint`) makes a self-addressed v2 output unprovable, not
+    /// merely uncredited.
+    pub output_templates: Vec<CoinTemplate>,
+    pub npk_rand: [u8; 32],
+}
+
+/// §2.3.2 send intent. Change outputs are computed by the engine.
+///
+/// `nav_rand` is **not** a request field: the engine derives it from the
+/// account's stored `op_secret` and the entry `send_counter` of the pending
+/// transition (§1.4 / Requirement 10).
+#[derive(Clone, Debug)]
+pub struct SendRequest {
+    pub owner: Address,
+    /// Identifiers of spendable coins the account owns (state-`1`).
+    pub input_coin_ids: Vec<HashDigest>,
+    /// Recipient output templates (before per-asset change).
+    pub output_templates: Vec<CoinTemplate>,
+    pub next_pubkey: [u8; 32],
+    pub npk_rand: [u8; 32],
+}
+
+/// §2.3.3 receive intent.
+///
+/// **Precondition (caller):** each entry of `received_coins` / `received_auth`
+/// comes from a `CoinProof` the caller has already decrypted and fully
+/// re-verified (creating proof + clause-10 host material). Bundle decrypt and
+/// the Bitcoin first-occurrence scan are P1-G responsibilities — this engine
+/// only folds the verified receipt into the account state.
+///
+/// `nav_rand` is derived inside the engine from `op_secret` and the entry
+/// `send_counter` — it is not representable on this type.
+#[derive(Clone, Debug)]
+pub struct ReceiveRequest {
+    pub owner: Address,
+    /// Operational nullifier key. Required so a first receive can construct
+    /// the canonical empty account for the `InitialProof` path.
+    pub nk: [u8; 32],
+    /// Nav-rand secret (A/4'; operational bundle). Required on every receive
+    /// so a first-transition account can be created and so a registered
+    /// account can refuse a mismatched bundle.
+    pub op_secret: OpSecret,
+    /// Consumed spend key `Pkᵢ` (`Pk₀` for a first-transition receive).
+    pub current_pubkey: [u8; 32],
+    pub received_coins: Vec<Coin>,
+    pub received_auth: Vec<ReceivedAuthorization>,
+    pub next_pubkey: [u8; 32],
+    pub npk_rand: [u8; 32],
+}
+
+/// Operational nav-rand secret (`A/4'`, §1.2). Part of the operational bundle
+/// entrusted to the account's **own** node — never sent to a foreign node,
+/// never logged, and never handed out as raw bytes to arbitrary callers.
+///
+/// ## Unreachability (not merely formatting)
+///
+/// The inner `[u8; 32]` is **private**. There is no public field, no
+/// `as_bytes`, and no [`serde::Serialize`] / [`serde::Deserialize`] on this
+/// type — so `format!("{:?}", secret.0)`, `secret.as_bytes()`, and
+/// `serde_json::to_string(&secret)` are all unobtainable outside this module.
+///
+/// - [`Debug`] / [`Display`] always print `OpSecret([REDACTED])`, so a newly
+///   added `{:?}` on any containing type (`MintRequest`, `PendingTransition`,
+///   `AccountSnapshot`, …) cannot print the key.
+/// - The **sole in-process consumer** of the raw material is
+///   [`OpSecret::derive_nav_rand`] (HKDF for §1.4 `nav_rand`). That is visible
+///   on the type: callers derive; they do not extract.
+/// - Durable paths that must still touch bytes are **explicit and narrow**:
+///   - [`OpSecret::to_account_row_bytea`] / [`from_account_row_bytea`] for the
+///     `v1_accounts.op_secret` BYTEA column;
+///   - [`FinalisationCapability::to_durable_bytes`] /
+///     [`from_durable_bytes`] (private wire layout; no general-purpose
+///     `Serialize` on `PendingTransition` / `FinalisationCapability`).
+///
+/// What remains open: those two durable codecs, and the opaque hex blob
+/// `capability_bincode_hex` once produced (Debug-redacted on
+/// `DurableFinalisationPersist` / `Job`, but still present in storage JSON).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct OpSecret([u8; 32]);
+
+impl OpSecret {
+    /// Construct from the account's operational-bundle secret material.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Sole in-process use of the raw secret: HKDF → `nav_rand` (§1.4).
+    ///
+    /// `nav_rand = HKDF("zkCoins/v1/NavRand", op_secret ‖ u64-be(send_counter))`.
+    pub fn derive_nav_rand(self, send_counter: u64) -> [u8; 32] {
+        host::derive_nav_rand(&self.0, send_counter)
+    }
+
+    /// Encode for the `v1_accounts.op_secret` BYTEA column.
+    ///
+    /// Narrow durable path only — not a general-purpose byte accessor and not
+    /// reachable via `Debug`/`Serialize` of containing types.
+    pub fn to_account_row_bytea(self) -> [u8; 32] {
+        self.0
+    }
+
+    /// Decode from the `v1_accounts.op_secret` BYTEA column.
+    pub const fn from_account_row_bytea(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for OpSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpSecret([REDACTED])")
+    }
+}
+
+impl std::fmt::Display for OpSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpSecret([REDACTED])")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State model
+// ---------------------------------------------------------------------------
+
+/// Metadata needed to spend a state-`1` coin (clause-2 auth + history).
+#[derive(Clone, Debug)]
+pub struct TrackedCoin {
+    pub coin: Coin,
+    /// `prev_ash` of the transition that created this coin (clause 2 / 5).
+    pub creating_prev_ash: HashDigest,
+    /// Output index within the creating transition.
+    pub coin_index: u32,
+}
+
+/// Per-account in-memory record.
+pub struct AccountRecord {
+    pub state: AccountState,
+    pub coinhist: CoinHistTree,
+    /// Account nullifier key (operational bundle).
+    pub nk: [u8; 32],
+    /// Nav-rand secret (A/4'; operational bundle). `None` only for pre-migration
+    /// rows that never received a bundle write — any transition that needs
+    /// `nav_rand` **refuses** rather than inventing a value.
+    pub op_secret: Option<OpSecret>,
+    /// Address-bound genesis spend key `Pk₀`.
+    pub genesis_pubkey: [u8; 32],
+    /// Spendable (state-`1`) coins keyed by `digest_to_bytes(identifier)`.
+    pub spendable: BTreeMap<[u8; 32], TrackedCoin>,
+    /// Spent (state-`2`) coin ids retained so the coin-history SMT can be
+    /// rebuilt without cloning `CoinHistTree`.
+    pub spent_ids: BTreeSet<[u8; 32]>,
+    /// Last compliance proof (required for `AccountUpdateProof`).
+    pub last_proof: Option<ComplianceProof>,
+    pub last_nav_opening: Option<NavOpening>,
+    pub last_nullifier: Option<NullifierOpening>,
+    pub last_nullifier_pos: Option<u64>,
+}
+
+/// Phase-1 output: witness ready for the wallet to sign (`awaiting_signature`).
+///
+/// **No** derived `Serialize`/`Deserialize`: the embedded [`OpSecret`] must
+/// not become reachable through general-purpose serialisation of this type.
+/// Durable resume goes only through
+/// [`FinalisationCapability::to_durable_bytes`] /
+/// [`FinalisationCapability::from_durable_bytes`].
+#[derive(Clone, Debug)]
+pub struct PendingTransition {
+    /// Full `TransitionWitness` with a placeholder signature; `finalise`
+    /// overwrites `transition_signature` before proving.
+    pub witness_wip: TransitionWitness,
+    pub proof_data: ProofData,
+    pub proof_data_hash: [u8; 32],
+    pub mode: TransitionMode,
+    /// Account this transition advances.
+    pub owner: Address,
+    /// NAV opening used for this transition (stored on apply).
+    pub nav_opening: NavOpening,
+    /// Operational nav-rand secret resolved for this transition (bundle).
+    /// Persisted onto the account on apply; Debug-redacted; not serde-reachable.
+    pub op_secret: OpSecret,
+}
+
+/// Private bincode wire for [`PendingTransition`].
+///
+/// Field order and types match the historical derived layout (where
+/// `OpSecret` was a serde newtype over `[u8; 32]`) so existing
+/// `capability_bincode_hex` blobs remain loadable. The wire type is never
+/// public — the only encode/decode entry points are
+/// [`FinalisationCapability::to_durable_bytes`] /
+/// [`from_durable_bytes`](FinalisationCapability::from_durable_bytes).
+///
+/// `witness_wip` uses the private witness wire (same byte layout as the
+/// former derived serde of public [`TransitionWitness`]). Decode binds
+/// embedded proofs in [`FinalisationCapability::from_durable_bytes`].
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct PendingTransitionWire {
+    witness_wip: crate::prover_bridge::TransitionWitnessWire,
+    proof_data: ProofData,
+    proof_data_hash: [u8; 32],
+    mode: TransitionMode,
+    owner: Address,
+    nav_opening: NavOpening,
+    op_secret: [u8; 32],
+}
+
+impl PendingTransition {
+    fn to_wire(&self) -> PendingTransitionWire {
+        PendingTransitionWire {
+            witness_wip: self.witness_wip.to_wire(),
+            proof_data: self.proof_data.clone(),
+            proof_data_hash: self.proof_data_hash,
+            mode: self.mode,
+            owner: self.owner,
+            nav_opening: self.nav_opening,
+            op_secret: self.op_secret.0,
+        }
+    }
+
+    fn from_wire(wire: PendingTransitionWire) -> Self {
+        Self {
+            witness_wip: TransitionWitness::from_wire(wire.witness_wip),
+            proof_data: wire.proof_data,
+            proof_data_hash: wire.proof_data_hash,
+            mode: wire.mode,
+            owner: wire.owner,
+            nav_opening: wire.nav_opening,
+            op_secret: OpSecret(wire.op_secret),
+        }
+    }
+}
+
+/// Durable, engine-owned finalisation capability for **prove + apply**.
+///
+/// Contains **everything** [`StateEngine::finalise`] /
+/// [`StateEngine::prove_pending_transition_detached`] +
+/// [`StateEngine::apply_proved_transition`] need from the host side.
+///
+/// Host-side publication of the §7.5 job result and job completion carry
+/// additional durable fields on the node envelope (`completion_result` /
+/// `completion_status` / `publisher_pubkey`) — derived the same way, from
+/// what those steps depend on including handed-in values. This engine type
+/// deliberately stops at prove/apply; the node composes the full path.
+///
+/// ## Contents (derived from what prove/apply depends on)
+///
+/// | Field | Why it is here |
+/// |-------|----------------|
+/// | `pending` (full [`PendingTransition`]) | prove installs the signature on the full host witness; apply re-validates live deps against it |
+/// | `signature` (once accepted) | caller-supplied wallet authorisation; prove binds it into the witness |
+///
+/// Live engine state (account tip, NfLog size, CoinHist, own-Pk absence) is
+/// **not** snapshotted here: apply re-validates those against the live engine
+/// after prove (same invariant as the receive path).
+///
+/// ## Persistence boundary
+///
+/// This type does **not** derive `Serialize`/`Deserialize`. The only supported
+/// durable encoding is [`to_durable_bytes`](Self::to_durable_bytes) /
+/// [`from_durable_bytes`](Self::from_durable_bytes) (private wire; embeds
+/// `op_secret` as raw bytes for resume). General-purpose `bincode::serialize`
+/// / `serde_json::to_string` on this type or on [`PendingTransition`] do not
+/// compile — so a newly added `{:?}` is not the only redaction; the secret is
+/// not reachable through containing-type serde either.
+///
+/// ## Idempotency of consumers
+///
+/// This type is pure data. Callers make resume safe with an **exclusive
+/// status claim** (only one resumer may enter finalise) and by persisting
+/// the completion surface after apply so a second resume publishes and
+/// completes without re-applying. The engine itself fails loud on a second
+/// apply against a moved account head.
+#[derive(Clone, Debug)]
+pub struct FinalisationCapability {
+    pending: PendingTransition,
+    signature: Option<TransitionSignature>,
+}
+
+/// Private bincode wire for [`FinalisationCapability`] (historical layout).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct FinalisationCapabilityWire {
+    pending: PendingTransitionWire,
+    signature: Option<TransitionSignature>,
+}
+
+impl FinalisationCapability {
+    /// Stage a pending transition produced by `begin_*` (unsigned).
+    pub fn stage(pending: PendingTransition) -> Self {
+        Self {
+            pending,
+            signature: None,
+        }
+    }
+
+    /// Install a wallet signature that already passed host verification.
+    ///
+    /// Fails loud if `sig.pk_i` does not match the pending account head —
+    /// never stores a signature that cannot authorise this transition.
+    pub fn install_signature(&mut self, sig: TransitionSignature) -> Result<()> {
+        ensure!(
+            sig.pk_i == self.pending.witness_wip.prev_account_state.current_pubkey,
+            "FinalisationCapability::install_signature: pk_i does not match \
+             pending prev_account_state.current_pubkey"
+        );
+        self.signature = Some(sig);
+        Ok(())
+    }
+
+    pub fn pending(&self) -> &PendingTransition {
+        &self.pending
+    }
+
+    pub fn signature(&self) -> Option<&TransitionSignature> {
+        self.signature.as_ref()
+    }
+
+    pub fn is_signed(&self) -> bool {
+        self.signature.is_some()
+    }
+
+    /// Split into the `(pending, signature)` pair finalise consumes.
+    ///
+    /// Fails if no signature has been installed — never invents a zero sig.
+    pub fn into_finalise_parts(self) -> Result<(PendingTransition, TransitionSignature)> {
+        let sig = self.signature.ok_or_else(|| {
+            anyhow::anyhow!("FinalisationCapability::into_finalise_parts: no signature installed")
+        })?;
+        Ok((self.pending, sig))
+    }
+
+    /// Explicit durable encoding for job-row resume (`capability_bincode_hex`).
+    ///
+    /// The only supported serialisation path that carries `op_secret`. Not
+    /// reachable via derived `Serialize` on this type or on
+    /// [`PendingTransition`]. Wire layout matches the historical
+    /// `bincode(FinalisationCapability)` newtype encoding of `OpSecret`.
+    pub fn to_durable_bytes(&self) -> Result<Vec<u8>> {
+        let wire = FinalisationCapabilityWire {
+            pending: self.pending.to_wire(),
+            signature: self.signature.clone(),
+        };
+        bincode::serialize(&wire).context("bincode serialize FinalisationCapability durable wire")
+    }
+
+    /// Inverse of [`to_durable_bytes`](Self::to_durable_bytes).
+    ///
+    /// **Stage 3 load gate:** the wire embeds a full [`TransitionWitness`],
+    /// which may carry `prev_proof` and receipt `creating_proof`s. Every
+    /// durable rehydrate path must bind those proofs to circuit `C`
+    /// identity — raw bincode alone accepts a well-formed proof of another
+    /// circuit (same Rust type alias). Uses the same bind set as
+    /// [`TransitionWitness::decode_bound`].
+    pub fn from_durable_bytes(bytes: &[u8], network: Network) -> Result<Self> {
+        let wire: FinalisationCapabilityWire = bincode::deserialize(bytes)
+            .context("bincode deserialize FinalisationCapability durable wire")?;
+        let pending = PendingTransition::from_wire(wire.pending);
+        let bridge = ProverBridge::new(network);
+        pending.witness_wip.bind_embedded_proofs(&bridge).context(
+            "FinalisationCapability durable decode: embedded compliance \
+                 proof(s) failed circuit-C identity bind",
+        )?;
+        Ok(Self {
+            pending,
+            signature: wire.signature,
+        })
+    }
+}
+
+/// Capability token: a pending transition that has been **proved**.
+///
+/// Fields are private. The sole production constructors are
+/// [`StateEngine::prove_pending_transition`] and
+/// [`StateEngine::prove_pending_transition_detached`]. Possession of this
+/// type is the proof a real prove ran — callers of
+/// [`StateEngine::apply_proved_transition`] (and node
+/// `commit_proved_receive`) cannot fabricate a hollow envelope.
+///
+/// A test-only hollow mint exists under **`#[cfg(test)]` in this crate only**
+/// so unit tests here can inject concurrent scan work between prove and apply
+/// without a multi-minute circuit. `cfg(test)` is never true for a dependency
+/// library build — external crates (including `node` integration tests) cannot
+/// enable it via features, transitive activation, or any Cargo flag.
+#[derive(Clone, Debug)]
+pub struct ProvedPendingTransition {
+    pending: PendingTransition,
+    proved: ProvedTransition,
+    signature: TransitionSignature,
+}
+
+impl ProvedPendingTransition {
+    /// Assemble a proved envelope from parts that already match each other.
+    ///
+    /// Performs only self-consistency checks (signature ↔ prev pubkey,
+    /// proved `ProofData` ↔ pending). **Does not** consult live engine state
+    /// — that is [`StateEngine::apply_proved_transition`]'s job after any
+    /// concurrent scan work.
+    ///
+    /// **Private:** only the prove path in this module may mint the
+    /// capability. External crates cannot construct a hollow envelope.
+    fn from_parts(
+        mut pending: PendingTransition,
+        proved: ProvedTransition,
+        signature: TransitionSignature,
+    ) -> Result<Self> {
+        ensure!(
+            signature.pk_i == pending.witness_wip.prev_account_state.current_pubkey,
+            "signature pk_i does not equal prev_account_state.current_pubkey"
+        );
+        ensure!(
+            pending.proof_data_hash
+                == host::hash_proof_data(&host::serialize_proof_data(&pending.proof_data)),
+            "pending proof_data_hash does not match proof_data"
+        );
+        ensure!(
+            proved.proof_data == pending.proof_data,
+            "proved ProofData differs from pending ProofData"
+        );
+        pending.witness_wip.transition_signature = signature.clone();
+        Ok(Self {
+            pending,
+            proved,
+            signature,
+        })
+    }
+
+    /// Test-only hollow mint for unit tests **in this crate**.
+    ///
+    /// Gated solely on `#[cfg(test)]` of the defining crate. That cfg is
+    /// never set when this library is compiled as a dependency — no Cargo
+    /// feature, no transitive activation, and no external test target can
+    /// open this door. External tests that need a proved envelope must use
+    /// a real prove ([`StateEngine::prove_pending_transition`] /
+    /// [`StateEngine::prove_pending_transition_detached`]).
+    #[cfg(test)]
+    pub fn from_parts_for_test(
+        pending: PendingTransition,
+        proved: ProvedTransition,
+        signature: TransitionSignature,
+    ) -> Result<Self> {
+        Self::from_parts(pending, proved, signature)
+    }
+
+    pub fn pending(&self) -> &PendingTransition {
+        &self.pending
+    }
+
+    pub fn proved(&self) -> &ProvedTransition {
+        &self.proved
+    }
+
+    pub fn signature(&self) -> &TransitionSignature {
+        &self.signature
+    }
+}
+
+/// Phase-2 output after a successful prove + atomic state apply.
+///
+/// **Capability token.** Fields are private. The sole production constructors
+/// are [`StateEngine::apply_proved_transition`], [`StateEngine::finalise`],
+/// and [`StateEngine::finalise_pending_chain_nullifier`] (the latter two go
+/// through prove → apply). Possession means a real apply ran against a
+/// [`ProvedPendingTransition`]; external crates cannot fabricate a hollow
+/// applied transition to drive publish / durable-state helpers.
+#[derive(Clone, Debug)]
+pub struct AppliedTransition {
+    proved: ProvedTransition,
+    /// On-chain nullifier `(Pkᵢ, R)` extracted from the transition signature.
+    nullifier: ([u8; 32], [u8; 32]),
+}
+
+impl AppliedTransition {
+    pub fn proved(&self) -> &ProvedTransition {
+        &self.proved
+    }
+
+    /// On-chain nullifier `(Pkᵢ, R)`.
+    pub fn nullifier(&self) -> ([u8; 32], [u8; 32]) {
+        self.nullifier
+    }
+}
+
+/// In-memory state-transition engine.
+pub struct StateEngine {
+    bridge: ProverBridge,
+    network: Network,
+    accounts: HashMap<Address, AccountRecord>,
+    activation_height: u64,
+    nflog: NfLogAccumulator,
+    /// Mirror of folded `NfLogEntry` values (for `size_final` NAV / inclusion
+    /// / consistency proofs — the accumulator does not expose its log).
+    nflog_entries: Vec<NfLogEntry>,
+    /// Canonical positions parallel to `nflog_entries`. Retained so finalise
+    /// can replay the accumulator transactionally before committing a fold.
+    nflog_positions: Vec<ChainPosition>,
+    tip_height: u64,
+    /// Strictly-increasing fold ordinal at the current tip (as `tx_index`).
+    fold_seq: u32,
+}
+
+/// Shared begin_* setup: mode, prev state, recursion material, coinhist leaves.
+type AccountTransitionContext = (
+    TransitionMode,
+    AccountState,
+    Option<ComplianceProof>,
+    Option<NavOpening>,
+    Option<PredecessorNullifier>,
+    Vec<HashDigest>,
+    BTreeMap<[u8; 32], host::CoinHistState>,
+);
+
+impl StateEngine {
+    /// Construct an empty engine for `network` with NfLog activation height.
+    pub fn new(network: Network, activation_height: u64) -> Self {
+        Self {
+            bridge: ProverBridge::new(network),
+            network,
+            accounts: HashMap::new(),
+            activation_height,
+            nflog: NfLogAccumulator::new(activation_height),
+            nflog_entries: Vec::new(),
+            nflog_positions: Vec::new(),
+            tip_height: 0,
+            fold_seq: 0,
+        }
+    }
+
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    pub fn tip_height(&self) -> u64 {
+        self.tip_height
+    }
+
+    /// Advance the Bitcoin tip used for `size_final` (scanner / tests).
+    pub fn set_tip_height(&mut self, tip_height: u64) {
+        self.tip_height = tip_height;
+        self.fold_seq = 0;
+    }
+
+    pub fn account(&self, owner: &Address) -> Option<&AccountRecord> {
+        self.accounts.get(owner)
+    }
+
+    pub fn nflog(&self) -> &NfLogAccumulator {
+        &self.nflog
+    }
+
+    pub fn activation_height(&self) -> u64 {
+        self.activation_height
+    }
+
+    pub fn fold_seq(&self) -> u32 {
+        self.fold_seq
+    }
+
+    pub fn bridge(&self) -> &ProverBridge {
+        &self.bridge
+    }
+
+    /// NfLog mirror in absolute position order: `(ChainPosition, entry)`.
+    ///
+    /// The sequence is the normative reconstruction input: reloading by
+    /// folding these pairs in order yields a byte-identical NfLog root.
+    pub fn nflog_mirror(&self) -> Vec<(ChainPosition, NfLogEntry)> {
+        self.nflog_positions
+            .iter()
+            .copied()
+            .zip(self.nflog_entries.iter().copied())
+            .collect()
+    }
+
+    /// Iterate accounts currently held by the engine.
+    pub fn accounts(&self) -> impl Iterator<Item = (&Address, &AccountRecord)> {
+        self.accounts.iter()
+    }
+
+    /// Rebuild an engine from a complete persisted snapshot.
+    ///
+    /// Fails loud if:
+    /// - NfLog positions are not a dense `0..n` sequence when folded,
+    /// - any fold is duplicate / pre-activation,
+    /// - account coinhist roots disagree with `AccountState`,
+    /// - the rebuilt NfLog root disagrees with the source entries.
+    ///
+    /// Does **not** fall back to an empty engine on partial data.
+    pub fn from_persisted(
+        network: Network,
+        activation_height: u64,
+        tip_height: u64,
+        fold_seq: u32,
+        nflog: Vec<(ChainPosition, NfLogEntry)>,
+        accounts: Vec<(Address, AccountRecord)>,
+    ) -> Result<Self> {
+        let mut engine = Self::new(network, activation_height);
+        // Do not call `set_tip_height` here: it zeroes `fold_seq`.
+        engine.tip_height = tip_height;
+        engine.fold_seq = fold_seq;
+
+        for (expected_pos, (chain_pos, entry)) in nflog.iter().copied().enumerate() {
+            match engine
+                .nflog
+                .fold(chain_pos, entry.pk, entry.r)
+                .context("from_persisted: NfLog fold failed")?
+            {
+                FoldOutcome::Appended(pos) => ensure!(
+                    pos == expected_pos as u64,
+                    "from_persisted: NfLog position gap or reorder at expected {expected_pos}, got {pos}"
+                ),
+                FoldOutcome::DuplicateIgnored => {
+                    bail!("from_persisted: NfLog snapshot contains a duplicate Pk at position {expected_pos}")
+                }
+                FoldOutcome::BelowActivationHeight => {
+                    bail!(
+                        "from_persisted: NfLog snapshot entry at position {expected_pos} \
+                         is below activation_height {activation_height}"
+                    )
+                }
+            }
+            engine.nflog_entries.push(entry);
+            engine.nflog_positions.push(chain_pos);
+        }
+
+        ensure!(
+            engine.nflog.nav().size == engine.nflog_entries.len() as u64,
+            "from_persisted: NfLog size drifted from entry count"
+        );
+        ensure!(
+            engine.nflog.nav().mth == host::nflog_mth(&engine.nflog_entries),
+            "from_persisted: NfLog MTH disagrees with full-sequence recomputation"
+        );
+
+        for (owner, record) in accounts {
+            engine.insert_account(owner, record)?;
+        }
+        Ok(engine)
+    }
+
+    /// Append a nullifier that was **observed by the scan path**.
+    ///
+    /// Requires a [`ScannedNullifier`] capability token — a bare
+    /// [`ChainPosition`] is not accepted. Possession of the token is proof
+    /// the position came from a scanner-emitted survivor (or an explicit
+    /// test mint of that survivor type). Updates the live accumulator and
+    /// its entry/position mirrors together. Fails loud on out-of-order
+    /// positions, pre-activation folds, and first-occurrence duplicates
+    /// (does not silently ignore duplicates — the scanner is expected to
+    /// classify those before calling this).
+    pub fn append_nullifier(&mut self, scanned: ScannedNullifier) -> Result<u64> {
+        let chain_pos = scanned.chain_pos;
+        let pk = scanned.pk;
+        let r = scanned.r;
+        let expected_pos = self.nflog_entries.len() as u64;
+        match self
+            .nflog
+            .fold(chain_pos, pk, r)
+            .context("append_nullifier: fold failed")?
+        {
+            FoldOutcome::Appended(pos) => {
+                ensure!(
+                    pos == expected_pos,
+                    "append_nullifier: position mismatch expected {expected_pos}, got {pos}"
+                );
+                self.nflog_entries.push(NfLogEntry { pk, r });
+                self.nflog_positions.push(chain_pos);
+                Ok(pos)
+            }
+            FoldOutcome::DuplicateIgnored => {
+                bail!("append_nullifier: Pk already present (first-occurrence would ignore)")
+            }
+            FoldOutcome::BelowActivationHeight => {
+                bail!(
+                    "append_nullifier: height {} is below activation_height {}",
+                    chain_pos.height,
+                    self.activation_height
+                )
+            }
+        }
+    }
+
+    /// Insert a pre-built account (e.g. funded fixture for tests / recovery).
+    ///
+    /// Fails if `owner` is already present.
+    ///
+    /// Also enforces the host invariant that the durable sets and the
+    /// committed coin-history root agree — the same checks the DB loader
+    /// applies when reconstructing a `CoinHistTree` from
+    /// `spendable`/`spent_ids` (see `node/src/v1/db_v1.rs` `into_record`):
+    /// - `spendable ∩ spent_ids = ∅`
+    /// - `rebuild_coinhist(leaves_from_sets(...)).root() == state.coin_history_root`
+    ///
+    /// The tree itself is not persisted; reconstruction from those sets is
+    /// authoritative. Guarding only `record.coinhist.root()` would miss a
+    /// contradictory set pair whose provided tree happens to match the root.
+    pub fn insert_account(&mut self, owner: Address, record: AccountRecord) -> Result<()> {
+        ensure!(
+            record.state.owner == owner,
+            "AccountRecord.owner does not match insert key"
+        );
+        ensure!(
+            !self.accounts.contains_key(&owner),
+            "account already present in the engine"
+        );
+        for id in record.spendable.keys() {
+            ensure!(
+                !record.spent_ids.contains(id),
+                "coin_id is both spendable and spent"
+            );
+        }
+        let rebuilt = rebuild_coinhist(&leaves_from_sets(&record.spendable, &record.spent_ids))
+            .context("insert_account: rebuild coinhist from spendable/spent_ids")?;
+        ensure!(
+            rebuilt.root() == record.state.coin_history_root,
+            "coinhist root after rebuild does not match AccountState.coin_history_root"
+        );
+        ensure!(
+            record.coinhist.root() == record.state.coin_history_root,
+            "coinhist root does not match AccountState.coin_history_root"
+        );
+        self.accounts.insert(owner, record);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // §2.3.1 Mint
+    // -----------------------------------------------------------------------
+
+    /// Phase 1 of mint / issuance (§2.3.1 + §6.5).
+    ///
+    /// **Token standard 1** (`issuance_version == 1`): empty inputs, one
+    /// self-output, `asset_issuance`, `nav = size_final`. Works as an
+    /// `InitialProof` (fresh account) **or** as an `AccountUpdateProof`
+    /// re-mint into an existing multi-asset account — §6.5 and §2.3.1 step 4
+    /// explicitly admit follow-up mints carrying `asset_issuance`; the
+    /// circuit's clause-3 mint checks apply identically on both modes.
+    ///
+    /// **Token standard 2** (`issuance_version == 2`): the host enforces the
+    /// unsatisfiable cases by name before any witness is built:
+    /// - amount `> cap_total` → §6.5 clause (e) / §2.1 clause 3
+    /// - non-genesis account (re-issuance) → §6.5 clause (f) genesis binding
+    /// - otherwise (no non-owner `output_templates` entry) → §6.5 clause (g); every
+    ///   `output_templates` entry must be non-owner-addressed, or the circuit's `enforce_mint`
+    ///   makes the witness unprovable
+    ///
+    /// Circuit `C` still re-checks every mint clause in-circuit when a
+    /// witness is eventually proved; the host checks are fail-closed
+    /// preflight, not a substitute for `C`.
+    pub fn begin_mint(&self, req: MintRequest) -> Result<PendingTransition> {
+        ensure!(
+            matches!(req.issuance_version, 1 | 2),
+            "unsupported issuance_version {}",
+            req.issuance_version
+        );
+        ensure!(req.amount > 0, "mint amount must be non-zero");
+        ensure!(
+            req.output_templates.len() <= MAX_TX_OUTPUTS,
+            "too many output templates: {} > {}",
+            req.output_templates.len(),
+            MAX_TX_OUTPUTS
+        );
+
+        let nk_commit = host::nk_commit(&req.nk);
+        // For genesis, owner = H(Pk₀ ‖ nk_commit). For a follow-up mint the
+        // address is still bound to Pk₀, not the rotated current_pubkey — the
+        // request carries the durable owner identity.
+        if let Some(existing) = self.accounts.get(&req.owner) {
+            ensure!(existing.state.owner == req.owner, "account owner mismatch");
+            ensure!(
+                existing.nk == req.nk,
+                "nk does not match the registered account"
+            );
+            match existing.op_secret {
+                None => {
+                    bail!("mint: op_secret missing for account — refusing (no silent default)");
+                }
+                Some(stored) => {
+                    ensure!(
+                        req.op_secret == stored,
+                        "op_secret does not match the registered account"
+                    );
+                }
+            }
+            ensure!(
+                existing.state.current_pubkey == req.current_pubkey,
+                "current_pubkey does not match the registered account"
+            );
+            ensure!(
+                host::nk_commit(&req.nk) == existing.state.nk_commit,
+                "nk does not open the registered nk_commit"
+            );
+            // §6.5 clause (b) / §2.1 clause 3: creator binding uses Pk₀
+            // (genesis_pubkey), not the rotated current key.
+            let expected_owner = Address(host::address(&existing.genesis_pubkey, nk_commit));
+            ensure!(
+                req.owner == expected_owner,
+                "token-standard-1 remint refused: H(creator_pubkey ‖ nk_commit) != owner \
+                 (§6.5 clause (b) / §2.1 clause 3 creator binding)"
+            );
+        } else {
+            let expected_owner = Address(host::address(&req.current_pubkey, nk_commit));
+            ensure!(
+                req.owner == expected_owner,
+                "owner must equal H(current_pubkey ‖ nk_commit) for a genesis mint"
+            );
+        }
+
+        // Token-standard-2 host preflight — refuse naming the clause, never
+        // construct an unprovable witness. Order: cap (e) then genesis (f)
+        // then emission (g), so each refusal is independently testable.
+        if req.issuance_version == 2 {
+            ensure!(
+                req.amount <= req.cap_total,
+                "token-standard-2 mint refused: amount exceeds cap_total \
+                 (§6.5 clause (e) / §2.1 clause 3 cap enforcement)"
+            );
+            if let Some(existing) = self.accounts.get(&req.owner) {
+                // Clause (f): mint MUST be the issuing account's genesis
+                // transition (send_counter == 0 and current_pubkey == Pk₀).
+                let is_genesis = existing.state.send_counter == 0
+                    && existing.state.current_pubkey == existing.genesis_pubkey
+                    && req.current_pubkey == existing.genesis_pubkey;
+                ensure!(
+                    is_genesis,
+                    "token-standard-2 mint refused: re-issuance into a non-genesis account \
+                     (§6.5 clause (f) genesis binding / §2.1 clause 3)"
+                );
+            }
+            // Clause (g): the circuit (`enforce_mint`, program-plonky2/src/circuit/
+            // compliance/skeleton.rs) asserts `forbidden_v2 == 0` for every ACTIVE
+            // output whose asset_id matches the issuance — an outright in-circuit
+            // BAN on any self-addressed output of the minted asset, not a soft
+            // "admit but do not credit". Every template must therefore be present
+            // and non-owner-addressed, or the witness would be unprovable; refuse
+            // host-side rather than build it.
+            ensure!(
+                !req.output_templates.is_empty()
+                    && req
+                        .output_templates
+                        .iter()
+                        .all(|t| t.recipient != req.owner),
+                "token-standard-2 mint requires an explicit non-owner emission recipient \
+                 (§6.5 clause (g) emission); MintRequest.output_templates must contain at \
+                 least one entry and every entry's recipient must differ from owner — \
+                 refusing rather than constructing an unprovable self-credit witness"
+            );
+        } else {
+            ensure!(
+                req.cap_total == 0,
+                "token-standard-1 mint requires cap_total == 0"
+            );
+            ensure!(
+                req.terms_salt == [0u8; 32],
+                "token-standard-1 mint requires all-zero terms_salt"
+            );
+            // Token-standard-1 is self-retained issuance: the creator mints into
+            // its own account; only token-standard-2 emits to a non-owner (§6.5
+            // clause (g), exclusive to issuance_version == 2). Enforce the single
+            // self-output shape host-side, fail-closed. asset_id per entry is
+            // already validated later by the generic conservation loop below —
+            // this only pins recipient identity, entry count, and amount.
+            ensure!(
+                req.output_templates.len() == 1
+                    && req.output_templates[0].recipient == req.owner
+                    && req.output_templates[0].amount == req.amount,
+                "token-standard-1 mint requires exactly one self-addressed \
+                 output_templates entry whose amount equals the mint amount \
+                 (single-issuer, self-retained issuance); got {} entries",
+                req.output_templates.len()
+            );
+        }
+
+        let name_hash = host::name_hash(&req.name).context("name_hash")?;
+        let creator_pubkey = match self.accounts.get(&req.owner) {
+            Some(rec) => rec.genesis_pubkey,
+            None => req.current_pubkey,
+        };
+        let asset_id = if req.issuance_version == 2 {
+            host::asset_id_v2(
+                host::GENESIS_TAG,
+                &creator_pubkey,
+                &name_hash,
+                req.decimals,
+                2,
+                req.cap_total,
+                &req.terms_salt,
+            )
+        } else {
+            host::asset_id_v1(
+                host::GENESIS_TAG,
+                &creator_pubkey,
+                &name_hash,
+                req.decimals,
+                1,
+            )
+        };
+        let terms_hash = if req.issuance_version == 2 {
+            host::terms_hash_v2(asset_id, 2, req.cap_total, &req.terms_salt)
+        } else {
+            host::terms_hash_v1(asset_id, 1)
+        };
+        let issuance = AssetIssuance {
+            asset_id,
+            creator_pubkey,
+            issuance_version: req.issuance_version,
+            name_hash,
+            decimals: req.decimals,
+            amount: req.amount,
+            terms_hash,
+            cap_total: req.cap_total,
+            terms_salt: req.terms_salt,
+        };
+
+        // Every template must describe THIS mint's asset (conservation forbids any
+        // other asset in a mint's outputs — a mint has no inputs) and the amounts
+        // must sum to exactly `req.amount` (mandatory in-circuit for v2 via
+        // `enforce_mint`'s `connect_wide(selected_out, amount)`; chosen as the
+        // uniform host rule for v1 too — no implicit mint-side burn/change).
+        let mut templates_sum: u128 = 0;
+        for (i, template) in req.output_templates.iter().enumerate() {
+            ensure!(
+                template.amount > 0,
+                "output_templates[{i}] amount must be non-zero"
+            );
+            ensure!(
+                template.asset_id == asset_id,
+                "output_templates[{i}].asset_id does not match this mint's derived asset_id"
+            );
+            templates_sum = templates_sum
+                .checked_add(template.amount)
+                .context("output_templates amount overflow")?;
+        }
+        ensure!(
+            templates_sum == req.amount,
+            "sum of output_templates amounts ({templates_sum}) does not equal mint amount ({})",
+            req.amount
+        );
+
+        let (
+            mode,
+            prev_account_state,
+            prev_proof,
+            prev_nav_opening,
+            predecessor_nullifier,
+            nav_consistency,
+            mut hist_leaves,
+        ) = self.account_transition_context(&req.owner, &req.nk, req.current_pubkey)?;
+
+        let prev_ash =
+            host::account_state_hash(&prev_account_state).context("hash prev account state")?;
+
+        // Build every output coin, mirroring begin_send's sequential
+        // self-output-admission loop (~line 1279-1334 of this file). A template is
+        // admitted to the issuer's own coin-history and credited to `balances`
+        // only when it is BOTH self-addressed AND token-standard-1 — a v2 mint can
+        // never reach this loop with a self-addressed template (refused above).
+        let mut hist_for_proofs = rebuild_coinhist(&hist_leaves)?;
+        let mut output_coins = Vec::with_capacity(req.output_templates.len());
+        let mut output_history_proofs = Vec::with_capacity(req.output_templates.len());
+        let mut new_balances = prev_account_state.balances.clone();
+        for (index, template) in req.output_templates.iter().enumerate() {
+            let coin = Coin {
+                identifier: host::coin_identifier(
+                    prev_ash,
+                    &template.recipient.0,
+                    asset_id,
+                    template.amount,
+                    index as u32,
+                ),
+                recipient: template.recipient,
+                amount: template.amount,
+                asset_id,
+            };
+            let is_self = template.recipient == req.owner;
+            let admits_self_credit = is_self && req.issuance_version == 1;
+            if admits_self_credit {
+                let id = host::digest_to_bytes(&coin.identifier);
+                let proof = hist_for_proofs
+                    .non_inclusion(id)
+                    .context("self-output coin_id already present")?;
+                ensure!(
+                    proof.verify(&id, hist_for_proofs.root()),
+                    "self-output history proof does not open the current sequential root"
+                );
+                output_history_proofs.push(Some(proof));
+                hist_for_proofs
+                    .admit(id)
+                    .context("apply sequential self-output admission to temporary coinhist")?;
+                hist_leaves.insert(id, host::CoinHistState::Admitted);
+                credit_balance(&mut new_balances, asset_id, template.amount)?;
+            } else {
+                output_history_proofs.push(None);
+            }
+            output_coins.push(coin);
+        }
+
+        let new_hist = rebuild_coinhist(&hist_leaves)?;
+        ensure!(
+            hist_for_proofs.root() == new_hist.root(),
+            "temporary sequential coinhist diverges from rebuilt final tree"
+        );
+        let new_root = new_hist.root();
+
+        let entry_send_counter = prev_account_state.send_counter;
+        let new_send = entry_send_counter
+            .checked_add(1)
+            .context("send_counter overflow")?;
+        let new_account_state = AccountState::new(
+            req.owner,
+            prev_account_state.nk_commit,
+            new_balances,
+            req.next_pubkey,
+            new_send,
+            new_root,
+        )
+        .context("construct new AccountState after mint")?;
+
+        let nav_rand = req.op_secret.derive_nav_rand(entry_send_counter);
+        let nav = self.size_final_nav()?;
+        let nav_opening = NavOpening { nav, nav_rand };
+        let proof_data = compute_proof_data(
+            &new_account_state,
+            &output_coins,
+            &[],
+            &req.nk,
+            (nav, &nav_rand, &req.next_pubkey, &req.npk_rand),
+        )?;
+        let proof_data_hash = host::hash_proof_data(&host::serialize_proof_data(&proof_data));
+
+        let witness_wip = TransitionWitness {
+            mode,
+            prev_account_state,
+            new_account_state,
+            input_coins: Vec::new(),
+            input_auth: Vec::new(),
+            output_templates: req.output_templates.clone(),
+            output_coins,
+            output_history_proofs,
+            received_coins: Vec::new(),
+            received_auth: Vec::new(),
+            asset_issuance: Some(issuance),
+            nk: req.nk,
+            nav,
+            nav_rand,
+            prev_nav_opening,
+            nav_consistency,
+            next_pubkey: req.next_pubkey,
+            npk_rand: req.npk_rand,
+            transition_signature: placeholder_signature(req.current_pubkey),
+            prev_proof,
+            predecessor_nullifier,
+        };
+
+        Ok(PendingTransition {
+            witness_wip,
+            proof_data,
+            proof_data_hash,
+            mode,
+            owner: req.owner,
+            nav_opening,
+            op_secret: req.op_secret,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // §2.3.2 Send
+    // -----------------------------------------------------------------------
+
+    /// Phase 1 of send (§2.3.2): spend inputs, derive nullifiers, add
+    /// per-asset change so `In(a)+Mint(a) == Out(a)`, `nav = size_final`.
+    pub fn begin_send(&self, req: SendRequest) -> Result<PendingTransition> {
+        let record = self
+            .accounts
+            .get(&req.owner)
+            .context("send: account not found")?;
+        ensure!(record.state.owner == req.owner, "account owner mismatch");
+        let op_secret = record
+            .op_secret
+            .context("send: op_secret missing for account — refusing (no silent default)")?;
+        ensure!(
+            !req.input_coin_ids.is_empty(),
+            "send requires at least one input coin"
+        );
+        ensure!(
+            req.input_coin_ids.len() <= MAX_TX_INPUTS,
+            "too many input coins: {} > {}",
+            req.input_coin_ids.len(),
+            MAX_TX_INPUTS
+        );
+        ensure!(
+            req.output_templates.len() <= MAX_TX_OUTPUTS,
+            "too many output templates: {} > {}",
+            req.output_templates.len(),
+            MAX_TX_OUTPUTS
+        );
+
+        // Resolve inputs and enforce conservation *before* any proving material
+        // or predecessor wiring, so over-spend fails fast and loud.
+        let mut input_coins = Vec::with_capacity(req.input_coin_ids.len());
+        let mut in_by_asset: BTreeMap<[u8; 32], u128> = BTreeMap::new();
+        let mut seen_inputs = BTreeSet::new();
+        for coin_id in &req.input_coin_ids {
+            let id_bytes = host::digest_to_bytes(coin_id);
+            ensure!(seen_inputs.insert(id_bytes), "duplicate input coin_id");
+            let tracked = record
+                .spendable
+                .get(&id_bytes)
+                .context("input coin is not spendable on this account")?;
+            ensure!(
+                tracked.coin.identifier == *coin_id,
+                "tracked coin identifier mismatch"
+            );
+            ensure!(
+                tracked.coin.recipient == req.owner,
+                "input coin recipient is not the spending account"
+            );
+            let asset_key = host::digest_to_bytes(&tracked.coin.asset_id);
+            let entry = in_by_asset.entry(asset_key).or_insert(0);
+            *entry = entry
+                .checked_add(tracked.coin.amount)
+                .context("In(a) amount overflow")?;
+            input_coins.push(tracked.clone());
+        }
+
+        let mut out_by_asset: BTreeMap<[u8; 32], u128> = BTreeMap::new();
+        for template in &req.output_templates {
+            ensure!(
+                template.amount > 0,
+                "output template amount must be non-zero"
+            );
+            let asset_key = host::digest_to_bytes(&template.asset_id);
+            let entry = out_by_asset.entry(asset_key).or_insert(0);
+            *entry = entry
+                .checked_add(template.amount)
+                .context("Out(a) amount overflow")?;
+        }
+
+        // Per-asset change: amount = In(a) − Out(a) (no mint on send).
+        let mut change_templates: Vec<CoinTemplate> = Vec::new();
+        let all_assets: BTreeSet<[u8; 32]> = in_by_asset
+            .keys()
+            .chain(out_by_asset.keys())
+            .copied()
+            .collect();
+        for asset_key in all_assets {
+            let inn = match in_by_asset.get(&asset_key) {
+                Some(&v) => v,
+                None => 0,
+            };
+            let out = match out_by_asset.get(&asset_key) {
+                Some(&v) => v,
+                None => 0,
+            };
+            ensure!(
+                inn >= out,
+                "over-spend: outputs exceed inputs for an asset (In={inn}, Out={out})"
+            );
+            let change = inn - out;
+            if change > 0 {
+                let asset_id = host::digest_from_bytes(&asset_key)
+                    .context("reconstruct asset_id from balance key")?;
+                change_templates.push(CoinTemplate {
+                    recipient: req.owner,
+                    amount: change,
+                    asset_id,
+                });
+            }
+        }
+        // Canonical order: caller recipient templates, then change by
+        // ascending asset_id (change_templates already sorted via BTreeSet).
+        let mut all_templates = req.output_templates.clone();
+        all_templates.extend(change_templates);
+        ensure!(
+            all_templates.len() <= MAX_TX_OUTPUTS,
+            "outputs including change exceed MAX_TX_OUTPUTS: {} > {}",
+            all_templates.len(),
+            MAX_TX_OUTPUTS
+        );
+
+        let (
+            mode,
+            prev_account_state,
+            prev_proof,
+            prev_nav_opening,
+            predecessor_nullifier,
+            nav_consistency,
+            mut hist_leaves,
+        ) = self.account_transition_context(&req.owner, &record.nk, record.state.current_pubkey)?;
+        // Defense-in-depth only: structurally unreachable once
+        // `account_transition_context` has returned for an existing account
+        // (that path always yields `AccountUpdateProof`). Kept because the
+        // mode decision is load-bearing for send, not because a missing
+        // invariant hides behind it.
+        ensure!(
+            matches!(mode, TransitionMode::AccountUpdateProof),
+            "send requires a prior account transition (AccountUpdateProof)"
+        );
+
+        // Clause 8 consumes active history paths sequentially. Generate each
+        // 1→2 opening against the current intermediate root, then apply the
+        // spend immediately before constructing the next input's path.
+        let mut hist_for_proofs = rebuild_coinhist(&hist_leaves)?;
+        let mut input_auth = Vec::with_capacity(input_coins.len());
+        let mut resolved_inputs = Vec::with_capacity(input_coins.len());
+        for tracked in &input_coins {
+            let id_bytes = host::digest_to_bytes(&tracked.coin.identifier);
+            let history_proof = hist_for_proofs.prove(id_bytes);
+            // No Admitted-state ensure here: every input already passed
+            // "input coin is not spendable", and `leaves_from_sets` marks
+            // every spendable key Admitted (spent cannot overlap after
+            // `insert_account`). The real host invariant sits there.
+            ensure!(
+                history_proof.verify(&id_bytes, hist_for_proofs.root()),
+                "input history proof does not open the current sequential coin-history root"
+            );
+            input_auth.push(InputAuthorization {
+                creating_prev_ash: tracked.creating_prev_ash,
+                coin_index: tracked.coin_index,
+                history_proof,
+            });
+            resolved_inputs.push(tracked.coin.clone());
+            hist_for_proofs
+                .spend(id_bytes)
+                .context("apply sequential input spend to temporary coinhist")?;
+            hist_leaves.insert(id_bytes, host::CoinHistState::Spent);
+        }
+        let input_coins = resolved_inputs;
+
+        let prev_ash =
+            host::account_state_hash(&prev_account_state).context("hash prev account state")?;
+        let mut output_coins = Vec::with_capacity(all_templates.len());
+        let mut output_history_proofs = Vec::with_capacity(all_templates.len());
+
+        // Continue from the post-spend intermediate tree for self-output
+        // admissions, matching the circuit's input → output slot order.
+        for (index, template) in all_templates.iter().enumerate() {
+            let coin = Coin {
+                identifier: host::coin_identifier(
+                    prev_ash,
+                    &template.recipient.0,
+                    template.asset_id,
+                    template.amount,
+                    index as u32,
+                ),
+                recipient: template.recipient,
+                amount: template.amount,
+                asset_id: template.asset_id,
+            };
+            let is_self = template.recipient == req.owner;
+            if is_self {
+                let id = host::digest_to_bytes(&coin.identifier);
+                let proof = hist_for_proofs
+                    .non_inclusion(id)
+                    .context("self-output coin_id already present")?;
+                ensure!(
+                    proof.verify(&id, hist_for_proofs.root()),
+                    "self-output history proof does not open the current sequential root"
+                );
+                output_history_proofs.push(Some(proof));
+                hist_for_proofs
+                    .admit(id)
+                    .context("apply sequential self-output admission to temporary coinhist")?;
+                hist_leaves.insert(id, host::CoinHistState::Admitted);
+            } else {
+                output_history_proofs.push(None);
+            }
+            output_coins.push(coin);
+        }
+
+        let new_hist = rebuild_coinhist(&hist_leaves)?;
+        ensure!(
+            hist_for_proofs.root() == new_hist.root(),
+            "temporary sequential coinhist diverges from rebuilt final tree"
+        );
+        let new_root = new_hist.root();
+
+        // balances: prev − In + Self (change / self-retained).
+        let mut new_balances = prev_account_state.balances.clone();
+        for coin in &input_coins {
+            debit_balance(&mut new_balances, coin.asset_id, coin.amount)?;
+        }
+        for (template, coin) in all_templates.iter().zip(&output_coins) {
+            if template.recipient == req.owner {
+                credit_balance(&mut new_balances, coin.asset_id, coin.amount)?;
+            }
+        }
+        let entry_send_counter = prev_account_state.send_counter;
+        let new_send = entry_send_counter
+            .checked_add(1)
+            .context("send_counter overflow")?;
+        let new_account_state = AccountState::new(
+            req.owner,
+            prev_account_state.nk_commit,
+            new_balances,
+            req.next_pubkey,
+            new_send,
+            new_root,
+        )
+        .context("construct new AccountState after send")?;
+
+        let nav_rand = op_secret.derive_nav_rand(entry_send_counter);
+        let nav = self.size_final_nav()?;
+        let nav_opening = NavOpening { nav, nav_rand };
+        let proof_data = compute_proof_data(
+            &new_account_state,
+            &output_coins,
+            &input_coins,
+            &record.nk,
+            (nav, &nav_rand, &req.next_pubkey, &req.npk_rand),
+        )?;
+        let proof_data_hash = host::hash_proof_data(&host::serialize_proof_data(&proof_data));
+
+        let witness_wip = TransitionWitness {
+            mode,
+            prev_account_state,
+            new_account_state,
+            input_coins,
+            input_auth,
+            output_templates: all_templates,
+            output_coins,
+            output_history_proofs,
+            received_coins: Vec::new(),
+            received_auth: Vec::new(),
+            asset_issuance: None,
+            nk: record.nk,
+            nav,
+            nav_rand,
+            prev_nav_opening,
+            nav_consistency,
+            next_pubkey: req.next_pubkey,
+            npk_rand: req.npk_rand,
+            transition_signature: placeholder_signature(record.state.current_pubkey),
+            prev_proof,
+            predecessor_nullifier,
+        };
+
+        Ok(PendingTransition {
+            witness_wip,
+            proof_data,
+            proof_data_hash,
+            mode,
+            owner: req.owner,
+            nav_opening,
+            op_secret,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // §2.3.3 Receive
+    // -----------------------------------------------------------------------
+
+    /// Phase 1 of receive (§2.3.3): admit already-verified received coins,
+    /// clause-10 auth from the request, `nav = size_final`.
+    ///
+    /// See module docs for the pre-verified `CoinProof` assumption (P1-G).
+    pub fn begin_receive(&self, req: ReceiveRequest) -> Result<PendingTransition> {
+        ensure!(
+            req.received_coins.len() == req.received_auth.len(),
+            "received_coins / received_auth length mismatch"
+        );
+        ensure!(
+            !req.received_coins.is_empty(),
+            "receive requires at least one received coin"
+        );
+        ensure!(
+            req.received_coins.len() <= MAX_RX_COINS,
+            "too many received coins: {} > {}",
+            req.received_coins.len(),
+            MAX_RX_COINS
+        );
+
+        if let Some(record) = self.accounts.get(&req.owner) {
+            ensure!(
+                req.nk == record.nk,
+                "receive: nk does not match the registered account"
+            );
+            match record.op_secret {
+                None => {
+                    bail!("receive: op_secret missing for account — refusing (no silent default)");
+                }
+                Some(stored) => {
+                    ensure!(
+                        req.op_secret == stored,
+                        "receive: op_secret does not match the registered account"
+                    );
+                }
+            }
+            ensure!(
+                req.current_pubkey == record.state.current_pubkey,
+                "receive: current_pubkey does not match the registered account"
+            );
+        } else {
+            let expected_owner =
+                Address(host::address(&req.current_pubkey, host::nk_commit(&req.nk)));
+            ensure!(
+                req.owner == expected_owner,
+                "receive: owner must equal H(current_pubkey ‖ nk_commit) for an InitialProof"
+            );
+        }
+
+        let (
+            mode,
+            prev_account_state,
+            prev_proof,
+            prev_nav_opening,
+            predecessor_nullifier,
+            nav_consistency,
+            mut hist_leaves,
+        ) = self.account_transition_context(&req.owner, &req.nk, req.current_pubkey)?;
+
+        for coin in &req.received_coins {
+            ensure!(
+                coin.recipient == req.owner,
+                "received coin recipient is not the receiving account"
+            );
+            ensure!(coin.amount > 0, "received coin amount must be non-zero");
+        }
+
+        // Clause 8 consumes active receipt paths sequentially. Generate each
+        // 0→1 opening against the current intermediate root and admit it
+        // before constructing the next receipt's path.
+        let mut hist_for_proofs = rebuild_coinhist(&hist_leaves)?;
+        let mut auth_with_history = Vec::with_capacity(req.received_auth.len());
+        for (coin, mut auth) in req.received_coins.iter().zip(req.received_auth) {
+            let id = host::digest_to_bytes(&coin.identifier);
+            let proof = hist_for_proofs
+                .non_inclusion(id)
+                .context("received coin_id already present in coinhist")?;
+            ensure!(
+                proof.verify(&id, hist_for_proofs.root()),
+                "received history proof does not open the current sequential coin-history root"
+            );
+            auth.history_proof = proof;
+            auth_with_history.push(auth);
+            hist_for_proofs
+                .admit(id)
+                .context("apply sequential receipt admission to temporary coinhist")?;
+            hist_leaves.insert(id, host::CoinHistState::Admitted);
+        }
+
+        let new_hist = rebuild_coinhist(&hist_leaves)?;
+        ensure!(
+            hist_for_proofs.root() == new_hist.root(),
+            "temporary sequential receive coinhist diverges from rebuilt final tree"
+        );
+        let new_root = new_hist.root();
+        let mut new_balances = prev_account_state.balances.clone();
+        for coin in &req.received_coins {
+            credit_balance(&mut new_balances, coin.asset_id, coin.amount)?;
+        }
+        let entry_send_counter = prev_account_state.send_counter;
+        let new_send = entry_send_counter
+            .checked_add(1)
+            .context("send_counter overflow")?;
+        let new_account_state = AccountState::new(
+            req.owner,
+            prev_account_state.nk_commit,
+            new_balances,
+            req.next_pubkey,
+            new_send,
+            new_root,
+        )
+        .context("construct new AccountState after receive")?;
+
+        let nav_rand = req.op_secret.derive_nav_rand(entry_send_counter);
+        let nav = self.size_final_nav()?;
+        let nav_opening = NavOpening { nav, nav_rand };
+        let proof_data = compute_proof_data(
+            &new_account_state,
+            &[],
+            &[],
+            &req.nk,
+            (nav, &nav_rand, &req.next_pubkey, &req.npk_rand),
+        )?;
+        let proof_data_hash = host::hash_proof_data(&host::serialize_proof_data(&proof_data));
+
+        let witness_wip = TransitionWitness {
+            mode,
+            prev_account_state,
+            new_account_state,
+            input_coins: Vec::new(),
+            input_auth: Vec::new(),
+            output_templates: Vec::new(),
+            output_coins: Vec::new(),
+            output_history_proofs: Vec::new(),
+            received_coins: req.received_coins,
+            received_auth: auth_with_history,
+            asset_issuance: None,
+            nk: req.nk,
+            nav,
+            nav_rand,
+            prev_nav_opening,
+            nav_consistency,
+            next_pubkey: req.next_pubkey,
+            npk_rand: req.npk_rand,
+            transition_signature: placeholder_signature(req.current_pubkey),
+            prev_proof,
+            predecessor_nullifier,
+        };
+
+        Ok(PendingTransition {
+            witness_wip,
+            proof_data,
+            proof_data_hash,
+            mode,
+            owner: req.owner,
+            nav_opening,
+            op_secret: req.op_secret,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: finalise
+    // -----------------------------------------------------------------------
+
+    /// Phase 2: install the wallet signature, prove via the bridge, then
+    /// **atomically** apply the new account state / CoinHist.
+    /// On proving failure the engine state is left unchanged.
+    ///
+    /// ## Engine invariant — no synthetic NfLog positions
+    ///
+    /// The canonical NfLog is a pure function of Bitcoin (§3.6). This method
+    /// **never** folds the transition's own nullifier into the accumulator
+    /// and never invents a local `(tip_height, fold_seq)` position. The
+    /// account records `last_nullifier = Some` / `last_nullifier_pos = None`
+    /// until the scanner folds the confirmed on-chain survivor at its real
+    /// `(height, tx_index, vin_index, member_index)`.
+    ///
+    /// Applies equally to mint, send, and receive: a public finalise path
+    /// that could invent a position would also fool the absent-lookup guard
+    /// and permanently desync after a later canonical scan-fold.
+    pub fn finalise(
+        &mut self,
+        pending: PendingTransition,
+        signature: TransitionSignature,
+    ) -> Result<AppliedTransition> {
+        let proved = self.prove_pending_transition(pending, signature)?;
+        self.apply_proved_transition(proved)
+    }
+
+    /// Prove + apply account/CoinHist **without** folding the own nullifier
+    /// into the canonical NfLog.
+    ///
+    /// Identical to [`Self::finalise`]: retained as a named alias so receive
+    /// call sites document that the chain (via the scanner) places the
+    /// nullifier. There is no alternate "synthetic local" outcome.
+    pub fn finalise_pending_chain_nullifier(
+        &mut self,
+        pending: PendingTransition,
+        signature: TransitionSignature,
+    ) -> Result<AppliedTransition> {
+        let proved = self.prove_pending_transition(pending, signature)?;
+        self.apply_proved_transition(proved)
+    }
+
+    /// Phase 2a: prove only. **Does not mutate** the engine.
+    ///
+    /// Validates the envelope against **this** engine, then proves via the
+    /// bridge. Callers that must not hold any engine lock across proving
+    /// should use [`Self::prove_pending_transition_detached`] instead and
+    /// re-validate on [`Self::apply_proved_transition`].
+    pub fn prove_pending_transition(
+        &self,
+        pending: PendingTransition,
+        signature: TransitionSignature,
+    ) -> Result<ProvedPendingTransition> {
+        self.validate_pending_envelope(&pending)?;
+        Self::prove_pending_transition_detached(&self.bridge, pending, signature)
+    }
+
+    /// Prove a pending transition **without reading engine state**.
+    ///
+    /// The pending witness already carries everything the prover needs.
+    /// Live-state re-validation (account, tip/`size_final`, receiver NAV
+    /// canonicity, creating anchors, own-Pk absence) happens only in
+    /// [`Self::apply_proved_transition`] after the caller re-acquires the
+    /// engine mutex. This is the production receive path: prove holds
+    /// neither `write_gate` nor the live-engine mutex.
+    pub fn prove_pending_transition_detached(
+        bridge: &ProverBridge,
+        mut pending: PendingTransition,
+        signature: TransitionSignature,
+    ) -> Result<ProvedPendingTransition> {
+        ensure!(
+            signature.pk_i == pending.witness_wip.prev_account_state.current_pubkey,
+            "signature pk_i does not equal prev_account_state.current_pubkey"
+        );
+        ensure!(
+            pending.proof_data_hash
+                == host::hash_proof_data(&host::serialize_proof_data(&pending.proof_data)),
+            "pending proof_data_hash does not match proof_data"
+        );
+
+        pending.witness_wip.transition_signature = signature.clone();
+        let proved = bridge
+            .prove_transition(&pending.witness_wip)
+            .context("prove_pending_transition: prove_transition failed (state unchanged)")?;
+        ensure!(
+            proved.proof_data == pending.proof_data,
+            "proved ProofData differs from pending ProofData"
+        );
+        ProvedPendingTransition::from_parts(pending, proved, signature)
+    }
+
+    /// Phase 2b: apply a previously proved pending transition.
+    ///
+    /// Mutates account/CoinHist only — never the canonical NfLog.
+    /// Re-validates **every live dependency** the prove-time decision read
+    /// so a concurrent scanner fold during unlocked prove fails loud
+    /// rather than committing against a moved tip / size_final / anchor.
+    pub fn apply_proved_transition(
+        &mut self,
+        proved_pending: ProvedPendingTransition,
+    ) -> Result<AppliedTransition> {
+        let ProvedPendingTransition {
+            pending,
+            proved,
+            signature,
+        } = proved_pending;
+        // Full live re-validation after any concurrent scan work during prove.
+        self.revalidate_pending_against_live(&pending)?;
+        ensure!(
+            signature.pk_i == pending.witness_wip.prev_account_state.current_pubkey,
+            "apply: signature pk_i does not equal prev_account_state.current_pubkey"
+        );
+        ensure!(
+            proved.proof_data == pending.proof_data,
+            "apply: proved ProofData differs from pending ProofData"
+        );
+        ensure!(
+            pending.witness_wip.transition_signature.pk_i == signature.pk_i
+                && pending.witness_wip.transition_signature.signature == signature.signature
+                && pending.witness_wip.transition_signature.r_prime == signature.r_prime,
+            "apply: pending witness signature does not match proved envelope"
+        );
+
+        let witness = &pending.witness_wip;
+        let pk_i = signature.pk_i;
+        let r = signature.signature_r();
+        let nullifier_opening = NullifierOpening {
+            public_key: pk_i,
+            signature_r: r,
+            r_prime: signature.r_prime,
+        };
+
+        // Apply atomically: if anything below fails after prove, we still
+        // return Err — callers must not observe partial account/Nflog state.
+        // Build the post-state, then swap in one go.
+        let prev_ash = host::account_state_hash(&witness.prev_account_state)
+            .context("hash prev account state for apply")?;
+
+        let mut next_spendable: BTreeMap<[u8; 32], TrackedCoin>;
+        let mut next_spent: BTreeSet<[u8; 32]>;
+        let next_hist: CoinHistTree;
+        let genesis_pubkey: [u8; 32];
+        let nk = witness.nk;
+
+        if let Some(existing) = self.accounts.get(&pending.owner) {
+            next_spendable = existing.spendable.clone();
+            next_spent = existing.spent_ids.clone();
+            genesis_pubkey = existing.genesis_pubkey;
+            // Start from a rebuilt tree so we re-validate the clause-8 path.
+            let mut leaves = leaves_from_sets(&next_spendable, &next_spent);
+            for coin in &witness.input_coins {
+                let id = host::digest_to_bytes(&coin.identifier);
+                ensure!(
+                    next_spendable.remove(&id).is_some(),
+                    "apply: spent input missing from spendable set"
+                );
+                // No Admitted-state ensure here: `leaves_from_sets` marks every
+                // spendable key Admitted (and would overwrite Spent), so after
+                // the remove check above the leaf is Admitted by construction.
+                // Consistency of spendable/spent_ids/coin_history_root is
+                // enforced in `insert_account` (and the DB loader).
+                leaves.insert(id, host::CoinHistState::Spent);
+                next_spent.insert(id);
+            }
+            for (index, (template, coin)) in witness
+                .output_templates
+                .iter()
+                .zip(&witness.output_coins)
+                .enumerate()
+            {
+                if template.recipient == pending.owner {
+                    let id = host::digest_to_bytes(&coin.identifier);
+                    ensure!(
+                        !leaves.contains_key(&id),
+                        "apply: self-output already in coinhist"
+                    );
+                    leaves.insert(id, host::CoinHistState::Admitted);
+                    next_spendable.insert(
+                        id,
+                        TrackedCoin {
+                            coin: coin.clone(),
+                            creating_prev_ash: prev_ash,
+                            coin_index: index as u32,
+                        },
+                    );
+                }
+            }
+            for (index, coin) in witness.received_coins.iter().enumerate() {
+                let id = host::digest_to_bytes(&coin.identifier);
+                ensure!(
+                    !leaves.contains_key(&id),
+                    "apply: received coin already in coinhist"
+                );
+                leaves.insert(id, host::CoinHistState::Admitted);
+                // Received coins use creating_prev_ash from auth when present.
+                let creating_prev_ash = witness
+                    .received_auth
+                    .get(index)
+                    .map(|a| a.creating_prev_ash)
+                    .context("apply: missing received_auth for received coin")?;
+                let coin_index = witness
+                    .received_auth
+                    .get(index)
+                    .map(|a| a.output_inclusion.leaf_index)
+                    .context("apply: missing output_inclusion for received coin")?;
+                next_spendable.insert(
+                    id,
+                    TrackedCoin {
+                        coin: coin.clone(),
+                        creating_prev_ash,
+                        coin_index,
+                    },
+                );
+            }
+            next_hist = rebuild_coinhist(&leaves)?;
+        } else {
+            // First transition: genesis mint or InitialProof receive.
+            ensure!(
+                matches!(pending.mode, TransitionMode::InitialProof),
+                "missing account requires InitialProof mode"
+            );
+            ensure!(
+                witness.input_coins.is_empty(),
+                "InitialProof transition cannot spend inputs"
+            );
+            genesis_pubkey = witness.prev_account_state.current_pubkey;
+            next_spendable = BTreeMap::new();
+            next_spent = BTreeSet::new();
+            let mut leaves = BTreeMap::new();
+            for (index, (template, coin)) in witness
+                .output_templates
+                .iter()
+                .zip(&witness.output_coins)
+                .enumerate()
+            {
+                if template.recipient == pending.owner {
+                    let id = host::digest_to_bytes(&coin.identifier);
+                    leaves.insert(id, host::CoinHistState::Admitted);
+                    next_spendable.insert(
+                        id,
+                        TrackedCoin {
+                            coin: coin.clone(),
+                            creating_prev_ash: prev_ash,
+                            coin_index: index as u32,
+                        },
+                    );
+                }
+            }
+            for (index, coin) in witness.received_coins.iter().enumerate() {
+                let id = host::digest_to_bytes(&coin.identifier);
+                ensure!(
+                    !leaves.contains_key(&id),
+                    "apply: received coin already in initial coinhist"
+                );
+                leaves.insert(id, host::CoinHistState::Admitted);
+                let auth = witness
+                    .received_auth
+                    .get(index)
+                    .context("apply: missing received_auth for initial received coin")?;
+                next_spendable.insert(
+                    id,
+                    TrackedCoin {
+                        coin: coin.clone(),
+                        creating_prev_ash: auth.creating_prev_ash,
+                        coin_index: auth.output_inclusion.leaf_index,
+                    },
+                );
+            }
+            next_hist = rebuild_coinhist(&leaves)?;
+        }
+
+        ensure!(
+            next_hist.root() == witness.new_account_state.coin_history_root,
+            "apply: coinhist root diverges from new_account_state"
+        );
+
+        // Engine invariant: never invent a local NfLog position. Refuse if
+        // the own Pk is already present (double-spend / republish). The
+        // scanner alone may fold this nullifier at a real chain position.
+        ensure!(
+            matches!(self.nflog.lookup(pk_i), LookupResult::Absent),
+            "apply: deferred nullifier Pk already present on canonical NfLog \
+             (double-spend / republish)"
+        );
+
+        // All fallible checks are complete. Commit the account record only —
+        // the canonical NfLog is untouched.
+        //
+        // `op_secret` is engine-local operational material: never invent a
+        // value here. Carry the secret resolved at begin_* (request or prior
+        // record); a fresh node rebuilds openings from the restored bundle.
+        let record = AccountRecord {
+            state: witness.new_account_state.clone(),
+            coinhist: next_hist,
+            nk,
+            op_secret: Some(pending.op_secret),
+            genesis_pubkey,
+            spendable: next_spendable,
+            spent_ids: next_spent,
+            last_proof: Some(proved.proof.clone()),
+            last_nav_opening: Some(pending.nav_opening),
+            last_nullifier: Some(nullifier_opening),
+            last_nullifier_pos: None,
+        };
+        self.accounts.insert(pending.owner, record);
+
+        Ok(AppliedTransition {
+            proved,
+            nullifier: (pk_i, r),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Host acceptance (D.5 Caveat A)
+    // -----------------------------------------------------------------------
+
+    /// Node-side acceptance for an incoming proved transition:
+    /// 1. bridge `verify_transition` (Plonky2 verify + cyclic-tail pin);
+    /// 2. open `proof_data.nav_commitment` with `nav_opening`;
+    /// 3. require the opened `(size, mth)` is **canonical** on this engine's
+    ///    NfLog and `size ≤ size_final(tip_height)`.
+    ///
+    /// The Bitcoin first-occurrence anchor check for the transition's own
+    /// `(Pkᵢ, R)` (or a creating nullifier) requires the scanner and is
+    /// deferred to P1-G.
+    pub fn verify_incoming_transition(
+        &self,
+        proved: &ProvedTransition,
+        nav_opening: &NavOpening,
+    ) -> Result<()> {
+        let extracted_proof_data = self
+            .bridge
+            .verify_proved_transition_wrapper(proved)
+            .context("incoming transition: wrapper/public-input mismatch")?;
+        self.bridge
+            .verify_transition(&proved.proof)
+            .context("incoming transition: bridge verify failed")?;
+
+        let expected_commit = host::nav_commitment(nav_opening.nav.root(), &nav_opening.nav_rand);
+        ensure!(
+            expected_commit == extracted_proof_data.nav_commitment,
+            "incoming transition: nav_opening does not open proof_data.nav_commitment"
+        );
+
+        let size = nav_opening.nav.size;
+        let mth = nav_opening.nav.mth;
+        ensure!(
+            self.nflog.is_canonical(size, mth),
+            "incoming transition: nav (size, mth) is not canonical on this NfLog"
+        );
+        let size_final = self.nflog.size_final(self.tip_height);
+        ensure!(
+            size <= size_final,
+            "incoming transition: nav.size {size} exceeds size_final {size_final}"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Internals
+    // -----------------------------------------------------------------------
+
+    fn validate_pending_envelope(&self, pending: &PendingTransition) -> Result<()> {
+        let witness = &pending.witness_wip;
+        ensure!(
+            pending.owner == witness.prev_account_state.owner,
+            "pending envelope owner differs from witness.prev_account_state.owner"
+        );
+        ensure!(
+            pending.owner == witness.new_account_state.owner,
+            "pending envelope owner differs from witness.new_account_state.owner"
+        );
+        ensure!(
+            pending.mode == witness.mode,
+            "pending envelope mode differs from witness.mode"
+        );
+        ensure!(
+            pending.nav_opening
+                == (NavOpening {
+                    nav: witness.nav,
+                    nav_rand: witness.nav_rand,
+                }),
+            "pending envelope nav_opening differs from witness nav/nav_rand"
+        );
+
+        match self.accounts.get(&pending.owner) {
+            Some(record) => {
+                ensure!(
+                    matches!(pending.mode, TransitionMode::AccountUpdateProof),
+                    "present account requires AccountUpdateProof mode"
+                );
+                ensure!(
+                    record.state == witness.prev_account_state,
+                    "stored account state differs from witness.prev_account_state"
+                );
+            }
+            None => {
+                ensure!(
+                    matches!(pending.mode, TransitionMode::InitialProof),
+                    "absent account requires InitialProof mode"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-check every live-engine input that `begin_*` / clause-10 / prove
+    /// decisions depend on. Derived by tracing what the **commit depends on**
+    /// (engine reads from pending construction through apply), not by
+    /// extending an ad-hoc checklist.
+    ///
+    /// **Scope of this method:** live engine state only. Caller-supplied
+    /// durable fields that never touch the engine (e.g. receive-path
+    /// `build_tip` vs adapter tip identity, commit signature vs proved
+    /// envelope) are revalidated at the node commit boundary — see
+    /// `node::v1::receive::commit_proved_receive`. A pure "what did we
+    /// read?" derivation misses those; the full method is "everything the
+    /// durable commit depends on".
+    ///
+    /// | Live read | Where baked | Re-check here |
+    /// |-----------|-------------|---------------|
+    /// | account `state` / presence / mode | envelope + coinhist | `validate_pending_envelope` |
+    /// | `tip_height` → `size_final` | `pending.nav` | `nav.size ≤ size_final(tip)` |
+    /// | canonical receiver NAV (size, mth) | `pending.nav` | `is_canonical` |
+    /// | predecessor nullifier pos/R | witness (AccountUpdate) | still Present at pos |
+    /// | creating nullifier anchors | `received_auth` | still Present at `pos_create` + inclusion |
+    /// | creating NAV canonicity / prefix | `received_auth` | `is_canonical` + consistency |
+    /// | own Pk absent (apply guard) | — | checked later in apply body |
+    /// | CoinHist leaf collisions / root | apply body | sequential rebuild below |
+    ///
+    /// Tip is not compared for equality here: the only tip-dependent *engine*
+    /// decision is `size_final(tip)`, which is rechecked directly. A concurrent
+    /// tip advance that only grows `size_final` leaves a still-valid proved NAV
+    /// as a canonical prefix (`size ≤ size_final`). (Caller-supplied
+    /// `build_tip` identity is a separate node-layer check.)
+    fn revalidate_pending_against_live(&self, pending: &PendingTransition) -> Result<()> {
+        self.validate_pending_envelope(pending)?;
+
+        let receiver_nav = pending.nav_opening.nav;
+        let size_final = self.nflog.size_final(self.tip_height);
+        ensure!(
+            receiver_nav.size <= size_final,
+            "apply: pending receiver nav.size {} exceeds live size_final {} at tip {} \
+             (tip/`size_final` moved under the proved NAV)",
+            receiver_nav.size,
+            size_final,
+            self.tip_height
+        );
+        ensure!(
+            self.nflog.is_canonical(receiver_nav.size, receiver_nav.mth),
+            "apply: pending receiver nav is no longer canonical on the live NfLog \
+             (tip={}, size_final={})",
+            self.tip_height,
+            size_final
+        );
+
+        if let Some(pred) = &pending.witness_wip.predecessor_nullifier {
+            match self.nflog.lookup(pred.nullifier.public_key) {
+                LookupResult::Present { pos, r, .. } => {
+                    ensure!(
+                        r == pred.nullifier.signature_r,
+                        "apply: predecessor nullifier R on live NfLog does not match witness"
+                    );
+                    ensure!(
+                        pos == pred.position,
+                        "apply: predecessor nullifier position moved \
+                         (witness {witness_pos} → live {pos})",
+                        witness_pos = pred.position
+                    );
+                    ensure!(
+                        pos < receiver_nav.size,
+                        "apply: predecessor position {pos} is not covered by \
+                         pending receiver nav.size {}",
+                        receiver_nav.size
+                    );
+                    let leaf = host::nflog_leaf_hash(
+                        pos,
+                        &NfLogEntry {
+                            pk: pred.nullifier.public_key,
+                            r: pred.nullifier.signature_r,
+                        },
+                    );
+                    ensure!(
+                        host::verify_inclusion(
+                            leaf,
+                            pos,
+                            &pred.nav_inclusion,
+                            receiver_nav.size,
+                            receiver_nav.mth,
+                        ),
+                        "apply: predecessor inclusion path no longer opens pending receiver nav"
+                    );
+                }
+                LookupResult::Absent => {
+                    bail!(
+                        "apply: predecessor nullifier is no longer on the live NfLog \
+                         (reorg / un-fold during prove)"
+                    );
+                }
+            }
+        }
+
+        for (index, auth) in pending.witness_wip.received_auth.iter().enumerate() {
+            match self.nflog.lookup(auth.creating_nullifier.public_key) {
+                LookupResult::Present { pos, r, .. } => {
+                    ensure!(
+                        r == auth.creating_nullifier.signature_r,
+                        "apply: creating nullifier R mismatch for received slot {index}"
+                    );
+                    ensure!(
+                        pos == auth.pos_create,
+                        "apply: creating nullifier position moved for received slot {index} \
+                         (witness {} → live {pos})",
+                        auth.pos_create
+                    );
+                    ensure!(
+                        pos < receiver_nav.size,
+                        "apply: creating nullifier position {pos} for slot {index} is not \
+                         covered by pending receiver nav.size {}",
+                        receiver_nav.size
+                    );
+                }
+                LookupResult::Absent => {
+                    bail!(
+                        "apply: creating nullifier for received slot {index} is no longer \
+                         on the live NfLog (reorg / un-fold during prove)"
+                    );
+                }
+            }
+
+            ensure!(
+                self.nflog.is_canonical(
+                    auth.creating_nav_opening.nav.size,
+                    auth.creating_nav_opening.nav.mth
+                ),
+                "apply: creating nav for received slot {index} is no longer canonical"
+            );
+
+            let leaf = host::nflog_leaf_hash(
+                auth.pos_create,
+                &NfLogEntry {
+                    pk: auth.creating_nullifier.public_key,
+                    r: auth.creating_nullifier.signature_r,
+                },
+            );
+            ensure!(
+                host::verify_inclusion(
+                    leaf,
+                    auth.pos_create,
+                    &auth.creating_nav_inclusion,
+                    receiver_nav.size,
+                    receiver_nav.mth,
+                ),
+                "apply: creating nullifier inclusion path no longer opens pending receiver \
+                 nav for slot {index}"
+            );
+            ensure!(
+                host::verify_consistency(
+                    auth.creating_nav_opening.nav.size,
+                    auth.creating_nav_opening.nav.mth,
+                    receiver_nav.size,
+                    receiver_nav.mth,
+                    &auth.creating_nav_consistency,
+                ),
+                "apply: creating nav is no longer a prefix of pending receiver nav for slot {index}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Shared setup for begin_*: mode, prev state, recursion material, and a
+    /// mutable coinhist leaf map for sequential clause-8 updates.
+    fn account_transition_context(
+        &self,
+        owner: &Address,
+        nk: &[u8; 32],
+        current_pubkey: [u8; 32],
+    ) -> Result<AccountTransitionContext> {
+        let nav = self.size_final_nav()?;
+
+        if let Some(record) = self.accounts.get(owner) {
+            ensure!(record.nk == *nk, "nk does not match registered account");
+            ensure!(
+                record.state.current_pubkey == current_pubkey,
+                "current_pubkey does not match registered account"
+            );
+            let prev_proof = record
+                .last_proof
+                .clone()
+                .context("AccountUpdateProof requires last_proof on the account")?;
+            let prev_nav_opening = record
+                .last_nav_opening
+                .context("AccountUpdateProof requires last_nav_opening")?;
+            let last_nf = record
+                .last_nullifier
+                .clone()
+                .context("AccountUpdateProof requires last_nullifier")?;
+            // Canonical position is what the chain-derived NfLog says (§3.6),
+            // never a locally invented fold ordinal. A receive that has been
+            // applied but not yet scan-folded has last_nullifier_pos = None
+            // and must fail here until inclusion (fail-closed, no silent skip).
+            let pos = match self.nflog.lookup(last_nf.public_key) {
+                LookupResult::Present { pos, r, .. } => {
+                    ensure!(
+                        r == last_nf.signature_r,
+                        "predecessor nullifier R on NfLog does not match account last_nullifier.R"
+                    );
+                    if let Some(cached) = record.last_nullifier_pos {
+                        ensure!(
+                            cached == pos,
+                            "account last_nullifier_pos {cached} diverges from canonical \
+                             NfLog position {pos} — refusing to prove on a stale cache"
+                        );
+                    }
+                    pos
+                }
+                LookupResult::Absent => {
+                    return Err(DependencyNotFinal::PredecessorAbsentFromCanonicalNfLog.into());
+                }
+            };
+
+            if pos >= nav.size {
+                return Err(
+                    DependencyNotFinal::PredecessorPositionNotCoveredBySizeFinal {
+                        position: pos,
+                        size_final: nav.size,
+                    }
+                    .into(),
+                );
+            }
+            // Inclusion path over the size_final prefix.
+            let prefix = &self.nflog_entries[..nav.size as usize];
+            let nav_inclusion = host::inclusion_path(pos, prefix)
+                .context("predecessor nullifier inclusion path")?;
+            let nav_consistency = host::consistency_proof(prev_nav_opening.nav.size, prefix)
+                .context("nav consistency proof")?;
+
+            let leaves = leaves_from_sets(&record.spendable, &record.spent_ids);
+            Ok((
+                TransitionMode::AccountUpdateProof,
+                record.state.clone(),
+                Some(prev_proof),
+                Some(prev_nav_opening),
+                Some(PredecessorNullifier {
+                    nullifier: last_nf,
+                    nav_inclusion,
+                    position: pos,
+                }),
+                nav_consistency,
+                leaves,
+            ))
+        } else {
+            // Genesis / first transition: canonical empty account.
+            let nk_commit = host::nk_commit(nk);
+            let prev = AccountState::new(
+                *owner,
+                nk_commit,
+                BTreeMap::new(),
+                current_pubkey,
+                0,
+                host::coinhist_empty_root(),
+            )
+            .context("construct empty genesis AccountState")?;
+            // InitialProof: empty consistency from 0 → nav.size (special-cased empty).
+            ensure!(
+                nav.size == 0
+                    || host::consistency_proof(0, &self.nflog_entries[..nav.size as usize]).is_ok(),
+                "initial nav consistency pre-check failed"
+            );
+            let nav_consistency = if nav.size == 0 {
+                Vec::new()
+            } else {
+                // m == 0 ⇒ empty proof per validate_consistency_proof.
+                Vec::new()
+            };
+            Ok((
+                TransitionMode::InitialProof,
+                prev,
+                None,
+                None,
+                None,
+                nav_consistency,
+                BTreeMap::new(),
+            ))
+        }
+    }
+
+    /// `nav = size_final` at the current tip (§2.3.2 step 5 / §3.9).
+    fn size_final_nav(&self) -> Result<Nav> {
+        let size = self.nflog.size_final(self.tip_height);
+        let full = self.nflog.nav();
+        ensure!(
+            size <= full.size,
+            "size_final {size} exceeds accumulator size {}",
+            full.size
+        );
+        if size == 0 {
+            return Ok(Nav {
+                size: 0,
+                mth: host::nflog_empty(),
+            });
+        }
+        if size == full.size {
+            return Ok(full);
+        }
+        ensure!(
+            self.nflog_entries.len() as u64 >= size,
+            "nflog_entries shorter than size_final"
+        );
+        let mth = host::nflog_mth(&self.nflog_entries[..size as usize]);
+        ensure!(
+            self.nflog.is_canonical(size, mth),
+            "computed size_final mth is not canonical"
+        );
+        Ok(Nav { size, mth })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn placeholder_signature(pk_i: [u8; 32]) -> TransitionSignature {
+    TransitionSignature {
+        pk_i,
+        signature: [0u8; 64],
+        r_prime: [0u8; 32],
+    }
+}
+
+fn compute_proof_data(
+    new_account_state: &AccountState,
+    output_coins: &[Coin],
+    input_coins: &[Coin],
+    nk: &[u8; 32],
+    nav_and_keys: (Nav, &[u8; 32], &[u8; 32], &[u8; 32]),
+) -> Result<ProofData> {
+    let (nav, nav_rand, next_pubkey, npk_rand) = nav_and_keys;
+    let output_ids: Vec<HashDigest> = output_coins.iter().map(|c| c.identifier).collect();
+    let nullifiers: Vec<HashDigest> = input_coins
+        .iter()
+        .map(|c| host::nullifier(nk, c.identifier))
+        .collect();
+    Ok(ProofData {
+        new_account_state_hash: host::account_state_hash(new_account_state)
+            .context("hash new account state")?,
+        output_coins_root: host::merkle_root(TreeKind::CoinsRoot, &output_ids),
+        input_nullifiers_root: host::merkle_root(TreeKind::NullifiersRoot, &nullifiers),
+        coin_history_root: new_account_state.coin_history_root,
+        nav_commitment: host::nav_commitment(nav.root(), nav_rand),
+        npk_commit: host::npk_commit(next_pubkey, npk_rand),
+    })
+}
+
+fn leaves_from_sets(
+    spendable: &BTreeMap<[u8; 32], TrackedCoin>,
+    spent_ids: &BTreeSet<[u8; 32]>,
+) -> BTreeMap<[u8; 32], host::CoinHistState> {
+    let mut leaves = BTreeMap::new();
+    for id in spent_ids {
+        leaves.insert(*id, host::CoinHistState::Spent);
+    }
+    for id in spendable.keys() {
+        leaves.insert(*id, host::CoinHistState::Admitted);
+    }
+    leaves
+}
+
+fn rebuild_coinhist(leaves: &BTreeMap<[u8; 32], host::CoinHistState>) -> Result<CoinHistTree> {
+    let mut hist = CoinHistTree::new();
+    for (&id, &state) in leaves {
+        match state {
+            host::CoinHistState::Admitted => {
+                hist.admit(id).context("rebuild admit")?;
+            }
+            host::CoinHistState::Spent => {
+                hist.admit(id).context("rebuild admit-before-spend")?;
+                hist.spend(id).context("rebuild spend")?;
+            }
+            host::CoinHistState::Absent => {
+                bail!("Absent must not appear in coinhist leaf map");
+            }
+        }
+    }
+    Ok(hist)
+}
+
+fn credit_balance(
+    balances: &mut BTreeMap<[u8; 32], u128>,
+    asset_id: HashDigest,
+    amount: u128,
+) -> Result<()> {
+    ensure!(amount > 0, "credit amount must be non-zero");
+    let key = host::digest_to_bytes(&asset_id);
+    let entry = balances.entry(key).or_insert(0);
+    *entry = entry
+        .checked_add(amount)
+        .context("balance credit overflow")?;
+    ensure!(
+        balances.len() <= MAX_ACCOUNT_ASSETS,
+        "account balance count exceeds MAX_ACCOUNT_ASSETS"
+    );
+    Ok(())
+}
+
+fn debit_balance(
+    balances: &mut BTreeMap<[u8; 32], u128>,
+    asset_id: HashDigest,
+    amount: u128,
+) -> Result<()> {
+    ensure!(amount > 0, "debit amount must be non-zero");
+    let key = host::digest_to_bytes(&asset_id);
+    let cur = balances
+        .get(&key)
+        .copied()
+        .context("debit: asset not present in balances")?;
+    ensure!(cur >= amount, "debit: insufficient balance");
+    let next = cur - amount;
+    if next == 0 {
+        balances.remove(&key);
+    } else {
+        balances.insert(key, next);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prover_bridge::test_signing::{
+        base_proved_transition, deterministic_secret, normalized_key, sign_transition,
+    };
+    use crate::prover_bridge::{OutputInclusionProof, ReceivedAuthorization};
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::polynomial::PolynomialCoeffs;
+    use plonky2::field::secp256k1_scalar::Secp256K1Scalar;
+    use plonky2::field::types::Field;
+    use plonky2::fri::proof::FriProof;
+    use plonky2::hash::merkle_tree::MerkleCap;
+    use plonky2::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
+    use sha2::{Digest, Sha256};
+    use zkcoins_program_plonky2::circuit::gadgets::curve_types::{AffinePoint, Secp256K1};
+
+    /// Host-only dummy last_proof for begin_* host construction (no circuit).
+    fn host_dummy_last_proof() -> ComplianceProof {
+        ProofWithPublicInputs {
+            proof: Proof {
+                wires_cap: MerkleCap(vec![]),
+                plonk_zs_partial_products_cap: MerkleCap(vec![]),
+                quotient_polys_cap: MerkleCap(vec![]),
+                openings: OpeningSet {
+                    constants: vec![],
+                    plonk_sigmas: vec![],
+                    wires: vec![],
+                    plonk_zs: vec![],
+                    plonk_zs_next: vec![],
+                    partial_products: vec![],
+                    quotient_polys: vec![],
+                    lookup_zs: vec![],
+                    lookup_zs_next: vec![],
+                },
+                opening_proof: FriProof {
+                    commit_phase_merkle_caps: vec![],
+                    query_round_proofs: vec![],
+                    final_poly: PolynomialCoeffs::new(vec![]),
+                    pow_witness: GoldilocksField::ZERO,
+                },
+            },
+            public_inputs: vec![],
+        }
+    }
+
+    /// Deterministic keys / coin construction matching `prover_bridge` fixtures.
+    struct FundedFixture {
+        owner: Address,
+        nk: [u8; 32],
+        op_secret: OpSecret,
+        asset_id: HashDigest,
+        input_coin: Coin,
+        /// Secret for the account's *current* spend key (post-mint = spend-key-1).
+        spend_secret: Secp256K1Scalar,
+        spend_public: AffinePoint<Secp256K1>,
+        next_pubkey: [u8; 32],
+        genesis_proof: ProvedTransition,
+        genesis_nav_opening: NavOpening,
+        genesis_nullifier: NullifierOpening,
+    }
+
+    fn label_op_secret(label: &[u8]) -> OpSecret {
+        OpSecret::new(Sha256::digest(label).into())
+    }
+
+    fn build_funded_fixture(bridge: &ProverBridge) -> FundedFixture {
+        // --- genesis mint witness (same pattern as prover_bridge::genesis_fixture) ---
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/compliance-chain/nk").into();
+        let nk_commit = host::nk_commit(&nk);
+        let (secret0, public0, pk0) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-chain/spend-key-0",
+        ));
+        let (_, _, pk1) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-chain/spend-key-1",
+        ));
+        let owner = Address(host::address(&pk0, nk_commit));
+        let name_hash: [u8; 32] = Sha256::digest(b"Recursive Fixture Asset").into();
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk0, &name_hash, 2, 1);
+        let issuance = AssetIssuance {
+            asset_id,
+            creator_pubkey: pk0,
+            issuance_version: 1,
+            name_hash,
+            decimals: 2,
+            amount: 100,
+            terms_hash: host::terms_hash_v1(asset_id, 1),
+            cap_total: 0,
+            terms_salt: [0u8; 32],
+        };
+        let prev_account_state = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let prev_ash = host::account_state_hash(&prev_account_state).unwrap();
+        let output_template = CoinTemplate {
+            recipient: owner,
+            amount: 100,
+            asset_id,
+        };
+        let output_coin = Coin {
+            identifier: host::coin_identifier(prev_ash, &owner.0, asset_id, 100, 0),
+            recipient: owner,
+            amount: 100,
+            asset_id,
+        };
+        let mut history = CoinHistTree::new();
+        let output_history = history.prove(host::digest_to_bytes(&output_coin.identifier));
+        history
+            .admit(host::digest_to_bytes(&output_coin.identifier))
+            .unwrap();
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 100);
+        let new_account_state =
+            AccountState::new(owner, nk_commit, balances, pk1, 1, history.root()).unwrap();
+        // Fresh-net mint: nav = size_final = empty.
+        let nav_opening = NavOpening {
+            nav: Nav {
+                size: 0,
+                mth: host::nflog_empty(),
+            },
+            nav_rand: [0x2bu8; 32],
+        };
+        let npk_rand = [0x4du8; 32];
+        let proof_data = ProofData {
+            new_account_state_hash: host::account_state_hash(&new_account_state).unwrap(),
+            output_coins_root: host::merkle_root(TreeKind::CoinsRoot, &[output_coin.identifier]),
+            input_nullifiers_root: host::merkle_root(TreeKind::NullifiersRoot, &[]),
+            coin_history_root: new_account_state.coin_history_root,
+            nav_commitment: host::nav_commitment(nav_opening.nav.root(), &nav_opening.nav_rand),
+            npk_commit: host::npk_commit(&pk1, &npk_rand),
+        };
+        let signature = sign_transition(secret0, public0, &proof_data, Network::Testnet);
+        let witness = TransitionWitness {
+            mode: TransitionMode::InitialProof,
+            prev_account_state,
+            new_account_state: new_account_state.clone(),
+            input_coins: Vec::new(),
+            input_auth: Vec::new(),
+            output_templates: vec![output_template],
+            output_coins: vec![output_coin.clone()],
+            output_history_proofs: vec![Some(output_history)],
+            received_coins: Vec::new(),
+            received_auth: Vec::new(),
+            asset_issuance: Some(issuance),
+            nk,
+            nav: nav_opening.nav,
+            nav_rand: nav_opening.nav_rand,
+            prev_nav_opening: None,
+            nav_consistency: Vec::new(),
+            next_pubkey: pk1,
+            npk_rand,
+            transition_signature: signature.transition.clone(),
+            prev_proof: None,
+            predecessor_nullifier: None,
+        };
+        let genesis_proof = bridge
+            .prove_transition(&witness)
+            .expect("fixture genesis/mint proof");
+
+        let (spend_secret, spend_public, pk1_check) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-chain/spend-key-1",
+        ));
+        assert_eq!(pk1_check, pk1);
+        let (_, _, next_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-chain/spend-key-2",
+        ));
+
+        FundedFixture {
+            owner,
+            nk,
+            op_secret: label_op_secret(b"zkCoins/v1/compliance-chain/op_secret"),
+            asset_id,
+            input_coin: output_coin,
+            spend_secret,
+            spend_public,
+            next_pubkey,
+            genesis_proof,
+            genesis_nav_opening: nav_opening,
+            genesis_nullifier: NullifierOpening {
+                public_key: signature.transition.pk_i,
+                signature_r: signature.transition.signature_r(),
+                r_prime: signature.transition.r_prime,
+            },
+        }
+    }
+
+    fn engine_with_funded_account(fixture: &FundedFixture) -> StateEngine {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        // Fold the genesis nullifier at height 100, then tip past finality so
+        // size_final covers it (predecessor dependency for the send).
+        engine.set_tip_height(100);
+        let genesis_position = ChainPosition {
+            height: 100,
+            tx_index: 0,
+            vin_index: 0,
+            member_index: 0,
+        };
+        let fold = engine
+            .nflog
+            .fold(
+                genesis_position,
+                fixture.genesis_nullifier.public_key,
+                fixture.genesis_nullifier.signature_r,
+            )
+            .expect("fold genesis nullifier");
+        let pos = match fold {
+            FoldOutcome::Appended(p) => p,
+            other => panic!("expected Appended, got {other:?}"),
+        };
+        engine.nflog_entries.push(NfLogEntry {
+            pk: fixture.genesis_nullifier.public_key,
+            r: fixture.genesis_nullifier.signature_r,
+        });
+        engine.nflog_positions.push(genesis_position);
+        engine.fold_seq = 1;
+        // tip ≥ height + 5 ⇒ size_final includes the entry.
+        engine.set_tip_height(105);
+
+        let mut coinhist = CoinHistTree::new();
+        let id = host::digest_to_bytes(&fixture.input_coin.identifier);
+        coinhist.admit(id).unwrap();
+        let mut spendable = BTreeMap::new();
+        let creating_prev_ash = {
+            // prev_ash of the genesis mint (empty → minted state).
+            let nk_commit = host::nk_commit(&fixture.nk);
+            let (_s, _p, pk0) = normalized_key(deterministic_secret(
+                b"zkCoins/v1/compliance-chain/spend-key-0",
+            ));
+            let empty = AccountState::new(
+                fixture.owner,
+                nk_commit,
+                BTreeMap::new(),
+                pk0,
+                0,
+                host::coinhist_empty_root(),
+            )
+            .unwrap();
+            host::account_state_hash(&empty).unwrap()
+        };
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: fixture.input_coin.clone(),
+                creating_prev_ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&fixture.asset_id), 100);
+        let (_s, _p, pk1) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/compliance-chain/spend-key-1",
+        ));
+        let state = AccountState::new(
+            fixture.owner,
+            host::nk_commit(&fixture.nk),
+            balances,
+            pk1,
+            1,
+            coinhist.root(),
+        )
+        .unwrap();
+        let record = AccountRecord {
+            state,
+            coinhist,
+            nk: fixture.nk,
+            op_secret: Some(fixture.op_secret),
+            genesis_pubkey: {
+                let (_s, _p, pk0) = normalized_key(deterministic_secret(
+                    b"zkCoins/v1/compliance-chain/spend-key-0",
+                ));
+                pk0
+            },
+            spendable,
+            spent_ids: BTreeSet::new(),
+            last_proof: Some(fixture.genesis_proof.proof.clone()),
+            last_nav_opening: Some(fixture.genesis_nav_opening),
+            last_nullifier: Some(fixture.genesis_nullifier.clone()),
+            last_nullifier_pos: Some(pos),
+        };
+        engine.insert_account(fixture.owner, record).unwrap();
+        let _ = pos;
+        engine
+    }
+
+    fn test_mint_request(issuance_version: u8) -> MintRequest {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/test-mint/nk").into();
+        let (_, _, current_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/test-mint/pk0",
+        ));
+        let (_, _, next_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/test-mint/pk1",
+        ));
+        let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
+        let name: Vec<u8> = b"State Engine Test Asset".to_vec();
+        let decimals = 2u8;
+        let amount = 100u128;
+        let cap_total = if issuance_version == 2 { 100 } else { 0 };
+        let terms_salt = if issuance_version == 2 {
+            [0x44; 32]
+        } else {
+            [0u8; 32]
+        };
+        // v1 default: one self-output for the full `amount` (today's implicit
+        // behaviour, now explicit). v2 default: EMPTY — token-standard-2 requires
+        // an explicit non-owner recipient (§6.5 clause (g)); tests that exercise a
+        // *valid* v2 mint set `req.output_templates` themselves.
+        let output_templates = if issuance_version == 1 {
+            let name_hash = host::name_hash(&name).expect("name_hash");
+            let asset_id =
+                host::asset_id_v1(host::GENESIS_TAG, &current_pubkey, &name_hash, decimals, 1);
+            vec![CoinTemplate {
+                recipient: owner,
+                amount,
+                asset_id,
+            }]
+        } else {
+            Vec::new()
+        };
+        MintRequest {
+            owner,
+            nk,
+            op_secret: label_op_secret(b"zkCoins/v1/state-engine/test-mint/op_secret"),
+            current_pubkey,
+            next_pubkey,
+            name,
+            decimals,
+            amount,
+            issuance_version,
+            cap_total,
+            terms_salt,
+            output_templates,
+            npk_rand: [0x22; 32],
+        }
+    }
+
+    fn dummy_received_auth(
+        creating_proof: ComplianceProof,
+        creating_prev_ash: HashDigest,
+        leaf_index: u32,
+    ) -> ReceivedAuthorization {
+        let empty_nav = Nav {
+            size: 0,
+            mth: host::nflog_empty(),
+        };
+        ReceivedAuthorization {
+            creating_proof,
+            output_inclusion: crate::prover_bridge::OutputInclusionProof {
+                leaf_index,
+                depth: 0,
+                siblings: Vec::new(),
+            },
+            creating_prev_ash,
+            creating_nullifier: NullifierOpening {
+                public_key: [0; 32],
+                signature_r: [0; 32],
+                r_prime: [0; 32],
+            },
+            creating_nav_inclusion: Vec::new(),
+            pos_create: 0,
+            creating_nav_opening: NavOpening {
+                nav: empty_nav,
+                nav_rand: [0; 32],
+            },
+            creating_nav_consistency: Vec::new(),
+            history_proof: CoinHistTree::new().prove([0; 32]),
+        }
+    }
+
+    #[test]
+    fn begin_mint_rejects_token_standard_2_without_explicit_recipient() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let err = engine
+            .begin_mint(test_mint_request(2))
+            .expect_err("v2 mint must fail loudly");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("explicit non-owner emission recipient")
+                && msg.contains("§6.5 clause (g)"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// §6.5 clause (e): amount > cap_total is refused by name before any
+    /// witness is built (including the emission-recipient gap).
+    #[test]
+    fn begin_mint_rejects_token_standard_2_amount_over_cap_naming_clause_e() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let mut req = test_mint_request(2);
+        req.amount = 101;
+        req.cap_total = 100;
+        let err = engine
+            .begin_mint(req)
+            .expect_err("over-cap v2 mint must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("amount exceeds cap_total") && msg.contains("§6.5 clause (e)"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// §6.5 clause (f): a re-mint of a capped asset into a non-genesis
+    /// account is refused by the genesis-binding clause (not silently
+    /// attempted, and not masked as the emission-recipient gap).
+    ///
+    /// Host preflight only — fires before `account_transition_context`, so
+    /// no `last_proof` / circuit build is required.
+    #[test]
+    fn begin_mint_rejects_token_standard_2_remint_naming_clause_f() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let base = test_mint_request(1);
+        let nk_commit = host::nk_commit(&base.nk);
+        // Install a post-genesis account (send_counter = 1) so clause (f)
+        // fires on a subsequent v2 mint request.
+        let state = AccountState::new(
+            base.owner,
+            nk_commit,
+            BTreeMap::new(),
+            base.next_pubkey, // rotated away from Pk₀
+            1,
+            host::coinhist_empty_root(),
+        )
+        .expect("post-genesis state");
+        engine
+            .insert_account(
+                base.owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk: base.nk,
+                    // Same operational secret the v2 request carries (test_mint_request).
+                    op_secret: Some(base.op_secret),
+                    genesis_pubkey: base.current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .expect("insert");
+
+        let mut req = test_mint_request(2);
+        req.owner = base.owner;
+        req.nk = base.nk;
+        req.current_pubkey = base.next_pubkey; // matches installed state
+        req.amount = 50;
+        req.cap_total = 100;
+        let err = engine
+            .begin_mint(req)
+            .expect_err("v2 remint must fail at genesis binding");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("non-genesis account") && msg.contains("§6.5 clause (f)"),
+            "unexpected error: {msg}"
+        );
+        // Cap is not the reason (amount ≤ cap); refuse must not mask as (e).
+        assert!(
+            !msg.contains("clause (e)"),
+            "clause (f) refusal must not be reported as clause (e): {msg}"
+        );
+    }
+
+    /// Host-only: AccountUpdateProof with `last_nullifier` not yet on the
+    /// canonical NfLog must fail as typed [`DependencyNotFinal`], not a bare
+    /// string that callers have to substring-match.
+    #[test]
+    fn begin_mint_predecessor_absent_from_nflog_is_dependency_not_final() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let first = test_mint_request(1);
+        let nk_commit = host::nk_commit(&first.nk);
+        let name_hash = host::name_hash(&first.name).expect("name_hash");
+        let asset_id = host::asset_id_v1(
+            host::GENESIS_TAG,
+            &first.current_pubkey,
+            &name_hash,
+            first.decimals,
+            1,
+        );
+        let empty = AccountState::new(
+            first.owner,
+            nk_commit,
+            BTreeMap::new(),
+            first.current_pubkey,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let prior_coin = Coin {
+            identifier: host::coin_identifier(empty_ash, &first.owner.0, asset_id, 100, 0),
+            recipient: first.owner,
+            amount: 100,
+            asset_id,
+        };
+        let mut coinhist = CoinHistTree::new();
+        let prior_id = host::digest_to_bytes(&prior_coin.identifier);
+        coinhist.admit(prior_id).expect("admit");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            prior_id,
+            TrackedCoin {
+                coin: prior_coin,
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 100u128);
+        let state = AccountState::new(
+            first.owner,
+            nk_commit,
+            balances,
+            first.next_pubkey,
+            1,
+            coinhist.root(),
+        )
+        .expect("post-mint state");
+        // last_nullifier set, but never folded into the NfLog.
+        engine
+            .insert_account(
+                first.owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk: first.nk,
+                    op_secret: Some(first.op_secret),
+                    genesis_pubkey: first.current_pubkey,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: Some(host_dummy_last_proof()),
+                    last_nav_opening: Some(NavOpening {
+                        nav: Nav {
+                            size: 0,
+                            mth: host::nflog_empty(),
+                        },
+                        nav_rand: first.op_secret.derive_nav_rand(0),
+                    }),
+                    last_nullifier: Some(NullifierOpening {
+                        public_key: first.current_pubkey,
+                        signature_r: [0x71u8; 32],
+                        r_prime: [0; 32],
+                    }),
+                    last_nullifier_pos: None,
+                },
+            )
+            .expect("insert");
+
+        let (_, _, remint_next) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/test-mint/pk2-absent-pred",
+        ));
+        let remint = MintRequest {
+            owner: first.owner,
+            nk: first.nk,
+            op_secret: first.op_secret,
+            current_pubkey: first.next_pubkey,
+            next_pubkey: remint_next,
+            name: first.name.clone(),
+            decimals: first.decimals,
+            amount: 40,
+            issuance_version: 1,
+            cap_total: 0,
+            terms_salt: [0u8; 32],
+            output_templates: vec![CoinTemplate {
+                recipient: first.owner,
+                amount: 40,
+                asset_id,
+            }],
+            npk_rand: [0x44; 32],
+        };
+        let err = engine
+            .begin_mint(remint)
+            .expect_err("absent predecessor must refuse AccountUpdateProof");
+        let cause = err
+            .downcast_ref::<DependencyNotFinal>()
+            .expect("typed DependencyNotFinal cause, not a bare string");
+        assert_eq!(
+            *cause,
+            DependencyNotFinal::PredecessorAbsentFromCanonicalNfLog
+        );
+    }
+
+    /// Host-only: predecessor on the NfLog but not inside `size_final` is the
+    /// second typed [`DependencyNotFinal`] variant (no circuit prove).
+    #[test]
+    fn begin_mint_predecessor_beyond_size_final_is_dependency_not_final() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let first = test_mint_request(1);
+        let nk_commit = host::nk_commit(&first.nk);
+        let name_hash = host::name_hash(&first.name).expect("name_hash");
+        let asset_id = host::asset_id_v1(
+            host::GENESIS_TAG,
+            &first.current_pubkey,
+            &name_hash,
+            first.decimals,
+            1,
+        );
+        // Fold a predecessor at height 10; tip stays at 10 so size_final = 0
+        // (confirmation depth not yet met).
+        let predecessor_position = ChainPosition {
+            height: 10,
+            tx_index: 0,
+            vin_index: 0,
+            member_index: 0,
+        };
+        let predecessor_entry = NfLogEntry {
+            pk: first.current_pubkey,
+            r: [0x71u8; 32],
+        };
+        engine.set_tip_height(10);
+        assert_eq!(
+            engine
+                .nflog
+                .fold(
+                    predecessor_position,
+                    predecessor_entry.pk,
+                    predecessor_entry.r,
+                )
+                .unwrap(),
+            FoldOutcome::Appended(0)
+        );
+        engine.nflog_entries.push(predecessor_entry);
+        engine.nflog_positions.push(predecessor_position);
+        // Keep tip at 10: size_final(10) does not cover height-10 entries.
+        assert_eq!(engine.nflog.size_final(10), 0);
+
+        let empty = AccountState::new(
+            first.owner,
+            nk_commit,
+            BTreeMap::new(),
+            first.current_pubkey,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let prior_coin = Coin {
+            identifier: host::coin_identifier(empty_ash, &first.owner.0, asset_id, 100, 0),
+            recipient: first.owner,
+            amount: 100,
+            asset_id,
+        };
+        let mut coinhist = CoinHistTree::new();
+        let prior_id = host::digest_to_bytes(&prior_coin.identifier);
+        coinhist.admit(prior_id).expect("admit");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            prior_id,
+            TrackedCoin {
+                coin: prior_coin,
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 100u128);
+        let state = AccountState::new(
+            first.owner,
+            nk_commit,
+            balances,
+            first.next_pubkey,
+            1,
+            coinhist.root(),
+        )
+        .expect("post-mint state");
+        engine
+            .insert_account(
+                first.owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk: first.nk,
+                    op_secret: Some(first.op_secret),
+                    genesis_pubkey: first.current_pubkey,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: Some(host_dummy_last_proof()),
+                    last_nav_opening: Some(NavOpening {
+                        nav: Nav {
+                            size: 0,
+                            mth: host::nflog_empty(),
+                        },
+                        nav_rand: first.op_secret.derive_nav_rand(0),
+                    }),
+                    last_nullifier: Some(NullifierOpening {
+                        public_key: predecessor_entry.pk,
+                        signature_r: predecessor_entry.r,
+                        r_prime: [0; 32],
+                    }),
+                    last_nullifier_pos: Some(0),
+                },
+            )
+            .expect("insert");
+
+        let (_, _, remint_next) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/test-mint/pk2-size-final",
+        ));
+        let remint = MintRequest {
+            owner: first.owner,
+            nk: first.nk,
+            op_secret: first.op_secret,
+            current_pubkey: first.next_pubkey,
+            next_pubkey: remint_next,
+            name: first.name.clone(),
+            decimals: first.decimals,
+            amount: 40,
+            issuance_version: 1,
+            cap_total: 0,
+            terms_salt: [0u8; 32],
+            output_templates: vec![CoinTemplate {
+                recipient: first.owner,
+                amount: 40,
+                asset_id,
+            }],
+            npk_rand: [0x44; 32],
+        };
+        let err = engine
+            .begin_mint(remint)
+            .expect_err("pos ≥ size_final must refuse AccountUpdateProof");
+        let cause = err
+            .downcast_ref::<DependencyNotFinal>()
+            .expect("typed DependencyNotFinal cause, not a bare string");
+        assert_eq!(
+            *cause,
+            DependencyNotFinal::PredecessorPositionNotCoveredBySizeFinal {
+                position: 0,
+                size_final: 0,
+            }
+        );
+    }
+
+    /// Conformant token-standard-1 re-mint into an existing multi-asset
+    /// account: AccountUpdateProof mode, asset_issuance present, supply
+    /// (balance) = prior + minted amount. Host-only — no circuit prove.
+    #[test]
+    fn begin_mint_std1_remint_into_existing_account_updates_supply() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let first = test_mint_request(1);
+        let nk_commit = host::nk_commit(&first.nk);
+        let name_hash = host::name_hash(&first.name).expect("name_hash");
+        let asset_id = host::asset_id_v1(
+            host::GENESIS_TAG,
+            &first.current_pubkey,
+            &name_hash,
+            first.decimals,
+            1,
+        );
+        let prior_amount: u128 = 100;
+        let remint_amount: u128 = 40;
+
+        // Fold a predecessor nullifier so AccountUpdateProof can bind it.
+        let predecessor_position = ChainPosition {
+            height: 10,
+            tx_index: 0,
+            vin_index: 0,
+            member_index: 0,
+        };
+        let predecessor_entry = NfLogEntry {
+            pk: first.current_pubkey,
+            r: [0x61; 32],
+        };
+        engine.set_tip_height(10);
+        assert_eq!(
+            engine
+                .nflog
+                .fold(
+                    predecessor_position,
+                    predecessor_entry.pk,
+                    predecessor_entry.r,
+                )
+                .unwrap(),
+            FoldOutcome::Appended(0)
+        );
+        engine.nflog_entries.push(predecessor_entry);
+        engine.nflog_positions.push(predecessor_position);
+        engine.set_tip_height(15);
+
+        // Prior self-output from the first mint, already admitted.
+        let empty = AccountState::new(
+            first.owner,
+            nk_commit,
+            BTreeMap::new(),
+            first.current_pubkey,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let prior_coin = Coin {
+            identifier: host::coin_identifier(empty_ash, &first.owner.0, asset_id, prior_amount, 0),
+            recipient: first.owner,
+            amount: prior_amount,
+            asset_id,
+        };
+        let mut coinhist = CoinHistTree::new();
+        let prior_id = host::digest_to_bytes(&prior_coin.identifier);
+        coinhist.admit(prior_id).expect("admit prior");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            prior_id,
+            TrackedCoin {
+                coin: prior_coin,
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), prior_amount);
+        // Post-first-mint: send_counter = 1, current key rotated to next.
+        let state = AccountState::new(
+            first.owner,
+            nk_commit,
+            balances,
+            first.next_pubkey,
+            1,
+            coinhist.root(),
+        )
+        .expect("post-mint state");
+        engine
+            .insert_account(
+                first.owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk: first.nk,
+                    // Same operational secret the remint request carries.
+                    op_secret: Some(first.op_secret),
+                    genesis_pubkey: first.current_pubkey,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: Some(host_dummy_last_proof()),
+                    last_nav_opening: Some(NavOpening {
+                        nav: Nav {
+                            size: 0,
+                            mth: host::nflog_empty(),
+                        },
+                        // Prior (genesis) opening: entry send_counter = 0.
+                        nav_rand: first.op_secret.derive_nav_rand(0),
+                    }),
+                    last_nullifier: Some(NullifierOpening {
+                        public_key: predecessor_entry.pk,
+                        signature_r: predecessor_entry.r,
+                        r_prime: [0; 32],
+                    }),
+                    last_nullifier_pos: Some(0),
+                },
+            )
+            .expect("insert funded account");
+
+        let (_, _, remint_next) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/test-mint/pk2",
+        ));
+        let remint = MintRequest {
+            owner: first.owner,
+            nk: first.nk,
+            op_secret: first.op_secret,
+            current_pubkey: first.next_pubkey,
+            next_pubkey: remint_next,
+            name: first.name.clone(),
+            decimals: first.decimals,
+            amount: remint_amount,
+            issuance_version: 1,
+            cap_total: 0,
+            terms_salt: [0u8; 32],
+            output_templates: vec![CoinTemplate {
+                recipient: first.owner,
+                amount: remint_amount,
+                asset_id,
+            }],
+            npk_rand: [0x44; 32],
+        };
+        let pending = engine.begin_mint(remint).expect("std1 remint must succeed");
+
+        assert_eq!(pending.mode, TransitionMode::AccountUpdateProof);
+        assert!(
+            pending.witness_wip.asset_issuance.is_some(),
+            "remint must carry asset_issuance so Mint(a) flows into clause 3"
+        );
+        let issuance = pending.witness_wip.asset_issuance.as_ref().unwrap();
+        assert_eq!(issuance.amount, remint_amount);
+        assert_eq!(issuance.asset_id, asset_id);
+        assert_eq!(issuance.creator_pubkey, first.current_pubkey);
+        assert_eq!(issuance.issuance_version, 1);
+
+        let new_bal = pending
+            .witness_wip
+            .new_account_state
+            .balances
+            .get(&host::digest_to_bytes(&asset_id))
+            .copied();
+        assert_eq!(
+            new_bal,
+            Some(prior_amount + remint_amount),
+            "supply must equal prior balance + remint amount"
+        );
+        assert_eq!(pending.witness_wip.new_account_state.send_counter, 2);
+        assert_eq!(
+            pending.witness_wip.new_account_state.current_pubkey,
+            remint_next
+        );
+        // Self-output of the remint amount only (prior coin stays spendable
+        // until a later spend; clause 7 credits balances, not rewrites coins).
+        assert_eq!(pending.witness_wip.output_coins.len(), 1);
+        assert_eq!(pending.witness_wip.output_coins[0].amount, remint_amount);
+        assert_eq!(pending.witness_wip.output_coins[0].asset_id, asset_id);
+    }
+
+    #[test]
+    fn begin_receive_initial_proof_uses_sequential_history_roots() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine.set_tip_height(0);
+
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/initial-receive/nk").into();
+        let (_, _, current_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/initial-receive/pk0",
+        ));
+        let (_, _, next_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/initial-receive/pk1",
+        ));
+        let owner = Address(host::address(&current_pubkey, host::nk_commit(&nk)));
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &current_pubkey, &[0x31; 32], 2, 1);
+        let initial_state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            current_pubkey,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let creating_prev_ash = host::account_state_hash(&initial_state).unwrap();
+        let coins = vec![
+            Coin {
+                identifier: host::coin_identifier(creating_prev_ash, &owner.0, asset_id, 40, 0),
+                recipient: owner,
+                amount: 40,
+                asset_id,
+            },
+            Coin {
+                identifier: host::coin_identifier(creating_prev_ash, &owner.0, asset_id, 60, 1),
+                recipient: owner,
+                amount: 60,
+                asset_id,
+            },
+        ];
+        let base = base_proved_transition(Network::Testnet);
+        let auth = vec![
+            dummy_received_auth(base.proof.clone(), creating_prev_ash, 0),
+            dummy_received_auth(base.proof, creating_prev_ash, 1),
+        ];
+
+        let pending = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/initial-receive/op_secret"),
+                current_pubkey,
+                received_coins: coins.clone(),
+                received_auth: auth,
+                next_pubkey,
+                npk_rand: [0x42; 32],
+            })
+            .expect("first-transition batched receive");
+        assert_eq!(pending.mode, TransitionMode::InitialProof);
+        assert!(pending.witness_wip.prev_proof.is_none());
+
+        let first_id = host::digest_to_bytes(&coins[0].identifier);
+        let second_id = host::digest_to_bytes(&coins[1].identifier);
+        let first_proof = &pending.witness_wip.received_auth[0].history_proof;
+        let second_proof = &pending.witness_wip.received_auth[1].history_proof;
+        assert!(first_proof.verify(&first_id, host::coinhist_empty_root()));
+        assert!(!second_proof.verify(&second_id, host::coinhist_empty_root()));
+        let mut intermediate = CoinHistTree::new();
+        intermediate.admit(first_id).unwrap();
+        assert!(second_proof.verify(&second_id, intermediate.root()));
+        intermediate.admit(second_id).unwrap();
+        assert_eq!(
+            intermediate.root(),
+            pending.witness_wip.new_account_state.coin_history_root
+        );
+    }
+
+    #[test]
+    fn begin_send_multi_input_uses_sequential_history_roots() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/multi-send/nk").into();
+        let (_, _, genesis_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/multi-send/pk0",
+        ));
+        let (_, _, current_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/multi-send/pk1",
+        ));
+        let (_, _, next_pubkey) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/multi-send/pk2",
+        ));
+        let owner = Address(host::address(&genesis_pubkey, host::nk_commit(&nk)));
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &genesis_pubkey, &[0x52; 32], 2, 1);
+        let creating_state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            genesis_pubkey,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let creating_prev_ash = host::account_state_hash(&creating_state).unwrap();
+        let coins = [
+            Coin {
+                identifier: host::coin_identifier(creating_prev_ash, &owner.0, asset_id, 40, 0),
+                recipient: owner,
+                amount: 40,
+                asset_id,
+            },
+            Coin {
+                identifier: host::coin_identifier(creating_prev_ash, &owner.0, asset_id, 60, 1),
+                recipient: owner,
+                amount: 60,
+                asset_id,
+            },
+        ];
+        let mut coinhist = CoinHistTree::new();
+        let mut spendable = BTreeMap::new();
+        for (index, coin) in coins.iter().enumerate() {
+            let id = host::digest_to_bytes(&coin.identifier);
+            coinhist.admit(id).unwrap();
+            spendable.insert(
+                id,
+                TrackedCoin {
+                    coin: coin.clone(),
+                    creating_prev_ash,
+                    coin_index: index as u32,
+                },
+            );
+        }
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 100);
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            balances,
+            current_pubkey,
+            1,
+            coinhist.root(),
+        )
+        .unwrap();
+
+        let predecessor_position = ChainPosition {
+            height: 10,
+            tx_index: 0,
+            vin_index: 0,
+            member_index: 0,
+        };
+        let predecessor_entry = NfLogEntry {
+            pk: genesis_pubkey,
+            r: [0x61; 32],
+        };
+        engine.set_tip_height(10);
+        assert_eq!(
+            engine
+                .nflog
+                .fold(
+                    predecessor_position,
+                    predecessor_entry.pk,
+                    predecessor_entry.r,
+                )
+                .unwrap(),
+            FoldOutcome::Appended(0)
+        );
+        engine.nflog_entries.push(predecessor_entry);
+        engine.nflog_positions.push(predecessor_position);
+        engine.set_tip_height(15);
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state: state.clone(),
+                    coinhist,
+                    nk,
+                    op_secret: Some(label_op_secret(
+                        b"zkCoins/v1/state-engine/multi-send/op_secret",
+                    )),
+                    genesis_pubkey,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: Some(base_proved_transition(Network::Testnet).proof),
+                    last_nav_opening: Some(NavOpening {
+                        nav: Nav {
+                            size: 0,
+                            mth: host::nflog_empty(),
+                        },
+                        nav_rand: [0; 32],
+                    }),
+                    last_nullifier: Some(NullifierOpening {
+                        public_key: predecessor_entry.pk,
+                        signature_r: predecessor_entry.r,
+                        r_prime: [0; 32],
+                    }),
+                    last_nullifier_pos: Some(0),
+                },
+            )
+            .unwrap();
+
+        let pending = engine
+            .begin_send(SendRequest {
+                owner,
+                input_coin_ids: coins.iter().map(|coin| coin.identifier).collect(),
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x71; 32]),
+                    amount: 100,
+                    asset_id,
+                }],
+                next_pubkey,
+                npk_rand: [0x73; 32],
+            })
+            .expect("multi-input begin_send");
+
+        let first_id = host::digest_to_bytes(&coins[0].identifier);
+        let second_id = host::digest_to_bytes(&coins[1].identifier);
+        let first_proof = &pending.witness_wip.input_auth[0].history_proof;
+        let second_proof = &pending.witness_wip.input_auth[1].history_proof;
+        assert!(first_proof.verify(&first_id, state.coin_history_root));
+        assert!(!second_proof.verify(&second_id, state.coin_history_root));
+        let mut intermediate = rebuild_coinhist(&leaves_from_sets(
+            &engine.account(&owner).unwrap().spendable,
+            &BTreeSet::new(),
+        ))
+        .unwrap();
+        intermediate.spend(first_id).unwrap();
+        assert!(second_proof.verify(&second_id, intermediate.root()));
+        intermediate.spend(second_id).unwrap();
+        assert_eq!(
+            intermediate.root(),
+            pending.witness_wip.new_account_state.coin_history_root
+        );
+    }
+
+    /// Second `begin_send` from the same account after a prior AccountUpdate:
+    /// the first send's change coin is spendable/`Admitted`, `send_counter`
+    /// and `current_pubkey` have advanced, and a further `begin_send` that
+    /// spends the change succeeds without a Plonky2 prove.
+    ///
+    /// Replaces the deleted legacy
+    /// `test_send_coins_twice_from_same_account_uses_update_account` host
+    /// property for the v1 entry point. Engine state is installed as if the
+    /// first send had already been applied (no prove path).
+    #[test]
+    fn begin_send_second_send_spends_prior_change_coin() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/second-send/nk").into();
+        let (_, _, pk0) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/second-send/pk0",
+        ));
+        let (_, _, pk1) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/second-send/pk1",
+        ));
+        // current_pubkey after first send (= next of that send)
+        let (_, _, pk2) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/second-send/pk2",
+        ));
+        // next_pubkey for the second send
+        let (_, _, pk3) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/second-send/pk3",
+        ));
+        let owner = Address(host::address(&pk0, host::nk_commit(&nk)));
+        let op_secret = label_op_secret(b"zkCoins/v1/state-engine/second-send/op_secret");
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk0, &[0x5a; 32], 2, 1);
+
+        // Creating ash of the mint that produced the original 100-coin.
+        let mint_prev = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("mint prev");
+        let mint_prev_ash = host::account_state_hash(&mint_prev).expect("mint ash");
+        let funded = Coin {
+            identifier: host::coin_identifier(mint_prev_ash, &owner.0, asset_id, 100, 0),
+            recipient: owner,
+            amount: 100,
+            asset_id,
+        };
+        let funded_id = host::digest_to_bytes(&funded.identifier);
+
+        // First send: spend 100 → 30 external + 70 change. Creating ash of
+        // that send is the post-mint account state (send_counter=1, pk1).
+        let mut post_mint_hist = CoinHistTree::new();
+        post_mint_hist.admit(funded_id).expect("admit funded");
+        let mut post_mint_balances = BTreeMap::new();
+        post_mint_balances.insert(host::digest_to_bytes(&asset_id), 100);
+        let post_mint_state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            post_mint_balances,
+            pk1,
+            1,
+            post_mint_hist.root(),
+        )
+        .expect("post-mint state");
+        let first_send_prev_ash =
+            host::account_state_hash(&post_mint_state).expect("first-send prev ash");
+
+        let change = Coin {
+            identifier: host::coin_identifier(first_send_prev_ash, &owner.0, asset_id, 70, 1),
+            recipient: owner,
+            amount: 70,
+            asset_id,
+        };
+        let change_id = host::digest_to_bytes(&change.identifier);
+
+        // Post-first-send coinhist: funded Spent, change Admitted.
+        let mut coinhist = CoinHistTree::new();
+        coinhist.admit(funded_id).expect("admit funded");
+        coinhist.spend(funded_id).expect("spend funded");
+        coinhist.admit(change_id).expect("admit change");
+
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            change_id,
+            TrackedCoin {
+                coin: change.clone(),
+                creating_prev_ash: first_send_prev_ash,
+                coin_index: 1,
+            },
+        );
+        let mut spent_ids = BTreeSet::new();
+        spent_ids.insert(funded_id);
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 70);
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            balances,
+            pk2, // rotated by first send
+            2,   // send_counter after mint + first send
+            coinhist.root(),
+        )
+        .expect("post-first-send state");
+
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        // Predecessor nullifier = first send's consumed key (pk1).
+        let predecessor_position = ChainPosition {
+            height: 20,
+            tx_index: 0,
+            vin_index: 0,
+            member_index: 0,
+        };
+        let predecessor_entry = NfLogEntry {
+            pk: pk1,
+            r: [0x62; 32],
+        };
+        engine.set_tip_height(20);
+        assert_eq!(
+            engine
+                .nflog
+                .fold(
+                    predecessor_position,
+                    predecessor_entry.pk,
+                    predecessor_entry.r,
+                )
+                .unwrap(),
+            FoldOutcome::Appended(0)
+        );
+        engine.nflog_entries.push(predecessor_entry);
+        engine.nflog_positions.push(predecessor_position);
+        engine.set_tip_height(25);
+
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state: state.clone(),
+                    coinhist,
+                    nk,
+                    op_secret: Some(op_secret),
+                    genesis_pubkey: pk0,
+                    spendable,
+                    spent_ids,
+                    last_proof: Some(host_dummy_last_proof()),
+                    last_nav_opening: Some(NavOpening {
+                        nav: Nav {
+                            size: 0,
+                            mth: host::nflog_empty(),
+                        },
+                        nav_rand: op_secret.derive_nav_rand(1),
+                    }),
+                    last_nullifier: Some(NullifierOpening {
+                        public_key: pk1,
+                        signature_r: [0x62; 32],
+                        r_prime: [0; 32],
+                    }),
+                    last_nullifier_pos: Some(0),
+                },
+            )
+            .expect("insert post-first-send account");
+
+        // Precondition: change is the sole spendable coin and Admitted.
+        let rec = engine.account(&owner).expect("account");
+        assert_eq!(rec.state.send_counter, 2);
+        assert_eq!(rec.state.current_pubkey, pk2);
+        assert_eq!(rec.spendable.len(), 1);
+        assert!(rec.spendable.contains_key(&change_id));
+        assert!(rec.spent_ids.contains(&funded_id));
+        assert_eq!(
+            rec.coinhist.prove(change_id).state,
+            host::CoinHistState::Admitted,
+            "change must be Admitted for the second begin_send"
+        );
+
+        let external = Address([0x71; 32]);
+        let pending = engine
+            .begin_send(SendRequest {
+                owner,
+                input_coin_ids: vec![change.identifier],
+                output_templates: vec![CoinTemplate {
+                    recipient: external,
+                    amount: 30,
+                    asset_id,
+                }],
+                next_pubkey: pk3,
+                npk_rand: [0x74; 32],
+            })
+            .expect("second begin_send from same account must succeed");
+
+        assert_eq!(pending.mode, TransitionMode::AccountUpdateProof);
+        assert_eq!(pending.witness_wip.prev_account_state.send_counter, 2);
+        assert_eq!(pending.witness_wip.prev_account_state.current_pubkey, pk2);
+        assert_eq!(pending.witness_wip.new_account_state.send_counter, 3);
+        assert_eq!(pending.witness_wip.new_account_state.current_pubkey, pk3);
+        assert_eq!(pending.witness_wip.input_coins.len(), 1);
+        assert_eq!(
+            pending.witness_wip.input_coins[0].identifier,
+            change.identifier
+        );
+        // Input history path opens the post-first-send root as Admitted.
+        let hist = &pending.witness_wip.input_auth[0].history_proof;
+        assert_eq!(hist.state, host::CoinHistState::Admitted);
+        assert!(hist.verify(&change_id, state.coin_history_root));
+        // Change of the second send: 70 − 30 = 40 to self.
+        assert_eq!(pending.witness_wip.output_coins.len(), 2);
+        assert_eq!(pending.witness_wip.output_templates[0].recipient, external);
+        assert_eq!(pending.witness_wip.output_templates[0].amount, 30);
+        assert_eq!(pending.witness_wip.output_templates[1].recipient, owner);
+        assert_eq!(pending.witness_wip.output_templates[1].amount, 40);
+    }
+
+    #[test]
+    fn finalise_rejects_pending_envelope_mismatches_before_proving() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let pending = engine
+            .begin_mint(test_mint_request(1))
+            .expect("begin token-standard-1 mint");
+        let signature =
+            placeholder_signature(pending.witness_wip.prev_account_state.current_pubkey);
+
+        let mut wrong_owner = pending.clone();
+        wrong_owner.owner = Address([0x91; 32]);
+        let mut owner_engine = engine;
+        let err = owner_engine
+            .finalise(wrong_owner, signature.clone())
+            .expect_err("wrong envelope owner must fail before proving");
+        assert!(format!("{err:#}").contains("envelope owner"));
+
+        let mut wrong_mode = pending.clone();
+        wrong_mode.mode = TransitionMode::AccountUpdateProof;
+        let mut mode_engine = StateEngine::new(Network::Testnet, 0);
+        let err = mode_engine
+            .finalise(wrong_mode, signature.clone())
+            .expect_err("wrong envelope mode must fail before proving");
+        assert!(format!("{err:#}").contains("envelope mode"));
+
+        let mut stale_pending = pending.clone();
+        stale_pending.mode = TransitionMode::AccountUpdateProof;
+        stale_pending.witness_wip.mode = TransitionMode::AccountUpdateProof;
+        let mut stale_state = stale_pending.witness_wip.prev_account_state.clone();
+        stale_state.send_counter = 1;
+        let stale_owner = stale_pending.owner;
+        let mut stale_engine = StateEngine::new(Network::Testnet, 0);
+        stale_engine
+            .insert_account(
+                stale_owner,
+                AccountRecord {
+                    state: stale_state,
+                    coinhist: CoinHistTree::new(),
+                    nk: stale_pending.witness_wip.nk,
+                    op_secret: Some(stale_pending.op_secret),
+                    genesis_pubkey: stale_pending.witness_wip.prev_account_state.current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let err = stale_engine
+            .finalise(stale_pending, signature.clone())
+            .expect_err("stale witness prev_account_state must fail before proving");
+        assert!(format!("{err:#}").contains("stored account state"));
+
+        let mut wrong_nav = pending;
+        wrong_nav.nav_opening.nav_rand[0] ^= 1;
+        let mut nav_engine = StateEngine::new(Network::Testnet, 0);
+        let err = nav_engine
+            .finalise(wrong_nav, signature)
+            .expect_err("wrong envelope NAV must fail before proving");
+        assert!(format!("{err:#}").contains("envelope nav_opening"));
+    }
+
+    /// Public finalise and the receive-named alias are the same deferred-only
+    /// path: neither can invent a synthetic NfLog position.
+    ///
+    /// Uses a cheap envelope-mismatch rejection (before prove) so the default
+    /// suite does not build the compliance circuit. Success-path proof that
+    /// mint/send leave the log untouched lives in the ignored send e2e.
+    #[test]
+    fn public_finalise_api_is_deferred_only_and_leaves_nflog_untouched_on_prove_fail() {
+        let mut via_finalise = StateEngine::new(Network::Testnet, 0);
+        let mut via_alias = StateEngine::new(Network::Testnet, 0);
+        let req = test_mint_request(1);
+        let pending_a = via_finalise.begin_mint(req.clone()).expect("begin mint A");
+        let pending_b = via_alias.begin_mint(req).expect("begin mint B");
+        let signature =
+            placeholder_signature(pending_a.witness_wip.prev_account_state.current_pubkey);
+
+        assert_eq!(via_finalise.nflog.nav().size, 0);
+        assert_eq!(via_alias.nflog.nav().size, 0);
+
+        // Envelope mismatch fails before prove — both public entry points
+        // must leave the canonical NfLog untouched (no SyntheticLocal fold).
+        let mut wrong_a = pending_a;
+        wrong_a.owner = Address([0x91u8; 32]);
+        let mut wrong_b = pending_b;
+        wrong_b.owner = Address([0x92u8; 32]);
+        via_finalise
+            .finalise(wrong_a, signature.clone())
+            .expect_err("finalise must reject envelope mismatch");
+        via_alias
+            .finalise_pending_chain_nullifier(wrong_b, signature)
+            .expect_err("alias must reject envelope mismatch");
+        assert_eq!(via_finalise.nflog.nav().size, 0);
+        assert_eq!(via_alias.nflog.nav().size, 0);
+        assert!(via_finalise.accounts.is_empty());
+        assert!(via_alias.accounts.is_empty());
+    }
+
+    #[test]
+    fn verify_incoming_rejects_forged_wrapper_proof_data_before_verify() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nav_opening = NavOpening {
+            nav: Nav {
+                size: 0,
+                mth: host::nflog_empty(),
+            },
+            nav_rand: [0xc1; 32],
+        };
+        let mut proved = base_proved_transition(Network::Testnet);
+        proved.proof_data.nav_commitment =
+            host::nav_commitment(nav_opening.nav.root(), &nav_opening.nav_rand);
+
+        let err = engine
+            .verify_incoming_transition(&proved, &nav_opening)
+            .expect_err("forged ProofData wrapper must not be trusted");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("wrapper/public-input mismatch")
+                && message.contains("proof_data differs"),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// `insert_account` refuses a record whose spendable and spent sets
+    /// share a coin_id — the same invariant the DB loader enforces.
+    #[test]
+    fn insert_account_rejects_overlapping_spendable_and_spent() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/insert-overlap/nk").into();
+        let nk_commit = host::nk_commit(&nk);
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/insert-overlap/pk",
+        ));
+        let owner = Address(host::address(&pk, nk_commit));
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x11; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let coin = Coin {
+            identifier: host::coin_identifier(empty_ash, &owner.0, asset_id, 50, 0),
+            recipient: owner,
+            amount: 50,
+            asset_id,
+        };
+        let id = host::digest_to_bytes(&coin.identifier);
+        let mut coinhist = CoinHistTree::new();
+        coinhist.admit(id).expect("admit");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: coin.clone(),
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut spent_ids = BTreeSet::new();
+        spent_ids.insert(id);
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 50);
+        let state =
+            AccountState::new(owner, nk_commit, balances, pk, 1, coinhist.root()).expect("state");
+        let record = AccountRecord {
+            state,
+            coinhist,
+            nk,
+            op_secret: Some(label_op_secret(
+                b"zkCoins/v1/state-engine/insert-overlap/op_secret",
+            )),
+            genesis_pubkey: pk,
+            spendable,
+            spent_ids,
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let err = engine
+            .insert_account(owner, record)
+            .expect_err("overlap must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("coin_id is both spendable and spent"),
+            "expected overlap cause, got: {msg}"
+        );
+    }
+
+    /// `insert_account` refuses when rebuild from spendable/spent_ids does
+    /// not reproduce `AccountState.coin_history_root`.
+    #[test]
+    fn insert_account_rejects_coinhist_root_mismatch_after_rebuild() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/insert-root/nk").into();
+        let nk_commit = host::nk_commit(&nk);
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/insert-root/pk",
+        ));
+        let owner = Address(host::address(&pk, nk_commit));
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x22; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let coin = Coin {
+            identifier: host::coin_identifier(empty_ash, &owner.0, asset_id, 50, 0),
+            recipient: owner,
+            amount: 50,
+            asset_id,
+        };
+        let id = host::digest_to_bytes(&coin.identifier);
+        // Tree / spendable claim coin is admitted, but AccountState pins the
+        // empty root — rebuild from sets must disagree with that pin.
+        let mut coinhist = CoinHistTree::new();
+        coinhist.admit(id).expect("admit");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: coin.clone(),
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 50);
+        let state = AccountState::new(
+            owner,
+            nk_commit,
+            balances,
+            pk,
+            1,
+            host::coinhist_empty_root(), // deliberately wrong vs spendable
+        )
+        .expect("state");
+        // Provided tree root also wrong relative to state so the failure is
+        // unambiguously the rebuild-vs-state check (not only the tree field).
+        let record = AccountRecord {
+            state,
+            coinhist,
+            nk,
+            op_secret: Some(label_op_secret(
+                b"zkCoins/v1/state-engine/insert-root/op_secret",
+            )),
+            genesis_pubkey: pk,
+            spendable,
+            spent_ids: BTreeSet::new(),
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let err = engine
+            .insert_account(owner, record)
+            .expect_err("root mismatch must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(
+                "coinhist root after rebuild does not match AccountState.coin_history_root"
+            ),
+            "expected rebuild-root cause, got: {msg}"
+        );
+    }
+
+    /// Consistent spendable/spent/coinhist triple is accepted.
+    #[test]
+    fn insert_account_accepts_consistent_record() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/insert-ok/nk").into();
+        let nk_commit = host::nk_commit(&nk);
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/insert-ok/pk",
+        ));
+        let owner = Address(host::address(&pk, nk_commit));
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x33; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let coin = Coin {
+            identifier: host::coin_identifier(empty_ash, &owner.0, asset_id, 50, 0),
+            recipient: owner,
+            amount: 50,
+            asset_id,
+        };
+        let id = host::digest_to_bytes(&coin.identifier);
+        let mut coinhist = CoinHistTree::new();
+        coinhist.admit(id).expect("admit");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: coin.clone(),
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 50);
+        let state =
+            AccountState::new(owner, nk_commit, balances, pk, 1, coinhist.root()).expect("state");
+        let record = AccountRecord {
+            state,
+            coinhist,
+            nk,
+            op_secret: Some(label_op_secret(
+                b"zkCoins/v1/state-engine/insert-ok/op_secret",
+            )),
+            genesis_pubkey: pk,
+            spendable,
+            spent_ids: BTreeSet::new(),
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine
+            .insert_account(owner, record)
+            .expect("consistent record must insert");
+        assert!(engine.account(&owner).is_some());
+    }
+
+    /// Fast: `begin_send` with outputs > inputs returns Err before proving.
+    /// Conservation is checked before predecessor / last_proof wiring.
+    #[test]
+    fn begin_send_overspend_returns_err() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/overspend/nk").into();
+        let nk_commit = host::nk_commit(&nk);
+        let (_s, _p, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/overspend/pk",
+        ));
+        let owner = Address(host::address(&pk, nk_commit));
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk, &[7u8; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty");
+        let empty_ash = host::account_state_hash(&empty).expect("ash");
+        let coin = Coin {
+            identifier: host::coin_identifier(empty_ash, &owner.0, asset_id, 50, 0),
+            recipient: owner,
+            amount: 50,
+            asset_id,
+        };
+        let mut coinhist = CoinHistTree::new();
+        let id = host::digest_to_bytes(&coin.identifier);
+        coinhist.admit(id).expect("admit");
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: coin.clone(),
+                creating_prev_ash: empty_ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 50);
+        let state =
+            AccountState::new(owner, nk_commit, balances, pk, 1, coinhist.root()).expect("state");
+        let record = AccountRecord {
+            state,
+            coinhist,
+            nk,
+            op_secret: Some(label_op_secret(
+                b"zkCoins/v1/state-engine/overspend/op_secret",
+            )),
+            genesis_pubkey: pk,
+            spendable,
+            spent_ids: BTreeSet::new(),
+            // No last_proof — overspend is checked first and must fail loud.
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine.insert_account(owner, record).expect("insert");
+
+        let err = engine
+            .begin_send(SendRequest {
+                owner,
+                input_coin_ids: vec![coin.identifier],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99u8; 32]),
+                    amount: 51, // > 50
+                    asset_id,
+                }],
+                next_pubkey: [0x55u8; 32],
+                npk_rand: [0x22u8; 32],
+            })
+            .expect_err("overspend must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("over-spend"),
+            "expected over-spend error, got: {msg}"
+        );
+    }
+
+    /// End-to-end SEND through the engine (one engine `finalise` prove).
+    ///
+    /// Fixture setup proves a genesis mint once via the bridge so the account
+    /// carries a genuine `last_proof`; the engine path under test is the send.
+    #[test]
+    #[ignore = "heavy: real Plonky2 prove (minutes); run with --ignored --release"]
+    fn state_engine_send_end_to_end() {
+        let bridge = ProverBridge::new(Network::Testnet);
+        let fixture = build_funded_fixture(&bridge);
+        let mut engine = engine_with_funded_account(&fixture);
+
+        let external = Address([0x82u8; 32]);
+        let pending = engine
+            .begin_send(SendRequest {
+                owner: fixture.owner,
+                input_coin_ids: vec![fixture.input_coin.identifier],
+                output_templates: vec![CoinTemplate {
+                    recipient: external,
+                    amount: 30,
+                    asset_id: fixture.asset_id,
+                }],
+                next_pubkey: fixture.next_pubkey,
+                npk_rand: [0xa5u8; 32],
+            })
+            .expect("begin_send");
+
+        // Expected ProofData: change 70 self + 30 external.
+        assert_eq!(pending.mode, TransitionMode::AccountUpdateProof);
+        assert_eq!(pending.witness_wip.input_coins.len(), 1);
+        assert_eq!(pending.witness_wip.output_coins.len(), 2);
+        // Canonical order: recipient templates first, then change.
+        assert_eq!(pending.witness_wip.output_templates[0].recipient, external);
+        assert_eq!(pending.witness_wip.output_templates[0].amount, 30);
+        assert_eq!(
+            pending.witness_wip.output_templates[1].recipient,
+            fixture.owner
+        );
+        assert_eq!(pending.witness_wip.output_templates[1].amount, 70);
+
+        let expected_pd = compute_proof_data(
+            &pending.witness_wip.new_account_state,
+            &pending.witness_wip.output_coins,
+            &pending.witness_wip.input_coins,
+            &fixture.nk,
+            (
+                pending.nav_opening.nav,
+                &pending.nav_opening.nav_rand,
+                &fixture.next_pubkey,
+                &pending.witness_wip.npk_rand,
+            ),
+        )
+        .unwrap();
+        assert_eq!(pending.proof_data, expected_pd);
+        assert_eq!(
+            pending.proof_data_hash,
+            host::hash_proof_data(&host::serialize_proof_data(&expected_pd))
+        );
+
+        // size_final nav must cover the predecessor.
+        assert_eq!(pending.nav_opening.nav.size, 1);
+        assert!(engine
+            .nflog
+            .is_canonical(pending.nav_opening.nav.size, pending.nav_opening.nav.mth));
+
+        let sig = sign_transition(
+            fixture.spend_secret,
+            fixture.spend_public,
+            &pending.proof_data,
+            Network::Testnet,
+        );
+        let nflog_size_before = engine.nflog.nav().size;
+        assert_eq!(nflog_size_before, 1, "only the funded genesis nullifier");
+
+        let applied = engine
+            .finalise(pending, sig.transition)
+            .expect("finalise send");
+
+        // Account state: balance 70, send_counter 2, current_pubkey rotated.
+        let rec = engine.account(&fixture.owner).expect("account present");
+        assert_eq!(rec.state.send_counter, 2);
+        assert_eq!(rec.state.current_pubkey, fixture.next_pubkey);
+        assert_eq!(
+            rec.state
+                .balances
+                .get(&host::digest_to_bytes(&fixture.asset_id)),
+            Some(&70)
+        );
+        assert_eq!(rec.coinhist.root(), rec.state.coin_history_root);
+        // Input spent, change admitted.
+        let in_id = host::digest_to_bytes(&fixture.input_coin.identifier);
+        assert!(rec.spent_ids.contains(&in_id));
+        assert!(!rec.spendable.contains_key(&in_id));
+        assert_eq!(rec.spendable.len(), 1);
+        let change = rec.spendable.values().next().unwrap();
+        assert_eq!(change.coin.amount, 70);
+        assert_eq!(change.coin.recipient, fixture.owner);
+
+        // Engine invariant: send finalise must not invent a synthetic NfLog
+        // entry. Own nullifier is pending until a real chain position is folded.
+        assert_eq!(applied.nullifier.0, applied.proved.consumed_pubkey);
+        assert_eq!(
+            engine.nflog.nav().size,
+            nflog_size_before,
+            "finalise must not grow the canonical NfLog"
+        );
+        assert!(
+            matches!(
+                engine.nflog.lookup(applied.nullifier.0),
+                LookupResult::Absent
+            ),
+            "send own nullifier must stay absent until scan-fold"
+        );
+        assert!(
+            rec.last_nullifier_pos.is_none(),
+            "last_nullifier_pos must stay None until scan-fold"
+        );
+        assert!(rec.last_nullifier.is_some());
+
+        // Scanner places the nullifier at a real chain position (not tip/fold_seq).
+        // Must be strictly after the genesis fold at height 100.
+        let scanned = ScannedNullifier::from_survivor(&PublishedNullifier {
+            chain_pos: ChainPosition {
+                height: 110,
+                tx_index: 3,
+                vin_index: 0,
+                member_index: 0,
+            },
+            pk: applied.nullifier.0,
+            r: applied.nullifier.1,
+        });
+        let pos = engine
+            .append_nullifier(scanned)
+            .expect("scan-fold send nullifier");
+        assert_eq!(pos, 1);
+        assert_eq!(engine.nflog.nav().size, 2);
+        assert_eq!(engine.nflog_entries[1].pk, applied.nullifier.0);
+        assert_eq!(engine.nflog_entries[1].r, applied.nullifier.1);
+
+        // Host acceptance: the send's nav was size_final=1 at prove time; after
+        // scan-fold size grows, but the proved nav remains a canonical prefix.
+        // send_counter at entry is 1 (post-mint); nav_rand is derived, not caller-set.
+        let expected_send_nav_rand = fixture.op_secret.derive_nav_rand(1);
+        engine
+            .verify_incoming_transition(
+                &applied.proved,
+                &NavOpening {
+                    nav: Nav {
+                        size: 1,
+                        mth: host::nflog_mth(&engine.nflog_entries[..1]),
+                    },
+                    nav_rand: expected_send_nav_rand,
+                },
+            )
+            .expect("verify_incoming_transition on applied send");
+    }
+
+    /// End-to-end RECEIVE through the engine with a **genuine creating proof**.
+    ///
+    /// Reuses [`build_funded_fixture`] (real genesis/mint prove) + a real send
+    /// prove to Bob, then Bob's receive prove via `begin_receive` + `finalise`.
+    /// Asserts:
+    /// - receive finalise credits Bob's CoinHist / balance;
+    /// - the canonical NfLog is **not** grown by receive finalise;
+    /// - `last_nullifier_pos` stays `None` until a scan-path
+    ///   [`ScannedNullifier`] append.
+    ///
+    /// Marked `#[ignore]`: three real Plonky2 proves (mint + send + receive).
+    #[test]
+    #[ignore = "heavy: real Plonky2 prove for mint+send+receive (minutes); run with --ignored --release"]
+    fn state_engine_receive_end_to_end_with_genuine_creating_proof() {
+        let bridge = ProverBridge::new(Network::Testnet);
+        let fixture = build_funded_fixture(&bridge);
+        let mut engine = engine_with_funded_account(&fixture);
+
+        // Bob's keys (distinct from Alice).
+        let bob_nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/receive-e2e/bob-nk").into();
+        let (bob_secret0, bob_public0, bob_pk0) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/receive-e2e/bob-sk0",
+        ));
+        let (_, _, bob_pk1) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/receive-e2e/bob-sk1",
+        ));
+        let bob_owner = Address(host::address(&bob_pk0, host::nk_commit(&bob_nk)));
+
+        // Alice sends 30 to Bob (genuine recursive prove).
+        let pending_send = engine
+            .begin_send(SendRequest {
+                owner: fixture.owner,
+                input_coin_ids: vec![fixture.input_coin.identifier],
+                output_templates: vec![CoinTemplate {
+                    recipient: bob_owner,
+                    amount: 30,
+                    asset_id: fixture.asset_id,
+                }],
+                next_pubkey: fixture.next_pubkey,
+                npk_rand: [0xa5u8; 32],
+            })
+            .expect("begin_send to Bob");
+        let bob_coin = pending_send
+            .witness_wip
+            .output_coins
+            .iter()
+            .find(|c| c.recipient == bob_owner)
+            .cloned()
+            .expect("Bob's coin in send outputs");
+        let bob_coin_index = pending_send
+            .witness_wip
+            .output_coins
+            .iter()
+            .position(|c| c.recipient == bob_owner)
+            .expect("index") as u32;
+        let send_creating_prev_ash =
+            host::account_state_hash(&pending_send.witness_wip.prev_account_state).unwrap();
+        let send_nav_opening = pending_send.nav_opening;
+        let send_sig = sign_transition(
+            fixture.spend_secret,
+            fixture.spend_public,
+            &pending_send.proof_data,
+            Network::Testnet,
+        );
+        let nflog_before_send = engine.nflog.nav().size;
+        let applied_send = engine
+            .finalise(pending_send, send_sig.transition.clone())
+            .expect("finalise send to Bob");
+        assert_eq!(
+            engine.nflog.nav().size,
+            nflog_before_send,
+            "send finalise must not grow NfLog"
+        );
+
+        // Scanner folds Alice's send nullifier so Bob's clause-10 can open it.
+        let send_scanned = ScannedNullifier::from_survivor(&PublishedNullifier {
+            chain_pos: ChainPosition {
+                height: 110,
+                tx_index: 1,
+                vin_index: 0,
+                member_index: 0,
+            },
+            pk: applied_send.nullifier.0,
+            r: applied_send.nullifier.1,
+        });
+        let send_pos = engine
+            .append_nullifier(send_scanned)
+            .expect("scan-fold send nullifier");
+        engine.set_tip_height(120); // past finality for send height 110
+
+        // Output inclusion of Bob's coin in the send's output tree (2 leaves).
+        let alice_change_id = {
+            let rec = engine.account(&fixture.owner).expect("alice");
+            rec.spendable
+                .values()
+                .next()
+                .expect("change")
+                .coin
+                .identifier
+        };
+        // Order matches begin_send: recipient templates first, then change.
+        let all_output_ids = vec![bob_coin.identifier, alice_change_id];
+        let ocr = host::merkle_root(TreeKind::CoinsRoot, &all_output_ids);
+        assert_eq!(ocr, applied_send.proved.proof_data.output_coins_root);
+        let sibling = host::leaf_hash(TreeKind::CoinsRoot, all_output_ids[1]);
+        let output_inclusion = OutputInclusionProof {
+            leaf_index: bob_coin_index,
+            depth: 1,
+            siblings: vec![sibling],
+        };
+
+        // Receiver nav = size_final covering genesis + send.
+        let size_final = engine.nflog.size_final(engine.tip_height());
+        assert!(size_final >= 2);
+        let creating_nav_inclusion =
+            host::inclusion_path(send_pos, &engine.nflog_entries).expect("inclusion");
+        let creating_nav_consistency =
+            host::consistency_proof(send_nav_opening.nav.size, &engine.nflog_entries)
+                .expect("consistency");
+
+        let received_auth = ReceivedAuthorization {
+            creating_proof: applied_send.proved.proof.clone(),
+            output_inclusion,
+            creating_prev_ash: send_creating_prev_ash,
+            creating_nullifier: NullifierOpening {
+                public_key: applied_send.nullifier.0,
+                signature_r: applied_send.nullifier.1,
+                r_prime: send_sig.transition.r_prime,
+            },
+            creating_nav_inclusion,
+            pos_create: send_pos,
+            creating_nav_opening: send_nav_opening,
+            creating_nav_consistency,
+            history_proof: host::CoinHistTree::new().prove([0u8; 32]),
+        };
+
+        let pending_rx = engine
+            .begin_receive(ReceiveRequest {
+                owner: bob_owner,
+                nk: bob_nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/receive-e2e/bob-op_secret"),
+                current_pubkey: bob_pk0,
+                received_coins: vec![bob_coin.clone()],
+                received_auth: vec![received_auth],
+                next_pubkey: bob_pk1,
+                npk_rand: [0x42u8; 32],
+            })
+            .expect("begin_receive Bob");
+        assert_eq!(pending_rx.mode, TransitionMode::InitialProof);
+        assert_eq!(pending_rx.nav_opening.nav.size, size_final);
+
+        let bob_sig = sign_transition(
+            bob_secret0,
+            bob_public0,
+            &pending_rx.proof_data,
+            Network::Testnet,
+        );
+        let nflog_before_rx = engine.nflog.nav().size;
+        let applied_rx = engine
+            .finalise(pending_rx, bob_sig.transition)
+            .expect("finalise receive with genuine creating proof");
+
+        // Assertions requested by the fix brief.
+        assert_eq!(
+            engine.nflog.nav().size,
+            nflog_before_rx,
+            "receive finalise must not grow the canonical NfLog"
+        );
+        let bob = engine.account(&bob_owner).expect("Bob account");
+        assert_eq!(bob.state.send_counter, 1);
+        assert_eq!(bob.state.current_pubkey, bob_pk1);
+        assert_eq!(
+            bob.state
+                .balances
+                .get(&host::digest_to_bytes(&fixture.asset_id)),
+            Some(&30)
+        );
+        assert!(bob.last_nullifier.is_some());
+        assert!(
+            bob.last_nullifier_pos.is_none(),
+            "last_nullifier_pos stays None until scan-fold"
+        );
+        assert_eq!(applied_rx.nullifier.0, bob_pk0);
+        assert!(matches!(engine.nflog.lookup(bob_pk0), LookupResult::Absent));
+
+        // Scanner places Bob's receive nullifier at a real chain position.
+        let rx_scanned = ScannedNullifier::from_survivor(&PublishedNullifier {
+            chain_pos: ChainPosition {
+                height: 115,
+                tx_index: 0,
+                vin_index: 0,
+                member_index: 0,
+            },
+            pk: applied_rx.nullifier.0,
+            r: applied_rx.nullifier.1,
+        });
+        let rx_pos = engine
+            .append_nullifier(rx_scanned)
+            .expect("scan-fold receive nullifier");
+        assert_eq!(rx_pos, nflog_before_rx);
+        assert_eq!(engine.nflog.nav().size, nflog_before_rx + 1);
+    }
+
+    /// Same account + same entry `send_counter` reproduce identical `nav_rand`;
+    /// a different counter yields a different one. Red if derivation ignored
+    /// the counter or accepted a caller-supplied constant.
+    #[test]
+    fn nav_rand_derived_deterministically_from_op_secret_and_send_counter() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let req = test_mint_request(1);
+        let pending_a = engine.begin_mint(req.clone()).expect("mint a");
+        let pending_b = engine.begin_mint(req.clone()).expect("mint b");
+        assert_eq!(
+            pending_a.nav_opening.nav_rand, pending_b.nav_opening.nav_rand,
+            "identical (op_secret, entry send_counter=0) must match"
+        );
+        let expected = req.op_secret.derive_nav_rand(0);
+        assert_eq!(pending_a.nav_opening.nav_rand, expected);
+        assert_ne!(
+            pending_a.nav_opening.nav_rand,
+            req.op_secret.derive_nav_rand(1),
+            "different send_counter must change nav_rand"
+        );
+        // OpSecret must never Debug-/Display-print raw bytes — including when
+        // nested under a derived-Debug request type. Known material is checked
+        // so we do not need a raw-byte accessor to prove redaction.
+        let known = OpSecret::new([0xAB; 32]);
+        let dbg = format!("{:?}", known);
+        assert_eq!(dbg, "OpSecret([REDACTED])");
+        assert_eq!(format!("{}", known), "OpSecret([REDACTED])");
+        assert!(
+            !dbg.to_lowercase().contains("ab"),
+            "Debug must not embed the raw secret hex"
+        );
+        let req_dbg = format!("{req:?}");
+        assert!(
+            req_dbg.contains("OpSecret([REDACTED])"),
+            "MintRequest Debug must redact op_secret; got: {req_dbg}"
+        );
+        let pending_dbg = format!("{pending_a:?}");
+        assert!(
+            pending_dbg.contains("OpSecret([REDACTED])"),
+            "PendingTransition Debug must redact op_secret; got: {pending_dbg}"
+        );
+    }
+
+    /// Missing `op_secret` on a registered account refuses a send — no zero
+    /// default, no generated secret. Red if begin_send invents a value.
+    #[test]
+    fn begin_send_refuses_when_op_secret_missing() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/missing-op/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/missing-op/pk0",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x11; 32], 2, 1);
+        let coin = Coin {
+            identifier: host::coin_identifier(
+                host::account_state_hash(
+                    &AccountState::new(
+                        owner,
+                        host::nk_commit(&nk),
+                        BTreeMap::new(),
+                        pk,
+                        0,
+                        host::coinhist_empty_root(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                &owner.0,
+                asset_id,
+                50,
+                0,
+            ),
+            recipient: owner,
+            amount: 50,
+            asset_id,
+        };
+        let mut coinhist = CoinHistTree::new();
+        let id = host::digest_to_bytes(&coin.identifier);
+        coinhist.admit(id).unwrap();
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: coin.clone(),
+                creating_prev_ash: host::ZERO_HASH,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset_id), 50);
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            balances,
+            pk,
+            1,
+            coinhist.root(),
+        )
+        .unwrap();
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk,
+                    op_secret: None, // the defect under test
+                    genesis_pubkey: pk,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    // last_proof deliberately None: op_secret is checked first
+                    // (must not reach AccountUpdateProof wiring / circuit).
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+
+        let err = engine
+            .begin_send(SendRequest {
+                owner,
+                input_coin_ids: vec![coin.identifier],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 10,
+                    asset_id,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("missing op_secret must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("op_secret missing"),
+            "expected missing-op_secret refusal, got: {msg}"
+        );
+    }
+
+    /// Requirement 10 (engine-level): drop the live engine, rebuild from a
+    /// persisted-shaped [`AccountRecord`] that carries the operational
+    /// bundle (`op_secret` + `send_counter` history), and reproduce the
+    /// prior opening from the **restored** secret — not from the original
+    /// request still held in locals. Red if `op_secret` were omitted from
+    /// the restored record.
+    ///
+    /// The DB-backed form (persist → `load_engine_snapshot` → `into_engine`)
+    /// lives in `node::v1::tests` so forcing `op_secret: None` on load
+    /// actually fails the suite.
+    #[test]
+    fn fresh_node_with_restored_bundle_reproduces_prior_nav_rand_opening() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let req = test_mint_request(1);
+        let pending = engine.begin_mint(req.clone()).expect("mint");
+        let issued_nav_rand = pending.nav_opening.nav_rand;
+        let entry_counter = pending.witness_wip.prev_account_state.send_counter;
+        assert_eq!(entry_counter, 0);
+        // Capture only what a durable account row would hold; drop every
+        // live handle that still carries the original request secret.
+        let owner = req.owner;
+        let nk = req.nk;
+        let current_pubkey = req.current_pubkey;
+        let next_pubkey = req.next_pubkey;
+        let name = req.name.clone();
+        let persisted_op_secret = req.op_secret;
+        drop(engine);
+        drop(pending);
+        drop(req);
+
+        let cold_state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            current_pubkey,
+            entry_counter,
+            host::coinhist_empty_root(),
+        )
+        .expect("restored empty account state");
+        let cold = StateEngine::from_persisted(
+            Network::Testnet,
+            0,
+            0,
+            0,
+            vec![],
+            vec![(
+                owner,
+                AccountRecord {
+                    state: cold_state,
+                    coinhist: CoinHistTree::new(),
+                    nk,
+                    op_secret: Some(persisted_op_secret),
+                    genesis_pubkey: current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )],
+        )
+        .expect("reconstruct engine from restored bundle");
+        // Do not use `persisted_op_secret` below — only the copy inside `cold`.
+        let _ = persisted_op_secret;
+
+        let restored = cold
+            .account(&owner)
+            .expect("account present after restore")
+            .op_secret
+            .expect("op_secret must be present on restored record");
+        // Equality against the inserted value proves from_persisted kept it;
+        // the bytes for derivation come only from `restored`.
+        assert_eq!(restored, persisted_op_secret);
+        let rebuilt = restored.derive_nav_rand(entry_counter);
+        assert_eq!(
+            rebuilt, issued_nav_rand,
+            "restored bundle must rebuild the opening's nav_rand"
+        );
+
+        // Re-issue on a brand-new empty engine using only the secret read
+        // back from the reconstructed record (genesis path; the cold
+        // account is deliberately not used for AccountUpdateProof).
+        let name_hash = host::name_hash(&name).expect("name_hash");
+        let asset_id = host::asset_id_v1(host::GENESIS_TAG, &current_pubkey, &name_hash, 2, 1);
+        let reissued = StateEngine::new(Network::Testnet, 0)
+            .begin_mint(MintRequest {
+                owner,
+                nk,
+                op_secret: restored,
+                current_pubkey,
+                next_pubkey,
+                name,
+                decimals: 2,
+                amount: 100,
+                issuance_version: 1,
+                cap_total: 0,
+                terms_salt: [0; 32],
+                output_templates: vec![CoinTemplate {
+                    recipient: owner,
+                    amount: 100,
+                    asset_id,
+                }],
+                npk_rand: [0x22; 32],
+            })
+            .expect("re-mint from restored secret");
+        assert_eq!(
+            reissued.nav_opening.nav_rand, issued_nav_rand,
+            "fresh engine keyed by restored op_secret must re-issue the same opening"
+        );
+        assert_ne!(
+            restored.derive_nav_rand(1),
+            issued_nav_rand,
+            "a different send_counter must not reproduce the prior opening"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Guard coverage: begin_send / begin_mint / begin_receive
+    //
+    // Each named host-side ensure!/context failure that is reachable without
+    // a Plonky2 prove has a test that asserts the *message*, not merely
+    // is_err(). Unreachable guards are documented in the task report only.
+    // -----------------------------------------------------------------------
+
+    /// Labels are unique per fixture so parallel nextest workers never share
+    /// digest material accidentally across tests.
+    fn send_guard_keys(label: &[u8]) -> (Address, [u8; 32], [u8; 32], [u8; 32], OpSecret) {
+        let mut nk_label = label.to_vec();
+        nk_label.extend_from_slice(b"/nk");
+        let nk: [u8; 32] = Sha256::digest(&nk_label).into();
+        let mut pk0_label = label.to_vec();
+        pk0_label.extend_from_slice(b"/pk0");
+        let (_, _, pk0) = normalized_key(deterministic_secret(&pk0_label));
+        let mut pk1_label = label.to_vec();
+        pk1_label.extend_from_slice(b"/pk1");
+        let (_, _, pk1) = normalized_key(deterministic_secret(&pk1_label));
+        let mut op_label = label.to_vec();
+        op_label.extend_from_slice(b"/op");
+        let op_secret = label_op_secret(&op_label);
+        let owner = Address(host::address(&pk0, host::nk_commit(&nk)));
+        (owner, nk, pk0, pk1, op_secret)
+    }
+
+    /// One or more spendable coins under a single owner. Early begin_send
+    /// guards (before AccountUpdateProof wiring) only need spendable +
+    /// op_secret; `wire_predecessor` adds last_proof / NfLog when a later
+    /// guard or happy path needs AccountUpdateProof.
+    struct GuardAccount {
+        engine: StateEngine,
+        owner: Address,
+        coins: Vec<Coin>,
+        creating_prev_ash: HashDigest,
+    }
+
+    fn install_guard_account(
+        label: &[u8],
+        coin_specs: &[(HashDigest, u128)],
+        wire_predecessor: bool,
+    ) -> GuardAccount {
+        let (owner, nk, pk0, pk1, op_secret) = send_guard_keys(label);
+        let nk_commit = host::nk_commit(&nk);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .expect("empty genesis state");
+        let creating_prev_ash = host::account_state_hash(&empty).expect("ash");
+
+        let mut coinhist = CoinHistTree::new();
+        let mut spendable = BTreeMap::new();
+        let mut balances: BTreeMap<[u8; 32], u128> = BTreeMap::new();
+        let mut coins = Vec::with_capacity(coin_specs.len());
+        for (index, &(asset_id, amount)) in coin_specs.iter().enumerate() {
+            let coin = Coin {
+                identifier: host::coin_identifier(
+                    creating_prev_ash,
+                    &owner.0,
+                    asset_id,
+                    amount,
+                    index as u32,
+                ),
+                recipient: owner,
+                amount,
+                asset_id,
+            };
+            let id = host::digest_to_bytes(&coin.identifier);
+            coinhist.admit(id).expect("admit");
+            spendable.insert(
+                id,
+                TrackedCoin {
+                    coin: coin.clone(),
+                    creating_prev_ash,
+                    coin_index: index as u32,
+                },
+            );
+            let entry = balances
+                .entry(host::digest_to_bytes(&asset_id))
+                .or_insert(0);
+            *entry = entry.checked_add(amount).expect("balance sum");
+            coins.push(coin);
+        }
+
+        let state = AccountState::new(owner, nk_commit, balances, pk1, 1, coinhist.root())
+            .expect("post-genesis state");
+
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let (last_proof, last_nav_opening, last_nullifier, last_nullifier_pos) = if wire_predecessor
+        {
+            let predecessor_position = ChainPosition {
+                height: 10,
+                tx_index: 0,
+                vin_index: 0,
+                member_index: 0,
+            };
+            let predecessor_entry = NfLogEntry {
+                pk: pk0,
+                r: [0x61; 32],
+            };
+            engine.set_tip_height(10);
+            assert_eq!(
+                engine
+                    .nflog
+                    .fold(
+                        predecessor_position,
+                        predecessor_entry.pk,
+                        predecessor_entry.r,
+                    )
+                    .unwrap(),
+                FoldOutcome::Appended(0)
+            );
+            engine.nflog_entries.push(predecessor_entry);
+            engine.nflog_positions.push(predecessor_position);
+            engine.set_tip_height(15);
+            (
+                Some(host_dummy_last_proof()),
+                Some(NavOpening {
+                    nav: Nav {
+                        size: 0,
+                        mth: host::nflog_empty(),
+                    },
+                    nav_rand: op_secret.derive_nav_rand(0),
+                }),
+                Some(NullifierOpening {
+                    public_key: pk0,
+                    signature_r: [0x61; 32],
+                    r_prime: [0; 32],
+                }),
+                Some(0u64),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk,
+                    op_secret: Some(op_secret),
+                    genesis_pubkey: pk0,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof,
+                    last_nav_opening,
+                    last_nullifier,
+                    last_nullifier_pos,
+                },
+            )
+            .expect("insert guard account");
+
+        GuardAccount {
+            engine,
+            owner,
+            coins,
+            creating_prev_ash,
+        }
+    }
+
+    fn err_msg(err: anyhow::Error) -> String {
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn begin_send_account_not_found() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let err = engine
+            .begin_send(SendRequest {
+                owner: Address([0xab; 32]),
+                input_coin_ids: vec![host::ZERO_HASH],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0xcd; 32]),
+                    amount: 1,
+                    asset_id: host::ZERO_HASH,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("missing account must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("send: account not found"),
+            "expected account-not-found, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_send_requires_at_least_one_input_coin() {
+        let label = b"zkCoins/v1/state-engine/guard-send/no-input";
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &[1u8; 32], &[2u8; 32], 2, 1);
+        let fx = install_guard_account(label, &[(asset, 50)], false);
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: vec![],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 1,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("empty inputs must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("send requires at least one input coin"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_send_duplicate_input_coin_id() {
+        let label = b"zkCoins/v1/state-engine/guard-send/dup-input";
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &[3u8; 32], &[4u8; 32], 2, 1);
+        let fx = install_guard_account(label, &[(asset, 50)], false);
+        let id = fx.coins[0].identifier;
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: vec![id, id],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 1,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("duplicate input must refuse");
+        let msg = err_msg(err);
+        assert!(msg.contains("duplicate input coin_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_send_input_coin_not_spendable() {
+        let label = b"zkCoins/v1/state-engine/guard-send/not-spendable";
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &[5u8; 32], &[6u8; 32], 2, 1);
+        let fx = install_guard_account(label, &[(asset, 50)], false);
+        let foreign_id = host::coin_identifier(fx.creating_prev_ash, &fx.owner.0, asset, 7, 99);
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: vec![foreign_id],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 1,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("unknown input must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("input coin is not spendable on this account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_send_tracked_coin_identifier_mismatch() {
+        let label = b"zkCoins/v1/state-engine/guard-send/id-mismatch";
+        let (owner, nk, pk0, pk1, op_secret) = send_guard_keys(label);
+        let nk_commit = host::nk_commit(&nk);
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk0, &[0x21; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let map_id = host::coin_identifier(ash, &owner.0, asset, 50, 0);
+        let inner_id = host::coin_identifier(ash, &owner.0, asset, 50, 1);
+        assert_ne!(map_id, inner_id);
+        let mut coinhist = CoinHistTree::new();
+        let map_bytes = host::digest_to_bytes(&map_id);
+        coinhist.admit(map_bytes).unwrap();
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            map_bytes,
+            TrackedCoin {
+                coin: Coin {
+                    identifier: inner_id, // key/id diverge — the defect under test
+                    recipient: owner,
+                    amount: 50,
+                    asset_id: asset,
+                },
+                creating_prev_ash: ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset), 50);
+        let state = AccountState::new(owner, nk_commit, balances, pk1, 1, coinhist.root()).unwrap();
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk,
+                    op_secret: Some(op_secret),
+                    genesis_pubkey: pk0,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+
+        let err = engine
+            .begin_send(SendRequest {
+                owner,
+                input_coin_ids: vec![map_id],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 1,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("identifier mismatch must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("tracked coin identifier mismatch"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_send_input_recipient_not_spending_account() {
+        let label = b"zkCoins/v1/state-engine/guard-send/wrong-recipient";
+        let (owner, nk, pk0, pk1, op_secret) = send_guard_keys(label);
+        let nk_commit = host::nk_commit(&nk);
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk0, &[0x22; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let foreign = Address([0xee; 32]);
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 50, 0),
+            recipient: foreign, // not the spending account
+            amount: 50,
+            asset_id: asset,
+        };
+        let mut coinhist = CoinHistTree::new();
+        let id = host::digest_to_bytes(&coin.identifier);
+        coinhist.admit(id).unwrap();
+        let mut spendable = BTreeMap::new();
+        spendable.insert(
+            id,
+            TrackedCoin {
+                coin: coin.clone(),
+                creating_prev_ash: ash,
+                coin_index: 0,
+            },
+        );
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset), 50);
+        let state = AccountState::new(owner, nk_commit, balances, pk1, 1, coinhist.root()).unwrap();
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk,
+                    op_secret: Some(op_secret),
+                    genesis_pubkey: pk0,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+
+        let err = engine
+            .begin_send(SendRequest {
+                owner,
+                input_coin_ids: vec![coin.identifier],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 1,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("foreign recipient must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("input coin recipient is not the spending account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_send_output_template_amount_must_be_non_zero() {
+        let label = b"zkCoins/v1/state-engine/guard-send/zero-out";
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &[7u8; 32], &[8u8; 32], 2, 1);
+        let fx = install_guard_account(label, &[(asset, 50)], false);
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: vec![fx.coins[0].identifier],
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 0,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("zero output amount must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("output template amount must be non-zero"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_send_in_amount_overflow() {
+        // Hand-built: balances cannot hold MAX+1, but In(a) sums coin amounts
+        // independently and must fail loud on checked_add overflow.
+        let label = b"zkCoins/v1/state-engine/guard-send/in-overflow";
+        let (owner, nk, pk0, pk1, op_secret) = send_guard_keys(label);
+        let nk_commit = host::nk_commit(&nk);
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk0, &[0x0a; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk0,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let coins = [
+            Coin {
+                identifier: host::coin_identifier(ash, &owner.0, asset, u128::MAX, 0),
+                recipient: owner,
+                amount: u128::MAX,
+                asset_id: asset,
+            },
+            Coin {
+                identifier: host::coin_identifier(ash, &owner.0, asset, 1, 1),
+                recipient: owner,
+                amount: 1,
+                asset_id: asset,
+            },
+        ];
+        let mut coinhist = CoinHistTree::new();
+        let mut spendable = BTreeMap::new();
+        for (i, coin) in coins.iter().enumerate() {
+            let id = host::digest_to_bytes(&coin.identifier);
+            coinhist.admit(id).unwrap();
+            spendable.insert(
+                id,
+                TrackedCoin {
+                    coin: coin.clone(),
+                    creating_prev_ash: ash,
+                    coin_index: i as u32,
+                },
+            );
+        }
+        // Deliberately under-state balances — In(a) still sums coin amounts.
+        let mut balances = BTreeMap::new();
+        balances.insert(host::digest_to_bytes(&asset), u128::MAX);
+        let state = AccountState::new(owner, nk_commit, balances, pk1, 1, coinhist.root()).unwrap();
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist,
+                    nk,
+                    op_secret: Some(op_secret),
+                    genesis_pubkey: pk0,
+                    spendable,
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let err = engine
+            .begin_send(SendRequest {
+                owner,
+                input_coin_ids: coins.iter().map(|c| c.identifier).collect(),
+                output_templates: vec![CoinTemplate {
+                    recipient: Address([0x99; 32]),
+                    amount: 1,
+                    asset_id: asset,
+                }],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("In(a) overflow must refuse");
+        let msg = err_msg(err);
+        assert!(msg.contains("In(a) amount overflow"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_send_out_amount_overflow() {
+        let label = b"zkCoins/v1/state-engine/guard-send/out-overflow";
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &[0x0b; 32], &[0x0c; 32], 2, 1);
+        let fx = install_guard_account(label, &[(asset, 1)], false);
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: vec![fx.coins[0].identifier],
+                output_templates: vec![
+                    CoinTemplate {
+                        recipient: Address([0x91; 32]),
+                        amount: u128::MAX,
+                        asset_id: asset,
+                    },
+                    CoinTemplate {
+                        recipient: Address([0x92; 32]),
+                        amount: 1,
+                        asset_id: asset,
+                    },
+                ],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("Out(a) overflow must refuse");
+        let msg = err_msg(err);
+        assert!(msg.contains("Out(a) amount overflow"), "got: {msg}");
+    }
+
+    /// Multi-asset over-spend: asset A is fully covered, asset B is not.
+    /// Carries the deleted legacy "foreign asset in queue" property.
+    #[test]
+    fn begin_send_multi_asset_overspend_returns_err() {
+        let label = b"zkCoins/v1/state-engine/guard-send/multi-overspend";
+        let asset_a = host::asset_id_v1(host::GENESIS_TAG, &[0x11; 32], &[0xa1; 32], 2, 1);
+        let asset_b = host::asset_id_v1(host::GENESIS_TAG, &[0x11; 32], &[0xb1; 32], 2, 1);
+        assert_ne!(asset_a, asset_b);
+        let fx = install_guard_account(label, &[(asset_a, 100), (asset_b, 10)], false);
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: fx.coins.iter().map(|c| c.identifier).collect(),
+                output_templates: vec![
+                    CoinTemplate {
+                        recipient: Address([0x91; 32]),
+                        amount: 50, // A covered
+                        asset_id: asset_a,
+                    },
+                    CoinTemplate {
+                        recipient: Address([0x92; 32]),
+                        amount: 20, // B over (In=10)
+                        asset_id: asset_b,
+                    },
+                ],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("multi-asset overspend must refuse");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("over-spend: outputs exceed inputs for an asset"),
+            "got: {msg}"
+        );
+    }
+
+    /// Templates alone stay ≤ MAX_TX_OUTPUTS; adding per-asset change tips
+    /// the total over the limit (distinct from the pure-template gate).
+    #[test]
+    fn begin_send_outputs_including_change_exceed_max_tx_outputs() {
+        let label = b"zkCoins/v1/state-engine/guard-send/change-exceeds";
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &[0x0d; 32], &[0x0e; 32], 2, 1);
+        // MAX templates of amount 1 + residual change ⇒ MAX+1 total outputs.
+        let input_amount = (MAX_TX_OUTPUTS as u128) + 10;
+        let fx = install_guard_account(label, &[(asset, input_amount)], false);
+        let templates: Vec<CoinTemplate> = (0..MAX_TX_OUTPUTS)
+            .map(|i| CoinTemplate {
+                recipient: Address([0x40 + i as u8; 32]),
+                amount: 1,
+                asset_id: asset,
+            })
+            .collect();
+        assert_eq!(templates.len(), MAX_TX_OUTPUTS);
+        let err = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: vec![fx.coins[0].identifier],
+                output_templates: templates,
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect_err("change must tip over MAX_TX_OUTPUTS");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("outputs including change exceed MAX_TX_OUTPUTS"),
+            "got: {msg}"
+        );
+    }
+
+    /// Green-path multi-asset conservation: both assets covered, change per
+    /// asset, change ordered by ascending asset_id after recipient templates.
+    #[test]
+    fn begin_send_multi_asset_covered_change_ordered_by_asset_id() {
+        let label = b"zkCoins/v1/state-engine/guard-send/multi-ok";
+        let asset_lo = host::asset_id_v1(host::GENESIS_TAG, &[0x31; 32], &[0x01; 32], 2, 1);
+        let asset_hi = host::asset_id_v1(host::GENESIS_TAG, &[0x31; 32], &[0xff; 32], 2, 1);
+        // Ensure lo < hi in byte order so the assertion is stable.
+        let (asset_a, asset_b) =
+            if host::digest_to_bytes(&asset_lo) < host::digest_to_bytes(&asset_hi) {
+                (asset_lo, asset_hi)
+            } else {
+                (asset_hi, asset_lo)
+            };
+        let fx = install_guard_account(label, &[(asset_a, 100), (asset_b, 50)], true);
+        let external = Address([0x77; 32]);
+        let pending = fx
+            .engine
+            .begin_send(SendRequest {
+                owner: fx.owner,
+                input_coin_ids: fx.coins.iter().map(|c| c.identifier).collect(),
+                output_templates: vec![
+                    CoinTemplate {
+                        recipient: external,
+                        amount: 30,
+                        asset_id: asset_a,
+                    },
+                    CoinTemplate {
+                        recipient: external,
+                        amount: 20,
+                        asset_id: asset_b,
+                    },
+                ],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x22; 32],
+            })
+            .expect("covered multi-asset send");
+
+        assert_eq!(pending.mode, TransitionMode::AccountUpdateProof);
+        // Recipient templates first, then change by ascending asset_id.
+        assert_eq!(pending.witness_wip.output_templates.len(), 4);
+        assert_eq!(pending.witness_wip.output_templates[0].recipient, external);
+        assert_eq!(pending.witness_wip.output_templates[0].amount, 30);
+        assert_eq!(pending.witness_wip.output_templates[0].asset_id, asset_a);
+        assert_eq!(pending.witness_wip.output_templates[1].recipient, external);
+        assert_eq!(pending.witness_wip.output_templates[1].amount, 20);
+        assert_eq!(pending.witness_wip.output_templates[1].asset_id, asset_b);
+        // Change: A=70, B=30, ascending asset_id order.
+        assert_eq!(pending.witness_wip.output_templates[2].recipient, fx.owner);
+        assert_eq!(pending.witness_wip.output_templates[2].amount, 70);
+        assert_eq!(pending.witness_wip.output_templates[2].asset_id, asset_a);
+        assert_eq!(pending.witness_wip.output_templates[3].recipient, fx.owner);
+        assert_eq!(pending.witness_wip.output_templates[3].amount, 30);
+        assert_eq!(pending.witness_wip.output_templates[3].asset_id, asset_b);
+        let a_key = host::digest_to_bytes(&asset_a);
+        let b_key = host::digest_to_bytes(&asset_b);
+        assert!(
+            a_key < b_key,
+            "fixture assets must be ascending for change order"
+        );
+    }
+
+    // --- begin_mint guards ---------------------------------------------------
+
+    #[test]
+    fn begin_mint_rejects_unsupported_issuance_version() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let mut req = test_mint_request(1);
+        req.issuance_version = 3;
+        let err = engine.begin_mint(req).expect_err("bad version");
+        let msg = err_msg(err);
+        assert!(msg.contains("unsupported issuance_version"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_mint_rejects_zero_amount() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let mut req = test_mint_request(1);
+        req.amount = 0;
+        let err = engine.begin_mint(req).expect_err("zero amount");
+        let msg = err_msg(err);
+        assert!(msg.contains("mint amount must be non-zero"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_mint_std1_rejects_nonzero_cap_total() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let mut req = test_mint_request(1);
+        req.cap_total = 1;
+        let err = engine.begin_mint(req).expect_err("cap on std1");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("token-standard-1 mint requires cap_total == 0"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_mint_std1_rejects_nonzero_terms_salt() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let mut req = test_mint_request(1);
+        req.terms_salt = [1u8; 32];
+        let err = engine.begin_mint(req).expect_err("salt on std1");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("token-standard-1 mint requires all-zero terms_salt"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_mint_genesis_rejects_owner_mismatch() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let mut req = test_mint_request(1);
+        req.owner = Address([0xde; 32]);
+        let err = engine.begin_mint(req).expect_err("bad genesis owner");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("owner must equal H(current_pubkey ‖ nk_commit) for a genesis mint"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_mint_remint_refuses_when_op_secret_missing() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let base = test_mint_request(1);
+        let nk_commit = host::nk_commit(&base.nk);
+        let state = AccountState::new(
+            base.owner,
+            nk_commit,
+            BTreeMap::new(),
+            base.next_pubkey,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                base.owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk: base.nk,
+                    op_secret: None,
+                    genesis_pubkey: base.current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let mut req = base;
+        req.current_pubkey = req.next_pubkey;
+        let err = engine.begin_mint(req).expect_err("missing op_secret");
+        let msg = err_msg(err);
+        assert!(msg.contains("mint: op_secret missing"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_mint_remint_refuses_op_secret_mismatch() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let base = test_mint_request(1);
+        let nk_commit = host::nk_commit(&base.nk);
+        let state = AccountState::new(
+            base.owner,
+            nk_commit,
+            BTreeMap::new(),
+            base.next_pubkey,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                base.owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk: base.nk,
+                    op_secret: Some(base.op_secret),
+                    genesis_pubkey: base.current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let mut req = base;
+        req.current_pubkey = req.next_pubkey;
+        req.op_secret = label_op_secret(b"zkCoins/v1/state-engine/mint-guard/wrong-op");
+        let err = engine.begin_mint(req).expect_err("op_secret mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("op_secret does not match the registered account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_mint_remint_refuses_nk_mismatch() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let base = test_mint_request(1);
+        let nk_commit = host::nk_commit(&base.nk);
+        let state = AccountState::new(
+            base.owner,
+            nk_commit,
+            BTreeMap::new(),
+            base.next_pubkey,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                base.owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk: base.nk,
+                    op_secret: Some(base.op_secret),
+                    genesis_pubkey: base.current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let mut req = base;
+        req.current_pubkey = req.next_pubkey;
+        req.nk = [0x99; 32];
+        let err = engine.begin_mint(req).expect_err("nk mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("nk does not match the registered account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_mint_remint_refuses_current_pubkey_mismatch() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let base = test_mint_request(1);
+        let nk_commit = host::nk_commit(&base.nk);
+        let state = AccountState::new(
+            base.owner,
+            nk_commit,
+            BTreeMap::new(),
+            base.next_pubkey,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                base.owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk: base.nk,
+                    op_secret: Some(base.op_secret),
+                    genesis_pubkey: base.current_pubkey,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let mut req = base;
+        // Account holds next_pubkey; request carries a third key.
+        let (_, _, wrong_pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/mint-guard/wrong-pk",
+        ));
+        req.current_pubkey = wrong_pk;
+        let err = engine.begin_mint(req).expect_err("pubkey mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("current_pubkey does not match the registered account"),
+            "got: {msg}"
+        );
+    }
+
+    // --- begin_receive guards ------------------------------------------------
+
+    #[test]
+    fn begin_receive_length_mismatch() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/len/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/len/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x41; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 10, 0),
+            recipient: owner,
+            amount: 10,
+            asset_id: asset,
+        };
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/len/op"),
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![], // length mismatch
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("length mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("received_coins / received_auth length mismatch"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_receive_requires_at_least_one_coin() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/empty/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/empty/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/empty/op"),
+                current_pubkey: pk,
+                received_coins: vec![],
+                received_auth: vec![],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("empty receive");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("receive requires at least one received coin"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_receive_too_many_received_coins() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/max/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/max/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x42; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let n = MAX_RX_COINS + 1;
+        let mut coins = Vec::with_capacity(n);
+        let mut auth = Vec::with_capacity(n);
+        let dummy = host_dummy_last_proof();
+        for i in 0..n {
+            coins.push(Coin {
+                identifier: host::coin_identifier(ash, &owner.0, asset, 1, i as u32),
+                recipient: owner,
+                amount: 1,
+                asset_id: asset,
+            });
+            auth.push(dummy_received_auth(dummy.clone(), ash, i as u32));
+        }
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/max/op"),
+                current_pubkey: pk,
+                received_coins: coins,
+                received_auth: auth,
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("over MAX_RX_COINS");
+        let msg = err_msg(err);
+        assert!(msg.contains("too many received coins"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_receive_initial_rejects_owner_mismatch() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/owner/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/owner/pk",
+        ));
+        let real_owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let fake_owner = Address([0xde; 32]);
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x43; 32], 2, 1);
+        // Creating ash for the fake owner still lets recipient checks fail later
+        // if we get that far — owner gate is first for missing accounts.
+        let empty = AccountState::new(
+            fake_owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &fake_owner.0, asset, 10, 0),
+            recipient: fake_owner,
+            amount: 10,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner: fake_owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/owner/op"),
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("owner mismatch on InitialProof");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains(
+                "receive: owner must equal H(current_pubkey ‖ nk_commit) for an InitialProof"
+            ),
+            "got: {msg} (real_owner={real_owner:?})"
+        );
+    }
+
+    #[test]
+    fn begin_receive_rejects_wrong_recipient() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/recip/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/recip/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x44; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 10, 0),
+            recipient: Address([0xee; 32]), // not owner
+            amount: 10,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/recip/op"),
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("wrong recipient");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("received coin recipient is not the receiving account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_receive_rejects_zero_amount() {
+        let engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/zero/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/zero/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x45; 32], 2, 1);
+        let empty = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            0,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        let ash = host::account_state_hash(&empty).unwrap();
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 0, 0),
+            recipient: owner,
+            amount: 0,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/zero/op"),
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("zero amount");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("received coin amount must be non-zero"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_receive_registered_refuses_when_op_secret_missing() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/noop/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/noop/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk,
+                    op_secret: None,
+                    genesis_pubkey: pk,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x46; 32], 2, 1);
+        let ash = host::ZERO_HASH;
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 10, 0),
+            recipient: owner,
+            amount: 10,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/noop/op"),
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("missing op_secret");
+        let msg = err_msg(err);
+        assert!(msg.contains("receive: op_secret missing"), "got: {msg}");
+    }
+
+    #[test]
+    fn begin_receive_registered_refuses_op_secret_mismatch() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/opmis/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/opmis/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let stored = label_op_secret(b"zkCoins/v1/state-engine/rx-guard/opmis/stored");
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk,
+                    op_secret: Some(stored),
+                    genesis_pubkey: pk,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x47; 32], 2, 1);
+        let ash = host::ZERO_HASH;
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 10, 0),
+            recipient: owner,
+            amount: 10,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: label_op_secret(b"zkCoins/v1/state-engine/rx-guard/opmis/wrong"),
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("op_secret mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("receive: op_secret does not match the registered account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_receive_registered_refuses_nk_mismatch() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/nkmis/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/nkmis/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let op = label_op_secret(b"zkCoins/v1/state-engine/rx-guard/nkmis/op");
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk,
+                    op_secret: Some(op),
+                    genesis_pubkey: pk,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x48; 32], 2, 1);
+        let ash = host::ZERO_HASH;
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 10, 0),
+            recipient: owner,
+            amount: 10,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk: [0x99; 32],
+                op_secret: op,
+                current_pubkey: pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("nk mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("receive: nk does not match the registered account"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn begin_receive_registered_refuses_current_pubkey_mismatch() {
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/rx-guard/pkmis/nk").into();
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/pkmis/pk",
+        ));
+        let owner = Address(host::address(&pk, host::nk_commit(&nk)));
+        let op = label_op_secret(b"zkCoins/v1/state-engine/rx-guard/pkmis/op");
+        let state = AccountState::new(
+            owner,
+            host::nk_commit(&nk),
+            BTreeMap::new(),
+            pk,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .unwrap();
+        engine
+            .insert_account(
+                owner,
+                AccountRecord {
+                    state,
+                    coinhist: CoinHistTree::new(),
+                    nk,
+                    op_secret: Some(op),
+                    genesis_pubkey: pk,
+                    spendable: BTreeMap::new(),
+                    spent_ids: BTreeSet::new(),
+                    last_proof: None,
+                    last_nav_opening: None,
+                    last_nullifier: None,
+                    last_nullifier_pos: None,
+                },
+            )
+            .unwrap();
+        let asset = host::asset_id_v1(host::GENESIS_TAG, &pk, &[0x49; 32], 2, 1);
+        let ash = host::ZERO_HASH;
+        let coin = Coin {
+            identifier: host::coin_identifier(ash, &owner.0, asset, 10, 0),
+            recipient: owner,
+            amount: 10,
+            asset_id: asset,
+        };
+        let dummy = host_dummy_last_proof();
+        let (_, _, wrong_pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/rx-guard/pkmis/wrong",
+        ));
+        let err = engine
+            .begin_receive(ReceiveRequest {
+                owner,
+                nk,
+                op_secret: op,
+                current_pubkey: wrong_pk,
+                received_coins: vec![coin],
+                received_auth: vec![dummy_received_auth(dummy, ash, 0)],
+                next_pubkey: [0x55; 32],
+                npk_rand: [0x42; 32],
+            })
+            .expect_err("pubkey mismatch");
+        let msg = err_msg(err);
+        assert!(
+            msg.contains("receive: current_pubkey does not match the registered account"),
+            "got: {msg}"
+        );
+    }
+}
