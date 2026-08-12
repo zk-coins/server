@@ -1071,7 +1071,7 @@ async fn insert_request_log_writes_row() {
 }
 
 #[tokio::test]
-async fn insert_block_log_writes_row_and_is_idempotent() {
+async fn insert_block_log_reobservation_keeps_single_row() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     let entry = BlockLogEntry {
@@ -1082,13 +1082,75 @@ async fn insert_block_log_writes_row_and_is_idempotent() {
         processing_duration_us: Some(99),
     };
     insert_block_log(&pool, &entry).await.unwrap();
-    // ON CONFLICT (block_hash) DO NOTHING — second insert is a no-op.
+    // Re-observation refreshes the existing row rather than creating a duplicate.
     insert_block_log(&pool, &entry).await.unwrap();
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM block_log")
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn insert_block_log_a_b_a_reobservation_restores_latest_canonical_block() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let block_a = BlockLogEntry {
+        block_time: Some(1_700_000_100),
+        block_hash: vec![0xAA; 32],
+        block_height: Some(100),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+    let block_b = BlockLogEntry {
+        block_time: Some(1_700_000_200),
+        block_hash: vec![0xBB; 32],
+        block_height: Some(100),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+
+    insert_block_log(&pool, &block_a).await.unwrap();
+    insert_block_log(&pool, &block_b).await.unwrap();
+    insert_block_log(&pool, &block_a).await.unwrap();
+
+    assert_eq!(
+        load_block_hash_at_height(&pool, 100).await.unwrap(),
+        Some([0xAA; 32])
+    );
+    assert_eq!(
+        load_block_time_at_height(&pool, 100).await.unwrap(),
+        Some(1_700_000_100)
+    );
+}
+
+#[tokio::test]
+async fn insert_block_log_reinsert_backfills_null_block_time_without_overwrite() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let mut entry = BlockLogEntry {
+        block_time: None,
+        block_hash: vec![0xCC; 32],
+        block_height: Some(101),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+
+    insert_block_log(&pool, &entry).await.unwrap();
+    entry.block_time = Some(1_700_000_300);
+    insert_block_log(&pool, &entry).await.unwrap();
+    assert_eq!(
+        load_block_time_at_height(&pool, 101).await.unwrap(),
+        Some(1_700_000_300)
+    );
+
+    entry.block_time = Some(1_700_000_400);
+    insert_block_log(&pool, &entry).await.unwrap();
+    assert_eq!(
+        load_block_time_at_height(&pool, 101).await.unwrap(),
+        Some(1_700_000_300),
+        "a real block_time observation must never be overwritten"
+    );
 }
 
 async fn insert_block_time_fixture(
