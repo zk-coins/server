@@ -87,7 +87,10 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use serde::Deserialize;
-use shared::spec_v1::{digest_to_bytes, hash_proof_data, serialize_proof_data, ProofData};
+use shared::spec_v1::{
+    asset_id_v1, asset_id_v2, digest_to_bytes, hash_proof_data, name_hash,
+    serialize_proof_data, ProofData, GENESIS_TAG,
+};
 use uuid::Uuid;
 use zkcoins_program::circuit::compliance::Network;
 use zkcoins_prover::half_agg::{comm_verify, verify_single};
@@ -1066,7 +1069,13 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
                 .map_err(|e| anyhow::anyhow!("load Phase A on crash-resume: {e:#}"))?;
             if already.is_none() {
                 let delivery_snapshot =
-                    DeliverySnapshot::from_pending(adapter.pool(), &pending, &signature).await?;
+                    DeliverySnapshot::from_pending(
+                        adapter.pool(),
+                        &pending,
+                        &signature,
+                        fence.job_id,
+                    )
+                    .await?;
                 let tip_hash = adapter.tip_hash();
                 let tip_height = adapter.with_engine(|engine| engine.tip_height());
                 let tip_height_u32 = u32::try_from(tip_height).map_err(|_| {
@@ -1106,8 +1115,13 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     }
 
     // Capture delivery materials before prove moves `pending`.
-    let delivery_snapshot =
-        DeliverySnapshot::from_pending(adapter.pool(), &pending, &signature).await?;
+    let delivery_snapshot = DeliverySnapshot::from_pending(
+        adapter.pool(),
+        &pending,
+        &signature,
+        fence.job_id,
+    )
+    .await?;
 
     // §4.2 targets must be resolved **before** durable finalise. A missing
     // IVPK discovered only at mesh-build would leave the transition already
@@ -1614,15 +1628,69 @@ async fn insert_issuer_mint_provenance(
     let Some(terms) = snap.mint_asset_terms.as_ref() else {
         return Ok(());
     };
-    let asset_id = snap
+    let coin_asset_id = snap
         .output_coins
         .first()
-        .map(|coin| digest_to_bytes(&coin.asset_id))
+        .map(|coin| coin.asset_id)
         .ok_or_else(|| {
             crate::v1::delivery::DeliveryError::Relay(
                 "mint transition has no output coins to derive asset_id from".into(),
             )
         })?;
+    let nh = name_hash(&terms.name).map_err(|e| {
+        crate::v1::delivery::DeliveryError::Relay(format!(
+            "issuer-side asset_terms name_hash: {e}"
+        ))
+    })?;
+    let recomputed = match terms.issuance_version {
+        1 => {
+            if terms.cap_total.is_some() || terms.terms_salt.is_some() {
+                return Err(crate::v1::delivery::DeliveryError::Relay(
+                    "issuer-side asset_terms v1 must not carry cap_total/terms_salt".into(),
+                ));
+            }
+            asset_id_v1(
+                GENESIS_TAG,
+                &terms.creator_pubkey,
+                &nh,
+                terms.decimals,
+                1,
+            )
+        }
+        2 => {
+            let cap = terms.cap_total.ok_or_else(|| {
+                crate::v1::delivery::DeliveryError::Relay(
+                    "issuer-side asset_terms v2 missing cap_total".into(),
+                )
+            })?;
+            let salt = terms.terms_salt.ok_or_else(|| {
+                crate::v1::delivery::DeliveryError::Relay(
+                    "issuer-side asset_terms v2 missing terms_salt".into(),
+                )
+            })?;
+            asset_id_v2(
+                GENESIS_TAG,
+                &terms.creator_pubkey,
+                &nh,
+                terms.decimals,
+                2,
+                cap,
+                &salt,
+            )
+        }
+        other => {
+            return Err(crate::v1::delivery::DeliveryError::Relay(format!(
+                "issuer-side asset_terms issuance_version {other} is neither 1 nor 2 — refuse provenance insert"
+            )));
+        }
+    };
+    if recomputed != coin_asset_id {
+        return Err(crate::v1::delivery::DeliveryError::Relay(
+            "issuer-side asset_terms self-auth failed: recomputed asset_id ≠ output coin asset_id"
+                .into(),
+        ));
+    }
+    let asset_id = digest_to_bytes(&coin_asset_id);
     crate::v1::db_token_provenance::insert_token_provenance(pool, &asset_id, terms)
         .await
         .map_err(|e| {
@@ -1696,6 +1764,7 @@ impl DeliverySnapshot {
         pool: &sqlx::PgPool,
         pending: &PendingTransition,
         signature: &TransitionSignature,
+        job_id: Uuid,
     ) -> Result<Self, anyhow::Error> {
         use shared::spec_v1 as host;
         use shared::spec_v1::serialize::serialize_proof_data;
@@ -1715,21 +1784,18 @@ impl DeliverySnapshot {
             if record_kind == shared::spec_v1::bundle::RecordKind::Mint {
                 Some(
                     crate::v1::db_mint_terms_staging::get_staged_mint_issuance_terms(
-                        pool,
-                        &signature.pk_i,
+                        pool, job_id,
                     )
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!(
-                            "v1.1 finalise: load staged mint IssuanceTerms for pk_create/signature.pk_i {}: {e:#}",
-                            hex_lower(&signature.pk_i)
+                            "v1.1 finalise: load staged mint IssuanceTerms for job {job_id}: {e:#}"
                         )
                     })?
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "v1.1 finalise: mint transition is finalising without staged \
-                             IssuanceTerms for pk_create/signature.pk_i {}",
-                            hex_lower(&signature.pk_i)
+                            "v1.1 finalise: mint transition job {job_id} is finalising without \
+                             staged IssuanceTerms"
                         )
                     })?,
                 )
@@ -3917,7 +3983,20 @@ mod tests {
 
         let scope = setup_pool().await;
         let expected_terms = mint_terms();
-        let coin = external_coin([0x81; 32]);
+        let nh = name_hash(&expected_terms.name).expect("mint terms name");
+        let computed_asset_id = asset_id_v2(
+            GENESIS_TAG,
+            &expected_terms.creator_pubkey,
+            &nh,
+            expected_terms.decimals,
+            2,
+            expected_terms.cap_total.expect("v2 mint terms cap_total"),
+            &expected_terms
+                .terms_salt
+                .expect("v2 mint terms terms_salt"),
+        );
+        let mut coin = external_coin([0x81; 32]);
+        coin.asset_id = computed_asset_id;
         let asset_id = digest_to_bytes(&coin.asset_id);
         let mut snap = delivery_snapshot(vec![coin]);
         snap.record_kind = 0x01;

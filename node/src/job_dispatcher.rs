@@ -1064,6 +1064,7 @@ async fn process_mint(
         };
         crate::v1::db_mint_terms_staging::stage_mint_issuance_terms(
             adapter.pool(),
+            public_id,
             &pending.witness_wip.prev_account_state.current_pubkey,
             &issuance_terms,
         )
