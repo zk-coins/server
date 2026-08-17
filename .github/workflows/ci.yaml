@@ -30,14 +30,11 @@ on:
   # `refs/heads/develop`, PR keyed by the Release PR's number — so
   # the block would not deduplicate them.)
   #
-  # `ready_for_review` is added so the workflow fires the moment a
-  # draft PR is marked ready — drafts themselves skip CI via the
-  # `if:` guard on each job (saves self-hosted-runner time while
-  # work is still in progress).
-  #
-  # `labeled` / `unlabeled` remain so label toggles re-fire the
-  # workflow (e.g. operational re-runs). The heavy gate no longer
-  # keys off `ci:full` (see `test-and-coverage` job `if:`).
+  # Drafts skip the jobs unless they carry `ci` or `ci:full`. That
+  # is how CI starts on a draft — never by flipping ready-for-review
+  # just to wake the suite. `labeled` / `unlabeled` re-fire so adding
+  # `ci` / `ci:full` on a draft actually starts the jobs.
+  # `ready_for_review` still fires when a finished PR leaves draft.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
@@ -95,8 +92,7 @@ env:
 #   `db_tests`, the Plonky2-heavy mint/send/receive prover flows, the
 #   measured coverage floor, plus the release-mode prover package and
 #   the four `#[ignore]` prove flows (Task #9), all in one job.
-#   Drafts still skip via the job `if:` (saves runner time while work
-#   is in progress).
+#   Drafts skip unless they carry `ci` or `ci:full`.
 #
 # There is no third "subset" tier: a test either runs in the default
 # Lint & Build (compile/lint) or in the heavy gate (the full suite).
@@ -126,10 +122,14 @@ env:
 jobs:
   lint-and-build:
     name: Lint & Build
-    # Skip on draft PRs. The heavy `test-and-coverage` gate carries
-    # the same draft/push guard on its own `if:`, so it runs in
-    # parallel with this job rather than gating behind it via `needs:`.
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    # Skip drafts that have no CI-start label. `ci` and `ci:full`
+    # start this job on a draft (same suite as a ready PR). Ready
+    # is not a CI switch.
+    if: >
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false ||
+      contains(github.event.pull_request.labels.*.name, 'ci') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:full')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -229,11 +229,14 @@ jobs:
     # nextest suite — see the file header for the merge rationale).
     # Floor values and ignore rules: `.github/coverage-baseline.md`.
     #
-    # CI endgame / G16: runs on every non-draft PR (same draft/push
-    # guard as `lint-and-build`). Previously opt-in via the `ci:full`
-    # label; the baseline recorded that expansion for the un-pause
-    # step — the label is no longer required for this gate.
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
+    # Same start rule as `lint-and-build`: every non-draft PR, plus
+    # drafts that carry `ci` or `ci:full`. `ci:full` is no longer a
+    # scope gate — it is only a start-on-draft alias.
+    if: >
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false ||
+      contains(github.event.pull_request.labels.*.name, 'ci') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:full')
     # The registered self-hosted M3 Ultra machines (dfx01, dfx01-2) advertise
     # the `zkcoins-node` pool label, not `m3-ultra` — the old `m3-ultra`
     # requirement matched no online runner, so this gate queued forever. Target

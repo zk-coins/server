@@ -427,7 +427,7 @@ Esplora WS); residual `ESPLORA_URL` is a boot pin only.
 | `main` | Production releases, promoted from `develop` | PRD node |
 
 - **Open feature PRs against `staging`** by default — it is the integration buffer where feature branches accumulate before being batched into a single `develop` promotion. (Repo-hygiene/cleanup PRs that target develop-only files may go directly to `develop`; note the reason in the PR body.)
-- **`develop` and `main` are protected** — no direct pushes, no force-pushes, no deletions. `develop` is auto-PR'd from `staging` (`auto-release-pr-staging.yaml`); `main` is auto-PR'd from `develop` (`auto-release-pr.yaml`). Non-draft PRs always get the heavy CI gate (no label).
+- **`develop` and `main` are protected** — no direct pushes, no force-pushes, no deletions. `develop` is auto-PR'd from `staging` (`auto-release-pr-staging.yaml`); `main` is auto-PR'd from `develop` (`auto-release-pr.yaml`). Non-draft PRs always get the heavy CI gate. Drafts start the same gate with the `ci` or `ci:full` label.
 - **Maintainers merge PRs; agents open them as drafts.** Never force-push, never amend, never `--no-verify` on a real change.
 
 ### Commit messages
@@ -448,16 +448,17 @@ wip
 
 | Workflow | Trigger | Action |
 |---|---|---|
-| `ci.yaml` — **Lint & Build** | Every non-draft PR (`pull_request` opened/synchronize/reopened/ready_for_review/…) | `cargo fmt --check`, clippy (MVP + all-features + program/prover), build, the no-polling grep over `node/src/main.rs` + `node/src/publisher.rs` (same-line `scanner-polling-ok:` opt-out). Fast GitHub-hosted tier. |
-| `ci.yaml` — **Tests + Coverage Gate** | Every non-draft PR (same draft guard; **no** `ci:full` label) | Full `node` + `shared` nextest under `llvm-cov` on the self-hosted M3 Ultra pool, measured coverage floor (see `.github/coverage-baseline.md`), then release-mode `zkcoins-prover-plonky2`, ignored prove flows (`--run-ignored ignored-only`), and circuit-digest verify. |
+| `ci.yaml` — **Lint & Build** | Every non-draft PR, or a draft with the `ci` / `ci:full` label | `cargo fmt --check`, clippy (MVP + all-features + program/prover), build, the no-polling grep over `node/src/main.rs` + `node/src/publisher.rs` (same-line `scanner-polling-ok:` opt-out). Fast GitHub-hosted tier. |
+| `ci.yaml` — **Tests + Coverage Gate** | Same start rule as Lint & Build | Full `node` + `shared` nextest under `llvm-cov` on the self-hosted M3 Ultra pool, measured coverage floor (see `.github/coverage-baseline.md`), then release-mode `zkcoins-prover-plonky2`, ignored prove flows (`--run-ignored ignored-only`), and circuit-digest verify. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → `zkcoins/node:beta` → DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → `zkcoins/node:latest` → PRD |
 | `auto-release-pr-staging.yaml` | Push to staging | Promote PR (staging → develop) |
 | `auto-release-pr.yaml` | Push to develop | Release PR (develop → main) |
 
-**Draft PRs skip every `ci.yaml` job** — CI fires once the PR is marked
-ready-for-review (or on synchronize of a ready PR). The heavy gate is the
-default for non-draft PRs; there is no label opt-in. After push, watch CI until
+**Draft PRs skip every `ci.yaml` job unless they carry `ci` or `ci:full`.**
+Apply one of those labels to start the same suite a ready PR would get;
+the PR stays a draft. Ready-for-review is not a CI switch. Non-draft PRs
+always run the heavy gate (no extra label). After a start, watch CI until
 green; never abandon a red run.
 
 **No-polling gate (Lint & Build).** Matches the workflow step exactly:
