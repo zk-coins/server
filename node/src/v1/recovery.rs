@@ -275,10 +275,10 @@ pub(crate) enum SdrDiscardReason {
     NotFirstOccurrence { detail: String },
     /// Check (v): inclusion block height/hash does not match NfLog + block_log.
     InclusionBlockMismatch { detail: String },
-    /// Check (v): `occurred_at` is zero, or differs from a successfully
-    /// re-derived BIP-113 MTP. A window that is not locally derivable uses the
-    /// documented presence-only fallback (accept on the other checks), not this
-    /// error.
+    /// Check (v): `occurred_at` is zero, differs from a successfully
+    /// re-derived BIP-113 MTP, or the local `[h-10..=h]` window cannot be
+    /// derived (pre-migration NULL `block_time`, scan-start edge). Spec §4.2
+    /// mandates discard; there is no presence-only accept path.
     OccurredAtInvalid { detail: String },
     /// Check (v) ordering stage: `occurred_at` regressed vs a previously accepted record.
     OccurredAtNotMonotonic { detail: String },
@@ -786,15 +786,13 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
                 });
             }
         }
-        // This is intentional graceful degradation to presence-only
-        // verification when local history is incomplete, not masking an error.
         None => {
-            tracing::info!(
-                inclusion_height,
-                "SDR recovery: MTP window was not locally available at the inclusion height; \
-                 BIP-113 binding was not re-verified for this record; intentional \
-                 recovery-completeness fallback to presence-only verification"
-            );
+            return Err(SdrDiscardReason::OccurredAtInvalid {
+                detail: format!(
+                    "BIP-113 MTP window not locally derivable at inclusion height \
+                     {inclusion_height}; check (v) discards (spec §4.2, no presence fallback)"
+                ),
+            });
         }
     }
 
@@ -4018,7 +4016,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdr_missing_mtp_window_is_accepted_via_presence_fallback() {
+    async fn sdr_missing_mtp_window_is_discarded() {
         let scope = crate::test_db::setup_pool().await;
         for height in 90_u64..=100 {
             // Height 95 is present but deliberately has SQL NULL block_time.
@@ -4034,9 +4032,18 @@ mod tests {
         insert_sdr_anchor_if_outside_window(&scope.pool, 100, 50).await;
         let record = sample_sdr_for_async_checks(100, 50, 95);
 
-        verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
+        let err = verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
             .await
-            .expect("an incomplete MTP window must fall back to presence verification");
+            .expect_err("an incomplete MTP window must discard under §4.2");
+        match err {
+            SdrDiscardReason::OccurredAtInvalid { detail } => {
+                assert!(
+                    detail.contains("not locally derivable"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected OccurredAtInvalid, got {other:?}"),
+        }
     }
 
     #[tokio::test]

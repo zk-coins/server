@@ -413,7 +413,7 @@ pub(crate) async fn load_block_time_at_height(
         SELECT block_time
         FROM block_log
         WHERE block_height = $1
-        ORDER BY processed_at DESC
+        ORDER BY processed_at DESC, id DESC
         LIMIT 1
         "#,
     )
@@ -449,7 +449,7 @@ pub(crate) async fn load_block_time_at_height_in_tx(
         SELECT block_time
         FROM block_log
         WHERE block_height = $1
-        ORDER BY processed_at DESC
+        ORDER BY processed_at DESC, id DESC
         LIMIT 1
         "#,
     )
@@ -533,7 +533,7 @@ pub(crate) async fn load_block_hash_at_height(
     let row: Option<(Vec<u8>,)> = sqlx::query_as(
         "SELECT block_hash FROM block_log \
          WHERE block_height = $1 \
-         ORDER BY processed_at DESC \
+         ORDER BY processed_at DESC, id DESC \
          LIMIT 1",
     )
     .bind(height_i64)
@@ -568,7 +568,7 @@ pub(crate) async fn load_block_hash_at_height_in_tx(
     let row: Option<(Vec<u8>,)> = sqlx::query_as(
         "SELECT block_hash FROM block_log \
          WHERE block_height = $1 \
-         ORDER BY processed_at DESC \
+         ORDER BY processed_at DESC, id DESC \
          LIMIT 1",
     )
     .bind(height_i64)
