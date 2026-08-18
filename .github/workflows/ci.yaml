@@ -128,8 +128,8 @@ jobs:
     if: >
       github.event_name != 'pull_request' ||
       github.event.pull_request.draft == false ||
-      contains(github.event.pull_request.labels.*.name, 'ci') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:full')
+      contains(toJson(github.event.pull_request.labels.*.name), '"ci"') ||
+      contains(toJson(github.event.pull_request.labels.*.name), '"ci:full"')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -235,8 +235,8 @@ jobs:
     if: >
       github.event_name != 'pull_request' ||
       github.event.pull_request.draft == false ||
-      contains(github.event.pull_request.labels.*.name, 'ci') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:full')
+      contains(toJson(github.event.pull_request.labels.*.name), '"ci"') ||
+      contains(toJson(github.event.pull_request.labels.*.name), '"ci:full"')
     # The registered self-hosted M3 Ultra machines (dfx01, dfx01-2) advertise
     # the `zkcoins-node` pool label, not `m3-ultra` — the old `m3-ultra`
     # requirement matched no online runner, so this gate queued forever. Target
