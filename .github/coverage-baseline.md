@@ -33,16 +33,11 @@ claim 100 % while carving production modules out of the measurement
    the floor toward 100 % is follow-up work; lowering it is a regression
    that needs an explicit decision and an update to this file.
 
-## CI trigger note (endgame — not yet applied)
+## CI trigger note
 
-Today the heavy gate still runs only when the `ci:full` label is present
-(or on push paths that already carry it). Expanding it to every
-non-draft PR (instead of label-gated only) belongs to the **CI endgame**
-when the workflow is un-paused; do not flip that condition while the
-workflow is still `workflow_dispatch`-only / PR-trigger-commented, or a
-60–90 min gate would fire on every PR against paused runners. Recorded
-here so the un-pause PR cannot claim the floor was fixed without also
-planning the trigger expansion.
+The heavy gate runs on every non-draft PR. Drafts stay quiet unless they
+carry `ci` or `ci:full` — those labels start the same suite without
+leaving draft. Ready-for-review is not a CI switch.
 
 ## Measurement record
 
