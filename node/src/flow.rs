@@ -781,7 +781,7 @@ mod tests {
     #[test]
     fn validate_mint_rejects_tampered_creator_pubkey() {
         let timestamp = now_secs();
-        let mut request = signed_mint_request("tampered-key".into(), 8, 42, timestamp);
+        let mut request = signed_mint_request("tampered-key", 8, 42, timestamp);
         let secp = Secp256k1::new();
         let mut replacement = public_key(&secp, 43);
         if replacement == request.creator_pubkey {
@@ -799,7 +799,7 @@ mod tests {
     #[test]
     fn validate_mint_rejects_tampered_name() {
         let timestamp = now_secs();
-        let mut request = signed_mint_request("original-name".into(), 8, 42, timestamp);
+        let mut request = signed_mint_request("original-name", 8, 42, timestamp);
         request.name = "tampered-name".to_string();
 
         expect_flow_error(
@@ -812,7 +812,7 @@ mod tests {
     #[test]
     fn validate_mint_rejects_tampered_decimals() {
         let timestamp = now_secs();
-        let mut request = signed_mint_request("tampered-decimals".into(), 8, 42, timestamp);
+        let mut request = signed_mint_request("tampered-decimals", 8, 42, timestamp);
         request.decimals = 9;
 
         expect_flow_error(
@@ -825,7 +825,7 @@ mod tests {
     #[test]
     fn validate_mint_rejects_tampered_timestamp() {
         let timestamp = now_secs();
-        let mut request = signed_mint_request("tampered-timestamp".into(), 8, 42, timestamp);
+        let mut request = signed_mint_request("tampered-timestamp", 8, 42, timestamp);
         request.timestamp = timestamp.saturating_add(1);
 
         expect_flow_error(
@@ -853,7 +853,7 @@ mod tests {
     #[test]
     fn validate_mint_rejects_invalid_hex_signature() {
         let timestamp = now_secs();
-        let mut request = signed_mint_request("invalid-hex-signature".into(), 8, 42, timestamp);
+        let mut request = signed_mint_request("invalid-hex-signature", 8, 42, timestamp);
         request.signature = "zz-not-hex".to_string();
 
         expect_flow_error(
@@ -881,7 +881,7 @@ mod tests {
     #[test]
     fn validate_mint_rejects_wrong_length_signature() {
         let timestamp = now_secs();
-        let mut request = signed_mint_request("wrong-length-signature".into(), 8, 42, timestamp);
+        let mut request = signed_mint_request("wrong-length-signature", 8, 42, timestamp);
         request.signature = hex::encode([0_u8; 32]);
 
         expect_flow_error(
@@ -908,7 +908,7 @@ mod tests {
     #[test]
     fn validate_mint_rejects_future_timestamp_outside_window() {
         let timestamp = now_secs().saturating_add(400);
-        let request = signed_mint_request("future-timestamp".into(), 8, 42, timestamp);
+        let request = signed_mint_request("future-timestamp", 8, 42, timestamp);
 
         expect_flow_error(
             validate_mint_request(&request),
@@ -948,7 +948,7 @@ mod tests {
     fn validate_mint_accepts_timestamp_at_exact_skew_boundary() {
         let now = now_secs();
         let timestamp = now.saturating_add(crate::router::MAX_TIMESTAMP_SKEW_SECS);
-        let request = signed_mint_request("exact-skew-boundary".into(), 8, 42, timestamp);
+        let request = signed_mint_request("exact-skew-boundary", 8, 42, timestamp);
 
         assert!(validate_mint_request(&request).is_ok());
     }
@@ -958,7 +958,7 @@ mod tests {
         let now = now_secs();
         let timestamp =
             now.saturating_sub(crate::router::MAX_TIMESTAMP_SKEW_SECS.saturating_add(1));
-        let request = signed_mint_request("past-skew-boundary".into(), 8, 42, timestamp);
+        let request = signed_mint_request("past-skew-boundary", 8, 42, timestamp);
 
         expect_flow_error(
             validate_mint_request(&request),
