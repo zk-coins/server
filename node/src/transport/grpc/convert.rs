@@ -2057,7 +2057,7 @@ mod tests {
         assert_eq!(err.code, KernelErrorCode::MalformedRequest);
         assert!(err.public_message.contains("both"));
 
-        for (field, mut req) in [
+        for (field, req) in [
             ("subject", {
                 let mut r = base_attest_request();
                 r.subject = wrong_width_subject_bech32();
@@ -2673,7 +2673,7 @@ mod tests {
 
     #[test]
     fn transition_presence_matrix_rejects_every_forbidden_shape_and_kind() {
-        for (field, mut req) in [
+        for (field, req) in [
             ("input_coins", {
                 let mut r = base_mint_request();
                 r.input_coins = vec![vec![0; 32]];

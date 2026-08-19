@@ -738,12 +738,7 @@ mod tests {
         let timestamp = now_secs();
         let account_address = hex::encode([0x11_u8; 32]);
         let recipient = hex::encode([0x22_u8; 32]);
-        let mut request = signed_send_request(
-            account_address.as_str().into(),
-            recipient.as_str().into(),
-            42,
-            timestamp,
-        );
+        let mut request = signed_send_request(&account_address, &recipient, 42, timestamp);
         request.account_address = hex::encode([0x33_u8; 32]);
 
         expect_flow_error(
@@ -758,12 +753,7 @@ mod tests {
         let timestamp = now_secs();
         let account_address = hex::encode([0x11_u8; 32]);
         let recipient = hex::encode([0x22_u8; 32]);
-        let mut request = signed_send_request(
-            account_address.as_str().into(),
-            recipient.as_str().into(),
-            42,
-            timestamp,
-        );
+        let mut request = signed_send_request(&account_address, &recipient, 42, timestamp);
         request.recipient = hex::encode([0x33_u8; 32]);
 
         expect_flow_error(
@@ -778,12 +768,7 @@ mod tests {
         let timestamp = now_secs();
         let account_address = hex::encode([0x11_u8; 32]);
         let recipient = hex::encode([0x22_u8; 32]);
-        let mut request = signed_send_request(
-            account_address.as_str().into(),
-            recipient.as_str().into(),
-            42,
-            timestamp,
-        );
+        let mut request = signed_send_request(&account_address, &recipient, 42, timestamp);
         request.timestamp = Some(timestamp.saturating_add(1));
 
         expect_flow_error(
@@ -855,12 +840,7 @@ mod tests {
         let timestamp = now_secs();
         let account_address = hex::encode([0x11_u8; 32]);
         let recipient = hex::encode([0x22_u8; 32]);
-        let mut request = signed_send_request(
-            account_address.as_str().into(),
-            recipient.as_str().into(),
-            42,
-            timestamp,
-        );
+        let mut request = signed_send_request(&account_address, &recipient, 42, timestamp);
         request.signature = Some("zz-not-hex".to_string());
 
         expect_flow_error(
@@ -888,12 +868,7 @@ mod tests {
         let timestamp = now_secs();
         let account_address = hex::encode([0x11_u8; 32]);
         let recipient = hex::encode([0x22_u8; 32]);
-        let mut request = signed_send_request(
-            account_address.as_str().into(),
-            recipient.as_str().into(),
-            42,
-            timestamp,
-        );
+        let mut request = signed_send_request(&account_address, &recipient, 42, timestamp);
         request.signature = Some(hex::encode([0_u8; 32]));
 
         expect_flow_error(
@@ -921,12 +896,7 @@ mod tests {
         let timestamp = now_secs().saturating_add(400);
         let account_address = hex::encode([0x11_u8; 32]);
         let recipient = hex::encode([0x22_u8; 32]);
-        let request = signed_send_request(
-            account_address.as_str().into(),
-            recipient.as_str().into(),
-            42,
-            timestamp,
-        );
+        let request = signed_send_request(&account_address, &recipient, 42, timestamp);
 
         expect_flow_error(
             validate_send_request(&request),
@@ -953,12 +923,7 @@ mod tests {
         let timestamp = now.saturating_add(crate::router::MAX_TIMESTAMP_SKEW_SECS);
         let account_address = hex::encode([0x11_u8; 32]);
         let recipient = hex::encode([0x22_u8; 32]);
-        let request = signed_send_request(
-            account_address.as_str().into(),
-            recipient.as_str().into(),
-            42,
-            timestamp,
-        );
+        let request = signed_send_request(&account_address, &recipient, 42, timestamp);
 
         assert!(validate_send_request(&request).is_ok());
     }
@@ -970,12 +935,7 @@ mod tests {
             now.saturating_sub(crate::router::MAX_TIMESTAMP_SKEW_SECS.saturating_add(1));
         let account_address = hex::encode([0x11_u8; 32]);
         let recipient = hex::encode([0x22_u8; 32]);
-        let request = signed_send_request(
-            account_address.as_str().into(),
-            recipient.as_str().into(),
-            42,
-            timestamp,
-        );
+        let request = signed_send_request(&account_address, &recipient, 42, timestamp);
 
         expect_flow_error(
             validate_send_request(&request),
@@ -1012,12 +972,7 @@ mod tests {
         let timestamp = now_secs();
         let account_address = hex::encode([0x11_u8; 32]);
         let recipient = hex::encode([0x22_u8; 31]);
-        let request = signed_send_request(
-            account_address.as_str().into(),
-            recipient.as_str().into(),
-            42,
-            timestamp,
-        );
+        let request = signed_send_request(&account_address, &recipient, 42, timestamp);
 
         expect_flow_error(
             validate_send_request(&request),

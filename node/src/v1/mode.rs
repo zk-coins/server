@@ -532,7 +532,7 @@ mod unit_tests {
             .unwrap_or_else(|p| p.into_inner())
     }
 
-    const BOOT_ENV_KEYS: &[&'static str] = &[
+    const BOOT_ENV_KEYS: &[&str] = &[
         "ZKCOINS_NETWORK",
         "ZKCOINS_ACTIVATION_HEIGHT",
         "ZKCOINS_EXPECTED_PARAMS_IDENTIFIER",

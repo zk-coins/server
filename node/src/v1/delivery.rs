@@ -2877,7 +2877,7 @@ mod tests {
             &op_sk,
             1_048_576,
             &[manifest_store.uri()],
-            &[seed_relay.clone()],
+            std::slice::from_ref(&seed_relay),
         )
         .await
         .expect_err("recipient placement alone must not satisfy relay overlap");

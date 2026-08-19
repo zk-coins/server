@@ -1373,7 +1373,6 @@ mod tests {
             .contains("creating Pk is present with a different R (double-spend loser)"));
     }
 
-    use super::*;
     use crate::test_db::setup_pool;
     use shared::spec_v1::bundle::IssuanceTerms;
     use shared::spec_v1::encoding::digest_to_bytes;
