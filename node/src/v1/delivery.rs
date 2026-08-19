@@ -1379,6 +1379,7 @@ impl OutgoingDeliveryPort for MeshDeliveryPort {
 }
 
 /// Build + network-publish one outbox row; mark_published.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish_outbox_row(
     pool: &PgPool,
     row: &OutboxRow,

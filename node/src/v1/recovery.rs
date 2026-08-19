@@ -838,12 +838,12 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
 ///
 /// Same-ash but non-identical records remain candidates, deterministically
 /// ordered by blob id, so chain validation names and resolves each one.
+type OrderedSdr = ([u8; 32], RecordKind, host::SelfDeliveryRecordV1);
+type OrderedSdrDiscard = (u64, [u8; 32], RecordKind, SdrDiscardReason);
+
 pub(crate) fn resolve_equivocation_and_order(
-    survivors: Vec<([u8; 32], RecordKind, host::SelfDeliveryRecordV1)>,
-) -> (
-    Vec<([u8; 32], RecordKind, host::SelfDeliveryRecordV1)>,
-    Vec<(u64, [u8; 32], RecordKind, SdrDiscardReason)>,
-) {
+    survivors: Vec<OrderedSdr>,
+) -> (Vec<OrderedSdr>, Vec<OrderedSdrDiscard>) {
     let mut by_counter: BTreeMap<u64, Vec<([u8; 32], RecordKind, host::SelfDeliveryRecordV1)>> =
         BTreeMap::new();
     for (blob_id, record_kind, record) in survivors {
@@ -914,11 +914,8 @@ pub(crate) fn resolve_equivocation_and_order(
 pub(crate) fn apply_ordered_chain(
     subject: &[u8; 32],
     nk: &[u8; 32],
-    ordered: Vec<([u8; 32], RecordKind, host::SelfDeliveryRecordV1)>,
-) -> (
-    Vec<AcceptedSdr>,
-    Vec<(u64, [u8; 32], RecordKind, SdrDiscardReason)>,
-) {
+    ordered: Vec<OrderedSdr>,
+) -> (Vec<AcceptedSdr>, Vec<OrderedSdrDiscard>) {
     let mut accepted = Vec::new();
     let mut discards = Vec::new();
     let mut prev_ash: Option<host::HashDigest> = None;
@@ -1707,6 +1704,7 @@ fn verify_fold_static_bindings(
 }
 
 /// Fetch, decrypt, bind, and verify one output ref without writing it.
+#[allow(clippy::too_many_arguments)]
 async fn stage_output_ref_inner(
     stores: FoldOutputRefStores<'_>,
     bridge: &ProverBridge,

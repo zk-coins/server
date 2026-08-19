@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(map.get(&a), Some(&1));
         assert_eq!(map.get(&c), Some(&2));
 
-        let cloned = a.clone();
+        let cloned = a;
         assert_eq!(cloned, a);
         let copied: Address = a;
         assert_eq!(copied, a);

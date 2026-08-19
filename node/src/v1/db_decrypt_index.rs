@@ -67,6 +67,8 @@ pub(crate) fn decrypt_record_id(
 ///
 /// On unique-constraint conflict the existing row is left untouched and
 /// [`InsertRecordOutcome::AlreadyPresent`] is returned (named replay).
+/// Used from decrypt-index / provenance tests; the live path uses the `_in_tx` form.
+#[allow(dead_code)]
 pub(crate) async fn insert_verified_coin_proof(
     pool: &PgPool,
     row: &DecryptIndexRow,

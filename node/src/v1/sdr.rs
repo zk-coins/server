@@ -39,6 +39,7 @@ use super::outbox_material::{SdrOutboxMaterial, SdrPhaseAMaterial, SdrPhaseAOutp
 use super::OsSecureRandom;
 
 /// Stable token in the mainnet provisional-MTP refusal message (tests + logs).
+#[cfg(test)]
 pub(crate) const PROVISIONAL_MTP_MAINNET_REFUSED: &str = "PROVISIONAL_MTP_MAINNET_REFUSED";
 
 /// Protocol-pinned finality depth (§3.9): six confirmations.
@@ -55,6 +56,7 @@ pub(crate) const FINALITY_CONFIRMATIONS: u64 = 6;
 /// **Fail-closed on mainnet:** provisional tip-hash + wall-clock must never
 /// seal a SelfDeliveryRecord on mainnet. Regtest and testnet may use the
 /// stand-in (still named provisional in logs / docs).
+#[cfg(test)]
 pub(crate) fn provisional_inclusion_mtp_for_network(
     network: Network,
     tip_hash: [u8; 32],
@@ -90,12 +92,14 @@ pub(crate) trait InclusionMtpSource: Send + Sync {
 }
 
 /// Fixed MTP source for unit tests (no bitcoind).
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct FixedInclusionMtp {
     pub block_hash: [u8; 32],
     pub occurred_at: u64,
 }
 
+#[cfg(test)]
 impl InclusionMtpSource for FixedInclusionMtp {
     fn inclusion_and_mtp(&self, height: u64) -> InclusionMtpFuture<'_> {
         let height_u32 = match u32::try_from(height) {
