@@ -496,7 +496,9 @@ pub(crate) async fn create_and_broadcast_inscription(
     for (outpoint, sats) in &outpoints_with_sats {
         tracing::info!(
             "Found UTXO: {}:{} with value {} sats",
-            outpoint.txid, outpoint.vout, sats
+            outpoint.txid,
+            outpoint.vout,
+            sats
         );
     }
 
@@ -560,7 +562,8 @@ pub(crate) async fn create_and_broadcast_inscription(
             Err(e) => {
                 tracing::error!(
                     "Failed to persist pending_inscriptions row for {}: {}",
-                    commit_txid, e
+                    commit_txid,
+                    e
                 );
                 return Err(format!("persist pending inscription: {}", e).into());
             }
@@ -619,7 +622,8 @@ pub(crate) async fn create_and_broadcast_inscription(
                 {
                     tracing::warn!(
                         "Failed to persist failure_reason for {}: {}",
-                        commit_txid, persist_err
+                        commit_txid,
+                        persist_err
                     );
                 }
             }
@@ -799,7 +803,8 @@ async fn resume_single_row(
         db::PENDING_STATUS_CONSTRUCTED => {
             tracing::info!(
                 "resume: row id={} status=constructed → re-broadcasting commit {}",
-                row.id, commit_txid
+                row.id,
+                commit_txid
             );
             match client.broadcast(&commit_tx).await {
                 Ok(()) => {
@@ -831,7 +836,8 @@ async fn resume_single_row(
         db::PENDING_STATUS_COMMIT_BROADCAST => {
             tracing::info!(
                 "resume: row id={} status=commit_broadcast → broadcasting reveal for {}",
-                row.id, commit_txid
+                row.id,
+                commit_txid
             );
             broadcast_reveal_and_complete(pool, &client, &row.commit_txid, &reveal_tx).await?;
         }

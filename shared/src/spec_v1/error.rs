@@ -730,8 +730,8 @@ impl std::error::Error for SpecError {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::accumulator::ChainPosition;
+    use super::*;
     use std::error::Error;
 
     #[test]
@@ -862,11 +862,7 @@ mod tests {
 
         // Balances / lengths / bech32 / numeric
         assert_eq!(
-            SpecError::TooManyBalances {
-                count: 40,
-                max: 32
-            }
-            .to_string(),
+            SpecError::TooManyBalances { count: 40, max: 32 }.to_string(),
             "too many balance entries: 40 (max 32)"
         );
         assert_eq!(
@@ -894,10 +890,7 @@ mod tests {
             "bech32m decode error: checksum failed"
         );
         assert_eq!(
-            SpecError::SmallNumericOutOfRange {
-                value: 1u64 << 56
-            }
-            .to_string(),
+            SpecError::SmallNumericOutOfRange { value: 1u64 << 56 }.to_string(),
             "small-numeric value out of range: 72057594037927936 (must be < 2^56)"
         );
         assert_eq!(
@@ -986,10 +979,7 @@ mod tests {
 
         // Bootstrap
         assert_eq!(
-            SpecError::BootstrapMagicInvalid {
-                got: *b"XYZQ"
-            }
-            .to_string(),
+            SpecError::BootstrapMagicInvalid { got: *b"XYZQ" }.to_string(),
             "bootstrap manifest magic invalid: got \"XYZQ\" (expected ASCII \"BMF1\")"
         );
         assert_eq!(

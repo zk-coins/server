@@ -1279,7 +1279,13 @@ mod tests {
         injected.extend_from_slice(&bytes[after_name..]);
         let err = deserialize_coin_proof(&injected).expect_err("v1+cap wire");
         assert!(
-            matches!(err, SpecError::BundleLengthOverrun { .. } | SpecError::BundleTrailingBytes { .. } | SpecError::BundleTruncated { .. } | SpecError::NonCanonicalDigestLimb { .. }),
+            matches!(
+                err,
+                SpecError::BundleLengthOverrun { .. }
+                    | SpecError::BundleTrailingBytes { .. }
+                    | SpecError::BundleTruncated { .. }
+                    | SpecError::NonCanonicalDigestLimb { .. }
+            ),
             "v1+cap wire must not parse cleanly, got {err:?}"
         );
     }

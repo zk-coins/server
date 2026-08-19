@@ -406,8 +406,7 @@ mod tests {
         assert_eq!(exact32(&exact, "digest").expect("exact 32 bytes"), exact);
 
         for bytes in [vec![0x42; 31], vec![0x42; 33]] {
-            let err = exact32(&bytes, "record_id")
-                .expect_err("non-32-byte field must fail closed");
+            let err = exact32(&bytes, "record_id").expect_err("non-32-byte field must fail closed");
             let message = err.to_string();
             assert!(message.contains("record_id"), "unexpected error: {err:#}");
             assert!(message.contains("32 bytes"), "unexpected error: {err:#}");
@@ -437,10 +436,7 @@ mod tests {
         let acked = sample_sql_row("acked", 0)
             .into_row()
             .expect("valid acked SQL row");
-        assert_eq!(
-            acked.verification_status,
-            DecryptVerificationStatus::Acked
-        );
+        assert_eq!(acked.verification_status, DecryptVerificationStatus::Acked);
         assert_eq!(acked.occurred_at, 0);
     }
 
@@ -625,10 +621,7 @@ mod tests {
             .await
             .expect("load acked row")
             .expect("acked row present");
-        assert_eq!(
-            acked.verification_status,
-            DecryptVerificationStatus::Acked
-        );
+        assert_eq!(acked.verification_status, DecryptVerificationStatus::Acked);
 
         mark_acked(&pool, &row.record_id)
             .await

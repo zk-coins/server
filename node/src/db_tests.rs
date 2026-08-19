@@ -1153,11 +1153,7 @@ async fn insert_block_log_reinsert_backfills_null_block_time_without_overwrite()
     );
 }
 
-async fn insert_block_time_fixture(
-    pool: &sqlx::PgPool,
-    height: u64,
-    block_time: Option<i64>,
-) {
+async fn insert_block_time_fixture(pool: &sqlx::PgPool, height: u64, block_time: Option<i64>) {
     insert_block_log(
         pool,
         &BlockLogEntry {
@@ -1180,7 +1176,10 @@ async fn load_median_time_past_full_eleven_block_window() {
         insert_block_time_fixture(&scope.pool, height, Some(block_time)).await;
     }
 
-    assert_eq!(load_median_time_past(&scope.pool, 100).await.unwrap(), Some(6));
+    assert_eq!(
+        load_median_time_past(&scope.pool, 100).await.unwrap(),
+        Some(6)
+    );
 }
 
 #[tokio::test]
@@ -1191,7 +1190,10 @@ async fn load_median_time_past_truncated_near_genesis_window() {
     }
 
     // Sorted values are [10, 20, 30, 40]; Bitcoin Core selects index len/2.
-    assert_eq!(load_median_time_past(&scope.pool, 3).await.unwrap(), Some(30));
+    assert_eq!(
+        load_median_time_past(&scope.pool, 3).await.unwrap(),
+        Some(30)
+    );
 }
 
 #[tokio::test]
@@ -1237,7 +1239,10 @@ async fn load_median_time_past_sorts_out_of_order_inserts() {
         insert_block_time_fixture(&scope.pool, height, Some(block_time)).await;
     }
 
-    assert_eq!(load_median_time_past(&scope.pool, 100).await.unwrap(), Some(6));
+    assert_eq!(
+        load_median_time_past(&scope.pool, 100).await.unwrap(),
+        Some(6)
+    );
 }
 
 #[tokio::test]
@@ -1250,7 +1255,10 @@ async fn insert_block_log_round_trips_some_and_none_block_time() {
         load_block_time_at_height(&scope.pool, 7).await.unwrap(),
         Some(1_700_000_007)
     );
-    assert_eq!(load_block_time_at_height(&scope.pool, 8).await.unwrap(), None);
+    assert_eq!(
+        load_block_time_at_height(&scope.pool, 8).await.unwrap(),
+        None
+    );
 }
 
 #[tokio::test]

@@ -865,8 +865,7 @@ impl ProverBridge {
                 .with_context(|| format!("received coin {index} creating proof is unacceptable"))?;
         }
         let expected = validate_transition(witness, self.network)?;
-        let partial =
-            assemble_transition_witness(&circuit, witness, &circuit.data.verifier_only)?;
+        let partial = assemble_transition_witness(&circuit, witness, &circuit.data.verifier_only)?;
         let proof = circuit
             .data
             .prove(partial)
@@ -1115,8 +1114,7 @@ fn lock_circuit_slot<T>(
     // cannot leave a partially-written circuit in the protected value.
     // Recovering poison therefore preserves the last complete state and avoids
     // cascading a build-worker panic into the independent reaper thread.
-    slot.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Inspect a slot and install `Building` as one atomic operation. `on_claim`
@@ -1394,9 +1392,9 @@ mod prover_lease_tests {
         // stand-in exercises the same generic slot decision used before the
         // production `compliance_circuit` call; only `Claimed` may enter that
         // dependency-build branch.
-        let slot: &'static Mutex<Option<CircuitSlot<u8>>> = Box::leak(Box::new(Mutex::new(
-            Some(CircuitSlot::Ready(Arc::new(7_u8))),
-        )));
+        let slot: &'static Mutex<Option<CircuitSlot<u8>>> = Box::leak(Box::new(Mutex::new(Some(
+            CircuitSlot::Ready(Arc::new(7_u8)),
+        ))));
         let compliance_builds = AtomicUsize::new(0);
 
         let circuit = match claim_circuit_build(

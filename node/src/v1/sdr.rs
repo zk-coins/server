@@ -715,8 +715,7 @@ pub(crate) async fn publish_sdr_outbox_row(
     for holder in &mat.blob_holders {
         // `now` above belongs to the delivery event. Blossom auth must be
         // timestamped at each actual HTTP upload, not at driver wake-up.
-        let (auth_created_at, auth_expiration) =
-            super::delivery::fresh_blossom_auth_timestamps()?;
+        let (auth_created_at, auth_expiration) = super::delivery::fresh_blossom_auth_timestamps()?;
         let _upload = client
             .upload(
                 holder,
@@ -812,9 +811,7 @@ mod tests {
     use crate::test_db::setup_pool;
     use crate::v1::db_outbox::{self, OutboxKind, OutboxRow, OutboxStatus};
     use crate::v1::db_sdr;
-    use crate::v1::outbox_material::{
-        SdrOutboxMaterial, SdrPhaseAMaterial, SdrPhaseAOutputRef,
-    };
+    use crate::v1::outbox_material::{SdrOutboxMaterial, SdrPhaseAMaterial, SdrPhaseAOutputRef};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1164,14 +1161,10 @@ mod tests {
         pool: &sqlx::PgPool,
         material: &SdrOutboxMaterial,
     ) -> OutboxRow {
-        let outbox_id = crate::v1::delivery::insert_sdr_outbox_pending(
-            pool,
-            [0xA1; 32],
-            [0xA2; 32],
-            material,
-        )
-        .await
-        .expect("insert SDR overlap fixture");
+        let outbox_id =
+            crate::v1::delivery::insert_sdr_outbox_pending(pool, [0xA1; 32], [0xA2; 32], material)
+                .await
+                .expect("insert SDR overlap fixture");
         db_outbox::get_by_id(pool, &outbox_id)
             .await
             .expect("load SDR overlap fixture")
@@ -1363,14 +1356,9 @@ mod tests {
     #[test]
     fn output_ref_from_built_encodes_every_field() {
         let holders = vec!["https://holder.example".to_string()];
-        let got = output_ref_from_built(
-            [0x11; 32],
-            [0x22; 32],
-            [0x33; 32],
-            &[0x44, 0x55],
-            &holders,
-        )
-        .expect("complete output ref");
+        let got =
+            output_ref_from_built([0x11; 32], [0x22; 32], [0x33; 32], &[0x44, 0x55], &holders)
+                .expect("complete output ref");
 
         assert_eq!(got.coin_id_hex, hex::encode([0x11; 32]));
         assert_eq!(got.blob_id_hex, hex::encode([0x22; 32]));
@@ -1396,10 +1384,7 @@ mod tests {
             &["https://holder.example".into()],
         )
         .expect_err("ciphertext is required");
-        assert!(
-            err.to_string().contains("empty out_ciphertext"),
-            "{err:#}"
-        );
+        assert!(err.to_string().contains("empty out_ciphertext"), "{err:#}");
     }
 
     #[test]
@@ -1438,7 +1423,10 @@ mod tests {
 
     #[test]
     fn parse_hex_vec_accepts_empty_input() {
-        assert_eq!(parse_hex_vec("", "field").expect("empty vector"), Vec::<u8>::new());
+        assert_eq!(
+            parse_hex_vec("", "field").expect("empty vector"),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
@@ -1537,16 +1525,9 @@ mod tests {
         };
         let mut rng = StepRng(1);
 
-        let err = try_finalize_one_from_snapshot(
-            &scope.pool,
-            1,
-            &material,
-            None,
-            &mtp,
-            &mut rng,
-        )
-        .await
-        .expect_err("missing classification must fail closed");
+        let err = try_finalize_one_from_snapshot(&scope.pool, 1, &material, None, &mtp, &mut rng)
+            .await
+            .expect_err("missing classification must fail closed");
         assert!(
             err.to_string()
                 .contains("Phase A own_nullifier hex incomplete"),
@@ -1650,16 +1631,10 @@ mod tests {
             None,
         ));
 
-        let err = try_finalize_one_from_snapshot(
-            &scope.pool,
-            8,
-            &material,
-            classify,
-            &mtp,
-            &mut rng,
-        )
-        .await
-        .expect_err("mirror position is required");
+        let err =
+            try_finalize_one_from_snapshot(&scope.pool, 8, &material, classify, &mtp, &mut rng)
+                .await
+                .expect_err("mirror position is required");
         assert!(
             err.to_string().contains("NfLog mirror missing position 7"),
             "{err:#}"
@@ -1713,21 +1688,13 @@ mod tests {
             Some(height),
         ));
 
-        let err = try_finalize_one_from_snapshot(
-            &scope.pool,
-            1,
-            &material,
-            classify,
-            &mtp,
-            &mut rng,
-        )
-        .await
-        .expect_err("BlockAnchor height is u32");
+        let err =
+            try_finalize_one_from_snapshot(&scope.pool, 1, &material, classify, &mtp, &mut rng)
+                .await
+                .expect_err("BlockAnchor height is u32");
         let message = format!("{err:#}");
         assert!(
-            message.contains(&format!(
-                "resolve inclusion block + MTP at height {height}"
-            )),
+            message.contains(&format!("resolve inclusion block + MTP at height {height}")),
             "{message}"
         );
         assert!(message.contains("does not fit u32"), "{message}");
@@ -1887,12 +1854,10 @@ mod tests {
             .await
             .expect("empty queue is not an error");
         assert_eq!(count, 0);
-        assert!(
-            db_sdr::list_awaiting_first_occurrence(&scope.pool)
-                .await
-                .expect("query open Phase A")
-                .is_empty()
-        );
+        assert!(db_sdr::list_awaiting_first_occurrence(&scope.pool)
+            .await
+            .expect("query open Phase A")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1989,7 +1954,10 @@ mod tests {
         match err {
             DeliveryError::Relay(message) => {
                 assert!(message.contains("SDR outbox material decode"), "{message}");
-                assert!(message.contains("decode SdrOutboxMaterial JSON"), "{message}");
+                assert!(
+                    message.contains("decode SdrOutboxMaterial JSON"),
+                    "{message}"
+                );
             }
             other => panic!("expected Relay, got {other:?}"),
         }
@@ -2245,8 +2213,7 @@ mod tests {
         let manifest_store = MockServer::start().await;
         let (recipient_relay, recipient_events) =
             crate::v1::delivery::start_overlap_test_relay(true).await;
-        let (seed_relay, seed_events) =
-            crate::v1::delivery::start_overlap_test_relay(true).await;
+        let (seed_relay, seed_events) = crate::v1::delivery::start_overlap_test_relay(true).await;
         let mut material = sample_sdr_outbox_material();
         material.blob_holders = vec![recipient_store.uri()];
         material.recipient_relays = vec![recipient_relay];
@@ -2273,7 +2240,10 @@ mod tests {
         assert_eq!(published.status, OutboxStatus::Completed);
         let event_id = published.event_id.expect("published SDR event id");
         assert_eq!(
-            recipient_events.lock().expect("recipient events").as_slice(),
+            recipient_events
+                .lock()
+                .expect("recipient events")
+                .as_slice(),
             &[event_id]
         );
         assert_eq!(
@@ -2303,8 +2273,7 @@ mod tests {
         let scope = setup_pool().await;
         let recipient_store = MockServer::start().await;
         let manifest_store = MockServer::start().await;
-        let (recipient_relay, _) =
-            crate::v1::delivery::start_overlap_test_relay(true).await;
+        let (recipient_relay, _) = crate::v1::delivery::start_overlap_test_relay(true).await;
         let mut material = sample_sdr_outbox_material();
         material.blob_holders = vec![recipient_store.uri()];
         material.recipient_relays = vec![recipient_relay];
@@ -2342,10 +2311,8 @@ mod tests {
         let scope = setup_pool().await;
         let recipient_store = MockServer::start().await;
         let manifest_store = MockServer::start().await;
-        let (recipient_relay, _) =
-            crate::v1::delivery::start_overlap_test_relay(true).await;
-        let (seed_relay, _) =
-            crate::v1::delivery::start_overlap_test_relay(false).await;
+        let (recipient_relay, _) = crate::v1::delivery::start_overlap_test_relay(true).await;
+        let (seed_relay, _) = crate::v1::delivery::start_overlap_test_relay(false).await;
         let mut material = sample_sdr_outbox_material();
         material.blob_holders = vec![recipient_store.uri()];
         material.recipient_relays = vec![recipient_relay];

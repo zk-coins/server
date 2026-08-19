@@ -221,8 +221,7 @@ mod tests {
         assert!(debug.contains("Address"));
 
         let encoded = bincode::serialize(&a).expect("bincode serialize Address");
-        let decoded: Address =
-            bincode::deserialize(&encoded).expect("bincode deserialize Address");
+        let decoded: Address = bincode::deserialize(&encoded).expect("bincode deserialize Address");
         assert_eq!(decoded, a);
     }
 
@@ -234,15 +233,8 @@ mod tests {
         balances.insert([0x20; 32], 200u128);
         balances.insert([0x30; 32], 300u128);
         let pubkey = [0xab; 32];
-        let state = AccountState::new(
-            owner,
-            ZERO_HASH,
-            balances.clone(),
-            pubkey,
-            7,
-            ZERO_HASH,
-        )
-        .expect("valid balances must be accepted");
+        let state = AccountState::new(owner, ZERO_HASH, balances.clone(), pubkey, 7, ZERO_HASH)
+            .expect("valid balances must be accepted");
         assert_eq!(state.owner, owner);
         assert_eq!(state.nk_commit, ZERO_HASH);
         assert_eq!(state.balances, balances);
@@ -439,6 +431,9 @@ mod tests {
         assert!(encoded.len() > 32);
         encoded.truncate(encoded.len() - 8);
         let result: Result<SpendRecord, _> = bincode::deserialize(&encoded);
-        assert!(result.is_err(), "truncated SpendRecord must fail deserialize");
+        assert!(
+            result.is_err(),
+            "truncated SpendRecord must fail deserialize"
+        );
     }
 }

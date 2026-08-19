@@ -2338,9 +2338,18 @@ mod tests {
         assert_eq!(KernelNetwork::Testnet.as_str(), "testnet");
         assert_eq!(KernelNetwork::Regtest.as_str(), "regtest");
 
-        assert_eq!(KernelNetwork::from_v1(Network::Mainnet), KernelNetwork::Mainnet);
-        assert_eq!(KernelNetwork::from_v1(Network::Testnet), KernelNetwork::Testnet);
-        assert_eq!(KernelNetwork::from_v1(Network::Regtest), KernelNetwork::Regtest);
+        assert_eq!(
+            KernelNetwork::from_v1(Network::Mainnet),
+            KernelNetwork::Mainnet
+        );
+        assert_eq!(
+            KernelNetwork::from_v1(Network::Testnet),
+            KernelNetwork::Testnet
+        );
+        assert_eq!(
+            KernelNetwork::from_v1(Network::Regtest),
+            KernelNetwork::Regtest
+        );
 
         assert_eq!(
             KernelNetwork::from_wire("mainnet").expect("mainnet wire label"),
@@ -2377,10 +2386,7 @@ mod tests {
     /// Stored catalog rows are copied field-for-field into the chain view model.
     #[test]
     fn catalog_entry_from_stored_preserves_every_field() {
-        let members = vec![
-            (3, [0x31; 32], [0x32; 32]),
-            (7, [0x71; 32], [0x72; 32]),
-        ];
+        let members = vec![(3, [0x31; 32], [0x32; 32]), (7, [0x71; 32], [0x72; 32])];
         let row = crate::v1::db_v1::CatalogInscription {
             height: 987_654,
             tx_index: 123,
@@ -2406,14 +2412,7 @@ mod tests {
     /// Catalog cursors widen both u32 indices without changing their values.
     #[test]
     fn catalog_entry_cursor_widens_indices_exactly() {
-        let entry = catalog_entry(
-            42,
-            u32::MAX - 1,
-            u32::MAX,
-            0,
-            vec![(0, pk(1), r(1))],
-            0x42,
-        );
+        let entry = catalog_entry(42, u32::MAX - 1, u32::MAX, 0, vec![(0, pk(1), r(1))], 0x42);
         assert_eq!(
             entry.cursor(),
             InscriptionCursor {
@@ -2718,10 +2717,7 @@ mod tests {
             KERNEL_PARTS_ENV,
         ];
         let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
-        std::env::set_var(
-            RELAY_URL_ENV,
-            std::ffi::OsStr::from_bytes(&[0xFF, 0xFE]),
-        );
+        std::env::set_var(RELAY_URL_ENV, std::ffi::OsStr::from_bytes(&[0xFF, 0xFE]));
         std::env::set_var(BLOSSOM_URL_ENV, "https://b.example");
         std::env::set_var(MAX_BLOB_BYTES_ENV, "1000");
         std::env::set_var(KERNEL_PARTS_ENV, "scanner,prover");
@@ -2894,21 +2890,9 @@ mod tests {
     #[test]
     fn chain_view_from_accumulator_rejects_size_mirror_mismatch() {
         let acc = NfLogAccumulator::new(0);
-        let mirror = vec![(
-            pos(1, 0, 0, 0),
-            NfLogEntry {
-                pk: pk(1),
-                r: r(1),
-            },
-        )];
-        let err = chain_view_from_accumulator_with_catalog(
-            &acc,
-            1,
-            [0xAB; 32],
-            mirror,
-            Vec::new(),
-        )
-        .expect_err("accumulator and mirror length mismatch must fail");
+        let mirror = vec![(pos(1, 0, 0, 0), NfLogEntry { pk: pk(1), r: r(1) })];
+        let err = chain_view_from_accumulator_with_catalog(&acc, 1, [0xAB; 32], mirror, Vec::new())
+            .expect_err("accumulator and mirror length mismatch must fail");
         let detail = err
             .internal_context
             .as_ref()

@@ -541,12 +541,7 @@ mod tests {
         PublicKey::from_secret_key(secp, &secret_key)
     }
 
-    fn signed_mint_request(
-        name: &str,
-        decimals: u8,
-        amount: u64,
-        timestamp: u64,
-    ) -> MintRequest {
+    fn signed_mint_request(name: &str, decimals: u8, amount: u64, timestamp: u64) -> MintRequest {
         let secp = Secp256k1::new();
         let secret_key = SecretKey::from_slice(&[7u8; 32]).expect("valid creator key");
         let creator_pubkey = PublicKey::from_secret_key(&secp, &secret_key);
@@ -690,12 +685,7 @@ mod tests {
 
     #[test]
     fn validate_send_rejects_timestamp_outside_window() {
-        let request = signed_send_request(
-            &hex::encode([1u8; 32]),
-            &hex::encode([2u8; 32]),
-            100,
-            0,
-        );
+        let request = signed_send_request(&hex::encode([1u8; 32]), &hex::encode([2u8; 32]), 100, 0);
 
         expect_flow_error(
             validate_send_request(&request),
@@ -723,12 +713,7 @@ mod tests {
 
     #[test]
     fn validate_send_rejects_invalid_account_address_hex() {
-        let request = signed_send_request(
-            "not-hex",
-            &hex::encode([2u8; 32]),
-            100,
-            now_secs(),
-        );
+        let request = signed_send_request("not-hex", &hex::encode([2u8; 32]), 100, now_secs());
 
         expect_flow_error(
             validate_send_request(&request),
@@ -739,12 +724,7 @@ mod tests {
 
     #[test]
     fn validate_send_rejects_invalid_recipient_hex() {
-        let request = signed_send_request(
-            &hex::encode([1u8; 32]),
-            "not-hex",
-            100,
-            now_secs(),
-        );
+        let request = signed_send_request(&hex::encode([1u8; 32]), "not-hex", 100, now_secs());
 
         expect_flow_error(
             validate_send_request(&request),
@@ -893,8 +873,7 @@ mod tests {
     #[test]
     fn validate_mint_rejects_invalid_hex_signature() {
         let timestamp = now_secs();
-        let mut request =
-            signed_mint_request("invalid-hex-signature".into(), 8, 42, timestamp);
+        let mut request = signed_mint_request("invalid-hex-signature".into(), 8, 42, timestamp);
         request.signature = "zz-not-hex".to_string();
 
         expect_flow_error(
@@ -927,8 +906,7 @@ mod tests {
     #[test]
     fn validate_mint_rejects_wrong_length_signature() {
         let timestamp = now_secs();
-        let mut request =
-            signed_mint_request("wrong-length-signature".into(), 8, 42, timestamp);
+        let mut request = signed_mint_request("wrong-length-signature".into(), 8, 42, timestamp);
         request.signature = hex::encode([0_u8; 32]);
 
         expect_flow_error(
@@ -988,9 +966,8 @@ mod tests {
     #[test]
     fn validate_send_rejects_timestamp_one_second_past_skew_boundary() {
         let now = now_secs();
-        let timestamp = now.saturating_sub(
-            crate::router::MAX_TIMESTAMP_SKEW_SECS.saturating_add(1),
-        );
+        let timestamp =
+            now.saturating_sub(crate::router::MAX_TIMESTAMP_SKEW_SECS.saturating_add(1));
         let account_address = hex::encode([0x11_u8; 32]);
         let recipient = hex::encode([0x22_u8; 32]);
         let request = signed_send_request(
@@ -1019,9 +996,8 @@ mod tests {
     #[test]
     fn validate_mint_rejects_timestamp_one_second_past_skew_boundary() {
         let now = now_secs();
-        let timestamp = now.saturating_sub(
-            crate::router::MAX_TIMESTAMP_SKEW_SECS.saturating_add(1),
-        );
+        let timestamp =
+            now.saturating_sub(crate::router::MAX_TIMESTAMP_SKEW_SECS.saturating_add(1));
         let request = signed_mint_request("past-skew-boundary".into(), 8, 42, timestamp);
 
         expect_flow_error(
@@ -1070,12 +1046,7 @@ mod tests {
     fn validate_send_returns_decoded_addresses() {
         let account_address = format!("0x{}", hex::encode([1u8; 32]));
         let recipient = format!("0x{}", hex::encode([2u8; 32]));
-        let request = signed_send_request(
-            &account_address,
-            &recipient,
-            100,
-            now_secs(),
-        );
+        let request = signed_send_request(&account_address, &recipient, 100, now_secs());
 
         let (from, to) = validate_send_request(&request).expect("valid send request");
 

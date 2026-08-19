@@ -509,7 +509,9 @@ async fn boot_resume_pending_publishes(
             Ok(publisher) => match resume_all_pending_publishes(adapter, &publisher).await {
                 Ok(0) => tracing::info!("v1.1 resume_all_pending_publishes: nothing pending"),
                 Ok(n) => {
-                    tracing::info!("v1.1 resume_all_pending_publishes: completed {n} pending publish(es)")
+                    tracing::info!(
+                        "v1.1 resume_all_pending_publishes: completed {n} pending publish(es)"
+                    )
                 }
                 Err(e) => {
                     return Err(format!(
@@ -703,7 +705,8 @@ async fn run_v1_scan_loop(
     tracing::info!(
         "v1.1 scanner: connecting bitcoind RPC for AggregateStateNullifierV3 / NfLog \
          (network={:?}, activation_height={})",
-        pins.network, pins.activation_height
+        pins.network,
+        pins.activation_height
     );
 
     // Boot-time pending-publish resume runs in `main` *before* REST bind
@@ -1011,7 +1014,10 @@ async fn run_v1_scan_loop(
             }
             tracing::info!(
                 "v1.1 scanner full-replace applied: tip={} hash={} appended={} dup_ignored={}",
-                tip_height, tip.1, stats.appended, stats.duplicate_ignored
+                tip_height,
+                tip.1,
+                stats.appended,
+                stats.duplicate_ignored
             );
         } else {
             // Gate only: apply_forward_scan owns expansion, coupling, and the
@@ -1048,7 +1054,10 @@ async fn run_v1_scan_loop(
                 if stats.appended > 0 || stats.duplicate_ignored > 0 {
                     tracing::info!(
                         "v1.1 scanner folded: tip={} appended={} dup_ignored={} below_act={}",
-                        tip_height, stats.appended, stats.duplicate_ignored, stats.below_activation
+                        tip_height,
+                        stats.appended,
+                        stats.duplicate_ignored,
+                        stats.below_activation
                     );
                 }
             }

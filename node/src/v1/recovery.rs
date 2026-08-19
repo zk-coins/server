@@ -1752,12 +1752,11 @@ async fn stage_output_ref_inner(
         detail: format!("BlossomClient: {e}"),
     })?;
     let holders = recovery_blob_holders(&oref.blob_locators.holders, blob_stores);
-    let (zbe_ciphertext, _attempts) =
-        fetch_blob_from_holders(&client, &oref.blob_id, &holders)
-            .await
-            .map_err(|e| SdrDiscardReason::FetchFailed {
-                detail: e.to_string(),
-            })?;
+    let (zbe_ciphertext, _attempts) = fetch_blob_from_holders(&client, &oref.blob_id, &holders)
+        .await
+        .map_err(|e| SdrDiscardReason::FetchFailed {
+            detail: e.to_string(),
+        })?;
 
     // 3. ZBE-open under recovered K_tx.
     let plaintext =
@@ -1868,10 +1867,7 @@ pub(crate) struct RecoveryCampaignDeps {
 
 /// Receiver-advertised holders remain preferred; verified manifest stores are
 /// appended as recovery-discoverable fallbacks without retrying duplicate URLs.
-pub(crate) fn recovery_blob_holders(
-    advertised: &[String],
-    blob_stores: &[String],
-) -> Vec<String> {
+pub(crate) fn recovery_blob_holders(advertised: &[String], blob_stores: &[String]) -> Vec<String> {
     let mut holders = Vec::with_capacity(advertised.len() + blob_stores.len());
     for holder in advertised.iter().chain(blob_stores) {
         if !holders.contains(holder) {
@@ -2133,8 +2129,7 @@ pub(crate) async fn run_recovery_campaign(
                         continue;
                     }
                 };
-                let holders =
-                    recovery_blob_holders(&candidate.holders, &deps.blob_stores);
+                let holders = recovery_blob_holders(&candidate.holders, &deps.blob_stores);
                 let zbe_ciphertext =
                     match fetch_blob_from_holders(&client, &candidate.blob_id, &holders).await {
                         Ok((body, _)) => body,
@@ -2723,7 +2718,9 @@ async fn install_and_persist_recovered_head(
 
     if let Err(e) = deps.adapter.persist().await {
         let detail = match deps.adapter.restore_live(pre) {
-            Ok(()) => format!("durable persist of recovered head failed (engine rolled back): {e:#}"),
+            Ok(()) => {
+                format!("durable persist of recovered head failed (engine rolled back): {e:#}")
+            }
             Err(restore_err) => format!(
                 "durable persist of recovered head failed AND engine restore failed \
                  (memory/disk may diverge): persist={e:#}; restore={restore_err:#}"
@@ -2822,11 +2819,7 @@ mod tests {
 
     impl RecoveryEnvRestore {
         fn clear() -> Self {
-            let names = [
-                RECOVERY_ENV,
-                RECOVERY_PAGE_LIMIT_ENV,
-                RECOVERY_EARLIEST_ENV,
-            ];
+            let names = [RECOVERY_ENV, RECOVERY_PAGE_LIMIT_ENV, RECOVERY_EARLIEST_ENV];
             let saved = names
                 .into_iter()
                 .map(|name| (name, std::env::var_os(name)))
@@ -3186,10 +3179,7 @@ mod tests {
         let _restore = RecoveryEnvRestore::clear();
         std::env::set_var(RECOVERY_ENV, "1");
         std::env::set_var(RECOVERY_PAGE_LIMIT_ENV, "25");
-        std::env::set_var(
-            RECOVERY_EARLIEST_ENV,
-            OsString::from_vec(vec![0xff, 0xfe]),
-        );
+        std::env::set_var(RECOVERY_EARLIEST_ENV, OsString::from_vec(vec![0xff, 0xfe]));
 
         assert_eq!(
             recovery_campaign_config_from_env(),
@@ -3914,13 +3904,8 @@ mod tests {
         let first_height = inclusion_height.saturating_sub(10);
         assert_eq!(times.len(), (inclusion_height - first_height + 1) as usize);
         for (height, block_time) in (first_height..=inclusion_height).zip(times.iter().copied()) {
-            insert_sdr_check_block(
-                pool,
-                height,
-                sdr_check_block_hash(height),
-                Some(block_time),
-            )
-            .await;
+            insert_sdr_check_block(pool, height, sdr_check_block_hash(height), Some(block_time))
+                .await;
         }
     }
 
@@ -4037,10 +4022,7 @@ mod tests {
             .expect_err("an incomplete MTP window must discard under §4.2");
         match err {
             SdrDiscardReason::OccurredAtInvalid { detail } => {
-                assert!(
-                    detail.contains("not locally derivable"),
-                    "{detail}"
-                );
+                assert!(detail.contains("not locally derivable"), "{detail}");
             }
             other => panic!("expected OccurredAtInvalid, got {other:?}"),
         }
@@ -4118,13 +4100,7 @@ mod tests {
         // A is initially canonical at height 95, B replaces it, then the scanner
         // re-observes A when the chain returns to the original physical block.
         insert_sdr_check_block(&scope.pool, 95, [0xEE; 32], Some(1_000)).await;
-        insert_sdr_check_block(
-            &scope.pool,
-            95,
-            sdr_check_block_hash(95),
-            Some(6),
-        )
-        .await;
+        insert_sdr_check_block(&scope.pool, 95, sdr_check_block_hash(95), Some(6)).await;
 
         assert_eq!(
             crate::db::load_median_time_past(&scope.pool, 100)
@@ -4552,13 +4528,9 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let out_ciphertext = crate::v1::delivery::out_ciphertext_for_output_ref(
-            &ovk,
-            &epk,
-            &k_tx,
-            &[0x76; 32],
-        )
-        .expect("construct OVK recovery envelope");
+        let out_ciphertext =
+            crate::v1::delivery::out_ciphertext_for_output_ref(&ovk, &epk, &k_tx, &[0x76; 32])
+                .expect("construct OVK recovery envelope");
         let oref = host::OutputRef {
             coin_id: digest_to_bytes(&coin_proof.coin.identifier),
             blob_id,
@@ -4640,13 +4612,9 @@ mod tests {
         }
 
         let k_tx = [0x75; 32];
-        let out_ciphertext = crate::v1::delivery::out_ciphertext_for_output_ref(
-            &ovk,
-            &epk,
-            &k_tx,
-            &[0x76; 32],
-        )
-        .expect("construct valid OVK recovery envelope");
+        let out_ciphertext =
+            crate::v1::delivery::out_ciphertext_for_output_ref(&ovk, &epk, &k_tx, &[0x76; 32])
+                .expect("construct valid OVK recovery envelope");
         let no_holders = host::OutputRef {
             coin_id: [0x77; 32],
             blob_id: [0x78; 32],
@@ -5011,9 +4979,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovered_head_install_handles_existing_accounts_and_index_read_failure() {
-        use crate::v1::separation::{
-            claim_stack_scan_mode, set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::separation::{claim_stack_scan_mode, set_process_stack_mode, ScanStackMode};
 
         let scope = crate::test_db::setup_pool().await;
         set_process_stack_mode(ScanStackMode::V1);
@@ -5119,15 +5085,9 @@ mod tests {
             record: no_op_sdr,
         }];
         let deps = make_deps(vec!["ws://unused.test".into()]);
-        install_and_persist_recovered_head(
-            &deps,
-            &bridge,
-            no_op_subject,
-            &bundle,
-            &no_op_accepted,
-        )
-        .await
-        .expect("an engine account ahead of the recovered head is an idempotent no-op");
+        install_and_persist_recovered_head(&deps, &bridge, no_op_subject, &bundle, &no_op_accepted)
+            .await
+            .expect("an engine account ahead of the recovered head is an idempotent no-op");
         assert_eq!(
             adapter.with_engine(|engine| {
                 engine
@@ -5139,15 +5099,8 @@ mod tests {
             5
         );
 
-        let behind_head_state =
-            sample_account_state_for(behind_subject, behind_nk, behind_pk, 2);
-        let behind_head = sample_sdr_record(
-            2,
-            host::ZERO_HASH,
-            behind_head_state,
-            behind_pk,
-            100,
-        );
+        let behind_head_state = sample_account_state_for(behind_subject, behind_nk, behind_pk, 2);
+        let behind_head = sample_sdr_record(2, host::ZERO_HASH, behind_head_state, behind_pk, 100);
         let behind_accepted = vec![AcceptedSdr {
             blob_id: [0xc2; 32],
             account_state_ash: digest_to_bytes(
@@ -5192,12 +5145,9 @@ mod tests {
         let missing_subject = [0xd1; 32];
         let missing_nk = [0xd2; 32];
         let missing_pk = [0xd3; 32];
-        assert!(adapter
-            .with_engine(|engine| engine.account(&Address(missing_subject)).is_none()));
-        let missing_state =
-            sample_account_state_for(missing_subject, missing_nk, missing_pk, 1);
-        let missing_head =
-            sample_sdr_record(1, host::ZERO_HASH, missing_state, missing_pk, 100);
+        assert!(adapter.with_engine(|engine| engine.account(&Address(missing_subject)).is_none()));
+        let missing_state = sample_account_state_for(missing_subject, missing_nk, missing_pk, 1);
+        let missing_head = sample_sdr_record(1, host::ZERO_HASH, missing_state, missing_pk, 100);
         let missing_accepted = vec![AcceptedSdr {
             blob_id: [0xd4; 32],
             account_state_ash: digest_to_bytes(
@@ -5224,8 +5174,7 @@ mod tests {
             }
             other => panic!("expected IndexLookupFailed, got {other:?}"),
         }
-        assert!(adapter
-            .with_engine(|engine| engine.account(&Address(missing_subject)).is_none()));
+        assert!(adapter.with_engine(|engine| engine.account(&Address(missing_subject)).is_none()));
     }
 
     // -----------------------------------------------------------------------

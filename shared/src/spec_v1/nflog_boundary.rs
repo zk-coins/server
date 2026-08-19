@@ -909,10 +909,7 @@ mod tests {
     #[test]
     fn try_inclusion_wrong_pivot_size_below_3() {
         let r = try_inclusion_wrong_pivot(0, 0, 2);
-        assert!(
-            matches!(r, PivotMutation::Unreachable { .. }),
-            "got {r:?}"
-        );
+        assert!(matches!(r, PivotMutation::Unreachable { .. }), "got {r:?}");
     }
 
     #[test]
@@ -933,7 +930,10 @@ mod tests {
         // m=1 < top_k=2: subproof_honest recurses to m==n==1 with b=true
         // (early left termination, empty residual — line 577 in subproof_honest).
         let w = ref_build_consistency_with_top_pivot(0, 1, 10, 2);
-        assert_eq!(w.proof.len(), consistency_proof_len_with_top_pivot(1, 10, 2));
+        assert_eq!(
+            w.proof.len(),
+            consistency_proof_len_with_top_pivot(1, 10, 2)
+        );
         assert!(!w.proof.is_empty());
     }
 

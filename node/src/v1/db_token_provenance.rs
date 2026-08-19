@@ -90,13 +90,12 @@ pub(crate) async fn insert_token_provenance_in_tx(
         );
     }
 
-    let existing: (Vec<u8>,) = sqlx::query_as(
-        "SELECT issuance_terms FROM token_provenance WHERE asset_id = $1",
-    )
-    .bind(asset_id.as_slice())
-    .fetch_one(&mut **tx)
-    .await
-    .context("token_provenance conflict row disappeared")?;
+    let existing: (Vec<u8>,) =
+        sqlx::query_as("SELECT issuance_terms FROM token_provenance WHERE asset_id = $1")
+            .bind(asset_id.as_slice())
+            .fetch_one(&mut **tx)
+            .await
+            .context("token_provenance conflict row disappeared")?;
     if existing.0 != canonical {
         bail!(
             "token_provenance corruption: asset_id {} already maps to different IssuanceTerms",
@@ -111,13 +110,12 @@ pub(crate) async fn get_token_provenance(
     pool: &PgPool,
     asset_id: &[u8; 32],
 ) -> Result<Option<IssuanceTerms>> {
-    let row: Option<(Vec<u8>,)> = sqlx::query_as(
-        "SELECT issuance_terms FROM token_provenance WHERE asset_id = $1",
-    )
-    .bind(asset_id.as_slice())
-    .fetch_optional(pool)
-    .await
-    .context("token_provenance lookup")?;
+    let row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT issuance_terms FROM token_provenance WHERE asset_id = $1")
+            .bind(asset_id.as_slice())
+            .fetch_optional(pool)
+            .await
+            .context("token_provenance lookup")?;
     row.map(|(canonical,)| {
         deserialize_issuance_terms(&canonical)
             .context("token_provenance stored IssuanceTerms are corrupt")
@@ -130,12 +128,9 @@ mod tests {
     use super::*;
     use crate::test_db::setup_pool;
     use crate::v1::db_decrypt_index::{
-        decrypt_record_id, insert_verified_coin_proof, DecryptIndexRow,
-        DecryptVerificationStatus,
+        decrypt_record_id, insert_verified_coin_proof, DecryptIndexRow, DecryptVerificationStatus,
     };
-    use shared::spec_v1::bundle::{
-        serialize_coin_proof, CoinProof, CreatingNullifier, NavOpening,
-    };
+    use shared::spec_v1::bundle::{serialize_coin_proof, CoinProof, CreatingNullifier, NavOpening};
     use shared::spec_v1::encoding::digest_to_bytes;
     use shared::spec_v1::hashes::{asset_id_v1, asset_id_v2, name_hash};
     use shared::spec_v1::tags::GENESIS_TAG;
@@ -390,7 +385,10 @@ mod tests {
         let err = insert_token_provenance(&scope.pool, &asset_id, &conflicting)
             .await
             .expect_err("different terms under one asset id must fail");
-        assert!(err.to_string().contains("different IssuanceTerms"), "{err:#}");
+        assert!(
+            err.to_string().contains("different IssuanceTerms"),
+            "{err:#}"
+        );
         assert_eq!(
             get_token_provenance(&scope.pool, &asset_id)
                 .await

@@ -685,21 +685,18 @@ impl KernelService {
         &self,
         asset_id: crate::kernel::types::Digest32,
     ) -> KernelResult<IssuanceTerms> {
-        crate::v1::db_token_provenance::get_token_provenance(
-            self.job_store.pool(),
-            &asset_id.0,
-        )
-        .await
-        .map_err(|e| {
-            KernelError::with_internal(
-                KernelErrorCode::InternalError,
-                "Failed to load token provenance",
-                format!("asset_id={}: {e:#}", hex::encode(asset_id.0)),
-            )
-        })?
-        .ok_or_else(|| {
-            KernelError::new(KernelErrorCode::NotFound, "Token provenance not found")
-        })
+        crate::v1::db_token_provenance::get_token_provenance(self.job_store.pool(), &asset_id.0)
+            .await
+            .map_err(|e| {
+                KernelError::with_internal(
+                    KernelErrorCode::InternalError,
+                    "Failed to load token provenance",
+                    format!("asset_id={}: {e:#}", hex::encode(asset_id.0)),
+                )
+            })?
+            .ok_or_else(|| {
+                KernelError::new(KernelErrorCode::NotFound, "Token provenance not found")
+            })
     }
 
     /// `SubscribeReceipts` — server-stream of verified credits for the
@@ -956,10 +953,7 @@ mod tests {
         assert!(service.chain_engine().is_none());
 
         let delivery_targets = Arc::clone(service.delivery_targets());
-        assert!(Arc::ptr_eq(
-            &delivery_targets,
-            service.delivery_targets()
-        ));
+        assert!(Arc::ptr_eq(&delivery_targets, service.delivery_targets()));
 
         let private_record_index = Arc::clone(service.private_record_index());
         assert!(Arc::ptr_eq(

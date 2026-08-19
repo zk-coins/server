@@ -955,8 +955,7 @@ async fn process_delivery_candidate_inner(
     // nullifier between the live-engine check and the durable credit.
     let (row, sql_outcome) = {
         let _write_gate = adapter.lock_writes().await;
-        adapter
-            .with_engine(|engine| verify_coin_proof_for_index(engine, &bridge, &cp, subject))?;
+        adapter.with_engine(|engine| verify_coin_proof_for_index(engine, &bridge, &cp, subject))?;
 
         let asset_id = digest_to_bytes(&cp.coin.asset_id);
         let record_id = decrypt_record_id(subject, &coin_id, &payload.blob_id);
@@ -1229,10 +1228,7 @@ mod tests {
         }
     }
 
-    fn nullifier_entry(
-        pk: [u8; 32],
-        r: [u8; 32],
-    ) -> (host::ChainPosition, host::NfLogEntry) {
+    fn nullifier_entry(pk: [u8; 32], r: [u8; 32]) -> (host::ChainPosition, host::NfLogEntry) {
         (
             host::ChainPosition {
                 height: 0,
@@ -1350,10 +1346,9 @@ mod tests {
 
         let err = verify_creating_nullifier_final(&engine, pk, r)
             .expect_err("an orphaned creating nullifier must remain deferred");
-        assert!(
-            err.to_string()
-                .contains("creating nullifier is not a first-occurrence on receiver NfLog")
-        );
+        assert!(err
+            .to_string()
+            .contains("creating nullifier is not a first-occurrence on receiver NfLog"));
     }
 
     #[test]
@@ -1373,9 +1368,9 @@ mod tests {
 
         let err = verify_creating_nullifier_final(&engine, pk, r_loser)
             .expect_err("a double-spend loser must remain rejected");
-        assert!(err.to_string().contains(
-            "creating Pk is present with a different R (double-spend loser)"
-        ));
+        assert!(err
+            .to_string()
+            .contains("creating Pk is present with a different R (double-spend loser)"));
     }
 
     use super::*;
@@ -1537,16 +1532,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "heavy: real Plonky2 prove; run with --ignored --release"]
     async fn store_and_ack_finality_gate_blocks_credit_until_final() {
-        use crate::kernel::grants::{
-            GrantAssetScope, GrantScope, SCOPE_NOT_AFTER_UNBOUNDED,
-        };
+        use crate::kernel::grants::{GrantAssetScope, GrantScope, SCOPE_NOT_AFTER_UNBOUNDED};
         use crate::v1::delivery::{
             build_coin_delivery, bundle_nav_opening, creating_nullifier_from_parts,
             OutgoingCoinMaterial,
         };
-        use crate::v1::separation::{
-            claim_stack_scan_mode, set_process_stack_mode, ScanStackMode,
-        };
+        use crate::v1::separation::{claim_stack_scan_mode, set_process_stack_mode, ScanStackMode};
         use futures_util::StreamExt as _;
         use shared::spec_v1::datastructures::Address;
         use std::time::Duration;
@@ -1555,9 +1546,7 @@ mod tests {
         use zkcoins_prover::prover_bridge::test_signing::{
             deterministic_secret, normalized_key, sign_transition,
         };
-        use zkcoins_prover::state_engine::{
-            MintRequest, OpSecret, ScannedNullifier, SendRequest,
-        };
+        use zkcoins_prover::state_engine::{MintRequest, OpSecret, ScannedNullifier, SendRequest};
 
         set_process_stack_mode(ScanStackMode::V1);
         let scope = setup_pool().await;
@@ -1568,8 +1557,7 @@ mod tests {
             .await
             .expect("load incoming pipeline engine adapter");
 
-        let alice_nk: [u8; 32] =
-            Sha256::digest(b"zkCoins/v1/incoming-finality/alice-nk").into();
+        let alice_nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/incoming-finality/alice-nk").into();
         let (alice_secret0, alice_public0, alice_pk0) = normalized_key(deterministic_secret(
             b"zkCoins/v1/incoming-finality/alice-sk0",
         ));
@@ -1577,10 +1565,8 @@ mod tests {
             b"zkCoins/v1/incoming-finality/alice-sk1",
         ));
         let alice_owner = Address(host::address(&alice_pk0, host::nk_commit(&alice_nk)));
-        let mint_name_hash =
-            host::name_hash(b"incoming finality asset").expect("mint name hash");
-        let mint_asset_id =
-            host::asset_id_v1(host::GENESIS_TAG, &alice_pk0, &mint_name_hash, 2, 1);
+        let mint_name_hash = host::name_hash(b"incoming finality asset").expect("mint name hash");
+        let mint_asset_id = host::asset_id_v1(host::GENESIS_TAG, &alice_pk0, &mint_name_hash, 2, 1);
         let mint_pending = adapter
             .with_engine(|engine| {
                 engine.begin_mint(MintRequest {
@@ -1645,15 +1631,14 @@ mod tests {
             })
             .expect("prepare final mint anchor");
 
-        let (alice_secret1, alice_public1, alice_pk1_check) = normalized_key(
-            deterministic_secret(b"zkCoins/v1/incoming-finality/alice-sk1"),
-        );
+        let (alice_secret1, alice_public1, alice_pk1_check) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/incoming-finality/alice-sk1",
+        ));
         assert_eq!(alice_pk1_check, alice_pk1);
         let (_, _, alice_pk2) = normalized_key(deterministic_secret(
             b"zkCoins/v1/incoming-finality/alice-sk2",
         ));
-        let bob_nk: [u8; 32] =
-            Sha256::digest(b"zkCoins/v1/incoming-finality/bob-nk").into();
+        let bob_nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/incoming-finality/bob-nk").into();
         let (_, _, bob_pk0) = normalized_key(deterministic_secret(
             b"zkCoins/v1/incoming-finality/bob-sk0",
         ));
@@ -1735,8 +1720,7 @@ mod tests {
             .expect("prepare non-final send anchor");
 
         let blob_store = MockServer::start().await;
-        let (sender_op, _) =
-            pipeline_fixture_sk(b"zkCoins/v1/incoming-finality/sender-op");
+        let (sender_op, _) = pipeline_fixture_sk(b"zkCoins/v1/incoming-finality/sender-op");
         let (recipient_ivk, recipient_ivpk) =
             pipeline_fixture_sk(b"zkCoins/v1/incoming-finality/recipient-ivk");
         let (recipient_op, recipient_op_pk) =
@@ -1767,8 +1751,7 @@ mod tests {
             recipient_relays: vec!["ws://127.0.0.1:9/".into()],
         };
         let now = 1_700_000_000;
-        let mut build_rng =
-            PipelineRng::new(b"zkCoins/v1/incoming-finality/build-delivery");
+        let mut build_rng = PipelineRng::new(b"zkCoins/v1/incoming-finality/build-delivery");
         let built = build_coin_delivery(
             &material,
             &sender_op,
@@ -1779,10 +1762,7 @@ mod tests {
         )
         .expect("build genuine incoming delivery");
         Mock::given(method("GET"))
-            .and(path(format!(
-                "/blossom/{}",
-                hex::encode(built.blob_id)
-            )))
+            .and(path(format!("/blossom/{}", hex::encode(built.blob_id))))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/octet-stream")
@@ -1802,8 +1782,7 @@ mod tests {
                 not_after: SCOPE_NOT_AFTER_UNBOUNDED,
             },
         );
-        let mut first_ack_rng =
-            PipelineRng::new(b"zkCoins/v1/incoming-finality/non-final-ack");
+        let mut first_ack_rng = PipelineRng::new(b"zkCoins/v1/incoming-finality/non-final-ack");
         let first = process_delivery_candidate(
             &built.gift_wrap,
             CandidateSecrets {
@@ -1860,8 +1839,7 @@ mod tests {
         // candidate wait before verification/persist. Removing the F2 gate
         // would let this warmed second attempt complete and credit here.
         let held_write_gate = adapter.lock_writes().await;
-        let mut final_ack_rng =
-            PipelineRng::new(b"zkCoins/v1/incoming-finality/final-ack");
+        let mut final_ack_rng = PipelineRng::new(b"zkCoins/v1/incoming-finality/final-ack");
         let mut final_attempt = Box::pin(process_delivery_candidate(
             &built.gift_wrap,
             CandidateSecrets {

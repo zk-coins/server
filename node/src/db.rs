@@ -423,12 +423,10 @@ pub(crate) async fn load_block_time_at_height(
 
     match block_time.flatten() {
         None => Ok(None),
-        Some(value) if value < 0 => Err(sqlx::Error::Decode(Box::new(
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("negative block_time {value} stored at height {height}"),
-            ),
-        ))),
+        Some(value) if value < 0 => Err(sqlx::Error::Decode(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("negative block_time {value} stored at height {height}"),
+        )))),
         Some(value) => u64::try_from(value)
             .map(Some)
             .map_err(|error| sqlx::Error::Decode(Box::new(error))),
@@ -459,12 +457,10 @@ pub(crate) async fn load_block_time_at_height_in_tx(
 
     match block_time.flatten() {
         None => Ok(None),
-        Some(value) if value < 0 => Err(sqlx::Error::Decode(Box::new(
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("negative block_time {value} stored at height {height}"),
-            ),
-        ))),
+        Some(value) if value < 0 => Err(sqlx::Error::Decode(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("negative block_time {value} stored at height {height}"),
+        )))),
         Some(value) => u64::try_from(value)
             .map(Some)
             .map_err(|error| sqlx::Error::Decode(Box::new(error))),

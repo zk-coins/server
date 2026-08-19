@@ -6427,12 +6427,9 @@ mod jobs_endpoint_tests {
             .await
             .expect("seed v1 retained provenance");
 
-        let req = Request::get(format!(
-            "/v1/token/{}/provenance",
-            hex::encode(asset_id)
-        ))
-        .body(Body::empty())
-        .unwrap();
+        let req = Request::get(format!("/v1/token/{}/provenance", hex::encode(asset_id)))
+            .body(Body::empty())
+            .unwrap();
         let (status, _headers, body) = run(state, req).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
 
@@ -6447,8 +6444,14 @@ mod jobs_endpoint_tests {
         assert_eq!(v["creator_pubkey"], hex::encode(terms.creator_pubkey));
         assert_eq!(v["name"], hex::encode(&terms.name));
         assert_eq!(v["decimals"], terms.decimals);
-        assert!(v.get("cap_total").is_none(), "v1 must omit cap_total: {body}");
-        assert!(v.get("terms_salt").is_none(), "v1 must omit terms_salt: {body}");
+        assert!(
+            v.get("cap_total").is_none(),
+            "v1 must omit cap_total: {body}"
+        );
+        assert!(
+            v.get("terms_salt").is_none(),
+            "v1 must omit terms_salt: {body}"
+        );
 
         let returned_asset_id: [u8; 32] = hex::decode(
             v["asset_id"]
@@ -6490,12 +6493,9 @@ mod jobs_endpoint_tests {
             .await
             .expect("seed v2 retained provenance");
 
-        let req = Request::get(format!(
-            "/v1/token/{}/provenance",
-            hex::encode(asset_id)
-        ))
-        .body(Body::empty())
-        .unwrap();
+        let req = Request::get(format!("/v1/token/{}/provenance", hex::encode(asset_id)))
+            .body(Body::empty())
+            .unwrap();
         let (status, _headers, body) = run(state, req).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
 
@@ -6515,13 +6515,12 @@ mod jobs_endpoint_tests {
             .as_str()
             .expect("v2 cap_total is a decimal string");
         assert_eq!(
-            response_cap.parse::<u128>().expect("v2 cap_total parses as u128"),
+            response_cap
+                .parse::<u128>()
+                .expect("v2 cap_total parses as u128"),
             terms.cap_total.expect("v2 cap")
         );
-        assert_eq!(
-            response_cap,
-            terms.cap_total.expect("v2 cap").to_string()
-        );
+        assert_eq!(response_cap, terms.cap_total.expect("v2 cap").to_string());
         assert_eq!(
             v["terms_salt"],
             hex::encode(terms.terms_salt.expect("v2 salt"))
@@ -6561,12 +6560,9 @@ mod jobs_endpoint_tests {
     async fn token_provenance_unknown_returns_404() {
         let (state, _pool, _scope) = jobs_test_state().await;
         let asset_id = [0xeeu8; 32];
-        let req = Request::get(format!(
-            "/v1/token/{}/provenance",
-            hex::encode(asset_id)
-        ))
-        .body(Body::empty())
-        .unwrap();
+        let req = Request::get(format!("/v1/token/{}/provenance", hex::encode(asset_id)))
+            .body(Body::empty())
+            .unwrap();
         let (status, _headers, body) = run(state, req).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).expect("not-found json");
@@ -6579,20 +6575,16 @@ mod jobs_endpoint_tests {
         let (state, _pool, _scope) = jobs_test_state().await;
 
         for width in [31usize, 33] {
-            let req = Request::get(format!(
-                "/v1/token/{}/provenance",
-                "aa".repeat(width)
-            ))
-            .body(Body::empty())
-            .unwrap();
+            let req = Request::get(format!("/v1/token/{}/provenance", "aa".repeat(width)))
+                .body(Body::empty())
+                .unwrap();
             let (status, _headers, body) = run(state.clone(), req).await;
             assert_eq!(
                 status,
                 StatusCode::BAD_REQUEST,
                 "{width}-byte asset_id body: {body}"
             );
-            let v: serde_json::Value =
-                serde_json::from_str(&body).expect("malformed-request json");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("malformed-request json");
             assert_eq!(v["error"], "malformed_request");
             assert!(v["message"].as_str().is_some(), "missing message: {body}");
         }
@@ -6614,13 +6606,9 @@ mod jobs_endpoint_tests {
             terms_salt: None,
         };
         let held_asset_id = recompute_token_provenance_asset_id(&terms);
-        crate::v1::db_token_provenance::insert_token_provenance(
-            &pool,
-            &held_asset_id,
-            &terms,
-        )
-        .await
-        .expect("seed ungated retained provenance");
+        crate::v1::db_token_provenance::insert_token_provenance(&pool, &held_asset_id, &terms)
+            .await
+            .expect("seed ungated retained provenance");
 
         let held_req = Request::get(format!(
             "/v1/token/{}/provenance",
@@ -6639,7 +6627,10 @@ mod jobs_endpoint_tests {
         );
 
         let unknown_asset_id = [0xfdu8; 32];
-        assert_ne!(unknown_asset_id, held_asset_id, "fixed unknown id collision");
+        assert_ne!(
+            unknown_asset_id, held_asset_id,
+            "fixed unknown id collision"
+        );
         let unknown_req = Request::get(format!(
             "/v1/token/{}/provenance",
             hex::encode(unknown_asset_id)

@@ -1045,15 +1045,9 @@ async fn process_mint(
     };
 
     let mint_terms_stage = async {
-        let ai = pending
-            .witness_wip
-            .asset_issuance
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "begin_v1_mint returned a transition without asset_issuance witness"
-                )
-            })?;
+        let ai = pending.witness_wip.asset_issuance.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("begin_v1_mint returned a transition without asset_issuance witness")
+        })?;
         let issuance_terms = shared::spec_v1::bundle::IssuanceTerms {
             creator_pubkey: ai.creator_pubkey,
             decimals: ai.decimals,
