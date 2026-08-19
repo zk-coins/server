@@ -1353,7 +1353,7 @@ mod tests {
             outcome.displaced_final_count
         );
         assert_eq!(acc.nav().size, 0, "empty-stream: log must be fully cleared");
-        assert!(acc.log.first().is_none());
+        assert!(acc.log.is_empty());
     }
 
     #[test]

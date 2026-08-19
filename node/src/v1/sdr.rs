@@ -28,6 +28,7 @@ use shared::spec_v1::serialize::{
     deserialize_proof_data, parse_account_state, serialize_proof_data,
 };
 use sqlx::PgPool;
+#[cfg(test)]
 use zkcoins_program::circuit::compliance::Network;
 
 use super::adapter::EngineAdapter;
