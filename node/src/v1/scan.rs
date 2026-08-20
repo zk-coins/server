@@ -1419,6 +1419,7 @@ pub fn v1_bitcoind_rpc_from_env() -> Result<(String, std::path::PathBuf)> {
     Ok((rpc_url, std::path::PathBuf::from(cookie)))
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[cfg(test)]
 mod tests {
     use super::*;
