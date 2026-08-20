@@ -419,7 +419,7 @@ jobs:
       # Task #9: four `#[ignore]` prove flows in node+shared that the
       # default nextest (and the llvm-cov step above) never select.
       # They exercise real sequential-history prove paths and a forged
-      # wrapper rejection — minutenlang, self-hosted only:
+      # wrapper rejection — multi-minute, self-hosted only:
       #   - begin_receive_initial_proof_uses_sequential_history_roots
       #   - begin_send_multi_input_uses_sequential_history_roots
       #   - verify_incoming_rejects_forged_wrapper_proof_data_before_verify
