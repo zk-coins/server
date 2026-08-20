@@ -1629,6 +1629,28 @@ pub(crate) async fn insert_block_log(
     Ok(())
 }
 
+/// Fill `block_time` on an existing row without touching `processed_at`.
+///
+/// Height lookups order by `processed_at DESC`. Using [`insert_block_log`]
+/// here would bump `processed_at` and let a NULL-time orphan win the
+/// height after a later COALESCE backfill. Only the timestamp is set, and
+/// only when it is still SQL NULL.
+pub(crate) async fn fill_null_block_time(
+    pool: &PgPool,
+    block_hash: &[u8],
+    block_time: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE block_log SET block_time = $1 \
+         WHERE block_hash = $2 AND block_time IS NULL",
+    )
+    .bind(block_time)
+    .bind(block_hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// One `block_log` row written by the live scan loop (or a test fixture).
 #[derive(Debug, Clone)]
 pub(crate) struct BlockLogEntry {

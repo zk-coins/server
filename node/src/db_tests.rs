@@ -1153,6 +1153,48 @@ async fn insert_block_log_reinsert_backfills_null_block_time_without_overwrite()
     );
 }
 
+#[tokio::test]
+async fn fill_null_block_time_does_not_let_orphan_win_height() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let canonical = BlockLogEntry {
+        block_time: Some(1_700_000_500),
+        block_hash: vec![0xAA; 32],
+        block_height: Some(95),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+    let orphan = BlockLogEntry {
+        block_time: None,
+        block_hash: vec![0xBB; 32],
+        block_height: Some(95),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+    insert_block_log(&pool, &orphan).await.unwrap();
+    insert_block_log(&pool, &canonical).await.unwrap();
+    assert_eq!(
+        load_block_hash_at_height(&pool, 95).await.unwrap(),
+        Some([0xAA; 32]),
+        "canonical re-observation must win the height before backfill"
+    );
+
+    fill_null_block_time(&pool, &orphan.block_hash, 1_700_000_600)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        load_block_hash_at_height(&pool, 95).await.unwrap(),
+        Some([0xAA; 32]),
+        "NULL-time backfill must not bump processed_at and steal the height"
+    );
+    assert_eq!(
+        load_block_time_at_height(&pool, 95).await.unwrap(),
+        Some(1_700_000_500),
+        "height lookup must still read the canonical nTime"
+    );
+}
+
 async fn insert_block_time_fixture(pool: &sqlx::PgPool, height: u64, block_time: Option<i64>) {
     insert_block_log(
         pool,

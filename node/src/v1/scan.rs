@@ -437,8 +437,6 @@ pub fn fetch_bip113_prelude_headers(
 struct NullBlockTimeRow {
     hash: [u8; 32],
     hash_bytes: Vec<u8>,
-    block_height: Option<i64>,
-    inscription_count: i32,
 }
 
 /// Blocking bitcoind nTime lookup for NULL `block_time` rows.
@@ -490,41 +488,34 @@ fn lookup_n_times_for_null_rows(
 /// Backfill `block_log.block_time` where it is still SQL NULL, by hash.
 ///
 /// Looks up header nTime (`time`, never `mediantime`) and writes it through
-/// [`crate::db::insert_block_log`] so ON CONFLICT COALESCE fills NULL without
-/// overwriting a timestamp that is already set. Unknown hashes are skipped;
-/// other RPC errors fail closed. Bitcoind RPC runs on `spawn_blocking`;
-/// only the Postgres read/write stays on the async task.
+/// [`crate::db::fill_null_block_time`] so a NULL timestamp is filled without
+/// bumping `processed_at` (height lookups order by that column; an orphan
+/// must not steal the height). Unknown hashes are skipped; other RPC errors
+/// fail closed. Bitcoind RPC runs on `spawn_blocking`; only the Postgres
+/// read/write stays on the async task.
 pub async fn backfill_null_block_times(
     pool: &sqlx::PgPool,
     rpc_url: &str,
     cookie_path: &Path,
 ) -> Result<()> {
-    let raw_rows: Vec<(Vec<u8>, Option<i64>, i32)> = sqlx::query_as(
-        "SELECT block_hash, block_height, inscription_count \
-         FROM block_log \
-         WHERE block_time IS NULL",
-    )
-    .fetch_all(pool)
-    .await
-    .context("backfill_null_block_times: load NULL block_time rows")?;
+    let raw_rows: Vec<(Vec<u8>,)> =
+        sqlx::query_as("SELECT block_hash FROM block_log WHERE block_time IS NULL")
+            .fetch_all(pool)
+            .await
+            .context("backfill_null_block_times: load NULL block_time rows")?;
     if raw_rows.is_empty() {
         return Ok(());
     }
 
     let mut rows = Vec::with_capacity(raw_rows.len());
-    for (hash_bytes, block_height, inscription_count) in raw_rows {
+    for (hash_bytes,) in raw_rows {
         let hash: [u8; 32] = hash_bytes.as_slice().try_into().map_err(|_| {
             anyhow::anyhow!(
                 "backfill_null_block_times: block_hash length {} is not 32 bytes",
                 hash_bytes.len()
             )
         })?;
-        rows.push(NullBlockTimeRow {
-            hash,
-            hash_bytes,
-            block_height,
-            inscription_count,
-        });
+        rows.push(NullBlockTimeRow { hash, hash_bytes });
     }
 
     let rpc_url = rpc_url.to_string();
@@ -537,18 +528,11 @@ pub async fn backfill_null_block_times(
     .context("backfill_null_block_times: bitcoind lookup")?;
 
     for (row, n_time) in looked_up {
-        let entry = crate::db::BlockLogEntry {
-            block_time: Some(i64::from(n_time)),
-            block_hash: row.hash_bytes,
-            block_height: row.block_height,
-            inscription_count: row.inscription_count,
-            processing_duration_us: None,
-        };
-        crate::db::insert_block_log(pool, &entry)
+        crate::db::fill_null_block_time(pool, &row.hash_bytes, i64::from(n_time))
             .await
             .with_context(|| {
                 format!(
-                    "backfill_null_block_times: insert block_log failed hash={}",
+                    "backfill_null_block_times: fill NULL block_time failed hash={}",
                     hex::encode(row.hash)
                 )
             })?;
