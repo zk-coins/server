@@ -274,6 +274,11 @@ jobs:
       # empty across the repo + CI config; it MUST NEVER be reused on
       # any chain that holds value.
       PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+      # Host-wide proving lease: `compliance_circuit` refuses to
+      # build without ZKCOINS_PROVER_LEASE_PATH (it serialises the
+      # RAM-heavy circuit across processes). The file is created on
+      # first open. `runner.temp` is writable per job.
+      ZKCOINS_PROVER_LEASE_PATH: ${{ runner.temp }}/zkcoins-prover.lease
       # The full suite includes the `db_tests`, which use the
       # `testcontainers` crate to spin up a real Postgres 17 per test
       # against the local Docker daemon. The self-hosted runner runs

@@ -53,8 +53,8 @@ Latest honest run (self-hosted gate, 1800 tests passed, 0 failed):
 | Ignore regex | `_tests\.rs$\|test_db\.rs$\|bin/.*\.rs$\|main\.rs$\|lib\.rs$\|program-plonky2/\|script-plonky2/` |
 | Nextest filter | `not binary(api_remote)` |
 
-Previous measurement (kept for history). **Lines:** the instrumented
-Lines denominator fell (50651 → 41959) and covered lines fell
+Previous measurement (kept for history). **Lines:** the Lines
+denominator fell (50651 → 41959) and covered lines fell
 (39142 → 31577), so the rate moved 77.28 % → 75.26 %. Keeping
 `--fail-under-lines 77` fails that measured rate — a real percentage
 drop, not a false integer fail from corpus growth. Regions 58032 is
