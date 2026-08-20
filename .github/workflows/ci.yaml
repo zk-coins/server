@@ -414,18 +414,18 @@ jobs:
       - name: Run zkcoins-prover-plonky2 release tests
         run: cargo nextest run -p zkcoins-prover-plonky2 --release
 
-      # Task #9: four `#[ignore]` prove flows in node+shared that the
-      # default nextest (and the llvm-cov step above) never select.
-      # They exercise real sequential-history prove paths and a forged
-      # wrapper rejection — multi-minute, self-hosted only:
-      #   - begin_receive_initial_proof_uses_sequential_history_roots
-      #   - begin_send_multi_input_uses_sequential_history_roots
-      #   - verify_incoming_rejects_forged_wrapper_proof_data_before_verify
-      #   - prover_bridge_real_end_to_end
+      # `#[ignore]` prove flows in node+shared that the llvm-cov
+      # nextest step never selects. Real Plonky2 proves — serial
+      # (`--test-threads 1`) because the host-wide proving lease
+      # allows one C residency; parallel waiters hit the 1800 s
+      # flock timeout. Same `api_remote` exclusion as llvm-cov
+      # (that binary talks to the live DEV node).
       - name: Run ignored prove flows (node + shared)
         run: >
           cargo nextest run -p node -p shared --all-features --release
           --run-ignored ignored-only
+          --test-threads 1
+          -E 'not binary(api_remote)'
 
       # §1.7.9 circuit-digest generator: builds real C / C_balance for every
       # network and verifies the committed generated_circuit_digests.txt
@@ -518,7 +518,7 @@ jobs:
   # timeout, OOM, runner crash — still fire the alert. `if: failure()`
   # evaluates against the whole `needs:` group: any listed job
   # transitioning to `failure` triggers it, while skipped jobs
-  # (all jobs on a draft PR) and manual cancellation stay silent.
+  # (drafts without ci / ci:full) and manual cancellation stay silent.
   notify-failure:
     name: Telegram alert on failure
     needs: [lint-and-build, test-and-coverage]
