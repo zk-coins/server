@@ -216,6 +216,7 @@ zkcoins_prover_plonky2::scanner
 zkcoins_prover_plonky2::scanner::BlockScanResult
 zkcoins_prover_plonky2::scanner::BlockScanResult::admitted
 zkcoins_prover_plonky2::scanner::BlockScanResult::block_hash
+zkcoins_prover_plonky2::scanner::BlockScanResult::block_time
 zkcoins_prover_plonky2::scanner::BlockScanResult::duplicate_details
 zkcoins_prover_plonky2::scanner::BlockScanResult::duplicates
 zkcoins_prover_plonky2::scanner::BlockScanResult::height
