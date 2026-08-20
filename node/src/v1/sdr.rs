@@ -51,12 +51,11 @@ pub(crate) const PROVISIONAL_MTP_MAINNET_REFUSED: &str = "PROVISIONAL_MTP_MAINNE
 /// hand.
 pub(crate) const FINALITY_CONFIRMATIONS: u64 = 6;
 
-/// Build the **named provisional** Inclusion/MTP stand-in used until
-/// bitcoind first-occurrence inclusion + BIP-113 MTP is wired.
+/// Test-only Inclusion/MTP stand-in. Production uses `BitcoindInclusionMtp`
+/// on every network (see CONTRIBUTING.md).
 ///
 /// **Fail-closed on mainnet:** provisional tip-hash + wall-clock must never
-/// seal a SelfDeliveryRecord on mainnet. Regtest and testnet may use the
-/// stand-in (still named provisional in logs / docs).
+/// seal a SelfDeliveryRecord on mainnet even in tests.
 #[cfg(test)]
 pub(crate) fn provisional_inclusion_mtp_for_network(
     network: Network,
@@ -71,7 +70,7 @@ pub(crate) fn provisional_inclusion_mtp_for_network(
              required before sealing SelfDeliveryRecordV1"
         ),
         Network::Regtest | Network::Testnet => {
-            // Named provisional — allowed only off mainnet until BitcoindInclusionMtp ships.
+            // Named provisional — tests only; production uses BitcoindInclusionMtp.
             Ok(FixedInclusionMtp {
                 block_hash: tip_hash,
                 occurred_at,
@@ -160,7 +159,7 @@ impl InclusionChainSource for bitcoincore_rpc::Client {
 /// Production Inclusion/MTP source: bitcoind's canonical block hash at the
 /// first-occurrence height plus that block's BIP-113 median-time-past.
 /// Fail-closed on RPC errors, non-final/orphaned headers, height mismatches, or
-/// absent mediantime — never consults the append-only audit log and never
+/// absent mediantime — never consults the durable block_log observations and never
 /// substitutes tip/wall-clock.
 pub(crate) struct BitcoindInclusionMtp<'a> {
     chain: &'a dyn InclusionChainSource,
@@ -899,7 +898,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn bitcoind_inclusion_mtp_recanonicalizes_flipflop_orphan() {
-        // The append-only block_log still contains this later-observed B row,
+        // The durable block_log still contains this later-observed B row,
         // but bitcoind's active chain has flipped back to A at the same height.
         let stale_orphaned_block_log_hash = [0xB2; 32];
         let canonical_internal = [0xA2; 32];

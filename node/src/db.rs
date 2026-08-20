@@ -403,7 +403,7 @@ pub(crate) async fn load_mmr(pool: &PgPool) -> Result<Option<Vec<u8>>, sqlx::Err
 /// unsigned values.
 /// Used from `db_tests` / recovery tests; the live scanner path goes through
 /// [`load_block_time_at_height_in_tx`].
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn load_block_time_at_height(
     pool: &PgPool,
     height: u64,
@@ -476,7 +476,7 @@ pub(crate) async fn load_block_time_at_height_in_tx(
 /// header timestamp.
 /// Used from `db_tests` / recovery tests; the live scanner path goes through
 /// [`load_median_time_past_in_tx`].
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn load_median_time_past(
     pool: &PgPool,
     inclusion_height: u64,
