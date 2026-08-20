@@ -75,7 +75,7 @@ env:
 # Job topology — a two-tier test-gating model:
 #
 # * Tier 1 — `lint-and-build` — GitHub-hosted Linux, the DEFAULT.
-#   Runs on every non-draft PR and every push. Catches cross-platform
+#   Runs on every non-draft PR (no push trigger; see on: above). Catches cross-platform
 #   compile bitrot and lint regressions cheaply. Runs in PARALLEL with
 #   the heavy gate below — it does not gate it via `needs:`. Each job
 #   carries its own draft `if:` guard, so a lint failure does not
@@ -237,7 +237,7 @@ jobs:
       github.event.pull_request.draft == false ||
       contains(toJson(github.event.pull_request.labels.*.name), '"ci"') ||
       contains(toJson(github.event.pull_request.labels.*.name), '"ci:full"')
-    # The registered self-hosted M3 Ultra machines (dfx01, dfx01-2) advertise
+    # The registered self-hosted M3 Ultra machines advertise
     # the `zkcoins-node` pool label, not `m3-ultra` — the old `m3-ultra`
     # requirement matched no online runner, so this gate queued forever. Target
     # the label the runners actually carry.
@@ -303,9 +303,9 @@ jobs:
       # and llvm-cov counts the excluded fns / lines as uncovered,
       # which would drag the measured floor below its true value the
       # moment the first annotation landed in the `node` crate. Set
-      # only on this job: the `lint-and-build` job runs stable
-      # 1.81.0 and would reject `feature(coverage_attribute)`, so the
-      # cfg has no effect there.
+      # only on this job: `lint-and-build` uses the same pinned
+      # toolchain but does not set this cfg, so `coverage(off)` stays
+      # inert there on purpose.
       RUSTFLAGS: "--cfg coverage_nightly"
     steps:
       - name: Checkout
