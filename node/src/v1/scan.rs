@@ -1511,4 +1511,20 @@ mod tests {
             .await
             .expect("empty prelude slice is Ok");
     }
+
+    #[test]
+    fn fetch_bip113_prelude_headers_skips_rpc_when_activation_is_zero() {
+        let headers =
+            fetch_bip113_prelude_headers("http://127.0.0.1:1", Path::new("/nonexistent"), 0)
+                .expect("empty prelude range must not open RPC");
+        assert!(headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backfill_null_block_times_is_ok_when_no_null_rows() {
+        let scope = crate::test_db::setup_pool().await;
+        backfill_null_block_times(&scope.pool, "http://127.0.0.1:1", Path::new("/nonexistent"))
+            .await
+            .expect("no NULL block_time rows must skip RPC");
+    }
 }
