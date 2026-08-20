@@ -399,7 +399,7 @@ jobs:
           cargo llvm-cov nextest --release -p node -p shared --all-features --show-missing-lines \
             --ignore-filename-regex '_tests\.rs$|test_db\.rs$|bin/.*\.rs$|main\.rs$|lib\.rs$|program-plonky2/|script-plonky2/' \
             --fail-under-lines 75 \
-            --fail-under-functions 75 \
+            --fail-under-functions 76 \
             --test-threads 8 \
             -E 'not binary(api_remote)'
 
