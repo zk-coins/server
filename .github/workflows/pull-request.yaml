@@ -80,7 +80,7 @@ env:
 # Job topology — a two-tier test-gating model:
 #
 # * Tier 1 — `lint-and-build` — GitHub-hosted Linux, the DEFAULT.
-#   Runs on every non-draft PR and every push. Catches cross-platform
+#   Runs on every non-draft PR (no push trigger; see on: above). Catches cross-platform
 #   compile bitrot and lint regressions cheaply. Runs in PARALLEL with
 #   the heavy gate below — it does not gate it via `needs:`. Each job
 #   carries its own draft `if:` guard, so a lint failure does not
@@ -520,7 +520,7 @@ jobs:
   # timeout, OOM, runner crash — still fire the alert. `if: failure()`
   # evaluates against the whole `needs:` group: any listed job
   # transitioning to `failure` triggers it, while skipped jobs
-  # (all jobs on a draft PR) and manual cancellation stay silent.
+  # (drafts without ci / ci:full) and manual cancellation stay silent.
   notify-failure:
     name: Telegram alert on failure
     needs: [lint-and-build, test-and-coverage]
