@@ -728,7 +728,7 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
     let mut tx = pool
         .begin()
         .await
-        .map_err(|e| SdrDiscardReason::InclusionBlockMismatch {
+        .map_err(|e| SdrDiscardReason::IndexLookupFailed {
             detail: format!("begin block_log verification snapshot: {e}"),
         })?;
     // REPEATABLE READ = snapshot isolation in Postgres: one MVCC snapshot for
@@ -736,14 +736,14 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
         .await
-        .map_err(|e| SdrDiscardReason::InclusionBlockMismatch {
+        .map_err(|e| SdrDiscardReason::IndexLookupFailed {
             detail: format!("set block_log verification snapshot to REPEATABLE READ: {e}"),
         })?;
 
     let stored_inclusion_hash =
         crate::db::load_block_hash_at_height_in_tx(&mut tx, inclusion_height)
             .await
-            .map_err(|e| SdrDiscardReason::InclusionBlockMismatch {
+            .map_err(|e| SdrDiscardReason::IndexLookupFailed {
                 detail: format!("block_log lookup at inclusion height {inclusion_height}: {e}"),
             })?;
     let Some(stored_inclusion_hash) = stored_inclusion_hash else {
@@ -769,7 +769,7 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
     }
     let mtp = crate::db::load_median_time_past_in_tx(&mut tx, inclusion_height)
         .await
-        .map_err(|e| SdrDiscardReason::OccurredAtInvalid {
+        .map_err(|e| SdrDiscardReason::IndexLookupFailed {
             detail: format!(
                 "block_log lookup for BIP-113 MTP window at inclusion height \
                  {inclusion_height}: {e}"
@@ -806,7 +806,7 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
         u64::from(record.proof_block_anchor.height),
     )
     .await
-    .map_err(|e| SdrDiscardReason::AnchorBoundFailed {
+    .map_err(|e| SdrDiscardReason::IndexLookupFailed {
         detail: format!(
             "block_log lookup at proof_block_anchor height {}: {e}",
             record.proof_block_anchor.height
@@ -825,7 +825,7 @@ pub(crate) async fn verify_sdr_record_checks_v_vi_async(
 
     tx.commit()
         .await
-        .map_err(|e| SdrDiscardReason::InclusionBlockMismatch {
+        .map_err(|e| SdrDiscardReason::IndexLookupFailed {
             detail: format!("commit block_log verification snapshot: {e}"),
         })?;
 
