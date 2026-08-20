@@ -308,9 +308,9 @@ jobs:
       # and llvm-cov counts the excluded fns / lines as uncovered,
       # which would drag the measured floor below its true value the
       # moment the first annotation landed in the `node` crate. Set
-      # only on this job: the `lint-and-build` job runs stable
-      # 1.81.0 and would reject `feature(coverage_attribute)`, so the
-      # cfg has no effect there.
+      # only on this job: `lint-and-build` uses the same pinned
+      # toolchain but does not set this cfg, so `coverage(off)` stays
+      # inert there on purpose.
       RUSTFLAGS: "--cfg coverage_nightly"
     steps:
       - name: Checkout
