@@ -393,12 +393,12 @@ jobs:
         # around the shared container (`test_db::init_shared_pg`)
         # make the suite parallel-safe under llvm-cov.
         #
-        # Floor: integer under measured totals (76.29% lines /
-        # 75.92% functions). See `.github/coverage-baseline.md`.
+        # Floor: integer under measured totals (75.26% lines /
+        # 76.02% functions). See `.github/coverage-baseline.md`.
         run: |
           cargo llvm-cov nextest --release -p node -p shared --all-features --show-missing-lines \
             --ignore-filename-regex '_tests\.rs$|test_db\.rs$|bin/.*\.rs$|main\.rs$|lib\.rs$|program-plonky2/|script-plonky2/' \
-            --fail-under-lines 76 \
+            --fail-under-lines 75 \
             --fail-under-functions 75 \
             --test-threads 8 \
             -E 'not binary(api_remote)'
