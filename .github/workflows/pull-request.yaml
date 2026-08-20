@@ -117,7 +117,7 @@ env:
 #   exclusion) while running the heavy suite once per PR.
 #
 #   The documented hardware target is the M3 Ultra (CONTRIBUTING.md
-#   § "Working on the Plonky2 Migration"). On `ubuntu-latest` the
+#   § "Hardware target"). On `ubuntu-latest` the
 #   full suite repeatedly hit the 75-min timeout (issue #30); on the
 #   M3 Ultra it is ~60-90 min for a Rust change. Moving the gate
 #   into CI rather than the developer's laptop unblocks the developer
@@ -369,12 +369,12 @@ jobs:
         run: docker info > /dev/null
 
       # Host-wide proving lease: `compliance_circuit` refuses to
-      # build without ZKCOINS_PROVER_LEASE_PATH (it serialises the
-      # RAM-heavy circuit across processes). The file is created on
-      # first open. `RUNNER_TEMP` is a step env, not a job-level
-      # `runner` context (that context is invalid under job `env:`).
-      - name: Point the proving lease at a per-job temp file
-        run: echo "ZKCOINS_PROVER_LEASE_PATH=${RUNNER_TEMP}/zkcoins-prover.lease" >> "$GITHUB_ENV"
+      # build without ZKCOINS_PROVER_LEASE_PATH. The flock file lives
+      # under $HOME so concurrent self-hosted agents on the same host
+      # serialise the RAM-heavy circuit (a job-local RUNNER_TEMP path
+      # would not). The file is created on first open.
+      - name: Point the proving lease at the host-wide lock file
+        run: echo "ZKCOINS_PROVER_LEASE_PATH=${HOME}/zkcoins-prover.lease" >> "$GITHUB_ENV"
 
       # `cargo llvm-cov nextest` is the nextest-aware coverage
       # subcommand: collects llvm-cov data while driving the suite
