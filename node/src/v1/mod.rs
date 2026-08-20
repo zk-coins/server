@@ -196,10 +196,11 @@ pub use receive::{
 // error type is re-exported on the facade for `crate::v1::ReconstituteError`.
 pub(crate) use reconstitute::ReconstituteError;
 pub use scan::{
-    apply_canonical_survivors, apply_forward_scan, first_boot_requires_full_replace,
-    folded_keys_from_nflog_mirror, observation_tip_still_live, reconcile_persisted_tip,
-    record_scanned_block_hashes, FoldStats, PersistedTipReconciliation, ResolvedBlock,
-    TipReconcileOutcome,
+    apply_canonical_survivors, apply_forward_scan, backfill_null_block_times,
+    fetch_bip113_prelude_headers, first_boot_requires_full_replace, folded_keys_from_nflog_mirror,
+    observation_tip_still_live, reconcile_persisted_tip, record_bip113_prelude_headers,
+    record_scanned_block_hashes, Bip113PreludeHeader, FoldStats, PersistedTipReconciliation,
+    ResolvedBlock, TipReconcileOutcome,
 };
 /// §4.2 Phase B: binary scan-loop hook after each NfLog fold.
 pub use sdr::finalize_due_phase_b_adapter;

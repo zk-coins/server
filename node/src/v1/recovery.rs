@@ -4027,6 +4027,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sdr_activation_edge_mtp_window_is_accepted_with_prelude() {
+        let scope = crate::test_db::setup_pool().await;
+        for height in 90_u64..100 {
+            insert_sdr_check_block(
+                &scope.pool,
+                height,
+                sdr_check_block_hash(height),
+                Some(height as i64),
+            )
+            .await;
+        }
+        insert_sdr_check_block(&scope.pool, 100, sdr_check_block_hash(100), Some(100)).await;
+        insert_sdr_anchor_if_outside_window(&scope.pool, 100, 50).await;
+        let occurred_at = crate::db::load_median_time_past(&scope.pool, 100)
+            .await
+            .unwrap()
+            .expect("prelude 90-99 plus inclusion 100 must complete the MTP window");
+        let record = sample_sdr_for_async_checks(100, 50, occurred_at);
+
+        verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
+            .await
+            .expect("activation-edge MTP with persisted prelude headers must pass");
+    }
+
+    #[tokio::test]
+    async fn sdr_activation_edge_without_prelude_is_discarded() {
+        let scope = crate::test_db::setup_pool().await;
+        insert_sdr_check_block(&scope.pool, 100, sdr_check_block_hash(100), Some(100)).await;
+        insert_sdr_anchor_if_outside_window(&scope.pool, 100, 50).await;
+        let record = sample_sdr_for_async_checks(100, 50, 100);
+
+        let err = verify_sdr_record_checks_v_vi_async(&scope.pool, 100, &record)
+            .await
+            .expect_err("activation-edge inclusion without prelude must discard");
+        match err {
+            SdrDiscardReason::OccurredAtInvalid { detail } => {
+                assert!(detail.contains("not locally derivable"), "{detail}");
+            }
+            other => panic!("expected OccurredAtInvalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn sdr_zero_occurred_at_is_discarded_when_mtp_window_unavailable() {
         let scope = crate::test_db::setup_pool().await;
         for height in 90_u64..=100 {
