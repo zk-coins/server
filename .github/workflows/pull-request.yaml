@@ -299,19 +299,6 @@ jobs:
       # server only reads SCCACHE_CACHE_SIZE at start, so the install
       # step below restarts it when the running cap differs.
       SCCACHE_CACHE_SIZE: "50G"
-      # Activate the workspace's `coverage_nightly` cfg gate so the
-      # `#[cfg_attr(coverage_nightly, coverage(off))]` annotations
-      # (14× repo-wide, plus the platform-detection helpers in
-      # `node/src/r2_probe.rs`) actually take effect under
-      # `cargo llvm-cov`. cargo-llvm-cov does NOT auto-set this cfg —
-      # without it every `coverage(off)` in the workspace is inert
-      # and llvm-cov counts the excluded fns / lines as uncovered,
-      # which would drag the measured floor below its true value the
-      # moment the first annotation landed in the `node` crate. Set
-      # only on this job: `lint-and-build` uses the same pinned
-      # toolchain but does not set this cfg, so `coverage(off)` stays
-      # inert there on purpose.
-      RUSTFLAGS: "--cfg coverage_nightly"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -397,6 +384,14 @@ jobs:
       # the suite, which covers the in-process axum handlers via
       # oneshot().
       - name: Run llvm-cov nextest (measured coverage floor)
+        # Activate `coverage_nightly` only here: llvm-cov does not
+        # auto-set the cfg, and without it `coverage(off)` is inert.
+        # Later prove steps must not inherit it — the cfg also
+        # compiles `spawn_coverage_flush_signal_handler`, which
+        # references `__llvm_profile_write_file` that only the
+        # llvm-cov profiler runtime provides.
+        env:
+          RUSTFLAGS: "--cfg coverage_nightly"
         # `--test-threads=8` (issue #181 Opt A): the heavy gate is
         # the largest wall consumer on M3 Ultra (~60-90 min at
         # --test-threads=1). 8 outer threads × Rayon-pinned cores
