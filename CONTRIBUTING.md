@@ -175,12 +175,16 @@ mirrored in `.github/workflows/ci.yaml`).
 
 **`#[ignore]` prove flows.** Several multi-minute prove paths are marked
 `#[ignore]` so the default hermetic nextest stays fast. The CI heavy gate
-runs them explicitly with `--run-ignored ignored-only` (node + shared) and
-also verifies live circuit digests against the committed file. Locally:
+runs them explicitly (node + shared) and also verifies live circuit
+digests against the committed file. `--test-threads 1` is required:
+the host-wide proving lease allows one `C` residency, and parallel
+waiters hit the 1800 s flock timeout. `-E 'not binary(api_remote)'`
+is the same live-DEV exclusion as the hermetic llvm-cov step. Locally:
 
 ```bash
 cargo nextest run -p node -p shared --all-features --release \
-  --run-ignored ignored-only
+  --run-ignored ignored-only --test-threads 1 \
+  -E 'not binary(api_remote)'
 ```
 
 ## Code style
@@ -452,7 +456,7 @@ wip
 | Workflow | Trigger | Action |
 |---|---|---|
 | `pull-request.yaml` (live) / `ci.yaml` — **Lint & Build** | Every non-draft PR, or a draft with the `ci` / `ci:full` label | `cargo fmt --check`, clippy (MVP + all-features + program/prover), build, the no-polling grep over `node/src/main.rs` + `node/src/publisher.rs` (same-line `scanner-polling-ok:` opt-out). Fast GitHub-hosted tier. |
-| `pull-request.yaml` (live) / `ci.yaml` — **Tests + Coverage Gate** | Same start rule as Lint & Build | Full `node` + `shared` nextest under `llvm-cov` on the self-hosted M3 Ultra pool, measured coverage floor (see `.github/coverage-baseline.md`), then release-mode `zkcoins-prover-plonky2`, ignored prove flows (`--run-ignored ignored-only`), and circuit-digest verify. |
+| `pull-request.yaml` (live) / `ci.yaml` — **Tests + Coverage Gate** | Same start rule as Lint & Build | Full `node` + `shared` nextest under `llvm-cov` on the self-hosted M3 Ultra pool, measured coverage floor (see `.github/coverage-baseline.md`), then release-mode `zkcoins-prover-plonky2`, ignored prove flows (`--run-ignored ignored-only --test-threads 1`, excluding `api_remote`), and circuit-digest verify. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → `zkcoins/node:beta` → DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → `zkcoins/node:latest` → PRD |
 | `auto-release-pr-staging.yaml` | Push to staging | Promote PR (staging → develop) |
