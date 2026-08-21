@@ -20,6 +20,17 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::test_db::{setup_pool, SchemaScope};
 
+/// Claim the legacy process stack for publisher unit tests.
+///
+/// The claim is monotonic and cannot be withdrawn outside `stack-policy`'s
+/// own `#[cfg(test)]`. Under process-per-test (nextest) the process starts
+/// unclaimed; this re-affirms Legacy so broadcast construction is allowed.
+/// A pre-existing V1 claim panics (fail loud) rather than silently clearing.
+fn ensure_legacy_process_for_publisher_test() {
+    use crate::v1::{set_process_stack_mode, ScanStackMode};
+    set_process_stack_mode(ScanStackMode::Legacy);
+}
+
 /// Test publisher key used to produce deterministic Taproot addresses
 /// and signatures. The production `PUBLISHER_KEY` is now a required env
 /// var with no default (see `lib.rs`); this constant is a local
@@ -367,76 +378,13 @@ async fn get_publisher_utxo_returns_empty_when_total_below_minimum() {
     );
 }
 
-#[tokio::test]
-async fn broadcast_inscription_txs_returns_both_txids_on_success() {
-    let (server, config) = setup_mock_esplora().await;
-    let publisher_address = test_publisher_address(config.network());
-    let outpoints = vec![(fake_outpoint(0), 100_000u64)];
-
-    // Build a real (commit, reveal) pair — broadcast just serialises and
-    // POSTs them, so the txids the function returns are the ones we
-    // computed locally.
-    let (commit_tx, reveal_tx, _stats) = inscription_txs(
-        b"Hello, zkCoins!",
-        &publisher_address,
-        outpoints,
-        TEST_PUBLISHER_KEY,
-        &config,
-    );
-    let expected_commit_txid = commit_tx.compute_txid();
-    let expected_reveal_txid = reveal_tx.compute_txid();
-
-    Mock::given(method("POST"))
-        .and(path("/tx"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(expected_commit_txid.to_string()))
-        .mount(&server)
-        .await;
-
-    let (got_commit, got_reveal) = broadcast_inscription_txs(&config, &commit_tx, &reveal_tx)
-        .await
-        .expect("broadcast should succeed when Esplora accepts both txs");
-
-    assert_eq!(got_commit, expected_commit_txid);
-    assert_eq!(got_reveal, expected_reveal_txid);
-}
-
-#[tokio::test]
-async fn broadcast_inscription_txs_propagates_esplora_error() {
-    let (server, config) = setup_mock_esplora().await;
-    let publisher_address = test_publisher_address(config.network());
-    let outpoints = vec![(fake_outpoint(0), 100_000u64)];
-
-    let (commit_tx, reveal_tx, _stats) = inscription_txs(
-        b"Hello, zkCoins!",
-        &publisher_address,
-        outpoints,
-        TEST_PUBLISHER_KEY,
-        &config,
-    );
-
-    Mock::given(method("POST"))
-        .and(path("/tx"))
-        .respond_with(ResponseTemplate::new(400).set_body_string("sendrawtransaction RPC error"))
-        .mount(&server)
-        .await;
-
-    let err = broadcast_inscription_txs(&config, &commit_tx, &reveal_tx)
-        .await
-        .expect_err("400 from Esplora must bubble up as Err");
-
-    // We don't pin the exact message, but it must be non-empty.
-    assert!(
-        !err.to_string().is_empty(),
-        "error should carry a non-empty message"
-    );
-}
-
 // -----------------------------------------------------------------------------
 // create_and_broadcast_inscription — integration over the mocked HTTP layer
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
 async fn create_and_broadcast_inscription_fails_when_no_utxos() {
+    ensure_legacy_process_for_publisher_test();
     let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
 
@@ -464,6 +412,7 @@ async fn create_and_broadcast_inscription_fails_when_no_utxos() {
 
 #[tokio::test]
 async fn create_and_broadcast_inscription_succeeds_end_to_end_with_mocked_esplora() {
+    ensure_legacy_process_for_publisher_test();
     let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
 
@@ -540,6 +489,11 @@ async fn create_and_broadcast_inscription_succeeds_end_to_end_with_mocked_esplor
 async fn setup_phaseb_pool() -> (PgPool, SchemaScope) {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    // Stage 3 Runde 6: pending_inscriptions writers are gated at the SQL
+    // sink — claim legacy so phase-B seed/resume tests can exercise them.
+    crate::v1::claim_stack_scan_mode(&pool, crate::v1::ScanStackMode::Legacy)
+        .await
+        .expect("claim legacy stack for publisher phase-B tests");
     (pool, scope)
 }
 
@@ -623,6 +577,7 @@ async fn seed_pending_row(
 
 #[tokio::test]
 async fn broadcast_persists_constructed_row_before_commit_broadcast() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
@@ -678,6 +633,7 @@ async fn broadcast_persists_constructed_row_before_commit_broadcast() {
 
 #[tokio::test]
 async fn broadcast_advances_to_commit_broadcast_after_commit_success() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
     let publisher_address = test_publisher_address(config.network());
@@ -743,6 +699,7 @@ async fn broadcast_advances_to_commit_broadcast_after_commit_success() {
 
 #[tokio::test]
 async fn broadcast_advances_to_reveal_broadcast_after_reveal_success() {
+    ensure_legacy_process_for_publisher_test();
     // Phase E: `complete` now means "SMT/MMR contain this inscription's
     // entry", not "reveal landed on chain". The broadcast leg stops at
     // `reveal_broadcast`; the caller (`mint_handler`) advances the row
@@ -791,6 +748,7 @@ async fn broadcast_advances_to_reveal_broadcast_after_reveal_success() {
 
 #[tokio::test]
 async fn resume_from_commit_broadcast_rebroadcasts_reveal_only() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
 
@@ -840,6 +798,7 @@ async fn resume_from_commit_broadcast_rebroadcasts_reveal_only() {
 
 #[tokio::test]
 async fn resume_from_constructed_rebroadcasts_both() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
 
@@ -886,6 +845,7 @@ async fn resume_from_constructed_rebroadcasts_both() {
 
 #[tokio::test]
 async fn resume_skips_complete_rows() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
 
@@ -924,6 +884,7 @@ async fn resume_skips_complete_rows() {
 
 #[tokio::test]
 async fn resume_is_idempotent_when_called_twice() {
+    ensure_legacy_process_for_publisher_test();
     let (pool, _container) = setup_phaseb_pool().await;
     let (server, config) = setup_mock_esplora().await;
 
@@ -1000,6 +961,7 @@ async fn resume_is_idempotent_when_called_twice() {
 
 #[tokio::test]
 async fn resume_tolerates_bad_inputs_error_on_double_spend() {
+    ensure_legacy_process_for_publisher_test();
     // The `constructed` retry case: a previous attempt's commit
     // landed on chain (so the input UTXO is already spent) but we
     // crashed before recording the success. The resumer re-tries
@@ -1089,157 +1051,3 @@ async fn resume_tolerates_bad_inputs_error_on_double_spend() {
 //   3. Scanner-side fallback: an in-progress row (or no row at all)
 //      lets the scanner run `state.update` itself — the recovery /
 //      external-mint path stays intact.
-
-/// `mint_handler_advances_state_synchronously_with_broadcast`:
-/// happy-path broadcast against a real Postgres + mocked Esplora
-/// leaves the row at `reveal_broadcast`, NOT `complete`. The
-/// `complete` advance is the caller's responsibility (Phase E moved
-/// it out of the publisher).
-#[tokio::test]
-async fn mint_handler_advances_state_synchronously_with_broadcast() {
-    let (pool, _container) = setup_phaseb_pool().await;
-    let (server, config) = setup_mock_esplora().await;
-    let publisher_address = test_publisher_address(config.network());
-
-    Mock::given(method("GET"))
-        .and(path(format!("/address/{}/utxo", publisher_address)))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-            {
-                "txid": "3333333333333333333333333333333333333333333333333333333333333333",
-                "vout": 0,
-                "value": 100_000,
-                "status": { "confirmed": true, "block_height": 100, "block_hash": "0000000000000000000000000000000000000000000000000000000000000001", "block_time": 1700000000 }
-            }
-        ])))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/tx"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
-        .mount(&server)
-        .await;
-
-    let (commit_txid, _reveal_txid) = create_and_broadcast_inscription(
-        b"phase-e-1",
-        db::InscriptionKind::Mint,
-        &config,
-        Some(&pool),
-    )
-    .await
-    .expect("happy path must succeed");
-
-    // Publisher leg stopped at `reveal_broadcast` — the `mint_handler`
-    // caller is what flips it to `complete` after running
-    // `state.update`. This is the Phase E load-bearing contract.
-    let commit_txid_bytes = commit_txid.as_byte_array().to_vec();
-    assert_eq!(
-        fetch_pending_status(&pool, &commit_txid_bytes).await,
-        db::PENDING_STATUS_REVEAL_BROADCAST,
-        "Phase E: publisher must stop at reveal_broadcast and let mint_handler advance to complete"
-    );
-
-    // Drive the caller-side advance to `complete` (the mint flow's
-    // post-state.update step) and re-check.
-    db::update_pending_status(&pool, &commit_txid_bytes, db::PENDING_STATUS_COMPLETE)
-        .await
-        .expect("post-state.update advance must succeed");
-    assert_eq!(
-        db::pending_inscription_status_by_commit_txid(&pool, &commit_txid_bytes)
-            .await
-            .expect("lookup must succeed"),
-        Some(db::PENDING_STATUS_COMPLETE.to_string())
-    );
-}
-
-/// `scanner_skips_already_integrated_commit_on_replay`: the scanner-
-/// callback decision used by `main.rs` short-circuits when the
-/// pending row is `complete`. Pairs the DB-level lookup with the
-/// pure-logic predicate so the integration is visible end-to-end
-/// (insert pending → mark complete → lookup → predicate).
-#[tokio::test]
-async fn scanner_skips_already_integrated_commit_on_replay() {
-    let (pool, _container) = setup_phaseb_pool().await;
-    let commit_txid = [0x42u8; 32];
-    let reveal_txid = [0x43u8; 32];
-
-    db::insert_pending_inscription(
-        &pool,
-        &commit_txid,
-        &reveal_txid,
-        db::InscriptionKind::Mint,
-        b"phase-e-2",
-        b"commit-tx-bytes",
-        b"reveal-tx-bytes",
-        12_345,
-    )
-    .await
-    .expect("insert pending");
-    db::update_pending_status(&pool, &commit_txid, db::PENDING_STATUS_COMPLETE)
-        .await
-        .expect("advance to complete");
-
-    let observed = db::pending_inscription_status_by_commit_txid(&pool, &commit_txid)
-        .await
-        .expect("lookup must succeed");
-    assert_eq!(
-        observed.as_deref(),
-        Some(db::PENDING_STATUS_COMPLETE),
-        "fetched status must reflect the mint handler's complete advance"
-    );
-    assert!(
-        crate::scanner::should_skip_scanner_state_update(observed.as_deref()),
-        "scanner must short-circuit state.update for an already-integrated commit"
-    );
-}
-
-/// `scanner_falls_back_to_state_update_for_commits_not_in_pending`:
-/// the recovery / external-mint path. A commit observed on chain that
-/// has no `pending_inscriptions` row (or one still in flight) must
-/// drive the scanner through its normal state.update path.
-#[tokio::test]
-async fn scanner_falls_back_to_state_update_for_commits_not_in_pending() {
-    let (pool, _container) = setup_phaseb_pool().await;
-    let external_txid = [0x99u8; 32];
-
-    // Case 1: no row at all (external / out-of-band inscription).
-    let no_row = db::pending_inscription_status_by_commit_txid(&pool, &external_txid)
-        .await
-        .expect("lookup must not error on missing row");
-    assert!(no_row.is_none());
-    assert!(
-        !crate::scanner::should_skip_scanner_state_update(no_row.as_deref()),
-        "scanner must NOT skip state.update when no pending row exists"
-    );
-
-    // Case 2: row present but the mint flow crashed before marking
-    // complete — status is still `reveal_broadcast`. The scanner is
-    // the recovery path here.
-    let crashed_txid = [0x55u8; 32];
-    let crashed_reveal_txid = [0x56u8; 32];
-    db::insert_pending_inscription(
-        &pool,
-        &crashed_txid,
-        &crashed_reveal_txid,
-        db::InscriptionKind::Send,
-        b"phase-e-3-crashed",
-        b"commit-tx-crashed",
-        b"reveal-tx-crashed",
-        99,
-    )
-    .await
-    .expect("insert pending");
-    db::update_pending_status(&pool, &crashed_txid, db::PENDING_STATUS_REVEAL_BROADCAST)
-        .await
-        .expect("advance to reveal_broadcast");
-    let crashed_status = db::pending_inscription_status_by_commit_txid(&pool, &crashed_txid)
-        .await
-        .expect("lookup must succeed");
-    assert_eq!(
-        crashed_status.as_deref(),
-        Some(db::PENDING_STATUS_REVEAL_BROADCAST)
-    );
-    assert!(
-        !crate::scanner::should_skip_scanner_state_update(crashed_status.as_deref()),
-        "scanner must run state.update when the mint flow stopped before state-advance"
-    );
-}

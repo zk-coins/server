@@ -1,0 +1,5 @@
+error[E0425]: cannot find value `Prover` in crate `zkcoins_prover`
+ --> tests/ui/prover_type_unobtainable.rs:5:29
+  |
+5 |     let _ = zkcoins_prover::Prover;
+  |                             ^^^^^^ not found in `zkcoins_prover`

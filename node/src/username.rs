@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::db;
 use zkcoins_program::hash::digest_from_bytes;
-#[cfg(feature = "username-claim")]
+#[cfg(all(test, feature = "username-claim"))]
 use zkcoins_program::hash::digest_to_bytes;
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -18,7 +18,7 @@ impl UsernameStore {
     /// `load_from_pg`. Kept because every store-touching test
     /// constructs a known-empty store via `new()`.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -107,8 +107,10 @@ impl UsernameStore {
     /// `claim_username_handler` calls the steps directly because it
     /// must not hold a `std::sync::Mutex` guard across the async DB
     /// round-trip.
-    #[cfg(feature = "username-claim")]
-    pub async fn claim(
+    // Test-only convenience wrapper (production uses the handler +
+    // `db::claim_username` steps without holding the mutex across await).
+    #[cfg(all(test, feature = "username-claim"))]
+    pub(crate) async fn claim(
         &mut self,
         pool: &PgPool,
         username: &str,
@@ -132,11 +134,12 @@ impl UsernameStore {
         Ok(())
     }
 
-    pub fn resolve(&self, username: &str) -> Option<Address> {
+    pub(crate) fn resolve(&self, username: &str) -> Option<Address> {
         self.usernames.get(&username.to_lowercase()).copied()
     }
 
-    pub fn get_username(&self, address: &Address) -> Option<&str> {
+    #[cfg(test)]
+    pub(crate) fn get_username(&self, address: &Address) -> Option<&str> {
         self.usernames
             .iter()
             .find(|(_, a)| *a == address)
@@ -167,9 +170,11 @@ impl UsernameStore {
 /// Error type for `UsernameStore::claim`. Wraps the validation error
 /// strings (returned to the API caller as a 4xx body) and any database
 /// error from the underlying `db::claim_username` upsert.
-#[cfg(feature = "username-claim")]
+///
+/// Test-only: production claim path does not use this enum.
+#[cfg(all(test, feature = "username-claim"))]
 #[derive(Debug)]
-pub enum ClaimUsernameError {
+pub(crate) enum ClaimUsernameError {
     /// Caller-fixable input rejection (charset, length, duplicate).
     Validation(&'static str),
     /// The Postgres `INSERT ... ON CONFLICT DO NOTHING` failed for a
@@ -177,7 +182,7 @@ pub enum ClaimUsernameError {
     Db(sqlx::Error),
 }
 
-#[cfg(feature = "username-claim")]
+#[cfg(all(test, feature = "username-claim"))]
 impl std::fmt::Display for ClaimUsernameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -187,7 +192,7 @@ impl std::fmt::Display for ClaimUsernameError {
     }
 }
 
-#[cfg(feature = "username-claim")]
+#[cfg(all(test, feature = "username-claim"))]
 impl std::error::Error for ClaimUsernameError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -197,7 +202,7 @@ impl std::error::Error for ClaimUsernameError {
     }
 }
 
-#[cfg(feature = "username-claim")]
+#[cfg(all(test, feature = "username-claim"))]
 impl From<sqlx::Error> for ClaimUsernameError {
     fn from(e: sqlx::Error) -> Self {
         ClaimUsernameError::Db(e)

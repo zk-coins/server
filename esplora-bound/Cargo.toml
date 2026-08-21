@@ -1,0 +1,14 @@
+[package]
+name = "esplora-bound"
+version.workspace = true
+edition.workspace = true
+description = "Guarded Esplora HTTP wrappers — sole workspace owner of the esplora-client dependency"
+publish = false
+
+[dependencies]
+bitcoin = { workspace = true }
+esplora-client = { git = "https://github.com/BitVM/rust-esplora-client", branch = "master" }
+# Process-stack policy runs inside the broadcast-client constructor so every
+# construction — including from `node` itself — executes the same check.
+# Claim reset is `#[cfg(test)]` of `stack-policy` only (not a feature).
+stack-policy = { path = "../stack-policy" }

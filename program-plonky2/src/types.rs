@@ -12,7 +12,7 @@ use plonky2::hash::hash_types::HashOut;
 use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::plonk::config::Hasher;
 
-use crate::hash::{hash_bytes, HashDigest};
+use crate::hash::{hash_bytes, sha256_to_digest, HashDigest};
 use crate::F;
 
 pub type Amount = u64;
@@ -117,11 +117,13 @@ impl BigArray33 {
 
 impl AccountState {
     /// Create a fresh account from an initial public key and the asset it
-    /// holds. Balance starts at 0; `owner` is derived as
-    /// `hash_bytes(initial_public_key)`.
+    /// holds. Balance starts at 0; `owner` is the protocol address
+    /// `H(Pk₀) = SHA-256(initial_public_key)` (see
+    /// [`crate::hash::sha256_to_digest`]) — the same address the wallet/SDK,
+    /// username-claim and SMT use. (#226)
     pub fn new(initial_public_key: PublicKey, asset_id: AssetId) -> Self {
         AccountState {
-            owner: hash_bytes(&initial_public_key),
+            owner: sha256_to_digest(&initial_public_key),
             balance: 0,
             public_key: initial_public_key,
             asset_id,
@@ -322,7 +324,7 @@ mod tests {
         let aid = test_asset_id();
         let s = AccountState::new(dummy_pubkey(1), aid);
         assert_eq!(s.balance, 0);
-        assert_eq!(s.owner, hash_bytes(&dummy_pubkey(1)));
+        assert_eq!(s.owner, sha256_to_digest(&dummy_pubkey(1)));
         assert_eq!(s.public_key, dummy_pubkey(1));
         assert_eq!(s.asset_id, aid);
     }

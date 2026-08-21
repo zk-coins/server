@@ -1,0 +1,89 @@
+# Kernel-RPC-Abbildung: §7.5 REST → §7.8 `kernel.v1`
+
+Normative Quellen:
+
+- REST: `docs/specification.md` §7.5 / §7.6 / §7.7 (tag `spec-v1.2`)
+- Kernel: `docs/specification.md` §7.8 + `proto/kernel/v1/kernel.proto`
+- Code-Stand: Worktree `node` (Branch `feat/v1-spec-rebuild`)
+
+Spalte **gRPC verdrahtet?** meint die `tonic`-Implementierung in
+`node/src/kernel_rpc.rs` über die transportneutrale Domain-Fassade
+(`node/src/kernel/`). **„Ja“ / transport-mapped** = Domain-Aufruf +
+Proto-Mapping ist verdrahtet; leere/malformed Bodies und fehlende Chain-
+Abhängigkeiten sind **nicht** `Status::unimplemented` (typisch
+`InvalidArgument` / `Internal`). Das ist **nicht** dasselbe wie
+„production happy-path complete“.
+
+**Feature-Gate (Ausnahme, kein Platzhalter):** `SignTransition` lehnt bei
+**inaktivem** V1-Claim (`!v1_sign_route_active()`) absichtlich am gRPC-Rand
+**vor** dem Domain-Aufruf ab — als `Internal` mit `ErrorInfo`
+(`internal_error` / 500, der §7.8-Fallback für eine Bedingung ausserhalb der
+Prozedur-Fehlertabelle; **nie** `Unimplemented`, das keiner der acht
+zulässigen gRPC-Codes ist) — mit Meldung zu `ZKCOINS_V1_SHADOW` /
+`ScanStackMode::V1`, **nicht** dem Text `not yet implemented` unverdrahteter
+Prozeduren. Bei aktivem V1-Claim ist der Pfad domain-mapped. Dieses Gate
+zählt als transport-mapped, nicht als unverdrahteter Stub.
+
+„Nein“ / unmapped würde die **konkret fehlende** Voraussetzung für eine
+ehrliche Verdrahtung nennen (aktuell: kein Kernel-RPC nur als bare
+`Unimplemented`-Stub).
+
+Boot: gRPC startet **nur** aus `start_rest_node` via
+`serve_kernel_grpc_with_domain` mit **geteiltem** Job-Store + Notify-Map
+(Dispatcher). Es gibt keinen pool-only-Public-Boot mit leerer Map.
+
+## Abbildungstabelle
+
+| §7.5 / §7.6 / §7.7 REST | Kernel-Prozedur (§7.8) | Kind | gRPC verdrahtet? | REST / Engine im node |
+|---|---|---|---|---|
+| `GET /` | — (API-lokal; §7.5) | — | — | ja: `router.rs` `root_handler` — Form weicht ab (legacy endpoint map) |
+| `GET /health` | — (API-lokal; §7.5) | — | — | ja: `router.rs` `health_handler` |
+| `GET /health/ready` | `GetInfo` (Teilfeld `ready` / `ready_reason`) | unary | **teilweise** — Domain-`GetInfo` + closed `reason`-Mapping existieren; mit Engine installiert `start_rest_node` eine verifizierte `ChainIdentity` (BMF1 + ops env), ohne Engine/Identity fail-closed `Internal`. REST-JSON ist eigenes Shape | teilweise: `ready_handler` |
+| `GET /v1/info` | `GetInfo` | unary | **teilweise** — Domain-Projektion vorhanden; Production-Boot mit Engine setzt Identity (s. Runtime), ohne sie fail-closed. §7.5-Route noch Legacy `/api/info` | Legacy: `info_handler` (`/api/info`) |
+| `GET /v1/chain/accumulator` | `GetAccumulator` | unary | **ja** — `kernel_rpc::get_accumulator` → live NfLog tip via `ChainView` | intern: `state_engine` tip/nflog, `shared` accumulator |
+| `GET /v1/chain/inscriptions` | `ListInscriptions` | server-stream | **ja** — `kernel_rpc::list_inscriptions` → Domain `list_inscriptions` über `ChainView` + Scanner-Katalog (`v1_inscriptions` / `v1_inscription_members`, gleiches TX wie NfLog-Fold); Member-`state` = Join Katalog × NfLog-Gewinner | Legacy 410: `get_inscription_handler` |
+| `GET /v1/chain/nullifier/<pubkey>` | `GetNullifierPath` | unary | **ja** — Path-B present/absent gegen live Index; Fehler nie als `present: false` | intern: `accumulator::lookup`, `nflog::inclusion_path` |
+| `POST /v1/tx` | `SubmitTransition` | unary | **ja** — Domain-Admit + gRPC-Request-Mapping (mint/send/receive) | Legacy-Admit: `jobs_mint_handler` / `jobs_send_handler`; Engine: `begin_v1_mint` / `begin_v1_send` / `execute_v1_receive` |
+| `GET /v1/jobs/<id>` | `GetJob` | unary | **ja** — `kernel_rpc::get_job` → `DomainKernel::get_job` → `job_to_proto` | ja: `get_job_v1_handler`; Store `JobStore::load` |
+| `GET /v1/jobs/<id>/stream` | `StreamJob` | server-stream | **ja** — `kernel_rpc::stream_job` → `DomainKernel::stream_job` / `JobEventHub` → `job_event_to_proto` (live nur mit shared Notify-Map) | ja: `stream_job_v1_handler` |
+| `POST /v1/jobs/<id>/sign` | `SignTransition` | unary | **ja** — `kernel_rpc::sign_transition` → `DomainKernel::sign_transition` → `job_to_proto` (Width 64/32 am gRPC-Rand). **Feature-Gate am gRPC-Rand** (vor Domäne): bei inaktivem V1-Claim (`!v1_sign_route_active()`) `Internal` mit `ErrorInfo` (`internal_error` / 500) mit Meldung, die `ZKCOINS_V1_SHADOW` / `ScanStackMode::V1` nennt und **nicht** den Text `not yet implemented` der unverdrahteten Prozeduren — analog HTTP `feature_disabled` (kein `KernelErrorCode`) | ja: `jobs_sign_handler` → Flag-Gate `feature_disabled` / 404 → `kernel/jobs/sign`; `accept_wallet_transition_signature` |
+| `POST /v1/jobs/<id>/cancel` | `CancelJob` | unary | **ja** — `kernel_rpc::cancel_job` → `DomainKernel::cancel_job` (`CancelPolicy::NotYetPublished`) → `job_to_proto` | ja: `jobs_cancel_v1_handler` |
+| `POST /v1/pull/challenge` | `OpenPullChallenge` | unary | **ja** — Domain `open_pull_challenge` / `ChallengeStore::issue_pull` (Pull) bzw. `issue` (AttestBalance / IssueViewGrant / Entrust / Revoke). Action-Set: `""`/`pull`, `attest_balance`, `issue_grant`, `entrust`, `revoke` | **nicht vorhanden** (gRPC only heute) |
+| `POST /v1/pull` | `Pull` | unary | **ja** — Domain-Pull (Challenge-Consume + Session-Issue); Authority via Metadata `x-zkcoins-session-authority` (Proto-GAP) | **nicht vorhanden** |
+| `GET /v1/record/<record_id>` | `GetRecord` | unary | **ja** — session-gated Domain; Index process-local/leer bis Katalog | **nicht vorhanden** |
+| `GET /v1/proof/<coin_id>` | `GetCoinProof` | unary | **ja** — session-gated Domain | Legacy 410: `get_proof_handler` |
+| `GET /v1/account/state` | `GetAccountState` | unary | **teilweise** — gRPC + Domain ownership-gated; process-local account index is **not** production-rehydrated (test-only writer today) → live success path incomplete | Engine: `state_engine::account` (rehydration follow-up) |
+| `GET /v1/receipts/stream` | `SubscribeReceipts` | server-stream | **ja** — Domain-Hub nach dual-Persist (§4.8): `v1::incoming` → `publish_credit_if_inserted` → `ReceiptHub`; Filter nach server-seitigem Session-Subjekt + resolved Scope (Ownership **oder** Grant). Rückstau: begrenzter Puffer, lag schliesst den Stream (Pull bleibt Wahrheit). REST-SSE bleibt in `zk-coins/api` | **nicht vorhanden** (gRPC only; REST gehört nach §7.5 in die API-Schicht) |
+| `POST /v1/publish/spendrecord` (§7.6) | `Publish` | unary | **ja** — `kernel_rpc::publish` → `DomainKernel::publish` / `kernel::publish::publish` mit `PublishPolicy` (AcceptFeeLess / DeclineFeeLess). Fee-Felder fail-closed am Transport-Rand; abgelehnter Publish ist erfolgreiche RPC mit `accepted: false` + closed `reason`, kein Transport-Fehler | intern: `v1::publish::publish_v1_batch` (crate-private self-publish); kein §7.6-REST-Endpoint |
+| `POST /v1/bootstrap/challenge` (§7.7) | `OpenPullChallenge` (`action` = entrust/revoke) | unary | **ja** — `entrust`/`revoke` am `OpenPullChallenge`-Rand: Domain `ChallengeStore::issue` mit `ChallengeAction::Entrust` / `Revoke` (eigene Nonce-Maps) | **nicht vorhanden** |
+| `POST /v1/bootstrap/entrust` (§7.7) | `EntrustOperationalBundle` | unary | **ja** — `kernel_rpc::entrust_operational_bundle` → `DomainKernel::entrust_operational_bundle` / `bootstrap::entrust_operational_bundle` (Challenge-Consume + Bundle-Persist, Layout 161 Bytes) | **nicht vorhanden** (gRPC only heute; BundleStore process-local) |
+| `POST /v1/bootstrap/revoke` (§7.7) | `RevokeOperationalBundle` | unary | **ja** — `kernel_rpc::revoke_operational_bundle` → `DomainKernel::revoke_operational_bundle` / `bootstrap::revoke_operational_bundle` (einmaliger Nonce-Consume, Active→Revoked) | **nicht vorhanden** |
+| `POST /v1/attest/balance/challenge` | `OpenPullChallenge` (`action` = `attest_balance`) | unary | **ja** — siehe `OpenPullChallenge` | ja: `attest_balance_challenge_handler` |
+| `POST /v1/attest/balance` | `AttestBalance` | unary | **ja** — Domain-Attest-Fassade + Proto-Mapping | ja: `attest_balance_handler`; `issue_attest_challenge` / `prove_attestation_for_job` |
+| `POST /v1/grants/challenge` | `OpenPullChallenge` (`action` = `issue_grant`) | unary | **ja** — siehe `OpenPullChallenge` | **nicht vorhanden** (gRPC only heute) |
+| `POST /v1/grants` | `IssueViewGrant` | unary | **ja** — Domain-Grant (ohne `op_sk` fail-closed vor Challenge-Consume) | **nicht vorhanden** (gRPC only heute) |
+
+## Blossom (§7.4) — kein Kernel-RPC in §7.8
+
+Die REST-Keys `blossom_get` / `blossom_head` / `blossom_upload` / `blossom_delete` (§7.5 closed endpoint map) laufen über die Blossom-Ebene, nicht über `service Kernel`. Im node: **nicht vorhanden**.
+
+## Zählung: Kernel-Prozeduren
+
+20 Prozeduren in `service Kernel`.
+
+| Kriterium | Prozeduren | Zahl |
+|---|---|---|
+| **gRPC transport-mapped** (Domain + Proto-Handler vorhanden; empty/malformed ≠ bare-`Unimplemented`-Stub; `SignTransition`-Feature-Gate bei inaktivem V1-Claim ist absichtlich und zählt hier mit) | alle 20 in `service Kernel` | **20** |
+| **Production happy-path complete** (persist + rehydrate + restart-tested content) | Teilmenge — siehe Zeilennotizen (`GetAccountState`-Index, process-local private records, …) | **nicht 20** |
+| gRPC bare-`Unimplemented` als einzige Fläche (kein Domain-Aufruf, Platzhalter) | — | **0** |
+
+**Kurzfassung:** Alle **20** Kernel-Prozeduren haben einen gRPC-Handler und Domain-Pfad (kein stummes Platzhalter-`Unimplemented`). Das ist **nicht** dasselbe wie „production-complete“: z. B. `GetAccountState` bleibt ohne rehydrierten Account-Index praktisch fail-closed, private records sind process-local bis SQL-Rehydrate, und einige Surfaces brauchen live Session/Engine. `ListInscriptions` liest den beim Falten geschriebenen Inschriften-Katalog. `SubscribeReceipts` streamt Credits vom `ReceiptHub` nach dual-Persist (`v1::incoming`). `OpenPullChallenge` deckt auch `entrust`/`revoke` ab. `SignTransition` hat ein **API-Rand-Feature-Gate** (`Internal` mit `ErrorInfo` bei inaktivem V1-Claim; mit aktivem Claim domain-mapped). Server-Boot nur über `start_rest_node` + shared Hub + pending-sign-Map + shared Receipt-Hub — kein stummer pool-only-Stream-Pfad.
+
+## API-lokale Endpunkte (explizit ohne Kernel)
+
+| REST | Grund |
+|---|---|
+| `GET /` | §7.5: Listing, API-lokal |
+| `GET /health` | §7.5: Liveness, API-lokal |
+
+`GET /health/ready` ist **nicht** rein API-lokal: §7.8 mappt Readiness über `GetInfo.ready` / `ready_reason`.

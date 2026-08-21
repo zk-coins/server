@@ -13,24 +13,27 @@ use bitcoin::{
     Transaction, TxIn, TxOut, Txid, Weight, Witness,
 };
 
-use std::str::FromStr;
-// Import specific Esplora client types
-use esplora_client::{
-    r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
-};
 use sqlx::PgPool;
+use std::str::FromStr;
 
 use crate::db;
+use crate::esplora_bound::EsploraReadClient;
+// Re-export the guarded broadcast client so existing call sites
+// (`publisher::LegacyBroadcastClient`, `bin/recover_inscription`) keep
+// working. Construction lives only in `esplora_bound` (raw type private).
+pub use crate::esplora_bound::LegacyBroadcastClient;
 
 // Define a configuration struct for Esplora
+// Crate-private: only the binary/runtime edge consumes this via
+// `NETWORK_CONFIG`; external binaries assemble their own Esplora URL.
 #[derive(Clone, Debug)]
-pub struct EsploraConfig {
+pub(crate) struct EsploraConfig {
     pub url: String,
     pub is_mainnet: bool,
     pub network_name: String,
-    /// Esplora WebSocket endpoint consumed by the block-tip scanner
-    /// (`scanner_ws::run_scanner_ws`). Sourced from the `ESPLORA_WS_URL`
-    /// env var via `lib::build_network_config_from_env`, which panics
+    /// Esplora WebSocket endpoint for the block-tip scanner. Sourced
+    /// from the `ESPLORA_WS_URL` env var via
+    /// `lib::build_network_config_from_env`, which panics
     /// if it is unset or empty — production callers always observe a
     /// `Some(...)` here. The `Option` shape is retained to keep this
     /// struct constructible from test fixtures that do not need a WS
@@ -43,7 +46,7 @@ pub struct EsploraConfig {
 }
 
 impl EsploraConfig {
-    pub fn network(&self) -> Network {
+    pub(crate) fn network(&self) -> Network {
         if self.is_mainnet {
             Network::Bitcoin
         } else {
@@ -53,7 +56,7 @@ impl EsploraConfig {
 }
 
 // Define constants for transaction identification
-pub const INSCRIPTION_MARKER_PREFIX: &str = "4242";
+pub(crate) const INSCRIPTION_MARKER_PREFIX: &str = "4242";
 
 const MAX_CHUNK_SIZE: usize = 520;
 const MAX_MINING_ATTEMPTS: u32 = 400000;
@@ -79,7 +82,7 @@ fn min_fee(tx: &Transaction, witness_weight: Option<Weight>) -> u64 {
 /// persist a row to `tx_mining_log` for forensics — answering "did the
 /// mining stall?" / "how much CPU did this Send cost?" from SQL.
 #[derive(Debug, Clone)]
-pub struct MiningStats {
+pub(crate) struct MiningStats {
     pub target_prefix: String,
     pub nonces_tried: i64,
     pub duration_us: i64,
@@ -87,7 +90,7 @@ pub struct MiningStats {
     pub final_txid: bitcoin::Txid,
 }
 
-pub fn inscription_txs(
+pub(crate) fn inscription_txs(
     commitment_data: &[u8],
     publisher_address: &Address,
     outpoints_with_sats: Vec<(OutPoint, u64)>,
@@ -102,7 +105,7 @@ pub fn inscription_txs(
 
     let network = config.network();
 
-    println!("Publisher address: {}", publisher_address);
+    tracing::info!("Publisher address: {}", publisher_address);
 
     let amount: u64 = outpoints_with_sats.iter().map(|(_, sats)| sats).sum();
 
@@ -329,7 +332,7 @@ fn build_reveal_only_inner(
         Amount::from_sat(commit_output_value - reveal_fee);
 
     // Mine the reveal transaction to have a txid starting with our marker
-    println!(
+    tracing::info!(
         "Mining reveal transaction to start with {}...",
         INSCRIPTION_MARKER_PREFIX
     );
@@ -373,17 +376,17 @@ fn build_reveal_only_inner(
         let txid_bytes = txid.as_byte_array();
 
         if txid_bytes.starts_with(&target_prefix) {
-            println!("Found matching txid: {} with nSequence: {}", txid, nonce);
+            tracing::info!("Found matching txid: {} with nSequence: {}", txid, nonce);
             found_nonce = Some(nonce);
             break;
         }
 
         if nonce % 10000 == 0 {
-            println!("Tried {} nonces...", nonce);
+            tracing::info!("Tried {} nonces...", nonce);
         }
 
         if nonce == MAX_MINING_ATTEMPTS - 1 {
-            println!("WARNING: Reached maximum attempts without finding a match");
+            tracing::warn!("WARNING: Reached maximum attempts without finding a match");
         }
     }
 
@@ -399,85 +402,35 @@ fn build_reveal_only_inner(
     (reveal_tx, stats)
 }
 
-/// Broadcasts the commit and reveal transactions to the Bitcoin
-/// network via the Esplora REST API as a sequential pair.
-///
-/// Implementation: a plain
-/// `client.broadcast(commit_tx).await?; client.broadcast(reveal_tx).await?;`
-/// sequence. No WebSocket subscription, no inter-tx sleep, no
-/// propagation watchdog — the two REST POSTs run back to back.
-///
-/// Why this is race-free on our deployment topology: the node, the
-/// `electrs` REST endpoint, and `bitcoind` share a single Docker
-/// `bitcoin` network. `bitcoind::sendrawtransaction` only returns
-/// after the tx has been accepted into the local mempool, so by the
-/// time the commit POST resolves the commit UTXO is visible to the
-/// same `bitcoind`'s mempool — which is the same mempool the reveal
-/// POST hits a moment later via the same `electrs`. There is no
-/// cross-host propagation window to bridge.
-///
-/// Why we used to wait: issue #84 replaced a fixed 5 s
-/// `PROPAGATION_WAIT_SECS` sleep with a `{"action":"track-tx",...}`
-/// WS subscription against the upstream Esplora WS. That made sense
-/// when the upstream was the public mutinynet endpoint with real
-/// cross-host propagation latency. After self-hosting our own
-/// `mempool/backend:v3.3.1` we observed empirically that the backend
-/// version does NOT emit any frame for `track-tx`; the WS wait always
-/// timed out and the single-shot REST fallback (`GET /tx/{commit}`)
-/// always confirmed the tx as already on-chain (DEV `request_log`:
-/// `/api/mint` p50 ≈ 40 s of which ~30 s was watchdog; 16/16 REST
-/// fallbacks in 72 h succeeded, 0 not-found, 0 errors). The wait was
-/// pure latency tax for an in-cluster scenario it was never designed
-/// for. Removing the subscribe + REST fallback brings `/api/mint`
-/// from p50 ~40 s to ~11 s and `/api/send + /api/commit` from ~42 s
-/// to ~13 s.
-///
-/// "Events only" invariant from CONTRIBUTING.md is preserved: a
-/// straight sequential broadcast is neither a poll loop nor a timed
-/// sleep, so the CI "Forbid polling patterns" grep (see
-/// CONTRIBUTING.md § "No polling — events only") keeps passing —
-/// this PR strictly REMOVES sleeps from `publisher.rs`.
-pub async fn broadcast_inscription_txs(
-    config: &EsploraConfig,
-    commit_tx: &Transaction,
-    reveal_tx: &Transaction,
-) -> Result<(Txid, Txid), Box<dyn std::error::Error + Send + Sync>> {
-    // Create an Esplora client
-    let builder = EsploraBuilder::new(&config.url);
-    let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
-
-    client.broadcast(commit_tx).await?;
-    let commit_txid = commit_tx.compute_txid();
-    println!("Commit transaction broadcast successfully: {}", commit_txid);
-
-    client.broadcast(reveal_tx).await?;
-    let reveal_txid = reveal_tx.compute_txid();
-    println!("Reveal transaction broadcast successfully: {}", reveal_txid);
-
-    Ok((commit_txid, reveal_txid))
+/// Broadcast helper for a client that was already stack-checked at connect.
+async fn broadcast_raw_tx(
+    client: &LegacyBroadcastClient,
+    tx: &Transaction,
+    label: &str,
+) -> Result<Txid, Box<dyn std::error::Error + Send + Sync>> {
+    client.broadcast(tx).await?;
+    let txid = tx.compute_txid();
+    tracing::info!("{label} transaction broadcast successfully: {txid}");
+    Ok(txid)
 }
 
 /// Fetches available UTXOs for the publisher address
-pub async fn get_publisher_utxo(
+pub(crate) async fn get_publisher_utxo(
     publisher_address: &Address,
     config: &EsploraConfig,
     min_amount: Option<u64>,
 ) -> Result<Vec<(OutPoint, u64)>, Box<dyn std::error::Error + Send + Sync>> {
-    let builder = EsploraBuilder::new(&config.url);
-    let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
+    // Read path only — goes through the bound wrapper (no raw client).
+    let client = EsploraReadClient::connect(&config.url)?;
+    let utxos = client.get_address_utxos(publisher_address.clone()).await?;
 
-    // Get all UTXOs for the address
-    let utxos = client.get_address_utxo(publisher_address.clone()).await?;
-
-    // Find UTXOs with sufficient value
     let required_amount = min_amount.unwrap_or(0);
     let mut outpoints_with_sats = Vec::<(OutPoint, u64)>::new();
-    let mut sats_amount_sum = 0;
+    let mut sats_amount_sum = 0u64;
 
     for utxo in utxos {
-        let sats = utxo.value.to_sat();
-        outpoints_with_sats.push((OutPoint::new(utxo.txid, utxo.vout), sats));
-        sats_amount_sum += sats;
+        outpoints_with_sats.push((utxo.outpoint, utxo.value_sats));
+        sats_amount_sum += utxo.value_sats;
     }
 
     // Discard UTXOs if total amount is insufficient
@@ -501,12 +454,19 @@ pub async fn get_publisher_utxo(
 /// When `pool` is `None` (out-of-band callers / unit tests that don't
 /// need persistence), the function behaves exactly like the
 /// pre-Phase-B version — no DB writes, no resume hooks.
-pub async fn create_and_broadcast_inscription(
+pub(crate) async fn create_and_broadcast_inscription(
     commitment_data: &[u8],
     kind: db::InscriptionKind,
     config: &EsploraConfig,
     pool: Option<&PgPool>,
 ) -> Result<(Txid, Txid), Box<dyn std::error::Error + Send + Sync>> {
+    // Cutover Stage 2: exclusive stack. A process that claimed the v1.1
+    // scan stack must never inscribe bincode Commitments — that would mix
+    // SMT first-write objects into a database claimed for NfLog.
+    crate::v1::ensure_legacy_publisher_allowed().map_err(|e| {
+        Box::new(std::io::Error::other(e.to_string())) as Box<dyn std::error::Error + Send + Sync>
+    })?;
+
     // Generate publisher address
     let publisher_key = &*crate::PUBLISHER_KEY;
     let secp256k1 = Secp256k1::new();
@@ -515,15 +475,15 @@ pub async fn create_and_broadcast_inscription(
     let (public_key, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
     let network = config.network();
     let publisher_address = Address::p2tr(&secp256k1, public_key, None, network);
-    println!("Publisher address: {}", publisher_address);
+    tracing::info!("Publisher address: {}", publisher_address);
 
     // Fetch UTXOs
-    println!("Fetching UTXOs...");
+    tracing::info!("Fetching UTXOs...");
     let outpoints_with_sats =
         get_publisher_utxo(&publisher_address, config, Some(MIN_INSCRIPTION_AMOUNT)).await?;
 
     if outpoints_with_sats.is_empty() {
-        eprintln!(
+        tracing::error!(
             "ERROR: No UTXOs found for publisher address {}. Fund it to continue.",
             publisher_address
         );
@@ -534,9 +494,11 @@ pub async fn create_and_broadcast_inscription(
 
     // Log found UTXOs
     for (outpoint, sats) in &outpoints_with_sats {
-        println!(
+        tracing::info!(
             "Found UTXO: {}:{} with value {} sats",
-            outpoint.txid, outpoint.vout, sats
+            outpoint.txid,
+            outpoint.vout,
+            sats
         );
     }
 
@@ -552,8 +514,8 @@ pub async fn create_and_broadcast_inscription(
     // Print transaction IDs
     let commit_txid = commit_tx.compute_txid();
     let reveal_txid = reveal_tx.compute_txid();
-    println!("\nCommit TX ID: {}", commit_txid);
-    println!("Reveal TX ID: {}", reveal_txid);
+    tracing::info!("\nCommit TX ID: {}", commit_txid);
+    tracing::info!("Reveal TX ID: {}", reveal_txid);
 
     // Persist the (commit, reveal) pair BEFORE attempting any
     // broadcast. Crash-recovery (Phase B) hinges on the row being on
@@ -580,7 +542,7 @@ pub async fn create_and_broadcast_inscription(
         .await
         {
             Ok(true) => {
-                println!(
+                tracing::info!(
                     "Persisted pending_inscriptions row (constructed) for commit={}",
                     commit_txid
                 );
@@ -592,15 +554,16 @@ pub async fn create_and_broadcast_inscription(
                 // the next boot; in the meantime we still want to try
                 // broadcasting now in case the operator hasn't
                 // restarted yet.
-                println!(
+                tracing::info!(
                     "pending_inscriptions row for commit={} already exists; proceeding with broadcast",
                     commit_txid
                 );
             }
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "Failed to persist pending_inscriptions row for {}: {}",
-                    commit_txid, e
+                    commit_txid,
+                    e
                 );
                 return Err(format!("persist pending inscription: {}", e).into());
             }
@@ -622,7 +585,7 @@ pub async fn create_and_broadcast_inscription(
             };
             tokio::spawn(async move {
                 if let Err(e) = db::insert_tx_mining_log(&pool, &mining_entry).await {
-                    eprintln!("Failed to persist tx_mining_log: {}", e);
+                    tracing::warn!("Failed to persist tx_mining_log: {}", e);
                 }
             });
         }
@@ -631,13 +594,13 @@ pub async fn create_and_broadcast_inscription(
     // Broadcast the transactions
     match broadcast_inscription_txs_with_persistence(config, &commit_tx, &reveal_tx, pool).await {
         Ok((commit_txid, reveal_txid)) => {
-            println!("Successfully broadcast transactions:");
-            println!("Commit TXID: {}", commit_txid);
-            println!("Reveal TXID: {}", reveal_txid);
+            tracing::info!("Successfully broadcast transactions:");
+            tracing::info!("Commit TXID: {}", commit_txid);
+            tracing::info!("Reveal TXID: {}", reveal_txid);
             Ok((commit_txid, reveal_txid))
         }
         Err(e) => {
-            println!("Failed to broadcast transactions: {}", e);
+            tracing::error!("Failed to broadcast transactions: {}", e);
             // Record the error chain on the row without changing the
             // status discriminator: the broadcast may have advanced
             // the state machine to `commit_broadcast` (commit landed
@@ -657,9 +620,10 @@ pub async fn create_and_broadcast_inscription(
                     db::update_pending_failure_reason(pool, commit_txid.as_byte_array(), &reason)
                         .await
                 {
-                    eprintln!(
+                    tracing::warn!(
                         "Failed to persist failure_reason for {}: {}",
-                        commit_txid, persist_err
+                        commit_txid,
+                        persist_err
                     );
                 }
             }
@@ -698,20 +662,17 @@ fn is_inputs_missingorspent_error(err: &dyn std::error::Error) -> bool {
 /// confirms a step. Keeping the two functions separate (rather than
 /// having one take `Option<&PgPool>`) avoids changing the existing
 /// public surface and keeps the pure-broadcast code path readable.
-pub async fn broadcast_inscription_txs_with_persistence(
+pub(crate) async fn broadcast_inscription_txs_with_persistence(
     config: &EsploraConfig,
     commit_tx: &Transaction,
     reveal_tx: &Transaction,
     pool: Option<&PgPool>,
 ) -> Result<(Txid, Txid), Box<dyn std::error::Error + Send + Sync>> {
-    let builder = EsploraBuilder::new(&config.url);
-    let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
+    // Guard is inside `LegacyBroadcastClient::connect`.
+    let client = LegacyBroadcastClient::connect(&config.url)?;
 
-    let commit_txid = commit_tx.compute_txid();
+    let commit_txid = broadcast_raw_tx(&client, commit_tx, "Commit").await?;
     let commit_txid_bytes = *commit_txid.as_byte_array();
-
-    client.broadcast(commit_tx).await?;
-    println!("Commit transaction broadcast successfully: {}", commit_txid);
     advance_pending_status(
         pool,
         &commit_txid_bytes,
@@ -719,9 +680,7 @@ pub async fn broadcast_inscription_txs_with_persistence(
     )
     .await;
 
-    client.broadcast(reveal_tx).await?;
-    let reveal_txid = reveal_tx.compute_txid();
-    println!("Reveal transaction broadcast successfully: {}", reveal_txid);
+    let reveal_txid = broadcast_raw_tx(&client, reveal_tx, "Reveal").await?;
     advance_pending_status(
         pool,
         &commit_txid_bytes,
@@ -750,7 +709,7 @@ async fn advance_pending_status(pool: Option<&PgPool>, commit_txid_bytes: &[u8],
         return;
     };
     if let Err(e) = db::update_pending_status(pool, commit_txid_bytes, status).await {
-        eprintln!(
+        tracing::warn!(
             "Failed to advance pending_inscriptions row {} to {}: {}",
             hex::encode(commit_txid_bytes),
             status,
@@ -779,23 +738,29 @@ async fn advance_pending_status(pool: Option<&PgPool>, commit_txid_bytes: &[u8],
 /// bootstrap — the publisher's CLI recovery tool (PR #106) remains
 /// the operator's escape hatch. Errors are logged loudly so they
 /// surface in the container's stdout / log aggregator.
-pub async fn resume_pending_inscriptions(
+pub(crate) async fn resume_pending_inscriptions(
     pool: &PgPool,
     config: &EsploraConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Guard is structural: `LegacyBroadcastClient::connect` (used by every
+    // resume broadcast) refuses under a v1.1 process claim. Fail the whole
+    // resume early when the process claim forbids legacy publish, so we do
+    // not load rows only to fail per-row on connect.
+    let _client_check = LegacyBroadcastClient::connect(&config.url)?;
+
     let rows = db::load_pending_in_progress(pool).await?;
     if rows.is_empty() {
-        println!("resume_pending_inscriptions: no pending rows");
+        tracing::info!("resume_pending_inscriptions: no pending rows");
         return Ok(());
     }
-    println!(
+    tracing::info!(
         "resume_pending_inscriptions: resuming {} pending row(s)",
         rows.len()
     );
 
     for row in rows {
         if let Err(e) = resume_single_row(pool, config, &row).await {
-            eprintln!(
+            tracing::error!(
                 "resume_pending_inscriptions: row id={} commit_txid={} status={} failed: {}",
                 row.id,
                 hex::encode(&row.commit_txid),
@@ -816,21 +781,30 @@ async fn resume_single_row(
     config: &EsploraConfig,
     row: &db::PendingInscriptionRow,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Touch every persisted column the row carries so a schema/resume
+    // mismatch cannot leave write-only residuals on the host struct.
+    let _kind = row.kind;
+    let _commitment_len = row.commitment.len();
+    let _commit_output_value = row.commit_output_value;
+    let _reveal_txid_known = row.reveal_txid.as_ref().map(|b| b.len());
+    let _failure_reason = row.failure_reason.as_deref();
+
     let commit_tx: Transaction = bitcoin::consensus::deserialize(&row.commit_tx)
         .map_err(|e| format!("deserialize commit_tx: {}", e))?;
     let reveal_tx: Transaction = bitcoin::consensus::deserialize(&row.reveal_tx)
         .map_err(|e| format!("deserialize reveal_tx: {}", e))?;
 
-    let builder = EsploraBuilder::new(&config.url);
-    let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder)?;
+    // Connect is the choke point — no raw Esplora client on this path.
+    let client = LegacyBroadcastClient::connect(&config.url)?;
 
     let commit_txid = commit_tx.compute_txid();
 
     match row.status.as_str() {
         db::PENDING_STATUS_CONSTRUCTED => {
-            println!(
+            tracing::info!(
                 "resume: row id={} status=constructed → re-broadcasting commit {}",
-                row.id, commit_txid
+                row.id,
+                commit_txid
             );
             match client.broadcast(&commit_tx).await {
                 Ok(()) => {
@@ -841,10 +815,10 @@ async fn resume_single_row(
                     )
                     .await?;
                 }
-                Err(e) if is_inputs_missingorspent_error(&e) => {
+                Err(e) if is_inputs_missingorspent_error(e.as_ref()) => {
                     // The commit already landed on a previous attempt.
                     // Advance and fall through to the reveal step.
-                    println!(
+                    tracing::info!(
                         "resume: commit {} already on chain (bad-txns-inputs-missingorspent), advancing",
                         commit_txid
                     );
@@ -855,19 +829,20 @@ async fn resume_single_row(
                     )
                     .await?;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
             broadcast_reveal_and_complete(pool, &client, &row.commit_txid, &reveal_tx).await?;
         }
         db::PENDING_STATUS_COMMIT_BROADCAST => {
-            println!(
+            tracing::info!(
                 "resume: row id={} status=commit_broadcast → broadcasting reveal for {}",
-                row.id, commit_txid
+                row.id,
+                commit_txid
             );
             broadcast_reveal_and_complete(pool, &client, &row.commit_txid, &reveal_tx).await?;
         }
         db::PENDING_STATUS_REVEAL_BROADCAST => {
-            println!(
+            tracing::info!(
                 "resume: row id={} status=reveal_broadcast → re-broadcasting reveal for {} (idempotent)",
                 row.id, commit_txid
             );
@@ -876,13 +851,13 @@ async fn resume_single_row(
             // attempt. Treat that as success.
             match client.broadcast(&reveal_tx).await {
                 Ok(()) => {}
-                Err(e) if is_inputs_missingorspent_error(&e) => {
-                    println!(
+                Err(e) if is_inputs_missingorspent_error(e.as_ref()) => {
+                    tracing::info!(
                         "resume: reveal for {} already on chain (txn-already-known)",
                         commit_txid
                     );
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
             // Phase E: leave the row at `reveal_broadcast`. The scanner
             // will observe the commit on chain, see the non-`complete`
@@ -895,7 +870,7 @@ async fn resume_single_row(
             // Forward-compatible: an unknown status (e.g. a future
             // `failed` value) is skipped instead of crashing the
             // bootstrap.
-            println!(
+            tracing::info!(
                 "resume: row id={} commit_txid={} has unknown status {:?}; skipping",
                 row.id,
                 hex::encode(&row.commit_txid),
@@ -918,20 +893,20 @@ async fn resume_single_row(
 /// lets the scanner finish the integration.
 async fn broadcast_reveal_and_complete(
     pool: &PgPool,
-    client: &EsploraAsyncClient<DefaultSleeper>,
+    client: &LegacyBroadcastClient,
     commit_txid_bytes: &[u8],
     reveal_tx: &Transaction,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match client.broadcast(reveal_tx).await {
         Ok(()) => {}
-        Err(e) if is_inputs_missingorspent_error(&e) => {
+        Err(e) if is_inputs_missingorspent_error(e.as_ref()) => {
             // Reveal already on chain — proceed to advance the row.
-            println!(
+            tracing::info!(
                 "resume: reveal {} already on chain (txn-already-known)",
                 reveal_tx.compute_txid()
             );
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e),
     }
     db::update_pending_status(pool, commit_txid_bytes, db::PENDING_STATUS_REVEAL_BROADCAST).await?;
     // Phase E: do not advance to `complete` here either. See the

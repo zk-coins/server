@@ -20,17 +20,18 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use node::account_node;
 use node::db;
-use node::publisher::EsploraConfig;
-use node::runtime::start_rest_node;
-use node::scanner_runtime::scan_for_inscriptions;
-use node::scanner_ws::{run_scanner_ws, ScannerWsConfig};
+use node::kernel_rpc;
+use node::runtime::{
+    boot_requires_prover_lease, require_chain_identity_ops_from_env, start_rest_node,
+    RestNodeConfig, V1Readiness,
+};
 use node::state::State;
 use node::username;
-use node::{persist_state_from_sync_context, DATABASE_URL, NETWORK_CONFIG};
-use shared::commitment::Commitment;
+use node::v1::{self, ScanStackMode, V1ShadowMode};
+use node::DATABASE_URL;
 use std::error::Error as StdError;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
 
 // Postgres state-layer carries every persistent slice of node state
 // after PR-A3: SMT / MMR / latest_block (PR-A2), accounts + usernames
@@ -45,9 +46,6 @@ const ACCOUNT_NODE_ADDR: &str = "0.0.0.0:4242";
 
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
-use esplora_client::{
-    r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
-};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn StdError>> {
@@ -80,16 +78,39 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // harness — does not panic the bootstrap.
     //
     // Partial-migration subscriber: routes `tracing::*` calls through fmt+EnvFilter.
-    // Many call sites in this crate still use `println!`/`eprintln!` (see TODO in
-    // scanner_ws.rs:11). Those continue to write directly to stdout/stderr and are
-    // not affected by RUST_LOG. The 4xx-validation paths in router.rs and
-    // account_node.rs are the first wave of the migration.
+    // Many call sites in this crate still use `println!`/`eprintln!`. Those continue
+    // to write directly to stdout/stderr and are not affected by RUST_LOG. The
+    // 4xx-validation paths in router.rs and account_node.rs are the first wave of
+    // the migration.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(false)
         .try_init();
+
+    // Fail-loud on the kernel gRPC bind address before any expensive
+    // bootstrap work. `KERNEL_GRPC_ADDR` has no default host/port
+    // (same posture as `DATABASE_URL` / `PUBLISHER_KEY`). The listener
+    // itself is spawned later next to the REST router.
+    let kernel_grpc_addr = kernel_rpc::kernel_grpc_addr_from_env().unwrap_or_else(|e| {
+        panic!("{e}");
+    });
+
+    // GetInfo operational pins (relay / blossom / max_blob_bytes /
+    // kernel_parts): required, no defaults — same posture as the gRPC
+    // addr. Missing variable names itself. A complete ChainIdentity also
+    // needs a verified §4.3 BootstrapManifest (`ZKCOINS_V1_BOOTSTRAP_MANIFEST_PATH`);
+    // that load + identity install fails closed in `start_rest_node` before
+    // any listener binds when the exclusive v1 engine is present.
+    require_chain_identity_ops_from_env().unwrap_or_else(|e| {
+        panic!("{e}");
+    });
+    if boot_requires_prover_lease().unwrap_or_else(|e| panic!("{e}")) {
+        zkcoins_prover::prover_bridge::validate_prover_lease_path_at_boot().expect(
+            "ZKCOINS_PROVER_LEASE_PATH must name an openable host-wide lease file for a prove-capable boot",
+        );
+    }
 
     // Open the Postgres pool and run pending migrations BEFORE any
     // state load — `connect_and_migrate` is idempotent (sqlx tracks
@@ -101,107 +122,288 @@ async fn main() -> Result<(), Box<dyn StdError>> {
             .await
             .expect("connect and migrate database"),
     );
-    println!("Connected to Postgres state-layer");
+    tracing::info!("Connected to Postgres state-layer");
+    node::v1::backfill_token_provenance_from_decrypt_index(&pool)
+        .await
+        .expect("backfill token provenance from v1 decrypt index");
 
-    // Build the Plonky2 prover ONCE, up front. Its
-    // `circuit_digest_bytes` drives the boot-time self-heal below, and
-    // the same instance is reused by the `AccountNode` rehydration so we
-    // pay the ~14 s circuit build exactly once.
-    let prover = zkcoins_prover::Prover::new();
-    let live_digest = prover.circuit_digest_bytes();
-    println!("Built Plonky2 prover (circuit ready)");
+    // Cutover Stage 3 — **atomic default switch**.
+    //
+    // The production binary always claims the exclusive v1 stack
+    // (AggregateStateNullifierV3 → NfLog). There is no dual-stack
+    // fall-back to the legacy Commitment/SMT scanner or to
+    // `Prover::new()` / `circuit::main`. Missing §3.6 pins fail loud.
+    //
+    // `ZKCOINS_V1_SHADOW=off` is refused at the binary edge: Stage 3
+    // makes the legacy prover unreachable from this path, not merely
+    // unused. Legacy code remains in the tree for Stage 4 deletion and
+    // for unit tests that construct `AccountNode::new()` explicitly.
+    let shadow_mode = v1::mode::v1_shadow_mode_from_env().unwrap_or_else(|e| {
+        panic!("{e}");
+    });
+    match shadow_mode {
+        V1ShadowMode::On => {}
+        V1ShadowMode::Off => {
+            panic!(
+                "Stage 3 binary refuses the legacy dual stack \
+                 (ZKCOINS_V1_SHADOW unset/empty/off). Set ZKCOINS_V1_SHADOW=1 \
+                 and the §3.6 pin env vars. Rollback after cutover requires a \
+                 pre-cutover DB restore — not a flag flip (wallets may already \
+                 have published v1 nullifiers)."
+            );
+        }
+    }
 
-    // Load existing state from Postgres (PR-A2). When SMT/MMR rows are
-    // absent (fresh DB), `load_from_pg` returns an empty State —
-    // equivalent to the previous file-based `State::new()` fallback.
+    // Exclusive claim before any NfLog write.
+    v1::enforce_stack_scan_mode(&pool, ScanStackMode::V1)
+        .await
+        .expect("v1 stack separation gate");
+    tracing::info!(
+        "Stage 3 v1 stack: AggregateStateNullifierV3 publisher + NfLog scanner; \
+         prove path = StateEngine / ProverBridge (legacy Prover::new is not on \
+         the binary path)"
+    );
+    // §3.6 pins must be installed before ANY circuit C build — including the
+    // ledger-load `last_proof` bind inside `EngineAdapter::load_or_create_from_env`
+    // — so `ProverBridge::ensure_proving_identity` is armed for both roles.
+    let pins = v1::mode::v1_boot_pins_from_env().expect("v1 pins re-read after adapter boot");
+    zkcoins_prover::prover_bridge::ProverBridge::install_network_pins(
+        pins.network,
+        pins.network_params.circuit_digest_c(),
+        pins.network_params.circuit_digest_c_balance(),
+    )
+    .expect(
+        "install §3.6 circuit pins before any circuit build (ledger load or \
+         first prove) so every build is checked against the pinned digest — \
+         a boot that cannot arm the identity gate must fail loudly",
+    );
+
+    // Verifier-cache role: read now (before the ledger load below), not at
+    // its historical later position. A Secondary must have BOTH circuit-
+    // identity gates satisfied from its shared cache before
+    // `EngineAdapter::load_or_create_from_env` runs: that load's per-account
+    // `bind_loaded_prev_proof` → `ProverBridge::ensure_proving_identity` path
+    // builds whichever circuit is not yet marked ready — on a Secondary with
+    // ledger history and the marks installed only afterward (this block's
+    // previous position), that meant building the ~90-100 GiB `C` from
+    // scratch during boot, defeating the cache entirely. The cache-verified
+    // C_balance digest is captured below and reused by the live-digest
+    // role-match after the load so the cache files are each read exactly
+    // once (never twice).
+    let verifier_cache_role = v1::verifier_cache_role_from_env().unwrap_or_else(|e| {
+        panic!("{e}");
+    });
+    let secondary_cached_balance_digest: Option<[u8; 32]> = match verifier_cache_role {
+        v1::VerifierCacheRole::Primary => None,
+        v1::VerifierCacheRole::Secondary => {
+            let verifier_cache_dir = std::env::var("ZKCOINS_VERIFIER_CACHE_DIR").expect(
+                "ZKCOINS_VERIFIER_CACHE_DIR must be set — a boot that cannot persist its trust anchor must fail loudly",
+            );
+            let balance_blob_hash =
+                zkcoins_prover::verifier_cache::balance_verifier_blob_hash_for_network(
+                    pins.network,
+                )
+                .expect(
+                    "§3.6 full-VerifierCircuitData blob-hash pin for C_balance on this \
+                         network must be generated (see \
+                         script-plonky2::verifier_cache::print_canonical_verifier_blob_hash) \
+                         before a secondary can trust the shared cache — refusing a \
+                         partially-pinned cache load",
+                );
+            let cached = zkcoins_prover::verifier_cache::load_balance_verifier_cache_checked(
+                pins.network,
+                std::path::Path::new(&verifier_cache_dir),
+                &pins.network_params.circuit_digest_c_balance(),
+                &balance_blob_hash,
+            )
+            .expect(
+                "secondary boot: shared C_balance verifier cache at ZKCOINS_VERIFIER_CACHE_DIR \
+                 must already exist (written by a primary boot) and pass the §3.6 pin check — \
+                 secondary never builds C_balance (at boot or at prove time; identity is \
+                 satisfied from this cache-verified digest)",
+            );
+            let balance_digest = cached.balance_circuit_digest_bytes();
+            // Cache load already recomputed C_balance's digest and checked it
+            // against the pin; mark the balance identity gate BEFORE the
+            // ledger load below so its last_proof bind never rebuilds it.
+            zkcoins_prover::prover_bridge::ProverBridge::mark_balance_identity_verified_from_cache(
+                pins.network,
+                balance_digest,
+            )
+            .expect(
+                "mark C_balance identity verified from the loaded cache so the secondary satisfies \
+                 the balance gate without rebuilding C_balance (2^18, the lighter circuit — C at \
+                 2^21 is the ~90-100 GiB one; the analogous cache for C is loaded right below)",
+            );
+            let compliance_blob_hash =
+                zkcoins_prover::verifier_cache::compliance_verifier_blob_hash_for_network(
+                    pins.network,
+                )
+                .expect(
+                    "§3.6 full-VerifierCircuitData blob-hash pin for C on this network must be \
+                     generated (see \
+                     script-plonky2::verifier_cache::print_canonical_verifier_blob_hash) before a \
+                     secondary can trust the shared cache — refusing a partially-pinned cache load",
+                );
+            let cached_c = zkcoins_prover::verifier_cache::load_compliance_verifier_cache_checked(
+                pins.network,
+                std::path::Path::new(&verifier_cache_dir),
+                &pins.network_params.circuit_digest_c(),
+                &compliance_blob_hash,
+            )
+            .expect(
+                "secondary boot: shared C verifier cache at ZKCOINS_VERIFIER_CACHE_DIR must \
+                 already exist (written by a primary boot) and pass the §3.6 pin check — \
+                 secondary never builds C (at boot, at prove time, or at verify time; \
+                 verify_transition uses this cache-verified verifier data instead)",
+            );
+            let cached_c_digest = cached_c.compliance_circuit_digest_bytes();
+            // Mark BEFORE the ledger load below so its last_proof bind
+            // (`bind_loaded_prev_proof` → `bind_prev_proof_identity` →
+            // `ensure_proving_identity`) never rebuilds the ~1.38M-gate C.
+            zkcoins_prover::prover_bridge::ProverBridge::mark_compliance_verifier_from_cache(
+                pins.network,
+                cached_c_digest,
+                cached_c.into_verifier_data(),
+            )
+            .expect(
+                "mark C identity verified from the loaded cache so verify_transition uses the \
+                 cached verifier without ever rebuilding the ~1.38M-gate (2^21) circuit",
+            );
+            Some(balance_digest)
+        }
+    };
+
+    let v1_adapter = Arc::new(
+        node::v1::EngineAdapter::load_or_create_from_env((*pool).clone())
+            .await
+            .expect("v1 EngineAdapter bootstrap"),
+    );
+    tracing::info!(
+        "v1 EngineAdapter ready (network={:?}, activation_height={})",
+        v1_adapter.network(),
+        v1_adapter.activation_height()
+    );
+
+    // Stage 3: do **not** call `Prover::new()`. The legacy AccountNode
+    // ledger is still rehydrated for residual balance/history REST, but
+    // without a legacy circuit. Prove work is Engine/Bridge only.
     let state = Arc::new(Mutex::new(
         State::load_from_pg(&pool)
             .await
             .expect("load state from Postgres"),
     ));
-    println!("Loaded State from Postgres");
+    tracing::info!("Loaded State from Postgres (residual SMT/MMR tables; v1 uses NfLog)");
 
-    // Reload AccountNode + UsernameStore from Postgres. The matching
-    // file-based loaders from PR-A1/A2 are gone — these two calls are
-    // the single source of truth after PR-A3. A DB error here aborts
-    // the bootstrap (same reasoning as the State load above). The
-    // pre-built `prover` is moved in here so the circuit is built once.
-    let account_node = account_node::AccountNode::load_from_pg(Arc::clone(&state), &pool, prover)
+    let account_node = account_node::AccountNode::load_ledger_from_pg(Arc::clone(&state), &pool)
         .await
-        .expect("load account node from Postgres");
-    println!("Loaded AccountNode from Postgres");
+        .expect("load account node ledger from Postgres (no legacy Prover)");
+    tracing::info!("Loaded AccountNode ledger (no Prover::new)");
 
-    // Self-heal on a breaking circuit change. A circuit change makes
-    // every persisted proof incompatible with the current circuit; the
-    // next AccountUpdate send/mint would fail to prove ("prove failed").
-    // The check runs AFTER the state + account load so the canary
-    // detector (used on the adoption boundary, when no digest is
-    // recorded yet) can recurse a persisted proof through the live
-    // circuit with the REAL commitment-merkle witnesses from the loaded
-    // state — a `circuit_digest` comparison and `Prover::verify` both
-    // miss the failure class where the digest is unchanged but recursion
-    // breaks (verified against the live DEV dump). On a mismatch / stale
-    // probe this resets the proof-dependent state to genesis (the same
-    // consistent tabula rasa as `reset-zkcoins-node`) and stores the new
-    // digest, so no future circuit change can brick DEV/PRD and no
-    // manual reset is needed. A DB error aborts the bootstrap (serving
-    // with half-reset state is worse than failing loudly); proof-store
-    // cleanup failures are logged and swallowed inside the helper.
+    // Self-heal: digest = tagged §1.7.1 `C || C_balance` of the circuits
+    // just built through ProverBridge; canary = v1 structural / slow path.
+    // On mismatch this uses the G5 generation fence (`reset_v1_proof_dependent_state_tx`):
+    // bump `self_heal_reset_meta.generation`, fail non-terminal jobs (leave
+    // their `reset_generation` behind the live epoch), wipe v1 proof state.
+    // Jobs in flight across the reset cannot advance (generation CAS).
     let proofs_dir = std::env::var("PROOFS_DIR").unwrap_or_else(|_| "./proofs".to_string());
 
-    // The canary recurses a persisted proof through the live circuit's
-    // AccountUpdate branch. The §8(b)/(c) state-continuity constraints
-    // fix the witnessed account-state pubkey to the key the producing
-    // transition rotated TO (== the NEXT transition's `public_key`).
-    //
-    // Neutral model (Milestone 2): there is NO server-held minting key,
-    // so the node cannot derive any account's current key. The resolver
-    // therefore returns `None` for every account — the canary then
-    // skips each sample (a state-derivation gap, not circuit staleness)
-    // and degrades to `NoSample` → `Baseline` (the data-loss-safe
-    // direction; no genesis wipe). The boot self-heal's digest fast
-    // path (`circuit_digest_meta`) remains the primary staleness signal;
-    // the canary is a secondary probe that simply has no usable sample
-    // under the neutral model. See `AccountNode::canary_recursion`.
-    let current_pubkey_for =
-        |_addr: &zkcoins_program::hash::HashDigest,
-         _smt: &zkcoins_program::merkle::sparse_merkle_tree::SparseMerkleTree| {
-            None::<bitcoin::secp256k1::PublicKey>
-        };
+    let live_digest = match verifier_cache_role {
+        v1::VerifierCacheRole::Primary => {
+            let live_digest = v1::resolve_v1_live_digest(
+                pins.network,
+                &pins.network_params.circuit_digest_c(),
+                &pins.network_params.circuit_digest_c_balance(),
+            )
+            .unwrap_or_else(|e| {
+                panic!("v1 live circuit digest (just-built circuit vs §3.6 pins): {e}");
+            });
+            let verifier_cache_dir = std::env::var("ZKCOINS_VERIFIER_CACHE_DIR").expect(
+                "ZKCOINS_VERIFIER_CACHE_DIR must be set — a boot that cannot persist its trust anchor must fail loudly",
+            );
+            zkcoins_prover::verifier_cache::write_balance_verifier_cache(
+                pins.network,
+                std::path::Path::new(&verifier_cache_dir),
+            )
+            .expect("write C_balance verifier cache to ZKCOINS_VERIFIER_CACHE_DIR");
+            zkcoins_prover::verifier_cache::write_compliance_verifier_cache(
+                pins.network,
+                std::path::Path::new(&verifier_cache_dir),
+            )
+            .expect("write C verifier cache to ZKCOINS_VERIFIER_CACHE_DIR");
+            tracing::info!(
+                "v1 self-heal: live digest = tagged C||C_balance from the circuits \
+                 just built through ProverBridge (matched §3.6 pins at construction; \
+                 set ZKCOINS_V1_SLOW_CANARY=1 for verify_transition canary)"
+            );
+            live_digest
+        }
+        v1::VerifierCacheRole::Secondary => {
+            let balance_digest = secondary_cached_balance_digest.expect(
+                "secondary cache-load + marks must have already run before the ledger load \
+                 above (see the pre-load block right after install_network_pins) — None here \
+                 would mean this match observed a different role than the pre-load block did",
+            );
+            let live_digest = v1::secondary_boot_live_digest(
+                &pins.network_params.circuit_digest_c(),
+                &balance_digest,
+            );
+            tracing::info!(
+                "v1 self-heal: secondary boot — live digest = tagged C||C_balance from \
+                 cache-verified C_balance (recomputed digest matched §3.6 pin) and pin C. \
+                 Both circuit-identity gates (C and C_balance) were already marked ready \
+                 from the shared cache above, before the ledger load — so \
+                 `EngineAdapter::load_or_create_from_env`'s last_proof bind never rebuilds \
+                 either circuit, even for an account with proof history. Set \
+                 ZKCOINS_V1_SLOW_CANARY=1 for the verify_transition canary."
+            );
+            live_digest
+        }
+    };
     let heal_decision =
         node::self_heal::heal_circuit_digest(&pool, &live_digest, &proofs_dir, &|| {
-            account_node.canary_recursion(&current_pubkey_for)
+            v1::v1_canary_for_heal(&v1_adapter)
         })
         .await
-        .expect("circuit-digest self-heal");
-    println!("Circuit-digest self-heal: {:?}", heal_decision);
+        .expect("v1 circuit-digest self-heal");
+    tracing::warn!("Circuit-digest self-heal: {:?}", heal_decision);
 
-    // On a reset the in-memory `state` + `account_node` were rehydrated
-    // from the pre-reset rows that `heal_circuit_digest` just wiped, so
-    // they no longer match Postgres. Reload both from the now-empty DB,
-    // recovering the prover (and its ~14 s circuit build) from the stale
-    // `account_node` so the circuit is still built exactly once.
-    let (state, account_node) = if heal_decision == node::self_heal::ResetDecision::Reset {
-        let prover = account_node.take_prover();
+    // On a reset the in-memory ledger + engine were rehydrated from
+    // pre-reset rows; reload empty genesis and re-init the engine.
+    // Jobs that were in flight across the reset are left behind the
+    // G5 generation fence (failed + pre-bump reset_generation) and
+    // cannot complete against wiped state.
+    // `state` is owned by AccountNode after load; the outer Arc is only
+    // needed when reloading after a self-heal wipe (and by the residual
+    // uncalled legacy scan function).
+    let account_node = if heal_decision == node::self_heal::ResetDecision::Reset {
         let state = Arc::new(Mutex::new(
             State::load_from_pg(&pool)
                 .await
                 .expect("reload state after self-heal reset"),
         ));
         let account_node =
-            account_node::AccountNode::load_from_pg(Arc::clone(&state), &pool, prover)
+            account_node::AccountNode::load_ledger_from_pg(Arc::clone(&state), &pool)
                 .await
-                .expect("reload account node after self-heal reset");
-        println!("Reloaded State + AccountNode from genesis after self-heal reset");
-        (state, account_node)
+                .expect("reload account node ledger after self-heal reset");
+        v1_adapter
+            .reinit_after_self_heal_reset()
+            .await
+            .expect("reinit v1 engine after self-heal reset");
+        tracing::info!(
+            "Re-inited v1 EngineAdapter + AccountNode ledger to empty genesis after self-heal reset"
+        );
+        account_node
     } else {
-        (state, account_node)
+        // Drop the outer state Arc — AccountNode already holds its clone.
+        drop(state);
+        account_node
     };
 
     let username_store = username::UsernameStore::load_from_pg(&pool)
         .await
         .expect("load username store from Postgres");
-    println!("Loaded UsernameStore from Postgres");
+    tracing::info!("Loaded UsernameStore from Postgres");
 
     // Spawn the account_node as a separate task. A bootstrap error
     // here (Postgres unreachable, listener bind failure) used to be
@@ -213,345 +415,699 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     // alerting fires on the loop, matching the panic-hook behaviour
     // above (zk-coins/node#89 round-2 MAJOR 2).
     let pool_for_rest = Arc::clone(&pool);
+    // Stage 3: always exclusive NfLog stack. REST binds before the scanner
+    // connects/catches up; `/health/ready` stays 503 until the first
+    // successful apply and trips on `finality_broken`.
+    let caught_up = Arc::new(AtomicBool::new(false));
+    let finality_ok = Arc::new(AtomicBool::new(true));
+    let v1_readiness = V1Readiness {
+        scan_caught_up: Some(Arc::clone(&caught_up)),
+        finality_ok: Some(Arc::clone(&finality_ok)),
+    };
+    let v1_scan_caught_up = Some(caught_up);
+    let v1_finality_ok = Some(finality_ok);
     // `proofs_dir` was already read at the binary edge above (for the
     // self-heal proof-store cleanup) and is moved into the spawned
     // task here. `start_rest_node` no longer touches `std::env` so the
     // runtime tests can each pass their own `tempfile::tempdir()` path
     // instead of racing on the process-wide env var under
     // `--test-threads=8` (issue #181 Opt A).
+    let v1_engine_for_rest = Some(Arc::clone(&v1_adapter));
+
+    // Boot-time pending-publish resume **before** REST accepts work. If the
+    // node cannot determine whether mid-flight AggregateStateNullifierV3
+    // publishes remain (or cannot recover them when the publisher is up),
+    // refuse to bind the listener — never a short window of accept-then-exit.
+    boot_resume_pending_publishes(&v1_adapter, pins.network).await?;
+
+    // REST + kernel.v1 gRPC share one job store / notify map inside
+    // `start_rest_node` (StreamJob must see dispatcher phase events).
+    // `KERNEL_GRPC_ADDR` was validated at boot — no default host/port.
     tokio::spawn(async move {
-        if let Err(e) = start_rest_node(
+        if let Err(e) = start_rest_node(RestNodeConfig {
             account_node,
             username_store,
-            ACCOUNT_NODE_ADDR,
-            pool_for_rest,
-            &proofs_dir,
-        )
+            addr: ACCOUNT_NODE_ADDR.to_string(),
+            pool: pool_for_rest,
+            proofs_dir,
+            v1_readiness,
+            v1_engine: v1_engine_for_rest,
+            kernel_grpc_addr,
+        })
         .await
         {
-            eprintln!("Account node error: {}", e);
+            tracing::error!("Account node error: {}", e);
             std::process::exit(1);
         }
     });
 
-    // Try to load the latest block hash from Postgres or fall back to
-    // Esplora's current tip. The Postgres row is written atomically
-    // alongside the SMT/MMR snapshot in the scanner callback, which is
-    // the structural fix for issue #11.
-    let network_config: &EsploraConfig = &NETWORK_CONFIG;
-    let start_block_hash = match db::load_latest_block(&pool).await? {
-        Some(hash_bytes) => {
-            let hash = BlockHash::from_byte_array(hash_bytes);
-            println!("Resuming from previously saved block: {}", hash);
-            hash
-        }
-        None => {
-            println!("No saved block hash found, fetching latest from Esplora...");
-            let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(EsploraBuilder::new(
-                &network_config.url,
-            ))?;
-            let tip_hash = client.get_tip_hash().await?;
-            println!("Fetched latest tip hash from Esplora: {}", tip_hash);
-            tip_hash
-        }
-    };
+    // In-process resumer for members_ready / progressive rows left after a
+    // failed finalise handoff. Own task — must not share the scan loop's
+    // await points (a hung bitcoind scan must not delay rebroadcast, and a
+    // slow rebroadcast must not block tip fold).
+    {
+        let adapter_for_resumer = Arc::clone(&v1_adapter);
+        let network = pins.network;
+        tokio::spawn(async move {
+            run_pending_publish_resumer(adapter_for_resumer, network).await;
+        });
+    }
 
-    // Clones for the scanner callback closure.
-    let pool_for_callback = Arc::clone(&pool);
-    let pool_for_scanner = (*pool).clone();
-    let state_for_callback = Arc::clone(&state);
-
-    // Event-driven chain ingestion (issue #84). The previous
-    // implementation polled `get_tip_hash` every 30 s, gating
-    // visibility on `/api/mint` and `/api/send` by up to a full
-    // block-time + poll-interval. `scanner_ws::run_scanner_ws`
-    // subscribes to the Esplora WebSocket stream and publishes
-    // each new tip into the bounded channel below; the scanner
-    // runtime drains the channel and walks forward through the
-    // block-status `next_best` chain between events.
-    //
-    // Channel depth = 64: plenty of headroom for the burst the
-    // initial `blocks` seed produces on subscribe (3-15 entries
-    // observed), bounded so a stuck consumer cannot grow the
-    // queue without bound.
-    let ws_config = ScannerWsConfig::from_network_config(network_config);
-    println!(
-        "Event-driven scanner: WS={} (sourced from NETWORK_CONFIG; \
-         set via ESPLORA_WS_URL — required, no default)",
-        ws_config.url
-    );
-    let (tip_tx, tip_rx) = mpsc::channel::<bitcoin::BlockHash>(64);
-    tokio::spawn(run_scanner_ws(ws_config, tip_tx));
-
-    scan_for_inscriptions(network_config, start_block_hash, Some(pool_for_scanner), &move |content_bytes: Vec<u8>, commit_txid, current_block_hash| {
-        println!("Received content size: {} bytes", content_bytes.len());
-
-        // Try to deserialize the content as a Commitment
-        match bincode::deserialize::<Commitment>(&content_bytes) {
-            Ok(commitment) => {
-                println!("Successfully deserialized as commitment");
-                println!("Public key: {}", commitment.public_key);
-
-                // Verify the commitment
-                if !commitment.verify() {
-                    println!("Commitment verification failed, not adding to state");
-                    return;
-                }
-                println!("Commitment signature verified successfully");
-
-                // Phase E: if the in-process mint flow has already
-                // advanced this inscription through `state.update` (the
-                // `pending_inscriptions` row is `complete`), the
-                // scanner has nothing to do — its `state.update` call
-                // would be a no-op for the SMT (same key + same value
-                // → idempotent insert) but would diverge the MMR
-                // because `mmr.append` is monotonic. Skipping early
-                // also avoids a redundant `persist_state_tx`. Any
-                // other status (including a missing row, which covers
-                // out-of-band recovery inscriptions and inscriptions
-                // from a previous boot whose mint flow crashed before
-                // marking the row complete) falls through to the
-                // regular state.update path.
-                let commit_txid_bytes = commit_txid.as_byte_array();
-                let pending_status = persist_pending_status_lookup(
-                    &pool_for_callback,
-                    commit_txid_bytes,
-                );
-
-                // observed_inscriptions: every commitment the scanner
-                // extracts from on-chain gets a row, regardless of
-                // whether `state.update` runs. `source` flags whether
-                // this came from our own publisher (pending row exists)
-                // or another operator's node / a recovery CLI. Captured
-                // here — once per call — so the row's `commitment` /
-                // `public_key` columns survive even if the early-return
-                // below short-circuits the rest of the callback.
-                {
-                    let source: &'static str = if pending_status.is_some() {
-                        "own"
-                    } else {
-                        "external"
-                    };
-                    let entry = node::db::ObservedInscriptionEntry {
-                        commit_txid: commit_txid_bytes.to_vec(),
-                        block_hash: Some(current_block_hash.to_byte_array().to_vec()),
-                        block_height: None, // not in scanner callback scope today
-                        source,
-                        commitment: content_bytes.clone(),
-                        public_key: commitment.public_key.serialize().to_vec(),
-                        integrated: false, // will be flipped post-state.update below
-                    };
-                    let pool = (*pool_for_callback).clone();
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async move {
-                            if let Err(e) =
-                                node::db::insert_observed_inscription(&pool, &entry).await
-                            {
-                                eprintln!("Failed to persist observed_inscription: {}", e);
-                            }
-                        });
-                    });
-                }
-
-                if node::scanner::should_skip_scanner_state_update(pending_status.as_deref()) {
-                    println!(
-                        "scanner: commit {} already integrated by mint_handler — skipping state.update",
-                        commit_txid
-                    );
-                    return;
-                }
-
-                // Capture the public_key before moving `commitment` into
-                // `state.update` so we can reference it in the Err arm.
-                let pubkey_for_log = commitment.public_key;
-
-                // Lock-scope: do the state mutation, capture the bytes
-                // needed for persistence, then DROP THE LOCK before the
-                // async DB call. Holding `std::sync::Mutex` across an
-                // .await is unsound; also we want subsequent commitments
-                // to make progress while the previous tx commits.
-                let snapshot = {
-                    let mut state_guard = state_for_callback.lock().unwrap();
-                    match state_guard.update_and_snapshot_for_persist(&[commitment]) {
-                        Ok((new_root, smt_bytes, mmr_bytes, root_index_entry)) => {
-                            Some((new_root, smt_bytes, mmr_bytes, root_index_entry))
-                        }
-                        Err(e) => {
-                            // Errors are logged but do NOT panic — the scanner is
-                            // best-effort and we never want a single bad commitment
-                            // (replay, client bug, or a re-scan after crash where
-                            // the SMT already has this public_key with a different
-                            // leaf value) to take the whole REST API down. The
-                            // scanner advances to the next block regardless.
-                            eprintln!(
-                                "Skipping commitment for public_key {}: state.update failed: {}",
-                                pubkey_for_log, e
-                            );
-                            None
-                        }
-                    }
-                }; // mutex dropped here, BEFORE the async tx below
-
-                if let Some((new_root, smt_bytes, mmr_bytes, root_index_entry)) = snapshot {
-                    let block_hash_bytes = current_block_hash.to_byte_array();
-
-                    // The callback runs INSIDE the async
-                    // `scan_for_inscriptions` task on a multi_thread
-                    // tokio runtime, so we cannot just
-                    // `Handle::current().block_on(...)` — the docs say
-                    // "may panic when called from a thread that is part
-                    // of the current Tokio runtime" and on
-                    // `#[tokio::main]` (multi_thread by default) it
-                    // does panic the first time a real inscription is
-                    // scanned. The fix is the documented
-                    // `block_in_place(|| Handle::current().block_on(…))`
-                    // pattern, encapsulated in
-                    // `persist_state_from_sync_context`.
-                    //
-                    // The freshly-inserted `mmr_root_index` row rides
-                    // along in the SAME transaction (Phase C). Folding
-                    // it in here closes the crash window the previous
-                    // two-call shape opened: a crash between the state
-                    // snapshot and the standalone root_index INSERT
-                    // resumed the scanner from a `latest_block` whose
-                    // MMR already contained the new leaf, so the
-                    // re-scanned commit advanced the MMR a second
-                    // time, the new `prev_mmr_root` diverged, and the
-                    // originally-missing row was never healed. With
-                    // both writes atomic, a crash before COMMIT leaves
-                    // the saved `latest_block` BEFORE this block; the
-                    // re-scan replays `state.update` against the same
-                    // unchanged MMR and writes the same row again
-                    // (ON CONFLICT DO NOTHING is a no-op when it
-                    // already landed).
-                    let root_index_ref = root_index_entry
-                        .as_ref()
-                        .map(|(p, s, i)| (p, s, *i as u64));
-                    let persist_result = persist_state_from_sync_context(
-                        &pool_for_callback,
-                        &smt_bytes,
-                        &mmr_bytes,
-                        &block_hash_bytes,
-                        root_index_ref,
-                    );
-                    match persist_result {
-                        Ok(()) => {
-                            println!(
-                                "Persisted state. New MMR root: {}",
-                                hex::encode(zkcoins_program::hash::digest_to_bytes(&new_root))
-                            );
-                            // Phase E: if this commit came from our own
-                            // mint flow but crashed between broadcast
-                            // Ok and `state.update` (so the row is
-                            // still at `reveal_broadcast`), the scanner
-                            // has just completed the integration; mark
-                            // the row `complete` so a future re-scan
-                            // skips its state.update path. For rows
-                            // that never existed (external / recovery
-                            // inscriptions) the UPDATE simply affects
-                            // zero rows, which is correct.
-                            if pending_status.is_some() {
-                                if let Err(e) = mark_pending_complete_from_sync_context(
-                                    &pool_for_callback,
-                                    commit_txid_bytes,
-                                ) {
-                                    eprintln!(
-                                        "Failed to mark pending_inscriptions {} complete after scanner state.update: {}",
-                                        commit_txid, e
-                                    );
-                                }
-                            }
-
-                            // Flip the matching `observed_inscriptions`
-                            // row to `integrated = true, integrated_at
-                            // = NOW()`. The row was inserted earlier
-                            // in this callback with `integrated =
-                            // false`; the UPDATE is the second half of
-                            // the two-step lifecycle (insert at
-                            // observation, mark integrated after the
-                            // SMT/MMR write lands). Idempotent — the
-                            // WHERE filter is keyed on `integrated =
-                            // FALSE` so re-runs (scanner replay) are a
-                            // no-op.
-                            let pool_clone = (*pool_for_callback).clone();
-                            let txid_bytes = commit_txid_bytes.to_vec();
-                            tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(async move {
-                                    if let Err(e) = node::db::mark_observed_inscription_integrated(
-                                        &pool_clone,
-                                        &txid_bytes,
-                                    )
-                                    .await
-                                    {
-                                        eprintln!(
-                                            "Failed to flip observed_inscriptions.integrated: {}",
-                                            e
-                                        );
-                                    }
-                                });
-                            });
-                        }
-                        Err(e) => eprintln!("persist_state_tx failed: {}", e),
-                    }
-                }
-            }
-            Err(e) => {
-                // Print more detailed debug information
-                println!("Found inscription with our message but failed to deserialize as commitment\nError: {}", e);
-            }
-        }
-    }, tip_rx)
-    .await?;
-
+    // Stage 3: only the v1 NfLog scanner. The legacy Commitment/SMT
+    // Esplora path lives behind `LegacyCommitmentScanCap` (sealed; no
+    // production mint) — not reachable from this binary.
+    run_v1_scan_loop(v1_adapter, v1_scan_caught_up, v1_finality_ok).await?;
     Ok(())
 }
 
-/// Synchronous wrapper around
-/// [`db::pending_inscription_status_by_commit_txid`] for the scanner
-/// callback's pre-`state.update` lookup (Phase E).
+/// Interval for the in-process AggregateStateNullifierV3 pending-publish
+/// resumer.
 ///
-/// Mirrors [`persist_state_from_sync_context`]: the scanner callback is
-/// a sync `Fn` invoked from a multi_thread tokio worker, and the
-/// `Handle::current().block_on(...)` bare form panics there. We use
-/// `block_in_place` + `Handle::current().block_on(...)`, exactly as the
-/// state-persist helper does. DB errors are swallowed by the call site
-/// (the scanner falls through to its normal `state.update` path on
-/// `None`), so this helper returns the inner `Option<String>` directly
-/// after logging any failure.
-fn persist_pending_status_lookup(pool: &sqlx::PgPool, commit_txid_bytes: &[u8]) -> Option<String> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(db::pending_inscription_status_by_commit_txid(
-                pool,
-                commit_txid_bytes,
-            ))
-            .unwrap_or_else(|e| {
-                eprintln!(
-                    "scanner: pending_inscriptions lookup for commit {} failed: {} (falling through to state.update)",
-                    hex::encode(commit_txid_bytes),
-                    e
+/// Matches the v1 scan-loop idle backoff (`Duration::from_secs(5)` after each
+/// successful `scan_to_tip`) and the recon incomplete-view backoff
+/// (`RECON_RETRY_BACKOFF` in [`run_v1_scan_loop`]) so a stranded
+/// `members_ready` row is retried on the same order of magnitude as tip
+/// observation — without a tight spin that would flood logs on a permanent
+/// publisher / bitcoind outage.
+const PENDING_PUBLISH_RESUME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Boot-time resume of durable AggregateStateNullifierV3 publishes left
+/// mid-flight by a previous crash (or a failed finalise handoff).
+///
+/// Fail-closed: publisher connect failure with pending work is fatal; a
+/// non-determinable pending-row list is fatal (never treated as empty).
+/// With a confirmed empty table, connect failure is logged loud and boot
+/// continues (receive/finalise paths will need the publisher later).
+async fn boot_resume_pending_publishes(
+    adapter: &node::v1::EngineAdapter,
+    network: zkcoins_program::circuit::compliance::Network,
+) -> Result<(), Box<dyn StdError>> {
+    use v1::{connect_v1_publisher, resume_all_pending_publishes, v1_publisher_env_from_env};
+
+    match v1_publisher_env_from_env(network) {
+        Ok(env) => match connect_v1_publisher(env) {
+            Ok(publisher) => match resume_all_pending_publishes(adapter, &publisher).await {
+                Ok(0) => tracing::info!("v1.1 resume_all_pending_publishes: nothing pending"),
+                Ok(n) => {
+                    tracing::info!(
+                        "v1.1 resume_all_pending_publishes: completed {n} pending publish(es)"
+                    )
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "v1.1 resume_all_pending_publishes failed: {e:#} — refusing to \
+                         continue with unrecovered mid-flight nullifier publishes"
+                    )
+                    .into());
+                }
+            },
+            Err(e) => {
+                let pending =
+                    match node::v1::db_v1::list_resumable_pending_publishes(adapter.pool()).await {
+                        Ok(rows) => rows.len(),
+                        Err(list_err) => {
+                            return Err(format!(
+                                "v1.1 publisher connect failed and resumable pending \
+                             publishes are not determinable ({list_err:#}); original \
+                             connect error: {e:#} — refusing to start without \
+                             knowing whether mid-flight nullifier publishes remain"
+                            )
+                            .into());
+                        }
+                    };
+                if pending > 0 {
+                    return Err(format!(
+                        "v1.1 publisher connect failed with {pending} resumable \
+                         pending publish(es): {e:#}"
+                    )
+                    .into());
+                }
+                tracing::warn!(
+                    "v1.1 publisher connect failed (no pending publishes; continuing boot): {e:#}"
                 );
-                None
-            })
-    })
+            }
+        },
+        Err(e) => {
+            let pending =
+                match node::v1::db_v1::list_resumable_pending_publishes(adapter.pool()).await {
+                    Ok(rows) => rows.len(),
+                    Err(list_err) => {
+                        return Err(format!(
+                            "v1.1 publisher env incomplete and resumable pending \
+                         publishes are not determinable ({list_err:#}); original \
+                         env error: {e:#} — refusing to start without \
+                         knowing whether mid-flight nullifier publishes remain"
+                        )
+                        .into());
+                    }
+                };
+            if pending > 0 {
+                return Err(format!(
+                    "v1.1 publisher env incomplete with {pending} resumable \
+                     pending publish(es): {e:#}"
+                )
+                .into());
+            }
+            tracing::warn!(
+                "v1.1 publisher env incomplete (no pending publishes; continuing boot): {e:#}"
+            );
+        }
+    }
+    Ok(())
 }
 
-/// Synchronous wrapper around
-/// [`db::update_pending_status`] for the scanner callback's
-/// post-`state.update` advance to `complete` (Phase E).
+/// Periodic in-process resumer: same work as boot [`boot_resume_pending_publishes`],
+/// without aborting the process on a single failed sweep.
 ///
-/// Same multi_thread tokio bridging story as
-/// [`persist_pending_status_lookup`]. Errors propagate to the caller so
-/// the callback can log them with the right context line.
-fn mark_pending_complete_from_sync_context(
-    pool: &sqlx::PgPool,
-    commit_txid_bytes: &[u8],
-) -> Result<(), sqlx::Error> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(db::update_pending_status(
-            pool,
-            commit_txid_bytes,
-            db::PENDING_STATUS_COMPLETE,
-        ))
+/// On durable publisher / bitcoind outage the open row count is logged and the
+/// next interval retries — never silent drop, never tight-loop flood.
+async fn run_pending_publish_resumer(
+    adapter: Arc<node::v1::EngineAdapter>,
+    network: zkcoins_program::circuit::compliance::Network,
+) {
+    use v1::{connect_v1_publisher, resume_all_pending_publishes, v1_publisher_env_from_env};
+
+    loop {
+        // Pending-publish resume idle backoff (named const; not tip poll).
+        tokio::time::sleep(PENDING_PUBLISH_RESUME_INTERVAL).await; // scanner-polling-ok: pending-publish resume idle backoff (event-driven bitcoind resume is follow-up)
+
+        // Fail-closed list: undeterminable is an error, not "nothing pending".
+        let open = match node::v1::db_v1::list_resumable_pending_publishes(adapter.pool()).await {
+            Ok(rows) => rows.len(),
+            Err(list_err) => {
+                tracing::warn!(
+                    "v1.1 pending-publish resumer: open rows not determinable \
+                     ({list_err:#}) — not treating as empty; will retry next interval"
+                );
+                continue;
+            }
+        };
+        if open == 0 {
+            continue;
+        }
+
+        let env = match v1_publisher_env_from_env(network) {
+            Ok(env) => env,
+            Err(e) => {
+                tracing::warn!(
+                    "v1.1 pending-publish resumer: {open} open row(s); publisher \
+                     env incomplete ({e:#}) — will retry next interval"
+                );
+                continue;
+            }
+        };
+        let publisher = match connect_v1_publisher(env) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    "v1.1 pending-publish resumer: {open} open row(s); publisher \
+                     connect failed ({e:#}) — will retry next interval"
+                );
+                continue;
+            }
+        };
+
+        // Same pickup path as boot — no second rebroadcast logic beside
+        // `resume_all_pending_publishes` / `resume_pending_publish`.
+        match resume_all_pending_publishes(adapter.as_ref(), &publisher).await {
+            Ok(0) => {
+                // Listed open rows, then none completed: another writer may
+                // have advanced them between list and resume, or statuses
+                // moved to non-resumable. Log the earlier open count.
+                tracing::info!(
+                    "v1.1 pending-publish resumer: saw {open} open row(s); \
+                     resume pass completed 0 (rows may have advanced concurrently)"
+                );
+            }
+            Ok(n) => tracing::info!(
+                "v1.1 pending-publish resumer: completed {n} of {open} open pending publish(es)"
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    "v1.1 pending-publish resumer: failed with {open} open row(s) \
+                     still pending ({e:#}) — will retry next interval; rows left as-is"
+                );
+            }
+        }
+    }
+}
+
+/// Stage 2 v1.1 exclusive scan loop: bitcoind RPC + script-plonky2
+/// [`zkcoins_prover::scanner::Scanner`] → NfLog fold on [`EngineAdapter`].
+///
+/// **Never** falls back to the Esplora Commitment scanner. Missing RPC
+/// pins, connect failures, or infrastructure errors abort the process.
+///
+/// ## Reorg (live)
+/// When `scan_to_tip` reports a reorg, the full post-reorg survivor stream
+/// replaces the engine NfLog ([`v1::apply_canonical_survivors`]). Forward
+/// progress without reorg appends only newly seen survivors.
+/// `ReorgOutcome::finality_broken` stops crediting and fails readiness.
+///
+/// ## Reorg (restart while down)
+/// A fresh scanner has no checkpoint, so a reorg that happened offline is
+/// invisible to `report.reorg`. Reconciliation and the first scan are
+/// therefore **one observation**: scan first, reconcile the persisted tip
+/// against that scan's tip, re-verify the tip is unchanged, then apply
+/// from the same survivors. A reorg between a free-standing recon and a
+/// later scan cannot slip through — there is no free-standing recon.
+async fn run_v1_scan_loop(
+    adapter: Arc<node::v1::EngineAdapter>,
+    scan_caught_up: Option<Arc<AtomicBool>>,
+    finality_ok: Option<Arc<AtomicBool>>,
+) -> Result<(), Box<dyn StdError>> {
+    use std::collections::HashSet;
+    use std::time::Duration;
+    use v1::{
+        first_boot_requires_full_replace, folded_keys_from_nflog_mirror,
+        observation_tip_still_live, reconcile_persisted_tip, PersistedTipReconciliation,
+        TipReconcileOutcome,
+    };
+
+    let pins = v1::mode::v1_boot_pins_from_env().map_err(|e| e.to_string())?;
+    let (rpc_url, cookie_path) = v1::scan::v1_bitcoind_rpc_from_env().map_err(|e| e.to_string())?;
+
+    let sdr_phase_b_client = bitcoincore_rpc::Client::new(
+        rpc_url.trim_end_matches('/'),
+        bitcoincore_rpc::Auth::CookieFile(cookie_path.clone()),
+    )
+    .map_err(|e| format!("bitcoind RPC client for SDR Phase B inclusion/MTP: {e}"))?;
+
+    let scanner_config = zkcoins_prover::scanner::ScannerConfig {
+        rpc_url: rpc_url.clone(),
+        cookie_path: cookie_path.clone(),
+        network: pins.network,
+        activation_height: pins.activation_height,
+        network_params: pins.network_params.clone(),
+        expected_params_identifier: pins.expected_params_identifier,
+    };
+
+    tracing::info!(
+        "v1.1 scanner: connecting bitcoind RPC for AggregateStateNullifierV3 / NfLog \
+         (network={:?}, activation_height={})",
+        pins.network,
+        pins.activation_height
+    );
+
+    // Boot-time pending-publish resume runs in `main` *before* REST bind
+    // (and a periodic resumer runs beside this loop). The scanner path
+    // only folds NfLog — it must not be the sole pickup for stranded
+    // members_ready rows.
+
+    // Connect is synchronous (blocking RPC). Keep it off the async worker.
+    let mut scanner = tokio::task::spawn_blocking(move || {
+        zkcoins_prover::scanner::Scanner::connect(scanner_config)
     })
+    .await
+    .map_err(|e| format!("v1.1 scanner connect join: {e}"))?
+    .map_err(|e| {
+        format!(
+            "v1.1 Scanner::connect failed: {e:#} — refusing to fall back to the \
+             legacy Esplora commitment scanner"
+        )
+    })?;
+
+    // Track which survivor chain positions we have already folded so a
+    // re-scan of the same tip does not re-append (append_nullifier is
+    // strict). Reorg / full-replace clears this set and rebuilds.
+    let mut folded_keys: HashSet<(u64, u32, u32, u32, [u8; 32])> = HashSet::new();
+    // First observation unit not yet committed: recon + first scan share
+    // one tip. After commit, the scanner has a checkpoint and `report.reorg`
+    // is trustworthy.
+    let mut boot_observation_committed = false;
+    let activation_height = pins.activation_height;
+    // Transient incomplete-view backoff (RPC behind). Not a chain-tip poll.
+    const RECON_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+
+    loop {
+        let scan_result = tokio::task::spawn_blocking(move || {
+            let report = scanner.scan_to_tip();
+            (scanner, report)
+        })
+        .await
+        .map_err(|e| format!("v1.1 scan_to_tip join: {e}"))?;
+
+        scanner = scan_result.0;
+        let report = match scan_result.1 {
+            Ok(r) => r,
+            Err(e) => {
+                // Infrastructure failure: fail loud (no legacy fall-back).
+                return Err(format!(
+                    "v1.1 scanner infrastructure failure: {e:#} — refusing to \
+                     fall back to the legacy commitment scanner"
+                )
+                .into());
+            }
+        };
+
+        // §3.9: finality_broken means callers must stop crediting and
+        // readiness must fail. Honour the contract — do not continue the
+        // fold loop after a deep reorg displaces final positions.
+        if let Some(ref reorg) = report.reorg {
+            if reorg.finality_broken {
+                if let Some(flag) = &finality_ok {
+                    flag.store(false, Ordering::SeqCst);
+                }
+                return Err(format!(
+                    "v1.1 scanner: FINALITY BROKEN after reorg \
+                     (displaced_final_count={}) — stopping NfLog credit and \
+                     failing readiness (deep_reorg). Manual recovery required; \
+                     refusing to continue folding",
+                    reorg.displaced_final_count
+                )
+                .into());
+            }
+        }
+
+        let tip = scanner
+            .scanned_through()
+            .ok_or("v1.1 scanner has no scanned_through tip after successful scan_to_tip")?;
+        let tip_height = tip.0;
+        let tip_hash = tip.1.to_byte_array();
+        // Durable inclusion hashes for every block this poll observed (forward
+        // and reorg-replacement). Below-tip §5.7 anchor locators read these
+        // via block_log; without this write settled anchors fail ATTEST_ANCHOR_LOCATOR_EDGE.
+        v1::record_scanned_block_hashes(adapter.pool(), &report.blocks)
+            .await
+            .map_err(|e| format!("v1.1 record scanned block hashes failed: {e:#}"))?;
+        let rpc_url_p = rpc_url.clone();
+        let cookie_path_p = cookie_path.clone();
+        let activation_height_p = activation_height;
+        let prelude = tokio::task::spawn_blocking(move || {
+            v1::fetch_bip113_prelude_headers(&rpc_url_p, &cookie_path_p, activation_height_p)
+        })
+        .await
+        .map_err(|e| format!("v1.1 fetch BIP-113 prelude headers join: {e}"))?
+        .map_err(|e| format!("v1.1 fetch BIP-113 prelude headers failed: {e:#}"))?;
+        v1::record_bip113_prelude_headers(adapter.pool(), &prelude)
+            .await
+            .map_err(|e| format!("v1.1 record BIP-113 prelude headers failed: {e:#}"))?;
+        v1::backfill_null_block_times(adapter.pool(), &rpc_url, &cookie_path)
+            .await
+            .map_err(|e| format!("v1.1 backfill null block_time failed: {e:#}"))?;
+        // Scanner streams only: accepted inscriptions + survivors. Expansion
+        // and coupling live inside apply_canonical_survivors /
+        // apply_forward_scan (immediately before mutate) so a second caller
+        // cannot skip them. The binary does not re-derive the fold source.
+        let accepted_inscriptions = scanner.accepted_inscriptions().to_vec();
+        let survivors = scanner.survivors().to_vec();
+
+        // —— Boot observation unit: bind recon to THIS scan's tip ——
+        // Window is closed, not narrowed: we never seed folded keys or
+        // choose forward vs full-replace from a recon that observed a
+        // different chain than the survivors we are about to apply.
+        let mut force_full_replace = report.reorg.is_some();
+        if !boot_observation_committed {
+            let persisted_height = adapter.with_engine(|e| e.tip_height());
+            let persisted_hash = adapter.tip_hash();
+            let scan_tip_height = tip_height;
+            let scan_tip_hash = tip_hash;
+            let rpc_url_b = rpc_url.clone();
+            let cookie_path_b = cookie_path.clone();
+
+            let recon_result = tokio::task::spawn_blocking(move || {
+                use bitcoincore_rpc::RpcApi;
+                use v1::scan::ResolvedBlock;
+
+                let open_client = || {
+                    bitcoincore_rpc::Client::new(
+                        rpc_url_b.trim_end_matches('/'),
+                        bitcoincore_rpc::Auth::CookieFile(cookie_path_b.clone()),
+                    )
+                    .map_err(|e| anyhow::anyhow!("bitcoind RPC open for tip recon: {e}"))
+                };
+
+                // Recon classifies against the **immutable ancestry of the
+                // captured scan-tip hash** (resolve by hash / prev links) —
+                // never against mutable getblockhash(height) of the live tip.
+                // A→B→A cannot flip StillCanonical under a fixed observation.
+                let resolve_hash = |block_hash: [u8; 32]| -> anyhow::Result<Option<ResolvedBlock>> {
+                    let client = open_client()?;
+                    let bh = BlockHash::from_byte_array(block_hash);
+                    match client.get_block_header_info(&bh) {
+                        Ok(info) => {
+                            let height = u64::try_from(info.height).map_err(|_| {
+                                anyhow::anyhow!(
+                                    "getblockheader height {} does not fit u64",
+                                    info.height
+                                )
+                            })?;
+                            let prev_hash = info
+                                .previous_block_hash
+                                .map(|p| p.to_byte_array())
+                                .unwrap_or([0u8; 32]);
+                            Ok(Some(ResolvedBlock { height, prev_hash }))
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            let unknown = msg.contains("Block not found")
+                                || msg.contains("Block header not found")
+                                || msg.contains("not found")
+                                || msg.contains("-5");
+                            if unknown {
+                                Ok(None)
+                            } else {
+                                Err(anyhow::anyhow!("getblockheader for tip recon: {e}"))
+                            }
+                        }
+                    }
+                };
+
+                let live_node_height = {
+                    let client = open_client()?;
+                    client
+                        .get_block_count()
+                        .map_err(|e| anyhow::anyhow!("getblockcount for tip recon: {e}"))?
+                };
+
+                let outcome = reconcile_persisted_tip(
+                    persisted_height,
+                    persisted_hash,
+                    activation_height,
+                    scan_tip_height,
+                    scan_tip_hash,
+                    live_node_height,
+                    resolve_hash,
+                )?;
+
+                // Secondary pin: if the live tip at the scan height moved
+                // away from the captured scan hash, re-observe. Not the
+                // A→B→A defence (that is ancestry-based recon above).
+                let live_at_scan = {
+                    let client = open_client()?;
+                    let tip = client
+                        .get_block_count()
+                        .map_err(|e| anyhow::anyhow!("getblockcount for tip pin: {e}"))?;
+                    if scan_tip_height > tip {
+                        None
+                    } else {
+                        let hash = client.get_block_hash(scan_tip_height).map_err(|e| {
+                            anyhow::anyhow!("getblockhash({scan_tip_height}) for tip pin: {e}")
+                        })?;
+                        Some(hash.to_byte_array())
+                    }
+                };
+                let stable = observation_tip_still_live(scan_tip_hash, live_at_scan);
+                Ok::<_, anyhow::Error>((outcome, stable))
+            })
+            .await
+            .map_err(|e| format!("v1.1 tip reconciliation join: {e}"))?;
+
+            let (outcome, tip_stable) = match recon_result {
+                Ok(v) => v,
+                Err(e) => {
+                    // Fatal only (deep reorg / unresolvable / corruption).
+                    if let Some(flag) = &finality_ok {
+                        flag.store(false, Ordering::SeqCst);
+                    }
+                    return Err(format!("v1.1 tip reconciliation failed: {e:#}").into());
+                }
+            };
+
+            if !tip_stable {
+                tracing::warn!(
+                    "v1.1 boot tip: scan tip height={} hash={} moved during \
+                     reconciliation — discarding observation and retrying \
+                     (bound recon+scan window closed, not narrowed)",
+                    tip_height,
+                    hex::encode(tip_hash)
+                );
+                tokio::time::sleep(RECON_RETRY_BACKOFF).await; // scanner-polling-ok: bound-observation tip-stability retry (not tip-advance poll; re-observe after discarded window)
+                continue;
+            }
+
+            match outcome {
+                TipReconcileOutcome::RetryableIncompleteView {
+                    queried_height,
+                    detail,
+                } => {
+                    // Transient: RPC behind. Stay unready, leave finality_ok
+                    // alone, never assume canonical or divergent.
+                    tracing::warn!(
+                        "v1.1 boot tip: incomplete live view at height \
+                         {queried_height} — {detail}; staying unready and retrying"
+                    );
+                    tokio::time::sleep(RECON_RETRY_BACKOFF).await; // scanner-polling-ok: incomplete-view RPC-behind backoff (transient; not tip-advance poll)
+                    continue;
+                }
+                TipReconcileOutcome::Ready(PersistedTipReconciliation::Fresh) => {
+                    tracing::info!(
+                        "v1.1 boot tip: fresh engine (no persisted tip); applying \
+                         first scan observation (tip={tip_height})"
+                    );
+                }
+                TipReconcileOutcome::Ready(PersistedTipReconciliation::StillCanonical {
+                    tip_height: ph,
+                    tip_hash: p_hash,
+                }) => {
+                    let mirror = adapter.with_engine(|e| e.nflog_mirror());
+                    folded_keys = folded_keys_from_nflog_mirror(&mirror);
+                    tracing::info!(
+                        "v1.1 boot tip: still canonical at height={} hash={} \
+                         (seeded {} folded keys; bound to scan tip={tip_height})",
+                        ph,
+                        hex::encode(p_hash),
+                        folded_keys.len()
+                    );
+                }
+                TipReconcileOutcome::Ready(PersistedTipReconciliation::ShallowReorg {
+                    ancestor_height,
+                    ancestor_hash,
+                    reorg_depth,
+                    persisted_height,
+                    persisted_hash,
+                }) => {
+                    force_full_replace = true;
+                    tracing::warn!(
+                        "v1.1 boot tip: shallow offline reorg depth={} (persisted \
+                         height={} hash={} → common ancestor height={} hash={}); \
+                         full-replace NfLog from this scan's survivors (bound \
+                         observation; §3.9 ≤5-block window)",
+                        reorg_depth,
+                        persisted_height,
+                        hex::encode(persisted_hash),
+                        ancestor_height,
+                        hex::encode(ancestor_hash)
+                    );
+                    debug_assert!(first_boot_requires_full_replace(
+                        &PersistedTipReconciliation::ShallowReorg {
+                            ancestor_height,
+                            ancestor_hash,
+                            reorg_depth,
+                            persisted_height,
+                            persisted_hash,
+                        }
+                    ));
+                }
+            }
+            boot_observation_committed = true;
+        }
+
+        let do_full_replace = force_full_replace;
+        if do_full_replace {
+            // Full replace: scanner survivors + accepted inscriptions are the
+            // canonical streams (catalog carries losers NfLog ignores).
+            // Expansion + coupling run inside apply (sole fold source).
+            let stats = v1::apply_canonical_survivors(
+                &adapter,
+                tip_height,
+                tip_hash,
+                &survivors,
+                &accepted_inscriptions,
+            )
+            .await
+            .map_err(|e| format!("v1.1 reorg/full-replace NfLog apply failed: {e:#}"))?;
+            folded_keys.clear();
+            for nf in &survivors {
+                folded_keys.insert((
+                    nf.chain_pos.height,
+                    nf.chain_pos.tx_index,
+                    nf.chain_pos.vin_index,
+                    nf.chain_pos.member_index,
+                    nf.pk,
+                ));
+            }
+            tracing::info!(
+                "v1.1 scanner full-replace applied: tip={} hash={} appended={} dup_ignored={}",
+                tip_height,
+                tip.1,
+                stats.appended,
+                stats.duplicate_ignored
+            );
+        } else {
+            // Gate only: apply_forward_scan owns expansion, coupling, and the
+            // fold delta against `folded_keys`. Catalog delta is crate-private.
+            let has_new = survivors.iter().any(|nf| {
+                !folded_keys.contains(&(
+                    nf.chain_pos.height,
+                    nf.chain_pos.tx_index,
+                    nf.chain_pos.vin_index,
+                    nf.chain_pos.member_index,
+                    nf.pk,
+                ))
+            });
+            if has_new || tip_height > adapter.with_engine(|e| e.tip_height()) {
+                let stats = v1::apply_forward_scan(
+                    &adapter,
+                    tip_height,
+                    tip_hash,
+                    &survivors,
+                    &accepted_inscriptions,
+                    &folded_keys,
+                )
+                .await
+                .map_err(|e| format!("v1.1 forward NfLog apply failed: {e:#}"))?;
+                for nf in &survivors {
+                    folded_keys.insert((
+                        nf.chain_pos.height,
+                        nf.chain_pos.tx_index,
+                        nf.chain_pos.vin_index,
+                        nf.chain_pos.member_index,
+                        nf.pk,
+                    ));
+                }
+                if stats.appended > 0 || stats.duplicate_ignored > 0 {
+                    tracing::info!(
+                        "v1.1 scanner folded: tip={} appended={} dup_ignored={} below_act={}",
+                        tip_height,
+                        stats.appended,
+                        stats.duplicate_ignored,
+                        stats.below_activation
+                    );
+                }
+            }
+        }
+
+        // §4.2 Phase B: after NfLog fold, finalise any open SDR Phase-A rows
+        // whose own nullifier is now first-occurrence + size_final completed.
+        // Same poll guard as the scan loop — no parallel scheduler.
+        {
+            // Inclusion / MTP: real bitcoind-backed source (canonical hash at
+            // first-occurrence height + BIP-113 mediantime via getblockheader),
+            // uniform on every network. The resolver verifies finality before
+            // sealing and stores the hash in Bitcoin's internal byte order.
+            let n = v1::finalize_due_phase_b_adapter(&adapter, &sdr_phase_b_client)
+                .await
+                .map_err(|e| format!("v1.1 SDR Phase B finalise failed: {e:#}"))?;
+            if n > 0 {
+                tracing::info!("v1.1 scanner: SDR Phase B finalised {n} SelfDeliveryRecord(s)");
+            }
+        }
+
+        // First successful catch-up after a committed boot observation:
+        // mark readiness so load balancers can send traffic once the NfLog
+        // view reflects the chain tip. Incomplete-view retries never reach
+        // here (they `continue` before apply / before this flag).
+        if let Some(flag) = &scan_caught_up {
+            if !flag.load(Ordering::SeqCst) {
+                flag.store(true, Ordering::SeqCst);
+                tracing::info!("v1.1 scanner: catch-up complete; readiness may pass v1_scan gate");
+            }
+        }
+
+        // Tip-advance poll: bitcoind block-signal subscription is follow-up
+        // work; until then this idle sleep is the only wake between
+        // successful scan_to_tip calls (no Esplora WS on the v1 path).
+        tokio::time::sleep(Duration::from_secs(5)).await; // scanner-polling-ok: scan_to_tip idle backoff until bitcoind block-signal subscription (event-driven tip advance is follow-up)
+    }
 }

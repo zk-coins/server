@@ -1,18 +1,119 @@
 //! Library crate root for `node`.
 //!
-//! The node is primarily a binary (`main.rs`), but a few pieces of
-//! it must be reachable from out-of-tree integration tests
-//! (`node/tests/api_remote.rs` in particular). Exposing those
-//! modules through a `lib` target keeps the binary side of the crate
-//! untouched while letting the integration suite import the
-//! `Capabilities` struct (for feature-gate detection on `/api/info`)
-//! and the `CoinProof` struct used to decode the binary blobs
-//! returned by `GET /api/proof/:id`. Other response types remain
-//! reachable through their owning modules but are not currently
-//! consumed by the suite.
+//! # Public surface — Stage 3 Runde 8 positive list
 //!
-//! Everything declared here is also `use`d from `main.rs` so the
-//! production binary keeps working with no change in behaviour.
+//! The default is **crate-private**. Only the items below are `pub`, and
+//! each has a **single, item-specific** reason to stay on the external
+//! edge. Sammelbegründungen that only cover a subset of the listed names
+//! are forbidden. Everything else is `pub(crate)` or private. Derive
+//! additions from the compiler (`cargo check --workspace --all-targets`),
+//! not from guesswork: a failed external use is either a legitimate list
+//! entry or a wrong caller.
+//!
+//! **Runde 8:** documented surface ≡ real surface. External consumers are
+//! exclusively `main.rs`, `probe_r2`, `recover_inscription`,
+//! `gen_bootstrap_manifest` (shared codec only — no `node::` surface),
+//! `downstream-boundary`, and `node/tests/`. Crate-internal unit tests are
+//! **not** a reason to keep `pub`. A rustdoc-JSON coverage test
+//! (`tests/public_surface_coverage.rs`) fails when a public item lacks a
+//! list entry.
+//!
+//! ## Modules (and why they are public)
+//!
+//! - [`account_node`] — binary `AccountNode::load_ledger_from_pg` (+
+//!   `LoadAccountNodeError`); integration `api_remote` deserialises
+//!   [`account_node::CoinProof`]; `CanaryOutcome` is in the public
+//!   signature of [`self_heal::heal_circuit_digest`]. Compile-fail probes
+//!   name sealed methods on `AccountNode`. **Not** public: `new`,
+//!   `import_account`, `persist_account`, mutative `state()`, send/mint/
+//!   receive, SMT helpers.
+//! - [`db`] — binary `connect_and_migrate` only. All residual read helpers
+//!   and legacy **write** sinks are `pub(crate)` (boot load goes through
+//!   `State` / `AccountNode` / `UsernameStore` methods).
+//! - [`runtime`] — binary `start_rest_node` / `V1Readiness`.
+//! - [`kernel_rpc`] — binary env edge `KERNEL_GRPC_ADDR_ENV` /
+//!   `kernel_grpc_addr_from_env` / `KernelGrpcStartError`. The gRPC server
+//!   itself is crate-private (`serve_kernel_grpc_with_domain`) and is
+//!   started only from `start_rest_node` with the shared job store + notify
+//!   map + pending-sign map (no pool-only silent-stream boot). `GetJob` /
+//!   `StreamJob` / `CancelJob` / `SignTransition` / `SubmitTransition` /
+//!   `AttestBalance` / `IssueViewGrant` / `GetInfo` / `GetAccumulator` /
+//!   `GetNullifierPath` / `OpenPullChallenge` / `Pull` / `GetRecord` /
+//!   `GetCoinProof` / `GetAccountState` / `SubscribeReceipts` /
+//!   `ListInscriptions` / `Publish` / `EntrustOperationalBundle` /
+//!   `RevokeOperationalBundle` / `GetTokenProvenance` are wired (**21 of 21**). Receipts stream
+//!   from the shared hub after the receive path's durable dual persist.
+//! - [`state`] — binary `State::load_from_pg` (+ `LoadStateError`). The
+//!   type is public so the binary can hold `Arc<Mutex<State>>`. **Not**
+//!   public: `new`, `update`, `serialize_for_persist`,
+//!   `update_and_snapshot_for_persist`, merkle helpers, fields,
+//!   `derive_num_pubkeys_from_smt`.
+//! - [`username`] — binary `UsernameStore::load_from_pg` (+
+//!   `LoadUsernameStoreError`). Claim/resolve stay `pub(crate)`.
+//! - [`v1`] — binary exclusive-stack boot/scanner/resume edge
+//!   (`EngineAdapter`, `ScanStackMode`, `V1ShadowMode`, boot pins,
+//!   live-digest and canary, tip reconcile and fold apply, publisher
+//!   connect and resume, §4.2 Phase-B scan hook
+//!   (`finalize_due_phase_b_adapter`), `record_scanned_block_hashes`
+//!   (durable per-height block_hash for below-tip §5.7 anchor locators),
+//!   `Bip113PreludeHeader` / `fetch_bip113_prelude_headers` /
+//!   `record_bip113_prelude_headers` / `backfill_null_block_times`
+//!   (header nTime for `[activation-10, activation)` plus NULL
+//!   `block_time` backfill so check (v) can derive BIP-113 MTP at
+//!   activation-edge inclusion heights without folding NfLog below
+//!   activation),
+//!   `db_v1::list_resumable_pending_publishes` /
+//!   `PendingPublishRow`, `enforce_stack_scan_mode`,
+//!   `claim_process_stack_from_v1_shadow_env` for `recover_inscription`).
+//!   **Kernel-API (§7.5)** for the forthcoming gRPC layer: receive
+//!   (`verify_and_begin_receive`, `execute_v1_receive`,
+//!   `finalise_publish_persist`, `commit_proved_receive`,
+//!   `resume_pending_publish` and request/outcome types), mint/send begin
+//!   (`begin_v1_mint`, `begin_v1_send`), and sign/finalise
+//!   (`durable_finalisation_with_signature`,
+//!   `finalise_with_accepted_signature`,
+//!   `finalise_accepted_prove_outside_lock`,
+//!   `register_live_pending_after_begin`, `FinaliseOutcome`,
+//!   `PendingSignEntry`, `WalletSignSubmission`, …). Sealed mint/provenance
+//!   engine sinks and process-control helpers stay non-public.
+//!   `downstream-boundary` compile-fail matrix names sealed sinks on this
+//!   module tree.
+//!   **Mesh-delivery target façade:**
+//!   [`v1::DeliveryTargetStore`] + [`v1::PaymentInvoice`] +
+//!   [`v1::DeliveryTargetStore::insert_verified_invoice`]. Kernel
+//!   `SubmitTransition` verifies `OutputTemplate.delivery` (§7.5) and fills
+//!   the store before prove; the API/SDK may still insert a verified Invoice
+//!   directly. Only `{ivpk, op_pubkey, relays}` are retained after a check.
+//! - [`self_heal`] — binary `heal_circuit_digest` / `ResetDecision`.
+//! - [`openapi`] — integration `openapi_smoke` reads `openapi_json` /
+//!   `DOCS_HTML` only; route handlers stay `pub(crate)`.
+//! - [`router`] — integration `api_remote` needs [`router::Capabilities`].
+//!   Request/response DTOs and handlers are `pub(crate)`.
+//! - [`r2_budgets`] / [`r2_probe`] — `probe_r2` binary (`ProverMode`,
+//!   `R2BudgetSet`, `budgets_for_mode` / `resolve_prover_mode`, host/run
+//!   persistence). Calibration internals are `pub(crate)`.
+//! - [`publisher`] — `recover_inscription` needs `build_reveal_only` and
+//!   the re-exported `LegacyBroadcastClient`. `EsploraConfig` and
+//!   broadcast/resume helpers are `pub(crate)`.
+//! - [`legacy_commitment_scan`] — type named only so compile-fail matrices
+//!   prove the scan cap is unconstructible; `mint_for_test` and the scan
+//!   loop are `pub(crate)` (no production mint of the cap).
+//!
+//! ## Crate-root items
+//!
+//! - [`DATABASE_URL`] — binary `main.rs` boot (`connect_and_migrate`).
+//!
+//! **Not** public (crate-internal only): `build_network_config_from_env`,
+//! `NETWORK_CONFIG`, `USERNAME_DOMAIN`, `PUBLISHER_KEY`,
+//! `PUBLISHER_ADDRESS`. `probe_r2` / `recover_inscription` read their env
+//! themselves; health/config handlers use the lazy cells via `pub(crate)`.
+//!
+//! Modules **not** on this list (`audit`, `flow`, `job_*`, `scanner*`,
+//! `prover_health`, `esplora_bound`, `persist_state_from_sync_context`, …)
+//! are `pub(crate)`.
+//!
+//! Spec: §7.5 — the node is a kernel (gRPC); public clients talk to the API
+//! layer. Capability-bound `read.account` is not “knows an address”.
 
 // Opt in to the unstable `coverage_attribute` feature only when
 // `cargo llvm-cov` defines the `coverage_nightly` cfg (it injects the
@@ -22,43 +123,55 @@
 // `program-plonky2/src/lib.rs` and `script-plonky2/src/lib.rs`. Without
 // the cfg gate the stable toolchain would refuse to compile the crate.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
-// `Account::new()` and `State::new()` are visible from the lib root
-// after the binary → bin+lib split. Clippy's `new_without_default`
-// lint did not fire while these types lived in a `bin` target — the
-// lint is library-target sensitive. Adding `Default` impls would
-// change the public API of the crate (downstream callers could pick
-// `Default::default()` over `::new()`), which is out of scope for
-// this refactor. Suppress at the crate root so the lint stays off
-// for the new lib target while the existing call sites stay
-// untouched.
+// Residual `new()` constructors remain crate-visible (`pub(crate)`) on
+// types that never got `Default`. Clippy's `new_without_default` is
+// library-target sensitive; suppress at the crate root so the lint
+// stays off while call sites keep using `::new()` rather than adding
+// a decorative `Default` impl.
 #![allow(clippy::new_without_default)]
 
 pub mod account_node;
-pub mod audit;
+/// Quarantined legacy job façades (ash‖ocr commit, …). Not §7.8 procedures.
+pub(crate) mod application;
+pub(crate) mod audit;
 pub mod db;
-pub mod flow;
-pub mod job_dispatcher;
-pub mod job_store;
+/// Node-side Esplora boundary: re-exports the `esplora-bound` facade
+/// (sole owner of `esplora-client`) and stack-gates legacy broadcast.
+/// Crate-private: external edge reaches `LegacyBroadcastClient` only via
+/// the `publisher` re-export used by `recover_inscription`.
+pub(crate) mod esplora_bound;
+pub(crate) mod flow;
+pub(crate) mod job_dispatcher;
+pub(crate) mod job_store;
+/// Transport-free kernel domain (§6.1 / §7.8). Crate-private so the
+/// public-surface allowlist does not move.
+pub(crate) mod kernel;
+/// `kernel.v1` gRPC edge (§7.8). Public for the binary env parse
+/// (`kernel_grpc_addr_from_env`); serve path is crate-private and only
+/// wired from `start_rest_node` with a shared domain façade.
+pub mod kernel_rpc;
+/// Stage-3 sealed legacy Commitment → SMT/MMR scan sink (Stage 4 deletes).
+/// Public only so compile-fail matrices can name the sealed cap type.
+pub mod legacy_commitment_scan;
 pub mod openapi;
-pub mod prover_health;
+pub(crate) mod prover_health;
 pub mod publisher;
+pub mod r2_budgets;
 pub mod r2_probe;
 pub mod router;
 pub mod runtime;
-pub mod scanner;
-pub mod scanner_runtime;
-pub mod scanner_ws;
-pub mod scanner_ws_parse;
 pub mod self_heal;
 pub mod state;
+/// Shared transport error contract + (later) HTTP/gRPC adapters.
+pub(crate) mod transport;
 pub mod username;
+/// v1.1 StateEngine adapter + exclusive stack (Stage 2/3).
+pub mod v1;
 
 use crate::publisher::EsploraConfig;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use lazy_static::lazy_static;
-use sqlx::PgPool;
 use std::str::FromStr;
-use zkcoins_program::hash::HashDigest;
 
 /// Pure builder for `NETWORK_CONFIG`. Extracted so the env-resolution
 /// logic — in particular the panic-on-missing rules below — is
@@ -82,8 +195,8 @@ use zkcoins_program::hash::HashDigest;
 ///
 /// 1. A Mainnet deployment that forgot `ESPLORA_URL` / `ESPLORA_WS_URL`
 ///    would silently scan Mutinynet and answer `/api/info` as Mainnet —
-///    visible only as a 5 s HTTP-retry loop on `scanner_runtime` with a
-///    green `/health/ready` (zk-coins/node #84).
+///    visible only as a recurring 5 s HTTP-retry loop with a green
+///    `/health/ready` (zk-coins/node #84).
 /// 2. A Mutinynet deployment that left `ESPLORA_WS_URL` unset would
 ///    couple itself to the public `wss://mutinynet.com/api/v1/ws`
 ///    endpoint we do not operate — DEV's entire WS observability would
@@ -110,11 +223,10 @@ use zkcoins_program::hash::HashDigest;
 /// ## Single source of truth
 ///
 /// `NETWORK_CONFIG.url` and `NETWORK_CONFIG.ws_url` are the only
-/// places these endpoints are read. `scanner_ws::ScannerWsConfig` is
-/// constructed via `from_network_config(&EsploraConfig)`; the
-/// publisher consumes the same struct. There is no second `env::var`
-/// path that could fall back to a hardcoded chain URL.
-pub fn build_network_config_from_env<F>(env: F) -> EsploraConfig
+/// places these endpoints are read before being supplied to runtime
+/// consumers. There is no second `env::var` path that could fall back
+/// to a hardcoded chain URL.
+pub(crate) fn build_network_config_from_env<F>(env: F) -> EsploraConfig
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -164,17 +276,28 @@ where
             "Mutinynet".to_string()
         }
     });
-    println!("Network config: {} ({}) ws={}", network_name, url, ws_url);
-    EsploraConfig {
+    let cfg = EsploraConfig {
         url,
         is_mainnet,
         network_name,
         ws_url: Some(ws_url),
-    }
+    };
+    // Read `ws_url` from the struct (sole store of ESPLORA_WS_URL after
+    // build) so the field is not a write-only residual after the legacy
+    // scanner deletion.
+    tracing::info!(
+        "Network config: {} ({}) ws={}",
+        cfg.network_name,
+        cfg.url,
+        cfg.ws_url
+            .as_deref()
+            .expect("ESPLORA_WS_URL was required above"),
+    );
+    cfg
 }
 
 lazy_static! {
-    pub static ref NETWORK_CONFIG: EsploraConfig =
+    pub(crate) static ref NETWORK_CONFIG: EsploraConfig =
         build_network_config_from_env(|k| std::env::var(k).ok());
 
     /// Domain used by the client to render `<hex|username>@<domain>`.
@@ -182,12 +305,22 @@ lazy_static! {
     /// (e.g. Mutinynet) is served from two isolated test worlds
     /// (`dev.zkcoins.app`, `zkcoins.app`) — the client needs the
     /// stage's external hostname, not the chain identifier.
-    pub static ref USERNAME_DOMAIN: String = {
-        let domain = std::env::var("USERNAME_DOMAIN").expect(
-            "USERNAME_DOMAIN env var must be set (e.g. `zkcoins.app` on PRD, \
-             `dev.zkcoins.app` on DEV) — see #95 for the cross-network rationale",
-        );
-        println!("Username domain: {}", domain);
+    pub(crate) static ref USERNAME_DOMAIN: String = {
+        // `.filter(|v| !v.trim().is_empty())` treats an empty/whitespace-only
+        // value (e.g. `USERNAME_DOMAIN=` in a compose file) as unset, same
+        // fail-closed contract as `IS_MAINNET`/`ESPLORA_URL` in
+        // `build_network_config_from_env`'s `env_or_unset` — otherwise a
+        // set-but-empty var would silently bypass `expect` and leave
+        // `USERNAME_DOMAIN = ""`.
+        let domain = std::env::var("USERNAME_DOMAIN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .expect(
+                "USERNAME_DOMAIN env var must be set (e.g. `zkcoins.app` on PRD, \
+                 `dev.zkcoins.app` on DEV) — see #95 for the cross-network rationale. \
+                 An empty or whitespace-only value is treated as unset (fail-closed).",
+            );
+        tracing::info!("Username domain: {}", domain);
         domain
     };
 
@@ -196,7 +329,7 @@ lazy_static! {
     /// placeholder was a publicly-known test key that drainer bots
     /// swept within minutes of any on-chain top-up. The matching
     /// public address is exposed by `GET /health/publisher`.
-    pub static ref PUBLISHER_KEY: String = std::env::var("PUBLISHER_KEY")
+    pub(crate) static ref PUBLISHER_KEY: String = std::env::var("PUBLISHER_KEY")
         .expect("PUBLISHER_KEY env var must be set — no default exists. \
                  Generate a 32-byte hex secret via `openssl rand -hex 32`.");
 
@@ -209,7 +342,7 @@ lazy_static! {
     /// an invalid key panics at startup, not on the first health
     /// probe. Log-only, NOT a secret (the matching key lives in
     /// `PUBLISHER_KEY`).
-    pub static ref PUBLISHER_ADDRESS: bitcoin::Address = {
+    pub(crate) static ref PUBLISHER_ADDRESS: bitcoin::Address = {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_str(&PUBLISHER_KEY)
             .expect("PUBLISHER_KEY must be a valid 32-byte hex secp256k1 secret");
@@ -221,11 +354,23 @@ lazy_static! {
     /// Postgres connection string for the state-layer. Required; the
     /// bootstrap refuses to start without it because there is no
     /// sensible default for a database URL.
+    ///
+    /// Public: binary `main.rs` is the sole external consumer
+    /// (`connect_and_migrate`). Other binaries read `DATABASE_URL` from
+    /// the environment themselves.
     pub static ref DATABASE_URL: String = {
-        std::env::var("DATABASE_URL").expect(
-            "DATABASE_URL env var must be set (e.g. \
-             postgresql://zkcoins:<pw>@postgres:5432/zkcoins)",
-        )
+        // Empty/whitespace-only is treated as unset (fail-closed), same
+        // contract as `USERNAME_DOMAIN` above and `IS_MAINNET`/`ESPLORA_URL`
+        // in `build_network_config_from_env` — a `DATABASE_URL=` line in a
+        // compose file must panic loudly, not resolve to `""`.
+        std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .expect(
+                "DATABASE_URL env var must be set (e.g. \
+                 postgresql://zkcoins:<pw>@postgres:5432/zkcoins). An empty or \
+                 whitespace-only value is treated as unset (fail-closed).",
+            )
     };
 }
 
@@ -241,25 +386,6 @@ lazy_static! {
 /// `root_index_entry` carries the freshly-inserted `mmr_root_index`
 /// row so the Phase-C write lands in the SAME Postgres transaction as
 /// the SMT/MMR/latest_block snapshot — see the doc-comment on
-/// `db::persist_state_tx` for the heal-on-restart rationale.
-pub fn persist_state_from_sync_context(
-    pool: &PgPool,
-    smt: &[u8],
-    mmr: &[u8],
-    latest_block: &[u8; 32],
-    root_index_entry: Option<(&HashDigest, &HashDigest, u64)>,
-) -> Result<(), sqlx::Error> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(db::persist_state_tx(
-            pool,
-            smt,
-            mmr,
-            latest_block,
-            root_index_entry,
-        ))
-    })
-}
-
 #[cfg(test)]
 #[path = "main_tests.rs"]
 mod tests;

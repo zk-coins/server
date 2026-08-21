@@ -1,0 +1,5 @@
+error[E0599]: no associated function or constant named `mint_for_test` found for struct `LegacyCommitmentScanCap` in the current scope
+ --> tests/ui/legacy_commitment_scan_cap_mint_unobtainable.rs:5:68
+  |
+5 |     let _ = node::legacy_commitment_scan::LegacyCommitmentScanCap::mint_for_test();
+  |                                                                    ^^^^^^^^^^^^^ associated function or constant not found in `LegacyCommitmentScanCap`

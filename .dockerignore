@@ -1,0 +1,7 @@
+# Keep the Docker build context lean: everything below is rebuilt inside the
+# image or is local dev/runtime state that must never enter the build.
+target/
+.git/
+deploy/local-e2e/data/
+deploy/local-e2e/coverage-data/
+**/*.log

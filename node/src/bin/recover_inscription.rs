@@ -25,8 +25,11 @@
 //! Required env vars:
 //!   - `PUBLISHER_KEY` — 32-byte hex secp256k1 secret, must match the
 //!     key that signed the commit.
-//!   - `IS_MAINNET` — `"true"` for `Network::Bitcoin`, anything else
-//!     resolves to `Network::Signet` (Mutinynet).
+//!   - `IS_MAINNET` — exactly `"true"` (`Network::Bitcoin`) or `"false"`
+//!     (`Network::Signet`, Mutinynet); unset or any other value panics
+//!     the binary (`resolve_network_from_env`, no "anything else falls
+//!     back to Signet" default — a typo must not silently target the
+//!     wrong chain during recovery).
 //!
 //! Optional env vars:
 //!   - `NETWORK_NAME` — log-only label.
@@ -56,11 +59,8 @@ use std::str::FromStr;
 use bitcoin::consensus::Encodable;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use bitcoin::{Address, Network, Txid};
-use esplora_client::{
-    r#async::DefaultSleeper, AsyncClient as EsploraAsyncClient, Builder as EsploraBuilder,
-};
 
-use node::publisher;
+use node::publisher::{self, LegacyBroadcastClient};
 
 #[derive(Debug)]
 struct CliArgs {
@@ -309,13 +309,17 @@ async fn run(validated: ValidatedArgs, publisher_key: String) -> Result<(), Stri
         return Ok(());
     }
 
-    // Broadcast via Esplora REST `POST /tx`. The publisher uses the
-    // same `esplora-client` crate to do exactly this on the happy
-    // path (`publisher::broadcast_inscription_txs`).
-    let builder = EsploraBuilder::new(&validated.esplora_url);
-    let client = EsploraAsyncClient::<DefaultSleeper>::from_builder(builder).map_err(|e| {
+    // Claim the process stack the same way the node binary does — from
+    // `ZKCOINS_V1_SHADOW`. Under `=1` the process is v1.1 and the guarded
+    // client refuses before any Esplora I/O. Raw `esplora-client` types are
+    // not reachable from this binary (confined to `node::esplora_bound`).
+    node::v1::claim_process_stack_from_v1_shadow_env().map_err(|e| {
+        format!("recover_inscription: failed to claim process stack from ZKCOINS_V1_SHADOW: {e}")
+    })?;
+
+    let client = LegacyBroadcastClient::connect(&validated.esplora_url).map_err(|e| {
         format!(
-            "failed to build esplora client for {}: {e}",
+            "failed to build guarded broadcast client for {}: {e}",
             validated.esplora_url
         )
     })?;

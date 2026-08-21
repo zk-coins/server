@@ -11,6 +11,7 @@ use plonky2::field::types::Field;
 use plonky2::hash::hash_types::HashOut;
 use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::plonk::config::Hasher;
+use sha2::{Digest, Sha256};
 
 use crate::F;
 
@@ -44,7 +45,11 @@ pub fn hash_bytes(bytes: &[u8]) -> HashDigest {
 
 /// Serialize a digest to exactly 32 bytes, big-endian per field element. This
 /// is the on-the-wire representation used at the Poseidon ↔ Bitcoin boundary
-/// (Schnorr message bytes, on-disk SMT storage).
+/// (Schnorr message bytes, on-disk SMT storage). Writes the RAW limb `e.0`
+/// (not a canonicalised value), so it is the exact inverse of
+/// `digest_from_bytes` for any 32-byte input — do NOT switch to
+/// `to_canonical_u64()`, that would break the round-trip for non-canonical
+/// limbs (e.g. a SHA-256 address chunk ≥ the field modulus).
 pub fn digest_to_bytes(d: &HashDigest) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (i, e) in d.elements.iter().enumerate() {
@@ -54,17 +59,35 @@ pub fn digest_to_bytes(d: &HashDigest) -> [u8; 32] {
 }
 
 /// Parse 32 bytes back into a digest. Each 8-byte chunk is interpreted as a
-/// big-endian Goldilocks element. Bytes that exceed the field modulus are
-/// reduced (`from_noncanonical_u64`) — the reduction is deterministic and
-/// inverse of `digest_to_bytes` for any digest this crate emits.
+/// big-endian Goldilocks element via `from_noncanonical_u64`, which stores the
+/// raw u64 WITHOUT reducing it. This makes `digest_to_bytes ∘ digest_from_bytes`
+/// an EXACT byte round-trip for ANY 32-byte input — including externally-
+/// supplied values (e.g. a SHA-256 address) whose 8-byte chunks exceed the
+/// field modulus. (`from_canonical_u64` would debug-panic on such chunks.)
 pub fn digest_from_bytes(bytes: &[u8; 32]) -> HashDigest {
     let mut elements = [F::ZERO; 4];
     for i in 0..4 {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&bytes[i * 8..(i + 1) * 8]);
-        elements[i] = F::from_canonical_u64(u64::from_be_bytes(buf));
+        // `from_noncanonical_u64` stores the raw u64 (no reduction): an 8-byte
+        // chunk of an externally-supplied 32-byte value (e.g. a SHA-256
+        // address) can exceed the Goldilocks modulus, on which
+        // `from_canonical_u64` would debug-panic. Storing raw keeps the byte
+        // round-trip with `digest_to_bytes` exact (see its doc).
+        elements[i] = F::from_noncanonical_u64(u64::from_be_bytes(buf));
     }
     HashOut { elements }
+}
+
+/// Account address / owner: `H(pubkey) = SHA-256(pubkey)`, per the protocol
+/// spec (`address = H(Pk₀)`, where `H` is SHA-256 for addresses / off-circuit
+/// ids). The 32-byte SHA-256 image is carried as a [`HashDigest`] via
+/// [`digest_from_bytes`] (big-endian, 4 field elements). This is the
+/// off-circuit identity hash and is distinct from the in-circuit Poseidon `H`
+/// used for Merkle/state hashing.
+pub fn sha256_to_digest(bytes: &[u8]) -> HashDigest {
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    digest_from_bytes(&digest)
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -132,5 +155,34 @@ mod tests {
         let mut almost = max.clone();
         almost[14] ^= 1;
         assert_ne!(hash_bytes(&max), hash_bytes(&almost));
+    }
+
+    #[test]
+    fn sha256_to_digest_matches_known_vector_and_distinguishes_inputs() {
+        // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        let want: [u8; 32] = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(sha256_to_digest(b"abc"), digest_from_bytes(&want));
+        assert_ne!(sha256_to_digest(b"abc"), sha256_to_digest(b"abd"));
+        assert_eq!(sha256_to_digest(b"abc"), sha256_to_digest(b"abc"));
+    }
+
+    #[test]
+    fn digest_byte_round_trip_holds_for_non_canonical_chunks() {
+        // An externally-supplied 32-byte value (e.g. a SHA-256 address) can
+        // carry an 8-byte big-endian chunk >= the Goldilocks modulus.
+        // `digest_from_bytes` MUST use `from_noncanonical_u64` (store the raw
+        // u64) so the byte round-trip is exact — `from_canonical_u64` would
+        // debug-panic / lose bytes, and `digest_to_bytes` MUST write the raw
+        // limb (`e.0`), not a canonicalised value. Pins both contracts.
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&u64::MAX.to_be_bytes()); // >= modulus
+        bytes[8..16].copy_from_slice(&0xFFFF_FFFF_0000_0001u64.to_be_bytes());
+        bytes[16..24].copy_from_slice(&1u64.to_be_bytes());
+        bytes[24..32].copy_from_slice(&7u64.to_be_bytes());
+        assert_eq!(digest_to_bytes(&digest_from_bytes(&bytes)), bytes);
     }
 }

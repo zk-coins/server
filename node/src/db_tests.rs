@@ -14,7 +14,17 @@
 
 use super::*;
 use crate::test_db::setup_pool;
+use crate::v1::{claim_stack_scan_mode, ScanStackMode};
 use sqlx::Row;
+
+/// Claim the legacy stack marker so `persist_state_tx` / related writers
+/// pass the in-transaction capability check (boot does this via
+/// `enforce_stack_scan_mode` in production).
+async fn claim_legacy_stack(pool: &sqlx::PgPool) {
+    claim_stack_scan_mode(pool, ScanStackMode::Legacy)
+        .await
+        .expect("claim legacy stack for test");
+}
 
 #[tokio::test]
 async fn connect_and_migrate_creates_all_tables() {
@@ -79,6 +89,34 @@ async fn connect_and_migrate_creates_all_tables() {
     //   * After 0018 (asset_creators):   25 tables + 1 view (the
     //     off-circuit per-asset creator binding — sorts between
     //     `accounts` and `block_log`.)
+    //   * After 0019 (v1 persistence): 31 tables + 1 view (additive
+    //     NfLog / CoinHist / multi-asset account tables; created as
+    //     historical `v11_*`, renamed to `v1_*` by 0027).
+    //   * After 0020 (stack_scan_mode):  32 tables + 1 view (exclusive
+    //     legacy vs v1 scan-stack claim for Cutover Stage 2).
+    //   * After 0021 (pending_publishes): 33 tables + 1 view
+    //     (durable AggregateStateNullifierV3 rebroadcast intent).
+    //   * After 0023 (op_secret): ALTER-only.
+    //   * After 0024 (self_heal_reset_meta): 34 tables + 1 view
+    //     (self-heal reset-generation fence for job-advancing writes).
+    //   * After 0025 (jobs kind attest_balance): ALTER-only.
+    //   * After 0026 (r2 probe columns): ALTER + view recreate
+    //     (no new table names; prover_mode / shape columns on runs).
+    //   * After 0027 (rename v11_* → v1_*): same count; renames stack
+    //     tables/indexes + stack_scan_mode / prover_mode labels.
+    //   * After 0029 (jobs kind receive): ALTER-only.
+    //   * After 0030 (v1 inscriptions catalog): +2 tables
+    //     (`v1_inscriptions`, `v1_inscription_members`).
+    //   * After 0031 (v1 decrypt index): +1 table (`v1_decrypt_index`).
+    //   * After 0032 (v1 delivery outbox): +1 table (`v1_delivery_outbox`).
+    //   * After 0033 (v1 SDR Phase A): +1 table (`v1_sdr_phase_a`).
+    //   * After 0036 (v1 self-delivery index): +1 table
+    //     (`v1_self_delivery_index`).
+    //   * After 0037 (token provenance): +1 table (`token_provenance`).
+    //   * After 0038 (v1 mint terms staging): +1 table
+    //     (`v1_mint_terms_staging`; the durable begin→finalise bridge for
+    //     the raw mint IssuanceTerms — sorts between `v1_inscriptions` and
+    //     `v1_nflog_entries`).
     assert_eq!(
         names,
         vec![
@@ -90,6 +128,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "boot_log".to_string(),
             "circuit_digest_meta".to_string(),
             "coin_proof_store".to_string(),
+            "derived_state_epoch_meta".to_string(),
             "error_log".to_string(),
             "esplora_log".to_string(),
             "jobs".to_string(),
@@ -103,11 +142,28 @@ async fn connect_and_migrate_creates_all_tables() {
             "r2_probe_runs_summary".to_string(),
             "r2_probe_warm_calls".to_string(),
             "request_log".to_string(),
+            "self_heal_reset_meta".to_string(),
             "smt_state".to_string(),
+            "stack_scan_mode".to_string(),
             "state_update_log".to_string(),
+            "token_provenance".to_string(),
             "tx_mining_log".to_string(),
             "username_claim_log".to_string(),
             "usernames".to_string(),
+            "v1_accounts".to_string(),
+            "v1_decrypt_index".to_string(),
+            "v1_delivery_outbox".to_string(),
+            "v1_engine_meta".to_string(),
+            "v1_inscription_members".to_string(),
+            "v1_inscriptions".to_string(),
+            "v1_mint_terms_staging".to_string(),
+            "v1_nflog_entries".to_string(),
+            "v1_nullifier_index".to_string(),
+            "v1_pending_publishes".to_string(),
+            "v1_sdr_phase_a".to_string(),
+            "v1_self_delivery_index".to_string(),
+            "v1_spendable_coins".to_string(),
+            "v1_spent_coins".to_string(),
         ]
     );
 }
@@ -140,6 +196,7 @@ async fn load_latest_block_returns_none_initially() {
 async fn persist_state_tx_writes_smt_mmr_block_atomically() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let smt = vec![0xAAu8; 64];
     let mmr = vec![0xBBu8; 128];
     let block = [0xCCu8; 32];
@@ -156,6 +213,7 @@ async fn persist_state_tx_writes_smt_mmr_block_atomically() {
 async fn persist_state_tx_is_idempotent_on_conflict() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let smt1 = vec![1u8; 16];
     let mmr1 = vec![2u8; 16];
     let block1 = [3u8; 32];
@@ -185,6 +243,7 @@ async fn persist_state_tx_writes_root_index_in_same_transaction() {
     // story. This test asserts all four landed from one call.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let smt = vec![0xAAu8; 64];
     let mmr = vec![0xBBu8; 128];
     let block = [0xCCu8; 32];
@@ -207,13 +266,14 @@ async fn persist_state_tx_root_index_on_conflict_does_nothing() {
     // Re-scanning the same commit tx after a crash MUST be a no-op on
     // the root_index row — `update()` is replayed against the same
     // unchanged MMR and the (prev_mmr_root, smt_root, leaf_index)
-    // tuple is identical, so `ON CONFLICT (prev_mmr_root) DO NOTHING`
+    // tuple is identical, so `ON CONFLICT (state_epoch, prev_mmr_root) DO NOTHING`
     // keeps the original row authoritative. Belt-and-braces: the
     // second call's `smt_root` differs to prove that the conflict
     // branch genuinely takes the DO NOTHING path (otherwise the row
     // would be silently mutated).
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let smt = vec![1u8; 16];
     let mmr = vec![2u8; 16];
     let block = [3u8; 32];
@@ -291,6 +351,7 @@ async fn load_all_accounts_returns_empty_initially() {
 async fn upsert_account_inserts_then_updates() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     // 64-byte composite (owner||asset_id) account key (Model B).
     let addr = vec![0xAAu8; 64];
     upsert_account(&pool, &addr, b"first").await.unwrap();
@@ -329,9 +390,10 @@ async fn store_circuit_digest_inserts_then_updates_on_conflict() {
 }
 
 #[tokio::test]
-async fn reset_proof_dependent_state_tx_wipes_state_and_stores_digest() {
+async fn reset_proof_dependent_state_tx_archives_state_and_stores_digest() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
 
     // Seed every table the reset touches.
     upsert_account(&pool, &[9u8; 64], b"acct").await.unwrap();
@@ -357,7 +419,7 @@ async fn reset_proof_dependent_state_tx_wipes_state_and_stores_digest() {
 
     reset_proof_dependent_state_tx(&pool, b"NEW").await.unwrap();
 
-    // All proof-dependent state gone, new digest stored, atomically.
+    // The new canonical epoch is empty and the new digest is stored atomically.
     assert!(load_all_accounts(&pool).await.unwrap().is_empty());
     assert_eq!(load_smt(&pool).await.unwrap(), None);
     assert_eq!(load_mmr(&pool).await.unwrap(), None);
@@ -366,6 +428,25 @@ async fn reset_proof_dependent_state_tx_wipes_state_and_stores_digest() {
     assert_eq!(
         load_circuit_digest(&pool).await.unwrap(),
         Some(b"NEW".to_vec())
+    );
+
+    // Data permanence: rows from the prior epoch remain physically stored.
+    let (account_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (smt_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM smt_state")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (mmr_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mmr_state")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(account_rows >= 1, "archived accounts must remain stored");
+    assert!(
+        smt_rows >= 1 || mmr_rows >= 1,
+        "at least one archived state snapshot must remain stored"
     );
 }
 
@@ -376,6 +457,7 @@ async fn reset_proof_dependent_state_tx_overwrites_existing_digest_row() {
     // before, so a row is present).
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     store_circuit_digest(&pool, b"PREEXISTING").await.unwrap();
     reset_proof_dependent_state_tx(&pool, b"AFTER-RESET")
         .await
@@ -390,6 +472,7 @@ async fn reset_proof_dependent_state_tx_overwrites_existing_digest_row() {
 async fn load_all_accounts_returns_all_inserted() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let a1 = vec![0x01u8; 64];
     let a2 = vec![0x02u8; 64];
     let a3 = vec![0x03u8; 64];
@@ -468,14 +551,26 @@ async fn resolve_username_returns_none_for_unknown() {
 
 #[tokio::test]
 async fn connect_and_migrate_propagates_connect_failure() {
-    // Bogus port → connect() fails fast (no Postgres listening) and
-    // the error propagates via `?`. Exercises the otherwise-unreached
-    // error branch in `connect_and_migrate`.
-    let err = connect_and_migrate("postgres://postgres:postgres@127.0.0.1:1/postgres")
-        .await
-        .expect_err("expected connect failure");
+    // Unresolvable host + explicit libpq `connect_timeout` so the error
+    // path fails in seconds rather than hanging on OS TCP blackholes
+    // (seen with low-numbered ports on some macOS/Docker setups where
+    // `127.0.0.1:1` never surfaces a refused connection to sqlx).
+    // Exercises the otherwise-unreached error branch in
+    // `connect_and_migrate`.
+    let err = connect_and_migrate(
+        "postgres://postgres:postgres@invalid.invalid:5432/postgres?connect_timeout=2",
+    )
+    .await
+    .expect_err("expected connect failure");
     assert!(
-        matches!(err, sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut),
+        matches!(
+            err,
+            sqlx::Error::Io(_)
+                | sqlx::Error::PoolTimedOut
+                | sqlx::Error::Tls(_)
+                | sqlx::Error::Protocol(_)
+                | sqlx::Error::Configuration(_)
+        ),
         "unexpected: {:?}",
         err
     );
@@ -492,6 +587,7 @@ async fn connect_and_migrate_propagates_connect_failure() {
 async fn commit_mint_tx_upserts_every_account_atomically() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let addr_a = [0xAAu8; 64];
     let data_a = vec![0xA1u8; 8];
     let addr_b = [0xBBu8; 64];
@@ -513,7 +609,7 @@ async fn commit_mint_tx_upserts_every_account_atomically() {
 }
 
 /// Second call with the same address overwrites the prior payload via
-/// the `ON CONFLICT (address) DO UPDATE` branch. Exercises the
+/// the `ON CONFLICT (state_epoch, address) DO UPDATE` branch. Exercises the
 /// idempotent-replay shape the post-Phase-D mint flow relies on (a
 /// concurrent receive between the snapshot and the commit will retry
 /// with the latest serialized Account on the next mint).
@@ -521,6 +617,7 @@ async fn commit_mint_tx_upserts_every_account_atomically() {
 async fn commit_mint_tx_is_idempotent_on_conflict() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let addr = [0xCCu8; 64];
     let first = vec![0x01u8; 16];
     let second = vec![0x02u8; 24];
@@ -543,6 +640,7 @@ async fn commit_mint_tx_is_idempotent_on_conflict() {
 async fn commit_mint_tx_with_empty_accounts_is_noop() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     commit_mint_tx(&pool, &[])
         .await
         .expect("empty commit must succeed");
@@ -609,6 +707,7 @@ async fn pending_inscription_status_by_commit_txid_returns_none_for_unknown_txid
 async fn pending_inscription_status_by_commit_txid_returns_current_status() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0xCDu8; 32];
     let reveal_txid = [0xCEu8; 32];
     let commitment = b"test-commitment";
@@ -659,6 +758,8 @@ async fn pending_inscription_status_by_commit_txid_returns_current_status() {
 /// Helper: insert a `pending_inscriptions` row in the given starting
 /// status so the atomic-tx tests can exercise the mark-complete step.
 async fn seed_pending_row(pool: &PgPool, commit_txid: &[u8], status: &str) {
+    claim_legacy_stack(pool).await;
+
     // Synthetic reveal txid for tests — not derived from the seed
     // bytes since this helper is only used to drive the status state
     // machine, not the reveal-txid lookup.
@@ -687,6 +788,7 @@ async fn persist_state_and_mark_complete_tx_writes_state_and_advances_row() {
     // untouched (the scanner is the only legitimate writer).
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0x55u8; 32];
     seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
 
@@ -727,6 +829,7 @@ async fn persist_state_and_mark_complete_tx_preserves_existing_latest_block() {
     // for SMT/MMR/root_index/pending_inscriptions only.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let scanner_block = [0x77u8; 32];
     persist_state_tx(&pool, b"old-smt", b"old-mmr", &scanner_block, None)
         .await
@@ -761,6 +864,7 @@ async fn persist_state_and_mark_complete_tx_accepts_no_root_index() {
     // mmr_root_index table stays empty, no error, latest_block untouched.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0x88u8; 32];
     seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
 
@@ -803,6 +907,7 @@ async fn persist_state_and_mark_complete_tx_rollback_on_failure_leaves_state_unt
     // SMT/MMR back.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0x99u8; 32];
     seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
 
@@ -873,6 +978,7 @@ async fn persist_state_and_mark_complete_tx_idempotent_on_already_complete_row()
     // error caused the caller to retry.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0xAAu8; 32];
     seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
 
@@ -965,59 +1071,18 @@ async fn insert_request_log_writes_row() {
 }
 
 #[tokio::test]
-async fn insert_esplora_log_writes_row() {
-    let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let entry = EsploraLogEntry {
-        direction: "outbound_http",
-        method: Some("POST".into()),
-        url: "http://example/tx".into(),
-        request_body: Some(b"raw".to_vec()),
-        response_status: Some(200),
-        response_body: Some(b"ok".to_vec()),
-        duration_us: Some(42),
-        trigger_source: Some("mint".into()),
-        triggering_request_log_id: None,
-    };
-    insert_esplora_log(&pool, &entry).await.unwrap();
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM esplora_log")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(count, 1);
-}
-
-#[tokio::test]
-async fn insert_error_log_writes_row() {
-    let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let entry = ErrorLogEntry {
-        severity: "error",
-        source: "publisher::broadcast".into(),
-        message: "broadcast failed".into(),
-        error_chain: Some("io: connection refused".into()),
-        request_log_id: None,
-    };
-    insert_error_log(&pool, &entry).await.unwrap();
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM error_log")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(count, 1);
-}
-
-#[tokio::test]
-async fn insert_block_log_writes_row_and_is_idempotent() {
+async fn insert_block_log_reobservation_keeps_single_row() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     let entry = BlockLogEntry {
+        block_time: Some(1_700_000_000),
         block_hash: vec![0x11; 32],
         block_height: Some(7),
         inscription_count: 2,
         processing_duration_us: Some(99),
     };
     insert_block_log(&pool, &entry).await.unwrap();
-    // ON CONFLICT (block_hash) DO NOTHING — second insert is a no-op.
+    // Re-observation refreshes the existing row rather than creating a duplicate.
     insert_block_log(&pool, &entry).await.unwrap();
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM block_log")
         .fetch_one(&pool)
@@ -1027,120 +1092,233 @@ async fn insert_block_log_writes_row_and_is_idempotent() {
 }
 
 #[tokio::test]
-async fn insert_observed_inscription_and_mark_integrated() {
+async fn insert_block_log_a_b_a_reobservation_restores_latest_canonical_block() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
-    let commit_txid = vec![0x22; 32];
-    let entry = ObservedInscriptionEntry {
-        commit_txid: commit_txid.clone(),
-        block_hash: Some(vec![0x33; 32]),
-        block_height: Some(42),
-        source: "external",
-        commitment: vec![0xAA; 145],
-        public_key: vec![0x03; 33],
-        integrated: false,
+    let block_a = BlockLogEntry {
+        block_time: Some(1_700_000_100),
+        block_hash: vec![0xAA; 32],
+        block_height: Some(100),
+        inscription_count: 0,
+        processing_duration_us: None,
     };
-    insert_observed_inscription(&pool, &entry).await.unwrap();
-    // Idempotent ON CONFLICT — second insert is a no-op.
-    insert_observed_inscription(&pool, &entry).await.unwrap();
+    let block_b = BlockLogEntry {
+        block_time: Some(1_700_000_200),
+        block_hash: vec![0xBB; 32],
+        block_height: Some(100),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
 
-    // Pre-flip: integrated=false, integrated_at IS NULL.
-    let (pre_integrated,): (bool,) =
-        sqlx::query_as("SELECT integrated FROM observed_inscriptions WHERE commit_txid = $1")
-            .bind(&commit_txid[..])
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(!pre_integrated);
+    insert_block_log(&pool, &block_a).await.unwrap();
+    insert_block_log(&pool, &block_b).await.unwrap();
+    insert_block_log(&pool, &block_a).await.unwrap();
 
-    mark_observed_inscription_integrated(&pool, &commit_txid)
+    assert_eq!(
+        load_block_hash_at_height(&pool, 100).await.unwrap(),
+        Some([0xAA; 32])
+    );
+    assert_eq!(
+        load_block_time_at_height(&pool, 100).await.unwrap(),
+        Some(1_700_000_100)
+    );
+}
+
+#[tokio::test]
+async fn insert_block_log_reinsert_backfills_null_block_time_without_overwrite() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let mut entry = BlockLogEntry {
+        block_time: None,
+        block_hash: vec![0xCC; 32],
+        block_height: Some(101),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+
+    insert_block_log(&pool, &entry).await.unwrap();
+    entry.block_time = Some(1_700_000_300);
+    insert_block_log(&pool, &entry).await.unwrap();
+    assert_eq!(
+        load_block_time_at_height(&pool, 101).await.unwrap(),
+        Some(1_700_000_300)
+    );
+
+    entry.block_time = Some(1_700_000_400);
+    insert_block_log(&pool, &entry).await.unwrap();
+    assert_eq!(
+        load_block_time_at_height(&pool, 101).await.unwrap(),
+        Some(1_700_000_300),
+        "a real block_time observation must never be overwritten"
+    );
+}
+
+#[tokio::test]
+async fn fill_null_block_time_does_not_let_orphan_win_height() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let canonical = BlockLogEntry {
+        block_time: Some(1_700_000_500),
+        block_hash: vec![0xAA; 32],
+        block_height: Some(95),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+    let orphan = BlockLogEntry {
+        block_time: None,
+        block_hash: vec![0xBB; 32],
+        block_height: Some(95),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+    insert_block_log(&pool, &orphan).await.unwrap();
+    insert_block_log(&pool, &canonical).await.unwrap();
+    assert_eq!(
+        load_block_hash_at_height(&pool, 95).await.unwrap(),
+        Some([0xAA; 32]),
+        "canonical re-observation must win the height before backfill"
+    );
+
+    fill_null_block_time(&pool, &orphan.block_hash, 1_700_000_600)
         .await
         .unwrap();
 
-    // Post-flip: both columns advanced; the logical-pair CHECK from 0010
-    // would have rejected a half-update.
-    let (post_integrated, has_ts): (bool, bool) = sqlx::query_as(
-        "SELECT integrated, integrated_at IS NOT NULL FROM observed_inscriptions WHERE commit_txid = $1",
+    assert_eq!(
+        load_block_hash_at_height(&pool, 95).await.unwrap(),
+        Some([0xAA; 32]),
+        "NULL-time backfill must not bump processed_at and steal the height"
+    );
+    assert_eq!(
+        load_block_time_at_height(&pool, 95).await.unwrap(),
+        Some(1_700_000_500),
+        "height lookup must still read the canonical nTime"
+    );
+}
+
+async fn insert_block_time_fixture(pool: &sqlx::PgPool, height: u64, block_time: Option<i64>) {
+    insert_block_log(
+        pool,
+        &BlockLogEntry {
+            block_time,
+            block_hash: vec![u8::try_from(height).unwrap(); 32],
+            block_height: Some(i64::try_from(height).unwrap()),
+            inscription_count: 0,
+            processing_duration_us: None,
+        },
     )
-    .bind(&commit_txid[..])
-    .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(post_integrated);
-    assert!(has_ts);
-
-    // Second flip is a no-op (WHERE integrated = FALSE filter).
-    mark_observed_inscription_integrated(&pool, &commit_txid)
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
-async fn insert_state_update_log_writes_row() {
+async fn load_median_time_past_full_eleven_block_window() {
     let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let entry = StateUpdateLogEntry {
-        trigger_source: "mint",
-        commit_txid: Some(vec![0x44; 32]),
-        prev_mmr_root: vec![0x55; 32],
-        new_mmr_root: vec![0x66; 32],
-        smt_root_before: vec![0x77; 32],
-        smt_root_after: vec![0x88; 32],
-        commitment_count: 1,
-    };
-    insert_state_update_log(&pool, &entry).await.unwrap();
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM state_update_log")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(count, 1);
+    let times = [11, 2, 9, 4, 8, 6, 7, 5, 3, 10, 1];
+    for (height, block_time) in (90_u64..=100).zip(times) {
+        insert_block_time_fixture(&scope.pool, height, Some(block_time)).await;
+    }
+
+    assert_eq!(
+        load_median_time_past(&scope.pool, 100).await.unwrap(),
+        Some(6)
+    );
 }
 
 #[tokio::test]
-async fn insert_account_history_writes_row_directly() {
+async fn load_median_time_past_truncated_near_genesis_window() {
     let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let entry = AccountHistoryEntry {
-        address: vec![0x99; 32],
-        prev_data: None,
-        new_data: b"new-blob".to_vec(),
-        source: "recovery",
-        triggering_commit_txid: None,
-        triggering_request_log_id: None,
-    };
-    insert_account_history(&pool, &entry).await.unwrap();
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM account_history")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(count, 1);
+    for (height, block_time) in [40, 10, 30, 20].into_iter().enumerate() {
+        insert_block_time_fixture(&scope.pool, height as u64, Some(block_time)).await;
+    }
+
+    // Sorted values are [10, 20, 30, 40]; Bitcoin Core selects index len/2.
+    assert_eq!(
+        load_median_time_past(&scope.pool, 3).await.unwrap(),
+        Some(30)
+    );
 }
 
 #[tokio::test]
-async fn insert_username_claim_log_writes_row() {
+async fn load_median_time_past_missing_window_row_returns_none() {
     let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let entry = UsernameClaimLogEntry {
-        requested_username: "Alice".into(),
-        normalized_username: "alice".into(),
-        address: vec![0xAA; 32],
-        signature: vec![0xBB; 64],
-        success: true,
-        reject_reason: None,
-        request_log_id: None,
-    };
-    insert_username_claim_log(&pool, &entry).await.unwrap();
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM username_claim_log")
-        .fetch_one(&pool)
+    for height in 90_u64..=100 {
+        if height != 95 {
+            insert_block_time_fixture(&scope.pool, height, Some(height as i64)).await;
+        }
+    }
+
+    assert_eq!(load_median_time_past(&scope.pool, 100).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn load_median_time_past_null_window_timestamp_returns_none() {
+    let scope = setup_pool().await;
+    for height in 90_u64..=100 {
+        let block_time = (height != 95).then_some(height as i64);
+        insert_block_time_fixture(&scope.pool, height, block_time).await;
+    }
+
+    assert_eq!(load_median_time_past(&scope.pool, 100).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn load_median_time_past_sorts_out_of_order_inserts() {
+    let scope = setup_pool().await;
+    let rows = [
+        (100, 11),
+        (90, 2),
+        (99, 9),
+        (91, 4),
+        (98, 8),
+        (92, 6),
+        (97, 7),
+        (93, 5),
+        (96, 3),
+        (94, 10),
+        (95, 1),
+    ];
+    for (height, block_time) in rows {
+        insert_block_time_fixture(&scope.pool, height, Some(block_time)).await;
+    }
+
+    assert_eq!(
+        load_median_time_past(&scope.pool, 100).await.unwrap(),
+        Some(6)
+    );
+}
+
+#[tokio::test]
+async fn insert_block_log_round_trips_some_and_none_block_time() {
+    let scope = setup_pool().await;
+    insert_block_time_fixture(&scope.pool, 7, Some(1_700_000_007)).await;
+    insert_block_time_fixture(&scope.pool, 8, None).await;
+
+    assert_eq!(
+        load_block_time_at_height(&scope.pool, 7).await.unwrap(),
+        Some(1_700_000_007)
+    );
+    assert_eq!(
+        load_block_time_at_height(&scope.pool, 8).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn block_log_negative_block_time_is_rejected_as_decode_error() {
+    let scope = setup_pool().await;
+    insert_block_time_fixture(&scope.pool, 9, Some(-1)).await;
+
+    let err = load_block_time_at_height(&scope.pool, 9)
         .await
-        .unwrap();
-    assert_eq!(count, 1);
+        .expect_err("negative stored header time must be rejected");
+    assert!(matches!(err, sqlx::Error::Decode(_)), "got {err:?}");
 }
 
 #[tokio::test]
 async fn insert_tx_mining_log_writes_row() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     // The 0010 FK from `tx_mining_log.commit_txid` to
     // `pending_inscriptions(commit_txid)` requires the parent row first.
     let commit_txid = [0xCC; 32];
@@ -1195,6 +1373,7 @@ async fn insert_boot_log_writes_row() {
 async fn update_pending_failure_reason_records_error_without_changing_status() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0x77; 32];
     let reveal_txid = [0x78; 32];
     insert_pending_inscription(
@@ -1232,6 +1411,7 @@ async fn update_pending_failure_reason_records_error_without_changing_status() {
 async fn upsert_account_with_source_tags_history_via_trigger() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     // The `accounts.address` is the 64-byte composite owner||asset_id
     // key (Model B). The history-capture trigger writes only the 32-byte
     // OWNER prefix into `account_history.address`, so the history queries
@@ -1282,6 +1462,7 @@ async fn get_inscription_summary_returns_none_for_unknown_txid() {
 async fn get_inscription_summary_returns_full_row() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     let commit_txid = [0x12; 32];
     let reveal_txid = [0x34; 32];
     insert_pending_inscription(
@@ -1335,6 +1516,7 @@ async fn load_pending_in_progress_rejects_invalid_kind_in_row() {
     // `sqlx::Error::Decode`.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     sqlx::query(
         "ALTER TABLE pending_inscriptions DROP CONSTRAINT pending_inscriptions_status_check",
     )
@@ -1371,6 +1553,7 @@ async fn get_inscription_summary_rejects_invalid_kind_in_row() {
     // the `GET /api/inscriptions/:txid` handler.
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
+    claim_legacy_stack(&pool).await;
     sqlx::query(
         "ALTER TABLE pending_inscriptions DROP CONSTRAINT pending_inscriptions_status_check",
     )
@@ -1404,294 +1587,4 @@ async fn get_inscription_summary_rejects_invalid_kind_in_row() {
 
 // ---- list_account_history (issue #153) ------------------------------------
 
-/// Insert a synthetic `account_history` row directly so the test can
-/// pin the timestamp ordering without racing the trigger-driven path.
-async fn plant_history_row(
-    pool: &PgPool,
-    address: &[u8],
-    source: &str,
-    new_balance: u64,
-    seconds_ago: i64,
-) {
-    use crate::account_node::Account;
-    let mut a = Account::new();
-    a.balance = new_balance;
-    let new_data = bincode::serialize(&a).expect("serialize account");
-    sqlx::query(
-        "INSERT INTO account_history \
-         (address, prev_data, new_data, source, changed_at) \
-         VALUES ($1, NULL, $2, $3, NOW() - ($4 || ' seconds')::INTERVAL)",
-    )
-    .bind(address)
-    .bind(&new_data)
-    .bind(source)
-    .bind(seconds_ago.to_string())
-    .execute(pool)
-    .await
-    .expect("insert account_history row");
-}
-
-#[tokio::test]
-async fn list_account_history_empty_returns_zero_total() {
-    let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let address = [0xaau8; 32];
-    let (rows, total) = list_account_history(&pool, &address[..], 50, 0)
-        .await
-        .expect("list returns Ok");
-    assert!(rows.is_empty());
-    assert_eq!(total, 0);
-}
-
-#[tokio::test]
-async fn list_account_history_orders_newest_first_and_paginates() {
-    let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let address = [0xbbu8; 32];
-    // Plant rows at 30 s, 20 s, 10 s ago — list must order
-    // newest-first (10 s, 20 s, 30 s).
-    plant_history_row(&pool, &address[..], "mint", 100, 30).await;
-    plant_history_row(&pool, &address[..], "receive", 200, 20).await;
-    plant_history_row(&pool, &address[..], "send", 150, 10).await;
-
-    let (page, total) = list_account_history(&pool, &address[..], 50, 0)
-        .await
-        .unwrap();
-    assert_eq!(total, 3);
-    assert_eq!(page.len(), 3);
-    assert_eq!(page[0].source, "send", "newest first");
-    assert_eq!(page[1].source, "receive");
-    assert_eq!(page[2].source, "mint");
-
-    // Limit + offset
-    let (page, total) = list_account_history(&pool, &address[..], 1, 1)
-        .await
-        .unwrap();
-    assert_eq!(page.len(), 1);
-    assert_eq!(page[0].source, "receive");
-    assert_eq!(total, 3, "total stays consistent across pages");
-
-    // Offset past total
-    let (page, total) = list_account_history(&pool, &address[..], 10, 99)
-        .await
-        .unwrap();
-    assert!(page.is_empty());
-    assert_eq!(
-        total, 3,
-        "empty page still surfaces the real total (no second-query branch needed)"
-    );
-
-    // Other address never appears.
-    let other = [0xccu8; 32];
-    let (page, total) = list_account_history(&pool, &other[..], 10, 0)
-        .await
-        .unwrap();
-    assert!(page.is_empty());
-    assert_eq!(total, 0);
-}
-
-#[tokio::test]
-async fn list_account_history_surfaces_blob_and_metadata() {
-    let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let address = [0xddu8; 32];
-    plant_history_row(&pool, &address[..], "mint", 12_345, 1).await;
-    let (rows, total) = list_account_history(&pool, &address[..], 10, 0)
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(total, 1);
-    let row = &rows[0];
-    assert_eq!(row.source, "mint");
-    assert!(row.prev_data.is_none(), "first INSERT has no prev_data");
-    assert!(row.commit_txid.is_none());
-    assert!(row.block_height.is_none());
-    assert!(row.pending_status.is_none());
-    assert!(row.timestamp_secs > 0, "timestamp epoch derived");
-    // new_data round-trips through bincode -> Account
-    let decoded: crate::account_node::Account =
-        bincode::deserialize(&row.new_data).expect("decode Account");
-    assert_eq!(decoded.balance, 12_345);
-}
-
-#[tokio::test]
-async fn list_account_history_filters_scanner_and_recovery_in_sql() {
-    // Scanner / recovery rows must be filtered in SQL — pushing the
-    // filter into the query is what keeps `total` and the page length
-    // honest (a post-fetch filter on the page would drop rows AFTER the
-    // LIMIT and break pagination math). Issue #153 round-2 review fix.
-    let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let address = [0xeeu8; 32];
-    plant_history_row(&pool, &address[..], "scanner", 50, 50).await;
-    plant_history_row(&pool, &address[..], "mint", 100, 40).await;
-    plant_history_row(&pool, &address[..], "recovery", 110, 30).await;
-    plant_history_row(&pool, &address[..], "send", 90, 20).await;
-    plant_history_row(&pool, &address[..], "receive", 200, 10).await;
-
-    let (rows, total) = list_account_history(&pool, &address[..], 50, 0)
-        .await
-        .unwrap();
-    assert_eq!(
-        total, 3,
-        "total = filtered count (mint + send + receive), excludes scanner/recovery"
-    );
-    assert_eq!(rows.len(), 3);
-    let sources: Vec<&str> = rows.iter().map(|r| r.source.as_str()).collect();
-    // Newest-first ordering preserved within the filter.
-    assert_eq!(sources, vec!["receive", "send", "mint"]);
-    assert!(
-        sources
-            .iter()
-            .all(|s| matches!(*s, "mint" | "send" | "receive")),
-        "no scanner / recovery rows leak past the SQL filter"
-    );
-}
-
 // ---- get_account_history_item (tx-detail endpoint) -------------------------
-
-#[tokio::test]
-async fn get_account_history_item_fetches_scoped_row_with_inscription_join() {
-    let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let address = [0x1au8; 32];
-    let commit_txid = [0x77u8; 32];
-
-    // Plant an account_history row that carries a commit_txid, plus the
-    // matching pending_inscriptions row (commit_output_value = 12_345 via
-    // `seed_pending_row`) so the detail-only join column lights up.
-    let mut a = crate::account_node::Account::new();
-    a.balance = 9_000;
-    let new_data = bincode::serialize(&a).expect("serialize account");
-    let (id,): (i64,) = sqlx::query_as(
-        "INSERT INTO account_history \
-         (address, prev_data, new_data, source, triggering_commit_txid) \
-         VALUES ($1, NULL, $2, 'mint', $3) RETURNING id",
-    )
-    .bind(&address[..])
-    .bind(&new_data)
-    .bind(&commit_txid[..])
-    .fetch_one(&pool)
-    .await
-    .expect("insert history row");
-    seed_pending_row(&pool, &commit_txid, PENDING_STATUS_REVEAL_BROADCAST).await;
-
-    let row = get_account_history_item(&pool, &address[..], id)
-        .await
-        .expect("query ok")
-        .expect("row found");
-    assert_eq!(row.id, id);
-    assert_eq!(row.source, "mint");
-    assert_eq!(row.commit_txid.as_deref(), Some(&commit_txid[..]));
-    assert_eq!(
-        row.commit_output_value,
-        Some(12_345),
-        "detail query surfaces pending_inscriptions.commit_output_value"
-    );
-    assert_eq!(row.pending_status.as_deref(), Some("reveal_broadcast"));
-    let decoded: crate::account_node::Account =
-        bincode::deserialize(&row.new_data).expect("decode Account");
-    assert_eq!(decoded.balance, 9_000);
-}
-
-#[tokio::test]
-async fn get_account_history_item_scopes_by_address_and_filters_internal() {
-    let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let address = [0x2bu8; 32];
-    let other = [0x3cu8; 32];
-
-    plant_history_row(&pool, &address[..], "mint", 100, 10).await;
-    plant_history_row(&pool, &address[..], "scanner", 110, 5).await;
-    let (rows, _) = list_account_history(&pool, &address[..], 10, 0)
-        .await
-        .unwrap();
-    let mint_id = rows[0].id;
-
-    // Fetch with the right address — found.
-    assert!(get_account_history_item(&pool, &address[..], mint_id)
-        .await
-        .unwrap()
-        .is_some());
-    // Same id, different address — scoped out (IDOR guard).
-    assert!(get_account_history_item(&pool, &other[..], mint_id)
-        .await
-        .unwrap()
-        .is_none());
-    // Unknown id — None.
-    assert!(
-        get_account_history_item(&pool, &address[..], mint_id + 9_999)
-            .await
-            .unwrap()
-            .is_none()
-    );
-
-    // The scanner row exists in the table but is internal — fetch its id
-    // directly and assert the item query refuses to surface it.
-    let (scanner_id,): (i64,) =
-        sqlx::query_as("SELECT id FROM account_history WHERE address = $1 AND source = 'scanner'")
-            .bind(&address[..])
-            .fetch_one(&pool)
-            .await
-            .expect("scanner row id");
-    assert!(get_account_history_item(&pool, &address[..], scanner_id)
-        .await
-        .unwrap()
-        .is_none());
-}
-
-// ---- Per-asset creator binding (off-circuit) ----------------------------
-
-#[tokio::test]
-async fn asset_creator_register_then_query_is_idempotent() {
-    let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let asset_id = vec![0x11u8; 32];
-    let creator = vec![0x02u8; 33];
-
-    // Unregistered asset: no conflict (a fresh mint is allowed).
-    assert!(!asset_creator_conflict(&pool, &asset_id, &creator)
-        .await
-        .unwrap());
-
-    // Register, then a matching creator is still not a conflict.
-    register_asset_creator(&pool, &asset_id, &creator)
-        .await
-        .unwrap();
-    assert!(!asset_creator_conflict(&pool, &asset_id, &creator)
-        .await
-        .unwrap());
-
-    // Registration is idempotent on conflict: a second insert with a
-    // DIFFERENT creator is a no-op (ON CONFLICT DO NOTHING), so the
-    // original creator still owns the asset.
-    let other = vec![0x03u8; 33];
-    register_asset_creator(&pool, &asset_id, &other)
-        .await
-        .unwrap();
-    assert!(!asset_creator_conflict(&pool, &asset_id, &creator)
-        .await
-        .unwrap());
-}
-
-#[tokio::test]
-async fn asset_creator_conflict_true_for_different_creator() {
-    let scope = setup_pool().await;
-    let pool = scope.pool.clone();
-    let asset_id = vec![0x22u8; 32];
-    let creator = vec![0x02u8; 33];
-    let other = vec![0x03u8; 33];
-
-    register_asset_creator(&pool, &asset_id, &creator)
-        .await
-        .unwrap();
-    // A different creator for the same asset_id is a conflict.
-    assert!(asset_creator_conflict(&pool, &asset_id, &other)
-        .await
-        .unwrap());
-    // A different asset_id is independent — no conflict.
-    let fresh_asset = vec![0x33u8; 32];
-    assert!(!asset_creator_conflict(&pool, &fresh_asset, &other)
-        .await
-        .unwrap());
-}

@@ -1,6 +1,6 @@
 # Multi-stage Docker build for the zkCoins node post Plonky2 migration.
 #
-# The Plonky2 toolchain pin is `nightly` (see `rust-toolchain` at the
+# The Plonky2 toolchain pin is the dated nightly (see `rust-toolchain` at the
 # repo root). rustup respects that file and installs the right channel
 # automatically when cargo is first invoked — no manual `rustup install`
 # step needed.
@@ -24,6 +24,16 @@
 FROM rust:bookworm AS builder
 WORKDIR /app
 
+# `kernel-proto/build.rs` compiles the `kernel.v1` gRPC contract with
+# prost, which needs `protoc` on PATH at build time. Pin the Debian
+# bookworm package (same pin as the api image) rather than an
+# unversioned install so the compiler is reproducible across rebuilds.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        protobuf-compiler=3.21.12-3+deb12u1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && protoc --version
+
 # `sqlx::migrate!("./migrations")` is compile-time, so the migrations
 # directory must exist when `cargo build` runs (the COPY below pulls
 # it in). The current `db.rs` uses runtime-checked `sqlx::query` /
@@ -40,6 +50,13 @@ ENV SQLX_OFFLINE=true
 COPY rust-toolchain ./
 RUN rustup show
 
+# Use RUSTC_WORKSPACE_WRAPPER instead of global RUSTFLAGS so external deps such as plonky2 stay uninstrumented.
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        'exec "$@" -C instrument-coverage --cfg coverage_nightly' \
+        > /usr/local/bin/coverage-rustc-wrapper.sh \
+    && chmod +x /usr/local/bin/coverage-rustc-wrapper.sh
+
 COPY . .
 
 # Cargo features for non-MVP routes. Empty by default — both DEV and
@@ -50,7 +67,19 @@ COPY . .
 # here are excluded from the binary at compile time, so the disabled
 # code cannot run, crash, or be exploited at runtime.
 ARG FEATURES=
-RUN if [ -z "$FEATURES" ]; then \
+# Non-empty only for deploy/local-e2e/compose.coverage.yaml. This adds LLVM
+# instrumentation and the matching signal-flush hook; the default branch below
+# remains the production build path.
+ARG COVERAGE=
+RUN if [ -n "$COVERAGE" ]; then \
+        if [ -z "$FEATURES" ]; then \
+            RUSTC_WORKSPACE_WRAPPER=/usr/local/bin/coverage-rustc-wrapper.sh \
+                cargo build --release -p node --features coverage-flush; \
+        else \
+            RUSTC_WORKSPACE_WRAPPER=/usr/local/bin/coverage-rustc-wrapper.sh \
+                cargo build --release -p node --features "$FEATURES,coverage-flush"; \
+        fi; \
+    elif [ -z "$FEATURES" ]; then \
         cargo build --release -p node; \
     else \
         cargo build --release -p node --features "$FEATURES"; \
@@ -61,6 +90,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/node /usr/local/bin/zkcoins-node
+COPY --from=builder /app/target/release/verify_attestation /usr/local/bin/verify_attestation
 
 ENV RUST_LOG=info
 WORKDIR /data

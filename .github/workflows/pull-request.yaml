@@ -1,0 +1,543 @@
+name: CI
+
+# Live workflow path while `.github/workflows/ci.yaml` is
+# `disabled_manually` on zk-coins/node. Same jobs and the same
+# draft-start labels (`ci` / `ci:full`). Re-enable `ci.yaml` and
+# delete this file in one follow-up if that disable is lifted.
+
+on:
+  # `workflow_dispatch` stays available: a run can still be started by
+  # hand from the Actions tab when a specific answer is wanted.
+  workflow_dispatch:
+
+  # CI runs on every pull request regardless of target branch. This
+  # makes the default safe for stacked PRs (PR-A → PR-B → PR-C where
+  # each PR's base is the previous PR's branch) and any other workflow
+  # that opens a PR against a non-`develop` branch — previously such
+  # PRs were silently skipped because `branches: [develop]` filtered
+  # them out, and the only fix was to hand-edit ci.yaml on each new
+  # feature stack. Letting every PR trigger CI matches what most
+  # repos default to. The heavy M3 Ultra gate (`test-and-coverage`)
+  # now runs on every non-draft PR (CI endgame / G16 — see
+  # `.github/coverage-baseline.md`); drafts still skip via each
+  # job's `if:` guard.
+  #
+  # `push: develop` is intentionally absent. Every commit reaching
+  # `develop` is already covered by the open Release PR (`Release:
+  # develop -> main`, created by auto-release-pr.yaml) — that PR's
+  # `synchronize` event runs CI on the new HEAD, and the heavy gate
+  # runs because the Release PR is non-draft. Adding
+  # `on: push: branches: [develop]` would queue a second workflow
+  # instance on the same SHA, doubling self-hosted-runner load on a
+  # check the Release PR's `synchronize` already provides.
+  # (Under the PR-number grouping in the concurrency block below the
+  # two runs would land in DIFFERENT groups — push keyed by
+  # `refs/heads/develop`, PR keyed by the Release PR's number — so
+  # the block would not deduplicate them.)
+  #
+  # Drafts skip the jobs unless they carry `ci` or `ci:full`. That
+  # is how CI starts on a draft — never by flipping ready-for-review
+  # just to wake the suite. `labeled` / `unlabeled` re-fire so adding
+  # `ci` / `ci:full` on a draft actually starts the jobs.
+  # `ready_for_review` still fires when a finished PR leaves draft.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+concurrency:
+  # Group by PR number so a new push to the same PR cancels the
+  # in-flight Heavy run on the outdated commit. The self-hosted
+  # M3 Ultra runner pool is shared with every other open PR —
+  # letting an obsolete 60-90-min run finish wastes a slot another
+  # PR could use. Grouping by SHA (the previous approach) put every
+  # commit in its own group, so `cancel-in-progress: true` never
+  # fired and back-to-back pushes queued sequentially.
+  # Falls back to `github.ref` for push/dispatch events (where there
+  # is no `pull_request.number`), so e.g. a `workflow_dispatch` on
+  # the same ref serializes too.
+  #
+  # Label events (`labeled` / `unlabeled`) get their own isolated
+  # group keyed by `run_id`, so toggling a label on a PR does NOT
+  # cancel an in-flight Heavy run on the same PR — most label
+  # toggles are unrelated (`bug`, `priority/*`, …) and killing the
+  # Heavy run for them would be a footgun. Trade-off: a label toggle
+  # mid-run does NOT auto-stop a Heavy run that is already
+  # executing; cancel it manually with `gh run cancel` if you really
+  # need to free an agent.
+  group: >-
+    ${{
+      (github.event.action == 'labeled' || github.event.action == 'unlabeled')
+        && format('ci-{0}-label-{1}', github.workflow, github.run_id)
+        || format('ci-{0}-{1}', github.workflow, github.event.pull_request.number || github.ref)
+    }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Job topology — a two-tier test-gating model:
+#
+# * Tier 1 — `lint-and-build` — GitHub-hosted Linux, the DEFAULT.
+#   Runs on every non-draft PR (no push trigger; see on: above). Catches cross-platform
+#   compile bitrot and lint regressions cheaply. Runs in PARALLEL with
+#   the heavy gate below — it does not gate it via `needs:`. Each job
+#   carries its own draft `if:` guard, so a lint failure does not
+#   block the heavy gate from starting (deliberate: parallel
+#   feedback. Trade-off: on a lint failure the m3-ultra runner time
+#   is spent regardless).
+#
+# * Tier 2 — `test-and-coverage` — the authoritative test + coverage
+#   gate. Runs on every non-draft PR (CI endgame / G16 expansion —
+#   previously label-gated behind `ci:full`; see
+#   `.github/coverage-baseline.md`). Single heavy job on the shared
+#   self-hosted M3 Ultra runner pool. It runs the FULL node + shared
+#   nextest suite under llvm-cov instrumentation: the Postgres
+#   `db_tests`, the Plonky2-heavy mint/send/receive prover flows, the
+#   measured coverage floor, plus the release-mode prover package and
+#   the four `#[ignore]` prove flows (Task #9), all in one job.
+#   Drafts skip unless they carry `ci` or `ci:full`.
+#
+# There is no third "subset" tier: a test either runs in the default
+# Lint & Build (compile/lint) or in the heavy gate (the full suite).
+# The previous narrow per-area subset jobs (and their per-area opt-in
+# labels) were removed — the heavy gate is a strict superset of
+# everything they selected, so they added a maintenance burden
+# (filter drift) without extending coverage.
+#
+#   Why test + coverage are merged into one job: the previous topology
+#   had a `node-tests` job and a separate `coverage` job, both
+#   running the SAME nextest suite (`coverage` simply wrapped nextest
+#   in `cargo llvm-cov nextest`). That doubled wall-clock and m3-ultra
+#   agent usage on every Release PR for no signal benefit — llvm-cov
+#   under nextest produces both test execution AND coverage data in a
+#   single binary run. Merging them keeps the measured coverage floor
+#   intact (same ignore regex as baseline, same `not binary(api_remote)`
+#   exclusion) while running the heavy suite once per PR.
+#
+#   The documented hardware target is the M3 Ultra (CONTRIBUTING.md
+#   § "Hardware target"). On `ubuntu-latest` the
+#   full suite repeatedly hit the 75-min timeout (issue #30); on the
+#   M3 Ultra it is ~60-90 min for a Rust change. Moving the gate
+#   into CI rather than the developer's laptop unblocks the developer
+#   on push (issue #40).
+#
+# Runner ops: see scripts/ci-runner/README.md.
+jobs:
+  lint-and-build:
+    name: Lint & Build
+    # Skip drafts that have no CI-start label. `ci` and `ci:full`
+    # start this job on a draft (same suite as a ready PR). Ready
+    # is not a CI switch.
+    if: >
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false ||
+      contains(toJson(github.event.pull_request.labels.*.name), '"ci"') ||
+      contains(toJson(github.event.pull_request.labels.*.name), '"ci:full"')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The repo pins its toolchain in `rust-toolchain` (a dated nightly, with
+      # `rustfmt` and `clippy` in `components`) and every other job uses it.
+      # This step used to install 1.81.0 explicitly and export
+      # `RUSTUP_TOOLCHAIN`, which overrides the file — so formatting and lints
+      # were checked on a toolchain seventeen releases older than the one that
+      # builds and tests the same tree. That is not a conservative choice, it
+      # is a different compiler: a clippy suggestion can name an API the build
+      # toolchain has and the lint toolchain does not, and a lint that only
+      # exists in one of them is either invisible or unfixable. Installing the
+      # pinned toolchain instead keeps a single pin with nothing to drift.
+      - name: Install the pinned toolchain (rust-toolchain)
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # kernel-proto/build.rs invokes `protoc` (via tonic-build / prost-build)
+      # to compile the kernel.v1 contract. ubuntu-latest ships no
+      # protobuf-compiler by default — without this step, fmt is fine but
+      # clippy/build fail with "Could not find `protoc`".
+      - name: Install protoc (kernel-proto build.rs)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # `--all-targets` on every clippy step: without it clippy lints the
+      # library targets only, so tests, benches and feature-gated fixture
+      # modules — several thousand lines that decide whether a green run
+      # means anything — were never linted at all. Two real lints were
+      # hiding in `shared/src/spec_v1/nflog_boundary.rs`, which is behind
+      # the `test-fixtures` feature and therefore invisible to a plain
+      # `-p shared` run.
+      - name: Run clippy (node + shared, MVP feature set)
+        run: cargo clippy -p node -p shared --all-targets -- -D warnings
+
+      - name: Run clippy (node, all features)
+        run: cargo clippy -p node --all-features --all-targets -- -D warnings
+
+      - name: Run clippy (program + prover)
+        run: cargo clippy -p zkcoins-program-plonky2 -p zkcoins-prover-plonky2 --all-targets -- -D warnings
+
+      # Issue #84: chain-tip advance and publisher commit→reveal waits must
+      # be event-driven (bitcoind ZMQ / block signals), not silent polls.
+      # The deleted Esplora WS scanner modules are gone; the live hotpaths
+      # are the v1 bitcoind scan loop in `main.rs` and `publisher.rs`.
+      # The grep fails the build if a `tokio::time::{sleep,sleep_until,
+      # interval}` or `std::thread::sleep` call appears there without the
+      # same-line opt-out marker. See CONTRIBUTING.md § "No polling —
+      # events only" for `scanner-polling-ok:` and the rationale for each
+      # grandfathered occurrence. The marker is a plain comment token
+      # (not an `#[allow(...)]` attribute) so contributors cannot mistake
+      # it for a real lint suppression (issue #84 round-4 MINOR 4).
+      # Follow-up: replace main.rs scan_to_tip idle sleep with bitcoind
+      # block-signal subscription (event-driven tip advance).
+      - name: Forbid polling patterns in scanner/publisher
+        run: |
+          set -e
+          FOUND=$(grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' node/src/main.rs node/src/publisher.rs 2>/dev/null | grep -v 'scanner-polling-ok:' || true)
+          if [ -n "$FOUND" ]; then
+            echo "::error::Polling pattern (tokio::time::sleep|sleep_until|interval or std::thread::sleep) detected in event-driven hot paths. See issue #84."
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "Scanner/publisher polling check: OK"
+
+      - name: Build node (MVP feature set — the DEV + PRD image)
+        run: cargo build -p node
+
+      - name: Build node (all features — self-host opt-in build)
+        run: cargo build -p node --all-features
+
+  test-and-coverage:
+    name: Tests + Coverage Gate (M3 Ultra, measured coverage floor)
+    # Authoritative heavy gate: runs the full nextest suite under
+    # llvm-cov instrumentation, producing both test execution AND
+    # coverage data in a single binary run. Replaces the previous
+    # `node-tests` + `coverage` pair (the two jobs ran the same
+    # nextest suite — see the file header for the merge rationale).
+    # Floor values and ignore rules: `.github/coverage-baseline.md`.
+    #
+    # Same start rule as `lint-and-build`: every non-draft PR, plus
+    # drafts that carry `ci` or `ci:full`. `ci:full` is no longer a
+    # scope gate — it is only a start-on-draft alias.
+    if: >
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.draft == false ||
+      contains(toJson(github.event.pull_request.labels.*.name), '"ci"') ||
+      contains(toJson(github.event.pull_request.labels.*.name), '"ci:full"')
+    # The registered self-hosted M3 Ultra machines advertise
+    # the `zkcoins-node` pool label, not `m3-ultra` — the old `m3-ultra`
+    # requirement matched no online runner, so this gate queued forever. Target
+    # the label the runners actually carry.
+    runs-on: [self-hosted, zkcoins-node]
+    # 180 min: llvm-cov nextest (~60-90 min) + release prover package
+    # + four `#[ignore]` prove flows (a representative multi-input
+    # send prove alone is ~290 s locally) + circuit-digest verify.
+    # Was 120 min when the job stopped at coverage + digests only.
+    timeout-minutes: 180
+    env:
+      # All three chain-shaping env vars are required by the node
+      # bootstrap (see `lib::build_network_config_from_env`). CI uses
+      # `127.0.0.1:1` endpoints so any test that exercises the commit
+      # pipeline / scanner WS fails fast instead of reaching a public
+      # third-party host (a previous Mutinynet-flavoured silent
+      # fallback used to add >60 s per test).
+      IS_MAINNET: "false"
+      ESPLORA_URL: http://127.0.0.1:1/api
+      ESPLORA_WS_URL: ws://127.0.0.1:1/api/v1/ws
+      # `USERNAME_DOMAIN` is required by the node bootstrap (no
+      # default — see node/src/main.rs and issue #95). The test value
+      # is irrelevant for the `info_returns_*` assertions (they only
+      # check non-empty + shape).
+      USERNAME_DOMAIN: test.zkcoins.local
+      # `PUBLISHER_KEY` is required on every network (no default —
+      # see `node/src/lib.rs`); the value is a syntactically valid
+      # 32-byte hex placeholder, NOT a secret. MUST match
+      # `node/src/router_tests.rs` — the test mocks derive the
+      # wiremock'd publisher address from this key. The previous
+      # `1234567890abcdef…` fallback was a publicly-known test key that
+      # drainer bots swept within minutes of any on-chain top-up; the
+      # fallback was removed network-wide. The `0000…0001` value here
+      # is chosen so a future grep for the burned `1234…` key returns
+      # empty across the repo + CI config; it MUST NEVER be reused on
+      # any chain that holds value.
+      PUBLISHER_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+      # The full suite includes the `db_tests`, which use the
+      # `testcontainers` crate to spin up a real Postgres 17 per test
+      # against the local Docker daemon. The self-hosted runner runs
+      # Colima (not Docker Desktop), whose socket lives under the
+      # runner user's home directory; `DOCKER_HOST` is set in a step
+      # below so the Colima socket path resolves from `$HOME` at
+      # runtime.
+      # `sccache` wraps `rustc` and caches compiled crates across CI
+      # runs. The M3 Ultra runner agents are self-hosted, so the cache
+      # lives on local disk and survives between jobs.
+      RUSTC_WRAPPER: sccache
+      # Bump the cache cap above sccache's 10-GiB default. The cache is
+      # user-level (~/Library/Caches/Mozilla.sccache) and shared by
+      # every m3-ultra agent on the host; with 3+ parallel agents the
+      # 10-GiB default thrashed (writes from one agent evicted hits
+      # another had not consumed yet). 50 GiB fits the current working
+      # set with room to grow; the host has >600 GiB free disk. The
+      # server only reads SCCACHE_CACHE_SIZE at start, so the install
+      # step below restarts it when the running cap differs.
+      SCCACHE_CACHE_SIZE: "50G"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepend ~/.cargo/bin to PATH (use rustup proxy, not Homebrew Rust)
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # The `testcontainers` workload runs in a dedicated, resource-
+      # capped Colima profile (`ci`) instead of the host's default
+      # Docker profile. Runner hosts may share their default profile
+      # with unrelated workloads; a separate profile guarantees the
+      # CI Postgres containers can never contend with (or be starved
+      # by) anything else on the host. The profile is created once per
+      # host (see the runner provisioning docs); this step only boots
+      # it if it is not already running. `--activate=false` keeps the
+      # host's global Docker context untouched — the job talks to the
+      # profile exclusively via the explicit DOCKER_HOST below.
+      - name: Ensure dedicated CI Docker profile is running
+        run: colima status ci >/dev/null 2>&1 || colima start ci --activate=false
+
+      # Point `testcontainers` at the `ci` profile's socket (see the
+      # `DOCKER_HOST` comment in the job env block above). Set in a
+      # step so the path resolves from `$HOME` at runtime instead of
+      # being hard-coded.
+      - name: Set DOCKER_HOST for CI Colima profile socket
+        run: echo "DOCKER_HOST=unix://$HOME/.colima/ci/docker.sock" >> "$GITHUB_ENV"
+
+      # `sccache` (compile cache) and `cargo-nextest` (test runner)
+      # are installed once per runner via Homebrew. Idempotent: no-op
+      # on a warm runner where both tools already exist. If a server is
+      # already running with a different cap than the requested
+      # SCCACHE_CACHE_SIZE, stop it so the next --start-server picks up
+      # the new env value; the on-disk cache files survive the restart.
+      - name: Ensure sccache + cargo-nextest + protoc are installed
+        run: |
+          command -v sccache >/dev/null || brew install sccache
+          command -v cargo-nextest >/dev/null || brew install cargo-nextest
+          # kernel-proto/build.rs invokes protoc; the self-hosted runner has
+          # no protobuf-compiler unless we install it (idempotent, like the
+          # tools above). The ubuntu lint job installs it via apt separately.
+          command -v protoc >/dev/null || brew install protobuf
+          protoc --version
+          if ! sccache --show-stats 2>/dev/null | grep -qE "Max cache size +50 GiB"; then
+            sccache --stop-server >/dev/null 2>&1 || true
+          fi
+          sccache --start-server >/dev/null 2>&1 || true
+          sccache --show-stats
+
+      # The full suite's `db_tests` use testcontainers to spin up a
+      # real Postgres 17 per test, so Docker (via Colima) must be
+      # reachable on PATH. Fail fast with a readable error if it ever
+      # goes away, instead of letting the suite die minutes into the
+      # run with a hard-to-read bollard error.
+      - name: Verify Docker is reachable (testcontainers dependency)
+        run: docker info > /dev/null
+
+      # Host-wide proving lease: `compliance_circuit` refuses to
+      # build without ZKCOINS_PROVER_LEASE_PATH. The flock file lives
+      # under $HOME so concurrent self-hosted agents on the same host
+      # serialise the RAM-heavy circuit (a job-local RUNNER_TEMP path
+      # would not). The file is created on first open.
+      - name: Point the proving lease at the host-wide lock file
+        run: echo "ZKCOINS_PROVER_LEASE_PATH=${HOME}/zkcoins-prover.lease" >> "$GITHUB_ENV"
+
+      # `cargo llvm-cov nextest` is the nextest-aware coverage
+      # subcommand: collects llvm-cov data while driving the suite
+      # through nextest, so the measured coverage floor and the test
+      # execution share a single binary run. This is the merge of
+      # the previous `node-tests` + `coverage` pair — the previous
+      # `node-tests` job ran the same nextest invocation without the
+      # `cargo llvm-cov` wrapper, which produced no extra signal.
+      #
+      # Scope: `-p node -p shared --all-features`. Production modules
+      # (publisher, runtime, flow, job_dispatcher, scanners, shared)
+      # are measured. Legitimate ignores only: test infra + crate
+      # entrypoints + Plonky2 circuit packages. Floor integers and
+      # full justification: `.github/coverage-baseline.md`.
+      #
+      # The `api_remote` integration test (node/tests/api_remote.rs)
+      # is excluded: it targets the live DEV node and belongs in
+      # the post-deploy `api-e2e` job in deploy-dev.yaml, not the
+      # hermetic gate. The coverage scope is measured by the rest of
+      # the suite, which covers the in-process axum handlers via
+      # oneshot().
+      - name: Run llvm-cov nextest (measured coverage floor)
+        # Activate `coverage_nightly` only here: llvm-cov does not
+        # auto-set the cfg, and without it `coverage(off)` is inert.
+        # Later prove steps must not inherit it — the cfg also
+        # compiles `spawn_coverage_flush_signal_handler`, which
+        # references `__llvm_profile_write_file` that only the
+        # llvm-cov profiler runtime provides.
+        env:
+          RUSTFLAGS: "--cfg coverage_nightly"
+        # `--test-threads=8` (issue #181 Opt A): the heavy gate is
+        # the largest wall consumer on M3 Ultra (~60-90 min at
+        # --test-threads=1). 8 outer threads × Rayon-pinned cores
+        # exploits the runner's 24 cores without over-subscribing —
+        # Plonky2 prove tests already saturate Rayon internally.
+        # Per-test schema isolation (#182) + cross-process file lock
+        # around the shared container (`test_db::init_shared_pg`)
+        # make the suite parallel-safe under llvm-cov.
+        #
+        # Floor: integer under measured totals (75.20% lines /
+        # 75.94% functions). See `.github/coverage-baseline.md`.
+        run: |
+          cargo llvm-cov nextest --release -p node -p shared --all-features --show-missing-lines \
+            --ignore-filename-regex '_tests\.rs$|test_db\.rs$|bin/.*\.rs$|main\.rs$|lib\.rs$|program-plonky2/|script-plonky2/' \
+            --fail-under-lines 75 \
+            --fail-under-functions 75 \
+            --test-threads 8 \
+            -E 'not binary(api_remote)'
+
+      # Task #9: release-mode prover package suite. These prove tests
+      # are multi-minute and never ran in any gate before; the M3 Ultra
+      # job is the right home (GitHub-hosted `lint-and-build` would
+      # time out). Local verification of a representative multi-input
+      # send prove in this package: ~290 s, green.
+      - name: Run zkcoins-prover-plonky2 release tests
+        run: cargo nextest run -p zkcoins-prover-plonky2 --release
+
+      # `#[ignore]` prove flows in node+shared that the llvm-cov
+      # nextest step never selects. Real Plonky2 proves — serial
+      # (`--test-threads 1`) because the host-wide proving lease
+      # allows one C residency; parallel waiters hit the 1800 s
+      # flock timeout. Same `api_remote` exclusion as llvm-cov
+      # (that binary talks to the live DEV node).
+      - name: Run ignored prove flows (node + shared)
+        run: >
+          cargo nextest run -p node -p shared --all-features --release
+          --run-ignored ignored-only
+          --test-threads 1
+          -E 'not binary(api_remote)'
+
+      # §1.7.9 circuit-digest generator: builds real C / C_balance for every
+      # network and verifies the committed generated_circuit_digests.txt
+      # matches. Multi-minute; kept out of default cargo test via #[ignore],
+      # but a test that cannot run cannot fail — this heavy job is the one
+      # that actually runs it. Does NOT set REGEN_CIRCUIT_DIGESTS
+      # (verify-only; no file rewrite).
+      - name: Verify live circuit digests vs committed generated_circuit_digests.txt
+        run: |
+          cargo test -p zkcoins-prover-plonky2 --release --test generated_circuit_digests_test \
+            generate_circuit_digests -- --ignored --nocapture
+
+      # On gate failure, re-format the existing llvm-cov data (no
+      # re-run, no new test execution — `report` reads the on-disk
+      # profraw / profdata produced by the previous step) and emit
+      # the per-file "Uncovered Lines" block plus a json digest of
+      # files still below 100% line / function (gap list; the gate
+      # itself fails under the measured floor — see baseline).
+      # `--show-missing-lines` on the gate step sometimes elides this
+      # section depending on the llvm-cov build, so this step makes
+      # the detail deterministic: whenever the gate fails, the
+      # operator sees which file/line/function is uncovered without
+      # having to reproduce locally.
+      - name: Show missing coverage on gate failure
+        if: failure()
+        run: |
+          IGNORE='_tests\.rs$|test_db\.rs$|bin/.*\.rs$|main\.rs$|lib\.rs$|program-plonky2/|script-plonky2/'
+
+          echo "--- llvm-cov report: --show-missing-lines (text) ---"
+          cargo llvm-cov report --release --show-missing-lines \
+            --ignore-filename-regex "$IGNORE" || true
+
+          echo "--- llvm-cov report: per-file json (filter < 100%) ---"
+          cargo llvm-cov report --release --json \
+            --ignore-filename-regex "$IGNORE" \
+            | jq -r '.data[0].files[]
+                | select(.summary.lines.percent < 100 or .summary.functions.percent < 100)
+                | {filename, lines: .summary.lines, functions: .summary.functions}' \
+            || echo "(jq not available or json parse failed)"
+
+          # Per-function coverage list: emits one line per uncovered
+          # function with file + name + line so the operator sees the
+          # exact `pub fn foo at router.rs:1234` without having to
+          # cross-reference the line ranges manually.
+          echo "--- llvm-cov report: uncovered functions (per-symbol) ---"
+          cargo llvm-cov report --release --json \
+            --ignore-filename-regex "$IGNORE" \
+            | jq -r '.data[0].functions[]
+                | select(.count == 0)
+                | "\(.filenames[0]):\(.regions[0][0])\t\(.name)"' \
+            | sort -u || echo "(per-function extraction failed)"
+
+          # Full HTML report — uploaded as an artifact below so the
+          # operator can browse the per-line coverage in a browser
+          # without re-running llvm-cov locally (heavy gate is
+          # ~50 min on M3 Ultra).
+          echo "--- llvm-cov report: generating HTML for artifact ---"
+          cargo llvm-cov report --release --html \
+            --output-dir target/llvm-cov-html \
+            --ignore-filename-regex "$IGNORE" \
+            || echo "(HTML generation failed)"
+
+      - name: Upload coverage HTML report on gate failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-cov-html-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/llvm-cov-html
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Tear down the shared test container created by
+      # `test_db::setup_pool` via testcontainers' `ReuseDirective::
+      # Always` (see `node/src/test_db.rs`). The reuse flag tells
+      # testcontainers NOT to drop the container at process exit so
+      # every `cargo nextest` test process can attach to the same
+      # daemon-side container — but that means nobody removes it
+      # either. Always-on cleanup so a stale container from one PR run
+      # cannot bleed into the next on the same self-hosted runner.
+      - name: Tear down shared test Postgres container
+        if: always()
+        run: docker rm -f zkcoins-test-shared-pg 2>/dev/null || true
+
+      - name: sccache stats (post-build)
+        if: always()
+        run: sccache --show-stats
+
+  # Telegram alert on workflow failure for the heavy gate. Modelled
+  # as a separate job (not an inline step) so job-level failures —
+  # timeout, OOM, runner crash — still fire the alert. `if: failure()`
+  # evaluates against the whole `needs:` group: any listed job
+  # transitioning to `failure` triggers it, while skipped jobs
+  # (drafts without ci / ci:full) and manual cancellation stay silent.
+  notify-failure:
+    name: Telegram alert on failure
+    needs: [lint-and-build, test-and-coverage]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram alert
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          TEXT=$'❌ <b>'"${{ github.workflow }}"$'</b> failed\n<b>Repo:</b> '"${{ github.repository }}"$'\n<b>Branch:</b> '"${{ github.ref_name }}"$'\n<b>Run:</b> '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+               --data-urlencode "chat_id=${TG_CHAT}" \
+               --data-urlencode "text=${TEXT}" \
+               -d "parse_mode=HTML" \
+               -d "disable_web_page_preview=true"

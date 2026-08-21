@@ -1,0 +1,20 @@
+error[E0624]: associated function `from_parts` is private
+  --> tests/ui/proved_pending_from_parts_unobtainable.rs:11:76
+   |
+11 |       let _ = zkcoins_prover_plonky2::state_engine::ProvedPendingTransition::from_parts;
+   |                                                                              ^^^^^^^^^^ private associated function
+   |
+  ::: src/state_engine.rs
+   |
+   | /     fn from_parts(
+   | |         mut pending: PendingTransition,
+   | |         proved: ProvedTransition,
+   | |         signature: TransitionSignature,
+   | |     ) -> Result<Self> {
+   | |_____________________- private associated function defined here
+
+error[E0599]: no associated function or constant named `from_parts_for_test` found for struct `ProvedPendingTransition` in the current scope
+  --> tests/ui/proved_pending_from_parts_unobtainable.rs:13:76
+   |
+13 |     let _ = zkcoins_prover_plonky2::state_engine::ProvedPendingTransition::from_parts_for_test;
+   |                                                                            ^^^^^^^^^^^^^^^^^^^ associated function or constant not found in `ProvedPendingTransition`

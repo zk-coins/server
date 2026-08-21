@@ -1,0 +1,27 @@
+[package]
+name = "kernel-proto"
+version.workspace = true
+edition.workspace = true
+description = "Generated kernel.v1 gRPC types and service stubs (no business logic)."
+
+[dependencies]
+# gRPC runtime + prost codec. 0.13 is the last tonic line whose
+# `tonic-build` still owns prost codegen (`compile_protos`); 0.14 moved
+# that into `tonic-prost-build`. Toolchain pin `nightly-2026-06-18`
+# satisfies the 0.13 MSRV (1.75).
+# Feature list must match `node/Cargo.toml` exactly (Cargo unifies
+# features across the graph, but divergent lists are the class of bug
+# that later surfaces as a mysterious link error). Same rationale as
+# node: transport (⇒ server+channel), router (`add_service`), codegen,
+# prost. Equals tonic 0.13.1 `default`; kept explicit under
+# `default-features = false` so upstream default expansion stays opt-in.
+tonic = { version = "0.13.1", default-features = false, features = [
+    "codegen",
+    "prost",
+    "transport",
+    "router",
+] }
+prost = "0.13.5"
+
+[build-dependencies]
+tonic-build = "0.13.1"

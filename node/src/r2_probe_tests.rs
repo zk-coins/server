@@ -29,9 +29,14 @@ fn sample_run(host_id: i32) -> ProbeRun {
         rustc_version: "rustc 1.81.0".to_string(),
         build_profile: "release".to_string(),
         allocator: "mimalloc".to_string(),
+        prover_mode: "legacy".to_string(),
         max_in_coins: 8,
         max_out_coins: 8,
         inner_pad_bits: 15,
+        max_tx_inputs: None,
+        max_tx_outputs: None,
+        max_rx_coins: None,
+        compliance_gate_count: None,
         warm_calls_requested: 5,
         circuit_build_wall_ms: 9_500,
         prove_cold_wall_ms: 18_000,
@@ -393,6 +398,55 @@ async fn fetch_recent_summary_returns_desc_with_budget_pass() {
     // Each row carries the joined host info.
     assert_eq!(rows[0].hostname, "test-host-sum");
     assert_eq!(rows[0].cpu_brand, "Apple M3 Ultra");
+    // Flag-off / legacy rows surface prover_mode = "legacy" (migration 0023).
+    assert_eq!(rows[0].prover_mode, "legacy");
+}
+
+#[tokio::test]
+async fn insert_run_persists_v1_shape_columns() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let host_id = upsert_host(&pool, &sample_host("v1shape"))
+        .await
+        .expect("host");
+    let mut run = sample_run(host_id);
+    run.prover_mode = "v1".to_string();
+    run.max_tx_inputs = Some(8);
+    run.max_tx_outputs = Some(8);
+    run.max_rx_coins = Some(4);
+    // Arbitrary fixture for the DB round-trip only — not the live C gate
+    // count (that is measured by the probe / asserted against the pinned
+    // digests file elsewhere). Any non-null i32 exercises the column.
+    const FIXTURE_COMPLIANCE_GATE_COUNT: i32 = 42;
+    run.compliance_gate_count = Some(FIXTURE_COMPLIANCE_GATE_COUNT);
+    // v1 budgets are larger; persist what the probe would have checked.
+    run.r2_warm_budget_ms = 600_000;
+    run.r2_cold_budget_ms = 900_000;
+    let run_id = insert_run(&pool, &run).await.expect("insert v1 run");
+
+    let row = sqlx::query(
+        "SELECT prover_mode, max_tx_inputs, max_tx_outputs, max_rx_coins, \
+                compliance_gate_count, r2_warm_budget_ms \
+         FROM r2_probe_runs WHERE id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .expect("select v1 run");
+
+    assert_eq!(row.get::<String, _>("prover_mode"), "v1");
+    assert_eq!(row.get::<Option<i32>, _>("max_tx_inputs"), Some(8));
+    assert_eq!(row.get::<Option<i32>, _>("max_tx_outputs"), Some(8));
+    assert_eq!(row.get::<Option<i32>, _>("max_rx_coins"), Some(4));
+    assert_eq!(
+        row.get::<Option<i32>, _>("compliance_gate_count"),
+        Some(FIXTURE_COMPLIANCE_GATE_COUNT)
+    );
+    assert_eq!(row.get::<i64, _>("r2_warm_budget_ms"), 600_000);
+
+    let summary = fetch_recent_summary(&pool, 1).await.expect("summary");
+    assert_eq!(summary.len(), 1);
+    assert_eq!(summary[0].prover_mode, "v1");
 }
 
 #[tokio::test]

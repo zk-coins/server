@@ -1,0 +1,10 @@
+error[E0624]: associated function `receive_coin_into` is private
+ --> tests/ui/legacy_receive_coin_into_unobtainable.rs:6:46
+  |
+6 |     let _ = node::account_node::AccountNode::receive_coin_into;
+  |                                              ^^^^^^^^^^^^^^^^^ private associated function
+  |
+ ::: src/account_node.rs
+  |
+  |     fn receive_coin_into(account: &mut Account, coin_proof: CoinProof) -> Result<(), &'static str> {
+  |     ---------------------------------------------------------------------------------------------- private associated function defined here

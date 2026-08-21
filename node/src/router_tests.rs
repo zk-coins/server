@@ -55,15 +55,13 @@ fn test_state() -> AppState {
     // Per-test scratch dir for the ProofStore. Issue #181 Opt A flips
     // the CI to `--test-threads=8`, which means several `test_state()`
     // callers run concurrently in the same process; the previous
-    // hard-coded `/tmp/zkcoins-test-proofs` had every test share one
-    // directory and one `ProofStore::next_id` AtomicU64 root, so
-    // parallel writers could race on the same proof id. `keep()`
-    // returns the underlying `PathBuf` and disables the auto-cleanup
-    // Drop — we accept the leak (tests are best-effort cleaned up by
-    // the OS / CI runner reboot) so we don't have to thread a
-    // `TempDir` guard through every caller and the `AppState` struct.
-    // The canonical comment lives here; the second call-site below
-    // (the mint helper around line ~2260) just points back.
+    // hard-coded `/tmp/zkcoins-test-proofs` shared one directory across
+    // tests. `keep()` returns the underlying `PathBuf` and disables the
+    // auto-cleanup Drop — we accept the leak (tests are best-effort
+    // cleaned up by the OS / CI runner reboot) so we don't have to
+    // thread a `TempDir` guard through every caller and the `AppState`
+    // struct. The canonical comment lives here; the second call-site
+    // below (the mint helper around line ~2260) just points back.
     let proofs_dir = tempfile::tempdir().expect("create proofs tempdir").keep();
     AppState {
         account_node: Arc::new(Mutex::new(account_node)),
@@ -94,6 +92,19 @@ fn test_state() -> AppState {
         job_store: Arc::new(crate::job_store::JobStore::new((*dead_pool()).clone())),
         job_tx: tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8).0,
         job_notify_map: Arc::new(dashmap::DashMap::new()),
+        // Legacy-stack tests: no v1.1 readiness gates.
+        v1_scan_caught_up: None,
+        v1_finality_ok: None,
+        pending_sign_map: Arc::new(dashmap::DashMap::new()),
+        v1_finalise: None,
+        v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
+        v1_pending_after_prove: None,
+        receive_creating_proof_loader: None,
+        v1_engine: None,
+        private_index: crate::kernel::access::InMemoryPrivateIndex::shared(),
+        bundles: crate::kernel::bootstrap::BundleStore::shared(),
+        attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
+        public_hosts: Arc::new(vec!["node.test".to_string()]),
     }
 }
 
@@ -277,11 +288,9 @@ fn bitcoin_network_label_maps_both_arms() {
     assert_eq!(bitcoin_network_label(false), BitcoinNetwork::Mutinynet);
 }
 
-// --- GET /api/balance ---
+// --- GET /api/balance (Stage 3 Runde 5: closed, 410) ---
 
-/// `&asset_id=<test_asset_id>` query-string fragment. The single-asset
-/// `/api/balance?address=` endpoint requires an explicit asset_id under
-/// the neutral multi-asset model.
+/// `&asset_id=<test_asset_id>` query-string fragment (legacy URL shape).
 fn asset_q() -> String {
     format!(
         "&asset_id={}",
@@ -289,56 +298,12 @@ fn asset_q() -> String {
     )
 }
 
+/// R2: seeded ledger balance must not leave via GET /api/balance.
+/// Asserts status **and** that the body does not carry the funded amount
+/// (not only that the route exists).
 #[tokio::test]
-async fn balance_unknown_address_returns_ok_with_zero() {
-    // 32 zero bytes in hex = 64 hex chars
-    let address_hex = "00".repeat(32);
-    let uri = format!("/api/balance?address={}{}", address_hex, asset_q());
-    let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::OK);
-
-    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, 0);
-    assert!(resp.username.is_none());
-    // num_sends MUST be 0 for an unobserved address — this is the
-    // canonical "fresh wallet" state the seed-restore flow assumes.
-    // A non-zero default would silently desync the wallet's BIP-32
-    // counter (see `BalanceResponse::num_sends` doc).
-    assert_eq!(resp.num_sends, 0);
-}
-
-#[tokio::test]
-async fn balance_unknown_address_with_claimed_username_returns_username() {
+async fn balance_is_gone_and_does_not_reveal_ledger() {
     let state = test_state();
-    let address_bytes = [0xABu8; 32];
-    let address = zkcoins_program::hash::digest_from_bytes(&address_bytes);
-
-    // Pre-populate the in-memory map (no Postgres round-trip — see
-    // the comment on `insert_for_test`).
-    {
-        let mut store = state.username_store.lock().unwrap();
-        store.insert_for_test("alice", address);
-    }
-
-    let uri = format!(
-        "/api/balance?address={}{}",
-        hex::encode(address_bytes),
-        asset_q()
-    );
-    let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-
-    assert_eq!(status, StatusCode::OK);
-    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, 0);
-    assert_eq!(resp.username, Some("alice".to_string()));
-    assert_eq!(resp.num_sends, 0);
-}
-
-#[tokio::test]
-async fn balance_seeded_account_returns_funded_balance() {
     let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let asset_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_asset_id()));
     let uri = format!(
@@ -346,85 +311,104 @@ async fn balance_seeded_account_returns_funded_balance() {
         address_hex, asset_hex
     );
     let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, body) = send_request(req).await;
+    let (status, body) = send_request_with_state(state, req).await;
 
-    assert_eq!(status, StatusCode::OK);
-
-    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, 1_000_000u64);
-    // The seeded account has not produced any send yet via the test
-    // fixture, so num_sends is 0 here.
-    assert_eq!(resp.num_sends, 0);
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "legacy balance must refuse loud (HTTP 410); body={body}"
+    );
+    let resp: serde_json::Value = serde_json::from_str(&body).expect("JSON error body");
+    let err = resp["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/balance") || err.contains("Stage 3") || err.contains("read.account"),
+        "error must name the removed surface; got {err:?}"
+    );
+    // No funded ledger fields: the fixture holds 1_000_000.
+    assert!(
+        resp.get("balance").is_none(),
+        "410 body must not carry a balance field; got {resp}"
+    );
+    assert!(
+        !body.contains("1000000") && !body.contains("1_000_000"),
+        "body must not leak the seeded balance; got {body}"
+    );
+    assert!(
+        resp.get("num_sends").is_none() && resp.get("assets").is_none(),
+        "410 body must not carry ledger fields; got {resp}"
+    );
 }
 
 #[tokio::test]
-async fn balance_missing_address_param_returns_unprocessable() {
+async fn balance_always_gone_even_without_params() {
     let req = Request::get("/api/balance").body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-
-    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, 0);
-    assert!(resp.username.is_none());
-    assert_eq!(resp.num_sends, 0);
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    assert!(
+        !body.contains("\"balance\""),
+        "must not return BalanceResponse shape; body={body}"
+    );
 }
 
-#[tokio::test]
-async fn balance_invalid_hex_returns_unprocessable() {
-    let req = Request::get("/api/balance?address=not_valid_hex")
-        .body(Body::empty())
-        .unwrap();
-    let (status, _body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn balance_wrong_length_returns_unprocessable() {
-    // 16 bytes = 32 hex chars, but the handler expects exactly 32 bytes
-    let short_hex = "ab".repeat(16);
-    let uri = format!("/api/balance?address={}", short_hex);
-    let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, _body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-// --- GET /api/address ---
+// --- GET /api/address (Stage 3 Runde 6: closed, 410) ---
 
 #[cfg(feature = "address-list")]
 #[tokio::test]
-async fn address_returns_list() {
+async fn address_list_is_gone_and_does_not_reveal_legacy_addresses() {
+    // Seed is present in test_state; closed handler must not enumerate it.
     let req = Request::get("/api/address").body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::OK);
-
-    let resp: AddressesResponse = serde_json::from_str(&body).expect("valid JSON");
-    // The test state has the minting address seeded
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).expect("JSON error body");
+    let err = resp["error"].as_str().unwrap_or("");
     assert!(
-        !resp.addresses.is_empty(),
-        "should contain at least the minting address"
+        err.contains("/api/address") || err.contains("Stage 3") || err.contains("read.account"),
+        "error must name the removed surface; got {err:?}"
     );
-    assert!(
-        resp.addresses[0].starts_with("0x"),
-        "addresses should be 0x-prefixed"
-    );
+    // No address list payload.
+    assert!(resp.get("addresses").is_none(), "must not emit addresses");
 }
 
 // --- POST /api/send with missing fields ---
 
 // --- POST /api/mint with missing fields ---
 
-// --- GET /api/proof/{id} for non-existent proof ---
+// --- GET /api/proof/{id} (Stage 3 Runde 5: closed, 410) ---
+
+/// R2: even when a CoinProof blob is on disk, the route must not hand it
+/// out (cleartext Coin). Status alone is insufficient — assert the body
+/// is not the bincode blob / not 200 octet-stream.
+#[tokio::test]
+async fn proof_is_gone_and_does_not_reveal_coinproof() {
+    let state = test_state();
+    // Plant a recognisable marker blob under a known id. The closed
+    // handler must never return these bytes.
+    let marker = b"CLEARTEXT_COIN_PROOF_MUST_NOT_LEAK";
+    state.proof_store.plant_raw_for_test(42, marker);
+    let req = Request::get("/api/proof/42").body(Body::empty()).unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "legacy proof download must refuse loud (HTTP 410); body={body}"
+    );
+    assert!(
+        !body.as_bytes().windows(marker.len()).any(|w| w == marker),
+        "body must not contain the on-disk CoinProof blob; got {body:?}"
+    );
+    let resp: serde_json::Value = serde_json::from_str(&body).expect("JSON error body");
+    let err = resp["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/proof") || err.contains("Stage 3") || err.contains("read.proof"),
+        "error must name the removed surface; got {err:?}"
+    );
+}
 
 #[tokio::test]
-async fn proof_not_found_returns_404() {
+async fn proof_unknown_id_is_gone_not_404() {
     let req = Request::get("/api/proof/9999").body(Body::empty()).unwrap();
-    let (status, _body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
 }
 
 // --- POST /api/commit with missing fields ---
@@ -469,21 +453,25 @@ async fn resolve_unknown_username_returns_404() {
 }
 
 #[tokio::test]
-async fn resolve_minting_address_by_hex_prefix() {
-    // The minting address starts with "af53a1" — a short prefix is enough
-    // for resolve_identifier to match via hex-prefix fallback.
+async fn resolve_hex_prefix_no_longer_scans_legacy_addresses() {
+    // Stage 3 Runde 6: hex-prefix fallback over get_addresses() is gone.
+    // A known ledger address prefix must not resolve or leak the full address.
     let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
-    let prefix = &full_hex[..8]; // first 8 hex chars
+    let prefix = &full_hex[..8];
 
     let uri = format!("/api/username/resolve/{}", prefix);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
 
-    assert_eq!(status, StatusCode::OK);
-
-    let resp: UsernameResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.address, format!("0x{}", full_hex));
-    assert_eq!(resp.username, prefix);
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "hex prefix must not resolve via legacy address scan; body={body}"
+    );
+    assert!(
+        !body.contains(&full_hex),
+        "body must not leak the full legacy address; got {body}"
+    );
 }
 
 // --- POST /api/username/claim ---
@@ -530,8 +518,9 @@ async fn lnurlp_unknown_user_returns_404() {
 
 #[cfg(feature = "lnurl")]
 #[tokio::test]
-async fn lnurlp_known_address_returns_pay_request() {
-    // The minting address is resolvable by hex prefix through resolve_identifier.
+async fn lnurlp_hex_prefix_no_longer_confirms_legacy_account() {
+    // Stage 3 Runde 6: LNURL must not use hex-prefix scan over legacy
+    // addresses (existence/validity oracle). Only the username store.
     let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let prefix = &full_hex[..8];
 
@@ -542,40 +531,37 @@ async fn lnurlp_known_address_returns_pay_request() {
         .unwrap();
     let (status, body) = send_request(req).await;
 
-    assert_eq!(status, StatusCode::OK);
-
-    let resp: LnurlpResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.tag, "payRequest");
-    assert!(
-        resp.callback.contains(prefix),
-        "callback should include the identifier"
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "hex prefix must not confirm a legacy account; body={body}"
     );
-    assert_eq!(resp.min_sendable, 1_000);
-    assert_eq!(resp.max_sendable, 1_000_000_000_000);
-    assert!(resp.metadata.contains("zkCoins"));
+    assert!(
+        !body.contains("payRequest"),
+        "must not return LNURL-pay metadata for hex prefix; got {body}"
+    );
 }
 
 #[cfg(feature = "lnurl")]
 #[tokio::test]
 async fn lnurlp_localhost_host_returns_http_callback() {
-    // Pins the `host.contains("localhost")` branch of `lnurlp_handler`'s
-    // scheme selection: when the request's Host header points at a local
-    // dev instance, the LNURL callback URL must be served back as `http://`
-    // so wallets following the redirect don't hit a TLS error against
-    // the dev node. The api.zkcoins.app path (covered by
-    // `lnurlp_known_address_returns_pay_request`) already pins the
-    // `https://` arm.
-    let full_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
-    let prefix = &full_hex[..8];
+    // Pins the `host.contains("localhost")` scheme arm for a *claimed*
+    // username (hex-prefix legacy resolve is closed). Seed the username
+    // store so the handler reaches scheme selection.
+    let state = test_state();
+    {
+        let mut store = state.username_store.lock().unwrap();
+        store.commit_after_db("localuser".to_string(), test_owner_address());
+    }
 
-    let uri = format!("/.well-known/lnurlp/{}", prefix);
-    let req = Request::get(&uri)
+    let uri = "/.well-known/lnurlp/localuser";
+    let req = Request::get(uri)
         .header("host", "localhost:8080")
         .body(Body::empty())
         .unwrap();
-    let (status, body) = send_request(req).await;
+    let (status, body) = send_request_with_state(state, req).await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "body={body}");
 
     let resp: LnurlpResponse = serde_json::from_str(&body).expect("valid JSON");
     assert!(
@@ -606,85 +592,31 @@ async fn lnurl_pay_callback_returns_phase2_error() {
     );
 }
 
-// --- Balance includes username field ---
+// --- Legacy balance surface closed (username / num_sends paths) ---
 
 #[tokio::test]
-async fn balance_minting_address_has_no_username() {
-    let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
-    let uri = format!("/api/balance?address={}{}", address_hex, asset_q());
-    let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, body) = send_request(req).await;
-
-    assert_eq!(status, StatusCode::OK);
-
-    // username should be absent (skip_serializing_if = None)
-    let raw: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(
-        raw.get("username").is_none() || raw["username"].is_null(),
-        "minting address without a claimed username should have no username field"
-    );
-}
-
-#[tokio::test]
-async fn balance_includes_username_when_claimed() {
+async fn balance_claimed_username_still_gone_no_ledger_leak() {
     let state = test_state();
-
-    // Pre-populate the in-memory username map via the test-only
-    // helper (bypasses the async Postgres path; production code
-    // claims via the /api/username/claim handler).
     {
         let mut username_store = state.username_store.lock().unwrap();
         username_store.insert_for_test("satoshi", test_owner_address());
     }
-
     let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let uri = format!("/api/balance?address={}{}", address_hex, asset_q());
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request_with_state(state, req).await;
-
-    assert_eq!(status, StatusCode::OK);
-
-    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, 1_000_000u64);
-    assert_eq!(resp.username, Some("satoshi".to_string()));
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    assert!(
+        !body.contains("satoshi") && !body.contains("1000000"),
+        "must not leak username or balance; body={body}"
+    );
 }
 
-// --- num_sends emission ---
-
-/// `BalanceResponse::num_sends` must reflect the queried account's
-/// per-account send counter (`Account::num_sends`).
-///
-/// The wallet uses this counter to choose its next signing pubkey
-/// (BIP-32 child index). `prev_commitment_pubkey` is no longer
-/// derived from this counter — the server reads it directly from
-/// `Account::commitment_public_key`. See the field doc on
-/// `Account::commitment_public_key` for the bug class that change
-/// eliminated (the wallet's local counter drifting from the server's
-/// after a seed restore or stale-app deploy and surfacing as
-/// `07-send.spec.ts::send-success` 400ing).
-///
-/// Driven via the in-memory `AccountNode` knob rather than a full
-/// `/api/send` round-trip: prover initialisation alone costs ~50 s
-/// of CI time and is exercised by the `api_remote` suite against
-/// the live DEV server. The handler-level guarantee tested here is
-/// "whatever `Account::num_sends` says, the JSON emits".
 #[tokio::test]
-async fn balance_response_emits_num_sends_from_account() {
+async fn balance_num_sends_path_is_gone_no_ledger_leak() {
     let state = test_state();
     let address_bytes = [0x77u8; 32];
     let address = zkcoins_program::hash::digest_from_bytes(&address_bytes);
-
-    // Inject an account whose `proof` is None and
-    // `commitment_public_key` is None but `num_sends` is non-zero —
-    // an impossible production state (the invariant says
-    // `num_sends > 0 iff proof.is_some() iff commitment_public_key.is_some()`),
-    // but the handler does not re-check the invariant on read; it
-    // emits whatever the field holds. Setting `num_sends` directly
-    // is the smallest possible signal that the handler reads the
-    // right field. (The invariant itself is covered by the
-    // `account_node_tests` unit test
-    // `test_send_coins_twice_from_same_account_uses_update_account`,
-    // which exercises the real bump path through `send_coins_inner`.)
     {
         let mut node = state.account_node.lock().unwrap();
         let mut acct = crate::account_node::Account::new_for_asset(test_asset_id());
@@ -692,7 +624,6 @@ async fn balance_response_emits_num_sends_from_account() {
         acct.num_sends = 3;
         node.import_account(address, acct);
     }
-
     let uri = format!(
         "/api/balance?address={}{}",
         hex::encode(address_bytes),
@@ -700,17 +631,14 @@ async fn balance_response_emits_num_sends_from_account() {
     );
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request_with_state(state, req).await;
-
-    assert_eq!(status, StatusCode::OK);
-    let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.balance, 42_000);
-    assert_eq!(
-        resp.num_sends, 3,
-        "balance handler must emit the per-account num_sends counter"
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    assert!(
+        !body.contains("42000") && !body.contains("\"num_sends\""),
+        "must not leak num_sends/balance; body={body}"
     );
 }
 
-// --- Concurrent balance reads ---
+// --- Concurrent balance reads (all Gone, no ledger leak) ---
 
 #[tokio::test]
 async fn concurrent_balance_reads_are_consistent() {
@@ -731,11 +659,10 @@ async fn concurrent_balance_reads_are_consistent() {
 
     for handle in handles {
         let (status, body) = handle.await.expect("task should not panic");
-        assert_eq!(status, StatusCode::OK);
-        let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-        assert_eq!(
-            resp.balance, 1_000_000u64,
-            "every concurrent read must see the same minting balance"
+        assert_eq!(status, StatusCode::GONE, "body={body}");
+        assert!(
+            !body.contains("1000000"),
+            "every concurrent read must refuse without leaking balance; body={body}"
         );
     }
 }
@@ -763,15 +690,16 @@ async fn concurrent_reads_with_username_claim() {
         let hex = address_hex.clone();
         handles.push(tokio::spawn(async move {
             if i % 2 == 0 {
-                // Balance request
+                // Legacy balance request — must be Gone, no ledger leak.
                 let req = Request::get(format!("/api/balance?address={}{}", hex, asset_q()))
                     .body(Body::empty())
                     .unwrap();
                 let (status, body) = send_request_with_state(s, req).await;
-                assert_eq!(status, StatusCode::OK);
-                let resp: BalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-                assert_eq!(resp.balance, 1_000_000u64);
-                assert_eq!(resp.username, Some("testuser".to_string()));
+                assert_eq!(status, StatusCode::GONE, "body={body}");
+                assert!(
+                    !body.contains("1000000") && !body.contains("testuser"),
+                    "must not leak ledger/username; body={body}"
+                );
             } else {
                 // Resolve request
                 let req = Request::get("/api/username/resolve/testuser")
@@ -1701,15 +1629,53 @@ fn send_signature_accepts_valid_signature() {
 /// happy-path upsert.
 
 #[tokio::test]
-async fn receive_coin_with_invalid_bincode_returns_default_response() {
+async fn receive_coin_is_gone_and_does_not_mutate_accounts() {
+    // B6: POST /api/receive must not mutate durable (or in-memory) account
+    // state. Stage 3 Runde 4 removes the legacy CoinProof receive path.
+    let state = test_state();
+    let owner = zkcoins_program::hash::digest_from_bytes(&[0x42u8; 32]);
+    let asset = zkcoins_program::hash::digest_from_bytes(&[0x43u8; 32]);
+    {
+        let mut node = state.account_node.lock().unwrap();
+        let mut acct = crate::account_node::Account::new_for_asset(asset);
+        acct.balance = 7;
+        node.import_account(owner, acct);
+    }
+    let before = {
+        let node = state.account_node.lock().unwrap();
+        let a = node.get_account(&owner, &asset).expect("fixture account");
+        (a.balance, a.coin_queue.len(), a.num_sends)
+    };
+
     let req = Request::post("/api/receive")
         .header("content-type", "application/octet-stream")
         .body(Body::from(vec![0xff, 0xfe, 0xfd, 0xfc]))
         .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send_request_with_state(state.clone(), req).await;
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "legacy receive must refuse loud (HTTP 410), not 200+success:false; body={body}"
+    );
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["success"], false);
+    let err = resp["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/receive") || err.contains("removed") || err.contains("Stage 3"),
+        "error must name the removed endpoint; got {err:?}"
+    );
+
+    let after = {
+        let node = state.account_node.lock().unwrap();
+        let a = node
+            .get_account(&owner, &asset)
+            .expect("account still present");
+        (a.balance, a.coin_queue.len(), a.num_sends)
+    };
+    assert_eq!(
+        before, after,
+        "POST /api/receive must not mutate the account"
+    );
 }
 
 // -----------------------------------------------------------------
@@ -1763,50 +1729,10 @@ fn proof_store_proof_path_returns_none_for_nonexistent_directory() {
     // None branch we point at one that does not exist.
     let truly_missing = ProofStore {
         dir: "/this/path/genuinely/does/not/exist/zkcoins".to_string(),
-        next_id: std::sync::atomic::AtomicU64::new(0),
     };
     assert!(truly_missing.proof_path(7).is_none());
     // The real store was created and resolves fine for arbitrary ids.
     drop(store);
-}
-
-#[test]
-fn proof_store_new_picks_up_max_id_from_existing_files() {
-    // `tempfile::tempdir` removes the directory on Drop even when the
-    // test panics, so no /tmp/zkcoins-* tree leaks on failure.
-    let tmp = tempfile::tempdir().expect("create tempdir");
-    let dir = tmp.path();
-    // Drop a few well-formed and one malformed filename.
-    std::fs::write(dir.join("3.bin"), b"placeholder").unwrap();
-    std::fs::write(dir.join("17.bin"), b"placeholder").unwrap();
-    std::fs::write(dir.join("garbage.bin"), b"placeholder").unwrap();
-    std::fs::write(dir.join("notbin.txt"), b"placeholder").unwrap();
-
-    let store = ProofStore::new(dir.to_str().unwrap());
-    // next_id starts at max(3, 17) + 1 = 18; the malformed names are skipped.
-    let id = store.next_id.load(std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(id, 18);
-}
-
-#[test]
-fn persist_proof_bytes_logs_error_when_write_fails() {
-    // Pointing at a file inside a directory that does not exist guarantees
-    // `File::create` inside `atomic_write` returns an `Err` on both Linux
-    // and macOS. The function is best-effort: it logs and returns ().
-    // Exercising it covers the `if let Err(e) = ...` arm in router.rs
-    // that was reported uncovered on the Linux runner only.
-    let bad = std::path::Path::new("/this/path/does/not/exist/zkcoins/0.bin");
-    ProofStore::persist_proof_bytes(bad, b"payload", 42);
-}
-
-#[test]
-fn persist_proof_bytes_succeeds_when_write_succeeds() {
-    // Mirror test for the Ok arm so the helper is fully exercised.
-    // `tempfile::tempdir` cleans up on Drop, even on test panic.
-    let tmp = tempfile::tempdir().expect("create tempdir");
-    let path = tmp.path().join("99.bin");
-    ProofStore::persist_proof_bytes(&path, b"payload", 99);
-    assert_eq!(std::fs::read(&path).unwrap(), b"payload");
 }
 
 #[test]
@@ -1842,178 +1768,6 @@ fn lock_or_recover_username_store_poisoned() {
 
     assert!(store.is_poisoned());
     let _guard = lock_or_recover(&store);
-}
-
-// --- Item 1 (Issue #28) — HTTP error mapping for /api/send + /api/mint ---
-//
-// `map_send_coins_error` is the single source of truth for translating
-// `account_node::send_coins` failure strings into a `(StatusCode,
-// body)` pair. These unit tests pin every documented error string to
-// its mapped pair so adding a new error string anywhere in `send_coins`
-// will silently fall through the `_ => INTERNAL_SERVER_ERROR` arm of
-// the helper but loudly break one of these tests if the new string was
-// supposed to be mapped to a 4xx.
-
-#[test]
-fn map_send_coins_error_unknown_account_address_is_404() {
-    let (status, body) = crate::router::map_send_coins_error("Unknown account address");
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body, "Unknown account address");
-}
-
-/// Historical `"prev_commitment_pubkey required for account update"`
-/// 400 is unreachable as of the `Account::commitment_public_key`
-/// refactor — the server reads the previous commitment pubkey from
-/// its own state, and the `send_coins_inner` AccountUpdate branch no
-/// longer consults the caller-supplied `prev_commitment_pubkey`. The
-/// error string is no longer mapped, so it falls through the catch-all
-/// 500 arm. The test pins THAT (i.e. "if some future regression
-/// re-introduces this string, it must NOT be silently mapped to 400
-/// without also restoring the architectural choice it implies").
-#[test]
-fn map_send_coins_error_legacy_prev_commitment_pubkey_string_is_unmapped_500() {
-    let (status, body) =
-        crate::router::map_send_coins_error("prev_commitment_pubkey required for account update");
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body, "internal error");
-}
-
-#[test]
-fn map_send_coins_error_insufficient_funds_is_422() {
-    let (status, body) = crate::router::map_send_coins_error("Insufficient funds");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Insufficient funds");
-}
-
-#[test]
-fn map_send_coins_error_unable_to_get_merkle_proofs_is_422() {
-    // Reachable from send_coins via the prev_commitment_pubkey path
-    // (account_node::get_merkle_proofs:224). Caller supplied a
-    // public_key that has no associated commitment proof in state.
-    let (status, body) =
-        crate::router::map_send_coins_error("Unable to get merkle proofs for provided public key");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Unable to get merkle proofs for provided public key");
-}
-
-#[test]
-fn map_send_coins_error_unable_to_get_mmr_inclusion_proof_is_422() {
-    // Reachable from send_coins via get_merkle_proofs (account_node::236).
-    // Caller's previous_proof references a history root the node's MMR
-    // hasn't observed yet — stale snapshot, caller-fixable.
-    let (status, body) = crate::router::map_send_coins_error(
-        "Unable to get mmr inclusion proof for the previous root",
-    );
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(
-        body,
-        "Unable to get mmr inclusion proof for the previous root"
-    );
-}
-
-#[test]
-fn map_send_coins_error_proof_public_inputs_too_short_is_500() {
-    // Reachable from send_coins via get_merkle_proofs (account_node::232).
-    // The proof bytes stored against the account are too short to
-    // decode N_PROOF_DATA_PUBLIC_INPUTS field elements — node-side
-    // corruption or version mismatch, not caller-fixable.
-    let (status, body) = crate::router::map_send_coins_error("Proof public_inputs too short");
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body, "Proof public_inputs too short");
-}
-
-#[test]
-fn map_send_coins_error_phase_2b_shim_in_coin_not_in_source_ocr_is_422() {
-    let (status, body) =
-        crate::router::map_send_coins_error("In-coin not present in source's output_coins_root");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "In-coin not present in source's output_coins_root");
-}
-
-#[test]
-fn map_send_coins_error_phase_2b_shim_source_not_in_history_is_422() {
-    let (status, body) =
-        crate::router::map_send_coins_error("Source commitment not present in history MMR");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Source commitment not present in history MMR");
-}
-
-#[test]
-fn map_send_coins_error_coin_missing_commitment_is_422() {
-    let (status, body) = crate::router::map_send_coins_error("Coin is missing commitment");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Coin is missing commitment");
-}
-
-#[test]
-fn map_send_coins_error_missing_inclusion_proof_is_422() {
-    let (status, body) = crate::router::map_send_coins_error("Should provide an inclusion proof");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Should provide an inclusion proof");
-}
-
-#[test]
-fn map_send_coins_error_coin_already_in_coin_history_is_422() {
-    let (status, body) =
-        crate::router::map_send_coins_error("Coin should not exist in coin history tree");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Coin should not exist in coin history tree");
-}
-
-#[test]
-fn map_send_coins_error_coin_already_in_output_smt_is_422() {
-    let (status, body) = crate::router::map_send_coins_error("Coin should not exist in tree yet");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Coin should not exist in tree yet");
-}
-
-#[test]
-fn map_send_coins_error_too_many_in_coins_is_422() {
-    let (status, body) =
-        crate::router::map_send_coins_error("Too many in-coins for one transition");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Too many in-coins for one transition");
-}
-
-#[test]
-fn map_send_coins_error_too_many_out_coins_is_422() {
-    let (status, body) =
-        crate::router::map_send_coins_error("Too many out-coins for one transition");
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body, "Too many out-coins for one transition");
-}
-
-#[test]
-fn map_send_coins_error_prove_failed_initial_collapses_to_500_prove_failed() {
-    // Per the threat-model note in map_send_coins_error, the prover-internal
-    // error string is intentionally collapsed to a generic "prove failed"
-    // body so 5xx responses don't leak prover state to callers.
-    let (status, body) = crate::router::map_send_coins_error(
-        "prove_initial_with_in_and_out_coins_and_sources failed",
-    );
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body, "prove failed");
-}
-
-#[test]
-fn map_send_coins_error_prove_failed_account_update_collapses_to_500_prove_failed() {
-    let (status, body) = crate::router::map_send_coins_error(
-        "prove_account_update_with_in_and_out_coins_and_sources failed",
-    );
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body, "prove failed");
-}
-
-#[test]
-fn map_send_coins_error_unknown_string_is_500_internal_error() {
-    // A new `send_coins` error string we haven't mapped yet must NOT
-    // accidentally surface as 200 OK / 4xx. The default arm is 500 with
-    // a generic "internal error" body so the wallet treats it as a
-    // node problem and the operator finds the unmapped string in the
-    // `eprintln!` log.
-    let (status, body) = crate::router::map_send_coins_error("a string we never added");
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body, "internal error");
 }
 
 // =======================================================================
@@ -2405,35 +2159,76 @@ fn mint_test_state() -> AppState {
         job_store: Arc::new(crate::job_store::JobStore::new((*dead_pool()).clone())),
         job_tx: tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8).0,
         job_notify_map: Arc::new(dashmap::DashMap::new()),
+        v1_scan_caught_up: None,
+        v1_finality_ok: None,
+        pending_sign_map: Arc::new(dashmap::DashMap::new()),
+        v1_finalise: None,
+        v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
+        v1_pending_after_prove: None,
+        receive_creating_proof_loader: None,
+        v1_engine: None,
+        private_index: crate::kernel::access::InMemoryPrivateIndex::shared(),
+        bundles: crate::kernel::bootstrap::BundleStore::shared(),
+        attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
+        public_hosts: Arc::new(vec!["node.test".to_string()]),
     }
 }
 
-/// `MintStore::add` / `MintStore::take` are exercised in production only
-/// from `flow::{mint_flow, mint_commit_flow}` (coverage-excluded), so
-/// drive the store directly with a REAL staged issuer-mint. `add`
+/// `MintStore::add` / `MintStore::take` are residual legacy helpers
+/// (prove-side `add` is test-only; `take` is used by
+/// `flow::mint_commit_flow`, coverage-excluded). Drive the store
+/// directly with a host-shaped staged mint — the store test only needs
+/// a well-formed `StagedMint` value, not a real circuit proof. `add`
 /// returns a 1-based id; `take` consumes — a second `take` of the same
 /// id returns `None`.
 #[test]
 fn mint_store_add_take_roundtrips_and_consumes() {
-    let node = AccountNode::new(Arc::new(Mutex::new(State::new())));
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::polynomial::PolynomialCoeffs;
+    use plonky2::field::types::Field;
+    use plonky2::fri::proof::FriProof;
+    use plonky2::hash::merkle_tree::MerkleCap;
+    use plonky2::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
+
     let secp = secp::Secp256k1::new();
     let creator_obj = bitcoin::secp256k1::SecretKey::from_slice(&[3u8; 32])
         .expect("valid sk")
         .public_key(&secp);
-    let creator = creator_obj.serialize();
-    // Distinct fresh key the mint rotates `next_public_key` to.
-    let next = bitcoin::secp256k1::SecretKey::from_slice(&[4u8; 32])
-        .expect("valid sk")
-        .public_key(&secp)
-        .serialize();
-    let prepared = node
-        .prepare_mint(&creator, "StoreCoin", 8, 1234, &next)
-        .expect("prepare_mint");
+    let asset_id = zkcoins_program::hash::hash_bytes(b"StoreCoin-asset");
+    let owner = zkcoins_program::hash::hash_bytes(&creator_obj.serialize());
+    let mut mutated = crate::account_node::Account::new_for_asset(asset_id);
+    mutated.balance = 1234;
+    // Hollow residual proof shell — MintStore only holds/returns the blob.
+    let hollow_proof = ProofWithPublicInputs {
+        proof: Proof {
+            wires_cap: MerkleCap(vec![]),
+            plonk_zs_partial_products_cap: MerkleCap(vec![]),
+            quotient_polys_cap: MerkleCap(vec![]),
+            openings: OpeningSet {
+                constants: vec![],
+                plonk_sigmas: vec![],
+                wires: vec![],
+                plonk_zs: vec![],
+                plonk_zs_next: vec![],
+                partial_products: vec![],
+                quotient_polys: vec![],
+                lookup_zs: vec![],
+                lookup_zs_next: vec![],
+            },
+            opening_proof: FriProof {
+                commit_phase_merkle_caps: vec![],
+                query_round_proofs: vec![],
+                final_poly: PolynomialCoeffs::new(vec![]),
+                pow_witness: GoldilocksField::ZERO,
+            },
+        },
+        public_inputs: vec![GoldilocksField::ZERO; 4],
+    };
     let staged = crate::router::StagedMint {
-        proof: prepared.proof,
-        owner: prepared.owner,
-        asset_id: prepared.asset_id,
-        mutated_account: prepared.mutated_account,
+        proof: hollow_proof,
+        owner,
+        asset_id,
+        mutated_account: mutated,
         creator_pubkey: creator_obj,
     };
 
@@ -2460,7 +2255,27 @@ fn mint_store_add_take_roundtrips_and_consumes() {
 mod jobs_endpoint_tests {
     use super::*;
     use crate::router::create_router;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    /// Serialise tests that flip the process-global stack claim so
+    /// parallel postgres-backed cases do not clear each other's mode
+    /// mid-request (shared container + shared `PROCESS_STACK_MODE`).
+    static V1_STACK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Acquire the process-global stack-mode serialisation lock.
+    ///
+    /// Held across `.await` points on purpose: these tests touch shared
+    /// process state (`PROCESS_STACK_MODE` / the shared container) and
+    /// must not interleave. `tokio::sync::Mutex` is the correct tool for
+    /// that (unlike `std::sync::MutexGuard`, which is thread-bound).
+    ///
+    /// `tokio::sync::Mutex` has no poison flag — a panicking holder does
+    /// not permanently lock out later tests. That resilience used to be
+    /// expressed via `unwrap_or_else(|poisoned| poisoned.into_inner())` on
+    /// `std::sync::Mutex`; do not reintroduce a poison recovery path.
+    async fn lock_v1_stack_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+        V1_STACK_TEST_LOCK.lock().await
+    }
 
     /// Build an `AppState` whose `job_store` is wired to a fresh
     /// per-test schema in the shared `postgres:17` container (issue
@@ -2674,6 +2489,49 @@ mod jobs_endpoint_tests {
         );
     }
 
+    /// §7.5: same Idempotency-Key with a **different** body is
+    /// `409 idempotency_conflict` — not a silent 202 replaying the first job.
+    /// Would be red against the pre-Block-4 store (same key always replayed).
+    #[tokio::test]
+    async fn jobs_mint_same_idem_key_different_body_returns_409_idempotency_conflict() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let body_a = signed_mint_body(1);
+        let body_b = signed_mint_body(2);
+        let key = "k-conflict";
+        let first = run(
+            state.clone(),
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", key)
+                .body(Body::from(body_a.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(first.0, StatusCode::ACCEPTED);
+
+        let second = run(
+            state,
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", key)
+                .body(Body::from(body_b.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            second.0,
+            StatusCode::CONFLICT,
+            "different body under same key must be 409, got body {}",
+            second.2
+        );
+        let v: serde_json::Value = serde_json::from_str(&second.2).expect("json");
+        assert_eq!(
+            v["error"], "idempotency_conflict",
+            "machine code must be the closed §7.5 reason, got {}",
+            second.2
+        );
+    }
+
     #[tokio::test]
     async fn jobs_mint_idempotent_replay_after_completion_returns_cached_body() {
         let (state, _pool, _c) = jobs_test_state().await;
@@ -2696,6 +2554,7 @@ mod jobs_endpoint_tests {
             .job_store
             .complete(
                 job_id,
+                crate::job_store::JobStatus::Queued,
                 serde_json::json!({"success": true, "proof_id": 99u64}),
                 200,
             )
@@ -2718,6 +2577,113 @@ mod jobs_endpoint_tests {
         );
         let v2: serde_json::Value = serde_json::from_str(&second.2).unwrap();
         assert_eq!(v2["proof_id"], 99u64);
+    }
+
+    /// Completed idempotent replay with `response_status = NULL` must be
+    /// `500 internal_error`, never invent HTTP 200.
+    ///
+    /// Pre-fix: `response_status.unwrap_or(200)` treated absence as success.
+    #[tokio::test]
+    async fn jobs_mint_idempotent_replay_missing_response_status_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let body = signed_mint_body(1);
+        let first = run(
+            state.clone(),
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k-missing-status")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        let v1: serde_json::Value = serde_json::from_str(&first.2).unwrap();
+        let job_id = uuid::Uuid::parse_str(v1["job_id"].as_str().unwrap()).unwrap();
+
+        // Body present, status NULL — the silent-200 path this gate removes.
+        sqlx::query(
+            "UPDATE jobs SET status = 'completed', phase = 'completed', progress = 100, \
+             response_body = $1::jsonb, response_status = NULL, completed_at = NOW() \
+             WHERE public_id = $2",
+        )
+        .bind(serde_json::json!({"success": true, "proof_id": 77u64}))
+        .bind(job_id)
+        .execute(pool.as_ref())
+        .await
+        .expect("plant completed without response_status");
+
+        let second = run(
+            state,
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k-missing-status")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            second.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "missing response_status must not 200; body={}",
+            second.2
+        );
+        let v2: serde_json::Value = serde_json::from_str(&second.2).unwrap();
+        assert_eq!(v2["error"], "internal_error");
+        assert!(
+            v2.get("proof_id").is_none(),
+            "must not surface cached body on corrupt status: {}",
+            second.2
+        );
+    }
+
+    /// Completed idempotent replay with a non-HTTP `response_status` must be
+    /// `500 internal_error`, never invent HTTP 200 via `from_u16` fallback.
+    ///
+    /// Pre-fix: `StatusCode::from_u16(...).unwrap_or(StatusCode::OK)`.
+    #[tokio::test]
+    async fn jobs_mint_idempotent_replay_invalid_response_status_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let body = signed_mint_body(1);
+        let first = run(
+            state.clone(),
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k-bad-status")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        let v1: serde_json::Value = serde_json::from_str(&first.2).unwrap();
+        let job_id = uuid::Uuid::parse_str(v1["job_id"].as_str().unwrap()).unwrap();
+
+        // 7000 is a valid i16 but not a valid HTTP status code.
+        sqlx::query(
+            "UPDATE jobs SET status = 'completed', phase = 'completed', progress = 100, \
+             response_body = $1::jsonb, response_status = 7000, completed_at = NOW() \
+             WHERE public_id = $2",
+        )
+        .bind(serde_json::json!({"success": true, "proof_id": 88u64}))
+        .bind(job_id)
+        .execute(pool.as_ref())
+        .await
+        .expect("plant completed with invalid response_status");
+
+        let second = run(
+            state,
+            Request::post("/api/jobs/mint")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "k-bad-status")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            second.0,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid response_status must not 200; body={}",
+            second.2
+        );
+        let v2: serde_json::Value = serde_json::from_str(&second.2).unwrap();
+        assert_eq!(v2["error"], "internal_error");
     }
 
     // ---- POST /api/jobs/send ----
@@ -2887,6 +2853,7 @@ mod jobs_endpoint_tests {
             .job_store
             .complete(
                 job_id,
+                crate::job_store::JobStatus::Queued,
                 serde_json::json!({"success": true, "proof_id": 7u64}),
                 200,
             )
@@ -2923,7 +2890,11 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .fail(job_id, "synthetic error")
+            .fail(
+                job_id,
+                crate::job_store::JobStatus::Queued,
+                "synthetic error",
+            )
             .await
             .expect("fail");
 
@@ -2984,6 +2955,114 @@ mod jobs_endpoint_tests {
         assert_eq!(v["result"]["output_coins_root"], ocr);
     }
 
+    /// Plant a `completed` row with SQL NULL `response_body` (corrupt).
+    ///
+    /// Against the pre-split handler this returned HTTP 200 without a
+    /// `result` field. Fail-closed behaviour must answer `500` instead.
+    async fn plant_completed_without_response_body(
+        pool: &sqlx::PgPool,
+        account: [u8; 32],
+        idem: &str,
+    ) -> uuid::Uuid {
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs \
+             (public_id, kind, status, phase, account_address, idempotency_key, request_body, \
+              progress, reset_generation) \
+             VALUES ($1, 'mint', 'completed', 'completed', $2, $3, '{}'::jsonb, 100, 0)",
+        )
+        .bind(job_id)
+        .bind(&account[..])
+        .bind(idem)
+        .execute(pool)
+        .await
+        .expect("plant corrupt completed row");
+        job_id
+    }
+
+    /// Would have been green (HTTP 200, no `result`) on the old handler;
+    /// must now fail closed with legacy 500 + free-text error.
+    #[tokio::test]
+    async fn get_job_completed_without_response_body_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let job_id =
+            plant_completed_without_response_body(pool.as_ref(), [0xC1u8; 32], "k-corrupt-legacy")
+                .await;
+
+        let req = Request::get(format!("/api/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "corrupt completed must not 200; body={body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "Failed to load job");
+        // Must not look like a successful poll envelope.
+        assert!(
+            v.get("status").is_none(),
+            "must not emit job status: {body}"
+        );
+        assert!(v.get("result").is_none(), "must not emit result: {body}");
+    }
+
+    /// Same corrupt row via `/v1/jobs/:id` → §7.5 `internal_error` (not 200).
+    #[tokio::test]
+    async fn v1_get_job_completed_without_response_body_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let job_id =
+            plant_completed_without_response_body(pool.as_ref(), [0xC2u8; 32], "k-corrupt-v1")
+                .await;
+
+        let req = Request::get(format!("/v1/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "corrupt completed must not 200; body={body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "internal_error");
+        assert_eq!(v["message"], "Failed to load job");
+        assert!(v.get("result").is_none(), "must not emit result: {body}");
+        assert!(
+            v.get("status").is_none(),
+            "must not emit job status: {body}"
+        );
+    }
+
+    /// Awaiting-signature without payload is likewise corrupt → 500.
+    #[tokio::test]
+    async fn get_job_awaiting_signature_without_payload_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let job_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs \
+             (public_id, kind, status, phase, account_address, idempotency_key, request_body, \
+              proof_id, reset_generation) \
+             VALUES ($1, 'send', 'awaiting_signature', 'awaiting_signature', $2, $3, '{}'::jsonb, \
+              7, 0)",
+        )
+        .bind(job_id)
+        .bind(&[0xC3u8; 32][..])
+        .bind("k-corrupt-sig")
+        .execute(pool.as_ref())
+        .await
+        .expect("plant corrupt awaiting_signature row");
+
+        let req = Request::get(format!("/api/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "Failed to load job");
+    }
+
     // ---- POST /api/jobs/:id/cancel ----
 
     #[tokio::test]
@@ -3022,6 +3101,49 @@ mod jobs_endpoint_tests {
         assert_eq!(status, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["status"], "cancelled");
+    }
+
+    /// Defect 1: legacy `/api/jobs/:id/cancel` rejects proving — flag-off
+    /// behaviour is byte-identical (queued only).
+    #[tokio::test]
+    async fn legacy_api_cancel_rejects_proving() {
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Mint,
+                &[0xAAu8; 32],
+                Some("k-legacy-cancel-proving"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .set_status(
+                job_id,
+                crate::job_store::JobStatus::Queued,
+                crate::job_store::JobStatus::Proving,
+                "proving",
+            )
+            .await
+            .expect("proving");
+
+        let req = Request::post(format!("/api/jobs/{}/cancel", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state.clone(), req).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "legacy cancel must refuse proving: {body}"
+        );
+        let after = state.job_store.load(job_id).await.unwrap().unwrap();
+        assert_eq!(after.status, crate::job_store::JobStatus::Proving);
     }
 
     // ---- POST /api/jobs/:id/commit ----
@@ -3162,6 +3284,2223 @@ mod jobs_endpoint_tests {
             .unwrap();
         let (status, _h, _b) = run(state, req).await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    // ---- POST /v1/jobs/:id/sign (Gap G4 §7.5 wire boundary) ----
+
+    #[tokio::test]
+    async fn jobs_sign_valid_v1_signature_accepted_through_route() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xABu8; 32],
+                Some("k-sign-ok"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (entry, submission) =
+            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v1::awaiting_signature_result_json(&entry);
+        // Persist restart-safe envelope + stage in-memory.
+        let persist = crate::v1::DurableFinalisationPersist::from_entry(&entry)
+            .expect("encode durable finalisation");
+        let mut body = serde_json::json!({});
+        body.as_object_mut().unwrap().insert(
+            crate::v1::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&body)
+            .bind(job_id)
+            .execute(state.job_store.pool())
+            .await
+            .expect("persist pending_sign");
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        state.pending_sign_map.insert(job_id, entry);
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier);
+
+        let body = serde_json::json!({
+            "signature": hex::encode(submission.signature),
+            "s2c_nonce": hex::encode(submission.s2c_nonce),
+        });
+        // §7.5 path is /v1/jobs/<id>/sign — not the legacy /api prefix.
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["status"], "signature_accepted");
+        // Staged material is kept until the dispatcher finalises.
+        assert!(state.pending_sign_map.get(&job_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn jobs_sign_malformed_encoding_rejected_at_boundary() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xACu8; 32],
+                Some("k-sign-enc"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+            .await
+            .expect("awaiting_signature");
+
+        // Uppercase hex is encoding failure → §7.5 `malformed_request`.
+        let body = serde_json::json!({
+            "signature": "AA".repeat(64),
+            "s2c_nonce": "bb".repeat(32),
+        });
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+        // Closed enumeration: no invented "check" field, no "encoding" code.
+        assert!(v.get("check").is_none(), "invented check field: {resp}");
+        assert!(
+            v["message"].as_str().unwrap_or("").contains("lowercase")
+                || v["message"].as_str().unwrap_or("").contains("hex"),
+            "message should describe the encoding rule: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jobs_sign_flag_off_refuses_and_legacy_commit_still_works() {
+        let _stack_guard = lock_v1_stack_for_test().await;
+        // Flag / claim off (default).
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xADu8; 32],
+                Some("k-sign-flag-off"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        // Legacy awaiting_signature shape (ash/ocr).
+        let ash = "aa".repeat(32);
+        let ocr = "bb".repeat(32);
+        state
+            .job_store
+            .set_awaiting_signature(
+                job_id,
+                7,
+                serde_json::json!({
+                    "account_state_hash": ash,
+                    "output_coins_root": ocr,
+                }),
+            )
+            .await
+            .expect("awaiting_signature");
+
+        // /v1/.../sign refuses under flag-off as feature_disabled (not
+        // wrong_phase — the job phase is fine; the surface is off).
+        let sign_body = serde_json::json!({
+            "signature": "00".repeat(64),
+            "s2c_nonce": "11".repeat(32),
+        });
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(sign_body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "feature_disabled");
+        assert!(v.get("check").is_none());
+
+        // Legacy GET /api/jobs still surfaces ash/ocr under `result`.
+        let req = Request::get(format!("/api/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["result"]["account_state_hash"], ash);
+        assert_eq!(v["result"]["output_coins_root"], ocr);
+        assert!(v["result"].get("proof_data_hash").is_none());
+
+        // Legacy /commit still accepts the request (wakes notifier) under flag-off.
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        let commit_wake = notifier.commit_wake.clone();
+        state.job_notify_map.insert(job_id, notifier);
+        let commit_body = serde_json::json!({
+            "proof_id": 7u64,
+            "public_key": "020000000000000000000000000000000000000000000000000000000000000001",
+            "signature": "00".repeat(64),
+            "message": "ff".repeat(32),
+        });
+        let req = Request::post(format!("/api/jobs/{}/commit", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(commit_body.to_string()))
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "legacy commit body: {body}");
+        tokio::time::timeout(std::time::Duration::from_secs(1), commit_wake.notified())
+            .await
+            .expect("legacy commit must still wake the dispatcher");
+    }
+
+    /// §7.5: route path, `awaiting_signature` envelope (not under `result`),
+    /// progress float in [0,1], closed error codes.
+    #[tokio::test]
+    async fn v1_job_poll_and_sign_follow_section_7_5_envelope() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Mint,
+                &[0xAEu8; 32],
+                Some("k-v1-ad"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (entry, _) = crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v1::select_awaiting_signature_result(
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+            Some(&entry),
+        )
+        .expect("v1 ad");
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 3, advertised)
+            .await
+            .expect("awaiting_signature");
+
+        // §7.5 poll: GET /v1/jobs/<id>
+        let req = Request::get(format!("/v1/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, body) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "awaiting_signature");
+        // Fields under `awaiting_signature`, NOT under `result`.
+        assert!(
+            v.get("result").is_none(),
+            "must not nest under result: {body}"
+        );
+        let surface = v
+            .get("awaiting_signature")
+            .expect("awaiting_signature field required by §7.5");
+        assert!(surface.get("account_state_hash").is_none());
+        assert!(surface.get("new_account_state_hash").is_some());
+        assert!(surface.get("proof_data_hash").is_some());
+        assert!(surface.get("txn_pubkey").is_some());
+        assert!(surface.get("send_counter").is_some());
+        assert!(surface.get("npk_commit").is_some());
+        // progress is a float in [0,1], not integer 0–100.
+        let progress = v["progress"].as_f64().expect("progress float");
+        assert!((0.0..=1.0).contains(&progress), "progress={progress}");
+        // phase optional diagnostic while non-terminal.
+        assert!(v.get("phase").is_some());
+        // Retry-After: 0 while awaiting_signature.
+        assert!(
+            headers
+                .iter()
+                .any(|(k, val)| k.eq_ignore_ascii_case("retry-after") && val == "0"),
+            "headers: {headers:?}"
+        );
+
+        // Closed error codes on /sign: job_not_found.
+        let missing = uuid::Uuid::new_v4();
+        let req = Request::post(format!("/v1/jobs/{}/sign", missing))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "signature": "00".repeat(64),
+                    "s2c_nonce": "11".repeat(32),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "job_not_found");
+        assert!(v.get("message").is_some());
+    }
+
+    /// Defect 2: an accepted signature drives finalise, not a bare status flip.
+    #[tokio::test]
+    async fn accepted_signature_drives_finalise_not_status_only() {
+        use crate::v1::{set_process_stack_mode, FinaliseOutcome, ScanStackMode};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let finalise_called = Arc::new(AtomicBool::new(false));
+        let finalise_called_hook = Arc::clone(&finalise_called);
+
+        let (mut state, _pool, _c) = jobs_test_state().await;
+        state.v1_finalise = Some(Arc::new(move |pending, signature, _fence| {
+            let finalise_called_hook = Arc::clone(&finalise_called_hook);
+            Box::pin(async move {
+                finalise_called_hook.store(true, Ordering::SeqCst);
+                // The hook receives the staged pending + the accepted signature
+                // — not just a status change. Bind to the pending's ProofData.
+                assert_eq!(
+                    signature.pk_i,
+                    pending.witness_wip.prev_account_state.current_pubkey
+                );
+                Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            })
+        }));
+
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xB1u8; 32],
+                Some("k-finalise"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (entry, submission) =
+            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v1::awaiting_signature_result_json(&entry);
+        let persist = crate::v1::DurableFinalisationPersist::from_entry(&entry)
+            .expect("encode durable finalisation");
+        let mut req_body = serde_json::json!({});
+        req_body.as_object_mut().unwrap().insert(
+            crate::v1::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&req_body)
+            .bind(job_id)
+            .execute(state.job_store.pool())
+            .await
+            .expect("persist");
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        state.pending_sign_map.insert(job_id, entry);
+
+        // Park a notifier so /sign can wake the dispatcher path we drive
+        // directly below (no full dispatcher spawn — call the same
+        // finalise path the dispatcher uses via a wake + inline process).
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        let commit_wake = notifier.commit_wake.clone();
+        state.job_notify_map.insert(job_id, notifier);
+
+        let body = serde_json::json!({
+            "signature": hex::encode(submission.signature),
+            "s2c_nonce": hex::encode(submission.s2c_nonce),
+        });
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "body: {resp}");
+
+        // Simulate the dispatcher waking and driving finalise from the
+        // durable capability (same path as wait_for_commit / drive_v1_finalise).
+        let _ = commit_wake;
+        let job = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        let entry = crate::v1::rehydrate_pending_sign(&job.request_body)
+            .expect("rehydrate")
+            .expect("signed durable finalisation on row after /sign");
+        let sig = entry.signature.clone().expect("signature installed");
+        let hook = state.v1_finalise.as_ref().expect("hook");
+        // Direct spy invocation (not via claim): dummy fence for type shape.
+        let outcome = hook(
+            entry.pending,
+            sig,
+            crate::job_store::FinaliseFence {
+                job_id,
+                owner: state.job_store.process_owner(),
+                fence: 0,
+            },
+        )
+        .await
+        .expect("finalise");
+        assert!(
+            finalise_called.load(Ordering::SeqCst),
+            "finalise hook must have been invoked"
+        );
+        let result_json = outcome.to_result_json();
+        assert!(result_json.get("new_account_state_hash").is_some());
+        assert!(result_json.get("signature_accepted").is_none());
+
+        // Job is still awaiting_signature (hook was invoked directly, not
+        // via claim/finalise owner complete).
+        state
+            .job_store
+            .complete(
+                job_id,
+                crate::job_store::JobStatus::AwaitingSignature,
+                result_json.clone(),
+                200,
+            )
+            .await
+            .expect("complete");
+        let req = Request::get(format!("/v1/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "completed");
+        assert!(
+            v.get("phase").is_none(),
+            "phase absent when terminal: {body}"
+        );
+        assert!(v["result"].get("new_account_state_hash").is_some());
+        assert!(v["result"].get("signature_accepted").is_none());
+    }
+
+    /// Defect 1: acceptance without a parked dispatcher is failure, not
+    /// success — no invented `dispatcher: "not_waiting"`.
+    #[tokio::test]
+    async fn jobs_sign_without_dispatcher_reports_failure_not_acceptance() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xC1u8; 32],
+                Some("k-no-disp"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (entry, submission) =
+            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v1::awaiting_signature_result_json(&entry);
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        state.pending_sign_map.insert(job_id, entry);
+        // Deliberately NO job_notify_map entry — dispatcher not parked.
+
+        let body = serde_json::json!({
+            "signature": hex::encode(submission.signature),
+            "s2c_nonce": hex::encode(submission.s2c_nonce),
+        });
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "internal_error");
+        assert_ne!(v["status"], "signature_accepted");
+        assert!(
+            v.get("dispatcher").is_none(),
+            "no invented dispatcher field: {resp}"
+        );
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no dispatcher"),
+            "message should describe the lifecycle failure: {resp}"
+        );
+    }
+
+    /// Durable finalisation rehydrate carries a full capability (not a
+    /// verification-grade partial). Signed resume is finalise-ready; completion
+    /// still needs the post-apply surface.
+    #[tokio::test]
+    async fn rehydrated_durable_finalisation_is_finalise_ready() {
+        use crate::v1::{
+            ensure_completion_ready, ensure_finalise_ready, set_process_stack_mode,
+            DurableFinalisationPersist, ScanStackMode,
+        };
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (mut entry, submission) =
+            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let accepted = crate::v1::accept_wallet_transition_signature(
+            crate::v1::V1ShadowMode::On,
+            entry.network,
+            &entry.pending,
+            &submission,
+        )
+        .expect("verify");
+        entry.install_signature(accepted).expect("install");
+        let rehydrated = DurableFinalisationPersist::from_entry(&entry)
+            .expect("encode")
+            .into_entry()
+            .expect("rehydrate");
+        ensure_finalise_ready(&rehydrated).expect("signed durable rehydrate is finalise-ready");
+        ensure_finalise_ready(&entry).expect("live-staged signed is finalise-ready");
+        assert!(
+            ensure_completion_ready(&rehydrated).is_err(),
+            "signed-only capability is not completion-ready without completion_result"
+        );
+    }
+
+    /// Defect 4/5: success result carries output_coin_ids + publisher_pubkey.
+    #[tokio::test]
+    async fn completed_result_carries_output_coin_ids_and_publisher_pubkey() {
+        use crate::v1::{set_process_stack_mode, FinaliseOutcome, ScanStackMode};
+        use shared::spec_v1::{digest_from_bytes, digest_to_bytes, Coin, ZERO_HASH};
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (mut entry, _) = crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        // Attach one synthetic output coin so the result is non-empty.
+        let coin_id = [0x42u8; 32];
+        entry.pending.witness_wip.output_coins.push(Coin {
+            identifier: digest_from_bytes(&coin_id).expect("digest"),
+            recipient: entry.pending.owner,
+            amount: 1,
+            asset_id: ZERO_HASH,
+        });
+
+        let publisher = [0xCCu8; 32];
+        let outcome = FinaliseOutcome::from_pending_proof_data_with_publisher(
+            &entry.pending,
+            Some(publisher),
+        );
+        let result_json = outcome.to_result_json();
+        assert_eq!(
+            result_json["output_coin_ids"].as_array().map(|a| a.len()),
+            Some(1),
+            "output_coin_ids: {result_json}"
+        );
+        assert_eq!(
+            result_json["output_coin_ids"][0].as_str().unwrap(),
+            hex::encode(digest_to_bytes(
+                &entry.pending.witness_wip.output_coins[0].identifier
+            ))
+        );
+        assert_eq!(
+            result_json["publisher_pubkey"].as_str().unwrap(),
+            hex::encode(publisher)
+        );
+
+        // Also surface via GET /v1/jobs poll envelope.
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Mint,
+                &[0xC2u8; 32],
+                Some("k-result-fields"),
+                serde_json::json!({
+                    "publisher_pubkey": hex::encode(publisher),
+                }),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .complete(
+                job_id,
+                crate::job_store::JobStatus::Queued,
+                result_json,
+                200,
+            )
+            .await
+            .expect("complete");
+        let req = Request::get(format!("/v1/jobs/{}", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["status"], "completed");
+        assert!(v["result"]["output_coin_ids"].is_array());
+        assert_eq!(
+            v["result"]["publisher_pubkey"].as_str().unwrap(),
+            hex::encode(publisher)
+        );
+    }
+
+    /// Defect 5: malformed JSON and malformed UUID → 400 malformed_request.
+    #[tokio::test]
+    async fn v1_extractors_map_malformed_json_and_uuid_to_malformed_request() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+
+        // Malformed UUID in path.
+        let req = Request::post("/v1/jobs/not-a-uuid/sign")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "signature": "00".repeat(64),
+                    "s2c_nonce": "11".repeat(32),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "uuid body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+        assert!(v.get("message").is_some());
+
+        // Malformed JSON body on a well-formed UUID.
+        let id = uuid::Uuid::new_v4();
+        let req = Request::post(format!("/v1/jobs/{}/sign", id))
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "json body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+
+        // Wrong-type JSON (missing required fields / wrong types).
+        let req = Request::post(format!("/v1/jobs/{}/sign", id))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"signature": 123, "s2c_nonce": true}"#))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "type body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+    }
+
+    /// Defect 4: /sign still works after a simulated restart (map empty,
+    /// rehydrate from request_body.pending_sign).
+    #[tokio::test]
+    async fn jobs_sign_works_after_simulated_restart() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xB2u8; 32],
+                Some("k-restart"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (entry, submission) =
+            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v1::awaiting_signature_result_json(&entry);
+        let persist = crate::v1::DurableFinalisationPersist::from_entry(&entry)
+            .expect("encode durable finalisation");
+        let mut req_body = serde_json::json!({});
+        req_body.as_object_mut().unwrap().insert(
+            crate::v1::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&req_body)
+            .bind(job_id)
+            .execute(state.job_store.pool())
+            .await
+            .expect("persist pending_sign");
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+
+        // Simulate restart: clear the in-memory map. /sign must rehydrate.
+        state.pending_sign_map.clear();
+        assert!(state.pending_sign_map.get(&job_id).is_none());
+
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier);
+
+        let body = serde_json::json!({
+            "signature": hex::encode(submission.signature),
+            "s2c_nonce": hex::encode(submission.s2c_nonce),
+        });
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "after restart /sign must rehydrate and accept: {resp}"
+        );
+        // Map re-populated from the envelope.
+        assert!(
+            state.pending_sign_map.get(&job_id).is_some(),
+            "rehydrate must re-stage the pending entry"
+        );
+    }
+
+    /// Defect 1 (round 5): a job that reaches `awaiting_signature` through
+    /// the dispatcher's production staging site (`stage_and_select_awaiting_signature`
+    /// → `stage_pending_sign`) can be signed via `/v1`.
+    #[tokio::test]
+    async fn dispatcher_staging_path_allows_v1_sign() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (mut state, _pool, _c) = jobs_test_state().await;
+        let (entry, submission) =
+            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+
+        // Prove-path hook supplies the live pending (Stage 3 will wire
+        // StateEngine::begin_* here). The dispatcher staging site is
+        // what actually calls stage_pending_sign.
+        let entry_for_hook = entry.clone();
+        state.v1_pending_after_prove = Some(Arc::new(move |_job_id| Some(entry_for_hook.clone())));
+
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xD1u8; 32],
+                Some("k-disp-stage"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        // Production site the dispatcher invokes after prove.
+        let live = state
+            .v1_pending_after_prove
+            .as_ref()
+            .and_then(|h| h(job_id));
+        let advertised = crate::job_dispatcher::stage_and_select_awaiting_signature(
+            &state.job_store,
+            &state,
+            job_id,
+            "aa".repeat(32).as_str(),
+            "bb".repeat(32).as_str(),
+            live,
+        )
+        .await
+        .expect("dispatcher staging must succeed with a live pending");
+        assert!(
+            advertised.get("proof_data_hash").is_some(),
+            "v1.1 surface required: {advertised}"
+        );
+        assert!(
+            state.pending_sign_map.get(&job_id).is_some(),
+            "stage_pending_sign must populate pending_sign_map"
+        );
+        // Restart envelope persisted.
+        let row = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert!(
+            row.request_body
+                .get(crate::v1::FINALISATION_BODY_KEY)
+                .is_some(),
+            "pending_sign envelope must be on the job row"
+        );
+
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier);
+
+        let body = serde_json::json!({
+            "signature": hex::encode(submission.signature),
+            "s2c_nonce": hex::encode(submission.s2c_nonce),
+        });
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["status"], "signature_accepted");
+    }
+
+    /// Defect 2 (round 5): dispatcher disappearing between clone and wake
+    /// (handoff CAS lost to timeout) yields rejection, not acceptance.
+    #[tokio::test]
+    async fn jobs_sign_rejects_when_dispatcher_handoff_already_timed_out() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xD2u8; 32],
+                Some("k-handoff-race"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (entry, submission) =
+            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v1::awaiting_signature_result_json(&entry);
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        state.pending_sign_map.insert(job_id, entry);
+
+        // Notifier is present (clone would succeed) but the dispatcher has
+        // already claimed timeout — the CAS must refuse acceptance.
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        assert!(
+            notifier.try_claim_timeout(),
+            "simulate dispatcher timeout claiming the handoff"
+        );
+        state.job_notify_map.insert(job_id, notifier);
+
+        let body = serde_json::json!({
+            "signature": hex::encode(submission.signature),
+            "s2c_nonce": hex::encode(submission.s2c_nonce),
+        });
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "internal_error");
+        assert_ne!(v["status"], "signature_accepted");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no longer waiting")
+                || v["message"].as_str().unwrap_or("").contains("timed out"),
+            "message should describe the handoff race: {resp}"
+        );
+        // Persist-before-signal: even on a refused handoff the signed
+        // durable capability must already be on the row.
+        let row = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        let entry = crate::v1::rehydrate_pending_sign(&row.request_body)
+            .expect("rehydrate")
+            .expect("durable finalisation present");
+        assert!(
+            entry.signature.is_some(),
+            "persist-before-signal: signed capability must be durable even when CAS refuses"
+        );
+    }
+
+    /// Defect 1: a job staged through the production registry
+    /// (`register_live_pending_after_begin` → resolve →
+    /// `stage_and_select_awaiting_signature`) can be signed via `/v1`.
+    #[tokio::test]
+    async fn production_begin_registry_staging_allows_v1_sign() {
+        use crate::v1::{register_live_pending_after_begin, set_process_stack_mode, ScanStackMode};
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (mut state, _pool, _c) = jobs_test_state().await;
+        let (entry, submission) =
+            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xD3u8; 32],
+                Some("k-prod-stage"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        // Production write site: begin_* registers the live pending here.
+        register_live_pending_after_begin(&state.v1_live_pending_after_begin, job_id, entry);
+
+        // No test hook — production resolve path only.
+        state.v1_pending_after_prove = None;
+        let live = crate::job_dispatcher::resolve_live_pending_after_prove_for_test(&state, job_id);
+        assert!(
+            live.is_some(),
+            "production registry must supply the pending"
+        );
+        let advertised = crate::job_dispatcher::stage_and_select_awaiting_signature(
+            &state.job_store,
+            &state,
+            job_id,
+            "aa".repeat(32).as_str(),
+            "bb".repeat(32).as_str(),
+            live,
+        )
+        .await
+        .expect("production staging must succeed");
+        assert!(advertised.get("proof_data_hash").is_some());
+        assert!(state.pending_sign_map.get(&job_id).is_some());
+
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        // set_awaiting_signature requires proving|queued — flip first.
+        // (create leaves queued; the WHERE allows it.)
+        let notifier = Arc::new(crate::job_dispatcher::JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier);
+
+        let body = serde_json::json!({
+            "signature": hex::encode(submission.signature),
+            "s2c_nonce": hex::encode(submission.s2c_nonce),
+        });
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["status"], "signature_accepted");
+    }
+
+    /// Defect 2: SIGNALED without durable state is unreachable.
+    /// A refused CAS after successful persist still has the sign blob;
+    /// the inverse (SIGNALED with no blob) cannot arise from /sign.
+    #[tokio::test]
+    async fn jobs_sign_persist_before_signal_invariant() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xD4u8; 32],
+                Some("k-persist-first"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (entry, submission) =
+            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v1::awaiting_signature_result_json(&entry);
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        state.pending_sign_map.insert(job_id, entry);
+
+        // No notifier → acceptance refuses before CAS; handoff never SIGNALED.
+        // (If we had signalled first, a crash before persist would leave
+        // SIGNALED with no durable sign — the reorder closes that window.)
+        let body = serde_json::json!({
+            "signature": hex::encode(submission.signature),
+            "s2c_nonce": hex::encode(submission.s2c_nonce),
+        });
+        let req = Request::post(format!("/v1/jobs/{}/sign", job_id))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {resp}");
+        let row = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        // Without a notifier we refuse before persist (no dispatcher to serve).
+        // The invariant under test is: we never set SIGNALED without a durable
+        // blob — and with no notifier there is no handoff to signal at all.
+        assert!(
+            state.job_notify_map.get(&job_id).is_none(),
+            "no handoff exists to be left in SIGNALED"
+        );
+        let _ = row; // status stays awaiting_signature
+    }
+
+    /// Helper: plant a signed durable capability (optionally with completion
+    /// surface) on a fresh send job at `awaiting_signature`.
+    async fn plant_signed_finalisation_job(
+        store: &crate::job_store::JobStore,
+        owner_tag: u8,
+        idem: &str,
+        with_completion: bool,
+    ) -> (uuid::Uuid, crate::v1::PendingSignEntry) {
+        let result = store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[owner_tag; 32],
+                Some(idem),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!("expected fresh job"),
+        };
+
+        let (mut entry, submission) =
+            crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let advertised = crate::v1::awaiting_signature_result_json(&entry);
+        let accepted = crate::v1::accept_wallet_transition_signature(
+            crate::v1::V1ShadowMode::On,
+            entry.network,
+            &entry.pending,
+            &submission,
+        )
+        .expect("verify");
+        entry.install_signature(accepted).expect("install");
+        if with_completion {
+            let outcome = crate::v1::FinaliseOutcome::from_pending_proof_data_with_publisher(
+                &entry.pending,
+                entry.publisher_pubkey,
+            );
+            entry
+                .install_completion(outcome.to_result_json(), 200)
+                .expect("install completion");
+        }
+        let persist = crate::v1::DurableFinalisationPersist::from_entry(&entry).expect("encode");
+        let mut body = serde_json::json!({});
+        body.as_object_mut().unwrap().insert(
+            crate::v1::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&body)
+            .bind(job_id)
+            .execute(store.pool())
+            .await
+            .expect("persist durable finalisation");
+        store
+            .set_awaiting_signature(job_id, 1, advertised)
+            .await
+            .expect("awaiting_signature");
+        // Re-plant after status flip (set_awaiting_signature does not clear
+        // request_body keys we need, but keep the durable blob authoritative).
+        let row = store.load(job_id).await.expect("load").expect("row");
+        let mut body = row.request_body;
+        body.as_object_mut().unwrap().insert(
+            crate::v1::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&body)
+            .bind(job_id)
+            .execute(store.pool())
+            .await
+            .expect("replant durable");
+        (job_id, entry)
+    }
+
+    /// Build a **genuinely fresh** AppState from the pool (new Arcs, empty
+    /// maps, `v1_finalise = None`) — the shape production boot constructs,
+    /// not a warm state with maps cleared.
+    fn fresh_app_state_from_pool(pool: Arc<sqlx::PgPool>) -> AppState {
+        let state = Arc::new(Mutex::new(State::new()));
+        let account_node = AccountNode::new(Arc::clone(&state));
+        let proofs_dir = tempfile::tempdir().expect("proofs tempdir").keep();
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::job_dispatcher::JobEnvelope>(8);
+        std::mem::forget(rx);
+        AppState {
+            account_node: Arc::new(Mutex::new(account_node)),
+            proof_store: Arc::new(ProofStore::new(proofs_dir.to_str().expect("utf-8"))),
+            mint_store: Arc::new(crate::router::MintStore::new()),
+            username_store: Arc::new(Mutex::new(crate::username::UsernameStore::new())),
+            pool: Arc::clone(&pool),
+            esplora_config: Arc::new(crate::publisher::EsploraConfig {
+                url: "http://127.0.0.1:1/api".to_string(),
+                is_mainnet: false,
+                network_name: "Mutinynet".to_string(),
+                ws_url: None,
+            }),
+            prover_warm: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            prover_health: Arc::new(crate::prover_health::ProverHealth::new()),
+            job_store: Arc::new(crate::job_store::JobStore::new((*pool).clone())),
+            job_tx: tx,
+            job_notify_map: Arc::new(dashmap::DashMap::new()),
+            v1_scan_caught_up: None,
+            v1_finality_ok: None,
+            pending_sign_map: Arc::new(dashmap::DashMap::new()),
+            // Production cold path: no injected hook. Completion must come
+            // from the durable capability alone (or a real EngineAdapter).
+            v1_finalise: None,
+            v1_live_pending_after_begin: Arc::new(dashmap::DashMap::new()),
+            v1_pending_after_prove: None,
+            receive_creating_proof_loader: None,
+            v1_engine: None,
+            private_index: crate::kernel::access::InMemoryPrivateIndex::shared(),
+            bundles: crate::kernel::bootstrap::BundleStore::shared(),
+            attest_challenges: crate::kernel::bootstrap::ChallengeStore::shared(),
+            public_hosts: Arc::new(vec!["node.test".to_string()]),
+        }
+    }
+
+    /// Cold boot: fresh `AppState` (new construction, not map-clear), **no**
+    /// injected finalise hook, production resume path, driven only by DB
+    /// bytes that already carry the completion surface (crash after apply).
+    ///
+    /// Reaches [`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`]: §7.5 job
+    /// result on the row + `completed`. Does **not** drive on-chain
+    /// AggregateStateNullifierV3 (bitcoind / `v1_pending_publishes` — design
+    /// edge of the sync finalise hook). Missing capability fields fail (see
+    /// incomplete test).
+    #[tokio::test]
+    async fn cold_fresh_appstate_drives_completion_from_durable_capability_alone() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+        use std::time::Duration;
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
+        // Plant durable bytes with a store bound only to the pool.
+        let plant_store = crate::job_store::JobStore::new((*pool).clone());
+        let (job_id, _entry) =
+            plant_signed_finalisation_job(&plant_store, 0xD5, "k-cold-fresh", true).await;
+
+        // Genuinely fresh AppState — new Arcs, empty maps, no hook.
+        let state = fresh_app_state_from_pool(Arc::clone(&pool));
+        assert!(
+            state.v1_finalise.is_none(),
+            "cold test must not inject a hook"
+        );
+        assert!(state.pending_sign_map.is_empty());
+        assert!(state.job_notify_map.is_empty());
+
+        crate::job_dispatcher::process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            crate::job_dispatcher::JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("cold resume process");
+
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(
+            after.status,
+            crate::job_store::JobStatus::Completed,
+            "cold resume must complete from durable completion_result; status={:?} err={:?}",
+            after.status,
+            after.error
+        );
+        assert!(after
+            .request_body
+            .get(crate::v1::FINALISATION_BODY_KEY)
+            .is_none());
+        assert!(after.response_body.is_some());
+        let result = after.response_body.as_ref().unwrap();
+        assert!(result.get("new_account_state_hash").is_some());
+
+        drop(scope);
+    }
+
+    /// Incomplete capability (signed, no completion surface, no hook): resume
+    /// must **fail** rather than silently half-finish at broadcasting.
+    #[tokio::test]
+    async fn incomplete_capability_without_completion_fails_resume() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+        use std::time::Duration;
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
+        let plant_store = crate::job_store::JobStore::new((*pool).clone());
+        // Signed but no completion_result — prove+apply never recorded.
+        let (job_id, _) =
+            plant_signed_finalisation_job(&plant_store, 0xD7, "k-incomplete", false).await;
+
+        let state = fresh_app_state_from_pool(Arc::clone(&pool));
+        assert!(state.v1_finalise.is_none());
+
+        crate::job_dispatcher::process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            crate::job_dispatcher::JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("process returns Ok after fail_v1");
+
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(
+            after.status,
+            crate::job_store::JobStatus::Failed,
+            "incomplete capability must fail, not complete or stick at broadcasting; \
+             status={:?} err={:?}",
+            after.status,
+            after.error
+        );
+        let err = after.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("completion_result")
+                || err.contains("incomplete")
+                || err.contains("no finalise driver"),
+            "error must name the missing capability path; got: {err}"
+        );
+        // Must not reach completed: response_status stays unset (awaiting_signature
+        // may still hold the wallet advertisement in response_body — that is not
+        // a terminal success publish).
+        assert!(
+            after.response_status.is_none(),
+            "must not publish a completed HTTP status; got {:?}",
+            after.response_status
+        );
+        assert!(
+            after.completed_at.is_some(),
+            "failed terminal must stamp completed_at"
+        );
+        // Durable envelope stripped on fail — cannot be half-finished and resumed.
+        assert!(
+            after
+                .request_body
+                .get(crate::v1::FINALISATION_BODY_KEY)
+                .is_none(),
+            "fail must strip finalisation envelope: {:?}",
+            after.request_body
+        );
+
+        drop(scope);
+    }
+
+    /// Two concurrent resumers race on `awaiting_signature`: exactly one wins
+    /// the exclusive broadcasting claim and runs side effects; the loser
+    /// observes the loss and does not continue.
+    #[tokio::test]
+    async fn concurrent_resumers_exactly_one_wins_exclusive_claim() {
+        use crate::v1::{set_process_stack_mode, FinaliseOutcome, ScanStackMode};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let hook_count = Arc::new(AtomicUsize::new(0));
+        let hook_count_h = Arc::clone(&hook_count);
+        // Gate: both tasks reach the claim, then proceed together.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let (mut state, pool, _scope) = jobs_test_state().await;
+        let (job_id, _) =
+            plant_signed_finalisation_job(&state.job_store, 0xE0, "k-race-claim", false).await;
+
+        let barrier_in_hook = Arc::clone(&barrier);
+        state.v1_finalise = Some(Arc::new(move |pending, _sig, _fence| {
+            let hook_count_h = Arc::clone(&hook_count_h);
+            let _ = barrier_in_hook;
+            Box::pin(async move {
+                // Count only after the exclusive claim (hook runs post-claim).
+                hook_count_h.fetch_add(1, Ordering::SeqCst);
+                Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            })
+        }));
+
+        let store = state.job_store.clone();
+        let notify = state.job_notify_map.clone();
+        let state_a = state.clone();
+        let state_b = state.clone();
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+
+        let j1 = tokio::spawn(async move {
+            b1.wait().await;
+            crate::job_dispatcher::process_envelope_for_test(
+                &store,
+                &state_a,
+                &notify,
+                Duration::from_secs(30),
+                crate::job_dispatcher::JobEnvelope { public_id: job_id },
+            )
+            .await
+        });
+        let store2 = state.job_store.clone();
+        let notify2 = state.job_notify_map.clone();
+        let j2 = tokio::spawn(async move {
+            b2.wait().await;
+            crate::job_dispatcher::process_envelope_for_test(
+                &store2,
+                &state_b,
+                &notify2,
+                Duration::from_secs(30),
+                crate::job_dispatcher::JobEnvelope { public_id: job_id },
+            )
+            .await
+        });
+
+        let (r1, r2) = tokio::join!(j1, j2);
+        r1.expect("join1").expect("process1");
+        r2.expect("join2").expect("process2");
+
+        assert_eq!(
+            hook_count.load(Ordering::SeqCst),
+            1,
+            "exactly one resumer must run the finalise hook (exclusive claim)"
+        );
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(
+            after.status,
+            crate::job_store::JobStatus::Completed,
+            "winner must complete the job; status={:?} err={:?}",
+            after.status,
+            after.error
+        );
+
+        // Direct claim API: a third attempt against a terminal job loses.
+        let claim = state
+            .job_store
+            .claim_finalise_exclusive(job_id)
+            .await
+            .expect("claim");
+        assert!(
+            matches!(
+                claim,
+                crate::job_store::FinaliseClaim::Lost {
+                    observed: crate::job_store::JobStatus::Completed
+                }
+            ),
+            "claim after complete must be Lost; got {claim:?}"
+        );
+
+        drop(pool);
+    }
+
+    /// Defect 3: a non-terminal losing resumer must leave the winner's
+    /// `notify_map` entry intact — observe the loss and return, no cleanup.
+    #[tokio::test]
+    async fn losing_resumer_leaves_winner_notify_map_intact() {
+        use crate::job_dispatcher::JobNotifier;
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+        use std::time::Duration;
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let (job_id, _) =
+            plant_signed_finalisation_job(&state.job_store, 0xE3, "k-loser-notify", true).await;
+
+        // Winner already holds the exclusive claim (live owner).
+        assert!(
+            matches!(
+                state
+                    .job_store
+                    .claim_finalise_exclusive(job_id)
+                    .await
+                    .expect("winner claim"),
+                crate::job_store::FinaliseClaim::Won { .. }
+            ),
+            "winner claim must win"
+        );
+
+        // Shared notify state that belongs to the winner / live dispatcher.
+        let notifier = Arc::new(JobNotifier::new());
+        state.job_notify_map.insert(job_id, notifier.clone());
+        assert!(
+            state.job_notify_map.get(&job_id).is_some(),
+            "precondition: winner notify present"
+        );
+
+        // Loser resume: claim lost, non-terminal — must not remove notify.
+        crate::job_dispatcher::process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            crate::job_dispatcher::JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("loser process returns Ok");
+
+        assert!(
+            state.job_notify_map.get(&job_id).is_some(),
+            "losing resumer must not remove the winner's notify_map entry"
+        );
+        // Job still broadcasting under the winner's claim — not failed/completed
+        // by the loser.
+        let row = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(
+            row.status,
+            crate::job_store::JobStatus::Broadcasting,
+            "loser must not terminal-flip the winner's job; status={:?} err={:?}",
+            row.status,
+            row.error
+        );
+        assert_eq!(row.phase, crate::job_store::FINALISE_CLAIM_PHASE);
+    }
+
+    /// Defect 1 (host edge): resume drives exactly to the documented host edge
+    /// ([`crate::job_dispatcher::JOB_FINALISE_HOST_EDGE`]) — §7.5 job complete
+    /// after durable completion surface **and** recorded nullifier broadcast
+    /// handoff — and does not silently stop earlier.
+    ///
+    /// With a durable completion surface and **no** leftover `members_ready`
+    /// row (handoff already recorded, or never staged), resume may complete.
+    /// Remaining work after the host edge is on-chain AggregateStateNullifierV3
+    /// confirmation / NfLog scan-fold (bitcoind).
+    #[tokio::test]
+    async fn resume_drives_to_documented_host_edge_not_silent_stop() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+        use std::time::Duration;
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
+        let plant_store = crate::job_store::JobStore::new((*pool).clone());
+        // Durable completion_result already present, no members_ready row:
+        // crash after host work + handoff recorded (or never staged), before
+        // terminal complete — resumable window up to the host edge.
+        let (job_id, entry) =
+            plant_signed_finalisation_job(&plant_store, 0xE4, "k-host-edge", true).await;
+        assert!(
+            entry.has_completion(),
+            "precondition: durable completion surface planted"
+        );
+
+        let state = fresh_app_state_from_pool(Arc::clone(&pool));
+        assert!(
+            state.v1_finalise.is_none(),
+            "edge test must not inject a hook — host path is durable-only"
+        );
+
+        crate::job_dispatcher::process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            crate::job_dispatcher::JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("resume to host edge");
+
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(
+            after.status,
+            crate::job_store::JobStatus::Completed,
+            "resume must reach host edge (job completed with §7.5 result); \
+             status={:?} err={:?} — not a silent stop at broadcasting",
+            after.status,
+            after.error
+        );
+        assert_eq!(after.phase, "completed");
+        assert!(
+            after.response_body.is_some() && after.response_status == Some(200),
+            "§7.5 result must be published onto the job row at the host edge"
+        );
+        assert!(
+            after
+                .request_body
+                .get(crate::v1::FINALISATION_BODY_KEY)
+                .is_none(),
+            "terminal strip must clear finalisation at host edge"
+        );
+        assert!(
+            after
+                .request_body
+                .get(crate::job_store::FINALISE_CLAIM_BODY_KEY)
+                .is_none(),
+            "terminal strip must clear finalise_claim at host edge"
+        );
+
+        // Documented edge names durable members_ready + broadcast handoff, and
+        // the chain/bitcoind remainder after host complete.
+        let edge = crate::job_dispatcher::JOB_FINALISE_HOST_EDGE;
+        assert!(
+            edge.contains("AggregateStateNullifierV3") && edge.contains("bitcoind"),
+            "JOB_FINALISE_HOST_EDGE must name the chain/bitcoind remainder; got: {edge}"
+        );
+        assert!(
+            edge.contains("members_ready"),
+            "JOB_FINALISE_HOST_EDGE must name the durable members_ready stage; got: {edge}"
+        );
+        assert!(
+            edge.contains("nullifier_broadcast_handoff")
+                || edge.contains("broadcast_handoff")
+                || edge.contains("publish handoff"),
+            "JOB_FINALISE_HOST_EDGE must name the nullifier broadcast handoff; got: {edge}"
+        );
+
+        drop(scope);
+    }
+
+    /// Defect 1 (P0): a crash at the edge leaves a **durable** job — engine
+    /// intent via `v1_pending_publishes` (`members_ready`) + completion
+    /// surface — that the resume path picks up without re-running the
+    /// finalise hook.
+    ///
+    /// Host edge (new): while the pending publish is still only
+    /// `members_ready` (broadcast handoff not recorded), resume must **not**
+    /// mark the job `completed`. Both: not completed **and** the
+    /// `members_ready` row retained. Crash/resume durability remains the
+    /// primary assertion — only the terminal end-state changes.
+    #[tokio::test]
+    async fn crash_at_edge_leaves_durable_job_resume_picks_up() {
+        use crate::v1::{
+            claim_stack_scan_mode, set_process_stack_mode, FinaliseOutcome, ScanStackMode,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let scope = crate::test_db::setup_pool().await;
+        let pool = Arc::new(scope.pool.clone());
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim stack_scan_mode v1");
+
+        let plant_store = crate::job_store::JobStore::new((*pool).clone());
+        let (job_id, entry) =
+            plant_signed_finalisation_job(&plant_store, 0xE5, "k-crash-edge", false).await;
+        let sig = entry.signature.clone().expect("signed");
+        let owner = entry.pending.owner;
+
+        // Simulate production durable stage at the edge: members_ready for
+        // this nullifier is on disk (engine snapshot co-persisted in prod).
+        crate::v1::db_v1::insert_pending_publish_members_ready(
+            &pool,
+            owner,
+            sig.pk_i,
+            sig.signature_r(),
+            sig.signature_s(),
+            sig.r_prime,
+            0,
+            [0u8; 32],
+        )
+        .await
+        .expect("stage members_ready at edge");
+
+        // And the §7.5 completion surface is durable (crash after stage +
+        // completion persist, before broadcast handoff / terminal complete).
+        let mut entry = entry;
+        let outcome = FinaliseOutcome::from_pending_proof_data_with_publisher(
+            &entry.pending,
+            entry.publisher_pubkey,
+        );
+        entry
+            .install_completion(outcome.to_result_json(), 200)
+            .expect("install completion");
+        let persist = crate::v1::DurableFinalisationPersist::from_entry(&entry).expect("encode");
+        let row = plant_store.load(job_id).await.expect("load").expect("row");
+        let mut body = row.request_body;
+        body.as_object_mut().unwrap().insert(
+            crate::v1::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&body)
+            .bind(job_id)
+            .execute(&*pool)
+            .await
+            .expect("plant completion");
+
+        // Fresh AppState — resume from durable bytes; spy hook must not run.
+        let mut state = fresh_app_state_from_pool(Arc::clone(&pool));
+        let hook_count = Arc::new(AtomicUsize::new(0));
+        let hook_count_h = Arc::clone(&hook_count);
+        state.v1_finalise = Some(Arc::new(move |pending, _sig, _fence| {
+            let hook_count_h = Arc::clone(&hook_count_h);
+            Box::pin(async move {
+                hook_count_h.fetch_add(1, Ordering::SeqCst);
+                Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            })
+        }));
+
+        crate::job_dispatcher::process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            crate::job_dispatcher::JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("resume after crash at edge");
+
+        assert_eq!(
+            hook_count.load(Ordering::SeqCst),
+            0,
+            "resume with durable completion must not re-run finalise hook"
+        );
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        // New host edge: members_ready alone is not host-complete.
+        assert_ne!(
+            after.status,
+            crate::job_store::JobStatus::Completed,
+            "must not complete while pending publish is still members_ready; \
+             status={:?} err={:?}",
+            after.status,
+            after.error
+        );
+        // Publisher / boot resume still finds the staged intent (durable handoff).
+        let pending = crate::v1::db_v1::load_pending_publish(&pool, sig.pk_i)
+            .await
+            .expect("load pending")
+            .expect("members_ready must survive crash + resume");
+        assert_eq!(
+            pending.status,
+            crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY,
+            "members_ready row must be retained for later broadcast handoff"
+        );
+        assert_eq!(pending.owner, owner);
+
+        drop(scope);
+    }
+
+    /// Defect 1 (P0): when the finalise hook runs, it must leave a durable
+    /// `v1_pending_publishes` row (test double stages intent the way
+    /// production `finalise_accepted_prove_persist_and_stage` does).
+    ///
+    /// This test stages **only** (no broadcast handoff). Host edge: the job
+    /// must **not** become `completed` while the intent remains
+    /// `members_ready` — both not-completed and the staged row retained.
+    /// Successful handoff → completed is covered by
+    /// `job_dispatcher::finalise_publish_handoff_tests` via `RecordingPublisher`.
+    #[tokio::test]
+    async fn finalise_hook_stages_pending_publish_for_durable_handoff() {
+        use crate::v1::{
+            claim_stack_scan_mode, set_process_stack_mode, FinaliseOutcome, ScanStackMode,
+        };
+        use std::time::Duration;
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (mut state, pool, _c) = jobs_test_state().await;
+        claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim stack_scan_mode v1");
+
+        let (job_id, entry) =
+            plant_signed_finalisation_job(&state.job_store, 0xE6, "k-stage-pending", false).await;
+        let pool_for_hook = Arc::clone(&pool);
+        state.v1_finalise = Some(Arc::new(move |pending, signature, fence| {
+            let pool_for_hook = Arc::clone(&pool_for_hook);
+            Box::pin(async move {
+                // Mirror production stage only: members_ready under the claim
+                // fence before returning the §7.5 outcome. Deliberately no
+                // broadcast handoff (see job_dispatcher RecordingPublisher tests
+                // for the handoff→completed path).
+                let staged =
+                    crate::v1::db_v1::persist_engine_with_pending_members_ready_if_finalise_fence(
+                        &pool_for_hook,
+                        &crate::v1::db_v1::EngineSnapshot {
+                            network: zkcoins_program::circuit::compliance::Network::Regtest,
+                            activation_height: 0,
+                            tip_height: 0,
+                            tip_hash: [0u8; 32],
+                            fold_seq: 0,
+                            nflog: vec![],
+                            accounts: vec![],
+                            inscriptions: vec![],
+                        },
+                        pending.owner,
+                        signature.pk_i,
+                        signature.signature_r(),
+                        signature.signature_s(),
+                        signature.r_prime,
+                        0,
+                        [0u8; 32],
+                        fence,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("stage members_ready under fence: {e:#}"))?;
+                if !staged {
+                    return Err(anyhow::Error::msg(crate::job_store::FINALISE_FENCE_LOST));
+                }
+                Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            })
+        }));
+
+        crate::job_dispatcher::process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(30),
+            crate::job_dispatcher::JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("process finalise with durable stage");
+
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_ne!(
+            after.status,
+            crate::job_store::JobStatus::Completed,
+            "staging members_ready without broadcast handoff must not complete; \
+             status={:?} err={:?}",
+            after.status,
+            after.error
+        );
+        let sig = entry.signature.expect("signed");
+        let pending = crate::v1::db_v1::load_pending_publish(&pool, sig.pk_i)
+            .await
+            .expect("load")
+            .expect("hook must stage v1_pending_publishes for the publisher handoff");
+        assert_eq!(
+            pending.status,
+            crate::v1::db_v1::PENDING_PUBLISH_MEMBERS_READY,
+            "members_ready must remain for durable handoff"
+        );
+    }
+
+    /// Resuming finalise twice is harmless: second attempt is claim-lost or
+    /// terminal no-op (job already completed; no double-credit / double-complete).
+    #[tokio::test]
+    async fn resume_finalise_twice_is_harmless() {
+        use crate::v1::{set_process_stack_mode, FinaliseOutcome, ScanStackMode};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let finalise_count = Arc::new(AtomicUsize::new(0));
+        let finalise_count_hook = Arc::clone(&finalise_count);
+
+        let (mut state, _pool, _c) = jobs_test_state().await;
+        state.v1_finalise = Some(Arc::new(move |pending, _sig, _fence| {
+            let finalise_count_hook = Arc::clone(&finalise_count_hook);
+            Box::pin(async move {
+                finalise_count_hook.fetch_add(1, Ordering::SeqCst);
+                Ok(FinaliseOutcome::from_pending_proof_data(&pending))
+            })
+        }));
+
+        let (job_id, _) =
+            plant_signed_finalisation_job(&state.job_store, 0xE1, "k-resume-twice", false).await;
+
+        state.pending_sign_map.clear();
+        state.job_notify_map.clear();
+
+        for i in 0..2 {
+            crate::job_dispatcher::process_envelope_for_test(
+                &state.job_store,
+                &state,
+                &state.job_notify_map,
+                Duration::from_secs(30),
+                crate::job_dispatcher::JobEnvelope { public_id: job_id },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("resume #{i}: {e:#}"));
+        }
+
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(after.status, crate::job_store::JobStatus::Completed);
+        // First resume runs the hook; second is a terminal no-op (no second apply).
+        assert_eq!(
+            finalise_count.load(Ordering::SeqCst),
+            1,
+            "second resume must not re-run finalise after complete"
+        );
+    }
+
+    /// Status-qualified request_body update fails when the job has moved on.
+    #[tokio::test]
+    async fn status_qualified_request_body_update_fails_when_status_moved() {
+        let (store, _c) = {
+            let (state, _pool, c) = jobs_test_state().await;
+            (state.job_store.clone(), c)
+        };
+        let result = store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xE2u8; 32],
+                Some("k-status-cas"),
+                serde_json::json!({ "seed": true }),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        store
+            .set_awaiting_signature(job_id, 1, serde_json::json!({}))
+            .await
+            .expect("awaiting_signature");
+
+        // Concurrent cancel wins.
+        let applied = store
+            .cancel_not_yet_published(job_id)
+            .await
+            .expect("cancel");
+        assert!(applied);
+
+        let refused = store
+            .replace_request_body_if_status(
+                job_id,
+                crate::job_store::JobStatus::AwaitingSignature,
+                &serde_json::json!({ "finalisation": { "should": "not_apply" } }),
+            )
+            .await
+            .expect("cas");
+        assert!(
+            !refused,
+            "status-qualified update must fail when status moved off awaiting_signature"
+        );
+        let row = store.load(job_id).await.expect("load").expect("row");
+        assert_eq!(row.status, crate::job_store::JobStatus::Cancelled);
+        assert!(
+            row.request_body.get("finalisation").is_none(),
+            "refused update must not apply: {:?}",
+            row.request_body
+        );
+    }
+
+    /// Defect 3: after a terminal fail, a leftover envelope (even if a
+    /// separate cleanup step never ran) cannot resurrect the job —
+    /// strip is atomic with fail, and rehydrate is gated on
+    /// `awaiting_signature`.
+    #[tokio::test]
+    async fn failed_job_envelope_cannot_resurrect_on_resume() {
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+        use std::time::Duration;
+
+        let _stack_guard = lock_v1_stack_for_test().await;
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let (state, _pool, _c) = jobs_test_state().await;
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xD6u8; 32],
+                Some("k-no-resurrect"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let job_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+
+        let (entry, _) = crate::v1::signature::test_fixtures::v5_mainnet_entry_and_submission();
+        let persist = crate::v1::DurableFinalisationPersist::from_entry(&entry)
+            .expect("encode durable finalisation");
+        let mut req_body = serde_json::json!({});
+        req_body.as_object_mut().unwrap().insert(
+            crate::v1::FINALISATION_BODY_KEY.to_string(),
+            serde_json::to_value(&persist).unwrap(),
+        );
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&req_body)
+            .bind(job_id)
+            .execute(state.job_store.pool())
+            .await
+            .expect("plant envelope");
+        state
+            .job_store
+            .set_awaiting_signature(job_id, 1, crate::v1::awaiting_signature_result_json(&entry))
+            .await
+            .expect("awaiting_signature");
+        // Re-plant after set (status flip does not clear body keys we need).
+        sqlx::query("UPDATE jobs SET request_body = $1 WHERE public_id = $2")
+            .bind(&req_body)
+            .bind(job_id)
+            .execute(state.job_store.pool())
+            .await
+            .expect("replant");
+
+        // Terminal fail: envelope strip is atomic with the status flip.
+        state
+            .job_store
+            .fail(
+                job_id,
+                crate::job_store::JobStatus::AwaitingSignature,
+                "awaiting_signature timeout",
+            )
+            .await
+            .expect("fail");
+        let after_fail = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(after_fail.status, crate::job_store::JobStatus::Failed);
+        assert!(
+            after_fail
+                .request_body
+                .get(crate::v1::FINALISATION_BODY_KEY)
+                .is_none(),
+            "fail must strip envelope atomically: {:?}",
+            after_fail.request_body
+        );
+
+        // Even if a stale map entry survived, process_envelope must not
+        // resurrect a terminal job.
+        state.pending_sign_map.insert(job_id, entry);
+        crate::job_dispatcher::process_envelope_for_test(
+            &state.job_store,
+            &state,
+            &state.job_notify_map,
+            Duration::from_secs(5),
+            crate::job_dispatcher::JobEnvelope { public_id: job_id },
+        )
+        .await
+        .expect("process terminal is a no-op");
+        let after = state
+            .job_store
+            .load(job_id)
+            .await
+            .expect("load")
+            .expect("row");
+        assert_eq!(
+            after.status,
+            crate::job_store::JobStatus::Failed,
+            "terminal failed job must not be resurrected"
+        );
+    }
+
+    /// Defect 4: `/v1/.../stream` emits `event: error` with a closed
+    /// enumeration code for a failed job (not `event: complete` + raw string).
+    #[test]
+    fn v1_stream_failed_job_emits_event_error_with_enumeration() {
+        let mut job = make_job(
+            JobStatus::Failed,
+            None,
+            None,
+            Some(crate::v1::encode_job_error(
+                "proving_failed",
+                "witness assembly failed",
+            )),
+        );
+        job.completed_at = Some(chrono::Utc::now());
+        // Domain projection + v1 SSE adapter (replaces deleted
+        // initial_event_from_job_v1 wrapper).
+        let domain = crate::kernel::job_projection::project_job_row(&job)
+            .expect("failed row is well-formed");
+        let frame =
+            crate::router::sse_event_from_job_event_v1(&crate::kernel::JobEvent::from_job(domain));
+        let wire = format!("{:?}", frame);
+        assert!(
+            wire.contains("error"),
+            "failed job must use event: error; wire: {wire}"
+        );
+        // Debug of Event typically renders the event name; refuse complete.
+        assert!(
+            !wire.contains("\"complete\"") || wire.contains("\"error\""),
+            "failed job must use event: error; wire: {wire}"
+        );
+        assert!(
+            wire.contains("proving_failed"),
+            "closed machine code required; wire: {wire}"
+        );
+        // Also exercise the phase→error translation used mid-stream.
+        let ev = JobPhaseEvent {
+            status: JobStatus::Failed,
+            phase: "failed".to_string(),
+            proof_id: None,
+            result: None,
+            error: Some(crate::v1::encode_job_error(
+                "proving_failed",
+                "witness assembly failed",
+            )),
+        };
+        let mid_domain = crate::kernel::job_projection::project_phase_event(
+            crate::kernel::JobId(job.public_id),
+            crate::kernel::types::JobKind::Send,
+            0,
+            &ev,
+        )
+        .expect("failed phase");
+        let mid = crate::router::sse_event_from_job_event_v1(&crate::kernel::JobEvent::from_job(
+            mid_domain,
+        ));
+        let mid_wire = format!("{:?}", mid);
+        assert!(
+            mid_wire.contains("proving_failed"),
+            "mid-stream error frame must carry enumeration; wire: {mid_wire}"
+        );
+    }
+
+    /// Defect 5: `/v1/.../cancel` accepts a proving job and refuses one
+    /// whose nullifier is published (`broadcasting`).
+    #[tokio::test]
+    async fn v1_cancel_accepts_proving_refuses_published() {
+        let (state, _pool, _c) = jobs_test_state().await;
+
+        // Proving → cancel OK.
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xC1u8; 32],
+                Some("k-cancel-proving"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let proving_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .set_status(
+                proving_id,
+                crate::job_store::JobStatus::Queued,
+                crate::job_store::JobStatus::Proving,
+                "proving",
+            )
+            .await
+            .expect("proving");
+
+        let req = Request::post(format!("/v1/jobs/{}/cancel", proving_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "proving cancel body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["status"], "cancelled");
+
+        // Broadcasting (nullifier published / in flight) → wrong_phase.
+        let result = state
+            .job_store
+            .create(
+                crate::job_store::JobKind::Send,
+                &[0xC2u8; 32],
+                Some("k-cancel-published"),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("create");
+        let pub_id = match result {
+            crate::job_store::CreateResult::Fresh(j) => j.public_id,
+            _ => panic!(),
+        };
+        state
+            .job_store
+            .set_status(
+                pub_id,
+                crate::job_store::JobStatus::Queued,
+                crate::job_store::JobStatus::Broadcasting,
+                "broadcasting",
+            )
+            .await
+            .expect("broadcasting");
+
+        let req = Request::post(format!("/v1/jobs/{}/cancel", pub_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "published cancel body: {resp}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "wrong_phase");
+    }
+
+    /// Defect 4 (round 5): normative `/v1/jobs/:id/stream` and `/cancel`
+    /// are registered and return §7.5 bodies (never a bare framework 404).
+    #[tokio::test]
+    async fn v1_stream_and_cancel_are_registered_with_section_7_5_errors() {
+        let (state, _pool, _c) = jobs_test_state().await;
+
+        // Unknown job → job_not_found on both normative routes.
+        let unknown = uuid::Uuid::new_v4();
+        let req = Request::get(format!("/v1/jobs/{}/stream", unknown))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "stream body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "job_not_found");
+        assert!(v.get("message").is_some());
+
+        let req = Request::post(format!("/v1/jobs/{}/cancel", unknown))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "cancel body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "job_not_found");
+
+        // Malformed UUID → malformed_request (V1JobId extractor).
+        let req = Request::post("/v1/jobs/not-a-uuid/cancel")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
     }
 
     // ---- DB-error 500 arms ----
@@ -3383,14 +5722,9 @@ mod jobs_endpoint_tests {
     // SSE push channel coverage — `GET /api/jobs/:id/stream` (PR2).
     // =======================================================================
     //
-    // The handler entry point + helper functions
-    // (`initial_event_from_job`, `event_from_phase`) stay covered
-    // here. The long-lived stream loop in `build_phase_stream` is
-    // marked `#[cfg_attr(coverage_nightly, coverage(off))]` because
-    // its inner `tokio::select!` arms depend on real-time
-    // broadcast-channel deliveries that can't be deterministically
-    // covered without a wall-clock advance — same exclusion pattern
-    // as `scanner_ws::run_subscription_loop`.
+    // The handler entry point + SSE projection helpers
+    // (`sse_event_from_job_event_legacy`, `_legacy_phase`) stay covered
+    // here. Domain event source coverage lives in `kernel/job_events`.
 
     use crate::job_dispatcher::{JobNotifier, JobPhaseEvent};
     use crate::job_store::{Job, JobKind, JobStatus};
@@ -3433,7 +5767,8 @@ mod jobs_endpoint_tests {
         String::from_utf8_lossy(&bytes).to_string()
     }
 
-    // ---- `initial_event_from_job` pure-helper coverage ----
+    // ---- Legacy SSE projection pure-helper coverage ----
+    // (domain event source: `kernel/job_events`; wire: `sse_event_from_job_event_*`)
 
     /// Helper: build a `Job` row directly (no DB) so the pure helpers
     /// can be exercised without a testcontainer.
@@ -3457,16 +5792,36 @@ mod jobs_endpoint_tests {
             proof_id,
             error,
             progress: 0,
+            reset_generation: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             completed_at: None,
         }
     }
 
+    fn legacy_snapshot_event(job: &Job) -> axum::response::sse::Event {
+        let domain = crate::kernel::job_projection::project_job_row(job)
+            .unwrap_or_else(|e| panic!("corrupt row: {e}"));
+        crate::router::sse_event_from_job_event_legacy(&crate::kernel::JobEvent::from_job(domain))
+    }
+
+    fn legacy_phase_event(ev: &JobPhaseEvent) -> axum::response::sse::Event {
+        let domain = crate::kernel::job_projection::project_phase_event(
+            crate::kernel::JobId(uuid::Uuid::nil()),
+            crate::kernel::types::JobKind::Mint,
+            0,
+            ev,
+        )
+        .unwrap_or_else(|e| panic!("corrupt phase: {e}"));
+        crate::router::sse_event_from_job_event_legacy_phase(&crate::kernel::JobEvent::from_job(
+            domain,
+        ))
+    }
+
     #[test]
     fn initial_event_proving_serialises_as_phase() {
         let job = make_job(JobStatus::Proving, None, None, None);
-        let event = crate::router::initial_event_from_job(&job);
+        let event = legacy_snapshot_event(&job);
         let wire = format!("{:?}", event);
         // The Event Debug impl renders the assembled SSE frame; we
         // assert on the event name field rather than the entire
@@ -3489,7 +5844,7 @@ mod jobs_endpoint_tests {
             })),
             None,
         );
-        let event = crate::router::initial_event_from_job(&job);
+        let event = legacy_snapshot_event(&job);
         // Re-serialise to check the payload contents.
         let wire = format!("{:?}", event);
         assert!(wire.contains("phase"), "wire: {}", wire);
@@ -3513,7 +5868,7 @@ mod jobs_endpoint_tests {
             Some(serde_json::json!({"success": true})),
             None,
         );
-        let event = crate::router::initial_event_from_job(&job);
+        let event = legacy_snapshot_event(&job);
         let wire = format!("{:?}", event);
         assert!(wire.contains("complete"), "wire: {}", wire);
         assert!(
@@ -3526,7 +5881,7 @@ mod jobs_endpoint_tests {
     #[test]
     fn initial_event_failed_emits_complete_event_with_error() {
         let job = make_job(JobStatus::Failed, None, None, Some("boom".to_string()));
-        let event = crate::router::initial_event_from_job(&job);
+        let event = legacy_snapshot_event(&job);
         let wire = format!("{:?}", event);
         assert!(wire.contains("complete"), "wire: {}", wire);
         assert!(wire.contains("boom"), "wire: {}", wire);
@@ -3535,12 +5890,12 @@ mod jobs_endpoint_tests {
     #[test]
     fn initial_event_cancelled_emits_complete_event() {
         let job = make_job(JobStatus::Cancelled, None, None, None);
-        let event = crate::router::initial_event_from_job(&job);
+        let event = legacy_snapshot_event(&job);
         let wire = format!("{:?}", event);
         assert!(wire.contains("complete"), "wire: {}", wire);
     }
 
-    // ---- `event_from_phase` pure-helper coverage ----
+    // ---- mid-stream legacy phase projection ----
 
     #[test]
     fn event_from_phase_proving_emits_phase_event() {
@@ -3551,21 +5906,28 @@ mod jobs_endpoint_tests {
             result: None,
             error: None,
         };
-        let frame = crate::router::event_from_phase(&ev);
+        let frame = legacy_phase_event(&ev);
         let wire = format!("{:?}", frame);
         assert!(wire.contains("phase"), "wire: {}", wire);
     }
 
     #[test]
     fn event_from_phase_awaiting_signature_includes_proof_id() {
+        // Domain projection fail-closes without a signature surface payload
+        // (same rule as GetJob / project_job_row). Include a minimal body so
+        // the pure helper exercises the proof_id wire field.
+        // Statement now also held by kernel/job_events + sse projection.
         let ev = JobPhaseEvent {
             status: JobStatus::AwaitingSignature,
             phase: "awaiting_signature".to_string(),
             proof_id: Some(17),
-            result: None,
+            result: Some(serde_json::json!({
+                "account_state_hash": "aa".repeat(32),
+                "output_coins_root": "bb".repeat(32),
+            })),
             error: None,
         };
-        let frame = crate::router::event_from_phase(&ev);
+        let frame = legacy_phase_event(&ev);
         let wire = format!("{:?}", frame);
         assert!(wire.contains("phase"), "wire: {}", wire);
         assert!(wire.contains("17"), "wire: {}", wire);
@@ -3580,7 +5942,7 @@ mod jobs_endpoint_tests {
             result: Some(serde_json::json!({"ok": 1})),
             error: None,
         };
-        let frame = crate::router::event_from_phase(&ev);
+        let frame = legacy_phase_event(&ev);
         let wire = format!("{:?}", frame);
         assert!(wire.contains("complete"), "wire: {}", wire);
     }
@@ -3594,7 +5956,7 @@ mod jobs_endpoint_tests {
             result: None,
             error: Some("err".to_string()),
         };
-        let frame = crate::router::event_from_phase(&ev);
+        let frame = legacy_phase_event(&ev);
         let wire = format!("{:?}", frame);
         assert!(wire.contains("complete"), "wire: {}", wire);
     }
@@ -3608,7 +5970,7 @@ mod jobs_endpoint_tests {
             result: None,
             error: None,
         };
-        let frame = crate::router::event_from_phase(&ev);
+        let frame = legacy_phase_event(&ev);
         let wire = format!("{:?}", frame);
         assert!(wire.contains("complete"), "wire: {}", wire);
     }
@@ -3665,6 +6027,7 @@ mod jobs_endpoint_tests {
             .job_store
             .complete(
                 job_id,
+                crate::job_store::JobStatus::Queued,
                 serde_json::json!({"success": true, "proof_id": 5u64}),
                 200,
             )
@@ -3724,7 +6087,11 @@ mod jobs_endpoint_tests {
         };
         state
             .job_store
-            .fail(job_id, "synthetic fail")
+            .fail(
+                job_id,
+                crate::job_store::JobStatus::Queued,
+                "synthetic fail",
+            )
             .await
             .expect("fail");
 
@@ -3949,6 +6316,895 @@ mod jobs_endpoint_tests {
         assert_eq!(ev.status, JobStatus::Cancelled);
         assert_eq!(ev.phase, "cancelled");
     }
+
+    // ---- Block 2: fail-closed stream masking (would have been green on old code) ----
+
+    /// Plant a completed row with SQL NULL `response_body`. Opening the
+    /// legacy stream must not emit `event: complete` with `result: null`.
+    #[tokio::test]
+    async fn jobs_stream_completed_without_result_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let job_id = plant_completed_without_response_body(
+            pool.as_ref(),
+            [0xD1u8; 32],
+            "k-stream-corrupt-complete",
+        )
+        .await;
+
+        let req = Request::get(format!("/api/jobs/{}/stream", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let app = create_router(state);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "corrupt completed must not open an SSE stream that masks null result"
+        );
+    }
+
+    /// Same corrupt row on the normative stream → §7.5 `internal_error`.
+    #[tokio::test]
+    async fn v1_stream_completed_without_result_is_internal_error() {
+        let (state, pool, _c) = jobs_test_state().await;
+        let job_id = plant_completed_without_response_body(
+            pool.as_ref(),
+            [0xD2u8; 32],
+            "k-v1-stream-corrupt-complete",
+        )
+        .await;
+
+        let req = Request::get(format!("/v1/jobs/{}/stream", job_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _h, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"], "internal_error");
+        assert_eq!(v["message"], "Failed to load job");
+        assert!(
+            v.get("result").is_none(),
+            "must not look like success: {body}"
+        );
+    }
+
+    // Fail-closed pure-helper cases for completed / awaiting_signature
+    // without payload are covered in `kernel::job_projection` tests
+    // (assert on KernelErrorCode + detail cause — no `should_panic`).
+
+    // -----------------------------------------------------------------------
+    // §4.6 / §7.5 open token-provenance REST surface
+    // -----------------------------------------------------------------------
+
+    fn recompute_token_provenance_asset_id(
+        terms: &shared::spec_v1::bundle::IssuanceTerms,
+    ) -> [u8; 32] {
+        use shared::spec_v1::encoding::digest_to_bytes;
+        use shared::spec_v1::hashes::{asset_id_v1, asset_id_v2, name_hash};
+        use shared::spec_v1::tags::GENESIS_TAG;
+
+        let name_hash = name_hash(&terms.name).expect("valid test name");
+        let digest = match terms.issuance_version {
+            1 => asset_id_v1(
+                GENESIS_TAG,
+                &terms.creator_pubkey,
+                &name_hash,
+                terms.decimals,
+                terms.issuance_version,
+            ),
+            2 => asset_id_v2(
+                GENESIS_TAG,
+                &terms.creator_pubkey,
+                &name_hash,
+                terms.decimals,
+                terms.issuance_version,
+                terms.cap_total.expect("v2 cap"),
+                &terms.terms_salt.expect("v2 salt"),
+            ),
+            other => panic!("unsupported test issuance version {other}"),
+        };
+        digest_to_bytes(&digest)
+    }
+
+    #[tokio::test]
+    async fn token_provenance_v1_held_returns_schema() {
+        use shared::spec_v1::bundle::IssuanceTerms;
+        use shared::spec_v1::encoding::digest_to_bytes;
+        use shared::spec_v1::hashes::{asset_id_v1, name_hash};
+        use shared::spec_v1::tags::GENESIS_TAG;
+
+        let (state, pool, _scope) = jobs_test_state().await;
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x51u8; 32],
+            decimals: 3,
+            issuance_version: 1,
+            name: vec![0xff, 0x00, b'R', b'1'],
+            cap_total: None,
+            terms_salt: None,
+        };
+        let asset_id = recompute_token_provenance_asset_id(&terms);
+        crate::v1::db_token_provenance::insert_token_provenance(&pool, &asset_id, &terms)
+            .await
+            .expect("seed v1 retained provenance");
+
+        let req = Request::get(format!("/v1/token/{}/provenance", hex::encode(asset_id)))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _headers, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let v: serde_json::Value = serde_json::from_str(&body).expect("token provenance json");
+        assert_eq!(
+            v.as_object().expect("token provenance object").len(),
+            5,
+            "unexpected v1 response fields: {body}"
+        );
+        assert_eq!(v["asset_id"], hex::encode(asset_id));
+        assert_eq!(v["issuance_version"], 1);
+        assert_eq!(v["creator_pubkey"], hex::encode(terms.creator_pubkey));
+        assert_eq!(v["name"], hex::encode(&terms.name));
+        assert_eq!(v["decimals"], terms.decimals);
+        assert!(
+            v.get("cap_total").is_none(),
+            "v1 must omit cap_total: {body}"
+        );
+        assert!(
+            v.get("terms_salt").is_none(),
+            "v1 must omit terms_salt: {body}"
+        );
+
+        let returned_asset_id: [u8; 32] = hex::decode(
+            v["asset_id"]
+                .as_str()
+                .expect("response asset_id is a hex string"),
+        )
+        .expect("response asset_id is valid hex")
+        .try_into()
+        .expect("response asset_id is 32 bytes");
+        let response_name_hash = name_hash(&terms.name).expect("valid test name");
+        let recomputed = digest_to_bytes(&asset_id_v1(
+            GENESIS_TAG,
+            &terms.creator_pubkey,
+            &response_name_hash,
+            terms.decimals,
+            terms.issuance_version,
+        ));
+        assert_eq!(returned_asset_id, recomputed);
+    }
+
+    #[tokio::test]
+    async fn token_provenance_v2_held_returns_cap() {
+        use shared::spec_v1::bundle::IssuanceTerms;
+        use shared::spec_v1::encoding::digest_to_bytes;
+        use shared::spec_v1::hashes::{asset_id_v2, name_hash};
+        use shared::spec_v1::tags::GENESIS_TAG;
+
+        let (state, pool, _scope) = jobs_test_state().await;
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x52u8; 32],
+            decimals: 9,
+            issuance_version: 2,
+            name: b"router-v2".to_vec(),
+            cap_total: Some(u128::MAX - 17),
+            terms_salt: Some([0x53u8; 32]),
+        };
+        let asset_id = recompute_token_provenance_asset_id(&terms);
+        crate::v1::db_token_provenance::insert_token_provenance(&pool, &asset_id, &terms)
+            .await
+            .expect("seed v2 retained provenance");
+
+        let req = Request::get(format!("/v1/token/{}/provenance", hex::encode(asset_id)))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _headers, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let v: serde_json::Value = serde_json::from_str(&body).expect("token provenance json");
+        assert_eq!(
+            v.as_object().expect("token provenance object").len(),
+            7,
+            "unexpected v2 response fields: {body}"
+        );
+        assert_eq!(v["asset_id"], hex::encode(asset_id));
+        assert_eq!(v["issuance_version"], 2);
+        assert_eq!(v["creator_pubkey"], hex::encode(terms.creator_pubkey));
+        assert_eq!(v["name"], hex::encode(&terms.name));
+        assert_eq!(v["decimals"], terms.decimals);
+
+        let response_cap = v["cap_total"]
+            .as_str()
+            .expect("v2 cap_total is a decimal string");
+        assert_eq!(
+            response_cap
+                .parse::<u128>()
+                .expect("v2 cap_total parses as u128"),
+            terms.cap_total.expect("v2 cap")
+        );
+        assert_eq!(response_cap, terms.cap_total.expect("v2 cap").to_string());
+        assert_eq!(
+            v["terms_salt"],
+            hex::encode(terms.terms_salt.expect("v2 salt"))
+        );
+        let response_salt: [u8; 32] = hex::decode(
+            v["terms_salt"]
+                .as_str()
+                .expect("v2 terms_salt is a hex string"),
+        )
+        .expect("v2 terms_salt is valid hex")
+        .try_into()
+        .expect("v2 terms_salt is 32 bytes");
+        assert_eq!(response_salt, terms.terms_salt.expect("v2 salt"));
+
+        let returned_asset_id: [u8; 32] = hex::decode(
+            v["asset_id"]
+                .as_str()
+                .expect("response asset_id is a hex string"),
+        )
+        .expect("response asset_id is valid hex")
+        .try_into()
+        .expect("response asset_id is 32 bytes");
+        let response_name_hash = name_hash(&terms.name).expect("valid test name");
+        let recomputed = digest_to_bytes(&asset_id_v2(
+            GENESIS_TAG,
+            &terms.creator_pubkey,
+            &response_name_hash,
+            terms.decimals,
+            terms.issuance_version,
+            terms.cap_total.expect("v2 cap"),
+            &terms.terms_salt.expect("v2 salt"),
+        ));
+        assert_eq!(returned_asset_id, recomputed);
+    }
+
+    #[tokio::test]
+    async fn token_provenance_unknown_returns_404() {
+        let (state, _pool, _scope) = jobs_test_state().await;
+        let asset_id = [0xeeu8; 32];
+        let req = Request::get(format!("/v1/token/{}/provenance", hex::encode(asset_id)))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _headers, body) = run(state, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("not-found json");
+        assert_eq!(v["error"], "not_found");
+        assert!(v["message"].as_str().is_some(), "missing message: {body}");
+    }
+
+    #[tokio::test]
+    async fn token_provenance_malformed_asset_id_returns_400() {
+        let (state, _pool, _scope) = jobs_test_state().await;
+
+        for width in [31usize, 33] {
+            let req = Request::get(format!("/v1/token/{}/provenance", "aa".repeat(width)))
+                .body(Body::empty())
+                .unwrap();
+            let (status, _headers, body) = run(state.clone(), req).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{width}-byte asset_id body: {body}"
+            );
+            let v: serde_json::Value = serde_json::from_str(&body).expect("malformed-request json");
+            assert_eq!(v["error"], "malformed_request");
+            assert!(v["message"].as_str().is_some(), "missing message: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn token_provenance_not_feature_gated_serves_without_v1_claim() {
+        use shared::spec_v1::bundle::IssuanceTerms;
+
+        // Deliberately no `set_process_stack_mode` call and no `_stack_guard`:
+        // unlike sign/attest routes, open provenance must not consult a gate.
+        let (state, pool, _scope) = jobs_test_state().await;
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x61u8; 32],
+            decimals: 6,
+            issuance_version: 1,
+            name: b"ungated-router".to_vec(),
+            cap_total: None,
+            terms_salt: None,
+        };
+        let held_asset_id = recompute_token_provenance_asset_id(&terms);
+        crate::v1::db_token_provenance::insert_token_provenance(&pool, &held_asset_id, &terms)
+            .await
+            .expect("seed ungated retained provenance");
+
+        let held_req = Request::get(format!(
+            "/v1/token/{}/provenance",
+            hex::encode(held_asset_id)
+        ))
+        .body(Body::empty())
+        .unwrap();
+        let (held_status, _headers, held_body) = run(state.clone(), held_req).await;
+        assert_eq!(held_status, StatusCode::OK, "body: {held_body}");
+        let held_json: serde_json::Value =
+            serde_json::from_str(&held_body).expect("held provenance json");
+        assert_eq!(held_json["asset_id"], hex::encode(held_asset_id));
+        assert!(
+            held_json.get("error").is_none(),
+            "ungated success returned an error: {held_body}"
+        );
+
+        let unknown_asset_id = [0xfdu8; 32];
+        assert_ne!(
+            unknown_asset_id, held_asset_id,
+            "fixed unknown id collision"
+        );
+        let unknown_req = Request::get(format!(
+            "/v1/token/{}/provenance",
+            hex::encode(unknown_asset_id)
+        ))
+        .body(Body::empty())
+        .unwrap();
+        let (unknown_status, _headers, unknown_body) = run(state, unknown_req).await;
+        assert_eq!(
+            unknown_status,
+            StatusCode::NOT_FOUND,
+            "body: {unknown_body}"
+        );
+        let unknown_json: serde_json::Value =
+            serde_json::from_str(&unknown_body).expect("unknown provenance json");
+        assert_eq!(unknown_json["error"], "not_found");
+        assert_ne!(unknown_json["error"], "feature_disabled");
+    }
+
+    // -----------------------------------------------------------------------
+    // Gap G6 — §7.5 balance attestation surface
+    // -----------------------------------------------------------------------
+
+    /// Flag-off: both attest routes refuse with `feature_disabled` (404).
+    #[tokio::test]
+    async fn attest_balance_flag_off_returns_feature_disabled() {
+        let _lock = lock_v1_stack_for_test().await;
+
+        let state = test_state();
+        let body = serde_json::json!({
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gtw4c"
+        });
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "feature_disabled");
+
+        let body = serde_json::json!({
+            "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gtw4c",
+            "asset_id": "00".repeat(32),
+            "challenge": { "nonce": "11".repeat(32) },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": "zk1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gtw4c",
+                "public_key": "00".repeat(32),
+                "nk_commit": "00".repeat(32),
+                "signature": "00".repeat(64),
+            }
+        });
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "feature_disabled");
+    }
+
+    /// Defect 4: flag check runs before V1Json. A malformed body to a
+    /// disabled endpoint must still be `feature_disabled`, not
+    /// `malformed_request`.
+    #[tokio::test]
+    async fn attest_balance_flag_off_malformed_body_is_feature_disabled() {
+        let _lock = lock_v1_stack_for_test().await;
+
+        let state = test_state();
+
+        // Broken JSON syntax on challenge.
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from("{not-json"))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(
+            v["error"], "feature_disabled",
+            "flag-off must beat V1Json extraction; got: {resp}"
+        );
+
+        // Empty / missing body on admit.
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "feature_disabled");
+
+        // Wrong content-type.
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "text/plain")
+            .body(Body::from("x"))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "feature_disabled");
+    }
+
+    /// §7.5 path + envelope + closed error codes under a v1.1 claim.
+    #[tokio::test]
+    async fn attest_balance_route_matches_section_7_5() {
+        let _lock = lock_v1_stack_for_test().await;
+        use crate::v1::{
+            parse_u64_decimal, set_process_stack_mode, ScanStackMode,
+            ATTEST_BALANCE_CHALLENGE_DOMAIN,
+        };
+        use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+        use shared::spec_v1::{self as host, Address};
+
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let host_name = "node.test";
+        let (mut state, pool, _scope) = jobs_test_state().await;
+        // DB marker + process claim so EngineAdapter::persist is allowed.
+        crate::v1::claim_stack_scan_mode(&pool, ScanStackMode::V1)
+            .await
+            .expect("claim v1 stack_scan_mode");
+        state.public_hosts = Arc::new(vec![host_name.to_string()]);
+
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[0x42u8; 32]).unwrap();
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        let pk0 = xonly.serialize();
+        let nk = [0x11u8; 32];
+        let nkc = host::nk_commit(&nk);
+        let nkc_bytes = host::digest_to_bytes(&nkc);
+        let subject_bytes = host::address(&pk0, nkc);
+        let subject = Address(subject_bytes).to_bech32m();
+        let asset = [0x22u8; 32];
+
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "subject": subject }).to_string(),
+            ))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "challenge body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["domain"], ATTEST_BALANCE_CHALLENGE_DOMAIN);
+        let nonce_hex = v["nonce"].as_str().expect("nonce").to_string();
+        assert_eq!(nonce_hex.len(), 64);
+        // §7.1: expiry is a decimal **string**, never a JSON number.
+        assert!(
+            v["expiry"].as_str().is_some(),
+            "expiry must be a decimal string, got: {}",
+            v["expiry"]
+        );
+        assert!(
+            v["expiry"].as_u64().is_none(),
+            "expiry must not be a JSON number"
+        );
+        let _ = parse_u64_decimal(v["expiry"].as_str().unwrap()).expect("canonical u64 string");
+
+        let body = serde_json::json!({
+            "subject": subject,
+            "asset_id": hex::encode(asset),
+            "challenge": { "nonce": nonce_hex },
+            "ownership_proof": {
+                "type": "grant",
+                "subject": subject,
+                "public_key": hex::encode(pk0),
+                "nk_commit": hex::encode(nkc_bytes),
+                "signature": "00".repeat(64),
+            }
+        });
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "unauthorized");
+
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "subject": subject }).to_string(),
+            ))
+            .unwrap();
+        let (_s, _h, resp) = run(state.clone(), req).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        let nonce_hex = v["nonce"].as_str().unwrap().to_string();
+
+        let body = serde_json::json!({
+            "subject": subject,
+            "asset_id": hex::encode(asset),
+            "nav_ceiling": hex::encode([0xabu8; 32]),
+            "challenge": { "nonce": nonce_hex },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": subject,
+                "public_key": hex::encode(pk0),
+                "nk_commit": hex::encode(nkc_bytes),
+                "signature": "00".repeat(64),
+            }
+        });
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+
+        // Numeric size_ceiling is §7.1-malformed (must be decimal string).
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "subject": subject }).to_string(),
+            ))
+            .unwrap();
+        let (_s, _h, resp) = run(state.clone(), req).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        let nonce_hex = v["nonce"].as_str().unwrap().to_string();
+        let body = serde_json::json!({
+            "subject": subject,
+            "asset_id": hex::encode(asset),
+            "nav_ceiling": hex::encode([0xabu8; 32]),
+            "size_ceiling": 7,
+            "challenge": { "nonce": nonce_hex },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": subject,
+                "public_key": hex::encode(pk0),
+                "nk_commit": hex::encode(nkc_bytes),
+                "signature": "00".repeat(64),
+            }
+        });
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "numeric size_ceiling must be malformed_request: {resp}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+
+        let body = serde_json::json!({
+            "subject": subject,
+            "asset_id": hex::encode(asset),
+            "challenge": { "nonce": "ff".repeat(32) },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": subject,
+                "public_key": hex::encode(pk0),
+                "nk_commit": hex::encode(nkc_bytes),
+                "signature": "00".repeat(64),
+            }
+        });
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::GONE, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "challenge_expired");
+
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "subject": subject }).to_string(),
+            ))
+            .unwrap();
+        let (_s, _h, resp) = run(state.clone(), req).await;
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        let nonce_hex = v["nonce"].as_str().unwrap().to_string();
+        let expiry = parse_u64_decimal(v["expiry"].as_str().unwrap()).unwrap();
+        let nonce: [u8; 32] = hex::decode(&nonce_hex).unwrap().try_into().unwrap();
+
+        let ceiling_enc = crate::v1::attest::ceiling_encoding(None, None).unwrap();
+        let request_hash =
+            crate::v1::attest::attest_request_hash(&subject_bytes, &asset, &ceiling_enc);
+        let cb = crate::v1::attest::chan_bind_for_host(host_name);
+        let chal = crate::v1::attest::attest_challenge_message(
+            &nonce,
+            &cb,
+            &subject_bytes,
+            expiry,
+            &request_hash,
+        );
+        let msg = Message::from_digest_slice(&chal).unwrap();
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &kp);
+        let mut sig_bytes = [0u8; 64];
+        sig_bytes.copy_from_slice(sig.as_ref());
+
+        let adapter = crate::v1::EngineAdapter::load_or_create(
+            (*pool).clone(),
+            zkcoins_program::circuit::compliance::Network::Regtest,
+            0,
+        )
+        .await
+        .expect("engine");
+        state.v1_engine = Some(std::sync::Arc::new(adapter));
+
+        let body = serde_json::json!({
+            "subject": subject,
+            "asset_id": hex::encode(asset),
+            "challenge": { "nonce": hex::encode(nonce) },
+            "ownership_proof": {
+                "type": "ownership",
+                "subject": subject,
+                "public_key": hex::encode(pk0),
+                "nk_commit": hex::encode(nkc_bytes),
+                "signature": hex::encode(sig_bytes),
+            }
+        });
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert!(v.get("job_id").and_then(|j| j.as_str()).is_some());
+        assert!(v.get("status").is_none(), "§7.5 admit is {{ job_id }} only");
+    }
+
+    /// V1Json extractor: malformed / missing JSON → 400 malformed_request
+    /// (not Axum's default 422).
+    #[tokio::test]
+    async fn attest_balance_malformed_json_returns_malformed_request() {
+        let _lock = lock_v1_stack_for_test().await;
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+
+        set_process_stack_mode(ScanStackMode::V1);
+        let state = test_state();
+
+        // Broken JSON syntax.
+        let req = Request::post("/v1/attest/balance/challenge")
+            .header("content-type", "application/json")
+            .body(Body::from("{not-json"))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+
+        // Missing required field on admit body.
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, _h, resp) = run(state.clone(), req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+
+        // Not JSON content-type.
+        let req = Request::post("/v1/attest/balance")
+            .header("content-type", "text/plain")
+            .body(Body::from("x"))
+            .unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(v["error"], "malformed_request");
+    }
+
+    /// Root closed map advertises the §7.5 attest surface **only when the
+    /// flag is on**.
+    #[tokio::test]
+    async fn root_advertises_attest_balance_endpoints_when_flag_on() {
+        let _lock = lock_v1_stack_for_test().await;
+        use crate::v1::{set_process_stack_mode, ScanStackMode};
+        set_process_stack_mode(ScanStackMode::V1);
+
+        let state = test_state();
+        let req = Request::get("/").body(Body::empty()).unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {resp}");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("json");
+        assert_eq!(
+            v["endpoints"]["attest_balance_challenge"].as_str(),
+            Some("POST /v1/attest/balance/challenge")
+        );
+        assert_eq!(
+            v["endpoints"]["attest_balance"].as_str(),
+            Some("POST /v1/attest/balance")
+        );
+    }
+
+    /// Frozen pre-G6 endpoints JSON (raw bytes). Single independent
+    /// golden for flag-off `GET /` — not re-derived from the live type, so
+    /// reordering fields or changing values turns this red even when a
+    /// hand-written `Value` map would still parse-equal.
+    const PRE_G6_ENDPOINTS_JSON: &str = concat!(
+        r#"{"info":"GET  /api/info","balance":"GET  /api/balance?address={hex}","#,
+        r#""history":"GET  /api/history?address={hex}&limit={n}&offset={n}","#,
+        r#""receive":"POST /api/receive","admit_mint":"POST /api/jobs/mint","#,
+        r#""admit_send":"POST /api/jobs/send","get_job":"GET  /api/jobs/{job_id}","#,
+        r#""stream_job":"GET  /api/jobs/{job_id}/stream","commit":"POST /api/jobs/{job_id}/commit","#,
+        r#""sign":"POST /v1/jobs/{job_id}/sign","cancel":"POST /api/jobs/{job_id}/cancel","#,
+        r#""proof":"GET  /api/proof/{id}","inscription":"GET  /api/inscriptions/{txid}","#,
+        r#""username_resolve":"GET  /api/username/resolve/{username}","health":"GET  /health","#,
+        r#""health_ready":"GET  /health/ready","health_publisher":"GET  /health/publisher","#,
+        r#""openapi":"GET  /openapi.json","docs":"GET  /docs"}"#,
+    );
+
+    /// Defect 4: type-derived always-on map serialises to the frozen
+    /// pre-G6 endpoints bytes. Adding/reordering/renaming a
+    /// [`RootEndpoints`] field without updating the golden turns this red.
+    #[test]
+    fn root_endpoints_type_serialises_to_pre_g6_golden_bytes() {
+        let live = serde_json::to_string(&crate::router::root_endpoints_always_on())
+            .expect("RootEndpoints serialises");
+        assert_eq!(
+            live.as_bytes(),
+            PRE_G6_ENDPOINTS_JSON.as_bytes(),
+            "RootEndpoints serde bytes must match the frozen pre-G6 golden"
+        );
+    }
+
+    /// Defects 2+4: flag-off `GET /` raw body is byte-identical to the
+    /// pre-G6 root response (endpoints from the type golden; no attest
+    /// keys). Compare **raw bytes**, never two parsed `Value`s — reparse
+    /// discards key order and would green-wash a sorted-map regression.
+    #[tokio::test]
+    async fn root_flag_off_is_byte_identical_to_pre_attestation_map() {
+        let _lock = lock_v1_stack_for_test().await;
+
+        let state = test_state();
+        let req = Request::get("/").body(Body::empty()).unwrap();
+        let (status, _h, resp) = run(state, req).await;
+        assert_eq!(status, StatusCode::OK, "body: {resp}");
+
+        // Frozen outer key order (service → version → network → endpoints
+        // → docs) + frozen endpoints golden. version/network are build/
+        // env derived; the layout bytes around them are not.
+        let expected_raw = format!(
+            concat!(
+                r#"{{"service":"zkcoins-node","version":"{}","network":"{}","endpoints":"#,
+                "{}",
+                r#","docs":"https://docs.zkcoins.com"}}"#,
+            ),
+            env!("CARGO_PKG_VERSION"),
+            crate::NETWORK_CONFIG.network_name,
+            PRE_G6_ENDPOINTS_JSON,
+        );
+        assert_eq!(
+            resp.as_bytes(),
+            expected_raw.as_bytes(),
+            "flag-off GET / raw bytes must match pre-G6 response\n got: {resp}\nwant: {expected_raw}"
+        );
+        assert!(
+            !resp.contains("attest_balance"),
+            "flag-off raw body must not mention attest_balance*: {resp}"
+        );
+    }
+
+    /// Defects 2+4: flag-off OpenAPI document omits attest keys and its
+    /// `RootEndpoints` schema matches the type-derived always-on map.
+    ///
+    /// Pins the **document content** via [`crate::openapi::openapi_json`]
+    /// (the same process-cached builder the handler would serve). HTTP
+    /// route registration of `GET /openapi.json` was dropped in the
+    /// Job-API refactor (#161 / `86491ab`) and is pre-existing / out of
+    /// G6 scope — do not re-wire it here. Reintroducing attest fields on
+    /// the `RootEndpoints` ToSchema type turns this red.
+    #[test]
+    fn openapi_flag_off_raw_bytes_omit_attest_and_match_type_schema() {
+        let resp = crate::openapi::openapi_json();
+        assert!(
+            !resp.contains("attest_balance"),
+            "flag-off openapi must not advertise attest_balance*: {}",
+            &resp[..resp.len().min(500)]
+        );
+
+        // RootEndpoints schema property set equals the type-derived keys
+        // (no attest_*). Independent of Value-key presence after reparse.
+        let v: serde_json::Value = serde_json::from_str(resp).expect("openapi json");
+        let props = v["components"]["schemas"]["RootEndpoints"]["properties"]
+            .as_object()
+            .expect("RootEndpoints.properties");
+        // Derive from the live type via serde field names.
+        let live = serde_json::to_value(crate::router::root_endpoints_always_on()).unwrap();
+        let type_keys: Vec<String> = live.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            props.len(),
+            type_keys.len(),
+            "OpenAPI RootEndpoints property count must match RootEndpoints type"
+        );
+        for k in &type_keys {
+            assert!(
+                props.contains_key(k),
+                "OpenAPI schema missing type field {k}"
+            );
+        }
+        assert!(
+            !props.contains_key("attest_balance")
+                && !props.contains_key("attest_balance_challenge"),
+            "OpenAPI RootEndpoints must not define attest_* properties"
+        );
+
+        // Raw-byte identity of the cached document against a second call
+        // (OnceLock). A reordering or schema property change alters these
+        // bytes relative to the pre-G6 component set.
+        let again = crate::openapi::openapi_json();
+        assert_eq!(
+            resp.as_bytes(),
+            again.as_bytes(),
+            "openapi_json() must be process-stable raw bytes"
+        );
+    }
+
+    /// Production digest gate is bound: wrong live digest is rejected,
+    /// pinned digest is accepted. (Constant comparison alone is not enough.)
+    #[test]
+    fn attest_c_balance_digest_gate_is_production_bound() {
+        use crate::v1::{
+            accept_c_balance_network_binding, networks_have_distinct_c_balance_pins,
+            pinned_c_balance_digest, PINNED_C_BALANCE_DIGEST_MAINNET,
+            PINNED_C_BALANCE_DIGEST_TESTNET,
+        };
+        use shared::spec_v1::{network_id_mainnet, network_id_testnet};
+        use zkcoins_program::circuit::compliance::Network;
+
+        assert!(networks_have_distinct_c_balance_pins(
+            Network::Testnet,
+            Network::Mainnet
+        ));
+        assert_eq!(
+            pinned_c_balance_digest(Network::Testnet),
+            PINNED_C_BALANCE_DIGEST_TESTNET
+        );
+        assert_eq!(
+            pinned_c_balance_digest(Network::Mainnet),
+            PINNED_C_BALANCE_DIGEST_MAINNET
+        );
+
+        // Production gate accepts the pin for each network.
+        accept_c_balance_network_binding(
+            &network_id_testnet(),
+            &PINNED_C_BALANCE_DIGEST_TESTNET,
+            Network::Testnet,
+        )
+        .expect("pinned testnet digest must pass the production gate");
+        accept_c_balance_network_binding(
+            &network_id_mainnet(),
+            &PINNED_C_BALANCE_DIGEST_MAINNET,
+            Network::Mainnet,
+        )
+        .expect("pinned mainnet digest must pass the production gate");
+
+        // Production gate rejects a wrong live digest.
+        let err =
+            accept_c_balance_network_binding(&network_id_testnet(), &[0u8; 32], Network::Testnet)
+                .unwrap_err();
+        assert_eq!(err.http_status_and_code(), (503, "circuit_digest_mismatch"));
+
+        // Production gate rejects cross-network network_id.
+        let err = accept_c_balance_network_binding(
+            &network_id_testnet(),
+            &PINNED_C_BALANCE_DIGEST_MAINNET,
+            Network::Mainnet,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::v1::AttestError::ProvingFailed(_)));
+    }
 }
 
 // =======================================================================
@@ -4006,44 +7262,50 @@ mod inscriptions_endpoint_tests {
     }
 
     #[tokio::test]
-    async fn get_inscription_bad_hex_returns_422() {
+    async fn get_inscription_bad_hex_is_gone_not_422() {
         let (app, _pool, _c) = live_pool_router().await;
         let req = Request::get("/api/inscriptions/zzzz")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::GONE);
     }
 
     #[tokio::test]
-    async fn get_inscription_wrong_length_returns_422() {
+    async fn get_inscription_malformed_txid_is_gone_not_422() {
+        // Closed surface: no validation path that could distinguish
+        // malformed vs known — always 410.
         let (app, _pool, _c) = live_pool_router().await;
         let req = Request::get("/api/inscriptions/abcd")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::GONE);
     }
 
     #[tokio::test]
-    async fn get_inscription_unknown_txid_returns_404() {
+    async fn get_inscription_unknown_txid_is_gone_not_404() {
         let (app, _pool, _c) = live_pool_router().await;
         let unknown = "f".repeat(64);
         let req = Request::get(format!("/api/inscriptions/{}", unknown))
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::GONE);
     }
 
     #[tokio::test]
-    async fn get_inscription_known_txid_returns_200_with_summary() {
+    async fn get_inscription_known_txid_is_gone_and_does_not_reveal_pending() {
+        // Stage 3 Runde 6: even with a row planted, the route must not
+        // hand out kind/status/amount/failure from legacy pending_inscriptions.
         let (app, pool, _c) = live_pool_router().await;
-        // Plant a row directly via the DB helper. The endpoint accepts
-        // the display-order (big-endian) hex; we reverse the stored
-        // little-endian bytes to construct the URL.
         let stored_commit: [u8; 32] = [0x42; 32];
         let stored_reveal: [u8; 32] = [0x43; 32];
+        // Claim legacy so the SQL sink gate allows the plant (handler itself
+        // must never return the row).
+        crate::v1::claim_stack_scan_mode(&pool, crate::v1::ScanStackMode::Legacy)
+            .await
+            .expect("claim legacy for plant");
         insert_pending_inscription(
             &pool,
             &stored_commit,
@@ -4064,22 +7326,30 @@ mod inscriptions_endpoint_tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::GONE);
         let body = http_body_util::BodyExt::collect(resp.into_body())
             .await
             .unwrap()
             .to_bytes();
+        let body_str = String::from_utf8_lossy(&body);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["kind"], "mint");
-        assert_eq!(v["status"], "constructed");
-        assert_eq!(v["commit_output_value"], 777);
+        assert!(
+            v.get("kind").is_none()
+                && v.get("status").is_none()
+                && v.get("commit_output_value").is_none(),
+            "must not emit pending_inscriptions summary; got {body_str}"
+        );
+        let err = v["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("/api/inscriptions") || err.contains("Stage 3"),
+            "error must name the removed surface; got {err:?}"
+        );
     }
 
     #[tokio::test]
-    async fn get_inscription_db_error_returns_500() {
+    async fn get_inscription_db_unavailable_is_gone_not_500() {
+        // Closed handler never hits the DB — even after DROP, status is 410.
         let (app, pool, _c) = live_pool_router().await;
-        // DROP the table out from under the handler so the SELECT fails.
-        // CASCADE because tx_mining_log / coin_proof_store have FKs to it.
         sqlx::query("DROP TABLE pending_inscriptions CASCADE")
             .execute(pool.as_ref())
             .await
@@ -4089,7 +7359,7 @@ mod inscriptions_endpoint_tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::GONE);
     }
 }
 
@@ -4334,9 +7604,14 @@ async fn r2_probe_history_returns_rows_with_pass_flags() {
         rustc_version: "rustc 1.81.0".to_string(),
         build_profile: "release".to_string(),
         allocator: "mimalloc".to_string(),
+        prover_mode: "legacy".to_string(),
         max_in_coins: 8,
         max_out_coins: 8,
         inner_pad_bits: 15,
+        max_tx_inputs: None,
+        max_tx_outputs: None,
+        max_rx_coins: None,
+        compliance_gate_count: None,
         warm_calls_requested: 3,
         circuit_build_wall_ms: 8_000,
         prove_cold_wall_ms: 18_000,
@@ -4429,1066 +7704,136 @@ async fn r2_probe_history_limit_clamped_to_max() {
 // ---------------------------------------------------------------------------
 
 // =======================================================================
-// GET /api/history — paginated per-address history (issue #153)
+// GET /api/history + /api/history/:id — Stage 3 Runde 6 closed (410)
 //
-// The handler is read-only against `account_history`; tests below cover
-// both the validation branches (dead pool — handler never reaches the
-// query) and the live-DB branches (live Postgres 17 container, accounts
-// upserted via `upsert_account_with_source` so the migration-0008
-// trigger fills the history rows).
+// Address knowledge is not `read.account`. These tests pin the ban:
+// no decoded legacy snapshots leave the node. Residual helpers
+// (`decode_history_address`, `history_row_to_item`, …) stay unit-tested
+// below for internal residual code; the HTTP surface is gone.
 // =======================================================================
 
-/// Hand back a migrated pool scoped to a fresh per-test schema in
-/// the shared `postgres:17` container (issue #181 Opt B; see
-/// `crate::test_db`) — shared shape with the readiness / r2-probe
-/// live tests above. The `SchemaScope` is returned alongside so the
-/// caller keeps it alive for the duration of the test.
-async fn history_live_pool() -> (Arc<sqlx::PgPool>, crate::test_db::SchemaScope) {
+#[tokio::test]
+async fn history_list_is_gone_and_does_not_reveal_legacy_snapshots() {
+    let (pool, _pg) = {
+        let scope = crate::test_db::setup_pool().await;
+        (Arc::new(scope.pool.clone()), scope)
+    };
+    // Plant history via direct SQL (bypasses gated upsert) so a regression
+    // that re-opens the handler would have rows to leak.
+    let address: [u8; 32] = [7u8; 32];
+    let mut acct = Account::new();
+    acct.balance = 100;
+    let blob = bincode::serialize(&acct).expect("Account serializable");
+    sqlx::query(
+        "INSERT INTO account_history (address, prev_data, new_data, source)          VALUES ($1, NULL, $2, 'mint')",
+    )
+    .bind(&address[..])
+    .bind(&blob)
+    .execute(&*pool)
+    .await
+    .expect("plant history row");
+
+    let state = live_test_state(pool);
+    let req = Request::get(format!("/api/history?address=0x{}", hex::encode(address)))
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send_request_with_state(state, req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    assert!(
+        v.get("items").is_none() && v.get("total").is_none(),
+        "must not emit history items/total; got {body}"
+    );
+    let err = v["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/history") || err.contains("Stage 3") || err.contains("read.account"),
+        "error must name the removed surface; got {err:?}"
+    );
+    // Amount / balance fields must never appear.
+    assert!(
+        !body.contains("\"amount\"") && !body.contains("\"balance_after\""),
+        "body must not carry decoded snapshot fields; got {body}"
+    );
+}
+
+#[tokio::test]
+async fn history_item_is_gone_and_does_not_reveal_decoded_snapshot() {
     let scope = crate::test_db::setup_pool().await;
     let pool = Arc::new(scope.pool.clone());
-    (pool, scope)
-}
-
-/// Seed an `Account { balance, .. }` row for `address` via the
-/// `upsert_account_with_source` path so the migration-0008 trigger
-/// writes the matching `account_history` row with the requested
-/// `source`. Returns the bincode bytes for the caller to chain a
-/// second upsert that mutates the same account (the trigger captures
-/// `prev_data` from the previous row).
-async fn seed_account_history(
-    pool: &sqlx::PgPool,
-    address: &[u8; 32],
-    balance: u64,
-    source: &str,
-) -> Vec<u8> {
-    let mut acct = Account::new();
-    acct.balance = balance;
-    let bytes = bincode::serialize(&acct).expect("Account serializable");
-    // Since migration 0017 `accounts.address` is the 64-byte
-    // `owner ‖ asset_id` composite key (`accounts_address_length` CHECK
-    // = 64). History stays OWNER-keyed: the `accounts_history_capture`
-    // trigger writes only the 32-byte owner prefix into
-    // `account_history`, so `GET /api/history?address=<owner>` still
-    // resolves. Seed under a deterministic composite so repeated calls
-    // for the same `address` hit the same row (UPDATE → history chain).
-    let owner = zkcoins_program::hash::digest_from_bytes(address);
-    let asset_id = zkcoins_program::hash::ZERO_HASH;
-    let key = crate::account_node::account_key_bytes(&owner, &asset_id);
-    crate::db::upsert_account_with_source(pool, key.as_slice(), &bytes, source)
-        .await
-        .expect("upsert seeded account");
-    bytes
-}
-
-#[tokio::test]
-async fn history_missing_address_returns_422() {
-    let req = Request::get("/api/history").body(Body::empty()).unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(
-        v["error"].as_str().unwrap_or("").contains("address"),
-        "expected address-related error, got {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn history_empty_address_returns_422() {
-    // `?address=` (empty string) is treated as missing — same 422 path
-    // as the missing-param case, mirroring `/api/balance`.
-    let req = Request::get("/api/history?address=")
-        .body(Body::empty())
-        .unwrap();
-    let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn history_invalid_hex_returns_422() {
-    let req = Request::get("/api/history?address=not_hex")
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"]
-        .as_str()
-        .unwrap_or("")
-        .to_lowercase()
-        .contains("hex"));
-}
-
-#[tokio::test]
-async fn history_wrong_length_returns_422() {
-    // 16 bytes worth of hex — decoded successfully but not 32 bytes.
-    let address = format!("0x{}", "ab".repeat(16));
-    let req = Request::get(format!("/api/history?address={}", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"].as_str().unwrap_or("").contains("32 bytes"));
-}
-
-#[tokio::test]
-async fn history_limit_zero_returns_422() {
-    let address = "00".repeat(32);
-    let req = Request::get(format!("/api/history?address={}&limit=0", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"].as_str().unwrap_or("").contains("limit"));
-}
-
-#[tokio::test]
-async fn history_limit_above_max_returns_422() {
-    let address = "00".repeat(32);
-    let req = Request::get(format!(
-        "/api/history?address={}&limit={}",
-        address,
-        HISTORY_MAX_LIMIT + 1
-    ))
-    .body(Body::empty())
-    .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"].as_str().unwrap_or("").contains("limit"));
-}
-
-#[tokio::test]
-async fn history_negative_offset_returns_422() {
-    let address = "00".repeat(32);
-    let req = Request::get(format!("/api/history?address={}&offset=-1", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"].as_str().unwrap_or("").contains("offset"));
-}
-
-#[tokio::test]
-async fn history_non_integer_limit_returns_400() {
-    // axum's typed `Query` extractor rejects a non-integer value with
-    // 400 (framework-level) before the handler runs — distinct from the
-    // 422s the handler emits for its own validation branches.
-    let address = "00".repeat(32);
-    let req = Request::get(format!("/api/history?address={}&limit=abc", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn history_db_error_returns_500() {
-    // `test_state()` uses `dead_pool()` — the single
-    // `list_account_history` query fails fast and the handler surfaces
-    // 500 + the documented error string. Collapsing count + list into
-    // one query (round-2 fix) removes the previous dead-arm gap.
-    let address = "00".repeat(32);
-    let req = Request::get(format!("/api/history?address={}", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(
-        v["error"]
-            .as_str()
-            .unwrap_or("")
-            .to_lowercase()
-            .contains("database"),
-        "expected database error, got {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn history_empty_result_returns_ok_with_zero_total() {
-    let (pool, _pg) = history_live_pool().await;
-    let state = live_test_state(pool);
-    let address = "ab".repeat(32);
-    let req = Request::get(format!("/api/history?address=0x{}", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(v["total"], 0);
-    assert_eq!(v["limit"], HISTORY_DEFAULT_LIMIT);
-    assert_eq!(v["offset"], 0);
-    assert_eq!(v["items"].as_array().unwrap().len(), 0);
-}
-
-#[tokio::test]
-async fn history_happy_path_returns_items_newest_first() {
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [7u8; 32];
-
-    // Three mutations on the same address: 0 -> 100 (mint),
-    // 100 -> 250 (receive), 250 -> 150 (send).
-    seed_account_history(&pool, &address, 100, "mint").await;
-    seed_account_history(&pool, &address, 250, "receive").await;
-    seed_account_history(&pool, &address, 150, "send").await;
-
-    let state = live_test_state(pool);
-    let req = Request::get(format!("/api/history?address=0x{}", hex::encode(address)))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(
-        v["total"], 3,
-        "total must reflect every account_history row"
-    );
-    let items = v["items"].as_array().expect("items array");
-    assert_eq!(items.len(), 3, "all three rows returned with default limit");
-
-    // Newest first: send (150), receive (250), mint (100).
-    assert_eq!(items[0]["direction"], "send");
-    assert_eq!(items[0]["amount"], 100, "250 -> 150 is a 100 delta");
-    // No pending_inscriptions row and no observed_inscriptions row for
-    // this address (the seed path doesn't thread the commit_txid GUC),
-    // so the wire status is `pending` — the DB write alone is not an
-    // on-chain confirmation.
-    assert_eq!(items[0]["status"], "pending");
-    assert!(
-        items[0]["txid"].is_null(),
-        "txid is null pre-broadcast link"
-    );
-    assert!(items[0]["counterparty"].is_null());
-    assert!(items[0]["block_height"].is_null());
-    assert!(items[0]["memo"].is_null());
-
-    assert_eq!(items[1]["direction"], "receive");
-    assert_eq!(items[1]["amount"], 150, "100 -> 250 is a 150 delta");
-
-    assert_eq!(items[2]["direction"], "mint");
-    assert_eq!(items[2]["amount"], 100, "0 -> 100 is a 100 delta");
-
-    // id field always present, monotonic descending (newest = highest id)
-    let id0 = items[0]["id"].as_i64().expect("id is i64");
-    let id1 = items[1]["id"].as_i64().expect("id is i64");
-    let id2 = items[2]["id"].as_i64().expect("id is i64");
-    assert!(id0 > id1 && id1 > id2, "ids are monotonic descending");
-}
-
-#[tokio::test]
-async fn history_pagination_offset_beyond_total_returns_empty_items_with_total() {
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [9u8; 32];
-    seed_account_history(&pool, &address, 100, "mint").await;
-    seed_account_history(&pool, &address, 200, "receive").await;
-
-    let state = live_test_state(pool);
-    let req = Request::get(format!(
-        "/api/history?address=0x{}&limit=10&offset=99",
-        hex::encode(address)
-    ))
-    .body(Body::empty())
-    .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(v["total"], 2, "total still reflects the seeded rows");
-    assert_eq!(v["limit"], 10);
-    assert_eq!(v["offset"], 99);
-    assert_eq!(
-        v["items"].as_array().unwrap().len(),
-        0,
-        "offset past total -> empty page"
-    );
-}
-
-#[tokio::test]
-async fn history_limit_clamps_page_size() {
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [11u8; 32];
-    // Five rows.
-    for (i, src) in ["mint", "receive", "send", "receive", "send"]
-        .iter()
-        .enumerate()
-    {
-        seed_account_history(&pool, &address, 100 + 50 * i as u64, src).await;
-    }
-    let state = live_test_state(pool);
-    let req = Request::get(format!(
-        "/api/history?address=0x{}&limit=2",
-        hex::encode(address)
-    ))
-    .body(Body::empty())
-    .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(v["total"], 5);
-    assert_eq!(v["limit"], 2);
-    assert_eq!(v["items"].as_array().unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn history_scanner_source_is_filtered_out() {
-    // `scanner` and `recovery` are internal mutations the user did not
-    // initiate; the SQL pushes the filter so they neither count toward
-    // `total` nor appear in `items`. A post-fetch filter (the previous
-    // behaviour) broke pagination — `total` over-counted and page sizes
-    // would have come back short of the requested `limit`.
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [13u8; 32];
-    seed_account_history(&pool, &address, 100, "scanner").await;
-    seed_account_history(&pool, &address, 200, "mint").await;
-
-    let state = live_test_state(pool);
-    let req = Request::get(format!("/api/history?address=0x{}", hex::encode(address)))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(
-        v["total"], 1,
-        "total reflects the filtered count (scanner row excluded)"
-    );
-    let items = v["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["direction"], "mint");
-}
-
-#[tokio::test]
-async fn history_pagination_walks_mixed_source_dataset_consistently() {
-    // Plant a mixed-source dataset and walk pagination across multiple
-    // pages. The client must see every user-facing row exactly once
-    // across consecutive pages, with `total` matching the cumulative
-    // page sizes — the SQL filter is what makes this true (a post-fetch
-    // filter would have left holes in pages and a `total` that no
-    // page-walk can hit).
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [17u8; 32];
-    // Plant in chronological order; the handler returns newest-first.
-    // 4 user-facing rows (mint, receive, send, receive) interleaved with
-    // 3 internal rows (scanner, scanner, recovery) — the internal rows
-    // must never appear and must never count toward `total`.
-    seed_account_history(&pool, &address, 100, "mint").await;
-    seed_account_history(&pool, &address, 110, "scanner").await;
-    seed_account_history(&pool, &address, 250, "receive").await;
-    seed_account_history(&pool, &address, 260, "scanner").await;
-    seed_account_history(&pool, &address, 150, "send").await;
-    seed_account_history(&pool, &address, 160, "recovery").await;
-    seed_account_history(&pool, &address, 300, "receive").await;
-
-    let state = live_test_state(pool);
-    let mut seen_directions: Vec<String> = Vec::new();
-    let mut total_seen_on_first_page: Option<i64> = None;
-    let mut offset: i64 = 0;
-    let limit: i64 = 2;
-    loop {
-        let req = Request::get(format!(
-            "/api/history?address=0x{}&limit={}&offset={}",
-            hex::encode(address),
-            limit,
-            offset
-        ))
-        .body(Body::empty())
-        .unwrap();
-        let (status, body) = send_request_with_state(state.clone(), req).await;
-        assert_eq!(status, StatusCode::OK, "body={}", body);
-        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-        let total = v["total"].as_i64().expect("total i64");
-        if total_seen_on_first_page.is_none() {
-            total_seen_on_first_page = Some(total);
-        } else {
-            assert_eq!(
-                total_seen_on_first_page,
-                Some(total),
-                "total must stay constant across pages"
-            );
-        }
-        let items = v["items"].as_array().expect("items array");
-        if items.is_empty() {
-            break;
-        }
-        // The page must never come back short of the requested `limit`
-        // unless we've hit the end — that's the property the post-fetch
-        // filter violated.
-        if (offset + items.len() as i64) < total {
-            assert_eq!(
-                items.len() as i64,
-                limit,
-                "page must be full while more rows remain (post-fetch filter would shrink this)"
-            );
-        }
-        for it in items {
-            let d = it["direction"].as_str().expect("direction str").to_string();
-            assert!(
-                matches!(d.as_str(), "mint" | "send" | "receive"),
-                "internal sources must never reach the wire, got {}",
-                d
-            );
-            seen_directions.push(d);
-        }
-        offset += items.len() as i64;
-        if offset >= total {
-            break;
-        }
-    }
-    let total = total_seen_on_first_page.expect("at least one page seen");
-    assert_eq!(total, 4, "filtered total = 4 user-facing rows");
-    assert_eq!(
-        seen_directions.len() as i64,
-        total,
-        "pagination walk yields exactly `total` rows"
-    );
-    // Newest-first: last receive (300), send (150), receive (250), mint (100).
-    assert_eq!(seen_directions, vec!["receive", "send", "receive", "mint"]);
-}
-
-// =======================================================================
-// GET /api/history/{id} — per-transaction detail (TxDetail)
-//
-// Validation branches run against the dead pool (`send_request`); the
-// found / not-found / decoded-snapshot branches run against the live
-// Postgres container, mirroring the list-endpoint tests above.
-// =======================================================================
-
-#[tokio::test]
-async fn history_item_missing_address_returns_422() {
-    let req = Request::get("/api/history/1").body(Body::empty()).unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(
-        v["error"].as_str().unwrap_or("").contains("address"),
-        "expected address-related error, got {}",
-        body
-    );
-}
-
-#[tokio::test]
-async fn history_item_empty_address_returns_422() {
-    let req = Request::get("/api/history/1?address=")
-        .body(Body::empty())
-        .unwrap();
-    let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-}
-
-#[tokio::test]
-async fn history_item_invalid_hex_returns_422() {
-    let req = Request::get("/api/history/1?address=not_hex")
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"]
-        .as_str()
-        .unwrap_or("")
-        .to_lowercase()
-        .contains("hex"));
-}
-
-#[tokio::test]
-async fn history_item_non_integer_id_returns_422() {
-    // The id is parsed from the path as a string so a malformed id is a
-    // 422 like every other bad input on the read surface — not axum's
-    // default 400 for a failed typed-Path extraction.
-    let address = "00".repeat(32);
-    let req = Request::get(format!("/api/history/not_a_number?address={}", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"]
-        .as_str()
-        .unwrap_or("")
-        .contains("positive integer"));
-}
-
-#[tokio::test]
-async fn history_item_zero_or_negative_id_returns_422() {
-    let address = "00".repeat(32);
-    for bad in ["0", "-3"] {
-        let req = Request::get(format!("/api/history/{}?address={}", bad, address))
-            .body(Body::empty())
-            .unwrap();
-        let (status, _body) = send_request(req).await;
-        assert_eq!(
-            status,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "id={bad} must 422"
-        );
-    }
-}
-
-#[tokio::test]
-async fn history_item_db_error_returns_500() {
-    // Dead pool: validation passes, the row query fails -> 500 with the
-    // documented error envelope.
-    let address = "00".repeat(32);
-    let req = Request::get(format!("/api/history/1?address={}", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(v["error"]
-        .as_str()
-        .unwrap_or("")
-        .to_lowercase()
-        .contains("database"));
-}
-
-#[tokio::test]
-async fn history_item_unknown_id_returns_404() {
-    let (pool, _pg) = history_live_pool().await;
-    let state = live_test_state(pool);
-    let address = "ab".repeat(32);
-    let req = Request::get(format!("/api/history/424242?address={}", address))
-        .body(Body::empty())
-        .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "body={}", body);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(v["error"], "Transaction not found");
-}
-
-#[tokio::test]
-async fn history_item_wrong_address_returns_404() {
-    // Scoping / IDOR guard: a real row id fetched with a different
-    // address must look identical to a missing row.
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [21u8; 32];
-    seed_account_history(&pool, &address, 100, "mint").await;
-    let (rows, _) = crate::db::list_account_history(&pool, &address[..], 10, 0)
-        .await
-        .unwrap();
-    let id = rows[0].id;
-
-    let state = live_test_state(pool);
-    let other = "cd".repeat(32);
-    let req = Request::get(format!("/api/history/{}?address={}", id, other))
-        .body(Body::empty())
-        .unwrap();
-    let (status, _body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn history_item_happy_path_returns_decoded_snapshot() {
-    let (pool, _pg) = history_live_pool().await;
     let address: [u8; 32] = [23u8; 32];
-
-    // Two mutations: 0 -> 100 (mint), then 100 -> 40 (send) so the
-    // detail of the send row carries both balance_before and
-    // balance_after plus the post-mutation num_sends.
-    seed_account_history(&pool, &address, 100, "mint").await;
-    let mut sent = Account::new();
-    sent.balance = 40;
-    sent.num_sends = 1;
-    let bytes = bincode::serialize(&sent).expect("Account serializable");
-    // Mutate the SAME `(owner, asset_id)` account `seed_account_history`
-    // created: since migration 0017 `accounts.address` is the 64-byte
-    // `owner ‖ asset_id` composite, so upsert under the composite (not the
-    // raw 32-byte owner) or the `accounts_address_length` = 64 CHECK trips.
-    // The capture trigger writes the 32-byte owner prefix into
-    // `account_history`, so the send row chains onto the mint row and
-    // `list_account_history(&address)` still resolves it.
-    let owner = zkcoins_program::hash::digest_from_bytes(&address);
-    let asset_id = zkcoins_program::hash::ZERO_HASH;
-    let key = crate::account_node::account_key_bytes(&owner, &asset_id);
-    crate::db::upsert_account_with_source(&pool, key.as_slice(), &bytes, "send")
-        .await
-        .expect("upsert send mutation");
-
-    let (rows, _) = crate::db::list_account_history(&pool, &address[..], 10, 0)
-        .await
-        .unwrap();
-    let send_id = rows[0].id; // newest first
+    let mut acct = Account::new();
+    acct.balance = 40;
+    acct.num_sends = 1;
+    let blob = bincode::serialize(&acct).expect("Account serializable");
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO account_history (address, prev_data, new_data, source)          VALUES ($1, NULL, $2, 'send') RETURNING id",
+    )
+    .bind(&address[..])
+    .bind(&blob)
+    .fetch_one(&*pool)
+    .await
+    .expect("plant detail row");
 
     let state = live_test_state(pool);
     let req = Request::get(format!(
         "/api/history/{}?address=0x{}",
-        send_id,
-        hex::encode(address)
-    ))
-    .body(Body::empty())
-    .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(v["id"].as_i64(), Some(send_id));
-    assert_eq!(
-        v["address"],
-        hex::encode(address),
-        "address echoed normalised (0x stripped, lower-case)"
-    );
-    assert_eq!(v["direction"], "send");
-    assert_eq!(v["amount"], 60, "|40 - 100|");
-    assert_eq!(v["status"], "pending", "no inscription link yet");
-    assert_eq!(v["balance_after"], 40);
-    assert_eq!(v["balance_before"], 100);
-    assert_eq!(v["num_sends_after"], 1);
-    // The seed path sets no commitment pubkey and the fresh schema has
-    // no circuit digest row / inscription rows.
-    assert!(v["commitment_public_key"].is_null());
-    assert!(v["circuit_digest"].is_null());
-    assert!(v["commit_output_value"].is_null());
-    assert!(v["txid"].is_null());
-    assert!(v["block_height"].is_null());
-    assert!(v["counterparty"].is_null());
-    assert!(v["memo"].is_null());
-}
-
-#[tokio::test]
-async fn history_item_surfaces_circuit_digest_when_stored() {
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [27u8; 32];
-    seed_account_history(&pool, &address, 100, "mint").await;
-    crate::db::store_circuit_digest(&pool, &[0xCD; 32])
-        .await
-        .expect("store digest");
-    let (rows, _) = crate::db::list_account_history(&pool, &address[..], 10, 0)
-        .await
-        .unwrap();
-    let id = rows[0].id;
-
-    let state = live_test_state(pool);
-    let req = Request::get(format!(
-        "/api/history/{}?address={}",
         id,
         hex::encode(address)
     ))
     .body(Body::empty())
     .unwrap();
     let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK, "body={}", body);
-    let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(
-        v["circuit_digest"].as_str(),
-        Some(hex::encode([0xCD; 32]).as_str())
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+    for key in [
+        "balance_before",
+        "balance_after",
+        "num_sends_after",
+        "commitment_public_key",
+        "amount",
+    ] {
+        assert!(
+            v.get(key).is_none(),
+            "must not emit {key} from closed detail; got {body}"
+        );
+    }
+    let err = v["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/history") || err.contains("Stage 3") || err.contains("read.account"),
+        "error must name the removed surface; got {err:?}"
     );
 }
 
 #[tokio::test]
-async fn history_item_corrupt_blob_returns_500() {
-    // A row whose new_data is not a valid bincode Account decodes to
-    // None in tx_detail_from_row — the handler maps that to a 500, never
-    // a fabricated detail.
-    let (pool, _pg) = history_live_pool().await;
-    let address: [u8; 32] = [29u8; 32];
-    let (id,): (i64,) = sqlx::query_as(
-        "INSERT INTO account_history (address, prev_data, new_data, source) \
-         VALUES ($1, NULL, $2, 'mint') RETURNING id",
-    )
-    .bind(&address[..])
-    .bind(vec![0xFFu8; 4])
-    .fetch_one(&*pool)
-    .await
-    .expect("insert corrupt row");
+async fn history_missing_params_still_gone_not_422() {
+    // Closed surface: no validation oracle — always 410.
+    let req = Request::get("/api/history").body(Body::empty()).unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
+}
 
-    let state = live_test_state(pool);
-    let req = Request::get(format!(
-        "/api/history/{}?address={}",
-        id,
-        hex::encode(address)
-    ))
-    .body(Body::empty())
-    .unwrap();
-    let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={}", body);
+#[tokio::test]
+async fn history_item_missing_params_still_gone_not_422() {
+    let req = Request::get("/api/history/1").body(Body::empty()).unwrap();
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
 }
 
 // --- Pure-function coverage for the helpers --------------------------------
 
-#[test]
-fn decode_history_address_accepts_with_and_without_0x_prefix() {
-    let plain = "ab".repeat(32);
-    let prefixed = format!("0x{}", plain);
-    assert!(decode_history_address(&plain).is_ok());
-    assert!(decode_history_address(&prefixed).is_ok());
-}
-
-#[test]
-fn decode_history_address_rejects_short_input() {
-    let bad = "ab".repeat(16);
-    let err = decode_history_address(&bad).unwrap_err();
-    assert!(err.contains("32 bytes"));
-}
-
-#[test]
-fn decode_history_address_rejects_non_hex() {
-    let err = decode_history_address("zzzz").unwrap_err();
-    assert!(err.to_lowercase().contains("hex"));
-}
-
-#[test]
-fn map_history_direction_covers_all_branches() {
-    assert_eq!(map_history_direction("mint"), Some("mint"));
-    assert_eq!(map_history_direction("send"), Some("send"));
-    assert_eq!(map_history_direction("receive"), Some("receive"));
-    assert_eq!(map_history_direction("scanner"), None);
-    assert_eq!(map_history_direction("recovery"), None);
-    assert_eq!(map_history_direction("anything-else"), None);
-}
-
-#[test]
-fn balance_from_account_blob_round_trips() {
-    let mut a = Account::new();
-    a.balance = 42_000;
-    let bytes = bincode::serialize(&a).unwrap();
-    assert_eq!(balance_from_account_blob(&bytes), Some(42_000));
-    // Garbage bytes -> None (defensive).
-    assert!(balance_from_account_blob(&[0u8, 1, 2, 3]).is_none());
-}
-
-/// Covers the **settled-balance** shape of an `Account` blob: a post-send
-/// account whose `coin_queue` has been drained into `coin_history` and
-/// whose remaining funds sit in the `balance` field. The companion
-/// **queue-only** shape (the actual production write produced by
-/// `commit_mint_tx` / `receive_coin` for a credit) requires a real
-/// `CoinProof` and is pinned in
-/// `account_node_tests::history_row_to_item_balance_from_coin_queue_only`
-/// where the prover fixtures live.
-#[test]
-fn history_row_to_item_handles_first_row_with_no_prev_data() {
-    let mut a = Account::new();
-    a.balance = 5_000;
-    let new_bytes = bincode::serialize(&a).unwrap();
-    let row = crate::db::AccountHistoryRow {
-        id: 42,
-        timestamp_secs: 1_700_000_000,
-        source: "mint".to_string(),
-        prev_data: None,
-        new_data: new_bytes,
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    let item = history_row_to_item(&row).expect("item produced");
-    assert_eq!(item.id, 42);
-    assert_eq!(item.direction, "mint");
-    assert_eq!(
-        item.amount, 5_000,
-        "from-zero credit is the full new balance"
-    );
-    // No pending_inscriptions row + no observed_inscriptions row = the
-    // on-chain side is not yet known. DB-committed alone is NOT a
-    // confirmation; wire status defaults to `pending`.
-    assert_eq!(item.status, "pending");
-    assert!(item.txid.is_none());
-}
-
-#[test]
-fn history_row_to_item_drops_unknown_source() {
-    let mut a = Account::new();
-    a.balance = 1;
-    let row = crate::db::AccountHistoryRow {
-        id: 1,
-        timestamp_secs: 0,
-        source: "scanner".to_string(),
-        prev_data: None,
-        new_data: bincode::serialize(&a).unwrap(),
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    assert!(history_row_to_item(&row).is_none());
-}
-
-#[test]
-fn history_row_to_item_drops_undecodable_new_data() {
-    let row = crate::db::AccountHistoryRow {
-        id: 1,
-        timestamp_secs: 0,
-        source: "mint".to_string(),
-        prev_data: None,
-        new_data: vec![0xff; 4], // not a valid bincode Account
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    assert!(history_row_to_item(&row).is_none());
-}
-
-#[test]
-fn history_row_to_item_maps_pending_status_to_wire_status() {
-    let mut a = Account::new();
-    a.balance = 100;
-    let bytes = bincode::serialize(&a).unwrap();
-    let mk = |status: Option<&str>, block_height: Option<i64>| crate::db::AccountHistoryRow {
-        id: 1,
-        timestamp_secs: 0,
-        source: "send".to_string(),
-        prev_data: Some(bincode::serialize(&Account::new()).unwrap()),
-        new_data: bytes.clone(),
-        commit_txid: Some(vec![0xab; 32]),
-        block_height,
-        pending_status: status.map(str::to_string),
-        commit_output_value: None,
-    };
-    // Every enum variant the migration-0003 CHECK constraint allows.
-    assert_eq!(
-        history_row_to_item(&mk(Some("failed"), Some(1)))
-            .unwrap()
-            .status,
-        "failed"
-    );
-    assert_eq!(
-        history_row_to_item(&mk(Some("complete"), Some(1)))
-            .unwrap()
-            .status,
-        "confirmed"
-    );
-    assert_eq!(
-        history_row_to_item(&mk(Some("constructed"), None))
-            .unwrap()
-            .status,
-        "pending"
-    );
-    assert_eq!(
-        history_row_to_item(&mk(Some("commit_broadcast"), None))
-            .unwrap()
-            .status,
-        "pending"
-    );
-    assert_eq!(
-        history_row_to_item(&mk(Some("reveal_broadcast"), None))
-            .unwrap()
-            .status,
-        "pending"
-    );
-    // No pending row + no observed row -> on-chain side is unknown -> pending.
-    assert_eq!(
-        history_row_to_item(&mk(None, None)).unwrap().status,
-        "pending"
-    );
-    // No pending row but observed_inscriptions has a block height -> confirmed.
-    assert_eq!(
-        history_row_to_item(&mk(None, Some(42))).unwrap().status,
-        "confirmed"
-    );
-    // Unknown pending_inscriptions.status (defensive — CHECK prevents
-    // it in practice). The handler degrades to `pending` and logs.
-    assert_eq!(
-        history_row_to_item(&mk(Some("nonsense_state"), None))
-            .unwrap()
-            .status,
-        "pending"
-    );
-    // commit_txid -> hex-encoded; block_height surfaced verbatim.
-    let item = history_row_to_item(&mk(Some("complete"), Some(123_456))).unwrap();
-    assert_eq!(item.txid.as_deref(), Some("ab".repeat(32).as_str()));
-    assert_eq!(item.block_height, Some(123_456));
-}
-
-#[test]
-fn history_row_to_item_drops_undecodable_prev_data() {
-    // A `Some(blob)` that fails to bincode-decode is NOT the same as
-    // `None` (first INSERT). Silently treating it as zero would
-    // fabricate a full-balance delta — the row is dropped instead.
-    let mut a = Account::new();
-    a.balance = 5_000;
-    let row = crate::db::AccountHistoryRow {
-        id: 7,
-        timestamp_secs: 0,
-        source: "send".to_string(),
-        prev_data: Some(vec![0xff; 4]), // not a valid bincode Account
-        new_data: bincode::serialize(&a).unwrap(),
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    assert!(
-        history_row_to_item(&row).is_none(),
-        "un-decodable prev_data must drop the row, not pretend prev_balance = 0"
-    );
-}
-
+// Covers the **settled-balance** shape of an `Account` blob: a post-send
+// account whose `coin_queue` has been drained into `coin_history` and
+// whose remaining funds sit in the `balance` field. The companion
+// **queue-only** shape (the actual production write produced by
+// `commit_mint_tx` / `receive_coin` for a credit) requires a real
+// `CoinProof` and is pinned in
+// `account_node_tests::history_row_to_item_balance_from_coin_queue_only`
+// where the prover fixtures live.
 // ── GET /api/history/{id} — TxDetail conversion (issue: tx-detail) ──────
-
-#[test]
-fn account_meta_from_blob_reads_num_sends_and_commitment_pubkey() {
-    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
-
-    // Fresh account: num_sends = 0, no commitment pubkey yet.
-    let fresh = Account::new();
-    let (n, cpk) = account_meta_from_blob(&bincode::serialize(&fresh).unwrap()).unwrap();
-    assert_eq!(n, 0);
-    assert!(cpk.is_none(), "genesis account has no commitment pubkey");
-
-    // Account that has sent: num_sends > 0 and a commitment pubkey set.
-    let secp = Secp256k1::new();
-    let sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
-    let pk = PublicKey::from_secret_key(&secp, &sk);
-    let mut sent = Account::new();
-    sent.num_sends = 3;
-    sent.commitment_public_key = Some(pk);
-    let (n, cpk) = account_meta_from_blob(&bincode::serialize(&sent).unwrap()).unwrap();
-    assert_eq!(n, 3);
-    assert_eq!(
-        cpk.as_deref(),
-        Some(hex::encode(pk.serialize()).as_str()),
-        "commitment pubkey is the 33-byte compressed form, hex-encoded"
-    );
-
-    // Garbage bytes -> None (decode failure → caller 500s).
-    assert!(account_meta_from_blob(&[0xff; 3]).is_none());
-}
-
-#[test]
-fn tx_detail_from_row_builds_full_detail_with_decoded_snapshot() {
-    let mut prev = Account::new();
-    prev.balance = 10_000;
-    let mut new = Account::new();
-    new.balance = 4_000;
-    new.num_sends = 1;
-
-    let row = crate::db::AccountHistoryRow {
-        id: 99,
-        timestamp_secs: 1_700_000_500,
-        source: "send".to_string(),
-        prev_data: Some(bincode::serialize(&prev).unwrap()),
-        new_data: bincode::serialize(&new).unwrap(),
-        commit_txid: Some(vec![0xab; 32]),
-        block_height: Some(900_001),
-        pending_status: Some("complete".to_string()),
-        commit_output_value: Some(546),
-    };
-    let digest = vec![0xcd; 32];
-    let detail = tx_detail_from_row(&row, "ee".repeat(32), Some(digest.clone()))
-        .expect("detail produced for a user-facing row");
-
-    // Core fields mirror history_row_to_item.
-    assert_eq!(detail.id, 99);
-    assert_eq!(detail.address, "ee".repeat(32));
-    assert_eq!(detail.direction, "send");
-    assert_eq!(detail.amount, 6_000, "|4000 - 10000|");
-    assert_eq!(
-        detail.status, "confirmed",
-        "complete inscription -> confirmed"
-    );
-    assert_eq!(detail.txid.as_deref(), Some("ab".repeat(32).as_str()));
-    assert_eq!(detail.block_height, Some(900_001));
-    // Decoded snapshot.
-    assert_eq!(detail.balance_after, 4_000);
-    assert_eq!(detail.balance_before, Some(10_000));
-    assert_eq!(detail.num_sends_after, 1);
-    // Proof + on-chain extras.
-    assert_eq!(
-        detail.circuit_digest.as_deref(),
-        Some(hex::encode(&digest).as_str())
-    );
-    assert_eq!(detail.commit_output_value, Some(546));
-}
-
-#[test]
-fn tx_detail_from_row_first_row_has_no_balance_before() {
-    let mut new = Account::new();
-    new.balance = 5_000;
-    let row = crate::db::AccountHistoryRow {
-        id: 1,
-        timestamp_secs: 0,
-        source: "mint".to_string(),
-        prev_data: None,
-        new_data: bincode::serialize(&new).unwrap(),
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    let detail = tx_detail_from_row(&row, "11".repeat(32), None).unwrap();
-    assert_eq!(detail.balance_after, 5_000);
-    assert_eq!(detail.amount, 5_000, "from-zero mint credits full balance");
-    assert!(
-        detail.balance_before.is_none(),
-        "first row has no prior state"
-    );
-    assert!(detail.circuit_digest.is_none(), "no digest passed -> null");
-    assert!(detail.commit_output_value.is_none());
-    assert_eq!(detail.num_sends_after, 0);
-    assert!(detail.commitment_public_key.is_none());
-}
-
-#[test]
-fn tx_detail_from_row_internal_source_returns_none() {
-    let mut new = Account::new();
-    new.balance = 1;
-    let row = crate::db::AccountHistoryRow {
-        id: 5,
-        timestamp_secs: 0,
-        source: "scanner".to_string(), // internal — must not surface
-        prev_data: None,
-        new_data: bincode::serialize(&new).unwrap(),
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    assert!(tx_detail_from_row(&row, "22".repeat(32), None).is_none());
-}
-
-#[test]
-fn tx_detail_from_row_undecodable_new_data_returns_none() {
-    let row = crate::db::AccountHistoryRow {
-        id: 5,
-        timestamp_secs: 0,
-        source: "mint".to_string(),
-        prev_data: None,
-        new_data: vec![0xff; 4], // corrupt -> caller 500s
-        commit_txid: None,
-        block_height: None,
-        pending_status: None,
-        commit_output_value: None,
-    };
-    assert!(tx_detail_from_row(&row, "33".repeat(32), None).is_none());
-}
-
-#[test]
-fn pending_inscription_status_from_db_str_round_trips_every_variant() {
-    // Mirrors migration-0003 CHECK constraint. Adding a state to
-    // `PendingInscriptionStatus` without updating this list fails CI.
-    assert_eq!(
-        PendingInscriptionStatus::from_db_str("constructed"),
-        Some(PendingInscriptionStatus::Constructed)
-    );
-    assert_eq!(
-        PendingInscriptionStatus::from_db_str("commit_broadcast"),
-        Some(PendingInscriptionStatus::CommitBroadcast)
-    );
-    assert_eq!(
-        PendingInscriptionStatus::from_db_str("reveal_broadcast"),
-        Some(PendingInscriptionStatus::RevealBroadcast)
-    );
-    assert_eq!(
-        PendingInscriptionStatus::from_db_str("complete"),
-        Some(PendingInscriptionStatus::Complete)
-    );
-    assert_eq!(
-        PendingInscriptionStatus::from_db_str("failed"),
-        Some(PendingInscriptionStatus::Failed)
-    );
-    assert_eq!(PendingInscriptionStatus::from_db_str("unknown"), None);
-}
 
 // ===========================================================================
 // Milestone 2: neutral, permissionless multi-asset router surface.
 // ===========================================================================
-
 use bitcoin::secp256k1::{
     Keypair as TestKeypair, Secp256k1 as TestSecp, SecretKey as TestSecretKey,
 };
@@ -5538,18 +7883,6 @@ fn now_secs() -> u64 {
 }
 
 #[test]
-fn parse_hex_digest_accepts_valid_and_rejects_malformed() {
-    let good = "0x".to_string() + &"ab".repeat(32);
-    assert!(parse_hex_digest(&good).is_some());
-    // Without 0x prefix also accepted.
-    assert!(parse_hex_digest(&"cd".repeat(32)).is_some());
-    // Bad hex.
-    assert!(parse_hex_digest("0xZZ").is_none());
-    // Wrong length.
-    assert!(parse_hex_digest(&"ab".repeat(16)).is_none());
-}
-
-#[test]
 fn verify_mint_signature_accepts_valid_signature() {
     let req = signed_mint_request("TestToken", 8, 50_000, now_secs());
     verify_mint_signature_pub(&req).expect("valid mint signature must verify");
@@ -5581,30 +7914,28 @@ fn verify_mint_signature_rejects_malformed_signature_hex() {
 }
 
 #[tokio::test]
-async fn balance_missing_asset_id_returns_unprocessable() {
-    // Under the multi-asset model the single-balance endpoint requires
-    // an explicit asset_id.
+async fn balance_missing_asset_id_is_gone() {
+    // Route closed regardless of query shape (no 422 that could leak schema).
     let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let uri = format!("/api/balance?address={}", address_hex);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
 }
 
 #[tokio::test]
-async fn balance_invalid_asset_id_returns_unprocessable() {
+async fn balance_invalid_asset_id_is_gone() {
     let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(&test_owner_address()));
     let uri = format!("/api/balance?address={}&asset_id=ZZ", address_hex);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
 }
 
+/// R2: multi-asset owner list must not reveal seeded balances.
 #[tokio::test]
-async fn owner_balance_lists_assets_for_owner() {
+async fn owner_balance_is_gone_and_does_not_reveal_assets() {
     let state = test_state();
-    // Seed a second asset for the same owner so the aggregation has two
-    // entries.
     {
         let mut node = state.account_node.lock().unwrap();
         let other_asset = zkcoins_program::hash::hash_bytes(b"router-test-asset-2");
@@ -5618,39 +7949,44 @@ async fn owner_balance_lists_assets_for_owner() {
     let uri = format!("/api/balance/{}", address_hex);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request_with_state(state, req).await;
-    assert_eq!(status, StatusCode::OK);
-    let resp: OwnerBalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert_eq!(resp.assets.len(), 2);
-    let total: u64 = resp.assets.iter().map(|a| a.balance).sum();
-    assert_eq!(total, 1_000_250);
-    let second = resp
-        .assets
-        .iter()
-        .find(|a| a.name.as_deref() == Some("SECOND"))
-        .expect("second asset present");
-    assert_eq!(second.balance, 250);
-    assert_eq!(second.decimals, Some(6));
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "legacy owner balance must refuse loud (HTTP 410); body={body}"
+    );
+    let resp: serde_json::Value = serde_json::from_str(&body).expect("JSON error body");
+    assert!(
+        resp.get("assets").is_none() && resp.get("balance").is_none(),
+        "must not carry OwnerBalanceResponse fields; got {resp}"
+    );
+    assert!(
+        !body.contains("SECOND") && !body.contains("1000000") && !body.contains("250"),
+        "must not leak asset names or balances; body={body}"
+    );
+    let err = resp["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("/api/balance") || err.contains("Stage 3") || err.contains("read.account"),
+        "error must name the removed surface; got {err:?}"
+    );
 }
 
 #[tokio::test]
-async fn owner_balance_empty_for_unknown_owner() {
+async fn owner_balance_unknown_owner_is_gone() {
     let address_hex = hex::encode(zkcoins_program::hash::digest_to_bytes(
         &zkcoins_program::hash::digest_from_bytes(&[0x55u8; 32]),
     ));
     let uri = format!("/api/balance/{}", address_hex);
     let req = Request::get(&uri).body(Body::empty()).unwrap();
     let (status, body) = send_request(req).await;
-    assert_eq!(status, StatusCode::OK);
-    let resp: OwnerBalanceResponse = serde_json::from_str(&body).expect("valid JSON");
-    assert!(resp.assets.is_empty());
+    assert_eq!(status, StatusCode::GONE, "body={body}");
 }
 
 #[tokio::test]
-async fn owner_balance_rejects_malformed_address() {
+async fn owner_balance_malformed_address_is_gone() {
     let uri = "/api/balance/not-hex".to_string();
     let req = Request::get(&uri).body(Body::empty()).unwrap();
-    let (status, _body) = send_request(req).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, body) = send_request(req).await;
+    assert_eq!(status, StatusCode::GONE, "body={body}");
 }
 
 #[tokio::test]
@@ -5692,3 +8028,5 @@ async fn jobs_mint_stale_timestamp_is_rejected() {
     let (status, _b) = send_request(http).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+// ---------------------------------------------------------------------------

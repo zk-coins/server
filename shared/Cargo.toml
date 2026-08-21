@@ -3,11 +3,36 @@ name = "shared"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Test-only: independent RFC-6962 reference + boundary fixtures
+# (`spec_v1::nflog_boundary`). Not part of the production API — normal
+# `cargo build -p shared` leaves the module uncompiled. Enabled by this
+# package's self-path dev-dependency (so `cargo test -p shared` gets it)
+# and by `program-plonky2`'s `shared` dev-dependency for the gadget suite.
+test-fixtures = []
+
 [dependencies]
 zkcoins-program = { path = "../program-plonky2/", package = "zkcoins-program-plonky2" }
 lazy_static = { workspace = true }
 bitcoin = { workspace = true }
 sha2 = { workspace = true }
+hkdf = "0.12"
 serde = { workspace = true }
 bincode = { workspace = true }
 hex = "0.4.3"
+bech32 = { workspace = true }
+plonky2 = "1.1.0"
+chacha20poly1305 = { workspace = true }
+
+[dev-dependencies]
+# Integration tests (`tests/*`) are separate crates and cannot see package
+# dependencies unless listed here.
+hex = "0.4.3"
+sha2 = { workspace = true }
+# base64url_no_pad for V.10 NIP44Binary envelope preimage (`coin_plain`).
+# Already present in the workspace lockfile (transitive); direct dev-dep so the
+# generator test can call URL_SAFE_NO_PAD without inventing an encoder.
+base64 = "0.22"
+# Self-path dep activates `test-fixtures` for this package's own test builds
+# (integration tests link the library without `cfg(test)`).
+shared = { path = ".", features = ["test-fixtures"] }
