@@ -1664,11 +1664,7 @@ fn token_provenance_error_response(err: KernelError) -> Response {
     if let Some(ctx) = &err.internal_context {
         tracing::error!("GetTokenProvenance internal error: {}", ctx.detail);
     }
-    (
-        status,
-        Json(v1_error_body(desc.reason, err.public_message)),
-    )
-        .into_response()
+    (status, Json(v1_error_body(desc.reason, err.public_message))).into_response()
 }
 
 /// `GET /v1/token/:asset_id/provenance` — open Class-B token terms (§7.5).

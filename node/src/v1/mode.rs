@@ -532,7 +532,7 @@ mod unit_tests {
             .unwrap_or_else(|p| p.into_inner())
     }
 
-    const BOOT_ENV_KEYS: &[&'static str] = &[
+    const BOOT_ENV_KEYS: &[&str] = &[
         "ZKCOINS_NETWORK",
         "ZKCOINS_ACTIVATION_HEIGHT",
         "ZKCOINS_EXPECTED_PARAMS_IDENTIFIER",
@@ -604,10 +604,7 @@ mod unit_tests {
         let _guard = env_lock();
         let _saved = SavedEnv::capture(&["ZKCOINS_V1_SHADOW"]);
         std::env::remove_var("ZKCOINS_V1_SHADOW");
-        assert_eq!(
-            v1_shadow_mode_from_env().expect("unset"),
-            V1ShadowMode::Off
-        );
+        assert_eq!(v1_shadow_mode_from_env().expect("unset"), V1ShadowMode::Off);
     }
 
     #[test]
@@ -757,16 +754,10 @@ mod unit_tests {
     fn parse_hex_32_uppercase_and_non_hex_fail() {
         let upper = format!("AA{}", "a".repeat(62));
         let err = super::parse_hex_32(&upper, "TEST_HEX").expect_err("uppercase");
-        assert!(
-            err.contains("not lowercase hex"),
-            "unexpected: {err}"
-        );
+        assert!(err.contains("not lowercase hex"), "unexpected: {err}");
         let non_hex = format!("g{}", "a".repeat(63));
         let err = super::parse_hex_32(&non_hex, "TEST_HEX").expect_err("non-hex");
-        assert!(
-            err.contains("not lowercase hex"),
-            "unexpected: {err}"
-        );
+        assert!(err.contains("not lowercase hex"), "unexpected: {err}");
     }
 
     // --- F. v1_boot_pins_from_env ---
@@ -784,7 +775,10 @@ mod unit_tests {
         let expected_from_env =
             hex::decode(std::env::var("ZKCOINS_EXPECTED_PARAMS_IDENTIFIER").unwrap())
                 .expect("env identifier hex");
-        assert_eq!(pins.expected_params_identifier.as_slice(), expected_from_env.as_slice());
+        assert_eq!(
+            pins.expected_params_identifier.as_slice(),
+            expected_from_env.as_slice()
+        );
     }
 
     #[test]
@@ -815,10 +809,7 @@ mod unit_tests {
         std::env::set_var("ZKCOINS_NETWORK", "notanetwork");
         let err = v1_boot_pins_from_env().expect_err("unknown network");
         assert_ne!(err, V1_BOOT_CONFIG_ERROR.to_string());
-        assert!(
-            err.contains("not a known network tag"),
-            "unexpected: {err}"
-        );
+        assert!(err.contains("not a known network tag"), "unexpected: {err}");
     }
 
     #[test]
@@ -914,10 +905,7 @@ mod unit_tests {
         let _guard = env_lock();
         let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
         install_testnet_boot_baseline();
-        std::env::set_var(
-            "ZKCOINS_CIRCUIT_DIGEST_C",
-            format!("zz{}", "0".repeat(62)),
-        );
+        std::env::set_var("ZKCOINS_CIRCUIT_DIGEST_C", format!("zz{}", "0".repeat(62)));
         let err = v1_boot_pins_from_env().expect_err("digest_c bad hex");
         assert_ne!(err, V1_BOOT_CONFIG_ERROR.to_string());
         assert!(
@@ -1008,15 +996,9 @@ mod unit_tests {
         let _saved = SavedEnv::capture(BOOT_ENV_KEYS);
         install_testnet_boot_baseline();
         // Well-formed 64-char lowercase hex that does not match the built params.
-        std::env::set_var(
-            "ZKCOINS_EXPECTED_PARAMS_IDENTIFIER",
-            "00".repeat(32),
-        );
+        std::env::set_var("ZKCOINS_EXPECTED_PARAMS_IDENTIFIER", "00".repeat(32));
         let err = v1_boot_pins_from_env().expect_err("wrong identifier");
-        assert!(
-            err.contains("identifier"),
-            "unexpected: {err}"
-        );
+        assert!(err.contains("identifier"), "unexpected: {err}");
     }
 
     // UNREACHABLE: mode.rs:181-183 — network_tag_for map_err body:

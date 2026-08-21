@@ -874,15 +874,14 @@ pub(crate) async fn publish_recovery_overlap(
         });
     }
 
-    let client = BlossomClient::new(max_blob_bytes).map_err(|error| {
-        DeliveryError::OverlapBlobStore {
+    let client =
+        BlossomClient::new(max_blob_bytes).map_err(|error| DeliveryError::OverlapBlobStore {
             attempted: 0,
             results: vec![BlossomOutcomeSummary {
                 holder: String::new(),
                 detail: error.to_string(),
             }],
-        }
-    })?;
+        })?;
     let binding = UploadBinding {
         event_id: gift_wrap.id,
         attempt_nonce: ack_nonce,
@@ -895,20 +894,18 @@ pub(crate) async fn publish_recovery_overlap(
         attempted = attempted.saturating_add(1);
         let timestamps = fresh_blossom_auth_timestamps();
         let upload = match timestamps {
-            Ok((created_at, expiration)) => {
-                client
-                    .upload(
-                        holder,
-                        zbe_ciphertext,
-                        Some(&binding),
-                        op_sk,
-                        created_at,
-                        expiration,
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            }
+            Ok((created_at, expiration)) => client
+                .upload(
+                    holder,
+                    zbe_ciphertext,
+                    Some(&binding),
+                    op_sk,
+                    created_at,
+                    expiration,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
             Err(error) => Err(error.to_string()),
         };
         match upload {
@@ -1021,7 +1018,11 @@ pub(crate) async fn start_overlap_test_relay(
                 "OK",
                 event_id_hex,
                 accepted,
-                if accepted { "stored" } else { "rejected by test relay" }
+                if accepted {
+                    "stored"
+                } else {
+                    "rejected by test relay"
+                }
             ])
             .to_string();
             websocket
@@ -1378,6 +1379,7 @@ impl OutgoingDeliveryPort for MeshDeliveryPort {
 }
 
 /// Build + network-publish one outbox row; mark_published.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish_outbox_row(
     pool: &PgPool,
     row: &OutboxRow,
@@ -1463,8 +1465,7 @@ pub(crate) async fn drive_due_outbox_entries(
     manifest_store: &ManifestStore,
     now: u64,
 ) -> Result<usize, DeliveryError> {
-    let (manifest_blob_stores, manifest_seed_relays) =
-        manifest_overlap_targets(manifest_store);
+    let (manifest_blob_stores, manifest_seed_relays) = manifest_overlap_targets(manifest_store);
     let due = db_outbox::list_due(pool)
         .await
         .map_err(|e| DeliveryError::Relay(format!("list_due: {e:#}")))?;
@@ -2202,8 +2203,8 @@ mod tests {
     };
     use crate::v1::db_outbox::OutboxStatus;
     use crate::v1::incoming::{
-        process_delivery_candidate, AckClock, CandidateNetwork, CandidateOutcome,
-        CandidateSecrets, CandidateStores, HolderOutcome,
+        process_delivery_candidate, AckClock, CandidateNetwork, CandidateOutcome, CandidateSecrets,
+        CandidateStores, HolderOutcome,
     };
     use crate::v1::nostr::kinds::ack::sign_ack;
     use crate::v1::nostr::kinds::delivery::encode_delivery_payload;
@@ -2387,11 +2388,7 @@ mod tests {
         format!("ws://{address}/")
     }
 
-    async fn mount_overlap_blossom(
-        server: &MockServer,
-        blob_id: [u8; 32],
-        status: u16,
-    ) {
+    async fn mount_overlap_blossom(server: &MockServer, blob_id: [u8; 32], status: u16) {
         let response = if status == 200 {
             ResponseTemplate::new(status).set_body_json(serde_json::json!({
                 "blob_id": hex::encode(blob_id),
@@ -2448,8 +2445,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("test wall clock after UNIX epoch")
             .as_secs();
-        let stale_hook_entry = before_build
-            .saturating_sub(super::super::blossom::AUTH_REPLAY_WINDOW_SECS + 60);
+        let stale_hook_entry =
+            before_build.saturating_sub(super::super::blossom::AUTH_REPLAY_WINDOW_SECS + 60);
         let material = sample_material(recipient_ivpk, recipient_op_pk);
         let mut rng = ChainRng::new(b"zkCoins/v1/test/delivery/fresh-auth-rng");
         let built = build_coin_delivery(
@@ -2529,8 +2526,7 @@ mod tests {
         let manifest_store = MockServer::start().await;
         let (recipient_relay, recipient_events) = start_overlap_test_relay(true).await;
         let (seed_relay, seed_events) = start_overlap_test_relay(true).await;
-        let (built, op_sk) =
-            build_overlap_fixture(recipient_store.uri(), recipient_relay);
+        let (built, op_sk) = build_overlap_fixture(recipient_store.uri(), recipient_relay);
         mount_overlap_blossom(&recipient_store, built.blob_id, 200).await;
         mount_overlap_blossom(&unhealthy_manifest_store, built.blob_id, 500).await;
         mount_overlap_blossom(&manifest_store, built.blob_id, 200).await;
@@ -2546,7 +2542,10 @@ mod tests {
         .expect("recipient and recovery overlap placement");
 
         assert_eq!(
-            recipient_events.lock().expect("recipient events").as_slice(),
+            recipient_events
+                .lock()
+                .expect("recipient events")
+                .as_slice(),
             &[built.gift_wrap.id]
         );
         assert_eq!(
@@ -2589,8 +2588,7 @@ mod tests {
             fixture_sk(b"zkCoins/v1/test/delivery/incoming-fallback-sender-op");
         let (sender_pk0_sk, sender_pk0) =
             fixture_sk(b"zkCoins/v1/test/delivery/incoming-fallback-sender-pk0");
-        let (_, sender_ivpk) =
-            fixture_sk(b"zkCoins/v1/test/delivery/incoming-fallback-sender-ivk");
+        let (_, sender_ivpk) = fixture_sk(b"zkCoins/v1/test/delivery/incoming-fallback-sender-ivk");
         let (recipient_ivk, recipient_ivpk) =
             fixture_sk(b"zkCoins/v1/test/delivery/incoming-fallback-recipient-ivk");
         let (recipient_op, recipient_op_pk) =
@@ -2613,10 +2611,7 @@ mod tests {
         .expect("build fallback delivery");
 
         Mock::given(method("GET"))
-            .and(path(format!(
-                "/blossom/{}",
-                hex::encode(built.blob_id)
-            )))
+            .and(path(format!("/blossom/{}", hex::encode(built.blob_id))))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/octet-stream")
@@ -2765,8 +2760,7 @@ mod tests {
         let recipient_store = MockServer::start().await;
         let manifest_store = MockServer::start().await;
         let (recipient_relay, _) = start_overlap_test_relay(true).await;
-        let (built, op_sk) =
-            build_overlap_fixture(recipient_store.uri(), recipient_relay);
+        let (built, op_sk) = build_overlap_fixture(recipient_store.uri(), recipient_relay);
         mount_overlap_blossom(&recipient_store, built.blob_id, 200).await;
         mount_overlap_blossom(&manifest_store, built.blob_id, 500).await;
 
@@ -2808,8 +2802,7 @@ mod tests {
 
         let (op_sk, _) = fixture_sk(b"zkCoins/v1/test/delivery/outbox-overlap-op");
         let (ovk, _) = fixture_sk(b"zkCoins/v1/test/delivery/outbox-overlap-ovk");
-        let (_, recipient_ivpk) =
-            fixture_sk(b"zkCoins/v1/test/delivery/outbox-overlap-ivk");
+        let (_, recipient_ivpk) = fixture_sk(b"zkCoins/v1/test/delivery/outbox-overlap-ivk");
         let (_, recipient_op_pk) =
             fixture_sk(b"zkCoins/v1/test/delivery/outbox-overlap-recipient-op");
         let mut material = sample_material(recipient_ivpk, recipient_op_pk);
@@ -2829,12 +2822,8 @@ mod tests {
         )
         .await
         .expect("insert external overlap fixture");
-        let outbox_id = db_outbox::outbox_id(
-            OutboxKind::ExternalCoin,
-            &subject,
-            &coin_id,
-            &transition_pk,
-        );
+        let outbox_id =
+            db_outbox::outbox_id(OutboxKind::ExternalCoin, &subject, &coin_id, &transition_pk);
         let row = db_outbox::get_by_id(&scope.pool, &outbox_id)
             .await
             .expect("load external overlap fixture")
@@ -2879,8 +2868,7 @@ mod tests {
         let manifest_store = MockServer::start().await;
         let (recipient_relay, _) = start_overlap_test_relay(true).await;
         let (seed_relay, _) = start_overlap_test_relay(false).await;
-        let (built, op_sk) =
-            build_overlap_fixture(recipient_store.uri(), recipient_relay);
+        let (built, op_sk) = build_overlap_fixture(recipient_store.uri(), recipient_relay);
         mount_overlap_blossom(&recipient_store, built.blob_id, 200).await;
         mount_overlap_blossom(&manifest_store, built.blob_id, 200).await;
 
@@ -2889,7 +2877,7 @@ mod tests {
             &op_sk,
             1_048_576,
             &[manifest_store.uri()],
-            &[seed_relay.clone()],
+            std::slice::from_ref(&seed_relay),
         )
         .await
         .expect_err("recipient placement alone must not satisfy relay overlap");
@@ -2907,8 +2895,7 @@ mod tests {
     async fn overlap_delivery_without_loaded_manifest_fails_closed() {
         let recipient_store = MockServer::start().await;
         let (recipient_relay, _) = start_overlap_test_relay(true).await;
-        let (built, op_sk) =
-            build_overlap_fixture(recipient_store.uri(), recipient_relay);
+        let (built, op_sk) = build_overlap_fixture(recipient_store.uri(), recipient_relay);
         mount_overlap_blossom(&recipient_store, built.blob_id, 200).await;
 
         let error = publish_built_delivery(&built, &op_sk, 1_048_576, &[], &[])
@@ -2928,20 +2915,13 @@ mod tests {
         let recipient_store = MockServer::start().await;
         let manifest_store = MockServer::start().await;
         let (recipient_relay, _) = start_overlap_test_relay(true).await;
-        let (built, op_sk) =
-            build_overlap_fixture(recipient_store.uri(), recipient_relay);
+        let (built, op_sk) = build_overlap_fixture(recipient_store.uri(), recipient_relay);
         mount_overlap_blossom(&recipient_store, built.blob_id, 200).await;
         mount_overlap_blossom(&manifest_store, built.blob_id, 200).await;
 
-        let error = publish_built_delivery(
-            &built,
-            &op_sk,
-            1_048_576,
-            &[manifest_store.uri()],
-            &[],
-        )
-        .await
-        .expect_err("a manifest without seed relays cannot satisfy event overlap");
+        let error = publish_built_delivery(&built, &op_sk, 1_048_576, &[manifest_store.uri()], &[])
+            .await
+            .expect_err("a manifest without seed relays cannot satisfy event overlap");
         assert_eq!(
             error,
             DeliveryError::OverlapSeedRelay {

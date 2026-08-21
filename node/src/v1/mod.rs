@@ -152,13 +152,13 @@ mod stage3;
 // noise. Names that neither production nor tests reach via `crate::v1::`
 // are not re-exported — callers use the defining submodule path.
 pub use adapter::EngineAdapter;
-pub use db_token_provenance::backfill_token_provenance_from_decrypt_index;
 pub(crate) use attest::{
     authorise_attest_balance, completed_attest_result, issue_attest_challenge,
     prove_attestation_for_job, public_hosts_from_env, serialize_balance_attestation, unix_now,
     v1_attest_route_active, AttestBalanceRequest, AttestChallengeMap, AttestChallengeRequest,
     AttestError, AttestJobBody, U64Decimal, ATTEST_BALANCE_CHALLENGE_DOMAIN,
 };
+pub use db_token_provenance::backfill_token_provenance_from_decrypt_index;
 // Delivery port + process-local stores used from `runtime` as `crate::v1::…`.
 // Request/report types and `DeliveryTarget` stay on the defining module path
 // (`crate::v1::delivery::…` / signature).
@@ -196,10 +196,11 @@ pub use receive::{
 // error type is re-exported on the facade for `crate::v1::ReconstituteError`.
 pub(crate) use reconstitute::ReconstituteError;
 pub use scan::{
-    apply_canonical_survivors, apply_forward_scan, first_boot_requires_full_replace,
-    folded_keys_from_nflog_mirror, observation_tip_still_live, reconcile_persisted_tip,
-    record_scanned_block_hashes, FoldStats, PersistedTipReconciliation, ResolvedBlock,
-    TipReconcileOutcome,
+    apply_canonical_survivors, apply_forward_scan, backfill_null_block_times,
+    fetch_bip113_prelude_headers, first_boot_requires_full_replace, folded_keys_from_nflog_mirror,
+    observation_tip_still_live, reconcile_persisted_tip, record_bip113_prelude_headers,
+    record_scanned_block_hashes, Bip113PreludeHeader, FoldStats, PersistedTipReconciliation,
+    ResolvedBlock, TipReconcileOutcome,
 };
 /// §4.2 Phase B: binary scan-loop hook after each NfLog fold.
 pub use sdr::finalize_due_phase_b_adapter;

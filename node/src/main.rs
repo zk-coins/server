@@ -509,7 +509,9 @@ async fn boot_resume_pending_publishes(
             Ok(publisher) => match resume_all_pending_publishes(adapter, &publisher).await {
                 Ok(0) => tracing::info!("v1.1 resume_all_pending_publishes: nothing pending"),
                 Ok(n) => {
-                    tracing::info!("v1.1 resume_all_pending_publishes: completed {n} pending publish(es)")
+                    tracing::info!(
+                        "v1.1 resume_all_pending_publishes: completed {n} pending publish(es)"
+                    )
                 }
                 Err(e) => {
                     return Err(format!(
@@ -703,7 +705,8 @@ async fn run_v1_scan_loop(
     tracing::info!(
         "v1.1 scanner: connecting bitcoind RPC for AggregateStateNullifierV3 / NfLog \
          (network={:?}, activation_height={})",
-        pins.network, pins.activation_height
+        pins.network,
+        pins.activation_height
     );
 
     // Boot-time pending-publish resume runs in `main` *before* REST bind
@@ -787,6 +790,21 @@ async fn run_v1_scan_loop(
         v1::record_scanned_block_hashes(adapter.pool(), &report.blocks)
             .await
             .map_err(|e| format!("v1.1 record scanned block hashes failed: {e:#}"))?;
+        let rpc_url_p = rpc_url.clone();
+        let cookie_path_p = cookie_path.clone();
+        let activation_height_p = activation_height;
+        let prelude = tokio::task::spawn_blocking(move || {
+            v1::fetch_bip113_prelude_headers(&rpc_url_p, &cookie_path_p, activation_height_p)
+        })
+        .await
+        .map_err(|e| format!("v1.1 fetch BIP-113 prelude headers join: {e}"))?
+        .map_err(|e| format!("v1.1 fetch BIP-113 prelude headers failed: {e:#}"))?;
+        v1::record_bip113_prelude_headers(adapter.pool(), &prelude)
+            .await
+            .map_err(|e| format!("v1.1 record BIP-113 prelude headers failed: {e:#}"))?;
+        v1::backfill_null_block_times(adapter.pool(), &rpc_url, &cookie_path)
+            .await
+            .map_err(|e| format!("v1.1 backfill null block_time failed: {e:#}"))?;
         // Scanner streams only: accepted inscriptions + survivors. Expansion
         // and coupling live inside apply_canonical_survivors /
         // apply_forward_scan (immediately before mutate) so a second caller
@@ -1011,7 +1029,10 @@ async fn run_v1_scan_loop(
             }
             tracing::info!(
                 "v1.1 scanner full-replace applied: tip={} hash={} appended={} dup_ignored={}",
-                tip_height, tip.1, stats.appended, stats.duplicate_ignored
+                tip_height,
+                tip.1,
+                stats.appended,
+                stats.duplicate_ignored
             );
         } else {
             // Gate only: apply_forward_scan owns expansion, coupling, and the
@@ -1048,7 +1069,10 @@ async fn run_v1_scan_loop(
                 if stats.appended > 0 || stats.duplicate_ignored > 0 {
                     tracing::info!(
                         "v1.1 scanner folded: tip={} appended={} dup_ignored={} below_act={}",
-                        tip_height, stats.appended, stats.duplicate_ignored, stats.below_activation
+                        tip_height,
+                        stats.appended,
+                        stats.duplicate_ignored,
+                        stats.below_activation
                     );
                 }
             }

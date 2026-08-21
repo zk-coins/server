@@ -1071,23 +1071,247 @@ async fn insert_request_log_writes_row() {
 }
 
 #[tokio::test]
-async fn insert_block_log_writes_row_and_is_idempotent() {
+async fn insert_block_log_reobservation_keeps_single_row() {
     let scope = setup_pool().await;
     let pool = scope.pool.clone();
     let entry = BlockLogEntry {
+        block_time: Some(1_700_000_000),
         block_hash: vec![0x11; 32],
         block_height: Some(7),
         inscription_count: 2,
         processing_duration_us: Some(99),
     };
     insert_block_log(&pool, &entry).await.unwrap();
-    // ON CONFLICT (block_hash) DO NOTHING — second insert is a no-op.
+    // Re-observation refreshes the existing row rather than creating a duplicate.
     insert_block_log(&pool, &entry).await.unwrap();
     let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM block_log")
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn insert_block_log_a_b_a_reobservation_restores_latest_canonical_block() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let block_a = BlockLogEntry {
+        block_time: Some(1_700_000_100),
+        block_hash: vec![0xAA; 32],
+        block_height: Some(100),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+    let block_b = BlockLogEntry {
+        block_time: Some(1_700_000_200),
+        block_hash: vec![0xBB; 32],
+        block_height: Some(100),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+
+    insert_block_log(&pool, &block_a).await.unwrap();
+    insert_block_log(&pool, &block_b).await.unwrap();
+    insert_block_log(&pool, &block_a).await.unwrap();
+
+    assert_eq!(
+        load_block_hash_at_height(&pool, 100).await.unwrap(),
+        Some([0xAA; 32])
+    );
+    assert_eq!(
+        load_block_time_at_height(&pool, 100).await.unwrap(),
+        Some(1_700_000_100)
+    );
+}
+
+#[tokio::test]
+async fn insert_block_log_reinsert_backfills_null_block_time_without_overwrite() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let mut entry = BlockLogEntry {
+        block_time: None,
+        block_hash: vec![0xCC; 32],
+        block_height: Some(101),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+
+    insert_block_log(&pool, &entry).await.unwrap();
+    entry.block_time = Some(1_700_000_300);
+    insert_block_log(&pool, &entry).await.unwrap();
+    assert_eq!(
+        load_block_time_at_height(&pool, 101).await.unwrap(),
+        Some(1_700_000_300)
+    );
+
+    entry.block_time = Some(1_700_000_400);
+    insert_block_log(&pool, &entry).await.unwrap();
+    assert_eq!(
+        load_block_time_at_height(&pool, 101).await.unwrap(),
+        Some(1_700_000_300),
+        "a real block_time observation must never be overwritten"
+    );
+}
+
+#[tokio::test]
+async fn fill_null_block_time_does_not_let_orphan_win_height() {
+    let scope = setup_pool().await;
+    let pool = scope.pool.clone();
+    let canonical = BlockLogEntry {
+        block_time: Some(1_700_000_500),
+        block_hash: vec![0xAA; 32],
+        block_height: Some(95),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+    let orphan = BlockLogEntry {
+        block_time: None,
+        block_hash: vec![0xBB; 32],
+        block_height: Some(95),
+        inscription_count: 0,
+        processing_duration_us: None,
+    };
+    insert_block_log(&pool, &orphan).await.unwrap();
+    insert_block_log(&pool, &canonical).await.unwrap();
+    assert_eq!(
+        load_block_hash_at_height(&pool, 95).await.unwrap(),
+        Some([0xAA; 32]),
+        "canonical re-observation must win the height before backfill"
+    );
+
+    fill_null_block_time(&pool, &orphan.block_hash, 1_700_000_600)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        load_block_hash_at_height(&pool, 95).await.unwrap(),
+        Some([0xAA; 32]),
+        "NULL-time backfill must not bump processed_at and steal the height"
+    );
+    assert_eq!(
+        load_block_time_at_height(&pool, 95).await.unwrap(),
+        Some(1_700_000_500),
+        "height lookup must still read the canonical nTime"
+    );
+}
+
+async fn insert_block_time_fixture(pool: &sqlx::PgPool, height: u64, block_time: Option<i64>) {
+    insert_block_log(
+        pool,
+        &BlockLogEntry {
+            block_time,
+            block_hash: vec![u8::try_from(height).unwrap(); 32],
+            block_height: Some(i64::try_from(height).unwrap()),
+            inscription_count: 0,
+            processing_duration_us: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn load_median_time_past_full_eleven_block_window() {
+    let scope = setup_pool().await;
+    let times = [11, 2, 9, 4, 8, 6, 7, 5, 3, 10, 1];
+    for (height, block_time) in (90_u64..=100).zip(times) {
+        insert_block_time_fixture(&scope.pool, height, Some(block_time)).await;
+    }
+
+    assert_eq!(
+        load_median_time_past(&scope.pool, 100).await.unwrap(),
+        Some(6)
+    );
+}
+
+#[tokio::test]
+async fn load_median_time_past_truncated_near_genesis_window() {
+    let scope = setup_pool().await;
+    for (height, block_time) in [40, 10, 30, 20].into_iter().enumerate() {
+        insert_block_time_fixture(&scope.pool, height as u64, Some(block_time)).await;
+    }
+
+    // Sorted values are [10, 20, 30, 40]; Bitcoin Core selects index len/2.
+    assert_eq!(
+        load_median_time_past(&scope.pool, 3).await.unwrap(),
+        Some(30)
+    );
+}
+
+#[tokio::test]
+async fn load_median_time_past_missing_window_row_returns_none() {
+    let scope = setup_pool().await;
+    for height in 90_u64..=100 {
+        if height != 95 {
+            insert_block_time_fixture(&scope.pool, height, Some(height as i64)).await;
+        }
+    }
+
+    assert_eq!(load_median_time_past(&scope.pool, 100).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn load_median_time_past_null_window_timestamp_returns_none() {
+    let scope = setup_pool().await;
+    for height in 90_u64..=100 {
+        let block_time = (height != 95).then_some(height as i64);
+        insert_block_time_fixture(&scope.pool, height, block_time).await;
+    }
+
+    assert_eq!(load_median_time_past(&scope.pool, 100).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn load_median_time_past_sorts_out_of_order_inserts() {
+    let scope = setup_pool().await;
+    let rows = [
+        (100, 11),
+        (90, 2),
+        (99, 9),
+        (91, 4),
+        (98, 8),
+        (92, 6),
+        (97, 7),
+        (93, 5),
+        (96, 3),
+        (94, 10),
+        (95, 1),
+    ];
+    for (height, block_time) in rows {
+        insert_block_time_fixture(&scope.pool, height, Some(block_time)).await;
+    }
+
+    assert_eq!(
+        load_median_time_past(&scope.pool, 100).await.unwrap(),
+        Some(6)
+    );
+}
+
+#[tokio::test]
+async fn insert_block_log_round_trips_some_and_none_block_time() {
+    let scope = setup_pool().await;
+    insert_block_time_fixture(&scope.pool, 7, Some(1_700_000_007)).await;
+    insert_block_time_fixture(&scope.pool, 8, None).await;
+
+    assert_eq!(
+        load_block_time_at_height(&scope.pool, 7).await.unwrap(),
+        Some(1_700_000_007)
+    );
+    assert_eq!(
+        load_block_time_at_height(&scope.pool, 8).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn block_log_negative_block_time_is_rejected_as_decode_error() {
+    let scope = setup_pool().await;
+    insert_block_time_fixture(&scope.pool, 9, Some(-1)).await;
+
+    let err = load_block_time_at_height(&scope.pool, 9)
+        .await
+        .expect_err("negative stored header time must be rejected");
+    assert!(matches!(err, sqlx::Error::Decode(_)), "got {err:?}");
 }
 
 #[tokio::test]

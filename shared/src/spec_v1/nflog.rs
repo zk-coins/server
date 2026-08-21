@@ -742,7 +742,13 @@ mod tests {
                     if m == 0 && n > 0 {
                         let entries = synthetic_entries(n);
                         let proof = consistency_proof(0, &entries).expect("ok");
-                        assert!(verify_consistency(0, nflog_empty(), n as u64, nflog_mth(&entries), &proof));
+                        assert!(verify_consistency(
+                            0,
+                            nflog_empty(),
+                            n as u64,
+                            nflog_mth(&entries),
+                            &proof
+                        ));
                     }
                     continue;
                 }

@@ -88,8 +88,8 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use serde::Deserialize;
 use shared::spec_v1::{
-    asset_id_v1, asset_id_v2, digest_to_bytes, hash_proof_data, name_hash,
-    serialize_proof_data, ProofData, GENESIS_TAG,
+    asset_id_v1, asset_id_v2, digest_to_bytes, hash_proof_data, name_hash, serialize_proof_data,
+    ProofData, GENESIS_TAG,
 };
 use uuid::Uuid;
 use zkcoins_program::circuit::compliance::Network;
@@ -1068,14 +1068,13 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
                 .await
                 .map_err(|e| anyhow::anyhow!("load Phase A on crash-resume: {e:#}"))?;
             if already.is_none() {
-                let delivery_snapshot =
-                    DeliverySnapshot::from_pending(
-                        adapter.pool(),
-                        &pending,
-                        &signature,
-                        fence.job_id,
-                    )
-                    .await?;
+                let delivery_snapshot = DeliverySnapshot::from_pending(
+                    adapter.pool(),
+                    &pending,
+                    &signature,
+                    fence.job_id,
+                )
+                .await?;
                 let tip_hash = adapter.tip_hash();
                 let tip_height = adapter.with_engine(|engine| engine.tip_height());
                 let tip_height_u32 = u32::try_from(tip_height).map_err(|_| {
@@ -1115,13 +1114,8 @@ pub(crate) async fn finalise_accepted_prove_persist_and_stage(
     }
 
     // Capture delivery materials before prove moves `pending`.
-    let delivery_snapshot = DeliverySnapshot::from_pending(
-        adapter.pool(),
-        &pending,
-        &signature,
-        fence.job_id,
-    )
-    .await?;
+    let delivery_snapshot =
+        DeliverySnapshot::from_pending(adapter.pool(), &pending, &signature, fence.job_id).await?;
 
     // §4.2 targets must be resolved **before** durable finalise. A missing
     // IVPK discovered only at mesh-build would leave the transition already
@@ -1638,9 +1632,7 @@ async fn insert_issuer_mint_provenance(
             )
         })?;
     let nh = name_hash(&terms.name).map_err(|e| {
-        crate::v1::delivery::DeliveryError::Relay(format!(
-            "issuer-side asset_terms name_hash: {e}"
-        ))
+        crate::v1::delivery::DeliveryError::Relay(format!("issuer-side asset_terms name_hash: {e}"))
     })?;
     let recomputed = match terms.issuance_version {
         1 => {
@@ -1649,13 +1641,7 @@ async fn insert_issuer_mint_provenance(
                     "issuer-side asset_terms v1 must not carry cap_total/terms_salt".into(),
                 ));
             }
-            asset_id_v1(
-                GENESIS_TAG,
-                &terms.creator_pubkey,
-                &nh,
-                terms.decimals,
-                1,
-            )
+            asset_id_v1(GENESIS_TAG, &terms.creator_pubkey, &nh, terms.decimals, 1)
         }
         2 => {
             let cap = terms.cap_total.ok_or_else(|| {
@@ -1712,7 +1698,11 @@ fn build_self_delivery_coin_materials(
         bundle_nav_opening, creating_nullifier_from_parts, OutgoingCoinMaterial,
     };
 
-    let all_output_ids: Vec<_> = snap.output_coins.iter().map(|coin| coin.identifier).collect();
+    let all_output_ids: Vec<_> = snap
+        .output_coins
+        .iter()
+        .map(|coin| coin.identifier)
+        .collect();
     let creating_nullifier =
         creating_nullifier_from_parts(snap.pk_create, snap.r_create, snap.r_prime_create);
     let nav_opening = bundle_nav_opening(snap.nav_size, snap.nav_mth, snap.nav_rand);
@@ -1780,12 +1770,9 @@ impl DeliverySnapshot {
             shared::spec_v1::bundle::RecordKind::Send => 0x02,
             shared::spec_v1::bundle::RecordKind::Receive => 0x03,
         };
-        let mint_asset_terms =
-            if record_kind == shared::spec_v1::bundle::RecordKind::Mint {
-                Some(
-                    crate::v1::db_mint_terms_staging::get_staged_mint_issuance_terms(
-                        pool, job_id,
-                    )
+        let mint_asset_terms = if record_kind == shared::spec_v1::bundle::RecordKind::Mint {
+            Some(
+                crate::v1::db_mint_terms_staging::get_staged_mint_issuance_terms(pool, job_id)
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -1798,10 +1785,10 @@ impl DeliverySnapshot {
                              staged IssuanceTerms"
                         )
                     })?,
-                )
-            } else {
-                None
-            };
+            )
+        } else {
+            None
+        };
         let spent_or_folded_coin_ids: Vec<[u8; 32]> = w
             .input_coins
             .iter()
@@ -3102,7 +3089,10 @@ mod tests {
 
     #[test]
     fn strict_hex_helpers_accept_lowercase_and_name_every_encoding_failure() {
-        assert_eq!(parse_hex_exact::<2>("00af", "sample").unwrap(), [0x00, 0xaf]);
+        assert_eq!(
+            parse_hex_exact::<2>("00af", "sample").unwrap(),
+            [0x00, 0xaf]
+        );
         assert_eq!(hex_lower(&[0x00, 0xaf, 0x10]), "00af10");
 
         for (raw, expected_message) in [
@@ -3114,26 +3104,14 @@ mod tests {
                 "0X00",
                 "sample must be bare lowercase hex (exactly 4 chars); 0x/0X prefix is not accepted",
             ),
-            (
-                "000",
-                "sample hex length 3 != 4 (no silent pad/truncate)",
-            ),
+            ("000", "sample hex length 3 != 4 (no silent pad/truncate)"),
             (
                 "00af10",
                 "sample hex length 6 != 4 (no silent pad/truncate)",
             ),
-            (
-                "00AF",
-                "sample is not lowercase hex (no silent case-fold)",
-            ),
-            (
-                "0aB0",
-                "sample is not lowercase hex (no silent case-fold)",
-            ),
-            (
-                "0a 0",
-                "sample is not lowercase hex (no silent case-fold)",
-            ),
+            ("00AF", "sample is not lowercase hex (no silent case-fold)"),
+            ("0aB0", "sample is not lowercase hex (no silent case-fold)"),
+            ("0a 0", "sample is not lowercase hex (no silent case-fold)"),
         ] {
             let err = parse_hex_exact::<2>(raw, "sample").expect_err(raw);
             assert_eq!(err.check, SignatureCheck::Encoding, "raw={raw}");
@@ -3159,8 +3137,7 @@ mod tests {
     #[test]
     fn strip_pending_sign_removes_each_key_and_refuses_non_objects() {
         for key in [FINALISATION_BODY_KEY, PENDING_SIGN_BODY_KEY, "sign"] {
-            let mut body =
-                serde_json::json!({ (key): { "kept_secret": true }, "kind": "send" });
+            let mut body = serde_json::json!({ (key): { "kept_secret": true }, "kind": "send" });
             assert!(strip_pending_sign_from_body(&mut body), "key={key}");
             assert!(body.get(key).is_none(), "key={key}, body={body}");
             assert_eq!(body["kind"], "send");
@@ -3203,9 +3180,11 @@ mod tests {
         assert_eq!(rehydrated.pending.proof_data_hash, expected_hash);
         assert_eq!(rehydrated.network, Network::Mainnet);
 
-        assert!(rehydrate_pending_sign(&serde_json::json!({ "kind": "send" }))
-            .expect("absence is not malformed")
-            .is_none());
+        assert!(
+            rehydrate_pending_sign(&serde_json::json!({ "kind": "send" }))
+                .expect("absence is not malformed")
+                .is_none()
+        );
 
         let malformed = serde_json::json!({ FINALISATION_BODY_KEY: 17 });
         let err = rehydrate_pending_sign(&malformed).expect_err("non-object envelope must fail");
@@ -3504,10 +3483,7 @@ mod tests {
             (SignatureCheck::S2cOpening, (409, "stale_message")),
             (SignatureCheck::Bip340, (409, "invalid_signature")),
             (SignatureCheck::PkMatch, (409, "invalid_signature")),
-            (
-                SignatureCheck::PendingEnvelope,
-                (409, "invalid_signature"),
-            ),
+            (SignatureCheck::PendingEnvelope, (409, "invalid_signature")),
             (SignatureCheck::LegacyCommitment, (409, "wrong_phase")),
         ] {
             let err = TransitionSignatureError::new(check, "specific rejection");
@@ -3544,10 +3520,8 @@ mod tests {
             "cancelled status takes precedence over message substrings"
         );
 
-        let closed_without_message = decode_job_error(
-            Some(r#"{"error":"invalid_signature"}"#),
-            JobStatus::Failed,
-        );
+        let closed_without_message =
+            decode_job_error(Some(r#"{"error":"invalid_signature"}"#), JobStatus::Failed);
         assert_eq!(closed_without_message["error"], "invalid_signature");
         assert_eq!(closed_without_message["message"], "");
 
@@ -3593,12 +3567,10 @@ mod tests {
         let encoded = encode_job_error_from_anyhow(&err);
         let decoded = decode_job_error(Some(&encoded), JobStatus::Failed);
         assert_eq!(decoded["error"], "proving_failed");
-        assert!(
-            decoded["message"]
-                .as_str()
-                .expect("encoded message string")
-                .contains("outer context")
-        );
+        assert!(decoded["message"]
+            .as_str()
+            .expect("encoded message string")
+            .contains("outer context"));
         assert_eq!(http_status_for_machine_code("malformed_request"), Some(400));
         assert_eq!(http_status_for_machine_code("invalid_signature"), Some(409));
         assert_eq!(http_status_for_machine_code("definitely_not_closed"), None);
@@ -3640,9 +3612,8 @@ mod tests {
         .expect("valid account state");
         let expected_bytes = shared::spec_v1::serialize::serialize_account_state(&state)
             .expect("account state serializes");
-        let expected_head = digest_to_bytes(
-            &account_state_hash(&state).expect("account state hash is defined"),
-        );
+        let expected_head =
+            digest_to_bytes(&account_state_hash(&state).expect("account state hash is defined"));
         let mut record = AccountRecord {
             state,
             coinhist,
@@ -3685,9 +3656,8 @@ mod tests {
         let port = UnusedDeliveryPort;
         let bundles = crate::kernel::bootstrap::BundleStore::new();
         let targets = DeliveryTargetStore::new();
-        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> = std::sync::Mutex::new(Box::new(
-            crate::v1::nostr::nip59::OsSecureRandom,
-        ));
+        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> =
+            std::sync::Mutex::new(Box::new(crate::v1::nostr::nip59::OsSecureRandom));
         let deps = FinaliseDeliveryDeps {
             port: &port,
             bundles: &bundles,
@@ -3701,11 +3671,9 @@ mod tests {
         };
 
         let no_external = delivery_snapshot(vec![external_coin([0x11; 32])]);
-        assert!(
-            build_outgoing_coin_materials(&no_external, &[], &deps)
-                .expect("self-output requires no mesh proof")
-                .is_empty()
-        );
+        assert!(build_outgoing_coin_materials(&no_external, &[], &deps)
+            .expect("self-output requires no mesh proof")
+            .is_empty());
 
         let recipient = [0x91; 32];
         let external = delivery_snapshot(vec![external_coin(recipient)]);
@@ -3721,10 +3689,7 @@ mod tests {
 
         let err = build_outgoing_coin_materials(&external, &[0xde, 0xad], &deps)
             .expect_err("missing verified target must fail");
-        assert_eq!(
-            err,
-            DeliveryError::RecipientIvpkUnavailable { recipient }
-        );
+        assert_eq!(err, DeliveryError::RecipientIvpkUnavailable { recipient });
 
         targets.insert(
             recipient,
@@ -3771,9 +3736,8 @@ mod tests {
         let port = UnusedDeliveryPort;
         let bundles = crate::kernel::bootstrap::BundleStore::new();
         let targets = DeliveryTargetStore::new();
-        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> = std::sync::Mutex::new(Box::new(
-            crate::v1::nostr::nip59::OsSecureRandom,
-        ));
+        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> =
+            std::sync::Mutex::new(Box::new(crate::v1::nostr::nip59::OsSecureRandom));
         let deps = FinaliseDeliveryDeps {
             port: &port,
             bundles: &bundles,
@@ -3791,16 +3755,13 @@ mod tests {
         let owner = [0x11; 32];
         let mut coin_a = external_coin(recipient_a);
         coin_a.amount = 11;
-        coin_a.identifier =
-            coin_identifier(ZERO_HASH, &recipient_a, ZERO_HASH, coin_a.amount, 0);
+        coin_a.identifier = coin_identifier(ZERO_HASH, &recipient_a, ZERO_HASH, coin_a.amount, 0);
         let mut self_coin = external_coin(owner);
         self_coin.amount = 22;
-        self_coin.identifier =
-            coin_identifier(ZERO_HASH, &owner, ZERO_HASH, self_coin.amount, 1);
+        self_coin.identifier = coin_identifier(ZERO_HASH, &owner, ZERO_HASH, self_coin.amount, 1);
         let mut coin_b = external_coin(recipient_b);
         coin_b.amount = 33;
-        coin_b.identifier =
-            coin_identifier(ZERO_HASH, &recipient_b, ZERO_HASH, coin_b.amount, 2);
+        coin_b.identifier = coin_identifier(ZERO_HASH, &recipient_b, ZERO_HASH, coin_b.amount, 2);
 
         targets.insert(
             recipient_a,
@@ -3898,9 +3859,8 @@ mod tests {
         let port = UnusedDeliveryPort;
         let bundles = crate::kernel::bootstrap::BundleStore::new();
         let targets = DeliveryTargetStore::new();
-        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> = std::sync::Mutex::new(Box::new(
-            crate::v1::nostr::nip59::OsSecureRandom,
-        ));
+        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> =
+            std::sync::Mutex::new(Box::new(crate::v1::nostr::nip59::OsSecureRandom));
         let deps = FinaliseDeliveryDeps {
             port: &port,
             bundles: &bundles,
@@ -3932,10 +3892,8 @@ mod tests {
         }
 
         let expected_terms = mint_terms();
-        let mut snap = delivery_snapshot(vec![
-            external_coin(recipient_a),
-            external_coin(recipient_b),
-        ]);
+        let mut snap =
+            delivery_snapshot(vec![external_coin(recipient_a), external_coin(recipient_b)]);
         snap.record_kind = 0x01;
         snap.mint_asset_terms = Some(expected_terms.clone());
 
@@ -3953,10 +3911,7 @@ mod tests {
         let mut self_coin = external_coin(owner);
         self_coin.amount = 77;
         let expected_terms = mint_terms();
-        let mut snap = delivery_snapshot(vec![
-            external_coin([0x91; 32]),
-            self_coin.clone(),
-        ]);
+        let mut snap = delivery_snapshot(vec![external_coin([0x91; 32]), self_coin.clone()]);
         snap.record_kind = 0x01;
         snap.mint_asset_terms = Some(expected_terms.clone());
 
@@ -3991,9 +3946,7 @@ mod tests {
             expected_terms.decimals,
             2,
             expected_terms.cap_total.expect("v2 mint terms cap_total"),
-            &expected_terms
-                .terms_salt
-                .expect("v2 mint terms terms_salt"),
+            &expected_terms.terms_salt.expect("v2 mint terms terms_salt"),
         );
         let mut coin = external_coin([0x81; 32]);
         coin.asset_id = computed_asset_id;
@@ -4030,9 +3983,7 @@ mod tests {
             expected_terms.decimals,
             2,
             expected_terms.cap_total.expect("v2 mint terms cap_total"),
-            &expected_terms
-                .terms_salt
-                .expect("v2 mint terms terms_salt"),
+            &expected_terms.terms_salt.expect("v2 mint terms terms_salt"),
         );
         let mismatched_asset_id = shared::spec_v1::digest_from_bytes(&[0x99; 32])
             .expect("fixed mismatched asset_id digest");
@@ -4071,9 +4022,8 @@ mod tests {
         let port = UnusedDeliveryPort;
         let bundles = crate::kernel::bootstrap::BundleStore::new();
         let targets = DeliveryTargetStore::new();
-        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> = std::sync::Mutex::new(Box::new(
-            crate::v1::nostr::nip59::OsSecureRandom,
-        ));
+        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> =
+            std::sync::Mutex::new(Box::new(crate::v1::nostr::nip59::OsSecureRandom));
         let deps = FinaliseDeliveryDeps {
             port: &port,
             bundles: &bundles,
@@ -4152,10 +4102,9 @@ mod tests {
             .expect("complete wrapper inputs must build an outbox insert");
         assert_eq!(inserts.len(), 1);
 
-        let encoded = crate::v1::outbox_material::ExternalOutboxMaterial::decode(
-            &inserts[0].material,
-        )
-        .expect("outbox material must decode");
+        let encoded =
+            crate::v1::outbox_material::ExternalOutboxMaterial::decode(&inserts[0].material)
+                .expect("outbox material must decode");
         let outgoing = encoded
             .to_outgoing()
             .expect("decoded outbox material must rebuild outgoing material");
@@ -4189,9 +4138,8 @@ mod tests {
         let port = UnusedDeliveryPort;
         let bundles = crate::kernel::bootstrap::BundleStore::new();
         let targets = DeliveryTargetStore::new();
-        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> = std::sync::Mutex::new(Box::new(
-            crate::v1::nostr::nip59::OsSecureRandom,
-        ));
+        let rng: std::sync::Mutex<Box<dyn SecureRandom + Send>> =
+            std::sync::Mutex::new(Box::new(crate::v1::nostr::nip59::OsSecureRandom));
         let deps = FinaliseDeliveryDeps {
             port: &port,
             bundles: &bundles,
@@ -4205,11 +4153,9 @@ mod tests {
         };
 
         let no_external = delivery_snapshot(Vec::new());
-        assert!(
-            build_external_outbox_inserts(&no_external, &[], &deps)
-                .expect("no external coins means no outbox inserts")
-                .is_empty()
-        );
+        assert!(build_external_outbox_inserts(&no_external, &[], &deps)
+            .expect("no external coins means no outbox inserts")
+            .is_empty());
 
         let recipient = [0xa1; 32];
         targets.insert(

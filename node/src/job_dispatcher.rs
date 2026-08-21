@@ -1045,15 +1045,9 @@ async fn process_mint(
     };
 
     let mint_terms_stage = async {
-        let ai = pending
-            .witness_wip
-            .asset_issuance
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "begin_v1_mint returned a transition without asset_issuance witness"
-                )
-            })?;
+        let ai = pending.witness_wip.asset_issuance.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("begin_v1_mint returned a transition without asset_issuance witness")
+        })?;
         let issuance_terms = shared::spec_v1::bundle::IssuanceTerms {
             creator_pubkey: ai.creator_pubkey,
             decimals: ai.decimals,
@@ -2557,7 +2551,7 @@ fn resolve_receive_auth_keys(
     let bundle = app_state
         .bundles
         .get_active(subject)
-        .ok_or_else(|| ReceiveAuthError::NoActiveBundle { subject: subject.0 })?;
+        .ok_or(ReceiveAuthError::NoActiveBundle { subject: subject.0 })?;
     let op_secret = zkcoins_prover::state_engine::OpSecret::new(bundle.op_secret);
     let owner = shared::spec_v1::Address(subject.0);
 

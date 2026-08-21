@@ -32,10 +32,9 @@ use kernel_proto::{
     AccountStateRequest, AccountStateResult, AccumulatorTip, AttestRequest, Challenge,
     CoinProofBlob, CoinProofRequest, EntrustRequest, EntrustResult, GetAccumulatorRequest,
     GetInfoRequest, GetTokenProvenanceRequest, GrantRequest, GrantResult, Info, Inscription, Job,
-    JobEvent, JobHandle,
-    JobRequest, ListInscriptionsRequest, NullifierPath, NullifierPathRequest, PublishRequest,
-    PublishResult, PullChallengeRequest, PullRequest, PullResult, Receipt, RecordBlob,
-    RecordRequest, RevokeRequest, RevokeResult, SignRequest, SubscribeReceiptsRequest,
+    JobEvent, JobHandle, JobRequest, ListInscriptionsRequest, NullifierPath, NullifierPathRequest,
+    PublishRequest, PublishResult, PullChallengeRequest, PullRequest, PullResult, Receipt,
+    RecordBlob, RecordRequest, RevokeRequest, RevokeResult, SignRequest, SubscribeReceiptsRequest,
     TokenProvenance, TransitionRequest,
 };
 use tonic::{Request, Response, Status};
@@ -55,12 +54,11 @@ use crate::transport::grpc::{
     entrust_result_to_proto, inscription_to_proto, job_event_to_proto, job_to_proto,
     kernel_error_to_status, kernel_info_to_proto, nullifier_path_to_proto, parse_attest_request,
     parse_coin_proof_request, parse_entrust_request, parse_get_token_provenance_request,
-    parse_grant_request,
-    parse_list_inscriptions_request, parse_nullifier_path_request, parse_publish_request,
-    parse_pull_request, parse_record_request, parse_revoke_request, parse_session_authority,
-    parse_session_bound, parse_sign_request, parse_transition_request, publish_outcome_to_proto,
-    pull_result_to_proto, receipt_to_proto, record_blob_to_proto, revoke_result_to_proto,
-    token_provenance_to_proto,
+    parse_grant_request, parse_list_inscriptions_request, parse_nullifier_path_request,
+    parse_publish_request, parse_pull_request, parse_record_request, parse_revoke_request,
+    parse_session_authority, parse_session_bound, parse_sign_request, parse_transition_request,
+    publish_outcome_to_proto, pull_result_to_proto, receipt_to_proto, record_blob_to_proto,
+    revoke_result_to_proto, token_provenance_to_proto,
 };
 use crate::v1::PendingSignMap;
 use shared::spec_v1::Address;
@@ -572,8 +570,8 @@ impl Kernel for GrpcKernelService {
         &self,
         request: Request<GetTokenProvenanceRequest>,
     ) -> Result<Response<TokenProvenance>, Status> {
-        let asset_id = parse_get_token_provenance_request(request.into_inner())
-            .map_err(map_domain_err)?;
+        let asset_id =
+            parse_get_token_provenance_request(request.into_inner()).map_err(map_domain_err)?;
         let terms = self
             .domain
             .get_token_provenance(asset_id)
@@ -861,7 +859,10 @@ mod tests {
                 .await
                 .expect("open GetTokenProvenance")
                 .into_inner();
-            assert_eq!(response.issuance_version, u32::from(expected.issuance_version));
+            assert_eq!(
+                response.issuance_version,
+                u32::from(expected.issuance_version)
+            );
             assert_eq!(response.creator_pubkey, expected.creator_pubkey);
             assert_eq!(response.name, expected.name);
             assert_eq!(response.decimals, u32::from(expected.decimals));

@@ -131,8 +131,7 @@ pub fn require_chain_identity_ops_from_env() -> Result<(), String> {
 /// Primary verifier-cache boot always self-heals live digests by constructing
 /// both circuits, even when the advertised kernel parts omit `prover`.
 pub fn boot_requires_prover_lease() -> Result<bool, String> {
-    let ops =
-        crate::kernel::chain::chain_identity_ops_from_env().map_err(|e| e.to_string())?;
+    let ops = crate::kernel::chain::chain_identity_ops_from_env().map_err(|e| e.to_string())?;
     let verifier_cache_role =
         crate::v1::verifier_cache_role_from_env().map_err(|e| e.to_string())?;
     Ok(ops
@@ -1832,7 +1831,8 @@ pub(crate) async fn boot_resume_jobs(
                     tracing::warn!(
                         "boot_resume_jobs: release_stale_finalise_claim({}) failed: {} \
                          (row left untouched for retry; fail closed)",
-                        job.public_id, e
+                        job.public_id,
+                        e
                     );
                     Err(())
                 }
@@ -1855,7 +1855,8 @@ pub(crate) async fn boot_resume_jobs(
                         tracing::warn!(
                             "boot_resume_jobs: load({}) after release_stale failed: {} \
                              (row left untouched for retry; fail closed)",
-                            job.public_id, e
+                            job.public_id,
+                            e
                         );
                         Err(())
                     }
@@ -1935,7 +1936,8 @@ pub(crate) async fn boot_resume_jobs(
             Err(e) => {
                 tracing::warn!(
                     "boot_resume_jobs: fail_if_status({}) failed: {} (continuing)",
-                    job.public_id, e
+                    job.public_id,
+                    e
                 );
             }
         }
@@ -1968,7 +1970,8 @@ pub(crate) async fn boot_resume_jobs(
                     Err(e) => {
                         tracing::warn!(
                             "boot_resume_jobs: fail_if_status({}) failed: {} (continuing)",
-                            job.public_id, e
+                            job.public_id,
+                            e
                         );
                     }
                 }
@@ -1984,7 +1987,8 @@ pub(crate) async fn boot_resume_jobs(
                 {
                     tracing::warn!(
                         "boot_resume_jobs: enqueue({}) failed: {} (continuing)",
-                        job.public_id, e
+                        job.public_id,
+                        e
                     );
                 } else {
                     tracing::info!(

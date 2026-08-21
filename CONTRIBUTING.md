@@ -105,8 +105,9 @@ full `node` + `shared` suite. The line for the full suite is below.
 ### Running tests
 
 **Full hermetic suite.** CI's authoritative heavy gate (`test-and-coverage` in
-`ci.yaml`) runs on **every non-draft PR** (no `ci:full` label required — see
-[CI/CD](#cicd)). It drives `node` + `shared` under `cargo llvm-cov nextest`,
+`pull-request.yaml`, mirrored in `ci.yaml`) runs on **every non-draft PR**
+(no `ci:full` label required — see [CI/CD](#cicd)). It drives `node` +
+`shared` under `cargo llvm-cov nextest`,
 then the release-mode prover package and ignored prove flows. Locally, mirror
 the hermetic `node` + `shared` selection with:
 
@@ -169,16 +170,21 @@ cargo nextest run -p zkcoins-prover-plonky2 --release
 
 A local run without `zkcoins-prover-plonky2` is **not** a complete verification
 of the prove path. The CI heavy gate **does** run that package in release mode
-after the llvm-cov nextest step (see `.github/workflows/ci.yaml`).
+after the llvm-cov nextest step (see `.github/workflows/pull-request.yaml`,
+mirrored in `.github/workflows/ci.yaml`).
 
 **`#[ignore]` prove flows.** Several multi-minute prove paths are marked
 `#[ignore]` so the default hermetic nextest stays fast. The CI heavy gate
-runs them explicitly with `--run-ignored ignored-only` (node + shared) and
-also verifies live circuit digests against the committed file. Locally:
+runs them explicitly (node + shared) and also verifies live circuit
+digests against the committed file. `--test-threads 1` is required:
+the host-wide proving lease allows one `C` residency, and parallel
+waiters hit the 1800 s flock timeout. `-E 'not binary(api_remote)'`
+is the same live-DEV exclusion as the hermetic llvm-cov step. Locally:
 
 ```bash
 cargo nextest run -p node -p shared --all-features --release \
-  --run-ignored ignored-only
+  --run-ignored ignored-only --test-threads 1 \
+  -E 'not binary(api_remote)'
 ```
 
 ## Code style
@@ -228,7 +234,8 @@ visibility by up to a full block-time — issue
 [#84](https://github.com/zk-coins/node/issues/84).)
 
 CI enforces this with a `grep` step in the `Lint & Build` job
-(`.github/workflows/ci.yaml`) over the **active** hotpaths:
+(`.github/workflows/pull-request.yaml`, mirrored in `ci.yaml`) over the
+**active** hotpaths:
 
 ```bash
 grep -rEn 'tokio::time::(sleep|sleep_until|interval)|std::thread::sleep' \
@@ -448,18 +455,21 @@ wip
 
 | Workflow | Trigger | Action |
 |---|---|---|
-| `ci.yaml` — **Lint & Build** | Every non-draft PR, or a draft with the `ci` / `ci:full` label | `cargo fmt --check`, clippy (MVP + all-features + program/prover), build, the no-polling grep over `node/src/main.rs` + `node/src/publisher.rs` (same-line `scanner-polling-ok:` opt-out). Fast GitHub-hosted tier. |
-| `ci.yaml` — **Tests + Coverage Gate** | Same start rule as Lint & Build | Full `node` + `shared` nextest under `llvm-cov` on the self-hosted M3 Ultra pool, measured coverage floor (see `.github/coverage-baseline.md`), then release-mode `zkcoins-prover-plonky2`, ignored prove flows (`--run-ignored ignored-only`), and circuit-digest verify. |
+| `pull-request.yaml` (live) / `ci.yaml` — **Lint & Build** | Every non-draft PR, or a draft with the `ci` / `ci:full` label | `cargo fmt --check`, clippy (MVP + all-features + program/prover), build, the no-polling grep over `node/src/main.rs` + `node/src/publisher.rs` (same-line `scanner-polling-ok:` opt-out). Fast GitHub-hosted tier. |
+| `pull-request.yaml` (live) / `ci.yaml` — **Tests + Coverage Gate** | Same start rule as Lint & Build | Full `node` + `shared` nextest under `llvm-cov` on the self-hosted M3 Ultra pool, measured coverage floor (see `.github/coverage-baseline.md`), then release-mode `zkcoins-prover-plonky2`, ignored prove flows (`--run-ignored ignored-only --test-threads 1`, excluding `api_remote`), and circuit-digest verify. |
 | `deploy-dev.yaml` | Push to develop | Docker build (ARM64) → `zkcoins/node:beta` → DEV |
 | `deploy-prd.yaml` | Push to main | Docker build (ARM64) → `zkcoins/node:latest` → PRD |
 | `auto-release-pr-staging.yaml` | Push to staging | Promote PR (staging → develop) |
 | `auto-release-pr.yaml` | Push to develop | Release PR (develop → main) |
 
-**Draft PRs skip every `ci.yaml` job unless they carry `ci` or `ci:full`.**
-Apply one of those labels to start the same suite a ready PR would get;
-the PR stays a draft. Ready-for-review is not a CI switch. Non-draft PRs
-always run the heavy gate (no extra label). After a start, watch CI until
-green; never abandon a red run.
+**Draft PRs skip every CI job unless they carry `ci` or `ci:full`.**
+The live workflow file is `.github/workflows/pull-request.yaml`;
+`.github/workflows/ci.yaml` is the same jobs currently disabled on the
+repo — keep the two files in lockstep. Apply `ci` / `ci:full` to start
+the same suite a ready PR would get; the PR stays a draft.
+Ready-for-review is not a CI switch. Non-draft PRs always run the heavy
+gate (no extra label). After a start, watch CI until green; never
+abandon a red run.
 
 **No-polling gate (Lint & Build).** Matches the workflow step exactly:
 

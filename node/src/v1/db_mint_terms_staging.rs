@@ -46,13 +46,12 @@ pub(crate) async fn stage_mint_issuance_terms(
         );
     }
 
-    let existing: (Vec<u8>,) = sqlx::query_as(
-        "SELECT issuance_terms FROM v1_mint_terms_staging WHERE job_id = $1",
-    )
-    .bind(job_id)
-    .fetch_one(pool)
-    .await
-    .context("v1_mint_terms_staging conflict row disappeared")?;
+    let existing: (Vec<u8>,) =
+        sqlx::query_as("SELECT issuance_terms FROM v1_mint_terms_staging WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .context("v1_mint_terms_staging conflict row disappeared")?;
     if existing.0 != canonical {
         bail!(
             "v1_mint_terms_staging corruption: job_id {} already maps to different IssuanceTerms",
@@ -73,13 +72,12 @@ pub(crate) async fn get_staged_mint_issuance_terms(
     pool: &PgPool,
     job_id: Uuid,
 ) -> Result<Option<IssuanceTerms>> {
-    let row: Option<(Vec<u8>,)> = sqlx::query_as(
-        "SELECT issuance_terms FROM v1_mint_terms_staging WHERE job_id = $1",
-    )
-    .bind(job_id)
-    .fetch_optional(pool)
-    .await
-    .context("v1_mint_terms_staging lookup")?;
+    let row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT issuance_terms FROM v1_mint_terms_staging WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_optional(pool)
+            .await
+            .context("v1_mint_terms_staging lookup")?;
     row.map(|(canonical,)| {
         deserialize_issuance_terms(&canonical)
             .context("v1_mint_terms_staging stored IssuanceTerms are corrupt")
@@ -196,20 +194,12 @@ mod tests {
         let mut divergent_terms = v1_terms();
         divergent_terms.name = vec![b'd', b'i', b'v', b'e', b'r', b'g', b'e', b'n', b't'];
 
-        stage_mint_issuance_terms(
-            &scope.pool,
-            job_id,
-            &original_terms,
-        )
-        .await
-        .expect("stage original mint terms");
-        stage_mint_issuance_terms(
-            &scope.pool,
-            job_id,
-            &divergent_terms,
-        )
-        .await
-        .expect_err("divergent terms under one attempt key must fail");
+        stage_mint_issuance_terms(&scope.pool, job_id, &original_terms)
+            .await
+            .expect("stage original mint terms");
+        stage_mint_issuance_terms(&scope.pool, job_id, &divergent_terms)
+            .await
+            .expect_err("divergent terms under one attempt key must fail");
 
         assert_eq!(
             get_staged_mint_issuance_terms(&scope.pool, job_id)

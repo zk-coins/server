@@ -41,18 +41,18 @@ use kernel_proto::{
     BootstrapManifest as ProtoBootstrapManifest, CoinProofBlob as ProtoCoinProofBlob,
     CoinProofRequest as ProtoCoinProofRequest, DeliveryCredential as ProtoDeliveryCredential,
     EntrustRequest as ProtoEntrustRequest, EntrustResult as ProtoEntrustResult,
-    GetTokenProvenanceRequest as ProtoGetTokenProvenanceRequest,
-    GrantRequest as ProtoGrantRequest, Info as ProtoInfo, Invoice as ProtoInvoice,
-    Issuance as ProtoIssuance, Job as ProtoJob, JobError as ProtoJobError,
-    JobEvent as ProtoJobEvent, JobResult as ProtoJobResult, Kind0Event as ProtoKind0Event,
-    ListInscriptionsRequest as ProtoListInscriptionsRequest, NullifierPath as ProtoNullifierPath,
-    NullifierPathRequest as ProtoNullifierPathRequest, OutputTemplate as ProtoOutputTemplate,
-    PublishRequest as ProtoPublishRequest, PublishResult as ProtoPublishResult,
-    PullRequest as ProtoPullRequest, PullResult as ProtoPullResult, Receipt as ProtoReceipt,
-    RecordBlob as ProtoRecordBlob, RecordRef as ProtoRecordRef,
-    RecordRequest as ProtoRecordRequest, RevokeRequest as ProtoRevokeRequest,
-    RevokeResult as ProtoRevokeResult, Scope as ProtoScope, SignRequest as ProtoSignRequest,
-    TokenProvenance as ProtoTokenProvenance, TransitionRequest as ProtoTransitionRequest,
+    GetTokenProvenanceRequest as ProtoGetTokenProvenanceRequest, GrantRequest as ProtoGrantRequest,
+    Info as ProtoInfo, Invoice as ProtoInvoice, Issuance as ProtoIssuance, Job as ProtoJob,
+    JobError as ProtoJobError, JobEvent as ProtoJobEvent, JobResult as ProtoJobResult,
+    Kind0Event as ProtoKind0Event, ListInscriptionsRequest as ProtoListInscriptionsRequest,
+    NullifierPath as ProtoNullifierPath, NullifierPathRequest as ProtoNullifierPathRequest,
+    OutputTemplate as ProtoOutputTemplate, PublishRequest as ProtoPublishRequest,
+    PublishResult as ProtoPublishResult, PullRequest as ProtoPullRequest,
+    PullResult as ProtoPullResult, Receipt as ProtoReceipt, RecordBlob as ProtoRecordBlob,
+    RecordRef as ProtoRecordRef, RecordRequest as ProtoRecordRequest,
+    RevokeRequest as ProtoRevokeRequest, RevokeResult as ProtoRevokeResult, Scope as ProtoScope,
+    SignRequest as ProtoSignRequest, TokenProvenance as ProtoTokenProvenance,
+    TransitionRequest as ProtoTransitionRequest,
 };
 use shared::spec_v1::bundle::IssuanceTerms;
 use shared::spec_v1::Address;
@@ -1428,8 +1428,8 @@ mod tests {
     use crate::kernel::access::{ReceiptState, RecordType, SessionToken, TransitionKind};
     use crate::kernel::bootstrap::{EntrustResult, RevokeResult};
     use crate::kernel::chain::{
-        KernelNetwork, KernelPart, ListedNullifier, NullifierMemberState, Readiness,
-        ReadyReason, RevealConfirmationState,
+        KernelNetwork, KernelPart, ListedNullifier, NullifierMemberState, Readiness, ReadyReason,
+        RevealConfirmationState,
     };
     use crate::kernel::publish::PublishRejectReason;
     use crate::kernel::types::{JobEventKind, JobKind, JobPayload, NormativeJobStatus};
@@ -1759,11 +1759,7 @@ mod tests {
             } else {
                 String::new()
             },
-            terms_salt: if version == 2 {
-                vec![0x41; 32]
-            } else {
-                vec![]
-            },
+            terms_salt: if version == 2 { vec![0x41; 32] } else { vec![] },
             creator_pubkey: vec![0x42; 32],
         }
     }
@@ -2061,7 +2057,7 @@ mod tests {
         assert_eq!(err.code, KernelErrorCode::MalformedRequest);
         assert!(err.public_message.contains("both"));
 
-        for (field, mut req) in [
+        for (field, req) in [
             ("subject", {
                 let mut r = base_attest_request();
                 r.subject = wrong_width_subject_bech32();
@@ -2167,10 +2163,9 @@ mod tests {
         assert_eq!(
             selected,
             GrantScope {
-                assets: GrantAssetScope::Selected(vec![
-                    Digest32([0x31; 32]),
-                    Digest32([0x32; 32]),
-                ]),
+                assets: GrantAssetScope::Selected(
+                    vec![Digest32([0x31; 32]), Digest32([0x32; 32]),]
+                ),
                 not_before: 1,
                 not_after: 2,
             }
@@ -2219,8 +2214,8 @@ mod tests {
                 r
             }),
         ] {
-            let err = parse_pull_request(req, SessionAuthority::Grant)
-                .expect_err("invalid pull field");
+            let err =
+                parse_pull_request(req, SessionAuthority::Grant).expect_err("invalid pull field");
             assert!(err.public_message.contains(field), "{}", err.public_message);
         }
     }
@@ -2379,21 +2374,34 @@ mod tests {
             let err = account_state_to_proto(&corrupt).expect_err("asymmetric pair");
             assert_eq!(err.code, KernelErrorCode::InternalError);
             assert_eq!(err.public_message, "Corrupt account state");
-            assert!(err.internal_context.expect("detail").detail.contains("both"));
+            assert!(err
+                .internal_context
+                .expect("detail")
+                .detail
+                .contains("both"));
         }
     }
 
     #[test]
     fn session_authority_and_exact_width_parsers_cover_all_arms() {
-        assert_eq!(parse_session_authority(" ownership ").unwrap(), SessionAuthority::Ownership);
-        assert_eq!(parse_session_authority("\tgrant\n").unwrap(), SessionAuthority::Grant);
+        assert_eq!(
+            parse_session_authority(" ownership ").unwrap(),
+            SessionAuthority::Ownership
+        );
+        assert_eq!(
+            parse_session_authority("\tgrant\n").unwrap(),
+            SessionAuthority::Grant
+        );
         let err = parse_session_authority("  ").expect_err("blank authority");
         assert_eq!(err.code, KernelErrorCode::MalformedRequest);
         assert!(err.public_message.contains("required"));
         let err = parse_session_authority(" admin ").expect_err("unknown authority");
         assert!(err.public_message.contains("admin"));
 
-        assert_eq!(parse_subject_address(&format!(" {} ", receive_subject_bech32())).unwrap(), SubjectAddress([0xA1; 32]));
+        assert_eq!(
+            parse_subject_address(&format!(" {} ", receive_subject_bech32())).unwrap(),
+            SubjectAddress([0xA1; 32])
+        );
         let err = parse_subject_address(" \t ").expect_err("blank subject");
         assert!(err.public_message.contains("subject is required"));
         let err = parse_subject_address("zk1invalid").expect_err("invalid bech32m");
@@ -2401,9 +2409,18 @@ mod tests {
 
         for (field, err) in [
             ("x", parse_xonly(&[0; 31], "x").expect_err("short xonly")),
-            ("digest", parse_digest32(&[0; 33], "digest").expect_err("long digest")),
-            ("exact32", parse_exact_32(&[0; 31], "exact32").expect_err("short exact32")),
-            ("exact64", parse_exact_64(&[0; 63], "exact64").expect_err("short exact64")),
+            (
+                "digest",
+                parse_digest32(&[0; 33], "digest").expect_err("long digest"),
+            ),
+            (
+                "exact32",
+                parse_exact_32(&[0; 31], "exact32").expect_err("short exact32"),
+            ),
+            (
+                "exact64",
+                parse_exact_64(&[0; 63], "exact64").expect_err("short exact64"),
+            ),
         ] {
             assert_eq!(err.code, KernelErrorCode::MalformedRequest);
             assert!(err.public_message.contains(field));
@@ -2549,7 +2566,10 @@ mod tests {
         assert_eq!(ready.network, "regtest");
         assert_eq!(ready.protocol_version, "v1");
         assert_eq!(ready.circuit_digests.get("C"), Some(&vec![0xA4; 32]));
-        assert_eq!(ready.circuit_digests.get("C_balance"), Some(&vec![0xA5; 32]));
+        assert_eq!(
+            ready.circuit_digests.get("C_balance"),
+            Some(&vec![0xA5; 32])
+        );
         assert_eq!(ready.relay_url, "wss://relay.example");
         assert_eq!(ready.blossom_url, "https://blob.example");
         assert_eq!(ready.finality_confirmations, 6);
@@ -2653,7 +2673,7 @@ mod tests {
 
     #[test]
     fn transition_presence_matrix_rejects_every_forbidden_shape_and_kind() {
-        for (field, mut req) in [
+        for (field, req) in [
             ("input_coins", {
                 let mut r = base_mint_request();
                 r.input_coins = vec![vec![0; 32]];
@@ -2694,7 +2714,8 @@ mod tests {
 
         let mut receive_issuance = base_receive_request();
         receive_issuance.issuance = Some(base_issuance(1));
-        let err = parse_transition_request(receive_issuance).expect_err("receive issuance forbidden");
+        let err =
+            parse_transition_request(receive_issuance).expect_err("receive issuance forbidden");
         assert!(err.public_message.contains("issuance"));
 
         let mut blank = base_send_request();
@@ -2710,8 +2731,8 @@ mod tests {
     #[test]
     fn refusal_helpers_cover_empty_and_nonempty_inputs() {
         assert_eq!(refuse_nonempty_digests(&[], "items", "mint"), Ok(()));
-        let err = refuse_nonempty_digests(&[vec![0; 32]], "items", "mint")
-            .expect_err("nonempty digests");
+        let err =
+            refuse_nonempty_digests(&[vec![0; 32]], "items", "mint").expect_err("nonempty digests");
         assert_eq!(err.code, KernelErrorCode::MalformedRequest);
         assert!(err.public_message.contains("kind=mint"));
         assert!(err.public_message.contains("items"));
@@ -2726,7 +2747,10 @@ mod tests {
         let err = parse_publisher_choice(&[], " \t fee ").expect_err("fee address forbidden");
         assert_eq!(err.code, KernelErrorCode::MalformedRequest);
         assert!(err.public_message.contains("fee_address"));
-        assert_eq!(parse_publisher_choice(&[], "  ").unwrap(), PublisherChoice::SelfPublish);
+        assert_eq!(
+            parse_publisher_choice(&[], "  ").unwrap(),
+            PublisherChoice::SelfPublish
+        );
         assert_eq!(
             parse_publisher_choice(&[0x11; 32], "").unwrap(),
             PublisherChoice::FeeLessHandOff {
@@ -2741,8 +2765,7 @@ mod tests {
             parse_digest_list(&[vec![0x21; 32]], "ids").unwrap(),
             vec![Digest32([0x21; 32])]
         );
-        let err = parse_digest_list(&[vec![0; 32], vec![0; 31]], "ids")
-            .expect_err("indexed width");
+        let err = parse_digest_list(&[vec![0; 32], vec![0; 31]], "ids").expect_err("indexed width");
         assert!(err.public_message.contains("ids[1]"));
     }
 
@@ -2755,7 +2778,9 @@ mod tests {
 
         let mut invoice_template = base_output_template();
         invoice_template.delivery = Some(ProtoDeliveryCredential {
-            body: Some(kernel_proto::delivery_credential::Body::Invoice(base_invoice())),
+            body: Some(kernel_proto::delivery_credential::Body::Invoice(
+                base_invoice(),
+            )),
         });
         let parsed = parse_output_templates(&[invoice_template]).expect("invoice delivery");
         match parsed[0].delivery.as_ref().expect("delivery") {
@@ -2786,7 +2811,9 @@ mod tests {
         let mut bad_recipient = base_output_template();
         bad_recipient.recipient = "bad".into();
         let err = parse_output_templates(&[bad_recipient]).expect_err("recipient error");
-        assert!(err.public_message.starts_with("output_templates[0].recipient: "));
+        assert!(err
+            .public_message
+            .starts_with("output_templates[0].recipient: "));
         let mut bad_asset = base_output_template();
         bad_asset.asset_id = vec![0; 31];
         let err = parse_output_templates(&[bad_asset]).expect_err("asset error");
@@ -2800,7 +2827,9 @@ mod tests {
     #[test]
     fn delivery_credential_directly_covers_invoice_and_profile_arms() {
         let invoice = ProtoDeliveryCredential {
-            body: Some(kernel_proto::delivery_credential::Body::Invoice(base_invoice())),
+            body: Some(kernel_proto::delivery_credential::Body::Invoice(
+                base_invoice(),
+            )),
         };
         match parse_delivery_credential(&invoice, 2).expect("invoice arm") {
             DeliveryCredential::Invoice(inv) => assert_eq!(inv.pk0, [0x71; 32]),
@@ -2899,7 +2928,9 @@ mod tests {
         let mut no_relays = base_invoice();
         no_relays.relays.clear();
         let err = parse_wire_invoice(&no_relays, "out").expect_err("relay required");
-        assert!(err.public_message.contains("must contain at least one relay URL"));
+        assert!(err
+            .public_message
+            .contains("must contain at least one relay URL"));
     }
 
     #[test]
@@ -2986,17 +3017,22 @@ mod tests {
             }
         );
 
-        for invalid_v1 in [{
-            let mut i = base_issuance(1);
-            i.cap_total = "1".into();
-            i
-        }, {
-            let mut i = base_issuance(1);
-            i.terms_salt = vec![0; 32];
-            i
-        }] {
+        for invalid_v1 in [
+            {
+                let mut i = base_issuance(1);
+                i.cap_total = "1".into();
+                i
+            },
+            {
+                let mut i = base_issuance(1);
+                i.terms_salt = vec![0; 32];
+                i
+            },
+        ] {
             let err = parse_issuance(invalid_v1).expect_err("v1 extras forbidden");
-            assert!(err.public_message.contains("must not carry cap_total or terms_salt"));
+            assert!(err
+                .public_message
+                .contains("must not carry cap_total or terms_salt"));
         }
 
         let mut missing_cap = base_issuance(2);
@@ -3099,12 +3135,11 @@ mod tests {
         let raw = r#"{"error":"proving_failed","message":7}"#;
         let err = proto_job_error(Some(raw), false).expect_err("message must be string");
         assert_eq!(err.code, KernelErrorCode::InternalError);
-        assert!(
-            err.internal_context
-                .expect("detail")
-                .detail
-                .contains("without message field")
-        );
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("without message field"));
     }
 
     #[test]
@@ -3112,18 +3147,27 @@ mod tests {
         let err = decode_awaiting_signature(&JobPayload(serde_json::json!([1, 2, 3])))
             .expect_err("awaiting object required");
         assert_eq!(err.code, KernelErrorCode::InternalError);
-        assert!(err.internal_context.expect("detail").detail.contains("not a JSON object"));
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("not a JSON object"));
 
         let err = decode_job_result(JobKind::Send, &JobPayload(serde_json::json!("string")))
             .expect_err("result object required");
-        assert!(err.internal_context.expect("detail").detail.contains("not a JSON object"));
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("not a JSON object"));
 
         let mut value = sample_completed_payload().0;
         value
             .as_object_mut()
             .expect("sample object")
             .insert("publisher_pubkey".into(), serde_json::json!(hex32(0xD1)));
-        let result = decode_job_result(JobKind::Receive, &JobPayload(value)).expect("receive result");
+        let result =
+            decode_job_result(JobKind::Receive, &JobPayload(value)).expect("receive result");
         assert_eq!(result.new_account_state_hash, vec![0xA1; 32]);
         assert_eq!(result.output_coins_root, vec![0xA2; 32]);
         assert_eq!(result.input_nullifiers_root, vec![0xA3; 32]);
@@ -3138,7 +3182,11 @@ mod tests {
         let obj = object.as_object().expect("object");
         assert_eq!(require_hex_bytes(obj, "field", 32).unwrap(), vec![0x11; 32]);
         let err = require_hex_bytes(obj, "missing", 32).expect_err("missing fixed hex");
-        assert!(err.internal_context.expect("detail").detail.contains("missing"));
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("missing"));
 
         for (value, expected) in [
             (serde_json::json!({}), "missing required hex field"),
@@ -3149,7 +3197,10 @@ mod tests {
             let err = require_hex_bytes_unbounded(value.as_object().unwrap(), "blob")
                 .expect_err("invalid unbounded hex");
             assert!(
-                err.internal_context.expect("detail").detail.contains(expected),
+                err.internal_context
+                    .expect("detail")
+                    .detail
+                    .contains(expected),
                 "expected {expected}"
             );
         }
@@ -3170,7 +3221,11 @@ mod tests {
         let value = serde_json::json!({"key": 1});
         let err = optional_hex_bytes(value.as_object().unwrap(), "key", 32)
             .expect_err("non-string optional hex");
-        assert!(err.internal_context.expect("detail").detail.contains("not a string"));
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("not a string"));
         let value = serde_json::json!({"key": ""});
         assert!(optional_hex_bytes(value.as_object().unwrap(), "key", 32)
             .unwrap()
@@ -3181,9 +3236,13 @@ mod tests {
             vec![0x22; 32]
         );
         let value = serde_json::json!({"key": "00"});
-        let err = optional_hex_bytes(value.as_object().unwrap(), "key", 32)
-            .expect_err("optional width");
-        assert!(err.internal_context.expect("detail").detail.contains("64 hex chars"));
+        let err =
+            optional_hex_bytes(value.as_object().unwrap(), "key", 32).expect_err("optional width");
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("64 hex chars"));
     }
 
     #[test]
@@ -3191,16 +3250,28 @@ mod tests {
         for value in [serde_json::json!({}), serde_json::json!({"ids": "no"})] {
             let err = require_hex_bytes_array(value.as_object().unwrap(), "ids", 32)
                 .expect_err("array required");
-            assert!(err.internal_context.expect("detail").detail.contains("array field"));
+            assert!(err
+                .internal_context
+                .expect("detail")
+                .detail
+                .contains("array field"));
         }
         let value = serde_json::json!({"ids": [hex32(0x31), 7]});
         let err = require_hex_bytes_array(value.as_object().unwrap(), "ids", 32)
             .expect_err("element string required");
-        assert!(err.internal_context.expect("detail").detail.contains("ids[1]"));
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("ids[1]"));
         let value = serde_json::json!({"ids": ["00"]});
         let err = require_hex_bytes_array(value.as_object().unwrap(), "ids", 32)
             .expect_err("element width");
-        assert!(err.internal_context.expect("detail").detail.contains("ids[0]"));
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("ids[0]"));
         let value = serde_json::json!({"ids": [hex32(0x32)]});
         assert_eq!(
             require_hex_bytes_array(value.as_object().unwrap(), "ids", 32).unwrap(),
@@ -3209,13 +3280,25 @@ mod tests {
 
         let value = serde_json::json!({});
         let err = require_u64(value.as_object().unwrap(), "n").expect_err("missing u64");
-        assert!(err.internal_context.expect("detail").detail.contains("missing required field"));
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("missing required field"));
         let value = serde_json::json!({"n": "1"});
         let err = require_u64(value.as_object().unwrap(), "n").expect_err("number required");
-        assert!(err.internal_context.expect("detail").detail.contains("not a number"));
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("not a number"));
         let value = serde_json::json!({"n": -1});
         let err = require_u64(value.as_object().unwrap(), "n").expect_err("nonnegative required");
-        assert!(err.internal_context.expect("detail").detail.contains("non-negative integer"));
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("non-negative integer"));
         let value = serde_json::json!({"n": 42});
         assert_eq!(require_u64(value.as_object().unwrap(), "n").unwrap(), 42);
     }
@@ -3223,10 +3306,21 @@ mod tests {
     #[test]
     fn decode_hex_exact_covers_length_alphabet_and_success() {
         let err = decode_hex_exact("00", "digest", 32).expect_err("wrong text length");
-        assert!(err.internal_context.expect("detail").detail.contains("64 hex chars"));
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("64 hex chars"));
         let err = decode_hex_exact(&"z".repeat(64), "digest", 32).expect_err("non-hex alphabet");
-        assert!(err.internal_context.expect("detail").detail.contains("is not hex"));
-        assert_eq!(decode_hex_exact(&hex32(0x41), "digest", 32).unwrap(), vec![0x41; 32]);
+        assert!(err
+            .internal_context
+            .expect("detail")
+            .detail
+            .contains("is not hex"));
+        assert_eq!(
+            decode_hex_exact(&hex32(0x41), "digest", 32).unwrap(),
+            vec![0x41; 32]
+        );
     }
 
     #[test]
@@ -3333,18 +3427,24 @@ mod tests {
         assert!(entrust_result_to_proto(EntrustResult { accepted: true }).accepted);
 
         for (field, req) in [
-            ("nonce", ProtoEntrustRequest {
-                nonce: vec![0; 31],
-                subject: receive_subject_bech32(),
-                bundle: vec![],
-                chan_bind: vec![0; 32],
-            }),
-            ("chan_bind", ProtoEntrustRequest {
-                nonce: vec![0; 32],
-                subject: receive_subject_bech32(),
-                bundle: vec![],
-                chan_bind: vec![0; 31],
-            }),
+            (
+                "nonce",
+                ProtoEntrustRequest {
+                    nonce: vec![0; 31],
+                    subject: receive_subject_bech32(),
+                    bundle: vec![],
+                    chan_bind: vec![0; 32],
+                },
+            ),
+            (
+                "chan_bind",
+                ProtoEntrustRequest {
+                    nonce: vec![0; 32],
+                    subject: receive_subject_bech32(),
+                    bundle: vec![],
+                    chan_bind: vec![0; 31],
+                },
+            ),
         ] {
             let err = parse_entrust_request(req).expect_err("entrust width");
             assert!(err.public_message.contains(field));
@@ -3362,16 +3462,22 @@ mod tests {
         assert!(revoke_result_to_proto(RevokeResult { revoked: true }).revoked);
 
         for (field, req) in [
-            ("nonce", ProtoRevokeRequest {
-                nonce: vec![0; 31],
-                subject: receive_subject_bech32(),
-                chan_bind: vec![0; 32],
-            }),
-            ("chan_bind", ProtoRevokeRequest {
-                nonce: vec![0; 32],
-                subject: receive_subject_bech32(),
-                chan_bind: vec![0; 31],
-            }),
+            (
+                "nonce",
+                ProtoRevokeRequest {
+                    nonce: vec![0; 31],
+                    subject: receive_subject_bech32(),
+                    chan_bind: vec![0; 32],
+                },
+            ),
+            (
+                "chan_bind",
+                ProtoRevokeRequest {
+                    nonce: vec![0; 32],
+                    subject: receive_subject_bech32(),
+                    chan_bind: vec![0; 31],
+                },
+            ),
         ] {
             let err = parse_revoke_request(req).expect_err("revoke width");
             assert!(err.public_message.contains(field));

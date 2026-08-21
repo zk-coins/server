@@ -1238,7 +1238,13 @@ mod tests {
             body.extend_from_slice(&[0xC3, 0x28]); // invalid UTF-8
             let err = deserialize(&body).expect_err("utf8");
             assert!(
-                matches!(err, SpecError::BootstrapInvalidUtf8 { field: BootstrapStringField::Network, .. }),
+                matches!(
+                    err,
+                    SpecError::BootstrapInvalidUtf8 {
+                        field: BootstrapStringField::Network,
+                        ..
+                    }
+                ),
                 "{err:?}"
             );
         }
@@ -1465,7 +1471,13 @@ mod tests {
         body.extend_from_slice(&[0xC3, 0x28]);
         let err = deserialize(&body).expect_err("url utf8");
         assert!(
-            matches!(err, SpecError::BootstrapInvalidUtf8 { field: BootstrapStringField::SeedRelay { index: 0 }, .. }),
+            matches!(
+                err,
+                SpecError::BootstrapInvalidUtf8 {
+                    field: BootstrapStringField::SeedRelay { index: 0 },
+                    ..
+                }
+            ),
             "{err:?}"
         );
     }
@@ -1486,7 +1498,13 @@ mod tests {
         body.extend_from_slice(&[0xFF, 0xFE]);
         let err = deserialize(&body).expect_err("blob utf8");
         assert!(
-            matches!(err, SpecError::BootstrapInvalidUtf8 { field: BootstrapStringField::BlobStore { index: 0 }, .. }),
+            matches!(
+                err,
+                SpecError::BootstrapInvalidUtf8 {
+                    field: BootstrapStringField::BlobStore { index: 0 },
+                    ..
+                }
+            ),
             "{err:?}"
         );
     }

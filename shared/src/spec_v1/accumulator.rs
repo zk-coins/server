@@ -1295,9 +1295,7 @@ mod tests {
         // size_final_confirmation_boundary suite (which uses 10,11,12,20 only).
         let mut gapped = NfLogAccumulator::new(0);
         for (h, b) in [(0u64, 1u8), (1, 2), (10, 3), (11, 4), (12, 5), (20, 6)] {
-            gapped
-                .fold(pos(h), pk(b), r(b))
-                .expect("fold gapped chain");
+            gapped.fold(pos(h), pk(b), r(b)).expect("fold gapped chain");
         }
         assert_eq!(gapped.nav().size, 6);
 
@@ -1336,7 +1334,10 @@ mod tests {
         fold_dense_chain_0_to(&mut acc, OLD_TIP);
         let old_final = acc.size_final(OLD_TIP);
         // old_final = 16 (heights 0..=15); empty replay displaces every one.
-        assert_eq!(old_final, 16, "empty-stream: pre-reorg old_final must be 16");
+        assert_eq!(
+            old_final, 16,
+            "empty-stream: pre-reorg old_final must be 16"
+        );
 
         let outcome = acc
             .reorg_replay(OLD_TIP, vec![])
@@ -1352,7 +1353,7 @@ mod tests {
             outcome.displaced_final_count
         );
         assert_eq!(acc.nav().size, 0, "empty-stream: log must be fully cleared");
-        assert!(acc.log.get(0).is_none());
+        assert!(acc.log.is_empty());
     }
 
     #[test]
@@ -1568,10 +1569,6 @@ mod tests {
     fn classify_pending_for_unknown_pk() {
         let mut acc = NfLogAccumulator::new(0);
         acc.fold(pos(100), pk(1), r(1)).expect("fold");
-        assert_eq!(
-            acc.classify(pk(99), r(1)),
-            SpendClassification::Pending
-        );
+        assert_eq!(acc.classify(pk(99), r(1)), SpendClassification::Pending);
     }
 }
-

@@ -1,5 +1,10 @@
 name: CI
 
+# Live workflow path while `.github/workflows/ci.yaml` is
+# `disabled_manually` on zk-coins/node. Same jobs and the same
+# draft-start labels (`ci` / `ci:full`). Re-enable `ci.yaml` and
+# delete this file in one follow-up if that disable is lifted.
+
 on:
   # `workflow_dispatch` stays available: a run can still be started by
   # hand from the Actions tab when a specific answer is wanted.

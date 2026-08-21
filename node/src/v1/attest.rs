@@ -2172,6 +2172,7 @@ mod tests {
         crate::db::insert_block_log(
             &pool,
             &crate::db::BlockLogEntry {
+                block_time: None,
                 block_hash: inclusion_hash.to_vec(),
                 block_height: Some(i64::try_from(fold_height).unwrap()),
                 inscription_count: 1,
@@ -2353,6 +2354,7 @@ mod tests {
         let blocks = [BlockScanResult {
             height: fold_height,
             block_hash: BlockHash::from_byte_array(inclusion_hash),
+            block_time: 1_700_000_000,
             inscriptions_seen: 0,
             rejected: vec![],
             admitted: vec![],
@@ -2677,9 +2679,7 @@ mod tests {
         let err = parse_hex32("abc", "fixture32").expect_err("three chars cannot encode 32 bytes");
         assert_eq!(
             err,
-            AttestError::Malformed(
-                "fixture32: expected 64 lowercase hex chars, got 3".to_string()
-            )
+            AttestError::Malformed("fixture32: expected 64 lowercase hex chars, got 3".to_string())
         );
     }
 
@@ -2991,16 +2991,17 @@ mod tests {
         let now = 1_700_000_200u64;
         let req_a = signed_attest_request(&store, host_name, now, 0x11);
         let mut req_b = signed_attest_request(&store, host_name, now, 0x12);
-        assert_ne!(req_a.subject, req_b.subject, "fixtures need distinct subjects");
+        assert_ne!(
+            req_a.subject, req_b.subject,
+            "fixtures need distinct subjects"
+        );
         req_b.challenge.nonce = req_a.challenge.nonce;
 
         let err = authorise_attest_balance(&store, &[host_name.into()], &req_b, now)
             .expect_err("a challenge is bound to its issued subject");
         assert_eq!(
             err,
-            AttestError::Unauthorized(
-                "challenge was issued for a different subject".to_string()
-            )
+            AttestError::Unauthorized("challenge was issued for a different subject".to_string())
         );
     }
 
@@ -3201,17 +3202,10 @@ mod tests {
             }])
             .expect("append deliberately inconsistent catalog member");
 
-        let err = resolve_anchor_locator(
-            &adapter,
-            &[0x11u8; 32],
-            &[0x22u8; 32],
-            fold_height,
-            0,
-            0,
-            0,
-        )
-        .await
-        .expect_err("catalog member must equal the NfLog-disclosed pair");
+        let err =
+            resolve_anchor_locator(&adapter, &[0x11u8; 32], &[0x22u8; 32], fold_height, 0, 0, 0)
+                .await
+                .expect_err("catalog member must equal the NfLog-disclosed pair");
         assert_eq!(
             err,
             AttestError::Internal(

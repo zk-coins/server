@@ -56,6 +56,12 @@
 //!   connect and resume, §4.2 Phase-B scan hook
 //!   (`finalize_due_phase_b_adapter`), `record_scanned_block_hashes`
 //!   (durable per-height block_hash for below-tip §5.7 anchor locators),
+//!   `Bip113PreludeHeader` / `fetch_bip113_prelude_headers` /
+//!   `record_bip113_prelude_headers` / `backfill_null_block_times`
+//!   (header nTime for `[activation-10, activation)` plus NULL
+//!   `block_time` backfill so check (v) can derive BIP-113 MTP at
+//!   activation-edge inclusion heights without folding NfLog below
+//!   activation),
 //!   `db_v1::list_resumable_pending_publishes` /
 //!   `PendingPublishRow`, `enforce_stack_scan_mode`,
 //!   `claim_process_stack_from_v1_shadow_env` for `recover_inscription`).

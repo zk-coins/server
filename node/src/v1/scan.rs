@@ -73,7 +73,9 @@
 
 use anyhow::{bail, Context, Result};
 use bitcoin::hashes::Hash;
+use bitcoin::BlockHash;
 use shared::spec_v1::{ChainPosition, PublishedNullifier};
+use std::path::Path;
 use zkcoins_prover::state_engine::StateEngine;
 
 use super::adapter::EngineAdapter;
@@ -256,13 +258,16 @@ pub(crate) fn replace_engine_nflog_from_survivors(
 /// Durably record the block hash of every block the scanner observed this poll.
 ///
 /// Writes one `block_log` row per entry in `blocks` via
-/// [`crate::db::insert_block_log`] (`ON CONFLICT (block_hash) DO NOTHING`).
+/// [`crate::db::insert_block_log`], refreshing the observation time and
+/// backfilling a missing header timestamp when the block hash already exists.
 /// The live v1.1 scan loop calls this **unconditionally** after each
 /// successful `scan_to_tip` so below-tip §5.7 anchor locators can resolve
 /// inclusion hashes through [`crate::db::load_block_hash_at_height`].
+/// `block_time` is the header nTime carried from the scanner's already-fetched
+/// block; this function performs no independent RPC lookup.
 ///
 /// Does not touch the in-memory engine or the durable inscription catalog —
-/// only the append-only block-observation audit log.
+/// only the block-observation audit log.
 pub async fn record_scanned_block_hashes(
     pool: &sqlx::PgPool,
     blocks: &[zkcoins_prover::scanner::BlockScanResult],
@@ -281,6 +286,7 @@ pub async fn record_scanned_block_hashes(
             )
         })?;
         let entry = crate::db::BlockLogEntry {
+            block_time: Some(i64::from(block.block_time)),
             block_hash: block.block_hash.to_byte_array().to_vec(),
             block_height: Some(block_height),
             inscription_count,
@@ -294,6 +300,240 @@ pub async fn record_scanned_block_hashes(
                      at height {} hash={}",
                     block.height,
                     hex::encode(block.block_hash.to_byte_array())
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// One BIP-113 prelude header: height in `[activation-10, activation)`,
+/// canonical hash, header nTime (Bitcoin `time`, not `mediantime`).
+///
+/// Persisted so check (v) can re-derive MTP for inclusion heights in
+/// `[activation, activation+9]` without folding NfLog below activation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bip113PreludeHeader {
+    pub height: u64,
+    pub block_hash: [u8; 32],
+    pub n_time: u32,
+}
+
+/// True only for Bitcoin Core's missing-height / unknown-hash replies.
+/// Substring matches on `"-5"`, `"-8"`, or bare `"not found"` are too
+/// broad (they would swallow "Method not found" and neighbouring RPC
+/// codes); those must stay fail-closed.
+fn is_skippable_bitcoind_lookup_error(err: &bitcoincore_rpc::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("Block height out of range")
+        || msg.contains("Block not found")
+        || msg.contains("Block header not found")
+}
+
+/// Persist prelude headers into `block_log` via [`crate::db::insert_block_log`].
+///
+/// `inscription_count = 0`, `processing_duration_us = None`. Idempotent
+/// (ON CONFLICT COALESCE). An empty slice is `Ok` (activation height 0).
+/// Does not fold NfLog.
+pub async fn record_bip113_prelude_headers(
+    pool: &sqlx::PgPool,
+    headers: &[Bip113PreludeHeader],
+) -> Result<()> {
+    for header in headers {
+        let block_height = i64::try_from(header.height).with_context(|| {
+            format!(
+                "record_bip113_prelude_headers: block height {} does not fit i64",
+                header.height
+            )
+        })?;
+        let entry = crate::db::BlockLogEntry {
+            block_time: Some(i64::from(header.n_time)),
+            block_hash: header.block_hash.to_vec(),
+            block_height: Some(block_height),
+            inscription_count: 0,
+            processing_duration_us: None,
+        };
+        crate::db::insert_block_log(pool, &entry)
+            .await
+            .with_context(|| {
+                format!(
+                    "record_bip113_prelude_headers: insert block_log failed \
+                     at height {} hash={}",
+                    header.height,
+                    hex::encode(header.block_hash)
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Fetch prelude headers from bitcoind for `[activation.saturating_sub(10), activation)`.
+///
+/// Returns header nTime (`time`), never `mediantime`. Does not collect or fold
+/// nullifiers. An empty range (activation 0) returns `Ok(vec![])` without
+/// opening an RPC client. Heights the connected node does not yet know are
+/// skipped; other RPC errors fail closed.
+pub fn fetch_bip113_prelude_headers(
+    rpc_url: &str,
+    cookie_path: &Path,
+    activation_height: u64,
+) -> Result<Vec<Bip113PreludeHeader>> {
+    use bitcoincore_rpc::RpcApi;
+
+    let first_height = activation_height.saturating_sub(10);
+    if first_height >= activation_height {
+        return Ok(Vec::new());
+    }
+
+    let client = bitcoincore_rpc::Client::new(
+        rpc_url.trim_end_matches('/'),
+        bitcoincore_rpc::Auth::CookieFile(cookie_path.to_path_buf()),
+    )
+    .context("bitcoind RPC client for BIP-113 prelude headers")?;
+
+    let mut headers = Vec::new();
+    for height in first_height..activation_height {
+        let hash = match client.get_block_hash(height) {
+            Ok(hash) => hash,
+            Err(err) if is_skippable_bitcoind_lookup_error(&err) => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("getblockhash for BIP-113 prelude header at height {height}")
+                });
+            }
+        };
+        let info = match client.get_block_header_info(&hash) {
+            Ok(info) => info,
+            Err(err) if is_skippable_bitcoind_lookup_error(&err) => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("getblockheader for BIP-113 prelude header at height {height}")
+                });
+            }
+        };
+        let reported_height = u64::try_from(info.height).with_context(|| {
+            format!(
+                "getblockheader height {} at requested height {height} does not fit u64",
+                info.height
+            )
+        })?;
+        if reported_height != height {
+            bail!("getblockheader height {reported_height} != requested prelude height {height}");
+        }
+        let n_time = u32::try_from(info.time).with_context(|| {
+            format!(
+                "header time {} at height {height} does not fit u32",
+                info.time
+            )
+        })?;
+        headers.push(Bip113PreludeHeader {
+            height,
+            block_hash: hash.to_byte_array(),
+            n_time,
+        });
+    }
+    Ok(headers)
+}
+
+struct NullBlockTimeRow {
+    hash: [u8; 32],
+    hash_bytes: Vec<u8>,
+}
+
+/// Blocking bitcoind nTime lookup for NULL `block_time` rows.
+///
+/// Opens the RPC client and walks headers on the calling thread. Callers
+/// must wrap this in `spawn_blocking` so the async scan loop does not
+/// run `Client::new` or `get_block_header_info` on a Tokio worker.
+fn lookup_n_times_for_null_rows(
+    rpc_url: &str,
+    cookie_path: &Path,
+    rows: Vec<NullBlockTimeRow>,
+) -> Result<Vec<(NullBlockTimeRow, u32)>> {
+    use bitcoincore_rpc::RpcApi;
+
+    let client = bitcoincore_rpc::Client::new(
+        rpc_url.trim_end_matches('/'),
+        bitcoincore_rpc::Auth::CookieFile(cookie_path.to_path_buf()),
+    )
+    .context("bitcoind RPC client for NULL block_time backfill")?;
+
+    let mut found = Vec::new();
+    for row in rows {
+        let hash = BlockHash::from_byte_array(row.hash);
+        match client.get_block_header_info(&hash) {
+            Ok(info) => {
+                let n_time = u32::try_from(info.time).with_context(|| {
+                    format!(
+                        "header time {} for hash {} does not fit u32",
+                        info.time,
+                        hex::encode(row.hash)
+                    )
+                })?;
+                found.push((row, n_time));
+            }
+            Err(err) if is_skippable_bitcoind_lookup_error(&err) => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "getblockheader for NULL block_time backfill hash={}",
+                        hex::encode(row.hash)
+                    )
+                });
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Backfill `block_log.block_time` where it is still SQL NULL, by hash.
+///
+/// Looks up header nTime (`time`, never `mediantime`) and writes it through
+/// [`crate::db::fill_null_block_time`] so a NULL timestamp is filled without
+/// bumping `processed_at` (height lookups order by that column; an orphan
+/// must not steal the height). Unknown hashes are skipped; other RPC errors
+/// fail closed. Bitcoind RPC runs on `spawn_blocking`; only the Postgres
+/// read/write stays on the async task.
+pub async fn backfill_null_block_times(
+    pool: &sqlx::PgPool,
+    rpc_url: &str,
+    cookie_path: &Path,
+) -> Result<()> {
+    let raw_rows: Vec<(Vec<u8>,)> =
+        sqlx::query_as("SELECT block_hash FROM block_log WHERE block_time IS NULL")
+            .fetch_all(pool)
+            .await
+            .context("backfill_null_block_times: load NULL block_time rows")?;
+    if raw_rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut rows = Vec::with_capacity(raw_rows.len());
+    for (hash_bytes,) in raw_rows {
+        let hash: [u8; 32] = hash_bytes.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "backfill_null_block_times: block_hash length {} is not 32 bytes",
+                hash_bytes.len()
+            )
+        })?;
+        rows.push(NullBlockTimeRow { hash, hash_bytes });
+    }
+
+    let rpc_url = rpc_url.to_string();
+    let cookie_path = cookie_path.to_path_buf();
+    let looked_up = tokio::task::spawn_blocking(move || {
+        lookup_n_times_for_null_rows(&rpc_url, &cookie_path, rows)
+    })
+    .await
+    .context("backfill_null_block_times: bitcoind lookup join")?
+    .context("backfill_null_block_times: bitcoind lookup")?;
+
+    for (row, n_time) in looked_up {
+        crate::db::fill_null_block_time(pool, &row.hash_bytes, i64::from(n_time))
+            .await
+            .with_context(|| {
+                format!(
+                    "backfill_null_block_times: fill NULL block_time failed hash={}",
+                    hex::encode(row.hash)
                 )
             })?;
     }
@@ -1177,4 +1417,115 @@ pub fn v1_bitcoind_rpc_from_env() -> Result<(String, std::path::PathBuf)> {
         );
     }
     Ok((rpc_url, std::path::PathBuf::from(cookie)))
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{
+        insert_block_log, load_block_time_at_height, load_median_time_past, BlockLogEntry,
+    };
+
+    fn prelude_header(height: u64, n_time: u32) -> Bip113PreludeHeader {
+        let mut block_hash = [0u8; 32];
+        block_hash[0] = u8::try_from(height).expect("test prelude height fits u8");
+        Bip113PreludeHeader {
+            height,
+            block_hash,
+            n_time,
+        }
+    }
+
+    #[tokio::test]
+    async fn record_bip113_prelude_headers_persists_n_time_idempotently() {
+        let scope = crate::test_db::setup_pool().await;
+        let headers: Vec<Bip113PreludeHeader> = (90_u64..100)
+            .map(|height| prelude_header(height, u32::try_from(height).unwrap()))
+            .collect();
+
+        record_bip113_prelude_headers(&scope.pool, &headers)
+            .await
+            .expect("first prelude persist");
+        assert_eq!(
+            load_block_time_at_height(&scope.pool, 90).await.unwrap(),
+            Some(90)
+        );
+        assert_eq!(
+            load_block_time_at_height(&scope.pool, 99).await.unwrap(),
+            Some(99)
+        );
+
+        record_bip113_prelude_headers(&scope.pool, &headers)
+            .await
+            .expect("idempotent prelude persist");
+        assert_eq!(
+            load_block_time_at_height(&scope.pool, 90).await.unwrap(),
+            Some(90)
+        );
+        assert_eq!(
+            load_block_time_at_height(&scope.pool, 99).await.unwrap(),
+            Some(99)
+        );
+    }
+
+    #[tokio::test]
+    async fn record_bip113_prelude_headers_completes_mtp_window_at_activation() {
+        let scope = crate::test_db::setup_pool().await;
+        let headers: Vec<Bip113PreludeHeader> = (90_u64..100)
+            .map(|height| prelude_header(height, u32::try_from(height).unwrap()))
+            .collect();
+        record_bip113_prelude_headers(&scope.pool, &headers)
+            .await
+            .expect("prelude persist");
+
+        insert_block_log(
+            &scope.pool,
+            &BlockLogEntry {
+                block_time: Some(100),
+                block_hash: {
+                    let mut hash = [0u8; 32];
+                    hash[0] = 100;
+                    hash.to_vec()
+                },
+                block_height: Some(100),
+                inscription_count: 0,
+                processing_duration_us: None,
+            },
+        )
+        .await
+        .expect("inclusion height 100");
+
+        assert!(
+            load_median_time_past(&scope.pool, 100)
+                .await
+                .unwrap()
+                .is_some(),
+            "prelude 90-99 plus scanned 100 must complete the BIP-113 window"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_bip113_prelude_headers_empty_slice_is_ok() {
+        let scope = crate::test_db::setup_pool().await;
+        record_bip113_prelude_headers(&scope.pool, &[])
+            .await
+            .expect("empty prelude slice is Ok");
+    }
+
+    #[test]
+    fn fetch_bip113_prelude_headers_skips_rpc_when_activation_is_zero() {
+        let headers =
+            fetch_bip113_prelude_headers("http://127.0.0.1:1", Path::new("/nonexistent"), 0)
+                .expect("empty prelude range must not open RPC");
+        assert!(headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backfill_null_block_times_is_ok_when_no_null_rows() {
+        let scope = crate::test_db::setup_pool().await;
+        backfill_null_block_times(&scope.pool, "http://127.0.0.1:1", Path::new("/nonexistent"))
+            .await
+            .expect("no NULL block_time rows must skip RPC");
+    }
 }

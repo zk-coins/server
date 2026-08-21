@@ -1511,8 +1511,8 @@ mod tests {
     #[test]
     fn check_1_rejects_wrong_event_kind() {
         let acct = sample_account("wrong-kind");
-        let event = Event::sign(&acct.op_sk, 1, 1, vec![], "{}".to_string())
-            .expect("sign kind-1 event");
+        let event =
+            Event::sign(&acct.op_sk, 1, 1, vec![], "{}".to_string()).expect("sign kind-1 event");
 
         let err = verify_payment_profile(&event, &acct.op_pk, "regtest", None)
             .expect_err("kind 1 must fail profile check 1");
@@ -1562,10 +1562,7 @@ mod tests {
         let err = verify_payment_profile(&event, &acct.op_pk, "regtest", None)
             .expect_err("mutated signed content must fail NIP-01 verification");
         match err {
-            ProfileCheckError::Check1BadSignature(EventError::IdMismatch {
-                claimed,
-                computed,
-            }) => {
+            ProfileCheckError::Check1BadSignature(EventError::IdMismatch { claimed, computed }) => {
                 assert_eq!(claimed, signed_id);
                 assert_ne!(computed, claimed);
             }
@@ -1757,13 +1754,8 @@ mod tests {
         );
         let event = sign_kind0(&acct.op_sk, 1, "invalid", &zk);
 
-        let err = verify_payment_profile(
-            &event,
-            &acct.op_pk,
-            "regtest",
-            Some("invalid"),
-        )
-        .expect_err("name without @ must fail name-message construction");
+        let err = verify_payment_profile(&event, &acct.op_pk, "regtest", Some("invalid"))
+            .expect_err("name without @ must fail name-message construction");
         assert_eq!(
             err,
             ProfileCheckError::Check5NameMessage {
@@ -1802,13 +1794,8 @@ mod tests {
     #[test]
     fn newest_valid_kind0_reports_no_kind0_event_for_empty_input() {
         let acct = sample_account("no-kind0");
-        let err = select_newest_valid_payment_profile(
-            &[],
-            &acct.op_pk,
-            "regtest",
-            None,
-        )
-        .expect_err("empty input has no kind-0 candidate");
+        let err = select_newest_valid_payment_profile(&[], &acct.op_pk, "regtest", None)
+            .expect_err("empty input has no kind-0 candidate");
         assert_eq!(err, ProfileResolveError::NoKind0Event);
     }
 
@@ -1824,13 +1811,8 @@ mod tests {
         );
         let event = sign_kind0(&acct.op_sk, 1, "alice@example.com", &zk);
 
-        let err = select_newest_valid_payment_profile(
-            &[event],
-            &acct.op_pk,
-            "mainnet",
-            None,
-        )
-        .expect_err("wrong-network candidate must not resolve");
+        let err = select_newest_valid_payment_profile(&[event], &acct.op_pk, "mainnet", None)
+            .expect_err("wrong-network candidate must not resolve");
         assert_eq!(
             err,
             ProfileResolveError::NoValidPaymentProfile {
@@ -2009,8 +1991,7 @@ mod tests {
         let mut inv = sample_invoice(&acct);
         inv.relays = vec!["http://bad".to_string()];
 
-        let err =
-            verify_invoice(&inv).expect_err("invoice relay URL must use WebSocket transport");
+        let err = verify_invoice(&inv).expect_err("invoice relay URL must use WebSocket transport");
         assert_eq!(
             err,
             InvoiceCheckError::InvalidRelayUrl {
@@ -2026,8 +2007,7 @@ mod tests {
         inv.pk0 = [0u8; 32];
         inv.recipient = address_from_parts(&inv.pk0, &inv.nk_commit);
 
-        let err =
-            verify_invoice(&inv).expect_err("invalid x-only pk0 must fail check (ii)");
+        let err = verify_invoice(&inv).expect_err("invalid x-only pk0 must fail check (ii)");
         assert_eq!(
             err,
             InvoiceCheckError::Check2Malformed {
@@ -2054,8 +2034,7 @@ mod tests {
         });
         inv.addr_sig = sign_bip340(&acct.sk0, &msg).expect("re-sign check (ii) message");
 
-        let err =
-            verify_invoice(&inv).expect_err("invalid x-only op_pubkey must fail check (iii)");
+        let err = verify_invoice(&inv).expect_err("invalid x-only op_pubkey must fail check (iii)");
         assert_eq!(
             err,
             InvoiceCheckError::Check3Malformed {
