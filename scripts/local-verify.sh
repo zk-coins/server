@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local-First hermetic node+shared suite (m5me). Same isolation and
+# Local-First hermetic node+shared suite. Same isolation and
 # selection as the heavy CI job, without llvm-cov.
 set -euo pipefail
 export PATH="${HOME}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:${HOME}/.orbstack/bin:${PATH}"
