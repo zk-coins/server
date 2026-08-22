@@ -1669,6 +1669,7 @@ async function stage10_attestation(client, seed, alice, host, usdAssetIdHex) {
   if (typeof usdAssetIdHex !== 'string' || usdAssetIdHex.length === 0) {
     fail('10', 'usdAssetIdHex missing/empty — stage 10 requires Alice USD asset id from stage 2');
   }
+  await entrustBundle(alice, host, API_URL, client);
 
   // Produce a real BalanceAttestationV1 via the SDK (challenge is opened inside attestBalance).
   const assetIdBytes = decodeHexExact(usdAssetIdHex, 32, 'usdAssetIdHex');
@@ -1729,6 +1730,7 @@ async function stage10_attestation(client, seed, alice, host, usdAssetIdHex) {
 }
 
 async function stage11_grants(client, alice, host, usdAssetIdHex, eurAssetIdHex) {
+  await entrustBundle(alice, host, API_URL, client);
   const existing = await client.openOwnershipPullSession({
     subject: alice.subject,
     sk0: alice.sk0.secretKey,
