@@ -904,9 +904,22 @@ async function stage2_alice_mint(client, seed, alice, host) {
 }
 
 async function stage2b_carol_eur(client, seed, alice, carol, host, usdAssetIdHex) {
-  await entrustBundle(carol, host);
+  await entrustBundle(carol, host, API_URL, client);
 
   const eurAssetIdHex = eurDemoAssetId(carol.sk0.publicKey);
+  const resolvedUsd =
+    typeof usdAssetIdHex === 'string' && usdAssetIdHex.length > 0
+      ? usdAssetIdHex
+      : usdDemoAssetId(alice.sk0.publicKey);
+  try {
+    const existing = await pullBalances(client, alice);
+    if (existing.get(eurAssetIdHex) === EUR_DEMO.amount) {
+      pass('2b', `Alice already holds EUR-Demo (${EUR_DEMO.amount}); skip mint`);
+      return { eurAssetIdHex, carolMintJob: null, skipped: true };
+    }
+  } catch (err) {
+    log(`[2b] no Alice EUR-Demo yet; minting (${err && err.name ? err.name : 'error'})`);
+  }
   const pub = publisherPubkeyHex();
 
   // Token-standard-2 forbids self-credit: mint explicitly to Alice. Alice's
@@ -992,12 +1005,12 @@ async function stage2b_carol_eur(client, seed, alice, carol, host, usdAssetIdHex
   // she still holds the full mint. Require usdAssetIdHex for the map key;
   // amount is whatever pull reports for USD plus exact EUR.
   const balances = await pullBalances(client, alice);
-  const usdBal = balances.get(usdAssetIdHex);
+  const usdBal = balances.get(resolvedUsd);
   if (usdBal === undefined) {
     fail('2b', `Alice missing USD-Demo balance after EUR receive`);
   }
   assertBalancesExact('2b', balances, {
-    [usdAssetIdHex]: usdBal,
+    [resolvedUsd]: usdBal,
     [eurAssetIdHex]: EUR_DEMO.amount,
   });
   pass(
@@ -1036,11 +1049,57 @@ async function stage3_4_alice_send(client, seed, alice, bob, host, assetIdHex, a
 
   // Bob must entrust before Alice delivers so the node holds his ivk/nk for
   // the incoming scanner and any later receive he proves himself.
-  await entrustBundle(bob, host);
+  await entrustBundle(bob, host, API_URL, client);
+
+  const resolvedAssetId =
+    typeof assetIdHex === 'string' && assetIdHex.length > 0
+      ? assetIdHex
+      : usdDemoAssetId(alice.sk0.publicKey);
+  await syncSendCounter(client, seed, alice, '3-send');
+
+  const aliceBalances = await pullBalances(client, alice);
+  const aliceUsd = aliceBalances.get(resolvedAssetId);
+  if (aliceUsd === ALICE_AFTER_SEND) {
+    const expectedAfterSend = { [resolvedAssetId]: ALICE_AFTER_SEND };
+    const resolvedEur =
+      typeof eurAssetIdHex === 'string' && eurAssetIdHex.length > 0
+        ? eurAssetIdHex
+        : [...aliceBalances.keys()].find((k) => k !== resolvedAssetId);
+    const hasEur =
+      typeof resolvedEur === 'string' && aliceBalances.get(resolvedEur) === EUR_DEMO.amount;
+    if (hasEur) {
+      expectedAfterSend[resolvedEur] = EUR_DEMO.amount;
+    }
+    assertBalancesExact(4, aliceBalances, expectedAfterSend);
+    pass(3, `Alice already at ${ALICE_AFTER_SEND}; skip send`);
+    pass(
+      4,
+      `Alice balances after fee-less send of ${SEND_AMOUNT}: USD-Demo == ${ALICE_AFTER_SEND}` +
+        (hasEur ? `, EUR-Demo == ${EUR_DEMO.amount} (untouched)` : ''),
+    );
+    return {
+      assetIdHex: resolvedAssetId,
+      sendJob: null,
+      sendSpendPubkey: null,
+      bobCoinId: null,
+      aliceChangeCoinId: null,
+      skipped: true,
+    };
+  }
+  if (aliceUsd !== USD_DEMO.amount) {
+    fail(
+      3,
+      `unexpected Alice USD-Demo amount: expected ${USD_DEMO.amount} or ${ALICE_AFTER_SEND}, got ${aliceUsd ?? 'ABSENT'}`,
+    );
+  }
 
   if (typeof aliceMintCoinId !== 'string' || aliceMintCoinId.length === 0) {
-    fail(3, 'aliceMintCoinId required (stage 2 mintJob.result.output_coin_ids[0])');
+    fail(
+      3,
+      'aliceMintCoinId required for a first send (stage 2 mintJob.result.output_coin_ids[0] from a non-skipped mint in the same run)',
+    );
   }
+  assetIdHex = resolvedAssetId;
 
   const bobInvoice = await issueInvoice({
     amount: SEND_AMOUNT,
@@ -1135,6 +1194,19 @@ async function stage3_4_alice_send(client, seed, alice, bob, host, assetIdHex, a
 }
 
 async function stage5_bob_receive(client, seed, bob, assetIdHex, bobCoinId) {
+  if (typeof assetIdHex !== 'string' || assetIdHex.length === 0) {
+    fail(5, 'assetIdHex required (USD-Demo id from stage 2 or usdDemoAssetId(Alice))');
+  }
+  await syncSendCounter(client, seed, bob, '5-receive');
+  try {
+    const bobBalances = await pullBalances(client, bob);
+    if (bobBalances.get(assetIdHex) === SEND_AMOUNT) {
+      pass(5, `Bob already holds USD-Demo (${SEND_AMOUNT}); skip receive`);
+      return { bobReceiveJob: null, skipped: true };
+    }
+  } catch (err) {
+    log(`[5-receive] no Bob balance yet; receiving (${err && err.name ? err.name : 'error'})`);
+  }
   let discoveredCoinId = bobCoinId;
 
   // Prefer the coin_id discovered during stage 3/4 (stream opened before
@@ -1941,6 +2013,7 @@ async function main() {
    *   bobCoinId?: string,
    *   aliceChangeCoinId?: string,
    *   eurAssetIdHex?: string,
+   *   stage34Done?: boolean,
    * }}
    */
   let ctx = {};
@@ -1954,9 +2027,7 @@ async function main() {
         ctx = { ...ctx, ...(await stage2_alice_mint(client, seed, alice, host)) };
         break;
       case '2b':
-        if (!ctx.assetIdHex) {
-          fail('2b', 'stage 2b requires stage 2 in the same run (Alice USD asset id)');
-        }
+        ctx.assetIdHex = ctx.assetIdHex || usdDemoAssetId(alice.sk0.publicKey);
         ctx = {
           ...ctx,
           ...(await stage2b_carol_eur(
@@ -1972,16 +2043,11 @@ async function main() {
       case '3':
       case '4': {
         // Stages 3 and 4 share one function; run only once if both are listed.
-        if (ctx.sendJob) {
+        if (ctx.stage34Done) {
           break;
         }
-        if (!ctx.assetIdHex || !ctx.mintJob) {
-          fail(s, 'stage 3/4 require stage 2 in the same run (asset id + mint job)');
-        }
+        ctx.assetIdHex = ctx.assetIdHex || usdDemoAssetId(alice.sk0.publicKey);
         const aliceMintCoinId = ctx.mintJob?.result?.output_coin_ids?.[0];
-        if (typeof aliceMintCoinId !== 'string') {
-          fail(s, 'stage 2 mintJob.result.output_coin_ids[0] missing');
-        }
         ctx = {
           ...ctx,
           ...(await stage3_4_alice_send(
@@ -1994,13 +2060,12 @@ async function main() {
             aliceMintCoinId,
             ctx.eurAssetIdHex,
           )),
+          stage34Done: true,
         };
         break;
       }
       case '5':
-        if (!ctx.assetIdHex) {
-          fail(5, 'stage 5 requires stage 2 in the same run (asset id)');
-        }
+        ctx.assetIdHex = ctx.assetIdHex || usdDemoAssetId(alice.sk0.publicKey);
         ctx = {
           ...ctx,
           ...(await stage5_bob_receive(
