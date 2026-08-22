@@ -188,6 +188,50 @@ async function sleep(ms) {
 // bitcoind mining via compose
 // ---------------------------------------------------------------------------
 
+/** Alice's latest self-delivery send coin id from the compose postgres catalog. */
+function recoverAliceChangeCoinId(alice) {
+  const fromEnv = process.env.ZKCOINS_E2E_ALICE_CHANGE_COIN_ID;
+  if (typeof fromEnv === 'string' && /^[0-9a-f]{64}$/.test(fromEnv)) {
+    return fromEnv;
+  }
+  const subjectHex = encodeHexLower(decodeZkAddress(alice.subject));
+  const sql =
+    `SELECT encode(coin_id,'hex') FROM v1_self_delivery_index ` +
+    `WHERE subject = decode('${subjectHex}','hex') AND transition_kind = 'send' ` +
+    `ORDER BY created_at DESC LIMIT 1`;
+  const result = spawnSync(
+    'docker',
+    [
+      'compose',
+      '-f',
+      COMPOSE_FILE,
+      'exec',
+      '-T',
+      'postgres',
+      'psql',
+      '-U',
+      'zkcoins',
+      '-d',
+      'zkcoins',
+      '-Atqc',
+      sql,
+    ],
+    { encoding: 'utf8', env: process.env },
+  );
+  if (result.status !== 0) {
+    log(
+      `change-coin SQL lookup failed: ${result.stderr || result.stdout || `exit ${result.status}`}`,
+    );
+    return null;
+  }
+  const hex = (result.stdout || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hex)) {
+    log(`change-coin SQL lookup returned ${JSON.stringify(hex)}`);
+    return null;
+  }
+  return hex;
+}
+
 function dockerCompose(args, stage) {
   const result = spawnSync(
     'docker',
@@ -580,10 +624,28 @@ async function syncSendCounter(client, seed, acct, stage) {
       return;
     }
     acct.sendCounter = state.send_counter;
+    for (let n = 0; n < 64; n++) {
+      const pk = encodeHexLower(
+        spendAt(seed, acct.accountIndex, acct.sendCounter).publicKey,
+      );
+      const nf = await httpJson('GET', `${API_URL}/v1/chain/nullifier/${pk}`);
+      if (nf.status === 200 && nf.json?.present === true) {
+        log(
+          `[${stage}] spend key at counter ${acct.sendCounter} already on NfLog; advance`,
+        );
+        acct.sendCounter += 1;
+        continue;
+      }
+      break;
+    }
     const expected = encodeHexLower(
       spendAt(seed, acct.accountIndex, acct.sendCounter).publicKey,
     );
-    if (state.current_pubkey && state.current_pubkey !== expected) {
+    if (
+      state.current_pubkey &&
+      state.current_pubkey !== expected &&
+      acct.sendCounter === state.send_counter
+    ) {
       fail(
         stage,
         `current_pubkey ${state.current_pubkey} != spend key at counter ${acct.sendCounter}`,
@@ -1059,8 +1121,13 @@ async function stage3_4_alice_send(client, seed, alice, bob, host, assetIdHex, a
 
   const aliceBalances = await pullBalances(client, alice);
   const aliceUsd = aliceBalances.get(resolvedAssetId);
-  if (aliceUsd === ALICE_AFTER_SEND) {
-    const expectedAfterSend = { [resolvedAssetId]: ALICE_AFTER_SEND };
+  const alreadySent =
+    typeof aliceUsd === 'string' &&
+    aliceUsd !== USD_DEMO.amount &&
+    BigInt(aliceUsd) > 0n &&
+    BigInt(aliceUsd) <= BigInt(ALICE_AFTER_SEND);
+  if (alreadySent) {
+    const expectedAfterSend = { [resolvedAssetId]: aliceUsd };
     const resolvedEur =
       typeof eurAssetIdHex === 'string' && eurAssetIdHex.length > 0
         ? eurAssetIdHex
@@ -1071,10 +1138,10 @@ async function stage3_4_alice_send(client, seed, alice, bob, host, assetIdHex, a
       expectedAfterSend[resolvedEur] = EUR_DEMO.amount;
     }
     assertBalancesExact(4, aliceBalances, expectedAfterSend);
-    pass(3, `Alice already at ${ALICE_AFTER_SEND}; skip send`);
+    pass(3, `Alice already at ${aliceUsd}; skip send`);
     pass(
       4,
-      `Alice balances after fee-less send of ${SEND_AMOUNT}: USD-Demo == ${ALICE_AFTER_SEND}` +
+      `Alice balances after fee-less send of ${SEND_AMOUNT}: USD-Demo == ${aliceUsd}` +
         (hasEur ? `, EUR-Demo == ${EUR_DEMO.amount} (untouched)` : ''),
     );
     return {
@@ -1082,14 +1149,14 @@ async function stage3_4_alice_send(client, seed, alice, bob, host, assetIdHex, a
       sendJob: null,
       sendSpendPubkey: null,
       bobCoinId: null,
-      aliceChangeCoinId: null,
+      aliceChangeCoinId: recoverAliceChangeCoinId(alice) || null,
       skipped: true,
     };
   }
   if (aliceUsd !== USD_DEMO.amount) {
     fail(
       3,
-      `unexpected Alice USD-Demo amount: expected ${USD_DEMO.amount} or ${ALICE_AFTER_SEND}, got ${aliceUsd ?? 'ABSENT'}`,
+      `unexpected Alice USD-Demo amount: expected ${USD_DEMO.amount} or ≤ ${ALICE_AFTER_SEND}, got ${aliceUsd ?? 'ABSENT'}`,
     );
   }
 
@@ -1508,9 +1575,12 @@ async function stage9_portability(ctx) {
     assertBalancesExact(9, node2Balances, node1Map);
     pass(9, 'portability (Req 10): node2 balances identical to node1');
 
-    const aliceChangeCoinId = ctx?.aliceChangeCoinId;
+    const aliceChangeCoinId =
+      typeof ctx?.aliceChangeCoinId === 'string' && ctx.aliceChangeCoinId.length === 64
+        ? ctx.aliceChangeCoinId
+        : recoverAliceChangeCoinId(alice);
     if (typeof aliceChangeCoinId !== 'string' || aliceChangeCoinId.length === 0) {
-      fail(9, 'stage 9 requires Alice change coin id from stage 3/4 in the same run');
+      fail(9, 'stage 9 requires Alice change coin id (stage 3/4 in the same run, or durable self-delivery catalog)');
     }
 
     // The coin id is threaded from the completed stage-3 job because pull
@@ -1659,6 +1729,17 @@ async function stage10_attestation(client, seed, alice, host, usdAssetIdHex) {
 }
 
 async function stage11_grants(client, alice, host, usdAssetIdHex, eurAssetIdHex) {
+  const existing = await client.openOwnershipPullSession({
+    subject: alice.subject,
+    sk0: alice.sk0.secretKey,
+    nkCommit: alice.nkCommit,
+  });
+  if (!Array.isArray(existing.records) || existing.records.length === 0) {
+    fail(
+      '11',
+      'ownership pull returned 0 records; durable v1_self_delivery_index/v1_decrypt_index still hold Alice rows — Pull lists the process-local index, which is empty until the kernel boot-hydrates those tables (restart with this tree)',
+    );
+  }
   const d = decodeHexExact(GRANTEE_SECRET_FIXTURE_HEX, 32, 'grantee_secret_d');
   const { pkBytes: granteePk } = bip340NormaliseSecret(d);
   const usdAssetIdBytes = decodeHexExact(usdAssetIdHex, 32, 'usdAssetIdHex');

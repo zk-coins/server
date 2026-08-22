@@ -1235,6 +1235,45 @@ pub async fn start_rest_node(config: RestNodeConfig) -> anyhow::Result<()> {
             }
         }
 
+        // Pull lists the process-local private-record index, not SQL. A
+        // restarted kernel would otherwise return zero records while
+        // `v1_decrypt_index` / `v1_self_delivery_index` still hold the
+        // durable catalog (GetAccountState is hydrated above; records
+        // were not). Fail-closed on SQL/decode errors — empty is only
+        // valid when both tables are empty.
+        {
+            let pg: sqlx::PgPool = (*pool).clone();
+            let decrypt_rows = crate::v1::db_decrypt_index::list_all(&pg)
+                .await
+                .map_err(|e| anyhow::anyhow!("boot-hydrate v1_decrypt_index: {e:#}"))?;
+            let self_rows = crate::v1::db_self_delivery_index::list_all(&pg)
+                .await
+                .map_err(|e| anyhow::anyhow!("boot-hydrate v1_self_delivery_index: {e:#}"))?;
+            let mut decrypt_n = 0usize;
+            let mut self_n = 0usize;
+            for row in decrypt_rows {
+                shared_private_index
+                    .insert_record(crate::v1::db_decrypt_index::to_indexed_record(&row))
+                    .map_err(|e| {
+                        anyhow::anyhow!("boot-hydrate decrypt-index insert failed: {e}")
+                    })?;
+                decrypt_n += 1;
+            }
+            for row in self_rows {
+                shared_private_index
+                    .insert_record(crate::v1::db_self_delivery_index::to_indexed_record(&row))
+                    .map_err(|e| {
+                        anyhow::anyhow!("boot-hydrate self-delivery insert failed: {e}")
+                    })?;
+                self_n += 1;
+            }
+            tracing::info!(
+                decrypt_index = decrypt_n,
+                self_delivery_index = self_n,
+                "Pull private-record index hydrated from SQL at boot"
+            );
+        }
+
         // Multi-member half-agg drain loop (same process as gRPC accept).
         // Transient bitcoind/publisher outages skip the cycle and retry —
         // never pass publisher=None into drain (that would terminal-fail
