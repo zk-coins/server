@@ -1584,6 +1584,10 @@ function runVerifyAttestation(attestationHex) {
   // The attestation hex is large (proof ~180 KB → ~360 KB hex), far past the OS
   // argv length limit ("argument list too long"), so feed it on stdin instead of
   // an --attestation-hex arg (the CLI reads trimmed stdin when the flag is absent).
+  const native = process.env.ZKCOINS_VERIFY_ATTESTATION;
+  if (typeof native === 'string' && native.length > 0) {
+    return spawnSync(native, [], { encoding: 'utf8', input: attestationHex });
+  }
   return spawnSync(
     'docker',
     ['compose', '-f', COMPOSE_FILE, 'exec', '-T', 'node', 'verify_attestation'],
@@ -2140,15 +2144,12 @@ async function main() {
         await stage9_portability(ctx);
         break;
       case '10':
-        if (!ctx.assetIdHex) {
-          fail('10', 'stage 10 requires stage 2 in the same run (Alice USD asset id)');
-        }
+        ctx.assetIdHex = ctx.assetIdHex || usdDemoAssetId(alice.sk0.publicKey);
         await stage10_attestation(client, seed, alice, host, ctx.assetIdHex);
         break;
       case '11':
-        if (!ctx.assetIdHex || !ctx.eurAssetIdHex) {
-          fail('11', 'stage 11 requires stage 2 AND stage 2b in the same run (USD + EUR asset ids)');
-        }
+        ctx.assetIdHex = ctx.assetIdHex || usdDemoAssetId(alice.sk0.publicKey);
+        ctx.eurAssetIdHex = ctx.eurAssetIdHex || eurDemoAssetId(carol.sk0.publicKey);
         await stage11_grants(client, alice, host, ctx.assetIdHex, ctx.eurAssetIdHex);
         break;
       default:
