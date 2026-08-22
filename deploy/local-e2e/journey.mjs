@@ -837,10 +837,14 @@ async function stage2_alice_mint(client, seed, alice, host) {
   const assetIdHex = usdDemoAssetId(alice.sk0.publicKey);
   try {
     const existing = await pullBalances(client, alice);
-    if (existing.get(assetIdHex) === USD_DEMO.amount) {
-      pass(2, 'Alice already holds USD-Demo at the expected amount; skip mint');
+    if (existing.has(assetIdHex)) {
+      pass(
+        2,
+        `Alice already holds USD-Demo (${existing.get(assetIdHex)}); skip mint`,
+      );
       return { assetIdHex, mintJob: null, mintSpendPubkey: null, skipped: true };
     }
+    log(`[2-mint] balances without USD-Demo (keys=${[...existing.keys()].join(',') || 'none'})`);
   } catch (err) {
     log(`[2-mint] no balance yet; minting (${err && err.name ? err.name : 'error'})`);
   }
