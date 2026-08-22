@@ -612,7 +612,7 @@ async function pullBalances(client, acct) {
 }
 
 /** Load send_counter from the kernel so a rerun does not sign the wrong spend key. */
-async function syncSendCounter(client, seed, acct, stage) {
+async function syncSendCounter(client, seed, acct, stage, apiUrl = API_URL) {
   try {
     const pull = await client.openOwnershipPullSession({
       subject: acct.subject,
@@ -628,7 +628,7 @@ async function syncSendCounter(client, seed, acct, stage) {
       const pk = encodeHexLower(
         spendAt(seed, acct.accountIndex, acct.sendCounter).publicKey,
       );
-      const nf = await httpJson('GET', `${API_URL}/v1/chain/nullifier/${pk}`);
+      const nf = await httpJson('GET', `${apiUrl}/v1/chain/nullifier/${pk}`);
       if (nf.status === 200 && nf.json?.present === true) {
         log(
           `[${stage}] spend key at counter ${acct.sendCounter} already on NfLog; advance`,
@@ -1604,6 +1604,15 @@ async function stage9_portability(ctx) {
         9,
         `node2 Alice current_pubkey does not match seed-derived spend key at counter ${alice.sendCounter}`,
       );
+    }
+    const headPk = expectedCurrentPubkey;
+    const nfHead = await httpJson('GET', `${API_URL_2}/v1/chain/nullifier/${headPk}`);
+    if (nfHead.status === 200 && nfHead.json?.present === true) {
+      pass(
+        9,
+        'portability (Req 10): node2 balances identical to node1; skip send because account-head spend key is already on NfLog',
+      );
+      return;
     }
 
     const publisher = publisherPubkeyHexFromEnv('PUBLISHER_KEY_2', 9);
