@@ -147,13 +147,15 @@ async function httpJson(method, url, body, headers = {}) {
   }
   // Bounded retry for transient connection failures only (thrown fetch).
   // HTTP responses (incl. 4xx/5xx) are never retried. Max 3 attempts;
-  // backoff 500ms then 1500ms via sleep. Per-attempt AbortController 15s.
+  // backoff 500ms then 1500ms via sleep. Per-attempt abort is long enough
+  // that a single prove-blocked GET does not exhaust the 3 attempts.
   const maxAttempts = 3;
   const backoffsMs = [500, 1500];
+  const attemptMs = Number(process.env.ZKCOINS_E2E_HTTP_TIMEOUT_MS ?? 180_000);
   let res;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
+    const timer = setTimeout(() => controller.abort(), attemptMs);
     try {
       res = await fetch(url, { ...init, signal: controller.signal });
       break;
@@ -432,19 +434,32 @@ function assertBalancesExact(stage, map, expected) {
 
 async function waitJobStatus(client, jobId, want, stage) {
   const deadline = Date.now() + JOB_WAIT_MS;
+  let lastErr = null;
   while (Date.now() < deadline) {
-    const { job, retryAfterMs } = await client.getJob(jobId);
-    if (job.status === want) return job;
-    if (job.status === 'failed' || job.status === 'cancelled') {
-      fail(
-        stage,
-        `job ${jobId} terminal ${job.status}: ${JSON.stringify(job.error ?? job)}`,
+    try {
+      const { job, retryAfterMs } = await client.getJob(jobId);
+      lastErr = null;
+      if (job.status === want) return job;
+      if (job.status === 'failed' || job.status === 'cancelled') {
+        fail(
+          stage,
+          `job ${jobId} terminal ${job.status}: ${JSON.stringify(job.error ?? job)}`,
+        );
+      }
+      const wait = retryAfterMs ?? 2000;
+      await sleep(Math.min(wait, POLL_CAP_MS));
+    } catch (err) {
+      // Proving saturates the kernel process; GET /v1/jobs then times out.
+      // Keep polling until JOB_WAIT_MS instead of aborting the journey.
+      lastErr = err;
+      log(
+        `[${stage}] getJob ${jobId} transient ${err && err.name ? err.name : 'error'}; retry`,
       );
+      await sleep(POLL_CAP_MS);
     }
-    const wait = retryAfterMs ?? 2000;
-    await sleep(Math.min(wait, POLL_CAP_MS));
   }
-  fail(stage, `timeout waiting for job ${jobId} status ${JSON.stringify(want)}`);
+  const extra = lastErr ? ` last error: ${lastErr}` : '';
+  fail(stage, `timeout waiting for job ${jobId} status ${JSON.stringify(want)}${extra}`);
 }
 
 async function runSignedTransition(client, seed, acct, request, stage) {
@@ -1844,7 +1859,7 @@ async function main() {
   const client = new ZkCoinsV1Client({
     apiUrl: API_URL,
     network: 'regtest',
-    requestTimeoutMs: 120_000,
+    requestTimeoutMs: Number(process.env.ZKCOINS_E2E_HTTP_TIMEOUT_MS ?? 180_000),
   });
   const host = canonicalHostFromApiUrl(API_URL);
   const seed = seedFromMnemonicV1(MNEMONIC);
