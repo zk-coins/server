@@ -1256,6 +1256,48 @@ async function stage5_bob_receive(client, seed, bob, assetIdHex, bobCoinId) {
   return { bobReceiveJob: job, bobReceiveSpendPubkey: spendPubkey };
 }
 
+/**
+ * When stage 3 was skipped, recover a used Alice spend pubkey that already
+ * has a completed §3.10 inscription. Prefer the latest used index (just
+ * before the current head) so a mint (index 0) is not selected first.
+ */
+async function recoverCompletedAliceSpendPubkey(client, seed, alice) {
+  await syncSendCounter(client, seed, alice, '6-recover');
+  if (!Number.isSafeInteger(alice.sendCounter) || alice.sendCounter < 1) {
+    return null;
+  }
+  const res = await httpJson('GET', `${API_URL}/v1/chain/inscriptions?limit=50`);
+  if (res.status !== 200 || !Array.isArray(res.json?.inscriptions)) {
+    return null;
+  }
+  /** @type {Map<string, { confirmation_state: string, memberState?: string }>} */
+  const byPk = new Map();
+  for (const ins of res.json.inscriptions) {
+    const members = ins.nullifiers ?? ins.members ?? [];
+    for (const m of members) {
+      const pk = m.pubkey ?? m.pk ?? m.public_key;
+      if (typeof pk !== 'string') continue;
+      byPk.set(pk.toLowerCase(), {
+        confirmation_state: ins.confirmation_state,
+        memberState: m.state,
+      });
+    }
+  }
+  for (let i = alice.sendCounter - 1; i >= 0; i--) {
+    const hex = encodeHexLower(spendAt(seed, alice.accountIndex, i).publicKey);
+    const hit = byPk.get(hex.toLowerCase());
+    if (
+      hit &&
+      hit.confirmation_state === 'completed' &&
+      (hit.memberState === 'completed' || hit.memberState === undefined)
+    ) {
+      log(`[6-recover] Alice spend index ${i} has completed inscription`);
+      return hex;
+    }
+  }
+  return null;
+}
+
 async function stage6_confirmation_link(sendSpendPubkey) {
   if (typeof sendSpendPubkey !== 'string' && !(sendSpendPubkey instanceof Uint8Array)) {
     fail(6, 'stage 6 requires sendSpendPubkey from stage 3/4 (Alice→Bob payment)');
@@ -2077,12 +2119,17 @@ async function main() {
           )),
         };
         break;
-      case '6':
-        if (!ctx.sendSpendPubkey) {
-          fail(6, 'stage 6 requires stage 3/4 in the same run (sendSpendPubkey)');
+      case '6': {
+        let sendPk = ctx.sendSpendPubkey;
+        if (!sendPk) {
+          sendPk = await recoverCompletedAliceSpendPubkey(client, seed, alice);
         }
-        await stage6_confirmation_link(ctx.sendSpendPubkey);
+        if (!sendPk) {
+          fail(6, 'stage 6 requires sendSpendPubkey from stage 3/4 or a completed Alice inscription');
+        }
+        await stage6_confirmation_link(sendPk);
         break;
+      }
       case '7':
         await stage7_reorg();
         break;
