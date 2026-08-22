@@ -1893,13 +1893,21 @@ pub(crate) fn recovery_blob_holders(advertised: &[String], blob_stores: &[String
 /// node (checked via the same private-index read `/v1/pull`'s
 /// `get_account_state` uses) — a re-run of the campaign must not re-scan,
 /// re-replay, or re-install these; it only needs to make progress on the rest.
+///
+/// A head whose `current_pubkey` is already a first-occurrence winner on the
+/// canonical NfLog is **not** recovered: the served `send_counter` still names
+/// a spent key, so SDR replay must install the post-spend state.
 fn already_recovered_subjects(
     index: &InMemoryPrivateIndex,
     active: &[(SubjectAddress, OperationalBundle)],
+    current_pk_spent_on_nflog: impl Fn(&[u8; 32]) -> bool,
 ) -> HashSet<[u8; 32]> {
     active
         .iter()
-        .filter(|(subject, _)| index.get_account_state(subject).is_ok())
+        .filter(|(subject, _)| match index.get_account_state(subject) {
+            Ok(view) => !current_pk_spent_on_nflog(&view.current_pubkey),
+            Err(_) => false,
+        })
         .map(|(subject, _)| subject.0)
         .collect()
 }
@@ -1921,7 +1929,11 @@ pub(crate) async fn run_recovery_campaign(
     // run without an operational bundle (see [`RecoveryError::NoOperationalBundle`]
     // text). There is no path that starts the scan with an empty subject set.
     let active = wait_for_active_bundles(&deps.bundles).await;
-    let already_recovered = already_recovered_subjects(&deps.index, &active);
+    let already_recovered = already_recovered_subjects(&deps.index, &active, |pk| {
+        deps.adapter.with_engine(|engine| {
+            matches!(engine.nflog().lookup(*pk), LookupResult::Present { .. })
+        })
+    });
     if !already_recovered.is_empty() {
         tracing::info!(
             subjects = already_recovered.len(),
@@ -2513,9 +2525,9 @@ async fn stage_output_ref_via_adapter(
 ///
 /// Idempotent across repeat campaign runs: if the engine already holds this
 /// subject at a send_counter >= the reconstructed head's, this is a no-op
-/// success (already installed). If it holds an *older* account, that is a
-/// fail-closed contradiction (no in-place update path exists for a live
-/// account — this task never adds one).
+/// success (already installed). If it holds an *older* account, the reconstructed
+/// head replaces it (`StateEngine::replace_account`) after the same VERIFY-ONLY
+/// reconstruction as a first install.
 async fn install_and_persist_recovered_head(
     deps: &RecoveryCampaignDeps,
     bridge: &ProverBridge,
@@ -2543,14 +2555,6 @@ async fn install_and_persist_recovered_head(
             );
             return Ok(());
         }
-        return Err(SdrDiscardReason::HeadReconstructionFailed {
-            detail: format!(
-                "engine already holds account at send_counter {existing}, behind the \
-                 reconstructed head {} — no in-place account update path exists; refusing \
-                 to overwrite (nothing was changed)",
-                head.record.account_state.send_counter
-            ),
-        });
     }
 
     // 1. Admitted coin universe: this account's own self-created outputs
@@ -2702,16 +2706,50 @@ async fn install_and_persist_recovered_head(
         })?;
 
     // 6. Install, then persist durably; roll the live engine back on a
-    // persist failure so memory and disk never diverge.
+    // persist failure so memory and disk never diverge. Hold the write gate
+    // for the full snapshot→mutate→persist→restore window (same serialisation
+    // as receive/scan). Re-read the live send_counter under the gate so
+    // insert vs replace is not a stale pre-reconstruct decision.
+    let _write_gate = deps.adapter.lock_writes().await;
+    let existing_now = deps
+        .adapter
+        .with_engine(|engine| engine.account(&owner).map(|r| r.state.send_counter));
+    let replace_stale = match existing_now {
+        Some(existing) if existing >= head.record.account_state.send_counter => {
+            tracing::info!(
+                subject = %hex::encode(subject),
+                existing_send_counter = existing,
+                head_send_counter = head.record.account_state.send_counter,
+                "§4.5 recovery: engine already holds this subject at or beyond the \
+                 reconstructed head — treating as already installed"
+            );
+            return Ok(());
+        }
+        Some(_) => true,
+        None => false,
+    };
     let pre = deps.adapter.snapshot_live();
     let insert_result = deps
         .adapter
-        .with_engine_mut(|engine| engine.insert_account(owner, record))
+        .with_engine_mut(|engine| {
+            if replace_stale {
+                engine.replace_account(owner, record)
+            } else {
+                engine.insert_account(owner, record)
+            }
+        })
         .map_err(|e| SdrDiscardReason::HeadReconstructionFailed {
             detail: format!("stack claim for account install: {e:#}"),
         })?;
     insert_result.map_err(|e| SdrDiscardReason::HeadReconstructionFailed {
-        detail: format!("insert_account: {e:#}"),
+        detail: format!(
+            "{}: {e:#}",
+            if replace_stale {
+                "replace_account"
+            } else {
+                "insert_account"
+            }
+        ),
     })?;
 
     if let Err(e) = deps.adapter.persist().await {
@@ -3277,11 +3315,46 @@ mod tests {
             .expect("register recovered subject fixture");
 
         let active = vec![(recovered_subject, bundle), (missing_subject, bundle)];
-        let recovered = already_recovered_subjects(&index, &active);
+        let recovered = already_recovered_subjects(&index, &active, |_| false);
         assert_eq!(recovered, HashSet::from([recovered_subject.0]));
         assert!(!recovered.contains(&missing_subject.0));
 
-        assert!(already_recovered_subjects(&index, &[]).is_empty());
+        assert!(already_recovered_subjects(&index, &[], |_| false).is_empty());
+    }
+
+    #[test]
+    fn already_recovered_subjects_skips_head_whose_current_pubkey_is_on_nflog() {
+        let recovered_subject = SubjectAddress([0x31; 32]);
+        let bundle = OperationalBundle {
+            ivk: [0x11; 32],
+            ovk: [0x12; 32],
+            op: [0x13; 32],
+            nk: [0x14; 32],
+            op_secret: [0x15; 32],
+        };
+        let current_pubkey = [0x22; 32];
+        let index = InMemoryPrivateIndex::new();
+        index
+            .insert_account(
+                recovered_subject,
+                crate::kernel::access::AccountStateView {
+                    account_state: vec![0x01],
+                    state_head: crate::kernel::types::Digest32([0x21; 32]),
+                    head_record_id: None,
+                    send_counter: 7,
+                    current_pubkey,
+                    last_nullifier_pk: None,
+                    last_nullifier_r: None,
+                },
+            )
+            .expect("register stale-head subject fixture");
+
+        let active = vec![(recovered_subject, bundle)];
+        let recovered = already_recovered_subjects(&index, &active, |pk| pk == &current_pubkey);
+        assert!(
+            recovered.is_empty(),
+            "stale head with spent current_pubkey must be replayed"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5157,15 +5230,13 @@ mod tests {
             &behind_accepted,
         )
         .await
-        .expect_err("an older installed account must fail closed instead of being overwritten");
-        assert_eq!(
-            err,
-            SdrDiscardReason::HeadReconstructionFailed {
-                detail: "engine already holds account at send_counter 1, behind the \
-                         reconstructed head 2 — no in-place account update path exists; refusing \
-                         to overwrite (nothing was changed)"
-                    .into(),
-            }
+        .expect_err(
+            "stale engine head is eligible for replace, but this fixture has no NfLog prefix \
+             that opens the reconstructed head — reconstruction must fail closed without mutating",
+        );
+        assert!(
+            matches!(err, SdrDiscardReason::HeadReconstructionFailed { .. }),
+            "got {err:?}"
         );
         assert_eq!(
             adapter.with_engine(|engine| {
