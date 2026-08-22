@@ -567,6 +567,36 @@ async function pullBalances(client, acct) {
   return parseBalancesMap(state.account_state);
 }
 
+/** Load send_counter from the kernel so a rerun does not sign the wrong spend key. */
+async function syncSendCounter(client, seed, acct, stage) {
+  try {
+    const pull = await client.openOwnershipPullSession({
+      subject: acct.subject,
+      sk0: acct.sk0.secretKey,
+      nkCommit: acct.nkCommit,
+    });
+    const state = await client.getAccountState(pull.session);
+    if (!Number.isSafeInteger(state.send_counter) || state.send_counter < 0) {
+      return;
+    }
+    acct.sendCounter = state.send_counter;
+    const expected = encodeHexLower(
+      spendAt(seed, acct.accountIndex, acct.sendCounter).publicKey,
+    );
+    if (state.current_pubkey && state.current_pubkey !== expected) {
+      fail(
+        stage,
+        `current_pubkey ${state.current_pubkey} != spend key at counter ${acct.sendCounter}`,
+      );
+    }
+    log(`[${stage}] synced send_counter=${acct.sendCounter}`);
+  } catch (err) {
+    log(
+      `[${stage}] no account state yet; send_counter stays ${acct.sendCounter} (${err && err.name ? err.name : 'error'})`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Nullifier / inscription §3.10
 // ---------------------------------------------------------------------------
@@ -802,6 +832,7 @@ async function stage1_info(client) {
 
 async function stage2_alice_mint(client, seed, alice, host) {
   await entrustBundle(alice, host, API_URL, client);
+  await syncSendCounter(client, seed, alice, '2-mint');
 
   const assetIdHex = usdDemoAssetId(alice.sk0.publicKey);
   const pub = publisherPubkeyHex();
