@@ -835,6 +835,15 @@ async function stage2_alice_mint(client, seed, alice, host) {
   await syncSendCounter(client, seed, alice, '2-mint');
 
   const assetIdHex = usdDemoAssetId(alice.sk0.publicKey);
+  try {
+    const existing = await pullBalances(client, alice);
+    if (existing.get(assetIdHex) === USD_DEMO.amount) {
+      pass(2, 'Alice already holds USD-Demo at the expected amount; skip mint');
+      return { assetIdHex, mintJob: null, mintSpendPubkey: null, skipped: true };
+    }
+  } catch (err) {
+    log(`[2-mint] no balance yet; minting (${err && err.name ? err.name : 'error'})`);
+  }
   const pub = publisherPubkeyHex();
 
   // First mint has no AccountState yet → self-output exemption fails; every
