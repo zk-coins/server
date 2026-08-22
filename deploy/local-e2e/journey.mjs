@@ -11,8 +11,9 @@
  *   USD-Demo, decimals=2, issuance_version=1, supply 1_000_000_000
  *   fee-less (D9); every confirmation wait = 6 mined blocks
  *
- * Default run: stages 1–2 (hard). Stages 2b–11 are named controls that fail
- * with an honest TODO when the surrounding mechanics are not yet operable.
+ * Default run: stages 1–2. Stages 2b–11 are named fail-closed controls;
+ * request them explicitly (`--stage` / all-stages wrapper). A re-run skips
+ * a completed mint/send/receive when the live balances already match.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -1894,8 +1895,8 @@ function parseArgs(argv) {
       out.stages.push(v);
     } else if (a === '-h' || a === '--help') {
       console.log(`Usage: journey.mjs [--stage N]… [--list]
-Default: stages 1 and 2 (hard core that this tree can drive unmocked).
-Stages 2b–11 are named and fail with TODO until their mechanics are operable.
+Default: stages 1 and 2.
+Stages 2b–11 are named fail-closed controls; pass --stage to run them.
 `);
       process.exit(0);
     } else {

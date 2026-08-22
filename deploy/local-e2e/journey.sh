@@ -5,9 +5,9 @@
 # sibling ../sdk available via package.json file: dependency.
 #
 # Usage:
-#   ./deploy/local-e2e/journey.sh                 # core steps 1–6
+#   ./deploy/local-e2e/journey.sh                 # default stages 1–2
 #   ./deploy/local-e2e/journey.sh --stage 1       # single stage
-#   ./deploy/local-e2e/journey.sh --stage 7       # reorg control (may be TODO)
+#   ./deploy/local-e2e/journey.sh --stage 7       # reorg control N-09
 #   ./deploy/local-e2e/journey.sh --list           # list stages
 
 set -euo pipefail
