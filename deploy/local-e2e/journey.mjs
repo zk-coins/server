@@ -1875,7 +1875,7 @@ const STAGES = {
   5: 'Bob receive fold + balance',
   6: 'confirmation link §3.10 completed',
   7: 'reorg control N-09',
-  8: 'recovery control Req 6 (TODO)',
+  8: 'recovery control Req 6',
   9: 'portability control Req 10',
   10: 'attestation round-trip Req 9(b): produce + independent verify + tamper-reject',
   11: 'grant control Req 9(c): issue USD-scoped grant, in-scope pull ok, EUR out-of-scope refused',
