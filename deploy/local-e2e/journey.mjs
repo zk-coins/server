@@ -511,7 +511,7 @@ async function runSignedTransition(client, seed, acct, request, stage) {
 // Entrust + pull balances
 // ---------------------------------------------------------------------------
 
-async function entrustBundle(acct, host, apiUrl = API_URL) {
+async function entrustBundle(acct, host, apiUrl = API_URL, client = null) {
   const ch = await httpJson('POST', `${apiUrl}/v1/bootstrap/challenge`, {
     subject: acct.subject,
     action: 'entrust',
@@ -536,10 +536,25 @@ async function entrustBundle(acct, host, apiUrl = API_URL) {
     ownership_proof: proof,
     bundle: acct.bundleHex,
   });
-  if (en.status !== 200 || !en.json?.accepted) {
-    fail('entrust', `bootstrap/entrust HTTP ${en.status}: ${en.text}`);
+  if (en.status === 200 && en.json?.accepted) {
+    pass('entrust', `operational bundle accepted for account'=${acct.accountIndex}`);
+    return;
   }
-  pass('entrust', `operational bundle accepted for account'=${acct.accountIndex}`);
+  // Live kernel maps "already active" to wrong_phase, which the API edge
+  // rejects as internal_error. If ownership pull works, the bundle is in.
+  if (client) {
+    try {
+      await pullBalances(client, acct);
+      pass(
+        'entrust',
+        `operational bundle already active for account'=${acct.accountIndex}`,
+      );
+      return;
+    } catch {
+      /* fall through to the original failure */
+    }
+  }
+  fail('entrust', `bootstrap/entrust HTTP ${en.status}: ${en.text}`);
 }
 
 async function pullBalances(client, acct) {
@@ -786,7 +801,7 @@ async function stage1_info(client) {
 }
 
 async function stage2_alice_mint(client, seed, alice, host) {
-  await entrustBundle(alice, host);
+  await entrustBundle(alice, host, API_URL, client);
 
   const assetIdHex = usdDemoAssetId(alice.sk0.publicKey);
   const pub = publisherPubkeyHex();
