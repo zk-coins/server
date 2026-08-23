@@ -1489,6 +1489,65 @@ mod tests {
     }
 
     #[test]
+    fn inclusion_proof_wire_rejects_truncated_prefix() {
+        let err = parse_inclusion_proof_wire(&[0u8; 4])
+            .expect_err("truncated inclusion proof must be rejected");
+
+        assert!(matches!(err, IncomingError::Verification(_)));
+        assert!(err
+            .to_string()
+            .contains("inclusion_proof truncated (need leaf_index + depth)"));
+    }
+
+    #[test]
+    fn inclusion_proof_wire_rejects_depth_above_max() {
+        let bytes = vec![0, 0, 0, 0, (MAX_OUTPUT_MERKLE_DEPTH as u8) + 1];
+        let err = parse_inclusion_proof_wire(&bytes)
+            .expect_err("inclusion proof depth above the maximum must be rejected");
+
+        assert!(matches!(err, IncomingError::Verification(_)));
+        assert!(err.to_string().contains("MAX_OUTPUT_MERKLE_DEPTH"));
+    }
+
+    #[test]
+    fn inclusion_proof_wire_rejects_length_mismatch() {
+        let bytes = vec![0, 0, 0, 0, 1];
+        let err = parse_inclusion_proof_wire(&bytes)
+            .expect_err("inclusion proof with mismatched length must be rejected");
+
+        assert!(matches!(err, IncomingError::Verification(_)));
+        assert!(err.to_string().contains("37"));
+    }
+
+    #[test]
+    fn inclusion_proof_wire_rejects_noncanonical_sibling() {
+        use plonky2::field::types::Field64;
+        use zkcoins_program::F;
+
+        let mut bytes = vec![0, 0, 0, 0, 1];
+        bytes.extend_from_slice(&F::ORDER.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 24]);
+
+        let err = parse_inclusion_proof_wire(&bytes)
+            .expect_err("non-canonical sibling digest must be rejected");
+        assert!(matches!(err, IncomingError::Verification(_)));
+    }
+
+    #[test]
+    fn inclusion_proof_wire_roundtrip_depth1() {
+        let mut bytes = Vec::with_capacity(37);
+        bytes.extend_from_slice(&7u32.to_be_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&[0x11u8; 32]);
+
+        let p = parse_inclusion_proof_wire(&bytes).expect("depth-1 inclusion proof must parse");
+        assert_eq!(p.leaf_index, 7);
+        assert_eq!(p.depth, 1);
+        assert_eq!(p.siblings.len(), 1);
+        assert_eq!(digest_to_bytes(&p.siblings[0]), [0x11u8; 32]);
+    }
+
+    #[test]
     fn holder_outcome_display_names_content_address_lie() {
         let o = HolderOutcome::ContentAddressLie {
             expected: [0x01; 32],
