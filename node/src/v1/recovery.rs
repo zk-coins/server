@@ -2376,7 +2376,7 @@ pub(crate) async fn run_recovery_campaign(
                             );
                         }
                         Err(reason) => {
-                            fold_failed = true;
+                            let fetch_miss = matches!(reason, SdrDiscardReason::FetchFailed { .. });
                             report.sdr_discards.push(SdrDiscard {
                                 subject: subject.0,
                                 blob_id: oref.blob_id,
@@ -2384,6 +2384,15 @@ pub(crate) async fn run_recovery_campaign(
                                 send_counter: Some(accepted_sdr.record.send_counter),
                                 reason,
                             });
+                            if fetch_miss {
+                                tracing::warn!(
+                                    subject = %hex::encode(subject.0),
+                                    oref_blob = %hex::encode(oref.blob_id),
+                                    "§4.5 recovery: output_ref blob missing; continuing fold with indexed coins"
+                                );
+                            } else {
+                                fold_failed = true;
+                            }
                         }
                     }
                 }
