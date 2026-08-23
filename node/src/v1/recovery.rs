@@ -613,30 +613,47 @@ pub(crate) fn verify_sdr_record_pre_engine(
 
 /// Engine-only part of §4.2 check (iv): NfLog classification, lookup, and
 /// mirror-height resolution. No attacker-controlled proof parsing occurs here.
+///
+/// First-occurrence matches either `R_create` or `R'_create`. The S2C opening
+/// already binds both to `H(ProofData)` in [`verify_sdr_record_pre_engine`].
+/// An inscription that published `R'` as the NfLog member (payload order
+/// `Pk ‖ R ‖ R'` vs a swapped publish) is still the same spend, not a
+/// double-spend loser.
 pub(crate) fn verify_sdr_record_engine_checks(
     engine: &StateEngine,
     pk_create: [u8; 32],
     r_create: [u8; 32],
+    r_prime_create: [u8; 32],
 ) -> Result<u64 /* inclusion_height */, SdrDiscardReason> {
-    match engine.nflog().classify(pk_create, r_create) {
-        SpendClassification::ValidFirstSpend => {}
-        SpendClassification::RejectedDoubleSpend => {
-            return Err(SdrDiscardReason::NotFirstOccurrence {
-                detail: "creating Pk is present with a different R (double-spend loser)".into(),
-            });
-        }
-        SpendClassification::Pending => {
-            return Err(SdrDiscardReason::NotFirstOccurrence {
-                detail: "creating nullifier is not a first-occurrence on receiver NfLog".into(),
-            });
-        }
+    let r_on_log = |r: [u8; 32]| {
+        matches!(
+            engine.nflog().classify(pk_create, r),
+            SpendClassification::ValidFirstSpend
+        )
+    };
+    if !r_on_log(r_create) && !r_on_log(r_prime_create) {
+        return Err(SdrDiscardReason::NotFirstOccurrence {
+            detail: match engine.nflog().lookup(pk_create) {
+                LookupResult::Present { r, .. } => format!(
+                    "creating Pk is present with a different R (double-spend loser); \
+                     sdr_r={} sdr_r_prime={} nflog_r={}",
+                    hex::encode(r_create),
+                    hex::encode(r_prime_create),
+                    hex::encode(r)
+                ),
+                LookupResult::Absent => {
+                    "creating nullifier is not a first-occurrence on receiver NfLog".into()
+                }
+            },
+        });
     }
     let inclusion_pos = match engine.nflog().lookup(pk_create) {
-        LookupResult::Present { pos, r, .. } if r == r_create => pos,
+        LookupResult::Present { pos, r, .. } if r == r_create || r == r_prime_create => pos,
         LookupResult::Present { r, .. } => {
             return Err(SdrDiscardReason::NotFirstOccurrence {
                 detail: format!(
-                    "NfLog first-occurrence R mismatches creating_nullifier.R (log has {})",
+                    "NfLog first-occurrence R mismatches creating_nullifier.R and R' \
+                     (log has {})",
                     hex::encode(r)
                 ),
             });
@@ -2230,7 +2247,12 @@ pub(crate) async fn run_recovery_campaign(
                         }
                     };
                 let inclusion_height = match deps.adapter.with_engine(|engine| {
-                    verify_sdr_record_engine_checks(engine, pk_create, r_create)
+                    verify_sdr_record_engine_checks(
+                        engine,
+                        pk_create,
+                        r_create,
+                        record.own_nullifier.r_prime_create,
+                    )
                 }) {
                     Ok(height) => height,
                     Err(reason) => {
@@ -5516,7 +5538,12 @@ mod tests {
         let bridge = ProverBridge::new(Network::Regtest);
         let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
             .expect("pre-engine checks must pass");
-        let err = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
+        let err = verify_sdr_record_engine_checks(
+            &engine,
+            pk_create,
+            r_create,
+            record.own_nullifier.r_prime_create,
+        )
             .expect_err("check (iv) first-occurrence must fail");
         assert!(
             matches!(err, SdrDiscardReason::NotFirstOccurrence { .. }),
@@ -5538,7 +5565,12 @@ mod tests {
         let bridge = ProverBridge::new(Network::Regtest);
         let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
             .expect("pre-engine checks must still pass");
-        let inclusion_height = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
+        let inclusion_height = verify_sdr_record_engine_checks(
+            &engine,
+            pk_create,
+            r_create,
+            record.own_nullifier.r_prime_create,
+        )
             .expect("engine checks must still pass");
         let err = verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
             .await
@@ -5563,7 +5595,12 @@ mod tests {
         let bridge = ProverBridge::new(Network::Regtest);
         let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
             .expect("pre-engine checks must still pass");
-        let inclusion_height = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
+        let inclusion_height = verify_sdr_record_engine_checks(
+            &engine,
+            pk_create,
+            r_create,
+            record.own_nullifier.r_prime_create,
+        )
             .expect("engine checks must still pass");
         let err = verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
             .await
@@ -5588,7 +5625,12 @@ mod tests {
         let bridge = ProverBridge::new(Network::Regtest);
         let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
             .expect("pre-engine checks must still pass");
-        let inclusion_height = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
+        let inclusion_height = verify_sdr_record_engine_checks(
+            &engine,
+            pk_create,
+            r_create,
+            record.own_nullifier.r_prime_create,
+        )
             .expect("engine checks must still pass");
         let err = verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
             .await
@@ -5611,7 +5653,12 @@ mod tests {
         let bridge = ProverBridge::new(Network::Regtest);
         let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
             .expect("fully valid record must pass pre-engine checks");
-        let inclusion_height = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
+        let inclusion_height = verify_sdr_record_engine_checks(
+            &engine,
+            pk_create,
+            r_create,
+            record.own_nullifier.r_prime_create,
+        )
             .expect("fully valid record must pass engine checks");
         verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
             .await
