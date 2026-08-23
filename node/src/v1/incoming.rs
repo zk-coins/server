@@ -2021,4 +2021,17 @@ mod tests {
             Some(terms)
         );
     }
+
+    #[tokio::test]
+    async fn fetch_blob_from_holders_empty_list_is_holders_empty() {
+        let client = BlossomClient::new(1024).expect("reqwest client");
+        let blob_id = [0u8; 32];
+        let holders: &[String] = &[];
+
+        let err = fetch_blob_from_holders(&client, &blob_id, holders)
+            .await
+            .expect_err("empty holders must fail before HTTP");
+
+        assert!(matches!(err, IncomingError::HoldersEmpty));
+    }
 }
