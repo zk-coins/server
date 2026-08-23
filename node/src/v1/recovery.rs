@@ -68,7 +68,7 @@ use zkcoins_prover::prover_bridge::{NavOpening, NullifierOpening, ProverBridge};
 use zkcoins_prover::state_engine::{OpSecret, StateEngine, TrackedCoin};
 
 use super::adapter::EngineAdapter;
-use super::blossom::BlossomClient;
+use super::blossom::{blob_id_of, BlossomClient};
 use super::db_decrypt_index::decrypt_record_id;
 use super::db_self_delivery_index::{
     get_by_subject_coin as get_self_delivery_by_subject_coin,
@@ -1745,16 +1745,12 @@ async fn stage_output_ref_inner(
         detail: format!("self-delivery lookup for fold skip: {e:#}"),
     })?
     .is_some()
-        || super::db_decrypt_index::get_by_subject_coin(
-            stores.pool,
-            secrets.subject,
-            &oref.coin_id,
-        )
-        .await
-        .map_err(|e| SdrDiscardReason::IndexLookupFailed {
-            detail: format!("decrypt-index lookup for fold skip: {e:#}"),
-        })?
-        .is_some()
+        || super::db_decrypt_index::get_by_subject_coin(stores.pool, secrets.subject, &oref.coin_id)
+            .await
+            .map_err(|e| SdrDiscardReason::IndexLookupFailed {
+                detail: format!("decrypt-index lookup for fold skip: {e:#}"),
+            })?
+            .is_some()
     {
         return Ok(StagedFoldOutcome::AlreadyPresent {
             coin_id: oref.coin_id,
@@ -1795,11 +1791,8 @@ async fn stage_output_ref_inner(
         detail: format!("BlossomClient: {e}"),
     })?;
     let holders = recovery_blob_holders(&oref.blob_locators.holders, blob_stores);
-    let (zbe_ciphertext, _attempts) = fetch_blob_from_holders(&client, &oref.blob_id, &holders)
-        .await
-        .map_err(|e| SdrDiscardReason::FetchFailed {
-            detail: e.to_string(),
-        })?;
+    let zbe_ciphertext =
+        fetch_blob_with_outbox_fallback(stores.pool, &client, &oref.blob_id, &holders).await?;
 
     // 3. ZBE-open under recovered K_tx.
     let plaintext =
@@ -1918,6 +1911,77 @@ pub(crate) fn recovery_blob_holders(advertised: &[String], blob_stores: &[String
         }
     }
     holders
+}
+
+/// Blossom first; durable outbox ZBE if every holder 404s or holders are empty.
+async fn fetch_blob_with_outbox_fallback(
+    pool: &sqlx::PgPool,
+    client: &BlossomClient,
+    blob_id: &[u8; 32],
+    holders: &[String],
+) -> Result<Vec<u8>, SdrDiscardReason> {
+    let blossom_err = if holders.is_empty() {
+        None
+    } else {
+        match fetch_blob_from_holders(client, blob_id, holders).await {
+            Ok((body, _)) => return Ok(body),
+            Err(e) => Some(e),
+        }
+    };
+    match super::db_outbox::get_zbe_by_blob_id(pool, blob_id).await {
+        Ok(Some(body)) if blob_id_of(&body) == *blob_id => {
+            tracing::warn!(
+                blob_id = %hex::encode(blob_id),
+                "§4.5 recovery: blossom holders missed; using durable outbox ZBE"
+            );
+            Ok(body)
+        }
+        Ok(Some(_)) => Err(SdrDiscardReason::FetchFailed {
+            detail: "outbox ZBE content-address mismatch".into(),
+        }),
+        Ok(None) => Err(SdrDiscardReason::FetchFailed {
+            detail: if holders.is_empty() {
+                IncomingError::HoldersEmpty.to_string()
+            } else {
+                blossom_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "blossom fetch failed".into())
+            },
+        }),
+        Err(e) => Err(SdrDiscardReason::IndexLookupFailed {
+            detail: format!("outbox ZBE lookup: {e:#}"),
+        }),
+    }
+}
+
+/// `Ok(true)` = live engine already at/beyond this head and the served
+/// `current_pubkey` is not spent on NfLog. `Ok(false)` = must install/replace.
+/// `Err` = same send_counter as the reconstructed head but the live
+/// `current_pubkey` is already a first-occurrence winner — not recovered.
+fn recovered_head_already_installed(
+    adapter: &EngineAdapter,
+    owner: Address,
+    head_send_counter: u64,
+) -> Result<bool, SdrDiscardReason> {
+    adapter.with_engine(|engine| {
+        let Some(record) = engine.account(&owner) else {
+            return Ok(false);
+        };
+        if record.state.send_counter < head_send_counter {
+            return Ok(false);
+        }
+        match engine.nflog().lookup(record.state.current_pubkey) {
+            LookupResult::Present { .. } => Err(SdrDiscardReason::HeadReconstructionFailed {
+                detail: format!(
+                    "engine send_counter {} >= reconstructed head {} but \
+                     current_pubkey is already first-occurrence on NfLog — \
+                     head is spent, not recovered",
+                    record.state.send_counter, head_send_counter
+                ),
+            }),
+            _ => Ok(true),
+        }
+    })
 }
 
 /// Wait for at least one entrusteed operational bundle, then run one recovery
@@ -2185,22 +2249,26 @@ pub(crate) async fn run_recovery_campaign(
                     }
                 };
                 let holders = recovery_blob_holders(&candidate.holders, &deps.blob_stores);
-                let zbe_ciphertext =
-                    match fetch_blob_from_holders(&client, &candidate.blob_id, &holders).await {
-                        Ok((body, _)) => body,
-                        Err(e) => {
-                            report.sdr_discards.push(SdrDiscard {
-                                subject: subject.0,
-                                blob_id: candidate.blob_id,
-                                record_kind: candidate.record_kind,
-                                send_counter: None,
-                                reason: SdrDiscardReason::FetchFailed {
-                                    detail: e.to_string(),
-                                },
-                            });
-                            continue;
-                        }
-                    };
+                let zbe_ciphertext = match fetch_blob_with_outbox_fallback(
+                    deps.pool.as_ref(),
+                    &client,
+                    &candidate.blob_id,
+                    &holders,
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(reason) => {
+                        report.sdr_discards.push(SdrDiscard {
+                            subject: subject.0,
+                            blob_id: candidate.blob_id,
+                            record_kind: candidate.record_kind,
+                            send_counter: None,
+                            reason,
+                        });
+                        continue;
+                    }
+                };
                 let k_tx = match derive_note_key(&candidate.ss, &candidate.epk) {
                     Ok(k) => k,
                     Err(e) => {
@@ -2600,20 +2668,22 @@ async fn install_and_persist_recovered_head(
         .expect("caller checked accepted is non-empty");
     let genesis = accepted.first().expect("non-empty implies a first element");
 
-    let existing_send_counter = deps
-        .adapter
-        .with_engine(|engine| engine.account(&owner).map(|r| r.state.send_counter));
-    if let Some(existing) = existing_send_counter {
-        if existing >= head.record.account_state.send_counter {
+    match recovered_head_already_installed(
+        &deps.adapter,
+        owner,
+        head.record.account_state.send_counter,
+    ) {
+        Ok(true) => {
             tracing::info!(
                 subject = %hex::encode(subject),
-                existing_send_counter = existing,
                 head_send_counter = head.record.account_state.send_counter,
                 "§4.5 recovery: engine already holds this subject at or beyond the \
                  reconstructed head — treating as already installed"
             );
             return Ok(());
         }
+        Ok(false) => {}
+        Err(e) => return Err(e),
     }
 
     // 1. Admitted coin universe: this account's own self-created outputs
@@ -2770,22 +2840,24 @@ async fn install_and_persist_recovered_head(
     // as receive/scan). Re-read the live send_counter under the gate so
     // insert vs replace is not a stale pre-reconstruct decision.
     let _write_gate = deps.adapter.lock_writes().await;
-    let existing_now = deps
-        .adapter
-        .with_engine(|engine| engine.account(&owner).map(|r| r.state.send_counter));
-    let replace_stale = match existing_now {
-        Some(existing) if existing >= head.record.account_state.send_counter => {
+    let replace_stale = match recovered_head_already_installed(
+        &deps.adapter,
+        owner,
+        head.record.account_state.send_counter,
+    ) {
+        Ok(true) => {
             tracing::info!(
                 subject = %hex::encode(subject),
-                existing_send_counter = existing,
                 head_send_counter = head.record.account_state.send_counter,
                 "§4.5 recovery: engine already holds this subject at or beyond the \
                  reconstructed head — treating as already installed"
             );
             return Ok(());
         }
-        Some(_) => true,
-        None => false,
+        Ok(false) => deps
+            .adapter
+            .with_engine(|engine| engine.account(&owner).is_some()),
+        Err(e) => return Err(e),
     };
     let pre = deps.adapter.snapshot_live();
     let insert_result = deps
@@ -5581,7 +5653,7 @@ mod tests {
             r_create,
             record.own_nullifier.r_prime_create,
         )
-            .expect_err("check (iv) first-occurrence must fail");
+        .expect_err("check (iv) first-occurrence must fail");
         assert!(
             matches!(err, SdrDiscardReason::NotFirstOccurrence { .. }),
             "got {err:?}"
@@ -5608,7 +5680,7 @@ mod tests {
             r_create,
             record.own_nullifier.r_prime_create,
         )
-            .expect("engine checks must still pass");
+        .expect("engine checks must still pass");
         let err = verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
             .await
             .expect_err("check (v) inclusion hash must fail");
@@ -5638,7 +5710,7 @@ mod tests {
             r_create,
             record.own_nullifier.r_prime_create,
         )
-            .expect("engine checks must still pass");
+        .expect("engine checks must still pass");
         let err = verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
             .await
             .expect_err("check (v) occurred_at must fail");
@@ -5668,7 +5740,7 @@ mod tests {
             r_create,
             record.own_nullifier.r_prime_create,
         )
-            .expect("engine checks must still pass");
+        .expect("engine checks must still pass");
         let err = verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
             .await
             .expect_err("check (vi) anchor bound must fail");
@@ -5696,7 +5768,7 @@ mod tests {
             r_create,
             record.own_nullifier.r_prime_create,
         )
-            .expect("fully valid record must pass engine checks");
+        .expect("fully valid record must pass engine checks");
         verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
             .await
             .expect("fully valid record must pass checks (v)/(vi)");

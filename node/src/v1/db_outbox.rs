@@ -268,6 +268,27 @@ pub(crate) async fn get_by_blob_and_ack_nonce(
     }
 }
 
+/// Content-addressed ZBE lookup for §4.5 recovery when Blossom holders 404.
+///
+/// Completed self-delivery rows keep `zbe_ciphertext` permanently (data
+/// permanence). Recovery must not treat a wiped Blossom store as a missing
+/// SDR when the durable outbox still holds the bytes.
+pub(crate) async fn get_zbe_by_blob_id(
+    pool: &PgPool,
+    blob_id: &[u8; 32],
+) -> Result<Option<Vec<u8>>> {
+    let row: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT zbe_ciphertext FROM v1_delivery_outbox \
+         WHERE blob_id = $1 AND zbe_ciphertext IS NOT NULL \
+         LIMIT 1",
+    )
+    .bind(blob_id.as_slice())
+    .fetch_optional(pool)
+    .await
+    .context("v1_delivery_outbox get_zbe_by_blob_id")?;
+    Ok(row)
+}
+
 /// Rows due for first publish or republish (`pending` / `awaiting_ack` with
 /// `next_attempt_at <= now`).
 ///
@@ -674,6 +695,11 @@ mod tests {
         assert_eq!(row.attempt_n, 1);
         assert_eq!(row.blob_id, Some(blob));
         assert_eq!(row.zbe_ciphertext.as_deref(), Some(zbe.as_slice()));
+        let looked_up = get_zbe_by_blob_id(&pool, &blob)
+            .await
+            .expect("get_zbe_by_blob_id")
+            .expect("published ZBE must be recoverable by blob_id");
+        assert_eq!(looked_up, zbe);
         // No fabricated ACK — only mark_ack_received sets ack_received_at.
         let ack_is_null: bool = sqlx::query_scalar(
             "SELECT ack_received_at IS NULL FROM v1_delivery_outbox WHERE outbox_id = $1",
