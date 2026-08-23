@@ -38,6 +38,12 @@ export COMPOSE_FILE="${COMPOSE_FILE:-${REPO_ROOT}/compose.yaml}"
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-zkcoins-local}"
 export ZKCOINS_V1_BITCOIND_WALLET="${ZKCOINS_V1_BITCOIND_WALLET:-zkcoins}"
 
+# Native kernel has no compose service `node`. Prefer the release verifier
+# binary when present so stage 10 does not docker-compose-exec a dead service.
+if [[ -z "${ZKCOINS_VERIFY_ATTESTATION:-}" && -x "${REPO_ROOT}/target/release/verify_attestation" ]]; then
+  export ZKCOINS_VERIFY_ATTESTATION="${REPO_ROOT}/target/release/verify_attestation"
+fi
+
 # Pin expected regtest digests if not already in env (same as env.example.sh).
 export ZKCOINS_CIRCUIT_DIGEST_C="${ZKCOINS_CIRCUIT_DIGEST_C:-9d256e8c828f531fc6cf9ffd4fa1ca9480473d00a99f92ea535912daa34e8352}"
 export ZKCOINS_CIRCUIT_DIGEST_C_BALANCE="${ZKCOINS_CIRCUIT_DIGEST_C_BALANCE:-bd696087e0e0f47b556a6803ef4fb5b9ebae2327e0438dd405f33752dc90772d}"

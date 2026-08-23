@@ -18,6 +18,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -1664,9 +1665,16 @@ function runVerifyAttestation(attestationHex) {
   // The attestation hex is large (proof ~180 KB → ~360 KB hex), far past the OS
   // argv length limit ("argument list too long"), so feed it on stdin instead of
   // an --attestation-hex arg (the CLI reads trimmed stdin when the flag is absent).
-  const native = process.env.ZKCOINS_VERIFY_ATTESTATION;
-  if (typeof native === 'string' && native.length > 0) {
-    return spawnSync(native, [], { encoding: 'utf8', input: attestationHex });
+  const here = dirname(fileURLToPath(import.meta.url));
+  const repoRoot = resolve(here, '../..');
+  const candidates = [
+    process.env.ZKCOINS_VERIFY_ATTESTATION,
+    resolve(repoRoot, 'target/release/verify_attestation'),
+  ];
+  for (const bin of candidates) {
+    if (typeof bin === 'string' && bin.length > 0 && existsSync(bin)) {
+      return spawnSync(bin, [], { encoding: 'utf8', input: attestationHex });
+    }
   }
   return spawnSync(
     'docker',
