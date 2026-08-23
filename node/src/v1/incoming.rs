@@ -1401,6 +1401,115 @@ mod tests {
     }
 
     #[test]
+    fn extract_scan_tags_missing_zkepk() {
+        let tags = vec![vec!["zkdt".into(), hex::encode([0xAAu8; 32])]];
+        let err = extract_scan_tags(&tags).expect_err("missing zkepk");
+        assert!(matches!(err, IncomingError::ScanTags { .. }));
+        let IncomingError::ScanTags { detail } = err else {
+            unreachable!("expected scan tags error");
+        };
+        assert_eq!(detail, "missing zkepk tag");
+    }
+
+    #[test]
+    fn extract_scan_tags_missing_zkdt() {
+        let tags = vec![vec!["zkepk".into(), hex::encode([0xBBu8; 32])]];
+        let err = extract_scan_tags(&tags).expect_err("missing zkdt");
+        assert!(matches!(err, IncomingError::ScanTags { .. }));
+        let IncomingError::ScanTags { detail } = err else {
+            unreachable!("expected scan tags error");
+        };
+        assert_eq!(detail, "missing zkdt tag");
+    }
+
+    #[test]
+    fn extract_scan_tags_empty_list_missing_zkdt() {
+        let tags = vec![];
+        let err = extract_scan_tags(&tags).expect_err("missing zkdt");
+        assert!(matches!(err, IncomingError::ScanTags { .. }));
+        let IncomingError::ScanTags { detail } = err else {
+            unreachable!("expected scan tags error");
+        };
+        assert_eq!(detail, "missing zkdt tag");
+    }
+
+    #[test]
+    fn extract_scan_tags_ignores_unknown_tag_when_both_present() {
+        let tags = vec![
+            vec!["unknown".into(), "deadbeef".into()],
+            vec!["zkdt".into(), hex::encode([0xAAu8; 32])],
+            vec!["zkepk".into(), hex::encode([0xBBu8; 32])],
+        ];
+        let (dt, epk) = extract_scan_tags(&tags).expect("both tags");
+        assert_eq!(dt, [0xAA; 32]);
+        assert_eq!(epk, [0xBB; 32]);
+    }
+
+    #[test]
+    fn extract_scan_tags_skips_len_one_tag() {
+        let tags = vec![
+            vec!["zkdt".into()],
+            vec!["zkdt".into(), hex::encode([0xAAu8; 32])],
+            vec!["zkepk".into(), hex::encode([0xBBu8; 32])],
+        ];
+        let (dt, epk) = extract_scan_tags(&tags).expect("both tags");
+        assert_eq!(dt, [0xAA; 32]);
+        assert_eq!(epk, [0xBB; 32]);
+    }
+
+    #[test]
+    fn extract_scan_tags_rejects_zkdt_len_63() {
+        let tags = vec![
+            vec!["zkdt".into(), "a".repeat(63)],
+            vec!["zkepk".into(), hex::encode([0xBBu8; 32])],
+        ];
+        let err = extract_scan_tags(&tags).expect_err("zkdt length 63");
+        assert!(matches!(err, IncomingError::ScanTags { .. }));
+        let IncomingError::ScanTags { detail } = err else {
+            unreachable!("expected scan tags error");
+        };
+        assert_eq!(detail, "zkdt must be 64 lowercase hex chars");
+    }
+
+    #[test]
+    fn extract_scan_tags_rejects_zkepk_short_aaa() {
+        let tags = vec![
+            vec!["zkdt".into(), hex::encode([0xAAu8; 32])],
+            vec!["zkepk".into(), "aaa".into()],
+        ];
+        let err = extract_scan_tags(&tags).expect_err("short zkepk");
+        assert!(matches!(err, IncomingError::ScanTags { .. }));
+        let IncomingError::ScanTags { detail } = err else {
+            unreachable!("expected scan tags error");
+        };
+        assert_eq!(detail, "zkepk must be 64 lowercase hex chars");
+    }
+
+    #[test]
+    fn extract_scan_tags_last_zkdt_wins() {
+        let tags = vec![
+            vec!["zkdt".into(), hex::encode([0xAAu8; 32])],
+            vec!["zkdt".into(), hex::encode([0xCCu8; 32])],
+            vec!["zkepk".into(), hex::encode([0xBBu8; 32])],
+        ];
+        let (dt, epk) = extract_scan_tags(&tags).expect("both tags");
+        assert_eq!(dt, [0xCC; 32]);
+        assert_eq!(epk, [0xBB; 32]);
+    }
+
+    #[test]
+    fn extract_scan_tags_skips_empty_inner_tag() {
+        let tags = vec![
+            vec![],
+            vec!["zkdt".into(), hex::encode([0xAAu8; 32])],
+            vec!["zkepk".into(), hex::encode([0xBBu8; 32])],
+        ];
+        let (dt, epk) = extract_scan_tags(&tags).expect("both tags");
+        assert_eq!(dt, [0xAA; 32]);
+        assert_eq!(epk, [0xBB; 32]);
+    }
+
+    #[test]
     fn match_detect_tag_honest_roundtrip() {
         use shared::spec_v1::note_encryption::{shared_secret_sender, xonly_pubkey};
         let ivk = {
