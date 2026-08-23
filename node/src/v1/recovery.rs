@@ -1733,6 +1733,34 @@ async fn stage_output_ref_inner(
     blob_stores: &[String],
     verify: impl FnOnce(&CoinProof) -> Result<(), IncomingError>,
 ) -> Result<StagedFoldOutcome, SdrDiscardReason> {
+    // 0. Already-indexed coins must not fail recovery on a missing Blossom
+    // re-fetch. The durable row is the same evidence the online path wrote.
+    if super::db_self_delivery_index::get_by_subject_coin(
+        stores.pool,
+        secrets.subject,
+        &oref.coin_id,
+    )
+    .await
+    .map_err(|e| SdrDiscardReason::IndexLookupFailed {
+        detail: format!("self-delivery lookup for fold skip: {e:#}"),
+    })?
+    .is_some()
+        || super::db_decrypt_index::get_by_subject_coin(
+            stores.pool,
+            secrets.subject,
+            &oref.coin_id,
+        )
+        .await
+        .map_err(|e| SdrDiscardReason::IndexLookupFailed {
+            detail: format!("decrypt-index lookup for fold skip: {e:#}"),
+        })?
+        .is_some()
+    {
+        return Ok(StagedFoldOutcome::AlreadyPresent {
+            coin_id: oref.coin_id,
+        });
+    }
+
     // 1. Recover K_tx from out_ciphertext under K_out (OVK path).
     let k_out =
         derive_out_key(secrets.ovk, &oref.epk).map_err(|e| SdrDiscardReason::ZbeOpenFailed {
