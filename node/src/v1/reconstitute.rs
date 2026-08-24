@@ -831,6 +831,42 @@ mod tests {
     }
 
     #[test]
+    fn creating_nullifier_not_covered_by_size_final_is_named() {
+        set_process_stack_mode(ScanStackMode::V1);
+        let owner = Address([0xB5; 32]);
+        let mut engine = StateEngine::new(Network::Regtest, 0);
+        let (cp, creating_proof, coin_id) = plant_folded_coin(&mut engine, owner, 7);
+        engine.set_tip_height(0);
+        let err = reconstitute_slot_from_coin_proof(&engine, &cp, creating_proof, &owner.0)
+            .expect_err("nullifier not covered by size_final must be named");
+        assert_eq!(
+            err,
+            ReconstituteError::CreatingNullifierNotCompleted {
+                coin_id,
+                detail: "creating nullifier position 0 not covered by size_final nav.size 0 (not yet §3.10 completed / 6-confirmation-final)".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn output_inclusion_truncated_wire_is_named() {
+        set_process_stack_mode(ScanStackMode::V1);
+        let owner = Address([0xB6; 32]);
+        let mut engine = StateEngine::new(Network::Regtest, 0);
+        let (mut cp, creating_proof, coin_id) = plant_folded_coin(&mut engine, owner, 8);
+        cp.inclusion_proof = vec![];
+        let err = reconstitute_slot_from_coin_proof(&engine, &cp, creating_proof, &owner.0)
+            .expect_err("truncated inclusion wire must be named");
+        assert_eq!(
+            err,
+            ReconstituteError::OutputInclusion {
+                coin_id,
+                detail: "verification: inclusion_proof truncated (need leaf_index + depth)".into(),
+            }
+        );
+    }
+
+    #[test]
     fn process_index_load_finds_planted_coin() {
         let index = InMemoryPrivateIndex::new();
         let subject = SubjectAddress([0xCCu8; 32]);
