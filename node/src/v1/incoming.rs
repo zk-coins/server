@@ -1932,6 +1932,30 @@ mod tests {
     }
 
     #[test]
+    fn incoming_error_scan_tags_display_names_detail() {
+        let err = IncomingError::ScanTags {
+            detail: "missing zkepk tag".into(),
+        };
+        assert_eq!(err.to_string(), "scan tags: missing zkepk tag");
+    }
+
+    #[test]
+    fn incoming_error_detect_tag_mismatch_display_names_both_digests() {
+        let err = IncomingError::DetectTagMismatch {
+            claimed: [0xAA; 32],
+            recomputed: [0xBB; 32],
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "detect_tag mismatch: claimed={}, recomputed={}",
+                hex::encode([0xAA; 32]),
+                hex::encode([0xBB; 32]),
+            ),
+        );
+    }
+
+    #[test]
     fn decrypt_record_id_is_stable() {
         let a = decrypt_record_id(&[1u8; 32], &[2u8; 32], &[3u8; 32]);
         let b = decrypt_record_id(&[1u8; 32], &[2u8; 32], &[3u8; 32]);
