@@ -551,6 +551,161 @@ pub fn verify_balance_attestation(
 mod tests {
     use super::*;
 
+    use std::error::Error as _;
+
+    use plonky2::field::types::Field64;
+    use shared::spec_v1::{digest_from_bytes, nflog_empty, Nav};
+    use zkcoins_program::circuit::compliance::Network;
+    use zkcoins_program::F;
+    use zkcoins_prover::prover_bridge::BalanceAttestationStatement;
+
+    const PROOF_BYTES: &[u8] = b"fake-c-balance-proof-bytes";
+
+    fn canonical_statement() -> BalanceAttestationStatement {
+        BalanceAttestationStatement {
+            subject: Address([0x01; 32]),
+            asset_id: digest_from_bytes(&[0x02; 32]).expect("canonical asset id"),
+            balance: 99,
+            nav_ceiling: Nav {
+                size: 7,
+                mth: nflog_empty(),
+            },
+            anchor: BalanceAnchor {
+                txid: [0x31; 32],
+                block_hash: [0x42; 32],
+                height: 100,
+                public_key: [0x11; 32],
+                signature_r: [0x22; 32],
+            },
+        }
+    }
+
+    fn serialize_fixture(proof_bytes: &[u8]) -> (BalanceAttestationStatement, Vec<u8>) {
+        let statement = canonical_statement();
+        let bytes = crate::v1::attest::serialize_balance_attestation_v1(
+            &statement,
+            Network::Testnet,
+            proof_bytes,
+        )
+        .expect("canonical fixture serializes");
+        (statement, bytes)
+    }
+
+    fn assert_decoded_matches(
+        decoded: &DecodedBalanceAttestation,
+        statement: &BalanceAttestationStatement,
+        proof_bytes: &[u8],
+    ) {
+        assert_eq!(decoded.subject, statement.subject);
+        assert_eq!(decoded.asset_id, statement.asset_id);
+        assert_eq!(decoded.balance, statement.balance);
+        assert_eq!(decoded.nav_ceiling_root, statement.nav_ceiling.root());
+        assert_eq!(decoded.size_ceiling, statement.nav_ceiling.size);
+        assert_eq!(decoded.anchor, statement.anchor);
+        assert_eq!(decoded.network_id, shared::spec_v1::network_id_testnet());
+        assert_eq!(decoded.proof_bytes, proof_bytes);
+    }
+
+    #[test]
+    fn decode_balance_attestation_roundtrips_canonical_fixture() {
+        let (statement, bytes) = serialize_fixture(PROOF_BYTES);
+
+        let decoded = decode_balance_attestation_v1(&bytes).expect("canonical fixture decodes");
+
+        assert_decoded_matches(&decoded, &statement, PROOF_BYTES);
+    }
+
+    #[test]
+    fn decode_balance_attestation_accepts_empty_proof() {
+        let (statement, bytes) = serialize_fixture(&[]);
+        assert_eq!(bytes.len(), 292);
+
+        let decoded = decode_balance_attestation_v1(&bytes).expect("empty proof decodes");
+
+        assert_decoded_matches(&decoded, &statement, &[]);
+        assert!(decoded.proof_bytes.is_empty());
+    }
+
+    #[test]
+    fn decode_balance_attestation_rejects_truncated_prefix() {
+        let (_, bytes) = serialize_fixture(PROOF_BYTES);
+        let truncated = &bytes[..291];
+
+        let err = decode_balance_attestation_v1(truncated).expect_err("prefix is truncated");
+
+        assert!(matches!(
+            &err,
+            DecodeBalanceAttestationError::Truncated {
+                need: 292,
+                have: 291
+            }
+        ));
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn decode_balance_attestation_rejects_truncated_proof() {
+        let (_, serialized) = serialize_fixture(PROOF_BYTES);
+        let mut bytes = serialized[..292].to_vec();
+        bytes[288..292].copy_from_slice(&1u32.to_be_bytes());
+
+        let err = decode_balance_attestation_v1(&bytes).expect_err("proof is truncated");
+
+        assert!(matches!(
+            &err,
+            DecodeBalanceAttestationError::Truncated {
+                need: 293,
+                have: 292
+            }
+        ));
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn decode_balance_attestation_rejects_trailing_bytes() {
+        let (_, mut bytes) = serialize_fixture(&[]);
+        bytes.push(0);
+
+        let err = decode_balance_attestation_v1(&bytes).expect_err("trailing byte is rejected");
+
+        assert!(matches!(
+            &err,
+            DecodeBalanceAttestationError::TrailingBytes {
+                expected_total: 292,
+                have: 293
+            }
+        ));
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn decode_balance_attestation_rejects_each_noncanonical_digest() {
+        let (_, canonical) = serialize_fixture(PROOF_BYTES);
+        let noncanonical_limb = F::ORDER.to_be_bytes();
+
+        for (field, offset) in [
+            ("asset_id", 32usize),
+            ("nav_ceiling_root", 80usize),
+            ("network_id", 256usize),
+        ] {
+            let mut bytes = canonical.clone();
+            bytes[offset..offset + 8].copy_from_slice(&noncanonical_limb);
+
+            let err = decode_balance_attestation_v1(&bytes)
+                .expect_err("non-canonical digest is rejected");
+
+            match &err {
+                DecodeBalanceAttestationError::NonCanonicalDigest {
+                    field: actual,
+                    source: _,
+                } => assert_eq!(*actual, field),
+                other => panic!("expected NonCanonicalDigest for {field}, got {other:?}"),
+            }
+            assert!(err.to_string().contains(field));
+            assert!(err.source().is_some());
+        }
+    }
+
     fn sample_public_statement() -> BalancePublicStatement {
         BalancePublicStatement {
             subject: Address([0x01u8; 32]),

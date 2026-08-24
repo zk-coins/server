@@ -943,6 +943,152 @@ mod tests {
         assert_eq!(err.public_message, expected_message);
     }
 
+    fn test_ops() -> crate::kernel::chain::ChainIdentityOps {
+        crate::kernel::chain::ChainIdentityOps {
+            relay_url: "wss://relay.example".into(),
+            blossom_url: "https://blossom.example".into(),
+            max_blob_bytes: 1_048_576,
+            kernel_parts: vec![
+                KernelPart::Scanner,
+                KernelPart::Prover,
+                KernelPart::Publisher,
+            ],
+        }
+    }
+
+    fn test_bootstrap() -> crate::kernel::chain::BootstrapManifest {
+        crate::kernel::chain::BootstrapManifest {
+            network: KernelNetwork::Regtest,
+            protocol_version: "v1".into(),
+            seed_relays: vec!["wss://seed.example".into()],
+            blob_stores: vec!["https://blob.example".into()],
+            operator_ids: vec![XOnlyKey([0x0B; 32])],
+            issued_at: 1,
+            expires_at: 2,
+            manifest_sig: [0x51; 64],
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_account_owner_returns_none_for_missing_subject() {
+        let service = service();
+        let subject = crate::kernel::types::SubjectAddress([0x10; 32]);
+
+        assert_eq!(service.lookup_account_owner(&subject), None);
+    }
+
+    #[tokio::test]
+    async fn lookup_account_owner_returns_none_for_short_account_state() {
+        let service = service();
+        let subject = crate::kernel::types::SubjectAddress([0x11; 32]);
+        let view = AccountStateView {
+            account_state: vec![0u8; 139],
+            state_head: crate::kernel::types::Digest32([0; 32]),
+            head_record_id: None,
+            send_counter: 0,
+            current_pubkey: [0; 32],
+            last_nullifier_pk: None,
+            last_nullifier_r: None,
+        };
+        service
+            .private_record_index()
+            .insert_account(subject.clone(), view)
+            .expect("account fixture should be inserted");
+
+        assert_eq!(service.lookup_account_owner(&subject), None);
+    }
+
+    #[tokio::test]
+    async fn lookup_account_owner_returns_first_32_bytes_for_complete_account_state() {
+        let service = service();
+        let subject = crate::kernel::types::SubjectAddress([0x12; 32]);
+        let mut account_state = vec![0u8; 140];
+        account_state[..32].copy_from_slice(&[0xAB; 32]);
+        let view = AccountStateView {
+            account_state,
+            state_head: crate::kernel::types::Digest32([0; 32]),
+            head_record_id: None,
+            send_counter: 0,
+            current_pubkey: [0; 32],
+            last_nullifier_pk: None,
+            last_nullifier_r: None,
+        };
+        service
+            .private_record_index()
+            .insert_account(subject.clone(), view)
+            .expect("account fixture should be inserted");
+
+        assert_eq!(service.lookup_account_owner(&subject), Some([0xAB; 32]));
+    }
+
+    #[tokio::test]
+    async fn resolve_publish_policy_declines_fee_less_without_identity() {
+        let result = service().resolve_publish_policy();
+
+        assert!(matches!(result, Ok(PublishPolicy::DeclineFeeLess)));
+    }
+
+    #[tokio::test]
+    async fn publish_fails_closed_without_network_pin() {
+        let command = PublishCommand {
+            public_key: XOnlyKey([0; 32]),
+            r: XOnlyKey([0; 32]),
+            s: crate::kernel::types::Digest32([0; 32]),
+            r_prime: XOnlyKey([0; 32]),
+            block_anchor: PublishBlockAnchor {
+                block_hash: crate::kernel::types::Digest32([0; 32]),
+                height: 0,
+            },
+        };
+
+        assert_internal_error(
+            service().publish(command).await,
+            "Publish requires a network pin",
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_handoff_queue_reports_publisher_unavailable_without_network_pin() {
+        let publisher: Option<&dyn crate::v1::receive::NullifierBatchPublisher> = None;
+        let result = service().drain_handoff_queue(publisher, None);
+
+        match result {
+            Err(crate::kernel::publish::InscriptionTerminal::PublisherUnavailable { detail }) => {
+                assert_eq!(
+                    detail,
+                    "drain_handoff_queue: no network pin on KernelService — \
+                     cannot half-aggregate under an unknown m_state"
+                );
+            }
+            other => {
+                panic!("expected PublisherUnavailable with the network-pin detail, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_info_fails_closed_when_identity_and_engine_network_disagree() {
+        let identity = crate::kernel::chain::assemble_chain_identity(
+            KernelNetwork::Testnet,
+            crate::kernel::types::Digest32([0xC1; 32]),
+            crate::kernel::types::Digest32([0xC2; 32]),
+            0,
+            XOnlyKey([0xB0; 32]),
+            test_ops(),
+            test_bootstrap(),
+        );
+        let service = service().with_chain(ChainHandle {
+            network: Some(KernelNetwork::Regtest),
+            identity: Some(identity),
+            ..Default::default()
+        });
+
+        assert_internal_error(
+            service.get_info(),
+            "Chain identity disagrees with engine network pin",
+        );
+    }
+
     #[tokio::test]
     async fn from_store_exposes_default_in_memory_dependencies_and_no_chain() {
         let service = service();

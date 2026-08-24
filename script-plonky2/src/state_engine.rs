@@ -883,6 +883,47 @@ impl StateEngine {
         Ok(())
     }
 
+    /// Replace an existing account with a strictly newer reconstructed head.
+    ///
+    /// Used by §4.5 recovery when the live engine still holds a stale
+    /// `send_counter` whose `current_pubkey` is already on the canonical NfLog.
+    /// Refuses a missing owner and refuses `incoming.send_counter <= existing`.
+    /// Same spendable/spent/coinhist guards as [`Self::insert_account`].
+    pub fn replace_account(&mut self, owner: Address, record: AccountRecord) -> Result<()> {
+        ensure!(
+            record.state.owner == owner,
+            "AccountRecord.owner does not match replace key"
+        );
+        let existing = self
+            .accounts
+            .get(&owner)
+            .context("account not present in the engine")?;
+        ensure!(
+            existing.state.send_counter < record.state.send_counter,
+            "replace_account: incoming send_counter {} is not strictly newer than {}",
+            record.state.send_counter,
+            existing.state.send_counter
+        );
+        for id in record.spendable.keys() {
+            ensure!(
+                !record.spent_ids.contains(id),
+                "coin_id is both spendable and spent"
+            );
+        }
+        let rebuilt = rebuild_coinhist(&leaves_from_sets(&record.spendable, &record.spent_ids))
+            .context("replace_account: rebuild coinhist from spendable/spent_ids")?;
+        ensure!(
+            rebuilt.root() == record.state.coin_history_root,
+            "coinhist root after rebuild does not match AccountState.coin_history_root"
+        );
+        ensure!(
+            record.coinhist.root() == record.state.coin_history_root,
+            "coinhist root does not match AccountState.coin_history_root"
+        );
+        self.accounts.insert(owner, record);
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // §2.3.1 Mint
     // -----------------------------------------------------------------------
@@ -4198,6 +4239,125 @@ mod tests {
             .insert_account(owner, record)
             .expect("consistent record must insert");
         assert!(engine.account(&owner).is_some());
+    }
+
+    #[test]
+    fn replace_account_accepts_strictly_newer_send_counter() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/replace-ok/nk").into();
+        let nk_commit = host::nk_commit(&nk);
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/replace-ok/pk",
+        ));
+        let owner = Address(host::address(&pk, nk_commit));
+        let empty = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk,
+            1,
+            host::coinhist_empty_root(),
+        )
+        .expect("old");
+        let newer = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk,
+            2,
+            host::coinhist_empty_root(),
+        )
+        .expect("new");
+        let old_record = AccountRecord {
+            state: empty,
+            coinhist: CoinHistTree::new(),
+            nk,
+            op_secret: Some(label_op_secret(
+                b"zkCoins/v1/state-engine/replace-ok/op_secret",
+            )),
+            genesis_pubkey: pk,
+            spendable: BTreeMap::new(),
+            spent_ids: BTreeSet::new(),
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+        let new_record = AccountRecord {
+            state: newer,
+            coinhist: CoinHistTree::new(),
+            nk,
+            op_secret: old_record.op_secret,
+            genesis_pubkey: pk,
+            spendable: BTreeMap::new(),
+            spent_ids: BTreeSet::new(),
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        engine
+            .insert_account(owner, old_record)
+            .expect("seed stale head");
+        engine
+            .replace_account(owner, new_record)
+            .expect("strictly newer head must replace");
+        assert_eq!(
+            engine.account(&owner).expect("replaced").state.send_counter,
+            2
+        );
+    }
+
+    #[test]
+    fn replace_account_rejects_not_newer_and_missing() {
+        let nk: [u8; 32] = Sha256::digest(b"zkCoins/v1/state-engine/replace-reject/nk").into();
+        let nk_commit = host::nk_commit(&nk);
+        let (_, _, pk) = normalized_key(deterministic_secret(
+            b"zkCoins/v1/state-engine/replace-reject/pk",
+        ));
+        let owner = Address(host::address(&pk, nk_commit));
+        let state = AccountState::new(
+            owner,
+            nk_commit,
+            BTreeMap::new(),
+            pk,
+            3,
+            host::coinhist_empty_root(),
+        )
+        .expect("state");
+        let record = AccountRecord {
+            state: state.clone(),
+            coinhist: CoinHistTree::new(),
+            nk,
+            op_secret: Some(label_op_secret(
+                b"zkCoins/v1/state-engine/replace-reject/op_secret",
+            )),
+            genesis_pubkey: pk,
+            spendable: BTreeMap::new(),
+            spent_ids: BTreeSet::new(),
+            last_proof: None,
+            last_nav_opening: None,
+            last_nullifier: None,
+            last_nullifier_pos: None,
+        };
+        let mut engine = StateEngine::new(Network::Testnet, 0);
+        let missing_err = engine
+            .replace_account(owner, record.clone())
+            .expect_err("missing owner");
+        assert!(
+            missing_err.to_string().contains("not present"),
+            "{missing_err:#}"
+        );
+        engine
+            .insert_account(owner, record.clone())
+            .expect("seed");
+        let same_err = engine
+            .replace_account(owner, record)
+            .expect_err("equal send_counter must not replace");
+        assert!(
+            same_err.to_string().contains("not strictly newer"),
+            "{same_err:#}"
+        );
     }
 
     /// Fast: `begin_send` with outputs > inputs returns Err before proving.

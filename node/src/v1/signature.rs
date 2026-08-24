@@ -4014,6 +4014,238 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn issuer_mint_provenance_rejects_v1_cap_total() {
+        use crate::test_db::setup_pool;
+
+        let scope = setup_pool().await;
+        let terms = shared::spec_v1::bundle::IssuanceTerms {
+            creator_pubkey: [0x71; 32],
+            decimals: 8,
+            issuance_version: 1,
+            name: b"Durable Mint".to_vec(),
+            cap_total: Some(1),
+            terms_salt: None,
+        };
+        let nh = name_hash(&terms.name).expect("mint terms name");
+        let honest_asset_id =
+            asset_id_v1(GENESIS_TAG, &terms.creator_pubkey, &nh, terms.decimals, 1);
+        let mut coin = external_coin([0x81; 32]);
+        coin.asset_id = honest_asset_id;
+        let asset_id = digest_to_bytes(&coin.asset_id);
+        let mut snap = delivery_snapshot(vec![coin]);
+        snap.record_kind = 0x01;
+        snap.mint_asset_terms = Some(terms);
+
+        let err = insert_issuer_mint_provenance(&scope.pool, &snap)
+            .await
+            .expect_err("issuer mint provenance must reject v1 terms with cap_total");
+        assert_eq!(
+            err,
+            crate::v1::delivery::DeliveryError::Relay(
+                "issuer-side asset_terms v1 must not carry cap_total/terms_salt".into(),
+            )
+        );
+        assert_eq!(
+            crate::v1::db_token_provenance::get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("read rejected issuer-side mint provenance"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn issuer_mint_provenance_rejects_v1_terms_salt() {
+        use crate::test_db::setup_pool;
+
+        let scope = setup_pool().await;
+        let terms = shared::spec_v1::bundle::IssuanceTerms {
+            creator_pubkey: [0x71; 32],
+            decimals: 8,
+            issuance_version: 1,
+            name: b"Durable Mint".to_vec(),
+            cap_total: None,
+            terms_salt: Some([0x72; 32]),
+        };
+        let nh = name_hash(&terms.name).expect("mint terms name");
+        let honest_asset_id =
+            asset_id_v1(GENESIS_TAG, &terms.creator_pubkey, &nh, terms.decimals, 1);
+        let mut coin = external_coin([0x81; 32]);
+        coin.asset_id = honest_asset_id;
+        let asset_id = digest_to_bytes(&coin.asset_id);
+        let mut snap = delivery_snapshot(vec![coin]);
+        snap.record_kind = 0x01;
+        snap.mint_asset_terms = Some(terms);
+
+        let err = insert_issuer_mint_provenance(&scope.pool, &snap)
+            .await
+            .expect_err("issuer mint provenance must reject v1 terms with terms_salt");
+        assert_eq!(
+            err,
+            crate::v1::delivery::DeliveryError::Relay(
+                "issuer-side asset_terms v1 must not carry cap_total/terms_salt".into(),
+            )
+        );
+        assert_eq!(
+            crate::v1::db_token_provenance::get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("read rejected issuer-side mint provenance"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn issuer_mint_provenance_rejects_v2_missing_cap_total() {
+        use crate::test_db::setup_pool;
+
+        let scope = setup_pool().await;
+        let mut terms = mint_terms();
+        terms.cap_total = None;
+        let mut coin = external_coin([0x81; 32]);
+        coin.asset_id = ZERO_HASH;
+        let asset_id = digest_to_bytes(&coin.asset_id);
+        let mut snap = delivery_snapshot(vec![coin]);
+        snap.record_kind = 0x01;
+        snap.mint_asset_terms = Some(terms);
+
+        let err = insert_issuer_mint_provenance(&scope.pool, &snap)
+            .await
+            .expect_err("issuer mint provenance must reject v2 terms missing cap_total");
+        assert_eq!(
+            err,
+            crate::v1::delivery::DeliveryError::Relay(
+                "issuer-side asset_terms v2 missing cap_total".into(),
+            )
+        );
+        assert_eq!(
+            crate::v1::db_token_provenance::get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("read rejected issuer-side mint provenance"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn issuer_mint_provenance_rejects_v2_missing_terms_salt() {
+        use crate::test_db::setup_pool;
+
+        let scope = setup_pool().await;
+        let mut terms = mint_terms();
+        terms.terms_salt = None;
+        let mut coin = external_coin([0x81; 32]);
+        coin.asset_id = ZERO_HASH;
+        let asset_id = digest_to_bytes(&coin.asset_id);
+        let mut snap = delivery_snapshot(vec![coin]);
+        snap.record_kind = 0x01;
+        snap.mint_asset_terms = Some(terms);
+
+        let err = insert_issuer_mint_provenance(&scope.pool, &snap)
+            .await
+            .expect_err("issuer mint provenance must reject v2 terms missing terms_salt");
+        assert_eq!(
+            err,
+            crate::v1::delivery::DeliveryError::Relay(
+                "issuer-side asset_terms v2 missing terms_salt".into(),
+            )
+        );
+        assert_eq!(
+            crate::v1::db_token_provenance::get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("read rejected issuer-side mint provenance"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn issuer_mint_provenance_rejects_unknown_issuance_version() {
+        use crate::test_db::setup_pool;
+
+        let scope = setup_pool().await;
+        let mut terms = mint_terms();
+        terms.issuance_version = 9;
+        let mut coin = external_coin([0x81; 32]);
+        coin.asset_id = ZERO_HASH;
+        let asset_id = digest_to_bytes(&coin.asset_id);
+        let mut snap = delivery_snapshot(vec![coin]);
+        snap.record_kind = 0x01;
+        snap.mint_asset_terms = Some(terms);
+
+        let err = insert_issuer_mint_provenance(&scope.pool, &snap)
+            .await
+            .expect_err("issuer mint provenance must reject unknown issuance_version");
+        assert_eq!(
+            err,
+            crate::v1::delivery::DeliveryError::Relay(
+                "issuer-side asset_terms issuance_version 9 is neither 1 nor 2 — refuse provenance insert"
+                    .into(),
+            )
+        );
+        assert_eq!(
+            crate::v1::db_token_provenance::get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("read rejected issuer-side mint provenance"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn issuer_mint_provenance_rejects_name_too_long() {
+        use crate::test_db::setup_pool;
+
+        let scope = setup_pool().await;
+        let mut terms = mint_terms();
+        terms.name = vec![b'x'; 256];
+        let mut coin = external_coin([0x81; 32]);
+        coin.asset_id = ZERO_HASH;
+        let asset_id = digest_to_bytes(&coin.asset_id);
+        let mut snap = delivery_snapshot(vec![coin]);
+        snap.record_kind = 0x01;
+        snap.mint_asset_terms = Some(terms);
+
+        let err = insert_issuer_mint_provenance(&scope.pool, &snap)
+            .await
+            .expect_err("issuer mint provenance must reject oversized asset name");
+        assert_eq!(
+            err,
+            crate::v1::delivery::DeliveryError::Relay(
+                "issuer-side asset_terms name_hash: asset name too long: 256 bytes (max 255)".into(),
+            )
+        );
+        assert_eq!(
+            crate::v1::db_token_provenance::get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("read rejected issuer-side mint provenance"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn issuer_mint_provenance_rejects_mint_without_output_coins() {
+        use crate::test_db::setup_pool;
+
+        let scope = setup_pool().await;
+        let mut snap = delivery_snapshot(vec![]);
+        snap.record_kind = 0x01;
+        snap.mint_asset_terms = Some(mint_terms());
+        let asset_id = digest_to_bytes(&ZERO_HASH);
+
+        let err = insert_issuer_mint_provenance(&scope.pool, &snap)
+            .await
+            .expect_err("issuer mint provenance must reject mint without output coins");
+        assert_eq!(
+            err,
+            crate::v1::delivery::DeliveryError::Relay(
+                "mint transition has no output coins to derive asset_id from".into(),
+            )
+        );
+        assert_eq!(
+            crate::v1::db_token_provenance::get_token_provenance(&scope.pool, &asset_id)
+                .await
+                .expect("read rejected issuer-side mint provenance"),
+            None
+        );
+    }
+
     #[test]
     fn external_outbox_wrapper_propagates_delivery_matrix_and_round_trips_every_field() {
         use crate::v1::delivery::{DeliveryError, DeliveryTarget, DeliveryTargetStore};

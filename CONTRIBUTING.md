@@ -115,6 +115,10 @@ the hermetic `node` + `shared` selection with:
 cargo nextest run -p node -p shared --all-features --test-threads 8 -E 'not binary(api_remote)'
 ```
 
+That command still needs `PUBLISHER_KEY` (32-byte hex, no default). The
+wrapper `scripts/local-verify.sh` exports the same dummy key and Esplora
+placeholders the CI job uses, then runs the line above.
+
 `-E 'not binary(api_remote)'` drops the `api_remote` integration target
 (`node/tests/api_remote.rs`). That suite talks to the live DEV node and does
 not belong in a hermetic run; the CI workflow excludes it with the same

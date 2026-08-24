@@ -68,7 +68,7 @@ use zkcoins_prover::prover_bridge::{NavOpening, NullifierOpening, ProverBridge};
 use zkcoins_prover::state_engine::{OpSecret, StateEngine, TrackedCoin};
 
 use super::adapter::EngineAdapter;
-use super::blossom::BlossomClient;
+use super::blossom::{blob_id_of, BlossomClient};
 use super::db_decrypt_index::decrypt_record_id;
 use super::db_self_delivery_index::{
     get_by_subject_coin as get_self_delivery_by_subject_coin,
@@ -613,30 +613,47 @@ pub(crate) fn verify_sdr_record_pre_engine(
 
 /// Engine-only part of §4.2 check (iv): NfLog classification, lookup, and
 /// mirror-height resolution. No attacker-controlled proof parsing occurs here.
+///
+/// First-occurrence matches either `R_create` or `R'_create`. The S2C opening
+/// already binds both to `H(ProofData)` in [`verify_sdr_record_pre_engine`].
+/// An inscription that published `R'` as the NfLog member (payload order
+/// `Pk ‖ R ‖ R'` vs a swapped publish) is still the same spend, not a
+/// double-spend loser.
 pub(crate) fn verify_sdr_record_engine_checks(
     engine: &StateEngine,
     pk_create: [u8; 32],
     r_create: [u8; 32],
+    r_prime_create: [u8; 32],
 ) -> Result<u64 /* inclusion_height */, SdrDiscardReason> {
-    match engine.nflog().classify(pk_create, r_create) {
-        SpendClassification::ValidFirstSpend => {}
-        SpendClassification::RejectedDoubleSpend => {
-            return Err(SdrDiscardReason::NotFirstOccurrence {
-                detail: "creating Pk is present with a different R (double-spend loser)".into(),
-            });
-        }
-        SpendClassification::Pending => {
-            return Err(SdrDiscardReason::NotFirstOccurrence {
-                detail: "creating nullifier is not a first-occurrence on receiver NfLog".into(),
-            });
-        }
+    let r_on_log = |r: [u8; 32]| {
+        matches!(
+            engine.nflog().classify(pk_create, r),
+            SpendClassification::ValidFirstSpend
+        )
+    };
+    if !r_on_log(r_create) && !r_on_log(r_prime_create) {
+        return Err(SdrDiscardReason::NotFirstOccurrence {
+            detail: match engine.nflog().lookup(pk_create) {
+                LookupResult::Present { r, .. } => format!(
+                    "creating Pk is present with a different R (double-spend loser); \
+                     sdr_r={} sdr_r_prime={} nflog_r={}",
+                    hex::encode(r_create),
+                    hex::encode(r_prime_create),
+                    hex::encode(r)
+                ),
+                LookupResult::Absent => {
+                    "creating nullifier is not a first-occurrence on receiver NfLog".into()
+                }
+            },
+        });
     }
     let inclusion_pos = match engine.nflog().lookup(pk_create) {
-        LookupResult::Present { pos, r, .. } if r == r_create => pos,
+        LookupResult::Present { pos, r, .. } if r == r_create || r == r_prime_create => pos,
         LookupResult::Present { r, .. } => {
             return Err(SdrDiscardReason::NotFirstOccurrence {
                 detail: format!(
-                    "NfLog first-occurrence R mismatches creating_nullifier.R (log has {})",
+                    "NfLog first-occurrence R mismatches creating_nullifier.R and R' \
+                     (log has {})",
                     hex::encode(r)
                 ),
             });
@@ -1716,6 +1733,30 @@ async fn stage_output_ref_inner(
     blob_stores: &[String],
     verify: impl FnOnce(&CoinProof) -> Result<(), IncomingError>,
 ) -> Result<StagedFoldOutcome, SdrDiscardReason> {
+    // 0. Already-indexed coins must not fail recovery on a missing Blossom
+    // re-fetch. The durable row is the same evidence the online path wrote.
+    if super::db_self_delivery_index::get_by_subject_coin(
+        stores.pool,
+        secrets.subject,
+        &oref.coin_id,
+    )
+    .await
+    .map_err(|e| SdrDiscardReason::IndexLookupFailed {
+        detail: format!("self-delivery lookup for fold skip: {e:#}"),
+    })?
+    .is_some()
+        || super::db_decrypt_index::get_by_subject_coin(stores.pool, secrets.subject, &oref.coin_id)
+            .await
+            .map_err(|e| SdrDiscardReason::IndexLookupFailed {
+                detail: format!("decrypt-index lookup for fold skip: {e:#}"),
+            })?
+            .is_some()
+    {
+        return Ok(StagedFoldOutcome::AlreadyPresent {
+            coin_id: oref.coin_id,
+        });
+    }
+
     // 1. Recover K_tx from out_ciphertext under K_out (OVK path).
     let k_out =
         derive_out_key(secrets.ovk, &oref.epk).map_err(|e| SdrDiscardReason::ZbeOpenFailed {
@@ -1750,11 +1791,8 @@ async fn stage_output_ref_inner(
         detail: format!("BlossomClient: {e}"),
     })?;
     let holders = recovery_blob_holders(&oref.blob_locators.holders, blob_stores);
-    let (zbe_ciphertext, _attempts) = fetch_blob_from_holders(&client, &oref.blob_id, &holders)
-        .await
-        .map_err(|e| SdrDiscardReason::FetchFailed {
-            detail: e.to_string(),
-        })?;
+    let zbe_ciphertext =
+        fetch_blob_with_outbox_fallback(stores.pool, &client, &oref.blob_id, &holders).await?;
 
     // 3. ZBE-open under recovered K_tx.
     let plaintext =
@@ -1875,6 +1913,77 @@ pub(crate) fn recovery_blob_holders(advertised: &[String], blob_stores: &[String
     holders
 }
 
+/// Blossom first; durable outbox ZBE if every holder 404s or holders are empty.
+async fn fetch_blob_with_outbox_fallback(
+    pool: &sqlx::PgPool,
+    client: &BlossomClient,
+    blob_id: &[u8; 32],
+    holders: &[String],
+) -> Result<Vec<u8>, SdrDiscardReason> {
+    let blossom_err = if holders.is_empty() {
+        None
+    } else {
+        match fetch_blob_from_holders(client, blob_id, holders).await {
+            Ok((body, _)) => return Ok(body),
+            Err(e) => Some(e),
+        }
+    };
+    match super::db_outbox::get_zbe_by_blob_id(pool, blob_id).await {
+        Ok(Some(body)) if blob_id_of(&body) == *blob_id => {
+            tracing::warn!(
+                blob_id = %hex::encode(blob_id),
+                "§4.5 recovery: blossom holders missed; using durable outbox ZBE"
+            );
+            Ok(body)
+        }
+        Ok(Some(_)) => Err(SdrDiscardReason::FetchFailed {
+            detail: "outbox ZBE content-address mismatch".into(),
+        }),
+        Ok(None) => Err(SdrDiscardReason::FetchFailed {
+            detail: if holders.is_empty() {
+                IncomingError::HoldersEmpty.to_string()
+            } else {
+                blossom_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "blossom fetch failed".into())
+            },
+        }),
+        Err(e) => Err(SdrDiscardReason::IndexLookupFailed {
+            detail: format!("outbox ZBE lookup: {e:#}"),
+        }),
+    }
+}
+
+/// `Ok(true)` = live engine already at/beyond this head and the served
+/// `current_pubkey` is not spent on NfLog. `Ok(false)` = must install/replace.
+/// `Err` = same send_counter as the reconstructed head but the live
+/// `current_pubkey` is already a first-occurrence winner — not recovered.
+fn recovered_head_already_installed(
+    adapter: &EngineAdapter,
+    owner: Address,
+    head_send_counter: u64,
+) -> Result<bool, SdrDiscardReason> {
+    adapter.with_engine(|engine| {
+        let Some(record) = engine.account(&owner) else {
+            return Ok(false);
+        };
+        if record.state.send_counter < head_send_counter {
+            return Ok(false);
+        }
+        match engine.nflog().lookup(record.state.current_pubkey) {
+            LookupResult::Present { .. } => Err(SdrDiscardReason::HeadReconstructionFailed {
+                detail: format!(
+                    "engine send_counter {} >= reconstructed head {} but \
+                     current_pubkey is already first-occurrence on NfLog — \
+                     head is spent, not recovered",
+                    record.state.send_counter, head_send_counter
+                ),
+            }),
+            _ => Ok(true),
+        }
+    })
+}
+
 /// Wait for at least one entrusteed operational bundle, then run one recovery
 /// campaign: gapless scan → per-event classify (SDR candidates + CoinProof
 /// receive path) → §4.2 VERIFY-ONLY SDR replay + output-coin fold.
@@ -1893,13 +2002,21 @@ pub(crate) fn recovery_blob_holders(advertised: &[String], blob_stores: &[String
 /// node (checked via the same private-index read `/v1/pull`'s
 /// `get_account_state` uses) — a re-run of the campaign must not re-scan,
 /// re-replay, or re-install these; it only needs to make progress on the rest.
+///
+/// A head whose `current_pubkey` is already a first-occurrence winner on the
+/// canonical NfLog is **not** recovered: the served `send_counter` still names
+/// a spent key, so SDR replay must install the post-spend state.
 fn already_recovered_subjects(
     index: &InMemoryPrivateIndex,
     active: &[(SubjectAddress, OperationalBundle)],
+    current_pk_spent_on_nflog: impl Fn(&[u8; 32]) -> bool,
 ) -> HashSet<[u8; 32]> {
     active
         .iter()
-        .filter(|(subject, _)| index.get_account_state(subject).is_ok())
+        .filter(|(subject, _)| match index.get_account_state(subject) {
+            Ok(view) => !current_pk_spent_on_nflog(&view.current_pubkey),
+            Err(_) => false,
+        })
         .map(|(subject, _)| subject.0)
         .collect()
 }
@@ -1921,7 +2038,11 @@ pub(crate) async fn run_recovery_campaign(
     // run without an operational bundle (see [`RecoveryError::NoOperationalBundle`]
     // text). There is no path that starts the scan with an empty subject set.
     let active = wait_for_active_bundles(&deps.bundles).await;
-    let already_recovered = already_recovered_subjects(&deps.index, &active);
+    let already_recovered = already_recovered_subjects(&deps.index, &active, |pk| {
+        deps.adapter.with_engine(|engine| {
+            matches!(engine.nflog().lookup(*pk), LookupResult::Present { .. })
+        })
+    });
     if !already_recovered.is_empty() {
         tracing::info!(
             subjects = already_recovered.len(),
@@ -2128,22 +2249,26 @@ pub(crate) async fn run_recovery_campaign(
                     }
                 };
                 let holders = recovery_blob_holders(&candidate.holders, &deps.blob_stores);
-                let zbe_ciphertext =
-                    match fetch_blob_from_holders(&client, &candidate.blob_id, &holders).await {
-                        Ok((body, _)) => body,
-                        Err(e) => {
-                            report.sdr_discards.push(SdrDiscard {
-                                subject: subject.0,
-                                blob_id: candidate.blob_id,
-                                record_kind: candidate.record_kind,
-                                send_counter: None,
-                                reason: SdrDiscardReason::FetchFailed {
-                                    detail: e.to_string(),
-                                },
-                            });
-                            continue;
-                        }
-                    };
+                let zbe_ciphertext = match fetch_blob_with_outbox_fallback(
+                    deps.pool.as_ref(),
+                    &client,
+                    &candidate.blob_id,
+                    &holders,
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(reason) => {
+                        report.sdr_discards.push(SdrDiscard {
+                            subject: subject.0,
+                            blob_id: candidate.blob_id,
+                            record_kind: candidate.record_kind,
+                            send_counter: None,
+                            reason,
+                        });
+                        continue;
+                    }
+                };
                 let k_tx = match derive_note_key(&candidate.ss, &candidate.epk) {
                     Ok(k) => k,
                     Err(e) => {
@@ -2218,7 +2343,12 @@ pub(crate) async fn run_recovery_campaign(
                         }
                     };
                 let inclusion_height = match deps.adapter.with_engine(|engine| {
-                    verify_sdr_record_engine_checks(engine, pk_create, r_create)
+                    verify_sdr_record_engine_checks(
+                        engine,
+                        pk_create,
+                        r_create,
+                        record.own_nullifier.r_prime_create,
+                    )
                 }) {
                     Ok(height) => height,
                     Err(reason) => {
@@ -2314,7 +2444,7 @@ pub(crate) async fn run_recovery_campaign(
                             );
                         }
                         Err(reason) => {
-                            fold_failed = true;
+                            let fetch_miss = matches!(reason, SdrDiscardReason::FetchFailed { .. });
                             report.sdr_discards.push(SdrDiscard {
                                 subject: subject.0,
                                 blob_id: oref.blob_id,
@@ -2322,6 +2452,15 @@ pub(crate) async fn run_recovery_campaign(
                                 send_counter: Some(accepted_sdr.record.send_counter),
                                 reason,
                             });
+                            if fetch_miss {
+                                tracing::warn!(
+                                    subject = %hex::encode(subject.0),
+                                    oref_blob = %hex::encode(oref.blob_id),
+                                    "§4.5 recovery: output_ref blob missing; continuing fold with indexed coins"
+                                );
+                            } else {
+                                fold_failed = true;
+                            }
                         }
                     }
                 }
@@ -2513,9 +2652,9 @@ async fn stage_output_ref_via_adapter(
 ///
 /// Idempotent across repeat campaign runs: if the engine already holds this
 /// subject at a send_counter >= the reconstructed head's, this is a no-op
-/// success (already installed). If it holds an *older* account, that is a
-/// fail-closed contradiction (no in-place update path exists for a live
-/// account — this task never adds one).
+/// success (already installed). If it holds an *older* account, the reconstructed
+/// head replaces it (`StateEngine::replace_account`) after the same VERIFY-ONLY
+/// reconstruction as a first install.
 async fn install_and_persist_recovered_head(
     deps: &RecoveryCampaignDeps,
     bridge: &ProverBridge,
@@ -2529,28 +2668,22 @@ async fn install_and_persist_recovered_head(
         .expect("caller checked accepted is non-empty");
     let genesis = accepted.first().expect("non-empty implies a first element");
 
-    let existing_send_counter = deps
-        .adapter
-        .with_engine(|engine| engine.account(&owner).map(|r| r.state.send_counter));
-    if let Some(existing) = existing_send_counter {
-        if existing >= head.record.account_state.send_counter {
+    match recovered_head_already_installed(
+        &deps.adapter,
+        owner,
+        head.record.account_state.send_counter,
+    ) {
+        Ok(true) => {
             tracing::info!(
                 subject = %hex::encode(subject),
-                existing_send_counter = existing,
                 head_send_counter = head.record.account_state.send_counter,
                 "§4.5 recovery: engine already holds this subject at or beyond the \
                  reconstructed head — treating as already installed"
             );
             return Ok(());
         }
-        return Err(SdrDiscardReason::HeadReconstructionFailed {
-            detail: format!(
-                "engine already holds account at send_counter {existing}, behind the \
-                 reconstructed head {} — no in-place account update path exists; refusing \
-                 to overwrite (nothing was changed)",
-                head.record.account_state.send_counter
-            ),
-        });
+        Ok(false) => {}
+        Err(e) => return Err(e),
     }
 
     // 1. Admitted coin universe: this account's own self-created outputs
@@ -2702,16 +2835,52 @@ async fn install_and_persist_recovered_head(
         })?;
 
     // 6. Install, then persist durably; roll the live engine back on a
-    // persist failure so memory and disk never diverge.
+    // persist failure so memory and disk never diverge. Hold the write gate
+    // for the full snapshot→mutate→persist→restore window (same serialisation
+    // as receive/scan). Re-read the live send_counter under the gate so
+    // insert vs replace is not a stale pre-reconstruct decision.
+    let _write_gate = deps.adapter.lock_writes().await;
+    let replace_stale = match recovered_head_already_installed(
+        &deps.adapter,
+        owner,
+        head.record.account_state.send_counter,
+    ) {
+        Ok(true) => {
+            tracing::info!(
+                subject = %hex::encode(subject),
+                head_send_counter = head.record.account_state.send_counter,
+                "§4.5 recovery: engine already holds this subject at or beyond the \
+                 reconstructed head — treating as already installed"
+            );
+            return Ok(());
+        }
+        Ok(false) => deps
+            .adapter
+            .with_engine(|engine| engine.account(&owner).is_some()),
+        Err(e) => return Err(e),
+    };
     let pre = deps.adapter.snapshot_live();
     let insert_result = deps
         .adapter
-        .with_engine_mut(|engine| engine.insert_account(owner, record))
+        .with_engine_mut(|engine| {
+            if replace_stale {
+                engine.replace_account(owner, record)
+            } else {
+                engine.insert_account(owner, record)
+            }
+        })
         .map_err(|e| SdrDiscardReason::HeadReconstructionFailed {
             detail: format!("stack claim for account install: {e:#}"),
         })?;
     insert_result.map_err(|e| SdrDiscardReason::HeadReconstructionFailed {
-        detail: format!("insert_account: {e:#}"),
+        detail: format!(
+            "{}: {e:#}",
+            if replace_stale {
+                "replace_account"
+            } else {
+                "insert_account"
+            }
+        ),
     })?;
 
     if let Err(e) = deps.adapter.persist().await {
@@ -3277,11 +3446,46 @@ mod tests {
             .expect("register recovered subject fixture");
 
         let active = vec![(recovered_subject, bundle), (missing_subject, bundle)];
-        let recovered = already_recovered_subjects(&index, &active);
+        let recovered = already_recovered_subjects(&index, &active, |_| false);
         assert_eq!(recovered, HashSet::from([recovered_subject.0]));
         assert!(!recovered.contains(&missing_subject.0));
 
-        assert!(already_recovered_subjects(&index, &[]).is_empty());
+        assert!(already_recovered_subjects(&index, &[], |_| false).is_empty());
+    }
+
+    #[test]
+    fn already_recovered_subjects_skips_head_whose_current_pubkey_is_on_nflog() {
+        let recovered_subject = SubjectAddress([0x31; 32]);
+        let bundle = OperationalBundle {
+            ivk: [0x11; 32],
+            ovk: [0x12; 32],
+            op: [0x13; 32],
+            nk: [0x14; 32],
+            op_secret: [0x15; 32],
+        };
+        let current_pubkey = [0x22; 32];
+        let index = InMemoryPrivateIndex::new();
+        index
+            .insert_account(
+                recovered_subject,
+                crate::kernel::access::AccountStateView {
+                    account_state: vec![0x01],
+                    state_head: crate::kernel::types::Digest32([0x21; 32]),
+                    head_record_id: None,
+                    send_counter: 7,
+                    current_pubkey,
+                    last_nullifier_pk: None,
+                    last_nullifier_r: None,
+                },
+            )
+            .expect("register stale-head subject fixture");
+
+        let active = vec![(recovered_subject, bundle)];
+        let recovered = already_recovered_subjects(&index, &active, |pk| pk == &current_pubkey);
+        assert!(
+            recovered.is_empty(),
+            "stale head with spent current_pubkey must be replayed"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5157,15 +5361,13 @@ mod tests {
             &behind_accepted,
         )
         .await
-        .expect_err("an older installed account must fail closed instead of being overwritten");
-        assert_eq!(
-            err,
-            SdrDiscardReason::HeadReconstructionFailed {
-                detail: "engine already holds account at send_counter 1, behind the \
-                         reconstructed head 2 — no in-place account update path exists; refusing \
-                         to overwrite (nothing was changed)"
-                    .into(),
-            }
+        .expect_err(
+            "stale engine head is eligible for replace, but this fixture has no NfLog prefix \
+             that opens the reconstructed head — reconstruction must fail closed without mutating",
+        );
+        assert!(
+            matches!(err, SdrDiscardReason::HeadReconstructionFailed { .. }),
+            "got {err:?}"
         );
         assert_eq!(
             adapter.with_engine(|engine| {
@@ -5445,8 +5647,13 @@ mod tests {
         let bridge = ProverBridge::new(Network::Regtest);
         let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
             .expect("pre-engine checks must pass");
-        let err = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
-            .expect_err("check (iv) first-occurrence must fail");
+        let err = verify_sdr_record_engine_checks(
+            &engine,
+            pk_create,
+            r_create,
+            record.own_nullifier.r_prime_create,
+        )
+        .expect_err("check (iv) first-occurrence must fail");
         assert!(
             matches!(err, SdrDiscardReason::NotFirstOccurrence { .. }),
             "got {err:?}"
@@ -5467,8 +5674,13 @@ mod tests {
         let bridge = ProverBridge::new(Network::Regtest);
         let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
             .expect("pre-engine checks must still pass");
-        let inclusion_height = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
-            .expect("engine checks must still pass");
+        let inclusion_height = verify_sdr_record_engine_checks(
+            &engine,
+            pk_create,
+            r_create,
+            record.own_nullifier.r_prime_create,
+        )
+        .expect("engine checks must still pass");
         let err = verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
             .await
             .expect_err("check (v) inclusion hash must fail");
@@ -5492,8 +5704,13 @@ mod tests {
         let bridge = ProverBridge::new(Network::Regtest);
         let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
             .expect("pre-engine checks must still pass");
-        let inclusion_height = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
-            .expect("engine checks must still pass");
+        let inclusion_height = verify_sdr_record_engine_checks(
+            &engine,
+            pk_create,
+            r_create,
+            record.own_nullifier.r_prime_create,
+        )
+        .expect("engine checks must still pass");
         let err = verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
             .await
             .expect_err("check (v) occurred_at must fail");
@@ -5517,8 +5734,13 @@ mod tests {
         let bridge = ProverBridge::new(Network::Regtest);
         let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
             .expect("pre-engine checks must still pass");
-        let inclusion_height = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
-            .expect("engine checks must still pass");
+        let inclusion_height = verify_sdr_record_engine_checks(
+            &engine,
+            pk_create,
+            r_create,
+            record.own_nullifier.r_prime_create,
+        )
+        .expect("engine checks must still pass");
         let err = verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
             .await
             .expect_err("check (vi) anchor bound must fail");
@@ -5540,8 +5762,13 @@ mod tests {
         let bridge = ProverBridge::new(Network::Regtest);
         let (pk_create, r_create) = verify_sdr_record_pre_engine(&bridge, &subject, &nk, &record)
             .expect("fully valid record must pass pre-engine checks");
-        let inclusion_height = verify_sdr_record_engine_checks(&engine, pk_create, r_create)
-            .expect("fully valid record must pass engine checks");
+        let inclusion_height = verify_sdr_record_engine_checks(
+            &engine,
+            pk_create,
+            r_create,
+            record.own_nullifier.r_prime_create,
+        )
+        .expect("fully valid record must pass engine checks");
         verify_sdr_record_checks_v_vi_async(&scope.pool, inclusion_height, &record)
             .await
             .expect("fully valid record must pass checks (v)/(vi)");

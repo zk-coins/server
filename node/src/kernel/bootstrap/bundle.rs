@@ -356,7 +356,13 @@ pub(crate) fn entrust_operational_bundle(
             "operational bundle for this subject has been revoked and cannot be restored",
         ));
     }
-    if bundles.is_active(&command.subject) {
+    if let Some(existing) = bundles.get_active(&command.subject) {
+        if existing.serialize().as_slice() == command.bundle_bytes.as_slice() {
+            // Identical re-entrust is a no-op success. Do not consume the
+            // challenge: the subject is already active with these bytes.
+            // (wrong_phase is not an allowed Entrust error at the API edge.)
+            return Ok(EntrustResult { accepted: true });
+        }
         return Err(KernelError::new(
             KernelErrorCode::WrongPhase,
             "operational bundle already entrusted for this subject",
@@ -554,6 +560,25 @@ mod tests {
         .expect("entrust");
         assert!(accepted.accepted);
         assert_eq!(bundles.op_sk(&subj), Some(sample_bundle().op));
+
+        // Identical re-entrust is idempotent (does not consume the nonce).
+        let issued_again = challenges.issue(ChallengeAction::Entrust, subj, now);
+        let again = entrust_operational_bundle(
+            BundleProcedureDeps {
+                challenges: &challenges,
+                bundles: &bundles,
+                allowed_chan_binds: &allowed,
+                now,
+            },
+            EntrustCommand {
+                subject: subj,
+                nonce: issued_again.nonce,
+                chan_bind: cb,
+                bundle_bytes: sample_bytes(),
+            },
+        )
+        .expect("identical re-entrust");
+        assert!(again.accepted);
 
         let issued_r = challenges.issue(ChallengeAction::Revoke, subj, now);
         let rev = revoke_operational_bundle(

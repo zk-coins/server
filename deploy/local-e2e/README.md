@@ -88,7 +88,7 @@ What `up.sh` does, fail-closed:
 ./deploy/local-e2e/journey.sh              # default: stages 1 + 2
 ./deploy/local-e2e/journey.sh --list
 ./deploy/local-e2e/journey.sh --stage 1 --stage 2
-./deploy/local-e2e/journey.sh --stage 7    # named control (may be TODO)
+./deploy/local-e2e/journey.sh --stage 7    # reorg control N-09
 ```
 
 Signing and key derivation use **`@zkcoins/sdk`** against the live api
@@ -120,20 +120,20 @@ expect OOM (exit 137) during circuit construction rather than a logic failure.
 | Stage | Mandate §3 | Status in this tree |
 | --- | --- | --- |
 | **1** | `GET /v1/info` equals pinned `circuit_digests` (`C`, `C_balance`) and bounds | **Hard** — digests + `finality_confirmations=6`, `max_tx_*=8`, `max_rx_coins=4`, `max_account_assets=32`, `activation_height=0` |
-| **2** | Alice mint → job `completed` → nullifier inscribed → §3.10 `completed` after 6 blocks → balance `1_000_000_000` | **Hard driver** — entrust bundle, mint, SDK `refuseOrSignAndSubmit` (awaiting_signature recompute), mine, `/v1/chain/nullifier` + inscriptions, pull + parse balances |
-| **2b** | Carol EUR-Demo token-standard-2 genesis + Alice receive; two-asset map | **TODO skeleton** — needs non-self mint delivery |
-| **3–4** | Alice fee-less send to Bob (case (c)); publisher half-agg + inscription; Alice balance `999_750_000` | **Partial**: fee_address **negative** control is hard; positive send is **TODO** (Nostr/Blossom delivery gap) |
-| **5** | Bob receive fold → balance `250_000` | **TODO skeleton** (depends on 3–4) |
-| **6** | Confirmation link reports §3.10 `completed` for the payment | **TODO skeleton** for payment; mint §3.10 already checked in stage 2 |
-| **7** | Reorg control N-09 | **TODO skeleton** |
-| **8** | Recovery control Req 6 | **TODO skeleton** |
-| **9** | Portability control Req 10 | **TODO skeleton** |
-| **10** | Attestation control Req 9(b) | **TODO skeleton** (challenge surface probed) |
-| **11** | Grant control Req 9(c) | **TODO skeleton** (challenge surface probed) |
+| **2** | Alice mint → job `completed` → nullifier inscribed → §3.10 `completed` after 6 blocks → balance `1_000_000_000` | **Hard** — entrust bundle, mint, SDK `refuseOrSignAndSubmit` (awaiting_signature recompute), mine, `/v1/chain/nullifier` + inscriptions, pull + parse balances. Re-run skips mint when USD-Demo is already held. |
+| **2b** | Carol EUR-Demo token-standard-2 genesis + Alice receive; two-asset map | **Hard** — re-run skips mint when EUR-Demo is already held |
+| **3–4** | Alice fee-less send to Bob (case (c)); publisher half-agg + inscription; Alice balance `999_750_000` | **Hard** — `fee_address` negative control always runs; positive send skips when Alice is already at `999_750_000` |
+| **5** | Bob receive fold → balance `250_000` | **Hard** — re-run skips receive when Bob already holds `250_000` |
+| **6** | Confirmation link reports §3.10 `completed` for the payment | **Hard** — recovers Alice spend pubkey from inscriptions when the send stage was skipped |
+| **7** | Reorg control N-09 | **Hard** — both nodes converge on size, root, and tip after a mined reorg |
+| **8** | Recovery control Req 6 | **Hard** — second node reconstructs Bob from seed + chain + replicated blobs |
+| **9** | Portability control Req 10 | **Hard** — second-node balances match; skips a redundant send when the account-head spend key is already on the NfLog |
+| **10** | Attestation control Req 9(b) | **Hard** — produce + independent verify + tamper-reject |
+| **11** | Grant control Req 9(c) | **Hard** — USD-scoped grant, in-scope pull ok, EUR out-of-scope refused |
 
 Default `journey.sh` runs **1 + 2 only**, so a green default run does **not**
-claim the full A-to-Z suite. Requesting a TODO stage exits non-zero with a
-named message — never a silent pass.
+claim the full A-to-Z suite. Pass `--stage` (repeatable) for 2b–11. First failed
+assertion exits non-zero with `journey FAIL [stage N]: …` — never a silent pass.
 
 ## Fixtures (mandate §3)
 
@@ -156,9 +156,9 @@ named message — never a silent pass.
 See `docs/local-stack.md` “Gaps / open items”. Material to journey completeness:
 
 1. Esplora not bundled (residual boot + node `/health/ready`).
-2. Nostr delivery client not fully wired into send/receive (blocks stages 3–6, 2b).
-3. Recipient `IVPK` / Invoice off REST inventory — wallet must supply delivery credentials.
-4. Kernel operational-bundle store is process-local (lost on node restart).
+2. Recipient `IVPK` / Invoice off REST inventory — wallet must supply delivery credentials.
+3. Kernel operational-bundle store is process-local (lost on node restart; the journey re-entrusts).
+4. Account `send_counter` can lag the NfLog first-occurrence index by one; the journey walks the counter before mint/send.
 5. Empty `ZKCOINS_BLOSSOM_ALLOWED_OPS` → uploads 403 (set op pubkeys when delivery is live).
 
 ## Verification (syntax)

@@ -208,3 +208,269 @@ pub(crate) fn publish_v1_batch(
         .publish(members)
         .context("v1.1 Publisher::publish failed (no legacy fall-back)")
 }
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
+mod tests {
+    use std::{
+        env,
+        ffi::OsString,
+        path::PathBuf,
+        sync::{Mutex, MutexGuard},
+    };
+
+    use super::*;
+    use crate::v1::{mode::V1ShadowMode, separation::claim_process_stack_from_shadow_mode};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const PUBLISHER_ENV_KEYS: [&str; 5] = [
+        V1_SCANNER_RPC_URL_ENV,
+        V1_SCANNER_COOKIE_ENV,
+        V1_PUBLISHER_WALLET_ENV,
+        V1_PUBLISHER_FEE_RATE_ENV,
+        V1_PUBLISHER_REVEAL_VALUE_ENV,
+    ];
+
+    struct PublisherEnvRestore {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl PublisherEnvRestore {
+        fn capture() -> Self {
+            Self {
+                saved: PUBLISHER_ENV_KEYS
+                    .into_iter()
+                    .map(|key| (key, env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for PublisherEnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn valid_env() {
+        env::set_var(V1_SCANNER_RPC_URL_ENV, "http://127.0.0.1:18443");
+        env::set_var(V1_SCANNER_COOKIE_ENV, "/tmp/cookie");
+        env::set_var(V1_PUBLISHER_WALLET_ENV, "zkcoins");
+        env::set_var(V1_PUBLISHER_FEE_RATE_ENV, "2");
+        env::set_var(V1_PUBLISHER_REVEAL_VALUE_ENV, "546");
+    }
+
+    fn with_v1_claim<R>(f: impl FnOnce() -> R) -> R {
+        // The process claim is monotonic; nextest provides process isolation for these tests.
+        claim_process_stack_from_shadow_mode(V1ShadowMode::On);
+        f()
+    }
+
+    fn publisher_env_error() -> String {
+        match v1_publisher_env_from_env(Network::Regtest) {
+            Ok(_) => panic!("publisher environment unexpectedly loaded"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    fn assert_error_names(error: &str, key: &str, fragment: &str) {
+        assert!(error.contains(key), "error did not name {key}: {error}");
+        assert!(
+            error.contains(fragment),
+            "error for {key} did not contain {fragment:?}: {error}"
+        );
+    }
+
+    #[test]
+    fn publisher_env_rejects_an_unclaimed_process_before_reading_env() {
+        let _env_lock = lock_env();
+        let _env_restore = PublisherEnvRestore::capture();
+
+        for key in PUBLISHER_ENV_KEYS {
+            env::remove_var(key);
+        }
+
+        let error = publisher_env_error();
+        assert!(
+            error.contains("stack separation"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("ScanStackMode::V1"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.contains(&format!("requires {V1_SCANNER_RPC_URL_ENV}")),
+            "publisher env was read before the stack-separation guard: {error}"
+        );
+        assert!(
+            !error.contains("Refusing to fall back to the legacy Esplora commitment publisher"),
+            "publisher env was read before the stack-separation guard: {error}"
+        );
+    }
+
+    #[test]
+    fn publisher_env_rejects_a_legacy_process_claim() {
+        let _env_lock = lock_env();
+        let _env_restore = PublisherEnvRestore::capture();
+
+        claim_process_stack_from_shadow_mode(V1ShadowMode::Off);
+        valid_env();
+
+        let error = publisher_env_error();
+        assert!(
+            error.contains("stack separation"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("legacy scan stack"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("AggregateStateNullifierV3"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.contains("ScanStackMode::V1 at boot"),
+            "legacy claim returned the unclaimed-process error: {error}"
+        );
+        assert!(
+            !error.contains(&format!("requires {V1_SCANNER_RPC_URL_ENV}")),
+            "legacy claim reached publisher env validation: {error}"
+        );
+    }
+
+    #[test]
+    fn publisher_env_rejects_each_missing_value() {
+        let _env_lock = lock_env();
+        let _env_restore = PublisherEnvRestore::capture();
+
+        with_v1_claim(|| {
+            let cases = [
+                (
+                    V1_SCANNER_RPC_URL_ENV,
+                    "Refusing to fall back to the legacy Esplora commitment publisher",
+                ),
+                (V1_SCANNER_COOKIE_ENV, "Refusing to fall back"),
+                (
+                    V1_PUBLISHER_WALLET_ENV,
+                    "bitcoind wallet name funding AggregateStateNullifierV3 commits",
+                ),
+                (
+                    V1_PUBLISHER_FEE_RATE_ENV,
+                    "sat/vB; no silent default fee rate",
+                ),
+                (
+                    V1_PUBLISHER_REVEAL_VALUE_ENV,
+                    "reveal output sats; no silent default",
+                ),
+            ];
+
+            for (key, fragment) in cases {
+                valid_env();
+                env::remove_var(key);
+                let error = publisher_env_error();
+                assert_error_names(&error, key, fragment);
+            }
+        });
+    }
+
+    #[test]
+    fn publisher_env_rejects_empty_and_whitespace_only_strings() {
+        let _env_lock = lock_env();
+        let _env_restore = PublisherEnvRestore::capture();
+
+        with_v1_claim(|| {
+            for key in [
+                V1_SCANNER_RPC_URL_ENV,
+                V1_SCANNER_COOKIE_ENV,
+                V1_PUBLISHER_WALLET_ENV,
+            ] {
+                for value in ["", "   "] {
+                    valid_env();
+                    env::set_var(key, value);
+                    let error = publisher_env_error();
+                    assert_error_names(&error, key, "is empty (no silent default)");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn publisher_env_rejects_invalid_and_zero_numeric_values() {
+        let _env_lock = lock_env();
+        let _env_restore = PublisherEnvRestore::capture();
+
+        with_v1_claim(|| {
+            let invalid_cases = [
+                (V1_PUBLISHER_FEE_RATE_ENV, "abc"),
+                (V1_PUBLISHER_FEE_RATE_ENV, ""),
+                (V1_PUBLISHER_FEE_RATE_ENV, "   "),
+                (V1_PUBLISHER_REVEAL_VALUE_ENV, "xyz"),
+                (V1_PUBLISHER_REVEAL_VALUE_ENV, ""),
+                (V1_PUBLISHER_REVEAL_VALUE_ENV, "   "),
+            ];
+            for (key, value) in invalid_cases {
+                valid_env();
+                env::set_var(key, value);
+                let error = publisher_env_error();
+                let expected = format!("{key}={value:?} is not a non-negative integer");
+                assert_error_names(&error, key, &expected);
+            }
+
+            for key in [V1_PUBLISHER_FEE_RATE_ENV, V1_PUBLISHER_REVEAL_VALUE_ENV] {
+                valid_env();
+                env::set_var(key, "0");
+                let error = publisher_env_error();
+                assert_error_names(&error, key, "must be > 0 (no silent default)");
+            }
+        });
+    }
+
+    #[test]
+    fn publisher_env_loads_and_maps_into_config() {
+        let _env_lock = lock_env();
+        let _env_restore = PublisherEnvRestore::capture();
+
+        with_v1_claim(|| {
+            valid_env();
+            let publisher_env = v1_publisher_env_from_env(Network::Regtest)
+                .expect("valid publisher environment should load");
+
+            assert_eq!(publisher_env.rpc_url, "http://127.0.0.1:18443");
+            assert_eq!(publisher_env.cookie_path, PathBuf::from("/tmp/cookie"));
+            assert_eq!(publisher_env.wallet_name, "zkcoins");
+            assert_eq!(publisher_env.fee_rate_sat_per_vb, 2);
+            assert_eq!(publisher_env.reveal_output_value_sats, 546);
+            assert_eq!(publisher_env.network, Network::Regtest);
+            assert_eq!(
+                publisher_env.inclusion_delay_margin,
+                BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN
+            );
+
+            let config = publisher_env.into_config();
+            assert_eq!(config.rpc_url, "http://127.0.0.1:18443");
+            assert_eq!(config.cookie_path, PathBuf::from("/tmp/cookie"));
+            assert_eq!(config.wallet_name, "zkcoins");
+            assert_eq!(config.fee_rate_sat_per_vb, 2);
+            assert_eq!(config.reveal_output_value, Amount::from_sat(546));
+            assert_eq!(config.network, Network::Regtest);
+            assert_eq!(
+                config.inclusion_delay_margin,
+                BLOCK_ANCHOR_INCLUSION_DELAY_MARGIN
+            );
+        });
+    }
+}

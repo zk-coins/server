@@ -44,6 +44,15 @@ use std::sync::{Arc, Mutex};
 // `router.rs`.
 const ACCOUNT_NODE_ADDR: &str = "0.0.0.0:4242";
 
+/// REST bind. Compose uses the constant (host maps 4242). A native stack
+/// that already occupies 4242 (ingress) sets `ZKCOINS_HTTP_ADDR`.
+fn rest_bind_addr() -> String {
+    match std::env::var("ZKCOINS_HTTP_ADDR") {
+        Ok(addr) if !addr.is_empty() => addr,
+        _ => ACCOUNT_NODE_ADDR.to_string(),
+    }
+}
+
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 
@@ -447,7 +456,7 @@ async fn main() -> Result<(), Box<dyn StdError>> {
         if let Err(e) = start_rest_node(RestNodeConfig {
             account_node,
             username_store,
-            addr: ACCOUNT_NODE_ADDR.to_string(),
+            addr: rest_bind_addr(),
             pool: pool_for_rest,
             proofs_dir,
             v1_readiness,

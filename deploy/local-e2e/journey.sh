@@ -5,9 +5,9 @@
 # sibling ../sdk available via package.json file: dependency.
 #
 # Usage:
-#   ./deploy/local-e2e/journey.sh                 # core steps 1–6
+#   ./deploy/local-e2e/journey.sh                 # default stages 1–2
 #   ./deploy/local-e2e/journey.sh --stage 1       # single stage
-#   ./deploy/local-e2e/journey.sh --stage 7       # reorg control (may be TODO)
+#   ./deploy/local-e2e/journey.sh --stage 7       # reorg control N-09
 #   ./deploy/local-e2e/journey.sh --list           # list stages
 
 set -euo pipefail
@@ -37,6 +37,12 @@ export ZKCOINS_NODE_URL="${ZKCOINS_NODE_URL:-http://127.0.0.1:4242}"
 export COMPOSE_FILE="${COMPOSE_FILE:-${REPO_ROOT}/compose.yaml}"
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-zkcoins-local}"
 export ZKCOINS_V1_BITCOIND_WALLET="${ZKCOINS_V1_BITCOIND_WALLET:-zkcoins}"
+
+# Native kernel has no compose service `node`. Prefer the release verifier
+# binary when present so stage 10 does not docker-compose-exec a dead service.
+if [[ -z "${ZKCOINS_VERIFY_ATTESTATION:-}" && -x "${REPO_ROOT}/target/release/verify_attestation" ]]; then
+  export ZKCOINS_VERIFY_ATTESTATION="${REPO_ROOT}/target/release/verify_attestation"
+fi
 
 # Pin expected regtest digests if not already in env (same as env.example.sh).
 export ZKCOINS_CIRCUIT_DIGEST_C="${ZKCOINS_CIRCUIT_DIGEST_C:-9d256e8c828f531fc6cf9ffd4fa1ca9480473d00a99f92ea535912daa34e8352}"

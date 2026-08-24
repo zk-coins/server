@@ -1401,6 +1401,127 @@ mod tests {
     }
 
     #[test]
+    fn extract_scan_tags_missing_zkepk() {
+        let tags = vec![vec!["zkdt".into(), hex::encode([0xAAu8; 32])]];
+        let err = extract_scan_tags(&tags).expect_err("missing zkepk");
+        assert!(matches!(err, IncomingError::ScanTags { .. }));
+        let IncomingError::ScanTags { detail } = err else {
+            unreachable!("expected scan tags error");
+        };
+        assert_eq!(detail, "missing zkepk tag");
+    }
+
+    #[test]
+    fn extract_scan_tags_missing_zkdt() {
+        let tags = vec![vec!["zkepk".into(), hex::encode([0xBBu8; 32])]];
+        let err = extract_scan_tags(&tags).expect_err("missing zkdt");
+        assert!(matches!(err, IncomingError::ScanTags { .. }));
+        let IncomingError::ScanTags { detail } = err else {
+            unreachable!("expected scan tags error");
+        };
+        assert_eq!(detail, "missing zkdt tag");
+    }
+
+    #[test]
+    fn extract_scan_tags_empty_list_missing_zkdt() {
+        let tags = vec![];
+        let err = extract_scan_tags(&tags).expect_err("missing zkdt");
+        assert!(matches!(err, IncomingError::ScanTags { .. }));
+        let IncomingError::ScanTags { detail } = err else {
+            unreachable!("expected scan tags error");
+        };
+        assert_eq!(detail, "missing zkdt tag");
+    }
+
+    #[test]
+    fn extract_scan_tags_ignores_unknown_tag_when_both_present() {
+        let tags = vec![
+            vec!["unknown".into(), "deadbeef".into()],
+            vec!["zkdt".into(), hex::encode([0xAAu8; 32])],
+            vec!["zkepk".into(), hex::encode([0xBBu8; 32])],
+        ];
+        let (dt, epk) = extract_scan_tags(&tags).expect("both tags");
+        assert_eq!(dt, [0xAA; 32]);
+        assert_eq!(epk, [0xBB; 32]);
+    }
+
+    #[test]
+    fn extract_scan_tags_skips_len_one_tag() {
+        let tags = vec![
+            vec!["zkdt".into()],
+            vec!["zkdt".into(), hex::encode([0xAAu8; 32])],
+            vec!["zkepk".into(), hex::encode([0xBBu8; 32])],
+        ];
+        let (dt, epk) = extract_scan_tags(&tags).expect("both tags");
+        assert_eq!(dt, [0xAA; 32]);
+        assert_eq!(epk, [0xBB; 32]);
+    }
+
+    #[test]
+    fn extract_scan_tags_rejects_zkdt_len_63() {
+        let tags = vec![
+            vec!["zkdt".into(), "a".repeat(63)],
+            vec!["zkepk".into(), hex::encode([0xBBu8; 32])],
+        ];
+        let err = extract_scan_tags(&tags).expect_err("zkdt length 63");
+        assert!(matches!(err, IncomingError::ScanTags { .. }));
+        let IncomingError::ScanTags { detail } = err else {
+            unreachable!("expected scan tags error");
+        };
+        assert_eq!(detail, "zkdt must be 64 lowercase hex chars");
+    }
+
+    #[test]
+    fn extract_scan_tags_rejects_zkepk_short_aaa() {
+        let tags = vec![
+            vec!["zkdt".into(), hex::encode([0xAAu8; 32])],
+            vec!["zkepk".into(), "aaa".into()],
+        ];
+        let err = extract_scan_tags(&tags).expect_err("short zkepk");
+        assert!(matches!(err, IncomingError::ScanTags { .. }));
+        let IncomingError::ScanTags { detail } = err else {
+            unreachable!("expected scan tags error");
+        };
+        assert_eq!(detail, "zkepk must be 64 lowercase hex chars");
+    }
+
+    #[test]
+    fn extract_scan_tags_last_zkdt_wins() {
+        let tags = vec![
+            vec!["zkdt".into(), hex::encode([0xAAu8; 32])],
+            vec!["zkdt".into(), hex::encode([0xCCu8; 32])],
+            vec!["zkepk".into(), hex::encode([0xBBu8; 32])],
+        ];
+        let (dt, epk) = extract_scan_tags(&tags).expect("both tags");
+        assert_eq!(dt, [0xCC; 32]);
+        assert_eq!(epk, [0xBB; 32]);
+    }
+
+    #[test]
+    fn extract_scan_tags_last_zkepk_wins() {
+        let tags = vec![
+            vec!["zkdt".into(), hex::encode([0xAAu8; 32])],
+            vec!["zkepk".into(), hex::encode([0xBBu8; 32])],
+            vec!["zkepk".into(), hex::encode([0xDDu8; 32])],
+        ];
+        let (dt, epk) = extract_scan_tags(&tags).expect("both tags");
+        assert_eq!(dt, [0xAA; 32]);
+        assert_eq!(epk, [0xDD; 32]);
+    }
+
+    #[test]
+    fn extract_scan_tags_skips_empty_inner_tag() {
+        let tags = vec![
+            vec![],
+            vec!["zkdt".into(), hex::encode([0xAAu8; 32])],
+            vec!["zkepk".into(), hex::encode([0xBBu8; 32])],
+        ];
+        let (dt, epk) = extract_scan_tags(&tags).expect("both tags");
+        assert_eq!(dt, [0xAA; 32]);
+        assert_eq!(epk, [0xBB; 32]);
+    }
+
+    #[test]
     fn match_detect_tag_honest_roundtrip() {
         use shared::spec_v1::note_encryption::{shared_secret_sender, xonly_pubkey};
         let ivk = {
@@ -1460,7 +1581,12 @@ mod tests {
         let mut bad = terms.clone();
         bad.decimals = 3;
         let err = verify_asset_terms_self_auth(id, &bad).expect_err("wrong decimals");
-        assert!(matches!(err, IncomingError::Verification(_)));
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "asset_terms self-auth failed: recomputed asset_id ≠ coin.asset_id".into(),
+            ),
+        );
     }
 
     #[test]
@@ -1474,8 +1600,153 @@ mod tests {
             terms_salt: None,
         };
         let err = verify_asset_terms_self_auth(shared::spec_v1::ZERO_HASH, &terms).expect_err("v9");
-        let msg = err.to_string();
-        assert!(msg.contains("neither 1 nor 2"), "got {msg}");
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "asset_terms issuance_version 9 is neither 1 nor 2 — refuse whole bundle".into(),
+            ),
+        );
+    }
+
+    #[test]
+    fn asset_terms_v1_rejects_cap_total() {
+        let name = b"USD-Demo";
+        let nh = name_hash(name).expect("name");
+        let creator = [0x11u8; 32];
+        let id = asset_id_v1(GENESIS_TAG, &creator, &nh, 2, 1);
+        let terms = IssuanceTerms {
+            creator_pubkey: creator,
+            decimals: 2,
+            issuance_version: 1,
+            name: name.to_vec(),
+            cap_total: Some(1),
+            terms_salt: None,
+        };
+        let err = verify_asset_terms_self_auth(id, &terms).expect_err("v1 with cap_total");
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "asset_terms v1 must not carry cap_total/terms_salt".into(),
+            ),
+        );
+    }
+
+    #[test]
+    fn asset_terms_v1_rejects_terms_salt() {
+        let name = b"USD-Demo";
+        let nh = name_hash(name).expect("name");
+        let creator = [0x11u8; 32];
+        let id = asset_id_v1(GENESIS_TAG, &creator, &nh, 2, 1);
+        let terms = IssuanceTerms {
+            creator_pubkey: creator,
+            decimals: 2,
+            issuance_version: 1,
+            name: name.to_vec(),
+            cap_total: None,
+            terms_salt: Some([0xAB; 32]),
+        };
+        let err = verify_asset_terms_self_auth(id, &terms).expect_err("v1 with terms_salt");
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "asset_terms v1 must not carry cap_total/terms_salt".into(),
+            ),
+        );
+    }
+
+    #[test]
+    fn asset_terms_v2_accepts_honest() {
+        let name = b"USD-Demo";
+        let nh = name_hash(name).expect("name");
+        let creator = [0x11u8; 32];
+        let id = asset_id_v2(GENESIS_TAG, &creator, &nh, 2, 2, 1_000_000u128, &[0xCD; 32]);
+        let terms = IssuanceTerms {
+            creator_pubkey: creator,
+            decimals: 2,
+            issuance_version: 2,
+            name: name.to_vec(),
+            cap_total: Some(1_000_000u128),
+            terms_salt: Some([0xCD; 32]),
+        };
+        verify_asset_terms_self_auth(id, &terms).expect("honest v2 terms");
+    }
+
+    #[test]
+    fn asset_terms_v2_missing_cap_total() {
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x11u8; 32],
+            decimals: 2,
+            issuance_version: 2,
+            name: b"USD-Demo".to_vec(),
+            cap_total: None,
+            terms_salt: Some([0xCD; 32]),
+        };
+        let err = verify_asset_terms_self_auth(shared::spec_v1::ZERO_HASH, &terms)
+            .expect_err("v2 missing cap_total");
+        assert_eq!(
+            err,
+            IncomingError::Verification("asset_terms v2 missing cap_total".into()),
+        );
+    }
+
+    #[test]
+    fn asset_terms_v2_missing_terms_salt() {
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x11u8; 32],
+            decimals: 2,
+            issuance_version: 2,
+            name: b"USD-Demo".to_vec(),
+            cap_total: Some(1),
+            terms_salt: None,
+        };
+        let err = verify_asset_terms_self_auth(shared::spec_v1::ZERO_HASH, &terms)
+            .expect_err("v2 missing terms_salt");
+        assert_eq!(
+            err,
+            IncomingError::Verification("asset_terms v2 missing terms_salt".into()),
+        );
+    }
+
+    #[test]
+    fn asset_terms_v2_self_auth_rejects_mismatch() {
+        let name = b"USD-Demo";
+        let creator = [0x11u8; 32];
+        let terms = IssuanceTerms {
+            creator_pubkey: creator,
+            decimals: 2,
+            issuance_version: 2,
+            name: name.to_vec(),
+            cap_total: Some(1_000_000u128),
+            terms_salt: Some([0xCD; 32]),
+        };
+        let err = verify_asset_terms_self_auth(shared::spec_v1::ZERO_HASH, &terms)
+            .expect_err("v2 mismatch");
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "asset_terms self-auth failed: recomputed asset_id ≠ coin.asset_id".into(),
+            ),
+        );
+    }
+
+    #[test]
+    fn asset_terms_name_too_long_is_verification() {
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x11u8; 32],
+            decimals: 2,
+            issuance_version: 1,
+            name: vec![b'x'; 256],
+            cap_total: None,
+            terms_salt: None,
+        };
+        let err = verify_asset_terms_self_auth(shared::spec_v1::ZERO_HASH, &terms)
+            .expect_err("name too long");
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "asset_terms name_hash: asset name too long: 256 bytes (max 255)".into(),
+            ),
+        );
     }
 
     #[test]
@@ -1489,6 +1760,107 @@ mod tests {
     }
 
     #[test]
+    fn inclusion_proof_wire_rejects_truncated_prefix() {
+        let err = parse_inclusion_proof_wire(&[0u8; 4])
+            .expect_err("truncated inclusion proof must be rejected");
+
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "inclusion_proof truncated (need leaf_index + depth)".into(),
+            ),
+        );
+    }
+
+    #[test]
+    fn inclusion_proof_wire_rejects_depth_above_max() {
+        let bytes = vec![0, 0, 0, 0, (MAX_OUTPUT_MERKLE_DEPTH as u8) + 1];
+        let err = parse_inclusion_proof_wire(&bytes)
+            .expect_err("inclusion proof depth above the maximum must be rejected");
+
+        assert_eq!(
+            err,
+            IncomingError::Verification(format!(
+                "inclusion_proof depth {} exceeds MAX_OUTPUT_MERKLE_DEPTH",
+                (MAX_OUTPUT_MERKLE_DEPTH as u8) + 1
+            )),
+        );
+    }
+
+    #[test]
+    fn inclusion_proof_wire_rejects_extra_byte_at_depth0() {
+        let bytes = vec![0u8, 0, 0, 0, 0, 0xff];
+        let err = parse_inclusion_proof_wire(&bytes).expect_err("extra byte must be rejected");
+        assert_eq!(
+            err,
+            IncomingError::Verification("inclusion_proof length 6 ≠ expected 5 for depth 0".into()),
+        );
+    }
+
+    #[test]
+    fn inclusion_proof_wire_rejects_length_mismatch() {
+        let bytes = vec![0, 0, 0, 0, 1];
+        let err = parse_inclusion_proof_wire(&bytes)
+            .expect_err("inclusion proof with mismatched length must be rejected");
+
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "inclusion_proof length 5 ≠ expected 37 for depth 1".into(),
+            ),
+        );
+    }
+
+    #[test]
+    fn inclusion_proof_wire_rejects_noncanonical_sibling() {
+        use plonky2::field::types::Field64;
+        use zkcoins_program::F;
+
+        let mut bytes = vec![0, 0, 0, 0, 1];
+        bytes.extend_from_slice(&F::ORDER.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 24]);
+
+        let err = parse_inclusion_proof_wire(&bytes)
+            .expect_err("non-canonical sibling digest must be rejected");
+        assert_eq!(
+            err,
+            IncomingError::Verification(format!(
+                "non-canonical digest limb 0: {:#x} >= p (GoldilocksField::ORDER)",
+                F::ORDER
+            )),
+        );
+    }
+
+    #[test]
+    fn inclusion_proof_wire_rejects_extra_byte_at_depth1() {
+        let mut bytes = vec![0, 0, 0, 0, 1];
+        bytes.extend_from_slice(&[0x11u8; 32]);
+        bytes.push(0xff);
+        let err = parse_inclusion_proof_wire(&bytes)
+            .expect_err("extra byte at depth 1 must be rejected");
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "inclusion_proof length 38 ≠ expected 37 for depth 1".into(),
+            ),
+        );
+    }
+
+    #[test]
+    fn inclusion_proof_wire_roundtrip_depth1() {
+        let mut bytes = Vec::with_capacity(37);
+        bytes.extend_from_slice(&7u32.to_be_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&[0x11u8; 32]);
+
+        let p = parse_inclusion_proof_wire(&bytes).expect("depth-1 inclusion proof must parse");
+        assert_eq!(p.leaf_index, 7);
+        assert_eq!(p.depth, 1);
+        assert_eq!(p.siblings.len(), 1);
+        assert_eq!(digest_to_bytes(&p.siblings[0]), [0x11u8; 32]);
+    }
+
+    #[test]
     fn holder_outcome_display_names_content_address_lie() {
         let o = HolderOutcome::ContentAddressLie {
             expected: [0x01; 32],
@@ -1498,6 +1870,139 @@ mod tests {
         assert!(s.contains("CONTENT_ADDRESS_LIE"), "{s}");
         assert!(s.contains(&hex::encode([0x01; 32])));
         assert!(s.contains(&hex::encode([0x02; 32])));
+    }
+
+    #[test]
+    fn holder_outcome_display_names_fetch_error() {
+        let o = HolderOutcome::FetchError {
+            message: "holder https://example.invalid/ returned 404".into(),
+        };
+        assert_eq!(
+            o.to_string(),
+            "fetch_error: holder https://example.invalid/ returned 404",
+        );
+    }
+
+    #[test]
+    fn holder_outcome_display_names_ok() {
+        let o = HolderOutcome::Ok { body_len: 64 };
+        assert_eq!(o.to_string(), "ok body_len=64");
+    }
+
+    #[test]
+    fn incoming_error_holders_empty_display_names_cause() {
+        assert_eq!(
+            IncomingError::HoldersEmpty.to_string(),
+            "no advertised or manifest blob holders configured",
+        );
+    }
+
+    #[test]
+    fn incoming_error_all_holders_failed_names_each_attempt() {
+        let err = IncomingError::AllHoldersFailed {
+            attempts: vec![
+                HolderAttempt {
+                    holder: "https://a.example.invalid/".into(),
+                    outcome: HolderOutcome::FetchError {
+                        message: "404".into(),
+                    },
+                },
+                HolderAttempt {
+                    holder: "https://b.example.invalid/".into(),
+                    outcome: HolderOutcome::ContentAddressLie {
+                        expected: [0x01; 32],
+                        actual: [0x02; 32],
+                    },
+                },
+            ],
+        };
+        let s = err.to_string();
+        assert_eq!(
+            s,
+            format!(
+                concat!(
+                    "all 2 holders failed: ",
+                    "[https://a.example.invalid/ → fetch_error: 404] ",
+                    "[https://b.example.invalid/ → CONTENT_ADDRESS_LIE expected={} actual={}]",
+                ),
+                hex::encode([0x01; 32]),
+                hex::encode([0x02; 32]),
+            ),
+        );
+    }
+
+    #[test]
+    fn incoming_error_scan_tags_display_names_detail() {
+        let err = IncomingError::ScanTags {
+            detail: "missing zkepk tag".into(),
+        };
+        assert_eq!(err.to_string(), "scan tags: missing zkepk tag");
+    }
+
+    #[test]
+    fn incoming_error_detect_tag_mismatch_display_names_both_digests() {
+        let err = IncomingError::DetectTagMismatch {
+            claimed: [0xAA; 32],
+            recomputed: [0xBB; 32],
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "detect_tag mismatch: claimed={}, recomputed={}",
+                hex::encode([0xAA; 32]),
+                hex::encode([0xBB; 32]),
+            ),
+        );
+    }
+
+    #[test]
+    fn incoming_error_nip59_display_names_cause() {
+        let err = IncomingError::Nip59("bad mac".into());
+        assert_eq!(err.to_string(), "NIP-59 unwrap: bad mac");
+    }
+
+    #[test]
+    fn incoming_error_seal_author_mismatch_display_names_both_keys() {
+        let err = IncomingError::SealAuthorMismatch {
+            seal_pubkey: [0x11; 32],
+            rumor_pubkey: [0x22; 32],
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "seal author {} ≠ rumor pubkey {} (forged sender)",
+                hex::encode([0x11; 32]),
+                hex::encode([0x22; 32]),
+            ),
+        );
+    }
+
+    #[test]
+    fn incoming_error_payload_display_names_cause() {
+        let err = IncomingError::Payload("truncated rumor".into());
+        assert_eq!(err.to_string(), "delivery payload: truncated rumor");
+    }
+
+    #[test]
+    fn incoming_error_ack_destination_display_names_detail() {
+        let err = IncomingError::AckDestination {
+            detail: "no sender ivpk".into(),
+        };
+        assert_eq!(err.to_string(), "ACK destination: no sender ivpk");
+    }
+
+    #[test]
+    fn incoming_error_ack_send_display_names_detail() {
+        let err = IncomingError::AckSend {
+            detail: "wrap failed".into(),
+        };
+        assert_eq!(err.to_string(), "ACK send: wrap failed");
+    }
+
+    #[test]
+    fn incoming_error_relay_display_names_cause() {
+        let err = IncomingError::Relay("empty relay list".into());
+        assert_eq!(err.to_string(), "relay: empty relay list");
     }
 
     #[test]
@@ -1961,5 +2466,18 @@ mod tests {
                 .expect("load durable terms"),
             Some(terms)
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_blob_from_holders_empty_list_is_holders_empty() {
+        let client = BlossomClient::new(1024).expect("reqwest client");
+        let blob_id = [0u8; 32];
+        let holders: &[String] = &[];
+
+        let err = fetch_blob_from_holders(&client, &blob_id, holders)
+            .await
+            .expect_err("empty holders must fail before HTTP");
+
+        assert!(matches!(err, IncomingError::HoldersEmpty));
     }
 }

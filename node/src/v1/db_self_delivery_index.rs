@@ -182,6 +182,21 @@ pub(crate) async fn get_by_subject_coin(
     row.map(SelfDeliveryIndexSqlRow::into_row).transpose()
 }
 
+/// All durable self-delivery rows, for boot-hydrate of the process Pull index.
+pub(crate) async fn list_all(pool: &PgPool) -> Result<Vec<SelfDeliveryIndexRow>> {
+    let rows: Vec<SelfDeliveryIndexSqlRow> = sqlx::query_as(
+        "SELECT record_id, subject, coin_id, blob_id, detect_tag, canonical, asset_id, \
+                transition_kind, occurred_at \
+         FROM v1_self_delivery_index",
+    )
+    .fetch_all(pool)
+    .await
+    .context("v1_self_delivery_index list_all")?;
+    rows.into_iter()
+        .map(SelfDeliveryIndexSqlRow::into_row)
+        .collect()
+}
+
 /// All folded self-delivery rows for `subject` — every self-created output
 /// coin recorded across the account's reconstructed lineage. §4.5 step 6 head
 /// reconstruction only; the online fold path uses `get_by_subject_coin` /
