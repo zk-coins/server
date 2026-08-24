@@ -1956,6 +1956,56 @@ mod tests {
     }
 
     #[test]
+    fn incoming_error_nip59_display_names_cause() {
+        let err = IncomingError::Nip59("bad mac".into());
+        assert_eq!(err.to_string(), "NIP-59 unwrap: bad mac");
+    }
+
+    #[test]
+    fn incoming_error_seal_author_mismatch_display_names_both_keys() {
+        let err = IncomingError::SealAuthorMismatch {
+            seal_pubkey: [0x11; 32],
+            rumor_pubkey: [0x22; 32],
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "seal author {} ≠ rumor pubkey {} (forged sender)",
+                hex::encode([0x11; 32]),
+                hex::encode([0x22; 32]),
+            ),
+        );
+    }
+
+    #[test]
+    fn incoming_error_payload_display_names_cause() {
+        let err = IncomingError::Payload("truncated rumor".into());
+        assert_eq!(err.to_string(), "delivery payload: truncated rumor");
+    }
+
+    #[test]
+    fn incoming_error_ack_destination_display_names_detail() {
+        let err = IncomingError::AckDestination {
+            detail: "no sender ivpk".into(),
+        };
+        assert_eq!(err.to_string(), "ACK destination: no sender ivpk");
+    }
+
+    #[test]
+    fn incoming_error_ack_send_display_names_detail() {
+        let err = IncomingError::AckSend {
+            detail: "wrap failed".into(),
+        };
+        assert_eq!(err.to_string(), "ACK send: wrap failed");
+    }
+
+    #[test]
+    fn incoming_error_relay_display_names_cause() {
+        let err = IncomingError::Relay("empty relay list".into());
+        assert_eq!(err.to_string(), "relay: empty relay list");
+    }
+
+    #[test]
     fn decrypt_record_id_is_stable() {
         let a = decrypt_record_id(&[1u8; 32], &[2u8; 32], &[3u8; 32]);
         let b = decrypt_record_id(&[1u8; 32], &[2u8; 32], &[3u8; 32]);
