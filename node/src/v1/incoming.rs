@@ -1764,10 +1764,12 @@ mod tests {
         let err = parse_inclusion_proof_wire(&[0u8; 4])
             .expect_err("truncated inclusion proof must be rejected");
 
-        assert!(matches!(err, IncomingError::Verification(_)));
-        assert!(err
-            .to_string()
-            .contains("inclusion_proof truncated (need leaf_index + depth)"));
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "inclusion_proof truncated (need leaf_index + depth)".into(),
+            ),
+        );
     }
 
     #[test]
@@ -1776,8 +1778,13 @@ mod tests {
         let err = parse_inclusion_proof_wire(&bytes)
             .expect_err("inclusion proof depth above the maximum must be rejected");
 
-        assert!(matches!(err, IncomingError::Verification(_)));
-        assert!(err.to_string().contains("MAX_OUTPUT_MERKLE_DEPTH"));
+        assert_eq!(
+            err,
+            IncomingError::Verification(format!(
+                "inclusion_proof depth {} exceeds MAX_OUTPUT_MERKLE_DEPTH",
+                (MAX_OUTPUT_MERKLE_DEPTH as u8) + 1
+            )),
+        );
     }
 
     #[test]
@@ -1796,8 +1803,12 @@ mod tests {
         let err = parse_inclusion_proof_wire(&bytes)
             .expect_err("inclusion proof with mismatched length must be rejected");
 
-        assert!(matches!(err, IncomingError::Verification(_)));
-        assert!(err.to_string().contains("37"));
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "inclusion_proof length 5 ≠ expected 37 for depth 1".into(),
+            ),
+        );
     }
 
     #[test]
