@@ -1498,6 +1498,18 @@ mod tests {
     }
 
     #[test]
+    fn extract_scan_tags_last_zkepk_wins() {
+        let tags = vec![
+            vec!["zkdt".into(), hex::encode([0xAAu8; 32])],
+            vec!["zkepk".into(), hex::encode([0xBBu8; 32])],
+            vec!["zkepk".into(), hex::encode([0xDDu8; 32])],
+        ];
+        let (dt, epk) = extract_scan_tags(&tags).expect("both tags");
+        assert_eq!(dt, [0xAA; 32]);
+        assert_eq!(epk, [0xDD; 32]);
+    }
+
+    #[test]
     fn extract_scan_tags_skips_empty_inner_tag() {
         let tags = vec![
             vec![],
@@ -1569,7 +1581,12 @@ mod tests {
         let mut bad = terms.clone();
         bad.decimals = 3;
         let err = verify_asset_terms_self_auth(id, &bad).expect_err("wrong decimals");
-        assert!(matches!(err, IncomingError::Verification(_)));
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "asset_terms self-auth failed: recomputed asset_id ≠ coin.asset_id".into(),
+            ),
+        );
     }
 
     #[test]
@@ -1583,8 +1600,153 @@ mod tests {
             terms_salt: None,
         };
         let err = verify_asset_terms_self_auth(shared::spec_v1::ZERO_HASH, &terms).expect_err("v9");
-        let msg = err.to_string();
-        assert!(msg.contains("neither 1 nor 2"), "got {msg}");
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "asset_terms issuance_version 9 is neither 1 nor 2 — refuse whole bundle".into(),
+            ),
+        );
+    }
+
+    #[test]
+    fn asset_terms_v1_rejects_cap_total() {
+        let name = b"USD-Demo";
+        let nh = name_hash(name).expect("name");
+        let creator = [0x11u8; 32];
+        let id = asset_id_v1(GENESIS_TAG, &creator, &nh, 2, 1);
+        let terms = IssuanceTerms {
+            creator_pubkey: creator,
+            decimals: 2,
+            issuance_version: 1,
+            name: name.to_vec(),
+            cap_total: Some(1),
+            terms_salt: None,
+        };
+        let err = verify_asset_terms_self_auth(id, &terms).expect_err("v1 with cap_total");
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "asset_terms v1 must not carry cap_total/terms_salt".into(),
+            ),
+        );
+    }
+
+    #[test]
+    fn asset_terms_v1_rejects_terms_salt() {
+        let name = b"USD-Demo";
+        let nh = name_hash(name).expect("name");
+        let creator = [0x11u8; 32];
+        let id = asset_id_v1(GENESIS_TAG, &creator, &nh, 2, 1);
+        let terms = IssuanceTerms {
+            creator_pubkey: creator,
+            decimals: 2,
+            issuance_version: 1,
+            name: name.to_vec(),
+            cap_total: None,
+            terms_salt: Some([0xAB; 32]),
+        };
+        let err = verify_asset_terms_self_auth(id, &terms).expect_err("v1 with terms_salt");
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "asset_terms v1 must not carry cap_total/terms_salt".into(),
+            ),
+        );
+    }
+
+    #[test]
+    fn asset_terms_v2_accepts_honest() {
+        let name = b"USD-Demo";
+        let nh = name_hash(name).expect("name");
+        let creator = [0x11u8; 32];
+        let id = asset_id_v2(GENESIS_TAG, &creator, &nh, 2, 2, 1_000_000u128, &[0xCD; 32]);
+        let terms = IssuanceTerms {
+            creator_pubkey: creator,
+            decimals: 2,
+            issuance_version: 2,
+            name: name.to_vec(),
+            cap_total: Some(1_000_000u128),
+            terms_salt: Some([0xCD; 32]),
+        };
+        verify_asset_terms_self_auth(id, &terms).expect("honest v2 terms");
+    }
+
+    #[test]
+    fn asset_terms_v2_missing_cap_total() {
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x11u8; 32],
+            decimals: 2,
+            issuance_version: 2,
+            name: b"USD-Demo".to_vec(),
+            cap_total: None,
+            terms_salt: Some([0xCD; 32]),
+        };
+        let err = verify_asset_terms_self_auth(shared::spec_v1::ZERO_HASH, &terms)
+            .expect_err("v2 missing cap_total");
+        assert_eq!(
+            err,
+            IncomingError::Verification("asset_terms v2 missing cap_total".into()),
+        );
+    }
+
+    #[test]
+    fn asset_terms_v2_missing_terms_salt() {
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x11u8; 32],
+            decimals: 2,
+            issuance_version: 2,
+            name: b"USD-Demo".to_vec(),
+            cap_total: Some(1),
+            terms_salt: None,
+        };
+        let err = verify_asset_terms_self_auth(shared::spec_v1::ZERO_HASH, &terms)
+            .expect_err("v2 missing terms_salt");
+        assert_eq!(
+            err,
+            IncomingError::Verification("asset_terms v2 missing terms_salt".into()),
+        );
+    }
+
+    #[test]
+    fn asset_terms_v2_self_auth_rejects_mismatch() {
+        let name = b"USD-Demo";
+        let creator = [0x11u8; 32];
+        let terms = IssuanceTerms {
+            creator_pubkey: creator,
+            decimals: 2,
+            issuance_version: 2,
+            name: name.to_vec(),
+            cap_total: Some(1_000_000u128),
+            terms_salt: Some([0xCD; 32]),
+        };
+        let err = verify_asset_terms_self_auth(shared::spec_v1::ZERO_HASH, &terms)
+            .expect_err("v2 mismatch");
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "asset_terms self-auth failed: recomputed asset_id ≠ coin.asset_id".into(),
+            ),
+        );
+    }
+
+    #[test]
+    fn asset_terms_name_too_long_is_verification() {
+        let terms = IssuanceTerms {
+            creator_pubkey: [0x11u8; 32],
+            decimals: 2,
+            issuance_version: 1,
+            name: vec![b'x'; 256],
+            cap_total: None,
+            terms_salt: None,
+        };
+        let err = verify_asset_terms_self_auth(shared::spec_v1::ZERO_HASH, &terms)
+            .expect_err("name too long");
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "asset_terms name_hash: asset name too long: 256 bytes (max 255)".into(),
+            ),
+        );
     }
 
     #[test]
