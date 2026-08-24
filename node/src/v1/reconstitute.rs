@@ -755,6 +755,82 @@ mod tests {
     }
 
     #[test]
+    fn double_spend_loser_creating_nullifier_is_named() {
+        set_process_stack_mode(ScanStackMode::V1);
+        let owner = Address([0xB2; 32]);
+        let mut engine = StateEngine::new(Network::Regtest, 0);
+        let (mut cp, proof, coin_id) = plant_folded_coin(&mut engine, owner, 4);
+        // Winner R is folded; loser presents the same Pk with a different R.
+        cp.creating_nullifier.r_create = [0xFF; 32];
+        let can = serialize_coin_proof(&cp).expect("ser after mutation");
+        let err = reconstitute_received_slots_with_loader(
+            &engine,
+            &owner.0,
+            &[coin_id],
+            |_| Ok(can.clone()),
+            |_| Ok(proof.clone()),
+        )
+        .expect_err("double-spend loser must be named");
+        assert_eq!(
+            err,
+            ReconstituteError::CreatingNullifierNotCompleted {
+                coin_id,
+                detail: "creating Pk present with a different R (double-spend loser)".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn recipient_mismatch_is_named() {
+        set_process_stack_mode(ScanStackMode::V1);
+        let owner = Address([0xB3; 32]);
+        let mut engine = StateEngine::new(Network::Regtest, 0);
+        let (cp, creating_proof, coin_id) = plant_folded_coin(&mut engine, owner, 5);
+        let wrong_subject = [0xEE; 32];
+        let err = reconstitute_slot_from_coin_proof(&engine, &cp, creating_proof, &wrong_subject)
+            .expect_err("recipient mismatch must be named");
+        assert_eq!(
+            err,
+            ReconstituteError::RecipientMismatch {
+                coin_id,
+                recipient: owner.0,
+                subject: wrong_subject,
+            }
+        );
+        assert_eq!(coin_id, digest_to_bytes(&cp.coin.identifier));
+    }
+
+    #[test]
+    fn canonical_identifier_mismatch_is_named() {
+        set_process_stack_mode(ScanStackMode::V1);
+        let owner = Address([0xB4; 32]);
+        let mut engine = StateEngine::new(Network::Regtest, 0);
+        let (cp, proof, _planted_id) = plant_folded_coin(&mut engine, owner, 6);
+        let fold_id = [0xDE; 32];
+        let can = serialize_coin_proof(&cp).expect("ser");
+        let wire_id = digest_to_bytes(&cp.coin.identifier);
+        let err = reconstitute_received_slots_with_loader(
+            &engine,
+            &owner.0,
+            &[fold_id],
+            |_| Ok(can.clone()),
+            |_| Ok(proof.clone()),
+        )
+        .expect_err("canonical identifier ≠ fold_coin_id must be named");
+        assert_eq!(
+            err,
+            ReconstituteError::CoinProofCorrupt {
+                coin_id: fold_id,
+                detail: format!(
+                    "canonical CoinProof.identifier {} ≠ fold_coin_id {}",
+                    hex::encode(wire_id),
+                    hex::encode(fold_id)
+                ),
+            }
+        );
+    }
+
+    #[test]
     fn process_index_load_finds_planted_coin() {
         let index = InMemoryPrivateIndex::new();
         let subject = SubjectAddress([0xCCu8; 32]);
