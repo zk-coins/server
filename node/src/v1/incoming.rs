@@ -1811,7 +1811,28 @@ mod tests {
 
         let err = parse_inclusion_proof_wire(&bytes)
             .expect_err("non-canonical sibling digest must be rejected");
-        assert!(matches!(err, IncomingError::Verification(_)));
+        assert_eq!(
+            err,
+            IncomingError::Verification(format!(
+                "non-canonical digest limb 0: {:#x} >= p (GoldilocksField::ORDER)",
+                F::ORDER
+            )),
+        );
+    }
+
+    #[test]
+    fn inclusion_proof_wire_rejects_extra_byte_at_depth1() {
+        let mut bytes = vec![0, 0, 0, 0, 1];
+        bytes.extend_from_slice(&[0x11u8; 32]);
+        bytes.push(0xff);
+        let err = parse_inclusion_proof_wire(&bytes)
+            .expect_err("extra byte at depth 1 must be rejected");
+        assert_eq!(
+            err,
+            IncomingError::Verification(
+                "inclusion_proof length 38 ≠ expected 37 for depth 1".into(),
+            ),
+        );
     }
 
     #[test]
