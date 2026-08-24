@@ -1619,6 +1619,16 @@ mod tests {
     }
 
     #[test]
+    fn inclusion_proof_wire_rejects_extra_byte_at_depth0() {
+        let bytes = vec![0u8, 0, 0, 0, 0, 0xff];
+        let err = parse_inclusion_proof_wire(&bytes).expect_err("extra byte must be rejected");
+        assert_eq!(
+            err,
+            IncomingError::Verification("inclusion_proof length 6 ≠ expected 5 for depth 0".into()),
+        );
+    }
+
+    #[test]
     fn inclusion_proof_wire_rejects_length_mismatch() {
         let bytes = vec![0, 0, 0, 0, 1];
         let err = parse_inclusion_proof_wire(&bytes)
