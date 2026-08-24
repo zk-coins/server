@@ -1890,6 +1890,48 @@ mod tests {
     }
 
     #[test]
+    fn incoming_error_holders_empty_display_names_cause() {
+        assert_eq!(
+            IncomingError::HoldersEmpty.to_string(),
+            "no advertised or manifest blob holders configured",
+        );
+    }
+
+    #[test]
+    fn incoming_error_all_holders_failed_names_each_attempt() {
+        let err = IncomingError::AllHoldersFailed {
+            attempts: vec![
+                HolderAttempt {
+                    holder: "https://a.example.invalid/".into(),
+                    outcome: HolderOutcome::FetchError {
+                        message: "404".into(),
+                    },
+                },
+                HolderAttempt {
+                    holder: "https://b.example.invalid/".into(),
+                    outcome: HolderOutcome::ContentAddressLie {
+                        expected: [0x01; 32],
+                        actual: [0x02; 32],
+                    },
+                },
+            ],
+        };
+        let s = err.to_string();
+        assert_eq!(
+            s,
+            format!(
+                concat!(
+                    "all 2 holders failed: ",
+                    "[https://a.example.invalid/ → fetch_error: 404] ",
+                    "[https://b.example.invalid/ → CONTENT_ADDRESS_LIE expected={} actual={}]",
+                ),
+                hex::encode([0x01; 32]),
+                hex::encode([0x02; 32]),
+            ),
+        );
+    }
+
+    #[test]
     fn decrypt_record_id_is_stable() {
         let a = decrypt_record_id(&[1u8; 32], &[2u8; 32], &[3u8; 32]);
         let b = decrypt_record_id(&[1u8; 32], &[2u8; 32], &[3u8; 32]);
