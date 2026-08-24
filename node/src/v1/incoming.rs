@@ -1873,6 +1873,23 @@ mod tests {
     }
 
     #[test]
+    fn holder_outcome_display_names_fetch_error() {
+        let o = HolderOutcome::FetchError {
+            message: "holder https://example.invalid/ returned 404".into(),
+        };
+        assert_eq!(
+            o.to_string(),
+            "fetch_error: holder https://example.invalid/ returned 404",
+        );
+    }
+
+    #[test]
+    fn holder_outcome_display_names_ok() {
+        let o = HolderOutcome::Ok { body_len: 64 };
+        assert_eq!(o.to_string(), "ok body_len=64");
+    }
+
+    #[test]
     fn decrypt_record_id_is_stable() {
         let a = decrypt_record_id(&[1u8; 32], &[2u8; 32], &[3u8; 32]);
         let b = decrypt_record_id(&[1u8; 32], &[2u8; 32], &[3u8; 32]);
